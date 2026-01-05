@@ -1,0 +1,10 @@
+{
+  "name": "bud-foundry-dashboard",
+  "version": "0.1.0",
+  "description": "Testing dashboard for Bud Foundry AI Gateway",
+  "type": "module",
+  "scripts": {
+    "serve": "npx serve -l 8080",
+    "lint": "npx eslint js/*.js --env browser --env es2022 --parser-options=sourceType:module"
+  }
+}

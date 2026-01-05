@@ -1,0 +1,29 @@
+{
+  "name": "bud-widget",
+  "version": "0.1.0",
+  "description": "Embeddable voice widget for Bud Foundry AI Gateway",
+  "main": "dist/bud-widget.js",
+  "types": "dist/bud-widget.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "rollup -c rollup.config.mjs",
+    "watch": "rollup -c rollup.config.mjs -w",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@rollup/plugin-node-resolve": "^16.0.0",
+    "@rollup/plugin-terser": "^0.4.4",
+    "@rollup/plugin-typescript": "^12.1.1",
+    "rollup": "^4.28.0",
+    "tslib": "^2.8.1",
+    "typescript": "^5.7.2"
+  },
+  "author": "Bud Foundry",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bud-foundry/sdk"
+  }
+}

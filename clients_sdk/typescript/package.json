@@ -1,0 +1,70 @@
+{
+  "name": "@bud-foundry/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for Bud Foundry AI Gateway - Speech-to-Text, Text-to-Speech, and Voice AI",
+  "main": "dist/index.cjs",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "rollup -c",
+    "dev": "rollup -c -w",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:api": "vitest run --config vitest.api.config.ts",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "lint": "eslint src --ext .ts",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "bud",
+    "foundry",
+    "ai",
+    "speech-to-text",
+    "stt",
+    "text-to-speech",
+    "tts",
+    "voice",
+    "websocket",
+    "streaming",
+    "deepgram",
+    "elevenlabs",
+    "livekit"
+  ],
+  "author": "Bud Foundry",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bud-foundry/sdk"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@rollup/plugin-node-resolve": "^15.2.3",
+    "@rollup/plugin-typescript": "^11.1.6",
+    "@types/node": "^20.11.0",
+    "@types/ws": "^8.18.1",
+    "@vitest/coverage-v8": "^1.2.0",
+    "msw": "^2.1.0",
+    "rollup": "^4.9.0",
+    "rollup-plugin-dts": "^6.1.0",
+    "tslib": "^2.6.2",
+    "typescript": "^5.3.3",
+    "vitest": "^1.2.0",
+    "ws": "^8.18.3"
+  },
+  "sideEffects": false
+}

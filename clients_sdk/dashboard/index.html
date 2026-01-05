@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bud Foundry Dashboard</title>
+    <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+    <div class="dashboard">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-left">
+                <h1 class="logo">BUD FOUNDRY</h1>
+                <span class="subtitle">Testing Dashboard</span>
+            </div>
+            <div class="header-right">
+                <button id="theme-toggle" class="btn btn-icon" title="Toggle theme">
+                    <svg class="icon" viewBox="0 0 24 24">
+                        <path d="M12 3c.132 0 .263 0 .393 0a7.5 7.5 0 0 0 7.92 12.446a9 9 0 1 1 -8.313 -12.454z"/>
+                    </svg>
+                </button>
+            </div>
+        </header>
+
+        <!-- Connection Bar -->
+        <section class="connection-bar">
+            <div class="connection-inputs">
+                <div class="input-group">
+                    <label for="server-url">Server</label>
+                    <input type="text" id="server-url" value="" placeholder="WebSocket URL">
+                </div>
+                <div class="input-group">
+                    <label for="api-key">API Key</label>
+                    <input type="password" id="api-key" placeholder="API Key (optional)">
+                </div>
+                <button id="connect-btn" class="btn btn-primary">Connect</button>
+            </div>
+            <div class="connection-status">
+                <span class="status-indicator" id="status-indicator"></span>
+                <span id="status-text">Disconnected</span>
+            </div>
+        </section>
+
+        <!-- Tabs -->
+        <nav class="tabs">
+            <button class="tab active" data-tab="stt">STT</button>
+            <button class="tab" data-tab="tts">TTS</button>
+            <button class="tab" data-tab="livekit">LiveKit</button>
+            <button class="tab" data-tab="sip">SIP</button>
+            <button class="tab" data-tab="api">API Explorer</button>
+            <button class="tab" data-tab="ws">WS Debug</button>
+            <button class="tab" data-tab="audio">Audio Tools</button>
+            <button class="tab" data-tab="metrics">Metrics</button>
+        </nav>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Left Panel: Tab Content -->
+            <div class="panel-left">
+                <!-- STT Panel -->
+                <div class="tab-panel active" id="panel-stt">
+                    <h2>Speech-to-Text</h2>
+                    <div class="form-section">
+                        <h3>Configuration</h3>
+                        <div class="form-row">
+                            <div class="input-group">
+                                <label for="stt-provider">Provider</label>
+                                <select id="stt-provider">
+                                    <option value="deepgram">Deepgram</option>
+                                    <option value="whisper">Whisper</option>
+                                    <option value="azure">Azure</option>
+                                    <option value="google">Google</option>
+                                </select>
+                            </div>
+                            <div class="input-group">
+                                <label for="stt-api-key">Provider API Key</label>
+                                <input type="password" id="stt-api-key" placeholder="Enter API key for selected provider">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="input-group">
+                                <label for="stt-language">Language</label>
+                                <select id="stt-language">
+                                    <option value="en-US">English (US)</option>
+                                    <option value="en-GB">English (UK)</option>
+                                    <option value="es">Spanish</option>
+                                    <option value="fr">French</option>
+                                    <option value="de">German</option>
+                                    <option value="ja">Japanese</option>
+                                    <option value="zh">Chinese</option>
+                                    <option value="ko">Korean</option>
+                                </select>
+                            </div>
+                            <div class="input-group">
+                                <label for="stt-model">Model</label>
+                                <input type="text" id="stt-model" value="nova-3" placeholder="Model name">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <h3>Feature Flags</h3>
+                        </div>
+                        <div class="form-row checkbox-row">
+                            <label class="checkbox">
+                                <input type="checkbox" id="stt-vad" checked>
+                                <span>VAD</span>
+                            </label>
+                            <label class="checkbox">
+                                <input type="checkbox" id="stt-interim" checked>
+                                <span>Interim Results</span>
+                            </label>
+                            <label class="checkbox">
+                                <input type="checkbox" id="stt-punctuation" checked>
+                                <span>Punctuation</span>
+                            </label>
+                            <label class="checkbox">
+                                <input type="checkbox" id="stt-diarization">
+                                <span>Diarization</span>
+                            </label>
+                            <label class="checkbox">
+                                <input type="checkbox" id="stt-noise">
+                                <span>Noise Cancel</span>
+                            </label>
+                        </div>
+                        <div class="form-row">
+                            <button id="stt-apply-config" class="btn btn-secondary">Apply STT Config</button>
+                        </div>
+                    </div>
+                    <div class="form-section">
+                        <h3>Input</h3>
+                        <div class="audio-controls">
+                            <button id="stt-record-btn" class="btn btn-primary">
+                                <svg class="icon" viewBox="0 0 24 24">
+                                    <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
+                                    <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+                                </svg>
+                                Start Recording
+                            </button>
+                            <input type="file" id="stt-file-input" accept="audio/*" class="hidden">
+                            <button id="stt-upload-btn" class="btn btn-secondary">Upload Audio</button>
+                        </div>
+                        <div class="visualizer" id="stt-visualizer"></div>
+                    </div>
+                    <div class="form-section">
+                        <h3>Transcript</h3>
+                        <div class="transcript-box" id="stt-transcript">
+                            <div class="transcript-placeholder">Transcript will appear here...</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- TTS Panel -->
+                <div class="tab-panel" id="panel-tts">
+                    <h2>Text-to-Speech</h2>
+                    <div class="form-section">
+                        <h3>Configuration</h3>
+                        <div class="form-row">
+                            <div class="input-group">
+                                <label for="tts-provider">Provider</label>
+                                <select id="tts-provider">
+                                    <option value="deepgram">Deepgram</option>
+                                    <option value="elevenlabs">ElevenLabs</option>
+                                    <option value="cartesia">Cartesia</option>
+                                    <option value="azure">Azure</option>
+                                    <option value="openai">OpenAI</option>
+                                </select>
+                            </div>
+                            <div class="input-group">
+                                <label for="tts-api-key">Provider API Key</label>
+                                <input type="password" id="tts-api-key" placeholder="Enter API key for selected provider">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="input-group">
+                                <label for="tts-voice">Voice</label>
+                                <select id="tts-voice">
+                                    <option value="">Select voice...</option>
+                                </select>
+                            </div>
+                            <div class="input-group">
+                                <label for="tts-model">Model</label>
+                                <input type="text" id="tts-model" placeholder="Model name">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <button id="tts-load-voices" class="btn btn-secondary">Load Voices</button>
+                            <button id="tts-apply-config" class="btn btn-secondary">Apply TTS Config</button>
+                        </div>
+                    </div>
+                    <div class="form-section">
+                        <h3>Text Input</h3>
+                        <textarea id="tts-text" placeholder="Enter text to synthesize..." rows="4">Hello, I am a voice assistant powered by Bud Foundry.</textarea>
+                        <div class="form-row button-row">
+                            <button id="tts-speak-btn" class="btn btn-primary">Speak</button>
+                            <button id="tts-stop-btn" class="btn btn-secondary">Stop</button>
+                        </div>
+                    </div>
+                    <div class="form-section">
+                        <h3>Audio Output</h3>
+                        <div class="audio-player" id="tts-player">
+                            <div class="player-status">Ready</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- LiveKit Panel -->
+                <div class="tab-panel" id="panel-livekit">
+                    <h2>LiveKit</h2>
+                    <div class="form-section">
+                        <h3>Token Generation</h3>
+                        <div class="form-row">
+                            <div class="input-group">
+                                <label for="lk-room">Room Name</label>
+                                <input type="text" id="lk-room" value="test-room" placeholder="Room name">
+                            </div>
+                            <div class="input-group">
+                                <label for="lk-identity">Identity</label>
+                                <input type="text" id="lk-identity" value="dashboard-user" placeholder="Participant identity">
+                            </div>
+                            <div class="input-group">
+                                <label for="lk-name">Display Name</label>
+                                <input type="text" id="lk-name" placeholder="Display name (optional)">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <button id="lk-generate-token" class="btn btn-primary">Generate Token</button>
+                        </div>
+                        <div class="result-box" id="lk-token-result"></div>
+                    </div>
+                    <div class="form-section">
+                        <h3>Rooms</h3>
+                        <div class="form-row">
+                            <button id="lk-list-rooms" class="btn btn-secondary">List Rooms</button>
+                        </div>
+                        <div class="result-box" id="lk-rooms-result"></div>
+                    </div>
+                </div>
+
+                <!-- SIP Panel -->
+                <div class="tab-panel" id="panel-sip">
+                    <h2>SIP Hooks</h2>
+                    <div class="form-section">
+                        <h3>Create Hook</h3>
+                        <div class="form-row">
+                            <div class="input-group">
+                                <label for="sip-host">SIP Host</label>
+                                <input type="text" id="sip-host" placeholder="sip.example.com">
+                            </div>
+                            <div class="input-group">
+                                <label for="sip-webhook">Webhook URL</label>
+                                <input type="text" id="sip-webhook" placeholder="https://your-server.com/webhook">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <button id="sip-create-hook" class="btn btn-primary">Create Hook</button>
+                        </div>
+                    </div>
+                    <div class="form-section">
+                        <h3>Existing Hooks</h3>
+                        <div class="form-row">
+                            <button id="sip-list-hooks" class="btn btn-secondary">Refresh</button>
+                        </div>
+                        <div class="result-box" id="sip-hooks-result"></div>
+                    </div>
+                </div>
+
+                <!-- API Explorer Panel -->
+                <div class="tab-panel" id="panel-api">
+                    <h2>API Explorer</h2>
+                    <div class="form-section">
+                        <div class="form-row">
+                            <div class="input-group" style="width: 120px;">
+                                <label for="api-method">Method</label>
+                                <select id="api-method">
+                                    <option value="GET">GET</option>
+                                    <option value="POST">POST</option>
+                                    <option value="PUT">PUT</option>
+                                    <option value="DELETE">DELETE</option>
+                                </select>
+                            </div>
+                            <div class="input-group" style="flex: 1;">
+                                <label for="api-endpoint">Endpoint</label>
+                                <input type="text" id="api-endpoint" value="/" placeholder="/endpoint">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="input-group" style="flex: 1;">
+                                <label for="api-body">Request Body (JSON)</label>
+                                <textarea id="api-body" rows="4" placeholder='{"key": "value"}'></textarea>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <button id="api-send" class="btn btn-primary">Send Request</button>
+                        </div>
+                    </div>
+                    <div class="form-section">
+                        <h3>Response</h3>
+                        <div class="result-box code" id="api-response"></div>
+                    </div>
+                </div>
+
+                <!-- WS Debug Panel -->
+                <div class="tab-panel" id="panel-ws">
+                    <h2>WebSocket Debug</h2>
+                    <div class="form-section">
+                        <h3>Send Message</h3>
+                        <div class="form-row">
+                            <div class="input-group" style="width: 150px;">
+                                <label for="ws-template">Template</label>
+                                <select id="ws-template">
+                                    <option value="">Custom</option>
+                                    <option value="config">Config</option>
+                                    <option value="speak">Speak</option>
+                                    <option value="clear">Clear</option>
+                                    <option value="ping">Ping</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <textarea id="ws-message" rows="6" placeholder='{"type": "..."}'></textarea>
+                        </div>
+                        <div class="form-row">
+                            <button id="ws-send" class="btn btn-primary">Send</button>
+                        </div>
+                    </div>
+                    <div class="form-section">
+                        <h3>Message Log</h3>
+                        <div class="message-log" id="ws-log"></div>
+                    </div>
+                </div>
+
+                <!-- Audio Tools Panel -->
+                <div class="tab-panel" id="panel-audio">
+                    <h2>Audio Tools</h2>
+                    <div class="form-section">
+                        <h3>Input Device</h3>
+                        <div class="form-row">
+                            <div class="input-group" style="flex: 1;">
+                                <label for="audio-input-device">Microphone</label>
+                                <select id="audio-input-device"></select>
+                            </div>
+                            <button id="audio-refresh-devices" class="btn btn-secondary">Refresh</button>
+                        </div>
+                        <div class="level-meter">
+                            <div class="level-bar" id="audio-input-level"></div>
+                        </div>
+                    </div>
+                    <div class="form-section">
+                        <h3>Test Recording</h3>
+                        <div class="form-row">
+                            <button id="audio-test-record" class="btn btn-primary">Record 5s</button>
+                            <button id="audio-test-play" class="btn btn-secondary" disabled>Play</button>
+                        </div>
+                    </div>
+                    <div class="form-section">
+                        <h3>Audio Visualization</h3>
+                        <canvas id="audio-waveform" width="600" height="100"></canvas>
+                    </div>
+                </div>
+
+                <!-- Metrics Panel -->
+                <div class="tab-panel" id="panel-metrics">
+                    <h2>Performance Metrics</h2>
+                    <div class="metrics-grid">
+                        <div class="metric-card">
+                            <div class="metric-label">STT TTFT</div>
+                            <div class="metric-value" id="metric-stt-ttft">-</div>
+                            <div class="metric-unit">ms (p95)</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-label">TTS TTFB</div>
+                            <div class="metric-value" id="metric-tts-ttfb">-</div>
+                            <div class="metric-unit">ms (p95)</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-label">E2E Latency</div>
+                            <div class="metric-value" id="metric-e2e">-</div>
+                            <div class="metric-unit">ms (p95)</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-label">WS Connect</div>
+                            <div class="metric-value" id="metric-ws-connect">-</div>
+                            <div class="metric-unit">ms</div>
+                        </div>
+                    </div>
+                    <div class="form-section">
+                        <h3>SLO Status</h3>
+                        <div class="slo-grid">
+                            <div class="slo-item" id="slo-stt">
+                                <span class="slo-status">-</span>
+                                <span class="slo-label">STT TTFT < 200ms</span>
+                            </div>
+                            <div class="slo-item" id="slo-tts">
+                                <span class="slo-status">-</span>
+                                <span class="slo-label">TTS TTFB < 150ms</span>
+                            </div>
+                            <div class="slo-item" id="slo-e2e">
+                                <span class="slo-status">-</span>
+                                <span class="slo-label">E2E < 1000ms</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="form-section">
+                        <h3>Latency Timeline</h3>
+                        <canvas id="metrics-timeline" width="700" height="150"></canvas>
+                    </div>
+                    <div class="form-section">
+                        <div class="form-row">
+                            <button id="metrics-reset" class="btn btn-secondary">Reset Metrics</button>
+                            <button id="metrics-export" class="btn btn-secondary">Export CSV</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Panel: Log & Status -->
+            <div class="panel-right">
+                <div class="panel-section">
+                    <h3>Quick Metrics</h3>
+                    <div class="quick-metrics">
+                        <div class="quick-metric">
+                            <span class="quick-metric-label">TTFT</span>
+                            <span class="quick-metric-value" id="quick-ttft">-</span>
+                        </div>
+                        <div class="quick-metric">
+                            <span class="quick-metric-label">TTFB</span>
+                            <span class="quick-metric-value" id="quick-ttfb">-</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="panel-section log-section">
+                    <h3>Request Log</h3>
+                    <div class="request-log" id="request-log"></div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script type="module" src="js/app.js?v=5"></script>
+</body>
+</html>
