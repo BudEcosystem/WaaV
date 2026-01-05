@@ -9,19 +9,19 @@
 //! Note: Tests requiring actual API calls are marked with #[ignore]
 //! and require ELEVENLABS_API_KEY environment variable.
 
+use std::sync::Arc;
 use waav_gateway::core::stt::{
     BaseSTT, CommitStrategy, ElevenLabsAudioFormat, ElevenLabsRegion, ElevenLabsSTT, STTConfig,
     STTError, STTProvider, STTResult, create_stt_provider, create_stt_provider_from_enum,
     get_supported_stt_providers,
 };
-use std::sync::Arc;
 
 /// Test that ElevenLabs is included in supported providers
 #[test]
 fn test_elevenlabs_in_supported_providers() {
     let providers = get_supported_stt_providers();
     assert!(providers.contains(&"elevenlabs"));
-    assert_eq!(providers.len(), 5); // deepgram, google, elevenlabs, microsoft-azure, cartesia
+    assert_eq!(providers.len(), 6); // deepgram, google, elevenlabs, microsoft-azure, cartesia, openai
 }
 
 /// Test provider creation via string name

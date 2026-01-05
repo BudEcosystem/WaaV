@@ -165,6 +165,14 @@ pub fn merge_config(
             .and_then(|p| p.cartesia_api_key.clone())
     );
 
+    // OpenAI API key (STT, TTS, and Realtime API)
+    let openai_api_key = get_optional!(
+        "OPENAI_API_KEY",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.openai_api_key.clone())
+    );
+
     // Recording S3 configuration
     let recording_s3_bucket = get_optional!(
         "RECORDING_S3_BUCKET",
@@ -292,7 +300,9 @@ pub fn merge_config(
     // Security configuration
     let cors_allowed_origins = get_optional!(
         "CORS_ALLOWED_ORIGINS",
-        yaml.security.as_ref().and_then(|s| s.cors_allowed_origins.clone())
+        yaml.security
+            .as_ref()
+            .and_then(|s| s.cors_allowed_origins.clone())
     );
 
     // Rate limiting configuration
@@ -354,6 +364,7 @@ pub fn merge_config(
         azure_speech_subscription_key,
         azure_speech_region,
         cartesia_api_key,
+        openai_api_key,
         recording_s3_bucket,
         recording_s3_region,
         recording_s3_endpoint,

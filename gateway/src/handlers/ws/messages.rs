@@ -235,13 +235,25 @@ impl std::fmt::Display for MessageValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SpeakTextTooLarge { size, max } => {
-                write!(f, "Speak text too large: {} bytes (max: {} bytes)", size, max)
+                write!(
+                    f,
+                    "Speak text too large: {} bytes (max: {} bytes)",
+                    size, max
+                )
             }
             Self::MessageContentTooLarge { size, max } => {
-                write!(f, "Message content too large: {} bytes (max: {} bytes)", size, max)
+                write!(
+                    f,
+                    "Message content too large: {} bytes (max: {} bytes)",
+                    size, max
+                )
             }
             Self::SipTransferToTooLarge { size, max } => {
-                write!(f, "SIP transfer_to too large: {} bytes (max: {} bytes)", size, max)
+                write!(
+                    f,
+                    "SIP transfer_to too large: {} bytes (max: {} bytes)",
+                    size, max
+                )
             }
         }
     }

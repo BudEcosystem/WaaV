@@ -57,9 +57,16 @@ providers:
   # Get from Cartesia dashboard: https://play.cartesia.ai/
   cartesia_api_key: ""                           # ENV: CARTESIA_API_KEY
 
+  # OpenAI API key (used for STT, TTS, and Realtime Audio-to-Audio)
+  # STT: Whisper models (whisper-1, gpt-4o-transcribe, gpt-4o-mini-transcribe)
+  # TTS: TTS models (tts-1, tts-1-hd, gpt-4o-mini-tts)
+  # Realtime: Full-duplex audio-to-audio (gpt-4o-realtime-preview)
+  # Get from OpenAI dashboard: https://platform.openai.com/api-keys
+  openai_api_key: ""                             # ENV: OPENAI_API_KEY
+
 # STT Provider Configuration (optional - can also be set via WebSocket config)
 # stt:
-#   provider: deepgram  # Options: "deepgram", "google", "elevenlabs", "microsoft-azure", "cartesia"
+#   provider: deepgram  # Options: "deepgram", "google", "elevenlabs", "microsoft-azure", "cartesia", "openai"
 #   # Google-specific settings (only used when provider is "google")
 #   google:
 #     location: global           # Options: global, us, eu, asia-southeast1, etc.
@@ -68,7 +75,7 @@ providers:
 
 # TTS Provider Configuration (optional - can also be set via WebSocket config)
 # tts:
-#   provider: elevenlabs  # Options: "deepgram", "elevenlabs", "google", "azure", "cartesia"
+#   provider: elevenlabs  # Options: "deepgram", "elevenlabs", "google", "azure", "cartesia", "openai"
 #   # Cartesia-specific settings (only used when provider is "cartesia")
 #   cartesia:
 #     model: sonic-3           # Options: sonic-3, sonic-3-2025-10-27

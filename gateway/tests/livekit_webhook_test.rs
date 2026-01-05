@@ -26,6 +26,7 @@ fn create_test_config_with_livekit() -> ServerConfig {
         azure_speech_subscription_key: None,
         azure_speech_region: None,
         cartesia_api_key: None,
+        openai_api_key: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -40,11 +41,11 @@ fn create_test_config_with_livekit() -> ServerConfig {
         auth_timeout_seconds: 5,
         auth_required: false,
         sip: None,
-    cors_allowed_origins: None,
-    rate_limit_requests_per_second: 60,
-    rate_limit_burst_size: 10,
-    max_websocket_connections: None,
-    max_connections_per_ip: 100,
+        cors_allowed_origins: None,
+        rate_limit_requests_per_second: 60,
+        rate_limit_burst_size: 10,
+        max_websocket_connections: None,
+        max_connections_per_ip: 100,
     }
 }
 
@@ -64,6 +65,7 @@ fn create_test_config_without_livekit() -> ServerConfig {
         azure_speech_subscription_key: None,
         azure_speech_region: None,
         cartesia_api_key: None,
+        openai_api_key: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -78,11 +80,11 @@ fn create_test_config_without_livekit() -> ServerConfig {
         auth_timeout_seconds: 5,
         auth_required: false,
         sip: None,
-    cors_allowed_origins: None,
-    rate_limit_requests_per_second: 60,
-    rate_limit_burst_size: 10,
-    max_websocket_connections: None,
-    max_connections_per_ip: 100,
+        cors_allowed_origins: None,
+        rate_limit_requests_per_second: 60,
+        rate_limit_burst_size: 10,
+        max_websocket_connections: None,
+        max_connections_per_ip: 100,
     }
 }
 

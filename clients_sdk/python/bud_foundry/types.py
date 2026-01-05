@@ -10,7 +10,7 @@ class STTConfig(BaseModel):
     """STT (Speech-to-Text) configuration."""
 
     provider: str = "deepgram"
-    """Provider name (e.g., 'deepgram', 'whisper', 'azure')"""
+    """Provider name (e.g., 'deepgram', 'google', 'elevenlabs', 'microsoft-azure', 'cartesia', 'openai')"""
 
     language: str = "en-US"
     """Language code for transcription"""
@@ -53,7 +53,7 @@ class TTSConfig(BaseModel):
     """TTS (Text-to-Speech) configuration."""
 
     provider: str = "deepgram"
-    """Provider name (e.g., 'deepgram', 'elevenlabs', 'azure')"""
+    """Provider name (e.g., 'deepgram', 'elevenlabs', 'google', 'microsoft-azure', 'cartesia', 'openai')"""
 
     voice: Optional[str] = None
     """Voice name"""
@@ -434,3 +434,177 @@ class SIPHookCreateResponse(BaseModel):
 
     created: bool
     """Whether newly created"""
+
+
+# =============================================================================
+# Realtime (Audio-to-Audio) Types
+# =============================================================================
+
+
+class VADConfig(BaseModel):
+    """Voice Activity Detection configuration for realtime sessions."""
+
+    enabled: bool = True
+    """Enable server-side VAD"""
+
+    threshold: float = 0.5
+    """VAD threshold (0.0 to 1.0)"""
+
+    silence_duration_ms: int = 500
+    """Silence duration before speech end detection in ms"""
+
+    prefix_padding_ms: int = 300
+    """Prefix padding in ms"""
+
+
+class InputTranscriptionConfig(BaseModel):
+    """Input audio transcription configuration for realtime sessions."""
+
+    enabled: bool = True
+    """Enable input audio transcription"""
+
+    model: str = "whisper-1"
+    """Model to use for transcription"""
+
+
+class RealtimeSessionConfig(BaseModel):
+    """
+    Provider-agnostic realtime session configuration.
+
+    This configuration abstracts away provider-specific details while exposing
+    common functionality. Advanced users can access provider-specific options
+    through the `provider_options` field.
+    """
+
+    provider: str = "openai"
+    """Provider to use (currently only 'openai' supported)"""
+
+    model: Optional[str] = "gpt-4o-realtime-preview"
+    """
+    Model to use (provider-specific).
+
+    OpenAI: "gpt-4o-realtime-preview", "gpt-4o-mini-realtime-preview"
+    """
+
+    voice: Optional[str] = "alloy"
+    """
+    Voice to use for audio output.
+
+    OpenAI: "alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"
+    """
+
+    instructions: Optional[str] = None
+    """System instructions for the AI assistant"""
+
+    vad: Optional[VADConfig] = Field(default_factory=VADConfig)
+    """Voice Activity Detection configuration"""
+
+    input_transcription: Optional[InputTranscriptionConfig] = Field(
+        default_factory=InputTranscriptionConfig
+    )
+    """Input audio transcription configuration"""
+
+    turn_detection: str = "server_vad"
+    """Turn detection mode: 'server_vad' or 'none'"""
+
+    temperature: float = 0.8
+    """Temperature for response generation (0.0 to 2.0)"""
+
+    max_response_tokens: Optional[int] = None
+    """Maximum tokens for response (provider-specific limits apply)"""
+
+    provider_options: Optional[dict[str, Any]] = None
+    """
+    Provider-specific options for advanced users.
+
+    These options are passed directly to the provider and may vary
+    between providers. Refer to provider documentation for details.
+    """
+
+
+class RealtimeTranscript(BaseModel):
+    """Realtime transcript result."""
+
+    text: str
+    """The transcribed or generated text"""
+
+    role: str
+    """Role: 'user' for input transcription, 'assistant' for AI response"""
+
+    is_final: bool
+    """Whether this is a final transcript (vs interim/streaming)"""
+
+    item_id: Optional[str] = None
+    """Item ID from the provider (for correlation)"""
+
+    response_id: Optional[str] = None
+    """Response ID from the provider (for correlation)"""
+
+    timestamp: int
+    """Timestamp when transcript was received (ms since epoch)"""
+
+
+class RealtimeSpeechEvent(BaseModel):
+    """Speech event (speech started/stopped) for realtime sessions."""
+
+    type: str
+    """Event type: 'speech_started' or 'speech_stopped'"""
+
+    audio_ms: int
+    """Audio position in ms when event occurred"""
+
+    item_id: Optional[str] = None
+    """Item ID from the provider"""
+
+    timestamp: int
+    """Timestamp when event was received (ms since epoch)"""
+
+
+class RealtimeAudioChunk(BaseModel):
+    """Realtime audio data chunk."""
+
+    data: bytes
+    """Raw PCM audio data (24kHz, mono, 16-bit little-endian)"""
+
+    sample_rate: int = 24000
+    """Sample rate (always 24000 for OpenAI)"""
+
+    channels: int = 1
+    """Number of channels (always 1 for mono)"""
+
+    is_final: bool = False
+    """Whether this is the final chunk for this response"""
+
+    response_id: Optional[str] = None
+    """Response ID from the provider"""
+
+    item_id: Optional[str] = None
+    """Item ID from the provider"""
+
+    sequence: int = 0
+    """Sequence number for ordering"""
+
+    timestamp: int = 0
+    """Timestamp when chunk was received (ms since epoch)"""
+
+
+# Provider-specific voice defaults
+VOICE_DEFAULTS: dict[str, dict[str, Optional[str]]] = {
+    "deepgram": {"model": "aura-asteria-en", "voice": "aura-asteria-en"},
+    "elevenlabs": {"model": "eleven_turbo_v2", "voice": "rachel"},
+    "google": {"model": "en-US-Studio-O", "voice": "en-US-Studio-O"},
+    "azure": {"model": "en-US-JennyNeural", "voice": "en-US-JennyNeural"},
+    "cartesia": {"model": "sonic-3", "voice": None},
+    "openai": {"model": "tts-1", "voice": "alloy"},
+}
+
+# Realtime provider defaults
+REALTIME_DEFAULTS: dict[str, dict[str, Any]] = {
+    "openai": {
+        "model": "gpt-4o-realtime-preview",
+        "voice": "alloy",
+        "turn_detection": "server_vad",
+        "temperature": 0.8,
+        "max_response_tokens": None,
+    }
+}

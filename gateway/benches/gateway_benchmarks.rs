@@ -4,10 +4,10 @@
 //! Or for specific benchmarks: cargo bench -- <filter>
 
 use bytes::Bytes;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::time::Duration;
-use waav_gateway::core::cache::{CacheBackend, MemoryCacheBackend, XxHasher, KeyHasher};
-use waav_gateway::handlers::ws::messages::{IncomingMessage, OutgoingMessage, MAX_SPEAK_TEXT_SIZE};
+use waav_gateway::core::cache::{CacheBackend, KeyHasher, MemoryCacheBackend, XxHasher};
+use waav_gateway::handlers::ws::messages::{IncomingMessage, MAX_SPEAK_TEXT_SIZE, OutgoingMessage};
 use waav_gateway::utils::phone_validation::validate_phone_number;
 
 /// Benchmark message parsing performance
@@ -127,27 +127,19 @@ fn bench_message_validation(c: &mut Criterion) {
     };
 
     group.bench_function("valid_speak_small", |b| {
-        b.iter(|| {
-            black_box(&valid_speak).validate_size()
-        });
+        b.iter(|| black_box(&valid_speak).validate_size());
     });
 
     group.bench_function("valid_speak_large", |b| {
-        b.iter(|| {
-            black_box(&large_speak).validate_size()
-        });
+        b.iter(|| black_box(&large_speak).validate_size());
     });
 
     group.bench_function("valid_send_message", |b| {
-        b.iter(|| {
-            black_box(&valid_send).validate_size()
-        });
+        b.iter(|| black_box(&valid_send).validate_size());
     });
 
     group.bench_function("valid_sip_transfer", |b| {
-        b.iter(|| {
-            black_box(&valid_sip).validate_size()
-        });
+        b.iter(|| black_box(&valid_sip).validate_size());
     });
 
     group.finish();
@@ -181,21 +173,15 @@ fn bench_message_serialization(c: &mut Criterion) {
     };
 
     group.bench_function("ready_message", |b| {
-        b.iter(|| {
-            serde_json::to_string(black_box(&ready_msg))
-        });
+        b.iter(|| serde_json::to_string(black_box(&ready_msg)));
     });
 
     group.bench_function("stt_result", |b| {
-        b.iter(|| {
-            serde_json::to_string(black_box(&stt_result))
-        });
+        b.iter(|| serde_json::to_string(black_box(&stt_result)));
     });
 
     group.bench_function("error_message", |b| {
-        b.iter(|| {
-            serde_json::to_string(black_box(&error_msg))
-        });
+        b.iter(|| serde_json::to_string(black_box(&error_msg)));
     });
 
     group.finish();
@@ -217,51 +203,35 @@ fn bench_phone_validation(c: &mut Criterion) {
     let empty = "";
 
     group.bench_function("international_simple", |b| {
-        b.iter(|| {
-            validate_phone_number(black_box(international))
-        });
+        b.iter(|| validate_phone_number(black_box(international)));
     });
 
     group.bench_function("international_long", |b| {
-        b.iter(|| {
-            validate_phone_number(black_box(international_long))
-        });
+        b.iter(|| validate_phone_number(black_box(international_long)));
     });
 
     group.bench_function("national", |b| {
-        b.iter(|| {
-            validate_phone_number(black_box(national))
-        });
+        b.iter(|| validate_phone_number(black_box(national)));
     });
 
     group.bench_function("with_spaces", |b| {
-        b.iter(|| {
-            validate_phone_number(black_box(with_spaces))
-        });
+        b.iter(|| validate_phone_number(black_box(with_spaces)));
     });
 
     group.bench_function("with_dashes", |b| {
-        b.iter(|| {
-            validate_phone_number(black_box(with_dashes))
-        });
+        b.iter(|| validate_phone_number(black_box(with_dashes)));
     });
 
     group.bench_function("extension", |b| {
-        b.iter(|| {
-            validate_phone_number(black_box(extension))
-        });
+        b.iter(|| validate_phone_number(black_box(extension)));
     });
 
     group.bench_function("invalid", |b| {
-        b.iter(|| {
-            validate_phone_number(black_box(invalid))
-        });
+        b.iter(|| validate_phone_number(black_box(invalid)));
     });
 
     group.bench_function("empty", |b| {
-        b.iter(|| {
-            validate_phone_number(black_box(empty))
-        });
+        b.iter(|| validate_phone_number(black_box(empty)));
     });
 
     group.finish();
@@ -275,8 +245,8 @@ fn bench_cache_operations(c: &mut Criterion) {
 
     // Create cache with memory backend
     let cache = MemoryCacheBackend::new(
-        100_000,            // max entries
-        Some(100_000_000),  // max size 100MB
+        100_000,                         // max entries
+        Some(100_000_000),               // max size 100MB
         Some(Duration::from_secs(3600)), // 1 hour TTL
     );
 
@@ -298,7 +268,9 @@ fn bench_cache_operations(c: &mut Criterion) {
     group.bench_function("insert_medium_10kb", |b| {
         let medium = medium_data.clone();
         b.to_async(&rt).iter(|| async {
-            let _ = cache.set("key-medium", black_box(medium.clone()), None).await;
+            let _ = cache
+                .set("key-medium", black_box(medium.clone()), None)
+                .await;
         });
     });
 
@@ -319,28 +291,24 @@ fn bench_cache_operations(c: &mut Criterion) {
 
     // Get benchmarks
     group.bench_function("get_small_100b", |b| {
-        b.to_async(&rt).iter(|| async {
-            cache.get(black_box("get-key-small")).await
-        });
+        b.to_async(&rt)
+            .iter(|| async { cache.get(black_box("get-key-small")).await });
     });
 
     group.bench_function("get_medium_10kb", |b| {
-        b.to_async(&rt).iter(|| async {
-            cache.get(black_box("get-key-medium")).await
-        });
+        b.to_async(&rt)
+            .iter(|| async { cache.get(black_box("get-key-medium")).await });
     });
 
     group.bench_function("get_large_100kb", |b| {
-        b.to_async(&rt).iter(|| async {
-            cache.get(black_box("get-key-large")).await
-        });
+        b.to_async(&rt)
+            .iter(|| async { cache.get(black_box("get-key-large")).await });
     });
 
     // Miss benchmark
     group.bench_function("get_miss", |b| {
-        b.to_async(&rt).iter(|| async {
-            cache.get(black_box("nonexistent-key")).await
-        });
+        b.to_async(&rt)
+            .iter(|| async { cache.get(black_box("nonexistent-key")).await });
     });
 
     group.finish();
@@ -358,21 +326,15 @@ fn bench_cache_hashing(c: &mut Criterion) {
     let long_key = "x".repeat(1000);
 
     group.bench_function("hash_short_key", |b| {
-        b.iter(|| {
-            hasher.hash(black_box(short_key))
-        });
+        b.iter(|| hasher.hash(black_box(short_key)));
     });
 
     group.bench_function("hash_medium_key", |b| {
-        b.iter(|| {
-            hasher.hash(black_box(medium_key))
-        });
+        b.iter(|| hasher.hash(black_box(medium_key)));
     });
 
     group.bench_function("hash_long_key", |b| {
-        b.iter(|| {
-            hasher.hash(black_box(&long_key))
-        });
+        b.iter(|| hasher.hash(black_box(&long_key)));
     });
 
     group.finish();

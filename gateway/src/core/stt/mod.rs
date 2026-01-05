@@ -4,6 +4,7 @@ pub mod cartesia;
 pub mod deepgram;
 pub mod elevenlabs;
 pub mod google;
+pub mod openai;
 
 // Re-export public types and traits
 pub use base::{
@@ -29,6 +30,13 @@ pub use azure::{AzureOutputFormat, AzureProfanityOption, AzureRegion, AzureSTT, 
 // Re-export Cartesia implementation
 pub use cartesia::{CartesiaAudioEncoding, CartesiaMessage, CartesiaSTT, CartesiaSTTConfig};
 
+// Re-export OpenAI implementation
+pub use openai::{
+    AudioInputFormat as OpenAIAudioInputFormat, FlushStrategy as OpenAIFlushStrategy, OpenAISTT,
+    OpenAISTTConfig, OpenAISTTModel, ResponseFormat as OpenAIResponseFormat,
+    TimestampGranularity as OpenAITimestampGranularity,
+};
+
 /// Supported STT providers
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum STTProvider {
@@ -42,6 +50,8 @@ pub enum STTProvider {
     Azure,
     /// Cartesia STT WebSocket API (ink-whisper)
     Cartesia,
+    /// OpenAI Whisper STT REST API
+    OpenAI,
 }
 
 impl std::fmt::Display for STTProvider {
@@ -52,6 +62,7 @@ impl std::fmt::Display for STTProvider {
             STTProvider::ElevenLabs => write!(f, "elevenlabs"),
             STTProvider::Azure => write!(f, "microsoft-azure"),
             STTProvider::Cartesia => write!(f, "cartesia"),
+            STTProvider::OpenAI => write!(f, "openai"),
         }
     }
 }
@@ -66,8 +77,9 @@ impl std::str::FromStr for STTProvider {
             "elevenlabs" => Ok(STTProvider::ElevenLabs),
             "microsoft-azure" | "azure" => Ok(STTProvider::Azure),
             "cartesia" => Ok(STTProvider::Cartesia),
+            "openai" => Ok(STTProvider::OpenAI),
             _ => Err(STTError::ConfigurationError(format!(
-                "Unsupported STT provider: {s}. Supported providers: deepgram, google, elevenlabs, microsoft-azure, cartesia"
+                "Unsupported STT provider: {s}. Supported providers: deepgram, google, elevenlabs, microsoft-azure, cartesia, openai"
             ))),
         }
     }
@@ -138,6 +150,10 @@ pub fn create_stt_provider(
             let cartesia_stt = <CartesiaSTT as BaseSTT>::new(config)?;
             Ok(Box::new(cartesia_stt))
         }
+        STTProvider::OpenAI => {
+            let openai_stt = <OpenAISTT as BaseSTT>::new(config)?;
+            Ok(Box::new(openai_stt))
+        }
     }
 }
 
@@ -197,6 +213,10 @@ pub fn create_stt_provider_from_enum(
             let cartesia_stt = <CartesiaSTT as BaseSTT>::new(config)?;
             Ok(Box::new(cartesia_stt))
         }
+        STTProvider::OpenAI => {
+            let openai_stt = <OpenAISTT as BaseSTT>::new(config)?;
+            Ok(Box::new(openai_stt))
+        }
     }
 }
 
@@ -220,6 +240,7 @@ pub fn get_supported_stt_providers() -> Vec<&'static str> {
         "elevenlabs",
         "microsoft-azure",
         "cartesia",
+        "openai",
     ]
 }
 
@@ -315,13 +336,15 @@ mod factory_tests {
                 "google",
                 "elevenlabs",
                 "microsoft-azure",
-                "cartesia"
+                "cartesia",
+                "openai"
             ]
         );
         assert!(providers.contains(&"deepgram"));
         assert!(providers.contains(&"google"));
         assert!(providers.contains(&"elevenlabs"));
         assert!(providers.contains(&"microsoft-azure"));
+        assert!(providers.contains(&"openai"));
         assert!(providers.contains(&"cartesia"));
     }
 

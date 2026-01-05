@@ -25,6 +25,7 @@ async fn test_websocket_voice_config() {
         azure_speech_subscription_key: None,
         azure_speech_region: None,
         cartesia_api_key: None,
+        openai_api_key: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -39,11 +40,11 @@ async fn test_websocket_voice_config() {
         auth_timeout_seconds: 5,
         auth_required: false,
         sip: None,
-    cors_allowed_origins: None,
-    rate_limit_requests_per_second: 60,
-    rate_limit_burst_size: 10,
-    max_websocket_connections: None,
-    max_connections_per_ip: 100,
+        cors_allowed_origins: None,
+        rate_limit_requests_per_second: 60,
+        rate_limit_burst_size: 10,
+        max_websocket_connections: None,
+        max_connections_per_ip: 100,
     };
 
     // Create application state
@@ -199,6 +200,7 @@ async fn test_websocket_invalid_message() {
         azure_speech_subscription_key: None,
         azure_speech_region: None,
         cartesia_api_key: None,
+        openai_api_key: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -213,11 +215,11 @@ async fn test_websocket_invalid_message() {
         auth_timeout_seconds: 5,
         auth_required: false,
         sip: None,
-    cors_allowed_origins: None,
-    rate_limit_requests_per_second: 60,
-    rate_limit_burst_size: 10,
-    max_websocket_connections: None,
-    max_connections_per_ip: 100,
+        cors_allowed_origins: None,
+        rate_limit_requests_per_second: 60,
+        rate_limit_burst_size: 10,
+        max_websocket_connections: None,
+        max_connections_per_ip: 100,
     };
 
     // Create application state
@@ -305,6 +307,7 @@ async fn test_websocket_sip_transfer_without_livekit_config() {
         azure_speech_subscription_key: None,
         azure_speech_region: None,
         cartesia_api_key: None,
+        openai_api_key: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -319,11 +322,11 @@ async fn test_websocket_sip_transfer_without_livekit_config() {
         auth_timeout_seconds: 5,
         auth_required: false,
         sip: None,
-    cors_allowed_origins: None,
-    rate_limit_requests_per_second: 60,
-    rate_limit_burst_size: 10,
-    max_websocket_connections: None,
-    max_connections_per_ip: 100,
+        cors_allowed_origins: None,
+        rate_limit_requests_per_second: 60,
+        rate_limit_burst_size: 10,
+        max_websocket_connections: None,
+        max_connections_per_ip: 100,
     };
 
     // Create application state
@@ -414,6 +417,7 @@ async fn test_websocket_sip_transfer_invalid_phone_number() {
         azure_speech_subscription_key: None,
         azure_speech_region: None,
         cartesia_api_key: None,
+        openai_api_key: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -428,11 +432,11 @@ async fn test_websocket_sip_transfer_invalid_phone_number() {
         auth_timeout_seconds: 5,
         auth_required: false,
         sip: None,
-    cors_allowed_origins: None,
-    rate_limit_requests_per_second: 60,
-    rate_limit_burst_size: 10,
-    max_websocket_connections: None,
-    max_connections_per_ip: 100,
+        cors_allowed_origins: None,
+        rate_limit_requests_per_second: 60,
+        rate_limit_burst_size: 10,
+        max_websocket_connections: None,
+        max_connections_per_ip: 100,
     };
 
     // Create application state
@@ -523,6 +527,7 @@ async fn test_websocket_sip_transfer_empty_phone_number() {
         azure_speech_subscription_key: None,
         azure_speech_region: None,
         cartesia_api_key: None,
+        openai_api_key: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -537,11 +542,11 @@ async fn test_websocket_sip_transfer_empty_phone_number() {
         auth_timeout_seconds: 5,
         auth_required: false,
         sip: None,
-    cors_allowed_origins: None,
-    rate_limit_requests_per_second: 60,
-    rate_limit_burst_size: 10,
-    max_websocket_connections: None,
-    max_connections_per_ip: 100,
+        cors_allowed_origins: None,
+        rate_limit_requests_per_second: 60,
+        rate_limit_burst_size: 10,
+        max_websocket_connections: None,
+        max_connections_per_ip: 100,
     };
 
     // Create application state

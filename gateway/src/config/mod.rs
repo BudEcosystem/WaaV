@@ -98,6 +98,8 @@ pub struct ServerConfig {
     pub azure_speech_region: Option<String>,
     /// Cartesia API key for both STT (ink-whisper model) and TTS (sonic-3 model)
     pub cartesia_api_key: Option<String>,
+    /// OpenAI API key for STT (Whisper), TTS, and Realtime API
+    pub openai_api_key: Option<String>,
 
     // LiveKit recording configuration
     pub recording_s3_bucket: Option<String>,
@@ -171,6 +173,9 @@ impl Drop for ServerConfig {
             key.zeroize();
         }
         if let Some(ref mut key) = self.cartesia_api_key {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.openai_api_key {
             key.zeroize();
         }
         if let Some(ref mut key) = self.recording_s3_access_key {
@@ -369,6 +374,12 @@ impl ServerConfig {
                     "Cartesia API key not configured in server environment".to_string()
                 })
             }
+            "openai" => {
+                // OpenAI uses API key authentication for STT (Whisper), TTS, and Realtime API
+                self.openai_api_key.as_ref().cloned().ok_or_else(|| {
+                    "OpenAI API key not configured in server environment".to_string()
+                })
+            }
             _ => Err(format!("Unsupported provider: {provider}")),
         }
     }
@@ -432,6 +443,7 @@ mod tests {
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -446,11 +458,11 @@ mod tests {
             auth_timeout_seconds: 5,
             auth_required: false,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         let result = config.get_api_key("deepgram");
@@ -478,6 +490,7 @@ mod tests {
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -492,11 +505,11 @@ mod tests {
             auth_timeout_seconds: 5,
             auth_required: false,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         let result = config.get_api_key("elevenlabs");
@@ -520,6 +533,7 @@ mod tests {
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -534,11 +548,11 @@ mod tests {
             auth_timeout_seconds: 5,
             auth_required: false,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         let result = config.get_api_key("deepgram");
@@ -565,6 +579,7 @@ mod tests {
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -579,11 +594,11 @@ mod tests {
             auth_timeout_seconds: 5,
             auth_required: false,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         let result = config.get_api_key("unsupported_provider");
@@ -610,6 +625,7 @@ mod tests {
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -624,11 +640,11 @@ mod tests {
             auth_timeout_seconds: 5,
             auth_required: false,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         // Test uppercase
@@ -661,6 +677,7 @@ mod tests {
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -675,11 +692,11 @@ mod tests {
             auth_timeout_seconds: 5,
             auth_required: true,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         assert!(config_with_jwt.has_jwt_auth());
@@ -699,6 +716,7 @@ mod tests {
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -713,11 +731,11 @@ mod tests {
             auth_timeout_seconds: 5,
             auth_required: false,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         assert!(!config_without_jwt.has_jwt_auth());
@@ -739,6 +757,7 @@ mod tests {
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -756,11 +775,11 @@ mod tests {
             auth_timeout_seconds: 5,
             auth_required: true,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         assert!(config_with_api_secret.has_api_secret_auth());
@@ -780,6 +799,7 @@ mod tests {
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -794,11 +814,11 @@ mod tests {
             auth_timeout_seconds: 5,
             auth_required: false,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         assert!(!config_without_api_secret.has_api_secret_auth());
@@ -820,6 +840,7 @@ mod tests {
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -843,11 +864,11 @@ mod tests {
             auth_timeout_seconds: 5,
             auth_required: true,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         assert_eq!(config.find_api_secret_id("token-a"), Some("client-a"));
@@ -870,6 +891,7 @@ mod tests {
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -884,11 +906,11 @@ mod tests {
             auth_timeout_seconds: 5,
             auth_required: false,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         // Google returns the credentials path/content when configured
@@ -914,6 +936,7 @@ mod tests {
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -928,11 +951,11 @@ mod tests {
             auth_timeout_seconds: 5,
             auth_required: false,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         // Google returns the inline JSON credentials when configured
@@ -957,6 +980,7 @@ mod tests {
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -971,11 +995,11 @@ mod tests {
             auth_timeout_seconds: 5,
             auth_required: false,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         // Google returns empty string when not configured, allowing ADC to be used
@@ -1000,6 +1024,7 @@ mod tests {
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1014,11 +1039,11 @@ mod tests {
             auth_timeout_seconds: 5,
             auth_required: false,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         // Test uppercase
@@ -1048,6 +1073,7 @@ mod tests {
             azure_speech_subscription_key: Some("test-azure-key".to_string()),
             azure_speech_region: Some("westus2".to_string()),
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1062,11 +1088,11 @@ mod tests {
             auth_timeout_seconds: 5,
             auth_required: false,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         let result = config.get_api_key("microsoft-azure");
@@ -1090,6 +1116,7 @@ mod tests {
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1104,11 +1131,11 @@ mod tests {
             auth_timeout_seconds: 5,
             auth_required: false,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         let result = config.get_api_key("microsoft-azure");
@@ -1135,6 +1162,7 @@ mod tests {
             azure_speech_subscription_key: Some("test-key".to_string()),
             azure_speech_region: Some("westeurope".to_string()),
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1149,11 +1177,11 @@ mod tests {
             auth_timeout_seconds: 5,
             auth_required: false,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         assert_eq!(config.get_azure_speech_region(), "westeurope");
@@ -1175,6 +1203,7 @@ mod tests {
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1189,11 +1218,11 @@ mod tests {
             auth_timeout_seconds: 5,
             auth_required: false,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         // Default is "eastus"

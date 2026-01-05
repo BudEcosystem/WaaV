@@ -117,6 +117,8 @@ pub struct ProvidersYaml {
     pub azure_speech_region: Option<String>,
     /// Cartesia API key for STT (ink-whisper model)
     pub cartesia_api_key: Option<String>,
+    /// OpenAI API key for STT (Whisper), TTS, and Realtime API
+    pub openai_api_key: Option<String>,
 }
 
 /// Recording S3 configuration from YAML

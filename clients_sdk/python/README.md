@@ -45,6 +45,7 @@ asyncio.run(main())
 - **Talk**: Bidirectional voice conversations with VAD and interruption handling
 - **Performance Metrics**: Built-in TTFT, TTFB, and E2E latency tracking
 - **Feature Flags**: VAD, noise cancellation, speaker diarization, and more
+- **OpenAI Support**: Whisper STT, TTS-1/TTS-1-HD synthesis, and GPT-4o Realtime API
 
 ## Configuration
 
@@ -138,6 +139,52 @@ async with bud.talk.connect(
         elif event.type == "audio":
             player.play(event.audio)
 ```
+
+## OpenAI Provider
+
+Use OpenAI's Whisper for transcription and TTS-1/TTS-1-HD for speech synthesis:
+
+```python
+from bud_foundry import BudClient, STTConfig, TTSConfig
+
+bud = BudClient(base_url="http://localhost:3001", api_key="your-api-key")
+
+# OpenAI STT (Whisper)
+async with bud.stt.connect(
+    config=STTConfig(
+        provider="openai",
+        model="whisper-1",  # or "gpt-4o-transcribe", "gpt-4o-mini-transcribe"
+        language="en"
+    )
+) as session:
+    async for result in session.transcribe_stream(audio_generator()):
+        print(f"Transcript: {result.text}")
+
+# OpenAI TTS
+async with bud.tts.connect(
+    config=TTSConfig(
+        provider="openai",
+        model="tts-1-hd",  # or "tts-1", "gpt-4o-mini-tts"
+        voice="nova"       # alloy, ash, ballad, coral, echo, fable, onyx, nova, sage, shimmer, verse
+    )
+) as session:
+    await session.speak("Hello from OpenAI!")
+```
+
+### OpenAI Models
+
+**STT Models:**
+- `whisper-1` - Original Whisper model
+- `gpt-4o-transcribe` - GPT-4o optimized transcription
+- `gpt-4o-mini-transcribe` - Smaller, faster transcription
+
+**TTS Models:**
+- `tts-1` - Standard quality, low latency
+- `tts-1-hd` - High-definition quality
+- `gpt-4o-mini-tts` - GPT-4o mini TTS
+
+**TTS Voices:**
+alloy, ash, ballad, coral, echo, fable, onyx, nova, sage, shimmer, verse
 
 ## Sync API
 

@@ -255,7 +255,10 @@ async fn initialize_voice_manager(
     // Get API keys - prefer client-provided keys, fall back to server config
     let stt_api_key = if let Some(ref client_key) = stt_ws_config.api_key {
         if !client_key.is_empty() {
-            info!("Using client-provided API key for STT provider: {}", stt_ws_config.provider);
+            info!(
+                "Using client-provided API key for STT provider: {}",
+                stt_ws_config.provider
+            );
             client_key.clone()
         } else {
             match app_state.config.get_api_key(&stt_ws_config.provider) {
@@ -288,7 +291,10 @@ async fn initialize_voice_manager(
 
     let tts_api_key = if let Some(ref client_key) = tts_ws_config.api_key {
         if !client_key.is_empty() {
-            info!("Using client-provided API key for TTS provider: {}", tts_ws_config.provider);
+            info!(
+                "Using client-provided API key for TTS provider: {}",
+                tts_ws_config.provider
+            );
             client_key.clone()
         } else {
             match app_state.config.get_api_key(&tts_ws_config.provider) {

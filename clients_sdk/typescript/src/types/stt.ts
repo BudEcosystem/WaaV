@@ -64,7 +64,7 @@ export interface TranscriptEvent {
  * STT connection options
  */
 export interface STTConnectOptions {
-  /** Provider name (e.g., "deepgram", "google", "elevenlabs", "microsoft-azure", "cartesia") */
+  /** Provider name (e.g., "deepgram", "google", "elevenlabs", "microsoft-azure", "cartesia", "openai") */
   provider: string;
   /** Language code (e.g., "en-US", "es-ES", "fr-FR") */
   language: string;

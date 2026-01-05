@@ -11,12 +11,12 @@
 //! and require AZURE_SPEECH_SUBSCRIPTION_KEY and AZURE_SPEECH_REGION
 //! environment variables.
 
+use std::sync::Arc;
 use waav_gateway::core::stt::{
     AzureOutputFormat, AzureProfanityOption, AzureRegion, AzureSTT, AzureSTTConfig, BaseSTT,
     STTConfig, STTError, STTProvider, STTResult, create_stt_provider,
     create_stt_provider_from_enum, get_supported_stt_providers,
 };
-use std::sync::Arc;
 
 // =============================================================================
 // Factory Integration Tests
@@ -27,7 +27,7 @@ use std::sync::Arc;
 fn test_azure_in_supported_providers() {
     let providers = get_supported_stt_providers();
     assert!(providers.contains(&"microsoft-azure"));
-    assert_eq!(providers.len(), 5); // deepgram, google, elevenlabs, microsoft-azure, cartesia
+    assert_eq!(providers.len(), 6); // deepgram, google, elevenlabs, microsoft-azure, cartesia, openai
 }
 
 /// Test provider creation via string name

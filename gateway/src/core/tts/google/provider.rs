@@ -796,11 +796,11 @@ impl BaseTTS for GoogleTTS {
         let req_manager_opt = self.req_manager.read().await.clone();
         let response = if let Some(ref req_manager) = req_manager_opt {
             // Use pooled connection from ReqManager
-            let client_guard = req_manager
-                .acquire()
-                .await
-                .map_err(|e| TTSError::NetworkError(format!("Failed to acquire HTTP client: {e}")))?;
-            let request = request_builder.build_http_request(client_guard.client(), &processed_text);
+            let client_guard = req_manager.acquire().await.map_err(|e| {
+                TTSError::NetworkError(format!("Failed to acquire HTTP client: {e}"))
+            })?;
+            let request =
+                request_builder.build_http_request(client_guard.client(), &processed_text);
             request
                 .send()
                 .await

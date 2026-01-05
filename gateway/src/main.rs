@@ -7,15 +7,22 @@ use std::fs;
 use axum::{Router, middleware};
 use axum_server::tls_rustls::RustlsConfig;
 use clap::{Parser, Subcommand};
-use http::{Method, header::{AUTHORIZATION, CONTENT_TYPE}};
+use http::{
+    Method,
+    header::{AUTHORIZATION, CONTENT_TYPE},
+};
 use tokio::net::TcpListener;
-use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor};
-use tower_http::cors::{CorsLayer, Any};
+use tower_governor::{
+    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
+};
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use anyhow::anyhow;
 
-use waav_gateway::{ServerConfig, init, middleware::auth::auth_middleware, routes, state::AppState};
+use waav_gateway::{
+    ServerConfig, init, middleware::auth::auth_middleware, routes, state::AppState,
+};
 
 /// WaaV Gateway - Real-time voice processing server
 #[derive(Parser, Debug)]
@@ -137,12 +144,19 @@ async fn main() -> anyhow::Result<()> {
         auth_middleware,
     ));
 
+    // Create Realtime WebSocket routes for audio-to-audio streaming (OpenAI Realtime API)
+    let realtime_routes = routes::realtime::create_realtime_router().layer(
+        middleware::from_fn_with_state(app_state.clone(), auth_middleware),
+    );
+
     // Create webhook routes (no auth - uses LiveKit signature verification)
     let webhook_routes = routes::webhooks::create_webhook_router();
 
     // Create public health check route (no auth)
-    let public_routes =
-        Router::new().route("/", axum::routing::get(waav_gateway::handlers::api::health_check));
+    let public_routes = Router::new().route(
+        "/",
+        axum::routing::get(waav_gateway::handlers::api::health_check),
+    );
 
     // Configure rate limiting (disabled when rate >= 100000 for performance testing)
     let governor_layer = if rate_limit_rps < 100000 {
@@ -163,7 +177,13 @@ async fn main() -> anyhow::Result<()> {
         if origins == "*" {
             CorsLayer::new()
                 .allow_origin(Any)
-                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
                 .allow_headers([AUTHORIZATION, CONTENT_TYPE])
                 .allow_credentials(false)
         } else {
@@ -174,7 +194,13 @@ async fn main() -> anyhow::Result<()> {
                 .collect();
             CorsLayer::new()
                 .allow_origin(origins)
-                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
                 .allow_headers([AUTHORIZATION, CONTENT_TYPE])
                 .allow_credentials(true)
         }
@@ -194,11 +220,12 @@ async fn main() -> anyhow::Result<()> {
             http::HeaderValue::from_static("DENY"),
         ));
 
-    // Combine all routes: public + webhook + protected + websocket
+    // Combine all routes: public + webhook + protected + websocket + realtime
     let app = public_routes
         .merge(webhook_routes)
         .merge(protected_routes)
         .merge(ws_routes)
+        .merge(realtime_routes)
         .with_state(app_state)
         .layer(cors_layer)
         .layer(tower::util::option_layer(governor_layer))
@@ -235,7 +262,11 @@ async fn main() -> anyhow::Result<()> {
         println!("Server listening on http://{}", socket_addr);
 
         let listener = TcpListener::bind(&socket_addr).await?;
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
     }
 
     Ok(())

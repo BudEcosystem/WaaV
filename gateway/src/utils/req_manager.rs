@@ -291,7 +291,7 @@ impl Default for ReqManagerConfig {
             http2_keep_alive_timeout: Duration::from_secs(10),
             pool_max_idle_per_host: 512,
             tcp_keepalive: Duration::from_secs(5),
-            connect_timeout: Duration::from_secs(5),  // 5s for TLS handshake
+            connect_timeout: Duration::from_secs(5), // 5s for TLS handshake
             request_timeout: Duration::from_secs(60), // 60s for TTS generation
             max_retries: 3,
             retry_initial_delay: Duration::from_millis(100),

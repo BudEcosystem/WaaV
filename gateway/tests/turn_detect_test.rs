@@ -1,10 +1,10 @@
 #[cfg(feature = "turn-detect")]
 use anyhow::Result;
 #[cfg(feature = "turn-detect")]
+use std::path::PathBuf;
+#[cfg(feature = "turn-detect")]
 use waav_gateway::core::turn_detect::TurnDetector;
 use waav_gateway::core::turn_detect::TurnDetectorConfig;
-#[cfg(feature = "turn-detect")]
-use std::path::PathBuf;
 
 #[cfg(feature = "turn-detect")]
 #[tokio::test]

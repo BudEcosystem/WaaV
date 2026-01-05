@@ -59,11 +59,7 @@ pub fn validate_tls_config(tls: &Option<TlsConfig>) -> Result<(), Box<dyn std::e
 
     // Validate key file exists
     if !config.key_path.exists() {
-        return Err(format!(
-            "TLS key file does not exist: {}",
-            config.key_path.display()
-        )
-        .into());
+        return Err(format!("TLS key file does not exist: {}", config.key_path.display()).into());
     }
 
     // Check files are readable

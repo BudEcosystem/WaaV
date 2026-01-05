@@ -60,7 +60,7 @@ export interface SpeakOptions {
  * TTS connection options
  */
 export interface TTSConnectOptions {
-  /** Provider name (e.g., "deepgram", "elevenlabs", "google", "azure", "cartesia") */
+  /** Provider name (e.g., "deepgram", "elevenlabs", "google", "azure", "cartesia", "openai") */
   provider: string;
   /** Voice ID to use */
   voice?: string;
@@ -137,5 +137,9 @@ export const VOICE_DEFAULTS: Record<string, { model: string; voice?: string }> =
   cartesia: {
     model: 'sonic-3',
     voice: undefined, // Requires voice_id from Cartesia library
+  },
+  openai: {
+    model: 'tts-1',
+    voice: 'alloy',
   },
 };

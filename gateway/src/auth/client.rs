@@ -263,6 +263,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -277,11 +278,11 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             auth_timeout_seconds: 5,
             auth_required: false,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         let result = AuthClient::from_config(&config).await;
@@ -305,6 +306,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -319,11 +321,11 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             auth_timeout_seconds: 5,
             auth_required: false,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         let result = AuthClient::from_config(&config).await;
@@ -362,6 +364,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -376,11 +379,11 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             auth_timeout_seconds: 5,
             auth_required: true,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         let client = AuthClient::from_config(&config).await.unwrap();
@@ -429,6 +432,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -443,11 +447,11 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             auth_timeout_seconds: 5,
             auth_required: true,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         let client = AuthClient::from_config(&config).await.unwrap();
@@ -495,6 +499,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -509,11 +514,11 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             auth_timeout_seconds: 5,
             auth_required: true,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         let client = AuthClient::from_config(&config).await.unwrap();
@@ -560,6 +565,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -574,11 +580,11 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             auth_timeout_seconds: 5,
             auth_required: true,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         let client = AuthClient::from_config(&config).await.unwrap();
@@ -627,6 +633,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -641,11 +648,11 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             auth_timeout_seconds: 1, // 1 second timeout
             auth_required: true,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         let client = AuthClient::from_config(&config).await.unwrap();
@@ -695,6 +702,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -709,11 +717,11 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             auth_timeout_seconds: 5,
             auth_required: true,
             sip: None,
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         let client = AuthClient::from_config(&config).await.unwrap();

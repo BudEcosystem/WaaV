@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod providers;
+pub mod realtime;
 pub mod state;
 pub mod stt;
 pub mod tts;
@@ -21,6 +22,12 @@ pub use stt::{
 pub use tts::{
     AudioCallback, AudioData, BaseTTS, BoxedTTS, ConnectionState, DeepgramTTS, TTSConfig, TTSError,
     TTSFactory, TTSResult, create_tts_provider, get_tts_provider_urls,
+};
+
+pub use realtime::{
+    BaseRealtime, BoxedRealtime, OpenAIRealtime, RealtimeConfig, RealtimeError, RealtimeProvider,
+    RealtimeResult, create_realtime_provider, create_realtime_provider_from_enum,
+    get_supported_realtime_providers,
 };
 
 pub use voice_manager::{

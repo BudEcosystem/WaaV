@@ -5,9 +5,9 @@ use axum::{
     middleware,
     routing::get,
 };
-use waav_gateway::{config::ServerConfig, middleware::auth::auth_middleware, state::AppState};
 use std::sync::Arc;
 use tower::ServiceExt;
+use waav_gateway::{config::ServerConfig, middleware::auth::auth_middleware, state::AppState};
 
 /// Helper to create a test AppState with auth disabled
 async fn create_test_state_auth_disabled() -> Arc<AppState> {
@@ -25,6 +25,7 @@ async fn create_test_state_auth_disabled() -> Arc<AppState> {
         azure_speech_subscription_key: None,
         azure_speech_region: None,
         cartesia_api_key: None,
+        openai_api_key: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -39,11 +40,11 @@ async fn create_test_state_auth_disabled() -> Arc<AppState> {
         auth_timeout_seconds: 5,
         auth_required: false, // Auth disabled
         sip: None,
-    cors_allowed_origins: None,
-    rate_limit_requests_per_second: 60,
-    rate_limit_burst_size: 10,
-    max_websocket_connections: None,
-    max_connections_per_ip: 100,
+        cors_allowed_origins: None,
+        rate_limit_requests_per_second: 60,
+        rate_limit_burst_size: 10,
+        max_websocket_connections: None,
+        max_connections_per_ip: 100,
     };
 
     AppState::new(config).await
@@ -167,6 +168,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -448,6 +450,7 @@ mod with_api_secret {
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,

@@ -4,6 +4,7 @@ pub mod cartesia;
 pub mod deepgram;
 pub mod elevenlabs;
 pub mod google;
+pub mod openai;
 pub mod provider;
 
 pub use azure::{AZURE_TTS_URL, AzureAudioEncoding, AzureTTS, AzureTTSConfig};
@@ -15,6 +16,7 @@ pub use cartesia::{CARTESIA_TTS_URL, CartesiaTTS};
 pub use deepgram::{DEEPGRAM_TTS_URL, DeepgramTTS};
 pub use elevenlabs::{ELEVENLABS_TTS_URL, ElevenLabsTTS};
 pub use google::{GOOGLE_TTS_URL, GoogleTTS};
+pub use openai::{AudioOutputFormat, OPENAI_TTS_URL, OpenAITTS, OpenAITTSModel, OpenAIVoice};
 pub use provider::{TTSProvider, TTSRequestBuilder};
 use std::collections::HashMap;
 
@@ -27,6 +29,7 @@ use std::collections::HashMap;
 /// - `"google"` - Google Cloud Text-to-Speech API
 /// - `"azure"` or `"microsoft-azure"` - Microsoft Azure Text-to-Speech API
 /// - `"cartesia"` - Cartesia TTS API (Sonic voice models)
+/// - `"openai"` - OpenAI TTS API (tts-1, tts-1-hd, gpt-4o-mini-tts)
 ///
 /// # Example
 ///
@@ -48,8 +51,9 @@ pub fn create_tts_provider(provider_type: &str, config: TTSConfig) -> TTSResult<
         "google" => Ok(Box::new(GoogleTTS::new(config)?)),
         "azure" | "microsoft-azure" => Ok(Box::new(AzureTTS::new(config)?)),
         "cartesia" => Ok(Box::new(CartesiaTTS::new(config)?)),
+        "openai" => Ok(Box::new(OpenAITTS::new(config)?)),
         _ => Err(TTSError::InvalidConfiguration(format!(
-            "Unsupported TTS provider: {provider_type}. Supported providers: deepgram, elevenlabs, google, azure, cartesia"
+            "Unsupported TTS provider: {provider_type}. Supported providers: deepgram, elevenlabs, google, azure, cartesia, openai"
         ))),
     }
 }
@@ -65,6 +69,7 @@ pub fn get_tts_provider_urls() -> HashMap<String, String> {
     urls.insert("google".to_string(), GOOGLE_TTS_URL.to_string());
     urls.insert("azure".to_string(), AZURE_TTS_URL.to_string());
     urls.insert("cartesia".to_string(), CARTESIA_TTS_URL.to_string());
+    urls.insert("openai".to_string(), OPENAI_TTS_URL.to_string());
     urls
 }
 
@@ -152,6 +157,58 @@ mod tests {
                 assert!(
                     msg.contains("azure"),
                     "Error message should mention azure as a supported provider"
+                );
+            }
+            Err(other) => panic!("Expected InvalidConfiguration error, got: {:?}", other),
+            Ok(_) => panic!("Expected error for invalid provider"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_openai_tts_provider() {
+        let config = TTSConfig {
+            provider: "openai".to_string(),
+            api_key: "test_key".to_string(),
+            voice_id: Some("nova".to_string()),
+            model: "tts-1-hd".to_string(),
+            ..Default::default()
+        };
+        let result = create_tts_provider("openai", config);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_openai_tts_provider_case_insensitive() {
+        let config = TTSConfig {
+            provider: "openai".to_string(),
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+        // Case should not matter
+        let result = create_tts_provider("OPENAI", config.clone());
+        assert!(result.is_ok());
+
+        let result = create_tts_provider("OpenAI", config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_tts_provider_urls_includes_openai() {
+        let urls = get_tts_provider_urls();
+        assert!(urls.contains_key("openai"));
+        assert_eq!(urls.get("openai").unwrap(), OPENAI_TTS_URL);
+    }
+
+    #[test]
+    fn test_invalid_provider_error_message_includes_openai() {
+        let config = TTSConfig::default();
+        let result = create_tts_provider("invalid_provider", config);
+
+        match result {
+            Err(TTSError::InvalidConfiguration(msg)) => {
+                assert!(
+                    msg.contains("openai"),
+                    "Error message should mention openai as a supported provider"
                 );
             }
             Err(other) => panic!("Expected InvalidConfiguration error, got: {:?}", other),

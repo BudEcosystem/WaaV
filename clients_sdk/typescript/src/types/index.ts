@@ -116,3 +116,20 @@ export {
   getSupportedFeatures,
   mergeFeatures,
 } from './features.js';
+
+// Realtime (Audio-to-Audio) types
+export type {
+  RealtimeProvider,
+  OpenAIRealtimeModel,
+  OpenAIRealtimeVoice,
+  VADConfig,
+  InputTranscriptionConfig,
+  RealtimeSessionConfig,
+  RealtimeTranscript,
+  SpeechEvent,
+  RealtimeAudioChunk,
+  RealtimeSessionState,
+  RealtimeSessionEvents,
+  IRealtimeSession,
+} from './realtime.js';
+export { REALTIME_DEFAULTS, createRealtimeConfig } from './realtime.js';

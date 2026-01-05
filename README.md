@@ -28,10 +28,11 @@
 
 **WaaV Gateway** is a high-performance, real-time voice processing server built in Rust. It provides a unified interface for Speech-to-Text (STT) and Text-to-Speech (TTS) services across multiple cloud providers, with advanced audio processing capabilities including noise suppression and intelligent turn detection.
 
-WaaV eliminates the complexity of integrating with multiple voice AI providers by providing a single WebSocket and REST API that abstracts away provider-specific implementations. Switch between Deepgram, ElevenLabs, Google Cloud, Azure, or Cartesia with a simple configuration change—no code modifications required.
+WaaV eliminates the complexity of integrating with multiple voice AI providers by providing a single WebSocket and REST API that abstracts away provider-specific implementations. Switch between Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, or OpenAI with a simple configuration change—no code modifications required.
 
 **Key Highlights:**
-- **5 STT/TTS Providers** - Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia
+- **6 STT/TTS Providers** - Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI
+- **OpenAI Realtime API** - Full-duplex audio-to-audio streaming with GPT-4o
 - **WebSocket Streaming** - Real-time bidirectional audio with sub-second latency
 - **LiveKit Integration** - WebRTC rooms and SIP telephony support
 - **Advanced Audio Processing** - DeepFilterNet noise suppression, ONNX-based turn detection
@@ -192,6 +193,7 @@ cargo build --release --features turn-detect,noise-filter,openapi
 | **ElevenLabs** | WebSocket | Flash, Eleven, ElevenScribe | Streaming STT, VAD-based |
 | **Azure** | WebSocket | Neural models | Streaming, interim results |
 | **Cartesia** | WebSocket | ink-whisper | Low-latency streaming |
+| **OpenAI** | REST | whisper-1, gpt-4o-transcribe | Batch transcription, 57+ languages |
 
 ### Text-to-Speech (TTS)
 
@@ -202,6 +204,13 @@ cargo build --release --features turn-detect,noise-filter,openapi
 | **Google Cloud** | gRPC | WaveNet, Neural2 | SSML support, multiple languages |
 | **Azure** | WebSocket | 400+ neural voices | SSML, streaming |
 | **Cartesia** | WebSocket | Sonic-3, custom clones | Low-latency, voice mixing |
+| **OpenAI** | HTTP | 11 voices (alloy, nova, etc.) | tts-1, tts-1-hd, gpt-4o-mini-tts |
+
+### Audio-to-Audio (Realtime)
+
+| Provider | Protocol | Models | Features |
+|----------|----------|--------|----------|
+| **OpenAI** | WebSocket | gpt-4o-realtime-preview | Full-duplex streaming, function calling, VAD |
 
 ---
 
@@ -235,10 +244,13 @@ cargo build --release --features turn-detect,noise-filter,openapi
 │                                                                              │
 │  ┌──────────────────────────────────────────────────────────────────────────┐│
 │  │                          Provider Layer                                   ││
-│  │ ┌──────────┐ ┌───────────┐ ┌──────────┐ ┌─────────┐ ┌─────────────────┐  ││
-│  │ │ Deepgram │ │ ElevenLabs│ │ Google   │ │ Azure   │ │ Cartesia        │  ││
-│  │ │ WS + HTTP│ │ WebSocket │ │ gRPC     │ │ WS      │ │ WebSocket       │  ││
-│  │ └──────────┘ └───────────┘ └──────────┘ └─────────┘ └─────────────────┘  ││
+│  │ ┌──────────┐ ┌───────────┐ ┌──────────┐ ┌─────────┐ ┌──────────────────┐ ││
+│  │ │ Deepgram │ │ ElevenLabs│ │ Google   │ │ Azure   │ │ Cartesia         │ ││
+│  │ │ WS + HTTP│ │ WebSocket │ │ gRPC     │ │ WS      │ │ WebSocket        │ ││
+│  │ └──────────┘ └───────────┘ └──────────┘ └─────────┘ └──────────────────┘ ││
+│  │ ┌──────────────────────────────────────────────────────────────────────┐ ││
+│  │ │ OpenAI: STT (REST) + TTS (HTTP) + Realtime (WebSocket Full-Duplex)  │ ││
+│  │ └──────────────────────────────────────────────────────────────────────┘ ││
 │  └──────────────────────────────────────────────────────────────────────────┘│
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -326,6 +338,19 @@ const talk = await bud.talk.connect({
   tts: { provider: 'elevenlabs' }
 });
 await talk.startListening();
+
+// OpenAI STT/TTS
+const sttOpenAI = await bud.stt.connect({
+  provider: 'openai',
+  model: 'whisper-1'
+});
+
+const ttsOpenAI = await bud.tts.connect({
+  provider: 'openai',
+  model: 'tts-1-hd',
+  voice: 'nova'
+});
+await ttsOpenAI.speak('Hello from OpenAI!');
 ```
 
 **Features:**
@@ -362,6 +387,14 @@ async with bud.talk.connect(
     async for event in session:
         if event.type == "transcript":
             print(event.text)
+
+# OpenAI STT/TTS
+async with bud.stt.connect(provider="openai", model="whisper-1") as session:
+    async for result in session.transcribe_stream(audio_generator()):
+        print(f"Transcript: {result.text}")
+
+async with bud.tts.connect(provider="openai", model="tts-1-hd", voice="nova") as session:
+    await session.speak("Hello from OpenAI!")
 ```
 
 **Features:**
@@ -417,6 +450,7 @@ Drop-in voice widget for web applications:
 | `/livekit/token` | POST | Generate LiveKit participant token |
 | `/recording/{stream_id}` | GET | Download recording from S3 |
 | `/sip/hooks` | GET/POST | Manage SIP webhook hooks |
+| `/realtime` | WebSocket | OpenAI Realtime audio-to-audio streaming |
 
 ### WebSocket Protocol
 
@@ -504,6 +538,7 @@ providers:
   azure_speech_subscription_key: ""     # ENV: AZURE_SPEECH_SUBSCRIPTION_KEY
   azure_speech_region: "eastus"         # ENV: AZURE_SPEECH_REGION
   cartesia_api_key: ""                  # ENV: CARTESIA_API_KEY
+  openai_api_key: ""                    # ENV: OPENAI_API_KEY
 
 # LiveKit configuration (optional)
 livekit:

@@ -52,7 +52,7 @@ http-body-util = "0.1"
 # HTTP client
 # Note: Using default-features = false + rustls-tls to avoid OpenSSL dependency
 # This is important for cross-compilation to musl targets
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2", "multipart"] }
 hound = "3.5"
 
 # JWT authentication

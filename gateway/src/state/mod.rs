@@ -300,6 +300,7 @@ mod tests {
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -314,11 +315,11 @@ mod tests {
             auth_timeout_seconds: 5,
             auth_required: false,
             sip: None, // No SIP config
-        cors_allowed_origins: None,
-        rate_limit_requests_per_second: 60,
-        rate_limit_burst_size: 10,
-        max_websocket_connections: None,
-        max_connections_per_ip: 100,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
         };
 
         // We can't actually call AppState::new in a sync test, but we can verify
@@ -346,6 +347,7 @@ mod tests {
             azure_speech_subscription_key: None,
             azure_speech_region: None,
             cartesia_api_key: None,
+            openai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
