@@ -1,3 +1,79 @@
+// =============================================================================
+// Emotion Types (Unified Emotion System)
+// =============================================================================
+
+/**
+ * Standardized emotions supported across TTS providers.
+ * Each emotion maps to provider-specific formats (SSML, audio tags, natural language, etc.)
+ */
+export type Emotion =
+  | 'neutral'
+  | 'happy'
+  | 'sad'
+  | 'angry'
+  | 'fearful'
+  | 'surprised'
+  | 'disgusted'
+  | 'excited'
+  | 'calm'
+  | 'anxious'
+  | 'confident'
+  | 'confused'
+  | 'empathetic'
+  | 'sarcastic'
+  | 'hopeful'
+  | 'disappointed'
+  | 'curious'
+  | 'grateful'
+  | 'proud'
+  | 'embarrassed'
+  | 'content'
+  | 'bored';
+
+/**
+ * Delivery styles that modify how speech is expressed.
+ * These can be combined with emotions for nuanced expression.
+ */
+export type DeliveryStyle =
+  | 'normal'
+  | 'whispered'
+  | 'shouted'
+  | 'rushed'
+  | 'measured'
+  | 'monotone'
+  | 'expressive'
+  | 'professional'
+  | 'casual'
+  | 'storytelling'
+  | 'soft'
+  | 'loud'
+  | 'cheerful'
+  | 'serious'
+  | 'formal';
+
+/**
+ * Emotion intensity presets.
+ * - 'low': Subtle emotion (0.3 intensity)
+ * - 'medium': Moderate emotion (0.6 intensity)
+ * - 'high': Strong emotion (1.0 intensity)
+ */
+export type EmotionIntensityLevel = 'low' | 'medium' | 'high';
+
+/**
+ * Emotion configuration for TTS.
+ * Supports both the unified emotion system and free-form descriptions.
+ */
+export interface EmotionConfig {
+  /** Primary emotion to express */
+  emotion?: Emotion;
+  /** Emotion intensity (0.0 to 1.0 or preset level) */
+  intensity?: number | EmotionIntensityLevel;
+  /** Delivery style */
+  style?: DeliveryStyle;
+  /** Free-form description (for providers like Hume that support natural language) */
+  description?: string;
+}
+
 /**
  * STT (Speech-to-Text) Configuration
  * Maps to Sayna's STTWebSocketConfig in src/handlers/ws/config.rs
@@ -76,6 +152,26 @@ export interface TTSConfig {
   style?: number;
   /** Use speaker boost (ElevenLabs specific) */
   useSpeakerBoost?: boolean;
+
+  // Emotion settings (Unified Emotion System)
+  /** Primary emotion to express */
+  emotion?: Emotion;
+  /** Emotion intensity (0.0 to 1.0 or preset level) */
+  emotionIntensity?: number | EmotionIntensityLevel;
+  /** Delivery style */
+  deliveryStyle?: DeliveryStyle;
+  /** Free-form emotion description (for Hume and other natural language providers) */
+  emotionDescription?: string;
+
+  // Hume-specific settings
+  /** Acting instructions for Hume Octave (max 100 chars, e.g., "whispered fearfully") */
+  actingInstructions?: string;
+  /** Voice description for Hume voice design */
+  voiceDescription?: string;
+  /** Trailing silence in seconds (Hume) */
+  trailingSilence?: number;
+  /** Enable instant mode for lower latency (Hume) */
+  instantMode?: boolean;
 }
 
 /**
@@ -158,4 +254,181 @@ export function createTTSConfig(config: Partial<TTSConfig> & Pick<TTSConfig, 'pr
     ...DEFAULT_TTS_CONFIG,
     ...config,
   } as TTSConfig;
+}
+
+// =============================================================================
+// Voice Cloning Types
+// =============================================================================
+
+/**
+ * Provider for voice cloning operations.
+ */
+export type VoiceCloneProvider = 'hume' | 'elevenlabs';
+
+/**
+ * Request to clone a voice from audio samples or description.
+ */
+export interface VoiceCloneRequest {
+  /** Provider to use for voice cloning */
+  provider: VoiceCloneProvider;
+  /** Name for the cloned voice */
+  name: string;
+  /** Description of the voice (used by Hume for voice design) */
+  description?: string;
+  /** Audio samples for cloning (base64-encoded). ElevenLabs: 1-2 min recommended */
+  audioSamples?: string[];
+  /** Sample text for voice generation (Hume only) */
+  sampleText?: string;
+  /** Remove background noise from samples (ElevenLabs only) */
+  removeBackgroundNoise?: boolean;
+  /** Labels for the voice (ElevenLabs only) */
+  labels?: Record<string, string>;
+}
+
+/**
+ * Response from voice cloning operation.
+ */
+export interface VoiceCloneResponse {
+  /** Unique identifier for the cloned voice */
+  voiceId: string;
+  /** Name of the cloned voice */
+  name: string;
+  /** Provider that created the voice */
+  provider: VoiceCloneProvider;
+  /** Status of the voice (ready, processing, failed) */
+  status: 'ready' | 'processing' | 'failed';
+  /** ISO 8601 timestamp when the voice was created */
+  createdAt: string;
+  /** Additional metadata from the provider */
+  metadata?: Record<string, unknown>;
+}
+
+// =============================================================================
+// Hume EVI (Empathic Voice Interface) Types
+// =============================================================================
+
+/**
+ * Hume EVI version.
+ */
+export type HumeEVIVersion = '1' | '2' | '3' | '4-mini';
+
+/**
+ * Hume EVI configuration for audio-to-audio realtime streaming.
+ */
+export interface HumeEVIConfig {
+  /** EVI configuration ID from Hume dashboard */
+  configId?: string;
+  /** Chat group ID for resuming a previous conversation */
+  resumedChatGroupId?: string;
+  /** EVI version to use (default: '3') */
+  eviVersion?: HumeEVIVersion;
+  /** Voice ID to use */
+  voiceId?: string;
+  /** Enable verbose transcription */
+  verboseTranscription?: boolean;
+  /** System prompt override */
+  systemPrompt?: string;
+}
+
+/**
+ * Prosody (emotion) scores from Hume EVI.
+ * Provides emotion dimensions detected in speech.
+ *
+ * Note: Hume's prosody API documents 48 core emotion dimensions, but the exact
+ * fields may vary. Missing fields will be 0 when not returned by the API.
+ */
+export interface ProsodyScores {
+  admiration: number;
+  adoration: number;
+  aestheticAppreciation: number;
+  amusement: number;
+  anger: number;
+  anxiety: number;
+  awe: number;
+  awkwardness: number;
+  boredom: number;
+  calmness: number;
+  concentration: number;
+  confusion: number;
+  contemplation: number;
+  contempt: number;
+  contentment: number;
+  craving: number;
+  desire: number;
+  determination: number;
+  disappointment: number;
+  disgust: number;
+  distress: number;
+  doubt: number;
+  ecstasy: number;
+  embarrassment: number;
+  empathicPain: number;
+  enthusiasm: number;
+  entrancement: number;
+  envy: number;
+  excitement: number;
+  fear: number;
+  gratitude: number;
+  guilt: number;
+  horror: number;
+  interest: number;
+  joy: number;
+  love: number;
+  nostalgia: number;
+  pain: number;
+  pride: number;
+  realization: number;
+  relief: number;
+  romance: number;
+  sadness: number;
+  satisfaction: number;
+  shame: number;
+  surpriseNegative: number;
+  surprisePositive: number;
+  sympathy: number;
+  tiredness: number;
+  triumph: number;
+}
+
+/**
+ * Get the top N emotions from prosody scores.
+ */
+export function getTopEmotions(
+  scores: ProsodyScores,
+  n: number = 3
+): Array<{ name: string; score: number }> {
+  const entries = Object.entries(scores) as Array<[string, number]>;
+  return entries
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n)
+    .map(([name, score]) => ({ name, score }));
+}
+
+/**
+ * Get the dominant emotion from prosody scores.
+ */
+export function getDominantEmotion(
+  scores: ProsodyScores
+): { name: string; score: number } | null {
+  const top = getTopEmotions(scores, 1);
+  return top.length > 0 ? top[0] : null;
+}
+
+/**
+ * Map intensity level to numeric value.
+ */
+export function intensityToNumber(intensity: number | EmotionIntensityLevel): number {
+  if (typeof intensity === 'number') {
+    return Math.max(0, Math.min(1, intensity));
+  }
+  switch (intensity) {
+    case 'low':
+      return 0.3;
+    case 'medium':
+      return 0.6;
+    case 'high':
+      return 1.0;
+    default:
+      return 0.6;
+  }
 }

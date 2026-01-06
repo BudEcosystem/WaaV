@@ -121,6 +121,8 @@ pub struct ProvidersYaml {
     pub openai_api_key: Option<String>,
     /// AssemblyAI API key for streaming STT
     pub assemblyai_api_key: Option<String>,
+    /// Hume AI API key for TTS (Octave) and EVI
+    pub hume_api_key: Option<String>,
 }
 
 /// Recording S3 configuration from YAML

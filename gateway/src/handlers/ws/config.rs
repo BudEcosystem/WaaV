@@ -8,6 +8,7 @@ use xxhash_rust::xxh3::xxh3_128;
 
 use crate::{
     core::{
+        emotion::{DeliveryStyle, Emotion, EmotionConfig, EmotionIntensity},
         stt::STTConfig,
         tts::{Pronunciation, TTSConfig},
     },
@@ -142,7 +143,7 @@ impl LiveKitWebSocketConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct TTSWebSocketConfig {
-    /// Provider name (e.g., "deepgram")
+    /// Provider name (e.g., "deepgram", "hume", "elevenlabs")
     #[cfg_attr(feature = "openapi", schema(example = "deepgram"))]
     pub provider: String,
     /// Voice ID or name to use for synthesis
@@ -172,6 +173,49 @@ pub struct TTSWebSocketConfig {
     /// Optional API key for this provider (overrides server config)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+
+    // =========================================================================
+    // Emotion Control (Unified Emotion System)
+    // =========================================================================
+
+    /// Emotion to express in speech synthesis.
+    ///
+    /// Supported by: Hume AI (all), ElevenLabs (core set), Azure (SSML styles).
+    /// Providers without emotion support will synthesize speech normally with a warning.
+    ///
+    /// Examples: "happy", "sad", "angry", "excited", "calm", "sarcastic"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(example = "happy"))]
+    pub emotion: Option<Emotion>,
+
+    /// Intensity of the emotion (0.0 to 1.0, or "low"/"medium"/"high").
+    ///
+    /// - 0.0-0.3: Subtle expression
+    /// - 0.4-0.7: Moderate expression (default: 0.6)
+    /// - 0.8-1.0: Strong expression
+    ///
+    /// Alternatively, use named levels: "low" (0.3), "medium" (0.6), "high" (1.0)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(example = 0.8))]
+    pub emotion_intensity: Option<EmotionIntensity>,
+
+    /// Delivery style modifier for speech.
+    ///
+    /// Affects pacing and prosody independently of emotion.
+    /// Examples: "whispered", "shouted", "rushed", "measured", "expressive"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(example = "expressive"))]
+    pub delivery_style: Option<DeliveryStyle>,
+
+    /// Free-form emotion description (for providers like Hume AI).
+    ///
+    /// When provided, this takes precedence over the `emotion` field for Hume AI.
+    /// Maximum 100 characters.
+    ///
+    /// Examples: "warm, friendly, inviting", "whispered fearfully", "sarcastic, dry"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(example = "warm, friendly, inviting"))]
+    pub emotion_description: Option<String>,
 }
 
 impl TTSWebSocketConfig {
@@ -200,6 +244,58 @@ impl TTSWebSocketConfig {
             pronunciations: self.pronunciations.clone(),
             request_pool_size: defaults.request_pool_size,
         }
+    }
+
+    /// Extract emotion configuration from WebSocket config.
+    ///
+    /// Combines all emotion-related fields into a unified `EmotionConfig`.
+    /// Returns `None` if no emotion settings are specified.
+    ///
+    /// # Returns
+    ///
+    /// An `EmotionConfig` if any emotion fields are set, `None` otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let ws_config = TTSWebSocketConfig {
+    ///     provider: "hume".to_string(),
+    ///     emotion: Some(Emotion::Happy),
+    ///     emotion_intensity: Some(EmotionIntensity::from_f32(0.8)),
+    ///     ..Default::default()
+    /// };
+    ///
+    /// if let Some(emotion_config) = ws_config.to_emotion_config() {
+    ///     let mapper = get_mapper_for_provider(&ws_config.provider);
+    ///     let mapped = mapper.map_emotion(&emotion_config);
+    /// }
+    /// ```
+    pub fn to_emotion_config(&self) -> Option<EmotionConfig> {
+        // Only return config if at least one emotion field is set
+        if self.emotion.is_none()
+            && self.emotion_intensity.is_none()
+            && self.delivery_style.is_none()
+            && self.emotion_description.is_none()
+        {
+            return None;
+        }
+
+        Some(EmotionConfig {
+            emotion: self.emotion,
+            intensity: self.emotion_intensity.clone(),
+            style: self.delivery_style,
+            description: self.emotion_description.clone(),
+            context: None, // Context is not exposed in WebSocket config for simplicity
+        })
+    }
+
+    /// Returns whether any emotion settings are configured.
+    #[inline]
+    pub fn has_emotion_config(&self) -> bool {
+        self.emotion.is_some()
+            || self.emotion_intensity.is_some()
+            || self.delivery_style.is_some()
+            || self.emotion_description.is_some()
     }
 }
 

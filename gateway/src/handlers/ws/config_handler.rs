@@ -816,6 +816,10 @@ async fn initialize_livekit_client(
         model: "".to_string(),
         pronunciations: Vec::new(),
         api_key: None, // No client-provided key for default config
+        emotion: None,
+        emotion_intensity: None,
+        delivery_style: None,
+        emotion_description: None,
     };
 
     let tts_config_for_livekit = tts_config.unwrap_or(&default_tts_config);

@@ -5,6 +5,7 @@ pub mod cartesia;
 pub mod deepgram;
 pub mod elevenlabs;
 pub mod google;
+pub mod hume;
 pub mod ibm_watson;
 pub mod openai;
 pub mod provider;
@@ -22,6 +23,7 @@ pub use cartesia::{CARTESIA_TTS_URL, CartesiaTTS};
 pub use deepgram::{DEEPGRAM_TTS_URL, DeepgramTTS};
 pub use elevenlabs::{ELEVENLABS_TTS_URL, ElevenLabsTTS};
 pub use google::{GOOGLE_TTS_URL, GoogleTTS};
+pub use hume::{HUME_TTS_STREAM_URL, HumeTTS, HumeTTSConfig};
 pub use ibm_watson::{
     IBM_WATSON_TTS_URL, IbmOutputFormat, IbmVoice, IbmWatsonTTS, IbmWatsonTTSConfig,
 };
@@ -41,6 +43,7 @@ use std::collections::HashMap;
 /// - `"openai"` - OpenAI TTS API (tts-1, tts-1-hd, gpt-4o-mini-tts)
 /// - `"aws-polly"` or `"amazon-polly"` or `"polly"` - Amazon Polly TTS API
 /// - `"ibm-watson"` or `"ibm_watson"` or `"watson"` or `"ibm"` - IBM Watson TTS API
+/// - `"hume"` or `"hume-ai"` - Hume AI Octave TTS API (natural language emotions)
 ///
 /// # Example
 ///
@@ -69,8 +72,9 @@ pub fn create_tts_provider(provider_type: &str, config: TTSConfig) -> TTSResult<
         "ibm-watson" | "ibm_watson" | "watson" | "ibm" => {
             Ok(Box::new(IbmWatsonTTS::new(config)?))
         }
+        "hume" | "hume-ai" | "hume_ai" => Ok(Box::new(HumeTTS::new(config)?)),
         _ => Err(TTSError::InvalidConfiguration(format!(
-            "Unsupported TTS provider: {provider_type}. Supported providers: deepgram, elevenlabs, google, azure, cartesia, openai, aws-polly, ibm-watson"
+            "Unsupported TTS provider: {provider_type}. Supported providers: deepgram, elevenlabs, google, azure, cartesia, openai, aws-polly, ibm-watson, hume"
         ))),
     }
 }
@@ -91,6 +95,7 @@ pub fn get_tts_provider_urls() -> HashMap<String, String> {
     urls.insert("openai".to_string(), OPENAI_TTS_URL.to_string());
     urls.insert("aws-polly".to_string(), AWS_POLLY_TTS_URL.to_string());
     urls.insert("ibm-watson".to_string(), IBM_WATSON_TTS_URL.to_string());
+    urls.insert("hume".to_string(), HUME_TTS_STREAM_URL.to_string());
     urls
 }
 

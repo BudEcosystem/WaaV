@@ -15,6 +15,7 @@ pub fn create_api_router() -> Router<Arc<AppState>> {
     Router::new()
         // Protected routes (auth required when AUTH_REQUIRED=true)
         .route("/voices", get(voices::list_voices))
+        .route("/voices/clone", post(voices::clone_voice))
         .route("/speak", post(speak::speak_handler))
         .route("/livekit/token", post(livekit::generate_token))
         .route("/livekit/rooms", get(livekit::list_rooms))

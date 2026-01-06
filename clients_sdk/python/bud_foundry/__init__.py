@@ -49,6 +49,12 @@ from .types import (
     SIPHook,
     SIPHookCreateRequest,
     SIPHookCreateResponse,
+    # Emotion types (Unified Emotion System)
+    Emotion,
+    DeliveryStyle,
+    EmotionIntensityLevel,
+    EmotionConfig,
+    intensity_to_number,
 )
 from .errors import (
     BudError,
@@ -86,6 +92,12 @@ __all__ = [
     "TTSConfig",
     "LiveKitConfig",
     "FeatureFlags",
+    # Emotion types (Unified Emotion System)
+    "Emotion",
+    "DeliveryStyle",
+    "EmotionIntensityLevel",
+    "EmotionConfig",
+    "intensity_to_number",
     # Result types
     "STTResult",
     "TranscriptEvent",

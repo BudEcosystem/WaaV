@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod emotion;
 pub mod providers;
 pub mod realtime;
 pub mod state;
@@ -37,3 +38,10 @@ pub use voice_manager::{
 
 // Re-export CoreState for external use
 pub use state::CoreState;
+
+// Re-export emotion types for convenience
+pub use emotion::{
+    DeliveryStyle, Emotion, EmotionConfig, EmotionIntensity, EmotionMapper, EmotionMethod,
+    IntensityLevel, MappedEmotion, ProviderEmotionSupport, get_mapper_for_provider,
+    map_emotion_for_provider, provider_supports_emotions, validate_emotion_config,
+};

@@ -107,6 +107,8 @@ pub struct ServerConfig {
     pub openai_api_key: Option<String>,
     /// AssemblyAI API key for streaming STT
     pub assemblyai_api_key: Option<String>,
+    /// Hume AI API key for TTS (Octave) and EVI (Empathic Voice Interface)
+    pub hume_api_key: Option<String>,
 
     // LiveKit recording configuration
     pub recording_s3_bucket: Option<String>,
@@ -396,6 +398,12 @@ impl ServerConfig {
                     "AssemblyAI API key not configured in server environment".to_string()
                 })
             }
+            "hume" => {
+                // Hume AI uses API key authentication for TTS (Octave) and EVI
+                self.hume_api_key.as_ref().cloned().ok_or_else(|| {
+                    "Hume API key not configured in server environment".to_string()
+                })
+            }
             _ => Err(format!("Unsupported provider: {provider}")),
         }
     }
@@ -461,6 +469,7 @@ mod tests {
             cartesia_api_key: None,
             openai_api_key: None,
             assemblyai_api_key: None,
+            hume_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -509,6 +518,7 @@ mod tests {
             cartesia_api_key: None,
             openai_api_key: None,
             assemblyai_api_key: None,
+            hume_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -553,6 +563,7 @@ mod tests {
             cartesia_api_key: None,
             openai_api_key: None,
             assemblyai_api_key: None,
+            hume_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -600,6 +611,7 @@ mod tests {
             cartesia_api_key: None,
             openai_api_key: None,
             assemblyai_api_key: None,
+            hume_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -647,6 +659,7 @@ mod tests {
             cartesia_api_key: None,
             openai_api_key: None,
             assemblyai_api_key: None,
+            hume_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -700,6 +713,7 @@ mod tests {
             cartesia_api_key: None,
             openai_api_key: None,
             assemblyai_api_key: None,
+            hume_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -740,6 +754,7 @@ mod tests {
             cartesia_api_key: None,
             openai_api_key: None,
             assemblyai_api_key: None,
+            hume_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -782,6 +797,7 @@ mod tests {
             cartesia_api_key: None,
             openai_api_key: None,
             assemblyai_api_key: None,
+            hume_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -825,6 +841,7 @@ mod tests {
             cartesia_api_key: None,
             openai_api_key: None,
             assemblyai_api_key: None,
+            hume_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -867,6 +884,7 @@ mod tests {
             cartesia_api_key: None,
             openai_api_key: None,
             assemblyai_api_key: None,
+            hume_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -919,6 +937,7 @@ mod tests {
             cartesia_api_key: None,
             openai_api_key: None,
             assemblyai_api_key: None,
+            hume_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -965,6 +984,7 @@ mod tests {
             cartesia_api_key: None,
             openai_api_key: None,
             assemblyai_api_key: None,
+            hume_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1010,6 +1030,7 @@ mod tests {
             cartesia_api_key: None,
             openai_api_key: None,
             assemblyai_api_key: None,
+            hume_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1055,6 +1076,7 @@ mod tests {
             cartesia_api_key: None,
             openai_api_key: None,
             assemblyai_api_key: None,
+            hume_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1105,6 +1127,7 @@ mod tests {
             cartesia_api_key: None,
             openai_api_key: None,
             assemblyai_api_key: None,
+            hume_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1149,6 +1172,7 @@ mod tests {
             cartesia_api_key: None,
             openai_api_key: None,
             assemblyai_api_key: None,
+            hume_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1196,6 +1220,7 @@ mod tests {
             cartesia_api_key: None,
             openai_api_key: None,
             assemblyai_api_key: None,
+            hume_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1238,6 +1263,7 @@ mod tests {
             cartesia_api_key: None,
             openai_api_key: None,
             assemblyai_api_key: None,
+            hume_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,

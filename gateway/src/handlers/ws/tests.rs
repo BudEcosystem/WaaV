@@ -37,6 +37,10 @@ fn test_ws_config_serialization() {
         request_timeout: Some(60),
         model: "".to_string(), // Model is in Voice ID for Deepgram
         pronunciations: Vec::new(),
+        emotion: None,
+        emotion_intensity: None,
+        delivery_style: None,
+        emotion_description: None,
     };
 
     let json = serde_json::to_string(&tts_ws_config).unwrap();
@@ -72,6 +76,10 @@ fn test_incoming_message_serialization() {
             request_timeout: Some(60),
             model: "".to_string(), // Model is in Voice ID for Deepgram
             pronunciations: Vec::new(),
+            emotion: None,
+            emotion_intensity: None,
+            delivery_style: None,
+            emotion_description: None,
         }),
         livekit: None,
     };
@@ -372,6 +380,10 @@ fn test_tts_ws_config_conversion_with_all_values() {
         request_timeout: Some(120),
         model: "".to_string(), // Model is in Voice ID for Deepgram
         pronunciations: Vec::new(),
+        emotion: None,
+        emotion_intensity: None,
+        delivery_style: None,
+        emotion_description: None,
     };
 
     let api_key = "test_api_key".to_string();
@@ -400,6 +412,10 @@ fn test_tts_ws_config_conversion_with_defaults() {
         request_timeout: None,
         model: "".to_string(), // Model is in Voice ID for Deepgram
         pronunciations: Vec::new(),
+        emotion: None,
+        emotion_intensity: None,
+        delivery_style: None,
+        emotion_description: None,
     };
 
     let api_key = "test_api_key".to_string();
@@ -457,6 +473,10 @@ fn test_livekit_ws_config_conversion() {
         request_timeout: Some(60),
         model: "".to_string(),
         pronunciations: Vec::new(),
+        emotion: None,
+        emotion_intensity: None,
+        delivery_style: None,
+        emotion_description: None,
     };
 
     let livekit_url = "wss://test-livekit.com".to_string();
@@ -495,6 +515,10 @@ fn test_livekit_config_with_empty_listen_participants() {
         request_timeout: Some(60),
         model: "".to_string(),
         pronunciations: Vec::new(),
+        emotion: None,
+        emotion_intensity: None,
+        delivery_style: None,
+        emotion_description: None,
     };
 
     let livekit_config = livekit_ws_config.to_livekit_config(
@@ -530,6 +554,10 @@ fn test_livekit_config_with_listen_participants() {
         request_timeout: Some(60),
         model: "".to_string(),
         pronunciations: Vec::new(),
+        emotion: None,
+        emotion_intensity: None,
+        delivery_style: None,
+        emotion_description: None,
     };
 
     let livekit_config = livekit_ws_config.to_livekit_config(
@@ -651,6 +679,10 @@ fn test_incoming_message_config_with_livekit() {
             request_timeout: Some(60),
             model: "".to_string(),
             pronunciations: Vec::new(),
+            emotion: None,
+            emotion_intensity: None,
+            delivery_style: None,
+            emotion_description: None,
         }),
         livekit: Some(LiveKitWebSocketConfig {
             room_name: "test-room".to_string(),
@@ -693,6 +725,10 @@ fn test_incoming_message_config_without_livekit() {
             request_timeout: Some(60),
             model: "".to_string(),
             pronunciations: Vec::new(),
+            emotion: None,
+            emotion_intensity: None,
+            delivery_style: None,
+            emotion_description: None,
         }),
         livekit: None,
     };
@@ -950,6 +986,10 @@ fn test_tts_ws_config_conversion_mixed_values() {
         request_timeout: None, // Should use default
         model: "".to_string(), // Model is in Voice ID for Deepgram
         pronunciations: Vec::new(),
+        emotion: None,
+        emotion_intensity: None,
+        delivery_style: None,
+        emotion_description: None,
     };
 
     let api_key = "test_api_key".to_string();
@@ -992,6 +1032,10 @@ fn test_config_message_without_livekit_routing() {
             request_timeout: Some(60),
             model: "".to_string(),
             pronunciations: Vec::new(),
+            emotion: None,
+            emotion_intensity: None,
+            delivery_style: None,
+            emotion_description: None,
         }),
         livekit: None, // No LiveKit configuration
     };
@@ -1039,6 +1083,10 @@ fn test_config_message_with_livekit_routing() {
             request_timeout: Some(60),
             model: "".to_string(),
             pronunciations: Vec::new(),
+            emotion: None,
+            emotion_intensity: None,
+            delivery_style: None,
+            emotion_description: None,
         }),
         livekit: Some(LiveKitWebSocketConfig {
             room_name: "test-room".to_string(),
@@ -1291,6 +1339,10 @@ fn test_config_message_audio_default() {
             request_timeout: Some(60),
             model: "".to_string(),
             pronunciations: Vec::new(),
+            emotion: None,
+            emotion_intensity: None,
+            delivery_style: None,
+            emotion_description: None,
         }),
         livekit: None,
     };

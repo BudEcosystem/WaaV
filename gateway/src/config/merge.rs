@@ -181,6 +181,14 @@ pub fn merge_config(
             .and_then(|p| p.assemblyai_api_key.clone())
     );
 
+    // Hume AI API key (TTS and EVI)
+    let hume_api_key = get_optional!(
+        "HUME_API_KEY",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.hume_api_key.clone())
+    );
+
     // Recording S3 configuration
     let recording_s3_bucket = get_optional!(
         "RECORDING_S3_BUCKET",
@@ -374,6 +382,7 @@ pub fn merge_config(
         cartesia_api_key,
         openai_api_key,
         assemblyai_api_key,
+        hume_api_key,
         recording_s3_bucket,
         recording_s3_region,
         recording_s3_endpoint,

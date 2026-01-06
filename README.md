@@ -31,8 +31,8 @@
 WaaV eliminates the complexity of integrating with multiple voice AI providers by providing a single WebSocket and REST API that abstracts away provider-specific implementations. Switch between Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, IBM Watson, or Groq with a simple configuration change—no code modifications required.
 
 **Key Highlights:**
-- **10 STT/TTS Providers** - Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, IBM Watson, Groq
-- **OpenAI Realtime API** - Full-duplex audio-to-audio streaming with GPT-4o
+- **11 STT/TTS Providers** - Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, IBM Watson, Groq, Hume AI
+- **OpenAI & Hume AI Realtime** - Full-duplex audio-to-audio streaming with GPT-4o and Hume EVI
 - **WebSocket Streaming** - Real-time bidirectional audio with sub-second latency
 - **LiveKit Integration** - WebRTC rooms and SIP telephony support
 - **Advanced Audio Processing** - DeepFilterNet noise suppression, ONNX-based turn detection
@@ -240,12 +240,14 @@ cargo build --release --features turn-detect,noise-filter,openapi
 | **OpenAI** | HTTP | 11 voices (alloy, nova, etc.) | tts-1, tts-1-hd, gpt-4o-mini-tts |
 | **Amazon Polly** | AWS SDK | 60+ voices (Joanna, Matthew, etc.) | Neural, Standard, Generative engines, SSML |
 | **IBM Watson** | HTTP | 30+ V3 neural voices | 15+ languages, SSML, rate/pitch control |
+| **Hume AI** | HTTP/WebSocket | Octave voices | Natural language emotion control, voice cloning, acting instructions |
 
 ### Audio-to-Audio (Realtime)
 
 | Provider | Protocol | Models | Features |
 |----------|----------|--------|----------|
 | **OpenAI** | WebSocket | gpt-4o-realtime-preview | Full-duplex streaming, function calling, VAD |
+| **Hume AI EVI** | WebSocket | EVI 3 | Empathic voice interface, 48 emotion dimensions, prosody analysis |
 
 ---
 
@@ -287,6 +289,7 @@ graph TB
             AWS[AWS<br/>Transcribe/Polly]
             IBM[IBM Watson<br/>STT/TTS]
             GRQ[Groq<br/>REST]
+            HUM[Hume AI<br/>TTS/EVI]
         end
     end
 
@@ -401,6 +404,16 @@ const ttsOpenAI = await bud.tts.connect({
   voice: 'nova'
 });
 await ttsOpenAI.speak('Hello from OpenAI!');
+
+// Hume AI TTS with emotion control
+const ttsHume = await bud.tts.connect({
+  provider: 'hume',
+  voice: 'Kora',
+  emotion: 'happy',
+  emotionIntensity: 0.8,
+  deliveryStyle: 'cheerful'
+});
+await ttsHume.speak('Hello from Hume AI with emotion!');
 ```
 
 **Features:**
@@ -445,6 +458,16 @@ async with bud.stt.connect(provider="openai", model="whisper-1") as session:
 
 async with bud.tts.connect(provider="openai", model="tts-1-hd", voice="nova") as session:
     await session.speak("Hello from OpenAI!")
+
+# Hume AI TTS with emotion control
+async with bud.tts.connect(
+    provider="hume",
+    voice="Kora",
+    emotion="happy",
+    emotion_intensity=0.8,
+    delivery_style="cheerful"
+) as session:
+    await session.speak("Hello from Hume AI with emotion!")
 ```
 
 **Features:**
@@ -596,6 +619,7 @@ providers:
   ibm_watson_instance_id: ""            # ENV: IBM_WATSON_INSTANCE_ID
   ibm_watson_region: "us-south"         # ENV: IBM_WATSON_REGION
   groq_api_key: ""                      # ENV: GROQ_API_KEY
+  hume_api_key: ""                      # ENV: HUME_API_KEY
 
 # LiveKit configuration (optional)
 livekit:

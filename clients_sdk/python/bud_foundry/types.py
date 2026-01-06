@@ -2,8 +2,108 @@
 Type definitions for bud-foundry SDK
 """
 
-from typing import Any, Optional
+from enum import Enum
+from typing import Any, Literal, Optional, Union
 from pydantic import BaseModel, Field
+
+
+# =============================================================================
+# Emotion Types (Unified Emotion System)
+# =============================================================================
+
+
+class Emotion(str, Enum):
+    """
+    Standardized emotions supported across TTS providers.
+    Each emotion maps to provider-specific formats (SSML, audio tags, natural language, etc.)
+    """
+
+    NEUTRAL = "neutral"
+    HAPPY = "happy"
+    SAD = "sad"
+    ANGRY = "angry"
+    FEARFUL = "fearful"
+    SURPRISED = "surprised"
+    DISGUSTED = "disgusted"
+    EXCITED = "excited"
+    CALM = "calm"
+    ANXIOUS = "anxious"
+    CONFIDENT = "confident"
+    CONFUSED = "confused"
+    EMPATHETIC = "empathetic"
+    SARCASTIC = "sarcastic"
+    HOPEFUL = "hopeful"
+    DISAPPOINTED = "disappointed"
+    CURIOUS = "curious"
+    GRATEFUL = "grateful"
+    PROUD = "proud"
+    EMBARRASSED = "embarrassed"
+    CONTENT = "content"
+    BORED = "bored"
+
+
+class DeliveryStyle(str, Enum):
+    """
+    Delivery styles that modify how speech is expressed.
+    These can be combined with emotions for nuanced expression.
+    """
+
+    NORMAL = "normal"
+    WHISPERED = "whispered"
+    SHOUTED = "shouted"
+    RUSHED = "rushed"
+    MEASURED = "measured"
+    MONOTONE = "monotone"
+    EXPRESSIVE = "expressive"
+    PROFESSIONAL = "professional"
+    CASUAL = "casual"
+    STORYTELLING = "storytelling"
+    SOFT = "soft"
+    LOUD = "loud"
+    CHEERFUL = "cheerful"
+    SERIOUS = "serious"
+    FORMAL = "formal"
+
+
+class EmotionIntensityLevel(str, Enum):
+    """
+    Emotion intensity presets.
+    - low: Subtle emotion (0.3 intensity)
+    - medium: Moderate emotion (0.6 intensity)
+    - high: Strong emotion (1.0 intensity)
+    """
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+def intensity_to_number(intensity: Union[float, EmotionIntensityLevel]) -> float:
+    """Convert intensity level to numeric value (0.0 to 1.0)."""
+    if isinstance(intensity, (int, float)):
+        return max(0.0, min(1.0, float(intensity)))
+    mapping = {
+        EmotionIntensityLevel.LOW: 0.3,
+        EmotionIntensityLevel.MEDIUM: 0.6,
+        EmotionIntensityLevel.HIGH: 1.0,
+    }
+    return mapping.get(intensity, 0.6)
+
+
+class EmotionConfig(BaseModel):
+    """Emotion configuration for TTS."""
+
+    emotion: Optional[Emotion] = None
+    """Primary emotion to express"""
+
+    intensity: Optional[Union[float, EmotionIntensityLevel]] = None
+    """Emotion intensity (0.0 to 1.0 or preset level)"""
+
+    style: Optional[DeliveryStyle] = None
+    """Delivery style"""
+
+    description: Optional[str] = None
+    """Free-form description (for providers like Hume)"""
 
 
 class STTConfig(BaseModel):
@@ -90,6 +190,32 @@ class TTSConfig(BaseModel):
 
     use_speaker_boost: Optional[bool] = None
     """Use speaker boost (ElevenLabs specific)"""
+
+    # Emotion settings (Unified Emotion System)
+    emotion: Optional[Emotion] = None
+    """Primary emotion to express"""
+
+    emotion_intensity: Optional[Union[float, EmotionIntensityLevel]] = None
+    """Emotion intensity (0.0 to 1.0 or preset level)"""
+
+    delivery_style: Optional[DeliveryStyle] = None
+    """Delivery style"""
+
+    emotion_description: Optional[str] = None
+    """Free-form emotion description (for Hume and other natural language providers)"""
+
+    # Hume-specific settings
+    acting_instructions: Optional[str] = None
+    """Acting instructions for Hume Octave (max 100 chars, e.g., 'whispered fearfully')"""
+
+    voice_description: Optional[str] = None
+    """Voice description for Hume voice design"""
+
+    trailing_silence: Optional[float] = None
+    """Trailing silence in seconds (Hume)"""
+
+    instant_mode: Optional[bool] = None
+    """Enable instant mode for lower latency (Hume)"""
 
 
 class LiveKitConfig(BaseModel):
@@ -606,5 +732,185 @@ REALTIME_DEFAULTS: dict[str, dict[str, Any]] = {
         "turn_detection": "server_vad",
         "temperature": 0.8,
         "max_response_tokens": None,
-    }
+    },
+    "hume": {
+        "evi_version": "3",
+        "voice_id": None,
+        "verbose_transcription": False,
+    },
 }
+
+
+# =============================================================================
+# Voice Cloning Types
+# =============================================================================
+
+
+class VoiceCloneProvider(str, Enum):
+    """Provider for voice cloning operations."""
+
+    HUME = "hume"
+    ELEVENLABS = "elevenlabs"
+
+
+class VoiceCloneRequest(BaseModel):
+    """Request to clone a voice from audio samples or description."""
+
+    provider: VoiceCloneProvider
+    """Provider to use for voice cloning"""
+
+    name: str
+    """Name for the cloned voice"""
+
+    description: Optional[str] = None
+    """Description of the voice (used by Hume for voice design)"""
+
+    audio_samples: Optional[list[str]] = None
+    """Audio samples for cloning (base64-encoded). ElevenLabs: 1-2 min recommended"""
+
+    sample_text: Optional[str] = None
+    """Sample text for voice generation (Hume only)"""
+
+    remove_background_noise: bool = False
+    """Remove background noise from samples (ElevenLabs only)"""
+
+    labels: Optional[dict[str, str]] = None
+    """Labels for the voice (ElevenLabs only)"""
+
+
+class VoiceCloneStatus(str, Enum):
+    """Status of a cloned voice."""
+
+    READY = "ready"
+    PROCESSING = "processing"
+    FAILED = "failed"
+
+
+class VoiceCloneResponse(BaseModel):
+    """Response from voice cloning operation."""
+
+    voice_id: str
+    """Unique identifier for the cloned voice"""
+
+    name: str
+    """Name of the cloned voice"""
+
+    provider: VoiceCloneProvider
+    """Provider that created the voice"""
+
+    status: VoiceCloneStatus
+    """Status of the voice (ready, processing, failed)"""
+
+    created_at: str
+    """ISO 8601 timestamp when the voice was created"""
+
+    metadata: Optional[dict[str, Any]] = None
+    """Additional metadata from the provider"""
+
+
+# =============================================================================
+# Hume EVI (Empathic Voice Interface) Types
+# =============================================================================
+
+
+class HumeEVIVersion(str, Enum):
+    """Hume EVI version."""
+
+    V1 = "1"
+    V2 = "2"
+    V3 = "3"
+    V4_MINI = "4-mini"
+
+
+class HumeEVIConfig(BaseModel):
+    """Hume EVI configuration for audio-to-audio realtime streaming."""
+
+    config_id: Optional[str] = None
+    """EVI configuration ID from Hume dashboard"""
+
+    resumed_chat_group_id: Optional[str] = None
+    """Chat group ID for resuming a previous conversation"""
+
+    evi_version: HumeEVIVersion = HumeEVIVersion.V3
+    """EVI version to use (default: V3)"""
+
+    voice_id: Optional[str] = None
+    """Voice ID to use"""
+
+    verbose_transcription: bool = False
+    """Enable verbose transcription"""
+
+    system_prompt: Optional[str] = None
+    """System prompt override"""
+
+
+class ProsodyScores(BaseModel):
+    """
+    Prosody (emotion) scores from Hume EVI.
+    Provides 48 emotion dimensions detected in speech.
+    """
+
+    admiration: float = 0.0
+    adoration: float = 0.0
+    aesthetic_appreciation: float = 0.0
+    amusement: float = 0.0
+    anger: float = 0.0
+    anxiety: float = 0.0
+    awe: float = 0.0
+    awkwardness: float = 0.0
+    boredom: float = 0.0
+    calmness: float = 0.0
+    concentration: float = 0.0
+    confusion: float = 0.0
+    contemplation: float = 0.0
+    contempt: float = 0.0
+    contentment: float = 0.0
+    craving: float = 0.0
+    desire: float = 0.0
+    determination: float = 0.0
+    disappointment: float = 0.0
+    disgust: float = 0.0
+    distress: float = 0.0
+    doubt: float = 0.0
+    ecstasy: float = 0.0
+    embarrassment: float = 0.0
+    empathic_pain: float = 0.0
+    enthusiasm: float = 0.0
+    entrancement: float = 0.0
+    envy: float = 0.0
+    excitement: float = 0.0
+    fear: float = 0.0
+    guilt: float = 0.0
+    horror: float = 0.0
+    interest: float = 0.0
+    joy: float = 0.0
+    love: float = 0.0
+    nostalgia: float = 0.0
+    pain: float = 0.0
+    pride: float = 0.0
+    realization: float = 0.0
+    relief: float = 0.0
+    romance: float = 0.0
+    sadness: float = 0.0
+    satisfaction: float = 0.0
+    shame: float = 0.0
+    surprise_negative: float = 0.0
+    surprise_positive: float = 0.0
+    sympathy: float = 0.0
+    tiredness: float = 0.0
+    triumph: float = 0.0
+
+    def top_emotions(self, n: int = 3) -> list[tuple[str, float]]:
+        """Get the top N emotions by score."""
+        scores = [
+            (name, getattr(self, name))
+            for name in self.model_fields
+            if isinstance(getattr(self, name), float)
+        ]
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return scores[:n]
+
+    def dominant_emotion(self) -> tuple[str, float] | None:
+        """Get the dominant (highest scoring) emotion."""
+        top = self.top_emotions(1)
+        return top[0] if top else None

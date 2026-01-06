@@ -33,12 +33,14 @@ This document lists all speech-to-text (STT), text-to-speech (TTS), and audio-to
 | **Cartesia** | WebSocket | Sonic model, ultra-low latency, voice cloning | `CARTESIA_API_KEY` |
 | **Amazon Polly** | AWS SDK | 60+ voices, neural/standard/generative engines, SSML, 30+ languages | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
 | **IBM Watson** | HTTP | 30+ V3 neural voices, 15+ languages, SSML, rate/pitch control | `IBM_WATSON_API_KEY`, `IBM_WATSON_INSTANCE_ID` |
+| **Hume AI** | HTTP/WebSocket | Octave TTS, natural language emotion control, voice cloning, acting instructions | `HUME_API_KEY` |
 
 ### Audio-to-Audio (Realtime)
 
 | Provider | Protocol | Key Features | Environment Variable |
 |----------|----------|--------------|---------------------|
 | **OpenAI Realtime** | WebSocket | GPT-4o, full-duplex audio streaming, function calling, voice activity detection | `OPENAI_API_KEY` |
+| **Hume AI EVI** | WebSocket | EVI 3 empathic voice interface, 48 emotion dimensions, prosody analysis, empathic response generation | `HUME_API_KEY` |
 
 ---
 
@@ -88,6 +90,43 @@ This document lists all speech-to-text (STT), text-to-speech (TTS), and audio-to
 - **TTS Voices:** alloy, ash, ballad, coral, echo, fable, nova, onyx, sage, shimmer
 - **Realtime Model:** gpt-4o-realtime-preview
 - **Special Features:** Translation, full-duplex audio, function calling
+
+### Hume AI
+
+- **Website:** https://hume.ai
+- **Documentation:** https://dev.hume.ai/docs
+- **Capabilities:** TTS (Octave), Audio-to-Audio (EVI)
+- **TTS Protocol:** HTTP streaming + WebSocket
+- **EVI Protocol:** WebSocket (full-duplex)
+- **TTS Features:**
+  - Natural language emotion control via `description` field (max 100 chars)
+  - Acting instructions (e.g., "happy, energetic", "whispered fearfully")
+  - Voice cloning with 15+ seconds of audio samples
+  - Speed control (0.5 to 2.0)
+  - Instant mode for low-latency streaming
+  - 11 languages supported
+- **EVI Features (Empathic Voice Interface):**
+  - Full-duplex audio streaming
+  - 48 emotion dimensions measured in real-time (prosody analysis)
+  - Empathic response generation
+  - Voice activity detection
+  - Context continuity across utterances
+- **Prosody Dimensions (48 emotions):**
+  - admiration, amusement, anger, anxiety, awe, boredom, calmness
+  - concentration, confusion, contemplation, contempt, contentment
+  - desire, determination, disappointment, disgust, distress, doubt
+  - ecstasy, embarrassment, empathic_pain, enthusiasm, envy, excitement
+  - fear, guilt, horror, interest, joy, love, nostalgia, pain, pride
+  - realization, relief, sadness, satisfaction, shame, surprise_negative
+  - surprise_positive, sympathy, tiredness, triumph
+- **EVI Versions:**
+  - EVI 3 (recommended)
+  - EVI 2 (deprecated, sunset August 30, 2025)
+  - EVI 1 (deprecated, sunset August 30, 2025)
+- **Pricing:**
+  - EVI 3: Starting ~$0.02/min (volume), $0.072/min standard
+  - Octave TTS: Free tier (10K chars), Starter $3/mo (30K chars), Creator $10/mo (100K chars)
+- **Authentication:** API key header (`X-HUME-API-KEY`)
 
 ### AssemblyAI
 
@@ -261,6 +300,9 @@ export IBM_WATSON_REGION="us-south"  # Optional, defaults to us-south
 
 # Groq
 export GROQ_API_KEY="gsk_your-groq-api-key"
+
+# Hume AI
+export HUME_API_KEY="your-hume-api-key"
 ```
 
 ### YAML Configuration
@@ -286,6 +328,7 @@ providers:
     instance_id: ${IBM_WATSON_INSTANCE_ID}
     region: ${IBM_WATSON_REGION}
   groq_api_key: ${GROQ_API_KEY}
+  hume_api_key: ${HUME_API_KEY}
 ```
 
 ### WebSocket Configuration Message
@@ -311,11 +354,12 @@ providers:
 | **Ultra-fast** | Groq (216x real-time) | Cartesia, ElevenLabs |
 | **Low latency** | Deepgram, Cartesia | Cartesia, ElevenLabs |
 | **High accuracy** | AssemblyAI, Google | Google Neural2, Azure |
-| **Voice cloning** | - | ElevenLabs, Cartesia |
+| **Voice cloning** | - | ElevenLabs, Cartesia, Hume AI |
+| **Emotion control** | - | Hume AI, ElevenLabs, Azure |
 | **Multi-language** | AssemblyAI (99), Amazon Transcribe (100+), Google (125+), IBM Watson (30+) | Azure (140+), Amazon Polly (30+), Google (40+), IBM Watson (15+) |
 | **Cost-effective** | Deepgram, Groq ($0.04/hr), OpenAI | OpenAI, Deepgram |
 | **Enterprise/HIPAA** | Azure, Google, Amazon Transcribe, IBM Watson | Azure, Google, Amazon Polly, IBM Watson |
-| **Conversational AI** | - | OpenAI Realtime |
+| **Conversational AI** | - | OpenAI Realtime, Hume AI EVI |
 
 ---
 
@@ -346,7 +390,6 @@ let tts_cost = estimate_tts_cost("elevenlabs", "eleven_multilingual_v2", 1000);
 
 The following providers are planned for future releases:
 
-- Hume AI (emotional TTS)
 - LMNT
 - Play.ht
 - Speechmatics

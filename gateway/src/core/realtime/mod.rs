@@ -6,6 +6,7 @@
 //! # Supported Providers
 //!
 //! - **OpenAI Realtime API** - Full duplex audio with GPT-4o
+//! - **Hume EVI** - Empathic Voice Interface with 48-dimension emotion analysis
 //!
 //! # Architecture
 //!
@@ -16,7 +17,8 @@
 //!
 //! # Audio Format
 //!
-//! All providers use PCM 16-bit signed little-endian at 24kHz by default.
+//! - OpenAI: PCM 16-bit signed little-endian at 24kHz
+//! - Hume EVI: Linear16 PCM at 44.1kHz or WebM
 //!
 //! # Example
 //!
@@ -46,6 +48,7 @@
 //! ```
 
 mod base;
+pub mod hume;
 pub mod openai;
 
 pub use base::{
@@ -60,12 +63,18 @@ pub use openai::{
     Modality, OPENAI_REALTIME_SAMPLE_RATE, OPENAI_REALTIME_URL, OpenAIRealtime,
     OpenAIRealtimeAudioFormat, OpenAIRealtimeModel, OpenAIRealtimeVoice,
 };
+pub use hume::{
+    EVIVersion, HumeEVI, HumeEVIConfig, ProsodyScores,
+    HUME_EVI_DEFAULT_SAMPLE_RATE, HUME_EVI_WEBSOCKET_URL,
+};
 
 /// Supported realtime providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RealtimeProvider {
     /// OpenAI Realtime API
     OpenAI,
+    /// Hume EVI (Empathic Voice Interface)
+    Hume,
 }
 
 impl RealtimeProvider {
@@ -73,6 +82,7 @@ impl RealtimeProvider {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "openai" => Some(RealtimeProvider::OpenAI),
+            "hume" | "hume_evi" | "hume-evi" | "evi" => Some(RealtimeProvider::Hume),
             _ => None,
         }
     }
@@ -82,6 +92,7 @@ impl std::fmt::Display for RealtimeProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RealtimeProvider::OpenAI => write!(f, "openai"),
+            RealtimeProvider::Hume => write!(f, "hume"),
         }
     }
 }
@@ -91,6 +102,7 @@ impl std::fmt::Display for RealtimeProvider {
 /// # Supported Providers
 ///
 /// - `"openai"` - OpenAI Realtime API (gpt-4o-realtime-preview)
+/// - `"hume"` / `"evi"` - Hume EVI (Empathic Voice Interface)
 ///
 /// # Example
 ///
@@ -111,8 +123,9 @@ pub fn create_realtime_provider(
 ) -> RealtimeResult<Box<dyn BaseRealtime>> {
     match provider_type.to_lowercase().as_str() {
         "openai" => Ok(Box::new(OpenAIRealtime::new(config)?)),
+        "hume" | "hume_evi" | "hume-evi" | "evi" => Ok(Box::new(HumeEVI::new(config)?)),
         _ => Err(RealtimeError::InvalidConfiguration(format!(
-            "Unsupported realtime provider: {provider_type}. Supported providers: openai"
+            "Unsupported realtime provider: {provider_type}. Supported providers: openai, hume"
         ))),
     }
 }
@@ -124,12 +137,13 @@ pub fn create_realtime_provider_from_enum(
 ) -> RealtimeResult<Box<dyn BaseRealtime>> {
     match provider {
         RealtimeProvider::OpenAI => Ok(Box::new(OpenAIRealtime::new(config)?)),
+        RealtimeProvider::Hume => Ok(Box::new(HumeEVI::new(config)?)),
     }
 }
 
 /// Get list of supported realtime providers.
 pub fn get_supported_realtime_providers() -> Vec<&'static str> {
-    vec!["openai"]
+    vec!["openai", "hume"]
 }
 
 #[cfg(test)]
@@ -165,7 +179,8 @@ mod tests {
     fn test_get_supported_providers() {
         let providers = get_supported_realtime_providers();
         assert!(providers.contains(&"openai"));
-        assert_eq!(providers.len(), 1);
+        assert!(providers.contains(&"hume"));
+        assert_eq!(providers.len(), 2);
     }
 
     #[test]
@@ -178,12 +193,29 @@ mod tests {
             RealtimeProvider::parse("OPENAI"),
             Some(RealtimeProvider::OpenAI)
         );
+        assert_eq!(
+            RealtimeProvider::parse("hume"),
+            Some(RealtimeProvider::Hume)
+        );
+        assert_eq!(
+            RealtimeProvider::parse("HUME"),
+            Some(RealtimeProvider::Hume)
+        );
+        assert_eq!(
+            RealtimeProvider::parse("evi"),
+            Some(RealtimeProvider::Hume)
+        );
+        assert_eq!(
+            RealtimeProvider::parse("hume-evi"),
+            Some(RealtimeProvider::Hume)
+        );
         assert_eq!(RealtimeProvider::parse("invalid"), None);
     }
 
     #[test]
     fn test_provider_display() {
         assert_eq!(RealtimeProvider::OpenAI.to_string(), "openai");
+        assert_eq!(RealtimeProvider::Hume.to_string(), "hume");
     }
 
     #[test]
@@ -196,6 +228,10 @@ mod tests {
                 assert!(
                     msg.contains("openai"),
                     "Error message should mention openai as supported"
+                );
+                assert!(
+                    msg.contains("hume"),
+                    "Error message should mention hume as supported"
                 );
             }
             _ => panic!("Expected InvalidConfiguration error"),

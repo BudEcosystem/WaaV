@@ -9,12 +9,29 @@ export type {
   Pronunciation,
   LiveKitConfig,
   SessionConfig,
+  // Emotion types (Unified Emotion System)
+  Emotion,
+  DeliveryStyle,
+  EmotionIntensityLevel,
+  EmotionConfig,
+  // Voice cloning types
+  VoiceCloneProvider,
+  VoiceCloneRequest,
+  VoiceCloneResponse,
+  // Hume EVI types
+  HumeEVIVersion,
+  HumeEVIConfig,
+  ProsodyScores,
 } from './config.js';
 export {
   DEFAULT_STT_CONFIG,
   DEFAULT_TTS_CONFIG,
   createSTTConfig,
   createTTSConfig,
+  // Emotion helper functions
+  getTopEmotions,
+  getDominantEmotion,
+  intensityToNumber,
 } from './config.js';
 
 // Message types
