@@ -182,20 +182,151 @@ For complete authentication setup and architecture details, see [docs/authentica
 
 ### Core Components
 
-- **VoiceManager**: Central coordinator for all voice processing operations
-- **Provider System**: Trait-based abstraction for pluggable STT/TTS providers
-- **WebSocket Handler**: Real-time communication and message routing
-- **LiveKit Integration**: WebRTC audio streaming and room management
-- **DeepFilterNet**: Advanced noise reduction with adaptive processing
+```mermaid
+graph TB
+    subgraph Gateway["WaaV Gateway"]
+        WS["WebSocket Handler<br/>/ws endpoint"]
+        REST["REST API<br/>/speak, /voices"]
+        VM["VoiceManager<br/>Central Coordinator"]
+        NF["DeepFilterNet<br/>Noise Reduction"]
+        LK["LiveKit Integration<br/>WebRTC Streaming"]
+    end
+
+    subgraph Providers["Provider System"]
+        STT["STT Providers"]
+        TTS["TTS Providers"]
+        RT["Realtime Providers"]
+    end
+
+    subgraph STTList["STT (10 providers)"]
+        DG_S["Deepgram"]
+        GC_S["Google Cloud"]
+        AZ_S["Azure"]
+        EL_S["ElevenLabs"]
+        OA_S["OpenAI"]
+        AA_S["AssemblyAI"]
+        CA_S["Cartesia"]
+        AWS_S["AWS Transcribe"]
+        IBM_S["IBM Watson"]
+        GQ_S["Groq"]
+    end
+
+    subgraph TTSList["TTS (8 providers)"]
+        DG_T["Deepgram"]
+        GC_T["Google Cloud"]
+        AZ_T["Azure"]
+        EL_T["ElevenLabs"]
+        OA_T["OpenAI"]
+        CA_T["Cartesia"]
+        AWS_T["AWS Polly"]
+        IBM_T["IBM Watson"]
+    end
+
+    Client((Client)) --> WS
+    Client --> REST
+    WS --> VM
+    REST --> VM
+    VM --> NF
+    VM --> STT
+    VM --> TTS
+    VM --> RT
+    VM --> LK
+    STT --> STTList
+    TTS --> TTSList
+    RT --> OA_RT["OpenAI Realtime<br/>GPT-4o"]
+    LK --> LiveKit[(LiveKit Server)]
+```
 
 ### Request Flow
 
-1. Client establishes WebSocket connection to `/ws`
-2. Client sends configuration with provider selection
-3. Audio processing pipeline:
-   - **STT**: Audio � Noise Filter (optional) � STT Provider � Text
-   - **TTS**: Text � TTS Provider � Audio � Client
-4. LiveKit mode enables room-based audio streaming
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant WS as WebSocket Handler
+    participant VM as VoiceManager
+    participant NF as Noise Filter
+    participant STT as STT Provider
+    participant TTS as TTS Provider
+
+    Note over C,TTS: Speech-to-Text Flow
+    C->>WS: 1. Connect to /ws
+    C->>WS: 2. Send config message
+    WS->>VM: Configure providers
+    VM-->>C: Ready confirmation
+
+    C->>WS: 3. Send audio data (PCM)
+    WS->>NF: Filter audio (optional)
+    NF->>STT: Clean audio
+    STT->>VM: Transcription result
+    VM->>WS: Send text to client
+    WS-->>C: {"type": "transcript", "text": "..."}
+
+    Note over C,TTS: Text-to-Speech Flow
+    C->>WS: 4. Send text message
+    WS->>VM: Process TTS request
+    VM->>TTS: Generate speech
+    TTS->>VM: Audio data
+    VM->>WS: Stream audio
+    WS-->>C: Binary audio chunks
+```
+
+### Audio Processing Pipeline
+
+```mermaid
+flowchart LR
+    subgraph Input
+        A[Audio Input<br/>16kHz 16-bit PCM]
+    end
+
+    subgraph Processing["WaaV Gateway Processing"]
+        B{Noise Filter<br/>Enabled?}
+        C[DeepFilterNet<br/>Noise Reduction]
+        D[STT Provider<br/>Transcription]
+    end
+
+    subgraph Output
+        E[Text Output<br/>JSON Response]
+    end
+
+    A --> B
+    B -->|Yes| C
+    B -->|No| D
+    C --> D
+    D --> E
+
+    style A fill:#e1f5fe
+    style E fill:#e8f5e9
+    style C fill:#fff3e0
+    style D fill:#fce4ec
+```
+
+### LiveKit Integration
+
+```mermaid
+flowchart TB
+    subgraph Clients["Clients"]
+        Web[Web Client]
+        Mobile[Mobile App]
+        SIP[SIP Phone]
+    end
+
+    subgraph LiveKit["LiveKit Server"]
+        Room[Room Manager]
+        Track[Audio Tracks]
+    end
+
+    subgraph Gateway["WaaV Gateway"]
+        LKI[LiveKit Integration]
+        VM2[VoiceManager]
+        Providers[STT/TTS Providers]
+    end
+
+    Web & Mobile & SIP --> Room
+    Room --> Track
+    Track <--> LKI
+    LKI <--> VM2
+    VM2 <--> Providers
+```
 
 ## Development
 
