@@ -10,10 +10,10 @@
 | Metric | Count |
 |--------|-------|
 | **Total Cloud Providers** | 70 |
-| **Implemented** | 6 |
+| **Implemented** | 7 |
 | **In Progress** | 0 |
-| **Yet to Start** | 64 |
-| **Estimated Days Remaining** | 35-46 |
+| **Yet to Start** | 63 |
+| **Estimated Days Remaining** | 34-45 |
 
 ---
 
@@ -349,7 +349,7 @@ RUSTFLAGS="-Zsanitizer=address" cargo +nightly test [provider]
 | # | Provider | Type | Status | Start Date | Notes |
 |---|----------|------|--------|------------|-------|
 | 1 | OpenAI | STT+TTS+A2A | [DONE] | 2026-01-06 | Whisper STT, TTS API, Realtime WebSocket |
-| 2 | AssemblyAI | STT | [TODO] | - | 99 languages |
+| 2 | AssemblyAI | STT | [DONE] | 2026-01-06 | Streaming API v3, immutable transcripts, 99 languages |
 | 3 | Amazon Transcribe | STT | [TODO] | - | AWS SDK required |
 | 4 | Amazon Polly | TTS | [TODO] | - | AWS SDK required |
 | 5 | IBM Watson STT | STT | [TODO] | - | Enterprise |
@@ -522,6 +522,26 @@ These require the Python inference engine to be completed first:
 ---
 
 ## Session Log
+
+### Session: 2026-01-06 (Update 3)
+**Status:** AssemblyAI STT implementation complete
+**Completed:**
+- AssemblyAI STT (Streaming API v3 WebSocket) - `src/core/stt/assemblyai/`
+  - `config.rs`: AssemblyAISTTConfig, AssemblyAIEncoding, AssemblyAISpeechModel, AssemblyAIRegion
+  - `messages.rs`: BeginMessage, TurnMessage, TerminationMessage, ErrorMessage
+  - `client.rs`: AssemblyAISTT implementing BaseSTT trait
+  - `tests.rs`: 72 comprehensive unit tests
+- Factory integration in `src/core/stt/mod.rs`
+- Key features:
+  - Immutable transcripts (transcripts never modified after delivery)
+  - End-of-turn detection with configurable confidence threshold
+  - Binary audio streaming (no base64 encoding overhead)
+  - Word-level timestamps
+  - Multilingual support with auto language detection
+  - Regional endpoints (US/EU)
+**Quality Gates:** All passed (cargo fmt, clippy, 72 tests passing)
+**Next Steps:**
+- Continue with Batch 1: Amazon Transcribe
 
 ### Session: 2026-01-06 (Update 2)
 **Status:** OpenAI implementation complete

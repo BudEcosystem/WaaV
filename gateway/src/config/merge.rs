@@ -173,6 +173,14 @@ pub fn merge_config(
             .and_then(|p| p.openai_api_key.clone())
     );
 
+    // AssemblyAI API key (streaming STT)
+    let assemblyai_api_key = get_optional!(
+        "ASSEMBLYAI_API_KEY",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.assemblyai_api_key.clone())
+    );
+
     // Recording S3 configuration
     let recording_s3_bucket = get_optional!(
         "RECORDING_S3_BUCKET",
@@ -365,6 +373,7 @@ pub fn merge_config(
         azure_speech_region,
         cartesia_api_key,
         openai_api_key,
+        assemblyai_api_key,
         recording_s3_bucket,
         recording_s3_region,
         recording_s3_endpoint,

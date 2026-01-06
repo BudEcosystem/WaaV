@@ -100,6 +100,8 @@ pub struct ServerConfig {
     pub cartesia_api_key: Option<String>,
     /// OpenAI API key for STT (Whisper), TTS, and Realtime API
     pub openai_api_key: Option<String>,
+    /// AssemblyAI API key for streaming STT
+    pub assemblyai_api_key: Option<String>,
 
     // LiveKit recording configuration
     pub recording_s3_bucket: Option<String>,
@@ -176,6 +178,9 @@ impl Drop for ServerConfig {
             key.zeroize();
         }
         if let Some(ref mut key) = self.openai_api_key {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.assemblyai_api_key {
             key.zeroize();
         }
         if let Some(ref mut key) = self.recording_s3_access_key {
@@ -380,6 +385,12 @@ impl ServerConfig {
                     "OpenAI API key not configured in server environment".to_string()
                 })
             }
+            "assemblyai" => {
+                // AssemblyAI uses API key authentication for streaming STT
+                self.assemblyai_api_key.as_ref().cloned().ok_or_else(|| {
+                    "AssemblyAI API key not configured in server environment".to_string()
+                })
+            }
             _ => Err(format!("Unsupported provider: {provider}")),
         }
     }
@@ -444,6 +455,7 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            assemblyai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -491,6 +503,7 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            assemblyai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -534,6 +547,7 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            assemblyai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -580,6 +594,7 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            assemblyai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -626,6 +641,7 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            assemblyai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -678,6 +694,7 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            assemblyai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -717,6 +734,7 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            assemblyai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -758,6 +776,7 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            assemblyai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -800,6 +819,7 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            assemblyai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -841,6 +861,7 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            assemblyai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -892,6 +913,7 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            assemblyai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -937,6 +959,7 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            assemblyai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -981,6 +1004,7 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            assemblyai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1025,6 +1049,7 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            assemblyai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1074,6 +1099,7 @@ mod tests {
             azure_speech_region: Some("westus2".to_string()),
             cartesia_api_key: None,
             openai_api_key: None,
+            assemblyai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1117,6 +1143,7 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            assemblyai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1163,6 +1190,7 @@ mod tests {
             azure_speech_region: Some("westeurope".to_string()),
             cartesia_api_key: None,
             openai_api_key: None,
+            assemblyai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1204,6 +1232,7 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            assemblyai_api_key: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,

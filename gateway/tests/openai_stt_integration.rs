@@ -169,9 +169,7 @@ async fn test_openai_callback_registration() {
     let mut stt = result.unwrap();
 
     // Register result callback with Arc (matching the trait signature)
-    let result_callback = stt
-        .on_result(Arc::new(|_result| Box::pin(async {})))
-        .await;
+    let result_callback = stt.on_result(Arc::new(|_result| Box::pin(async {}))).await;
     assert!(result_callback.is_ok());
 
     // Register error callback with Arc

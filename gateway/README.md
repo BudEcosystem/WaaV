@@ -17,6 +17,7 @@ A high-performance real-time voice processing server built in Rust that provides
   - Google Cloud (STT/TTS) - WaveNet, Neural2, and Studio voices
   - Microsoft Azure (STT/TTS) - 400+ neural voices across 140+ languages
   - OpenAI (STT/TTS/Realtime) - Whisper, TTS-1, GPT-4o Realtime API
+  - AssemblyAI (STT) - Streaming API v3, 99 languages, immutable transcripts
 - **OpenAI Realtime API**: Full-duplex audio-to-audio streaming with GPT-4o
 - **Audio-Disabled Mode**: Development mode without API keys
 
@@ -274,6 +275,7 @@ docker run -p 3001:3001 --env-file .env waav-gateway
 | `AZURE_SPEECH_SUBSCRIPTION_KEY` | Azure Speech Services subscription key | - | No* |
 | `AZURE_SPEECH_REGION` | Azure region (e.g., eastus, westeurope) | `eastus` | No* |
 | `OPENAI_API_KEY` | OpenAI API key (for STT, TTS, and Realtime) | - | No* |
+| `ASSEMBLYAI_API_KEY` | AssemblyAI API key (for streaming STT) | - | No* |
 | `LIVEKIT_URL` | LiveKit server WebSocket URL | `ws://localhost:7880` | No |
 | `LIVEKIT_API_KEY` | LiveKit API key (for webhooks and token generation) | - | No*** |
 | `LIVEKIT_API_SECRET` | LiveKit API secret (for webhooks and token generation) | - | No*** |

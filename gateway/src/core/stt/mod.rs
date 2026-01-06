@@ -1,3 +1,4 @@
+pub mod assemblyai;
 pub mod azure;
 mod base;
 pub mod cartesia;
@@ -37,6 +38,12 @@ pub use openai::{
     TimestampGranularity as OpenAITimestampGranularity,
 };
 
+// Re-export AssemblyAI implementation
+pub use assemblyai::{
+    AssemblyAIEncoding, AssemblyAIMessage, AssemblyAIRegion, AssemblyAISTT, AssemblyAISTTConfig,
+    AssemblyAISpeechModel,
+};
+
 /// Supported STT providers
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum STTProvider {
@@ -52,6 +59,8 @@ pub enum STTProvider {
     Cartesia,
     /// OpenAI Whisper STT REST API
     OpenAI,
+    /// AssemblyAI Streaming STT v3 WebSocket API
+    AssemblyAI,
 }
 
 impl std::fmt::Display for STTProvider {
@@ -63,6 +72,7 @@ impl std::fmt::Display for STTProvider {
             STTProvider::Azure => write!(f, "microsoft-azure"),
             STTProvider::Cartesia => write!(f, "cartesia"),
             STTProvider::OpenAI => write!(f, "openai"),
+            STTProvider::AssemblyAI => write!(f, "assemblyai"),
         }
     }
 }
@@ -78,8 +88,9 @@ impl std::str::FromStr for STTProvider {
             "microsoft-azure" | "azure" => Ok(STTProvider::Azure),
             "cartesia" => Ok(STTProvider::Cartesia),
             "openai" => Ok(STTProvider::OpenAI),
+            "assemblyai" => Ok(STTProvider::AssemblyAI),
             _ => Err(STTError::ConfigurationError(format!(
-                "Unsupported STT provider: {s}. Supported providers: deepgram, google, elevenlabs, microsoft-azure, cartesia, openai"
+                "Unsupported STT provider: {s}. Supported providers: deepgram, google, elevenlabs, microsoft-azure, cartesia, openai, assemblyai"
             ))),
         }
     }
@@ -154,6 +165,10 @@ pub fn create_stt_provider(
             let openai_stt = <OpenAISTT as BaseSTT>::new(config)?;
             Ok(Box::new(openai_stt))
         }
+        STTProvider::AssemblyAI => {
+            let assemblyai_stt = <AssemblyAISTT as BaseSTT>::new(config)?;
+            Ok(Box::new(assemblyai_stt))
+        }
     }
 }
 
@@ -217,6 +232,10 @@ pub fn create_stt_provider_from_enum(
             let openai_stt = <OpenAISTT as BaseSTT>::new(config)?;
             Ok(Box::new(openai_stt))
         }
+        STTProvider::AssemblyAI => {
+            let assemblyai_stt = <AssemblyAISTT as BaseSTT>::new(config)?;
+            Ok(Box::new(assemblyai_stt))
+        }
     }
 }
 
@@ -241,6 +260,7 @@ pub fn get_supported_stt_providers() -> Vec<&'static str> {
         "microsoft-azure",
         "cartesia",
         "openai",
+        "assemblyai",
     ]
 }
 
@@ -337,7 +357,8 @@ mod factory_tests {
                 "elevenlabs",
                 "microsoft-azure",
                 "cartesia",
-                "openai"
+                "openai",
+                "assemblyai"
             ]
         );
         assert!(providers.contains(&"deepgram"));
@@ -346,6 +367,7 @@ mod factory_tests {
         assert!(providers.contains(&"microsoft-azure"));
         assert!(providers.contains(&"openai"));
         assert!(providers.contains(&"cartesia"));
+        assert!(providers.contains(&"assemblyai"));
     }
 
     #[tokio::test]
@@ -635,6 +657,100 @@ mod factory_tests {
         assert!(result.is_err());
         if let Err(STTError::ConfigurationError(msg)) = result {
             assert!(msg.contains("cartesia"));
+        }
+    }
+
+    // AssemblyAI STT provider tests
+
+    #[test]
+    fn test_stt_provider_enum_assemblyai_from_string() {
+        // Test valid provider names - AssemblyAI
+        assert_eq!(
+            "assemblyai".parse::<STTProvider>().unwrap(),
+            STTProvider::AssemblyAI
+        );
+        assert_eq!(
+            "AssemblyAI".parse::<STTProvider>().unwrap(),
+            STTProvider::AssemblyAI
+        );
+        assert_eq!(
+            "ASSEMBLYAI".parse::<STTProvider>().unwrap(),
+            STTProvider::AssemblyAI
+        );
+    }
+
+    #[test]
+    fn test_stt_provider_enum_assemblyai_display() {
+        assert_eq!(STTProvider::AssemblyAI.to_string(), "assemblyai");
+    }
+
+    #[test]
+    fn test_create_stt_provider_assemblyai_valid() {
+        let config = STTConfig {
+            provider: "assemblyai".to_string(),
+            api_key: "test_key".to_string(),
+            language: "en".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "pcm_s16le".to_string(),
+            model: "".to_string(),
+        };
+
+        let result = create_stt_provider("assemblyai", config);
+        assert!(result.is_ok());
+
+        let stt = result.unwrap();
+        assert_eq!(stt.get_provider_info(), "AssemblyAI Streaming STT v3");
+        assert!(!stt.is_ready()); // Not connected yet
+    }
+
+    #[test]
+    fn test_create_stt_provider_assemblyai_empty_api_key() {
+        let config = STTConfig {
+            provider: "assemblyai".to_string(),
+            api_key: String::new(), // Empty API key should fail
+            language: "en".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "pcm_s16le".to_string(),
+            model: "".to_string(),
+        };
+
+        let result = create_stt_provider("assemblyai", config);
+        assert!(result.is_err());
+
+        if let Err(STTError::AuthenticationFailed(msg)) = result {
+            assert!(msg.contains("API key is required"));
+        } else {
+            panic!("Expected AuthenticationFailed error");
+        }
+    }
+
+    #[test]
+    fn test_create_stt_provider_from_enum_assemblyai() {
+        let config = STTConfig {
+            provider: "assemblyai".to_string(),
+            api_key: "test_key".to_string(),
+            language: "en".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "pcm_s16le".to_string(),
+            model: "".to_string(),
+        };
+
+        let result = create_stt_provider_from_enum(STTProvider::AssemblyAI, config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_error_message_includes_assemblyai() {
+        let result = "invalid".parse::<STTProvider>();
+        assert!(result.is_err());
+        if let Err(STTError::ConfigurationError(msg)) = result {
+            assert!(msg.contains("assemblyai"));
         }
     }
 }

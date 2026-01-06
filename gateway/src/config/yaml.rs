@@ -119,6 +119,8 @@ pub struct ProvidersYaml {
     pub cartesia_api_key: Option<String>,
     /// OpenAI API key for STT (Whisper), TTS, and Realtime API
     pub openai_api_key: Option<String>,
+    /// AssemblyAI API key for streaming STT
+    pub assemblyai_api_key: Option<String>,
 }
 
 /// Recording S3 configuration from YAML

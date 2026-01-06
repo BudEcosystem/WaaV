@@ -79,6 +79,9 @@ impl ServerConfig {
         // OpenAI API key (used for STT, TTS, and Realtime API)
         let openai_api_key = env::var("OPENAI_API_KEY").ok();
 
+        // AssemblyAI API key (used for streaming STT)
+        let assemblyai_api_key = env::var("ASSEMBLYAI_API_KEY").ok();
+
         // LiveKit recording S3 configuration
         let recording_s3_bucket = env::var("RECORDING_S3_BUCKET").ok();
         let recording_s3_region = env::var("RECORDING_S3_REGION").ok();
@@ -173,6 +176,7 @@ impl ServerConfig {
             azure_speech_region,
             cartesia_api_key,
             openai_api_key,
+            assemblyai_api_key,
             recording_s3_bucket,
             recording_s3_region,
             recording_s3_endpoint,
