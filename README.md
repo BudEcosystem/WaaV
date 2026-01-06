@@ -93,24 +93,54 @@ play -r 24000 -e signed -b 16 -c 1 hello.pcm
 
 WaaV provides a complete audio processing pipeline with optional pre-processing and post-processing stages:
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        Audio Processing Pipeline                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Audio Input ──► DeepFilterNet ──► STT Provider ──► Turn Detection ──► Output│
-│                  (Pre-Process)     (Transcription)   (Post-Process)          │
-│                       │                  │                 │                  │
-│                       ▼                  ▼                 ▼                  │
-│              ┌────────────────┐  ┌───────────────┐  ┌──────────────┐         │
-│              │ Noise Filter   │  │ Multi-Provider│  │ ONNX Model   │         │
-│              │ • SNR-adaptive │  │ • Deepgram    │  │ • Probability│         │
-│              │ • Echo suppress│  │ • Google gRPC │  │ • Threshold  │         │
-│              │ • 40dB max     │  │ • Azure       │  │   (0.7 def)  │         │
-│              │ • Thread pool  │  │ • ElevenLabs  │  │ • <50ms      │         │
-│              └────────────────┘  │ • Cartesia    │  └──────────────┘         │
-│                                  └───────────────┘                            │
-└──────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph Input
+        A[Audio Input<br/>16kHz 16-bit PCM]
+    end
+
+    subgraph PreProcess["Pre-Processing"]
+        B[DeepFilterNet<br/>Noise Filter]
+        B1[SNR-adaptive]
+        B2[Echo suppress]
+        B3[40dB max]
+        B4[Thread pool]
+    end
+
+    subgraph Transcription["STT Provider"]
+        C[Multi-Provider]
+        C1[Deepgram]
+        C2[Google gRPC]
+        C3[Azure]
+        C4[ElevenLabs]
+        C5[Cartesia]
+        C6[OpenAI]
+        C7[AWS Transcribe]
+        C8[IBM Watson]
+        C9[Groq]
+    end
+
+    subgraph PostProcess["Post-Processing"]
+        D[Turn Detection<br/>ONNX Model]
+        D1[Probability]
+        D2[Threshold 0.7]
+        D3["<50ms"]
+    end
+
+    subgraph Output
+        E[Text Output]
+    end
+
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+
+    style A fill:#e1f5fe
+    style E fill:#e8f5e9
+    style B fill:#fff3e0
+    style C fill:#fce4ec
+    style D fill:#f3e5f5
 ```
 
 ### Pre-Processing: DeepFilterNet Noise Suppression
@@ -221,43 +251,58 @@ cargo build --release --features turn-detect,noise-filter,openapi
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           Client Applications                                │
-│  TypeScript SDK │ Python SDK │ Dashboard │ Widget │ Mobile Apps             │
-└──────────────────────────────────┬──────────────────────────────────────────┘
-                                   │ WebSocket / REST / WebRTC
-┌──────────────────────────────────▼──────────────────────────────────────────┐
-│                          WaaV Gateway (Rust)                                 │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌───────────────────┐   │
-│  │ WebSocket   │  │ REST API    │  │ LiveKit     │  │ Rate Limiter      │   │
-│  │ Handler     │  │ (Axum)      │  │ Integration │  │ (tower-governor)  │   │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └───────────────────┘   │
-│         │                │                │                                  │
-│  ┌──────▼────────────────▼────────────────▼────────────────────────────────┐│
-│  │                     VoiceManager (Central Coordinator)                   ││
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌────────────────┐  ││
-│  │  │ STT Manager │  │ TTS Manager │  │ Audio Cache │  │ Turn Detector  │  ││
-│  │  │ (BaseSTT)   │  │ (TTSProvider)│ │ (moka+XXH3) │  │ (ONNX Runtime) │  ││
-│  │  └──────┬──────┘  └──────┬──────┘  └─────────────┘  └────────────────┘  ││
-│  │         │                │                                               ││
-│  │  ┌──────▼────────────────▼──────────────────────────────────────────┐   ││
-│  │  │                   Noise Filter (DeepFilterNet)                    │   ││
-│  │  │           Thread Pool │ Adaptive Processing │ Echo Suppression    │   ││
-│  │  └──────────────────────────────────────────────────────────────────┘   ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  ┌──────────────────────────────────────────────────────────────────────────┐│
-│  │                          Provider Layer                                   ││
-│  │ ┌──────────┐ ┌───────────┐ ┌──────────┐ ┌─────────┐ ┌──────────────────┐ ││
-│  │ │ Deepgram │ │ ElevenLabs│ │ Google   │ │ Azure   │ │ Cartesia         │ ││
-│  │ │ WS + HTTP│ │ WebSocket │ │ gRPC     │ │ WS      │ │ WebSocket        │ ││
-│  │ └──────────┘ └───────────┘ └──────────┘ └─────────┘ └──────────────────┘ ││
-│  │ ┌──────────────────────────────────────────────────────────────────────┐ ││
-│  │ │ OpenAI: STT (REST) + TTS (HTTP) + Realtime (WebSocket Full-Duplex)  │ ││
-│  │ └──────────────────────────────────────────────────────────────────────┘ ││
-│  └──────────────────────────────────────────────────────────────────────────┘│
-└──────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph Clients["Client Applications"]
+        TS[TypeScript SDK]
+        PY[Python SDK]
+        DASH[Dashboard]
+        WIDG[Widget]
+        MOB[Mobile Apps]
+    end
+
+    subgraph Gateway["WaaV Gateway (Rust)"]
+        subgraph Handlers["Request Handlers"]
+            WS[WebSocket Handler]
+            REST[REST API<br/>Axum]
+            LK[LiveKit Integration]
+            RL[Rate Limiter<br/>tower-governor]
+        end
+
+        subgraph VM["VoiceManager (Central Coordinator)"]
+            STT[STT Manager<br/>BaseSTT]
+            TTS[TTS Manager<br/>TTSProvider]
+            CACHE[Audio Cache<br/>moka+XXH3]
+            TURN[Turn Detector<br/>ONNX Runtime]
+            NF[Noise Filter<br/>DeepFilterNet]
+        end
+
+        subgraph Providers["Provider Layer"]
+            DG[Deepgram<br/>WS + HTTP]
+            EL[ElevenLabs<br/>WebSocket]
+            GC[Google<br/>gRPC]
+            AZ[Azure<br/>WebSocket]
+            CA[Cartesia<br/>WebSocket]
+            OAI[OpenAI<br/>STT/TTS/Realtime]
+            AWS[AWS<br/>Transcribe/Polly]
+            IBM[IBM Watson<br/>STT/TTS]
+            GRQ[Groq<br/>REST]
+        end
+    end
+
+    Clients -->|WebSocket / REST / WebRTC| Handlers
+    WS --> VM
+    REST --> VM
+    LK --> VM
+    STT --> NF
+    TTS --> NF
+    STT --> Providers
+    TTS --> Providers
+
+    style Clients fill:#e3f2fd
+    style Gateway fill:#f5f5f5
+    style VM fill:#fff3e0
+    style Providers fill:#e8f5e9
 ```
 
 ---
