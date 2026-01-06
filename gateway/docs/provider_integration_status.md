@@ -10,10 +10,10 @@
 | Metric | Count |
 |--------|-------|
 | **Total Cloud Providers** | 70 |
-| **Implemented** | 9 |
+| **Implemented** | 11 |
 | **In Progress** | 0 |
-| **Yet to Start** | 61 |
-| **Estimated Days Remaining** | 32-43 |
+| **Yet to Start** | 59 |
+| **Estimated Days Remaining** | 31-42 |
 
 ---
 
@@ -31,7 +31,7 @@
 
 ## How to Use This Document
 
-### For Claude Code (Automated Workflow)
+### For AI-Assisted Workflow
 
 When starting work on a provider:
 1. **Read this document** to identify next provider to implement
@@ -63,7 +63,7 @@ Before implementing ANY provider, create a research document:
 ```markdown
 ## Provider: [Name]
 **Research Date:** YYYY-MM-DD
-**Researcher:** Claude Code
+**Researcher:** [Developer/AI]
 
 ### Basic Information
 - **Website:** [URL from waav_integrations.json]
@@ -352,8 +352,8 @@ RUSTFLAGS="-Zsanitizer=address" cargo +nightly test [provider]
 | 2 | AssemblyAI | STT | [DONE] | 2026-01-06 | Streaming API v3, immutable transcripts, 99 languages |
 | 3 | Amazon Transcribe | STT | [DONE] | 2026-01-06 | AWS SDK, 100+ languages, streaming WebSocket |
 | 4 | Amazon Polly | TTS | [DONE] | 2026-01-06 | AWS SDK, 60+ voices, Neural/Standard/Generative engines |
-| 5 | IBM Watson STT | STT | [TODO] | - | Enterprise |
-| 6 | IBM Watson TTS | TTS | [TODO] | - | Enterprise |
+| 5 | IBM Watson STT | STT | [DONE] | 2026-01-06 | IAM auth, 30+ languages, WebSocket streaming |
+| 6 | IBM Watson TTS | TTS | [DONE] | 2026-01-06 | V3 neural voices, SSML support, 15+ languages |
 | 7 | Groq | STT | [TODO] | - | Fastest Whisper hosting |
 | 8 | Hume AI | TTS+A2A | [TODO] | - | Emotional expression |
 
@@ -523,6 +523,35 @@ These require the Python inference engine to be completed first:
 
 ## Session Log
 
+### Session: 2026-01-06 (Update 5)
+**Status:** IBM Watson STT and TTS implementation complete
+**Completed:**
+- IBM Watson STT (WebSocket Streaming) - `src/core/stt/ibm_watson/`
+  - `config.rs`: IbmWatsonSTTConfig, IbmRegion (7 regions), RecognitionModel (10 models)
+  - `messages.rs`: IbmWatsonMessage, RecognitionResults, SpeakerLabels, AudioMetrics
+  - `client.rs`: IbmWatsonSTT implementing BaseSTT trait via WebSocket
+  - `tests.rs`: 43 comprehensive unit tests
+  - Key features: IAM token authentication, 30+ languages, speaker diarization, smart formatting
+  - WebSocket URL: `wss://api.{region}.speech-to-text.watson.cloud.ibm.com/instances/{id}/v1/recognize`
+- IBM Watson TTS (HTTP REST) - `src/core/tts/ibm_watson/`
+  - `config.rs`: IbmWatsonTTSConfig, IbmVoice (30+ V3 neural voices), IbmOutputFormat (10 formats)
+  - `provider.rs`: IbmWatsonTTS implementing BaseTTS trait via HTTP REST
+  - `tests.rs`: 94 comprehensive unit tests
+  - Key features: V3 neural voices across 15+ languages, SSML prosody support, rate/pitch control
+  - REST URL: `https://api.{region}.text-to-speech.watson.cloud.ibm.com/instances/{id}/v1/synthesize`
+- Shared IbmRegion enum between STT and TTS (with `stt_hostname()` and `tts_hostname()` methods)
+- Factory integration in `src/core/stt/mod.rs` and `src/core/tts/mod.rs`
+- Provider aliases: `ibm-watson`, `ibm_watson`, `watson`, `ibm`
+**Quality Gates:** All passed (cargo fmt, clippy, 137 IBM Watson tests + mod-level tests passing)
+**Key Design Decisions:**
+- Used HTTP REST for TTS (simpler than WebSocket for one-shot synthesis)
+- Used WebSocket for STT (required for real-time streaming)
+- IAM token caching with automatic refresh before expiry
+- SSML generation for rate/pitch control via `<prosody>` element
+- Connection pooling via reqwest client for TTS HTTP requests
+**Next Steps:**
+- Continue with Batch 1: Groq (fastest Whisper hosting) or Hume AI
+
 ### Session: 2026-01-06 (Update 4)
 **Status:** Amazon Transcribe STT and Amazon Polly TTS implementation complete
 **Completed:**
@@ -613,4 +642,4 @@ These require the Python inference engine to be completed first:
 
 ---
 
-*This document should be updated by Claude Code as providers are implemented.*
+*This document should be updated as providers are implemented.*

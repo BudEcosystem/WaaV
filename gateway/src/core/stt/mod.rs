@@ -6,6 +6,7 @@ pub mod cartesia;
 pub mod deepgram;
 pub mod elevenlabs;
 pub mod google;
+pub mod ibm_watson;
 pub mod openai;
 
 // Re-export public types and traits
@@ -51,6 +52,12 @@ pub use aws_transcribe::{
     PartialResultsStability,
 };
 
+// Re-export IBM Watson implementation
+pub use ibm_watson::{
+    IbmAudioEncoding, IbmModel, IbmRegion, IbmWatsonSTT, IbmWatsonSTTConfig,
+    IBM_IAM_URL, IBM_WATSON_STT_URL,
+};
+
 /// Supported STT providers
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum STTProvider {
@@ -70,6 +77,8 @@ pub enum STTProvider {
     AssemblyAI,
     /// Amazon Transcribe Streaming STT API
     AwsTranscribe,
+    /// IBM Watson Speech-to-Text WebSocket API
+    IbmWatson,
 }
 
 impl std::fmt::Display for STTProvider {
@@ -83,6 +92,7 @@ impl std::fmt::Display for STTProvider {
             STTProvider::OpenAI => write!(f, "openai"),
             STTProvider::AssemblyAI => write!(f, "assemblyai"),
             STTProvider::AwsTranscribe => write!(f, "aws-transcribe"),
+            STTProvider::IbmWatson => write!(f, "ibm-watson"),
         }
     }
 }
@@ -102,8 +112,9 @@ impl std::str::FromStr for STTProvider {
             "aws-transcribe" | "aws_transcribe" | "amazon-transcribe" | "transcribe" => {
                 Ok(STTProvider::AwsTranscribe)
             }
+            "ibm-watson" | "ibm_watson" | "watson" | "ibm" => Ok(STTProvider::IbmWatson),
             _ => Err(STTError::ConfigurationError(format!(
-                "Unsupported STT provider: {s}. Supported providers: deepgram, google, elevenlabs, microsoft-azure, cartesia, openai, assemblyai, aws-transcribe"
+                "Unsupported STT provider: {s}. Supported providers: deepgram, google, elevenlabs, microsoft-azure, cartesia, openai, assemblyai, aws-transcribe, ibm-watson"
             ))),
         }
     }
@@ -186,6 +197,10 @@ pub fn create_stt_provider(
             let aws_transcribe_stt = <AwsTranscribeSTT as BaseSTT>::new(config)?;
             Ok(Box::new(aws_transcribe_stt))
         }
+        STTProvider::IbmWatson => {
+            let ibm_watson_stt = <IbmWatsonSTT as BaseSTT>::new(config)?;
+            Ok(Box::new(ibm_watson_stt))
+        }
     }
 }
 
@@ -257,6 +272,10 @@ pub fn create_stt_provider_from_enum(
             let aws_transcribe_stt = <AwsTranscribeSTT as BaseSTT>::new(config)?;
             Ok(Box::new(aws_transcribe_stt))
         }
+        STTProvider::IbmWatson => {
+            let ibm_watson_stt = <IbmWatsonSTT as BaseSTT>::new(config)?;
+            Ok(Box::new(ibm_watson_stt))
+        }
     }
 }
 
@@ -283,6 +302,7 @@ pub fn get_supported_stt_providers() -> Vec<&'static str> {
         "openai",
         "assemblyai",
         "aws-transcribe",
+        "ibm-watson",
     ]
 }
 

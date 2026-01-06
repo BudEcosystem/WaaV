@@ -5,6 +5,7 @@ pub mod cartesia;
 pub mod deepgram;
 pub mod elevenlabs;
 pub mod google;
+pub mod ibm_watson;
 pub mod openai;
 pub mod provider;
 
@@ -21,6 +22,9 @@ pub use cartesia::{CARTESIA_TTS_URL, CartesiaTTS};
 pub use deepgram::{DEEPGRAM_TTS_URL, DeepgramTTS};
 pub use elevenlabs::{ELEVENLABS_TTS_URL, ElevenLabsTTS};
 pub use google::{GOOGLE_TTS_URL, GoogleTTS};
+pub use ibm_watson::{
+    IBM_WATSON_TTS_URL, IbmOutputFormat, IbmVoice, IbmWatsonTTS, IbmWatsonTTSConfig,
+};
 pub use openai::{AudioOutputFormat, OPENAI_TTS_URL, OpenAITTS, OpenAITTSModel, OpenAIVoice};
 pub use provider::{TTSProvider, TTSRequestBuilder};
 use std::collections::HashMap;
@@ -36,6 +40,7 @@ use std::collections::HashMap;
 /// - `"cartesia"` - Cartesia TTS API (Sonic voice models)
 /// - `"openai"` - OpenAI TTS API (tts-1, tts-1-hd, gpt-4o-mini-tts)
 /// - `"aws-polly"` or `"amazon-polly"` or `"polly"` - Amazon Polly TTS API
+/// - `"ibm-watson"` or `"ibm_watson"` or `"watson"` or `"ibm"` - IBM Watson TTS API
 ///
 /// # Example
 ///
@@ -61,8 +66,11 @@ pub fn create_tts_provider(provider_type: &str, config: TTSConfig) -> TTSResult<
         "aws-polly" | "aws_polly" | "amazon-polly" | "polly" => {
             Ok(Box::new(AwsPollyTTS::new(config)?))
         }
+        "ibm-watson" | "ibm_watson" | "watson" | "ibm" => {
+            Ok(Box::new(IbmWatsonTTS::new(config)?))
+        }
         _ => Err(TTSError::InvalidConfiguration(format!(
-            "Unsupported TTS provider: {provider_type}. Supported providers: deepgram, elevenlabs, google, azure, cartesia, openai, aws-polly"
+            "Unsupported TTS provider: {provider_type}. Supported providers: deepgram, elevenlabs, google, azure, cartesia, openai, aws-polly, ibm-watson"
         ))),
     }
 }
@@ -72,6 +80,7 @@ pub fn create_tts_provider(provider_type: &str, config: TTSConfig) -> TTSResult<
 /// Note: Azure uses regional endpoints. The URL returned here is for the
 /// default region (eastus). For specific regions, use `AzureRegion::tts_rest_url()`.
 /// Note: AWS Polly uses regional endpoints. The URL returned here is a template.
+/// Note: IBM Watson uses regional endpoints. The URL returned here is for us-south.
 pub fn get_tts_provider_urls() -> HashMap<String, String> {
     let mut urls = HashMap::new();
     urls.insert("deepgram".to_string(), DEEPGRAM_TTS_URL.to_string());
@@ -81,6 +90,7 @@ pub fn get_tts_provider_urls() -> HashMap<String, String> {
     urls.insert("cartesia".to_string(), CARTESIA_TTS_URL.to_string());
     urls.insert("openai".to_string(), OPENAI_TTS_URL.to_string());
     urls.insert("aws-polly".to_string(), AWS_POLLY_TTS_URL.to_string());
+    urls.insert("ibm-watson".to_string(), IBM_WATSON_TTS_URL.to_string());
     urls
 }
 
@@ -292,6 +302,80 @@ mod tests {
                 assert!(
                     msg.contains("aws-polly"),
                     "Error message should mention aws-polly as a supported provider"
+                );
+            }
+            Err(other) => panic!("Expected InvalidConfiguration error, got: {:?}", other),
+            Ok(_) => panic!("Expected error for invalid provider"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_ibm_watson_tts_provider() {
+        let config = TTSConfig {
+            provider: "ibm-watson".to_string(),
+            api_key: "test_key".to_string(),
+            voice_id: Some("en-US_AllisonV3Voice".to_string()),
+            audio_format: Some("wav".to_string()),
+            sample_rate: Some(22050),
+            ..Default::default()
+        };
+        let result = create_tts_provider("ibm-watson", config);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_ibm_watson_tts_provider_aliases() {
+        let config = TTSConfig {
+            provider: "ibm-watson".to_string(),
+            api_key: "test_key".to_string(),
+            voice_id: Some("en-US_AllisonV3Voice".to_string()),
+            ..Default::default()
+        };
+
+        // All aliases should work
+        let result = create_tts_provider("ibm_watson", config.clone());
+        assert!(result.is_ok());
+
+        let result = create_tts_provider("watson", config.clone());
+        assert!(result.is_ok());
+
+        let result = create_tts_provider("ibm", config);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_ibm_watson_tts_provider_case_insensitive() {
+        let config = TTSConfig {
+            provider: "ibm-watson".to_string(),
+            api_key: "test_key".to_string(),
+            voice_id: Some("en-US_AllisonV3Voice".to_string()),
+            ..Default::default()
+        };
+        // Case should not matter
+        let result = create_tts_provider("IBM-WATSON", config.clone());
+        assert!(result.is_ok());
+
+        let result = create_tts_provider("Ibm-Watson", config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_tts_provider_urls_includes_ibm_watson() {
+        let urls = get_tts_provider_urls();
+        assert!(urls.contains_key("ibm-watson"));
+        assert_eq!(urls.get("ibm-watson").unwrap(), IBM_WATSON_TTS_URL);
+    }
+
+    #[test]
+    fn test_invalid_provider_error_message_includes_ibm_watson() {
+        let config = TTSConfig::default();
+        let result = create_tts_provider("invalid_provider", config);
+
+        match result {
+            Err(TTSError::InvalidConfiguration(msg)) => {
+                assert!(
+                    msg.contains("ibm-watson"),
+                    "Error message should mention ibm-watson as a supported provider"
                 );
             }
             Err(other) => panic!("Expected InvalidConfiguration error, got: {:?}", other),

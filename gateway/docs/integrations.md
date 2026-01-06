@@ -18,6 +18,7 @@ This document lists all speech-to-text (STT), text-to-speech (TTS), and audio-to
 | **AssemblyAI** | WebSocket | Streaming API v3, 99 languages, immutable transcripts, end-of-turn detection | `ASSEMBLYAI_API_KEY` |
 | **Cartesia** | WebSocket | Low-latency streaming, word-level timestamps | `CARTESIA_API_KEY` |
 | **Amazon Transcribe** | AWS SDK | 100+ languages, streaming, speaker diarization, content redaction | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
+| **IBM Watson** | WebSocket | 30+ languages, speaker diarization, smart formatting, background noise suppression | `IBM_WATSON_API_KEY`, `IBM_WATSON_INSTANCE_ID` |
 
 ### Text-to-Speech (TTS)
 
@@ -30,6 +31,7 @@ This document lists all speech-to-text (STT), text-to-speech (TTS), and audio-to
 | **OpenAI** | REST | TTS-1/TTS-1-HD models, 6 voices | `OPENAI_API_KEY` |
 | **Cartesia** | WebSocket | Sonic model, ultra-low latency, voice cloning | `CARTESIA_API_KEY` |
 | **Amazon Polly** | AWS SDK | 60+ voices, neural/standard/generative engines, SSML, 30+ languages | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
+| **IBM Watson** | HTTP | 30+ V3 neural voices, 15+ languages, SSML, rate/pitch control | `IBM_WATSON_API_KEY`, `IBM_WATSON_INSTANCE_ID` |
 
 ### Audio-to-Audio (Realtime)
 
@@ -148,6 +150,41 @@ This document lists all speech-to-text (STT), text-to-speech (TTS), and audio-to
   - Generative engine for highest quality
 - **Authentication:** AWS access keys, IAM roles, or AWS credentials file
 
+### IBM Watson Speech Services
+
+- **Website:** https://www.ibm.com/cloud/watson-speech-to-text
+- **Documentation:** https://cloud.ibm.com/apidocs/speech-to-text, https://cloud.ibm.com/apidocs/text-to-speech
+- **Capabilities:** STT, TTS
+- **STT Protocol:** WebSocket (real-time streaming)
+- **TTS Protocol:** HTTP REST
+- **Languages:** 30+ languages supported
+- **Regions:** us-south (Dallas), us-east (Washington DC), eu-de (Frankfurt), eu-gb (London), au-syd (Sydney), jp-tok (Tokyo), kr-seo (Seoul)
+- **STT Features:**
+  - Real-time streaming transcription
+  - Speaker diarization (speaker labels)
+  - Smart formatting (numbers, dates, currencies)
+  - Word-level timestamps and confidence
+  - Background audio suppression
+  - Profanity filtering and redaction
+  - Custom language and acoustic models
+  - Low-latency mode for faster interim results
+- **TTS Features:**
+  - 30+ V3 neural voices across 15+ languages
+  - SSML support for prosody control
+  - Rate and pitch adjustment (-100% to +100%)
+  - Multiple audio formats: WAV, MP3, OGG-Opus, OGG-Vorbis, FLAC, WebM, L16 (PCM), μ-law, A-law
+  - Custom pronunciation dictionaries (up to 2 per request)
+- **TTS Voices (Selected):**
+  - **US English:** Allison, Emily, Henry, Kevin, Lisa, Michael, Olivia
+  - **UK English:** Charlotte, James, Kate
+  - **German:** Birgit, Dieter, Erika
+  - **Spanish:** Enrique, Laura, Sofia
+  - **French:** Nicolas, Renee, Louise (Canadian)
+  - **Japanese:** Emi
+  - **Korean:** Hyunjun, Siwoo, Youngmi, Yuna
+  - **Chinese:** LiNa, WangWei, ZhangJing
+- **Authentication:** IAM token-based (API key exchanged for bearer token)
+
 ---
 
 ## Configuration Examples
@@ -181,6 +218,11 @@ export CARTESIA_API_KEY="your-cartesia-key"
 export AWS_ACCESS_KEY_ID="your-aws-access-key"
 export AWS_SECRET_ACCESS_KEY="your-aws-secret-key"
 export AWS_REGION="us-east-1"  # Optional, defaults to us-east-1
+
+# IBM Watson
+export IBM_WATSON_API_KEY="your-ibm-watson-key"
+export IBM_WATSON_INSTANCE_ID="your-instance-id"
+export IBM_WATSON_REGION="us-south"  # Optional, defaults to us-south
 ```
 
 ### YAML Configuration
@@ -201,6 +243,10 @@ providers:
     access_key_id: ${AWS_ACCESS_KEY_ID}
     secret_access_key: ${AWS_SECRET_ACCESS_KEY}
     region: ${AWS_REGION}
+  ibm_watson:
+    api_key: ${IBM_WATSON_API_KEY}
+    instance_id: ${IBM_WATSON_INSTANCE_ID}
+    region: ${IBM_WATSON_REGION}
 ```
 
 ### WebSocket Configuration Message
@@ -226,9 +272,9 @@ providers:
 | **Low latency** | Deepgram, Cartesia | Cartesia, ElevenLabs |
 | **High accuracy** | AssemblyAI, Google | Google Neural2, Azure |
 | **Voice cloning** | - | ElevenLabs, Cartesia |
-| **Multi-language** | AssemblyAI (99), Amazon Transcribe (100+), Google (125+) | Azure (140+), Amazon Polly (30+), Google (40+) |
+| **Multi-language** | AssemblyAI (99), Amazon Transcribe (100+), Google (125+), IBM Watson (30+) | Azure (140+), Amazon Polly (30+), Google (40+), IBM Watson (15+) |
 | **Cost-effective** | Deepgram, OpenAI | OpenAI, Deepgram |
-| **Enterprise/HIPAA** | Azure, Google, Amazon Transcribe | Azure, Google, Amazon Polly |
+| **Enterprise/HIPAA** | Azure, Google, Amazon Transcribe, IBM Watson | Azure, Google, Amazon Polly, IBM Watson |
 | **Conversational AI** | - | OpenAI Realtime |
 
 ---
@@ -237,7 +283,6 @@ providers:
 
 The following providers are planned for future releases:
 
-- IBM Watson Speech
 - Groq (Whisper hosting)
 - Hume AI (emotional TTS)
 - LMNT

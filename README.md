@@ -28,10 +28,10 @@
 
 **WaaV Gateway** is a high-performance, real-time voice processing server built in Rust. It provides a unified interface for Speech-to-Text (STT) and Text-to-Speech (TTS) services across multiple cloud providers, with advanced audio processing capabilities including noise suppression and intelligent turn detection.
 
-WaaV eliminates the complexity of integrating with multiple voice AI providers by providing a single WebSocket and REST API that abstracts away provider-specific implementations. Switch between Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, or Amazon Polly with a simple configuration change—no code modifications required.
+WaaV eliminates the complexity of integrating with multiple voice AI providers by providing a single WebSocket and REST API that abstracts away provider-specific implementations. Switch between Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, or IBM Watson with a simple configuration change—no code modifications required.
 
 **Key Highlights:**
-- **8 STT/TTS Providers** - Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly
+- **9 STT/TTS Providers** - Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, IBM Watson
 - **OpenAI Realtime API** - Full-duplex audio-to-audio streaming with GPT-4o
 - **WebSocket Streaming** - Real-time bidirectional audio with sub-second latency
 - **LiveKit Integration** - WebRTC rooms and SIP telephony support
@@ -195,6 +195,7 @@ cargo build --release --features turn-detect,noise-filter,openapi
 | **Cartesia** | WebSocket | ink-whisper | Low-latency streaming |
 | **OpenAI** | REST | whisper-1, gpt-4o-transcribe | Batch transcription, 57+ languages |
 | **Amazon Transcribe** | AWS SDK | Streaming | 100+ languages, speaker diarization, PII redaction |
+| **IBM Watson** | WebSocket | Next-gen models | 30+ languages, speaker diarization, smart formatting |
 
 ### Text-to-Speech (TTS)
 
@@ -207,6 +208,7 @@ cargo build --release --features turn-detect,noise-filter,openapi
 | **Cartesia** | WebSocket | Sonic-3, custom clones | Low-latency, voice mixing |
 | **OpenAI** | HTTP | 11 voices (alloy, nova, etc.) | tts-1, tts-1-hd, gpt-4o-mini-tts |
 | **Amazon Polly** | AWS SDK | 60+ voices (Joanna, Matthew, etc.) | Neural, Standard, Generative engines, SSML |
+| **IBM Watson** | HTTP | 30+ V3 neural voices | 15+ languages, SSML, rate/pitch control |
 
 ### Audio-to-Audio (Realtime)
 
@@ -544,6 +546,9 @@ providers:
   aws_access_key_id: ""                 # ENV: AWS_ACCESS_KEY_ID
   aws_secret_access_key: ""             # ENV: AWS_SECRET_ACCESS_KEY
   aws_region: "us-east-1"               # ENV: AWS_REGION
+  ibm_watson_api_key: ""                # ENV: IBM_WATSON_API_KEY
+  ibm_watson_instance_id: ""            # ENV: IBM_WATSON_INSTANCE_ID
+  ibm_watson_region: "us-south"         # ENV: IBM_WATSON_REGION
 
 # LiveKit configuration (optional)
 livekit:
