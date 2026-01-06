@@ -1,4 +1,5 @@
 pub mod assemblyai;
+pub mod aws_transcribe;
 pub mod azure;
 mod base;
 pub mod cartesia;
@@ -44,6 +45,12 @@ pub use assemblyai::{
     AssemblyAISpeechModel,
 };
 
+// Re-export AWS Transcribe implementation
+pub use aws_transcribe::{
+    AwsRegion, AwsTranscribeSTT, AwsTranscribeSTTConfig, MediaEncoding as AwsMediaEncoding,
+    PartialResultsStability,
+};
+
 /// Supported STT providers
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum STTProvider {
@@ -61,6 +68,8 @@ pub enum STTProvider {
     OpenAI,
     /// AssemblyAI Streaming STT v3 WebSocket API
     AssemblyAI,
+    /// Amazon Transcribe Streaming STT API
+    AwsTranscribe,
 }
 
 impl std::fmt::Display for STTProvider {
@@ -73,6 +82,7 @@ impl std::fmt::Display for STTProvider {
             STTProvider::Cartesia => write!(f, "cartesia"),
             STTProvider::OpenAI => write!(f, "openai"),
             STTProvider::AssemblyAI => write!(f, "assemblyai"),
+            STTProvider::AwsTranscribe => write!(f, "aws-transcribe"),
         }
     }
 }
@@ -89,8 +99,11 @@ impl std::str::FromStr for STTProvider {
             "cartesia" => Ok(STTProvider::Cartesia),
             "openai" => Ok(STTProvider::OpenAI),
             "assemblyai" => Ok(STTProvider::AssemblyAI),
+            "aws-transcribe" | "aws_transcribe" | "amazon-transcribe" | "transcribe" => {
+                Ok(STTProvider::AwsTranscribe)
+            }
             _ => Err(STTError::ConfigurationError(format!(
-                "Unsupported STT provider: {s}. Supported providers: deepgram, google, elevenlabs, microsoft-azure, cartesia, openai, assemblyai"
+                "Unsupported STT provider: {s}. Supported providers: deepgram, google, elevenlabs, microsoft-azure, cartesia, openai, assemblyai, aws-transcribe"
             ))),
         }
     }
@@ -128,7 +141,7 @@ impl std::str::FromStr for STTProvider {
 ///     // Use the provider
 ///     if stt.is_ready() {
 ///         let audio_data = vec![0u8; 1024];
-///         stt.send_audio(audio_data).await?;
+///         stt.send_audio(audio_data.into()).await?;
 ///     }
 ///
 ///     Ok(())
@@ -168,6 +181,10 @@ pub fn create_stt_provider(
         STTProvider::AssemblyAI => {
             let assemblyai_stt = <AssemblyAISTT as BaseSTT>::new(config)?;
             Ok(Box::new(assemblyai_stt))
+        }
+        STTProvider::AwsTranscribe => {
+            let aws_transcribe_stt = <AwsTranscribeSTT as BaseSTT>::new(config)?;
+            Ok(Box::new(aws_transcribe_stt))
         }
     }
 }
@@ -236,6 +253,10 @@ pub fn create_stt_provider_from_enum(
             let assemblyai_stt = <AssemblyAISTT as BaseSTT>::new(config)?;
             Ok(Box::new(assemblyai_stt))
         }
+        STTProvider::AwsTranscribe => {
+            let aws_transcribe_stt = <AwsTranscribeSTT as BaseSTT>::new(config)?;
+            Ok(Box::new(aws_transcribe_stt))
+        }
     }
 }
 
@@ -261,6 +282,7 @@ pub fn get_supported_stt_providers() -> Vec<&'static str> {
         "cartesia",
         "openai",
         "assemblyai",
+        "aws-transcribe",
     ]
 }
 
@@ -358,7 +380,8 @@ mod factory_tests {
                 "microsoft-azure",
                 "cartesia",
                 "openai",
-                "assemblyai"
+                "assemblyai",
+                "aws-transcribe"
             ]
         );
         assert!(providers.contains(&"deepgram"));
@@ -795,7 +818,7 @@ mod factory_tests {
 ///     
 ///     // Send audio data
 ///     let audio_data = vec![0u8; 1024]; // Your audio bytes here
-///     stt_provider.send_audio(audio_data).await.unwrap();
+///     stt_provider.send_audio(audio_data.into()).await.unwrap();
 ///     
 ///     // Disconnect when done
 ///     stt_provider.disconnect().await.unwrap();

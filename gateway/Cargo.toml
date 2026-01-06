@@ -137,6 +137,14 @@ tonic = { version = "0.11", features = ["tls-roots", "prost", "channel"] }
 prost-types = "0.12"
 async-stream = "0.3"
 
+# AWS SDKs for Amazon Transcribe and Polly
+aws-config = { version = "1.5", features = ["behavior-version-latest"] }
+aws-sdk-transcribestreaming = "1.62"
+aws-sdk-polly = "1.61"
+aws-credential-types = "1.2"
+aws-types = "1.3"
+aws-smithy-types = "1.3"
+
 [dev-dependencies]
 tower = { version = "0.5.2", features = ["util"] }
 tempfile = "3.8"

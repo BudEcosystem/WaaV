@@ -134,7 +134,7 @@ enum ConnectionState {
 ///
 ///     // Send audio data
 ///     let audio_data = vec![0u8; 1024]; // Your PCM audio data
-///     stt.send_audio(audio_data).await?;
+///     stt.send_audio(audio_data.into()).await?;
 ///
 ///     // Disconnect when done
 ///     stt.disconnect().await?;

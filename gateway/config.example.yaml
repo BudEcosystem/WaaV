@@ -64,24 +64,61 @@ providers:
   # Get from OpenAI dashboard: https://platform.openai.com/api-keys
   openai_api_key: ""                             # ENV: OPENAI_API_KEY
 
+  # AssemblyAI API key (used for STT)
+  # Streaming API v3 with real-time transcription
+  # Get from AssemblyAI dashboard: https://www.assemblyai.com/app
+  assemblyai_api_key: ""                         # ENV: ASSEMBLYAI_API_KEY
+
+  # AWS credentials for Amazon Transcribe (STT) and Amazon Polly (TTS)
+  # Uses AWS SDK credential chain:
+  # 1. These explicit credentials (if provided)
+  # 2. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+  # 3. AWS credentials file (~/.aws/credentials)
+  # 4. IAM role (when running on EC2/ECS/Lambda)
+  # Get from AWS IAM console or use IAM roles for production
+  aws_access_key_id: ""                          # ENV: AWS_ACCESS_KEY_ID
+  aws_secret_access_key: ""                      # ENV: AWS_SECRET_ACCESS_KEY
+  aws_region: "us-east-1"                        # ENV: AWS_REGION (default: us-east-1)
+
 # STT Provider Configuration (optional - can also be set via WebSocket config)
 # stt:
-#   provider: deepgram  # Options: "deepgram", "google", "elevenlabs", "microsoft-azure", "cartesia", "openai"
+#   provider: deepgram  # Options: "deepgram", "google", "elevenlabs", "microsoft-azure", "cartesia", "openai", "assemblyai", "aws-transcribe"
 #   # Google-specific settings (only used when provider is "google")
 #   google:
 #     location: global           # Options: global, us, eu, asia-southeast1, etc.
 #     recognizer_id: ""          # Optional: pre-configured recognizer ID
 #     model: latest_long         # Options: latest_long, latest_short, chirp_2, telephony
+#   # AssemblyAI-specific settings (only used when provider is "assemblyai")
+#   assemblyai:
+#     speech_model: best        # Options: best, nano
+#     region: us                # Options: us, eu
+#     end_of_turn_confidence: 0.8  # Threshold for turn detection (0.0-1.0)
+#     sample_rate: 16000        # Options: 8000, 16000 (recommended)
+#   # AWS Transcribe-specific settings (only used when provider is "aws-transcribe")
+#   aws_transcribe:
+#     language: en-US           # Options: en-US, en-GB, es-US, fr-FR, de-DE, ja-JP, etc. (100+ languages)
+#     media_encoding: pcm       # Options: pcm, ogg-opus, flac
+#     sample_rate: 16000        # Options: 8000, 16000, 32000, 48000
+#     enable_partial_results: true      # Receive interim transcripts
+#     show_speaker_labels: false        # Enable speaker diarization
+#     vocabulary_filter_method: remove  # Options: remove, mask, tag (for profanity filtering)
 
 # TTS Provider Configuration (optional - can also be set via WebSocket config)
 # tts:
-#   provider: elevenlabs  # Options: "deepgram", "elevenlabs", "google", "azure", "cartesia", "openai"
+#   provider: elevenlabs  # Options: "deepgram", "elevenlabs", "google", "azure", "cartesia", "openai", "aws-polly"
 #   # Cartesia-specific settings (only used when provider is "cartesia")
 #   cartesia:
 #     model: sonic-3           # Options: sonic-3, sonic-3-2025-10-27
 #     voice_id: ""             # Voice UUID from Cartesia voice library
 #     audio_format: linear16   # Options: linear16/pcm, wav, mp3
 #     sample_rate: 24000       # Options: 8000, 16000, 22050, 24000, 44100, 48000
+#   # AWS Polly-specific settings (only used when provider is "aws-polly")
+#   aws_polly:
+#     voice: Joanna            # Options: Joanna, Matthew, Amy, Emma, Brian, Nicole, etc. (60+ voices)
+#     engine: neural           # Options: standard, neural, long-form, generative
+#     output_format: pcm       # Options: pcm, mp3, ogg_vorbis
+#     sample_rate: 16000       # PCM: 8000, 16000 | MP3/OGG: 8000, 16000, 22050, 24000
+#     text_type: text          # Options: text, ssml
 
 # LiveKit recording configuration (S3)
 recording:

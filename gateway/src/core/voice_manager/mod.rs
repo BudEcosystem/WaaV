@@ -90,7 +90,7 @@
 //!
 //!     // Example: Send audio for transcription
 //!     let audio_data = vec![0u8; 1024]; // Your audio data here
-//!     voice_manager.receive_audio(audio_data).await?;
+//!     voice_manager.receive_audio(audio_data.into()).await?;
 //!
 //!     // Example: Synthesize speech
 //!     voice_manager.speak("Hello, this is a test message", true).await?;
@@ -210,7 +210,7 @@
 //!     // Audio processing loop
 //!     tokio::spawn(async move {
 //!         while let Some(audio_data) = audio_rx.recv().await {
-//!             if let Err(e) = voice_manager.receive_audio(audio_data).await {
+//!             if let Err(e) = voice_manager.receive_audio(audio_data.into()).await {
 //!                 eprintln!("Failed to process audio: {}", e);
 //!             }
 //!         }

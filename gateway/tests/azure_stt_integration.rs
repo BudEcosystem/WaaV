@@ -27,7 +27,7 @@ use waav_gateway::core::stt::{
 fn test_azure_in_supported_providers() {
     let providers = get_supported_stt_providers();
     assert!(providers.contains(&"microsoft-azure"));
-    assert_eq!(providers.len(), 6); // deepgram, google, elevenlabs, microsoft-azure, cartesia, openai
+    assert_eq!(providers.len(), 8); // deepgram, google, elevenlabs, microsoft-azure, cartesia, openai, assemblyai, aws-transcribe
 }
 
 /// Test provider creation via string name

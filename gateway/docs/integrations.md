@@ -17,6 +17,7 @@ This document lists all speech-to-text (STT), text-to-speech (TTS), and audio-to
 | **OpenAI** | REST | Whisper model, 57+ languages, translation support | `OPENAI_API_KEY` |
 | **AssemblyAI** | WebSocket | Streaming API v3, 99 languages, immutable transcripts, end-of-turn detection | `ASSEMBLYAI_API_KEY` |
 | **Cartesia** | WebSocket | Low-latency streaming, word-level timestamps | `CARTESIA_API_KEY` |
+| **Amazon Transcribe** | AWS SDK | 100+ languages, streaming, speaker diarization, content redaction | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
 
 ### Text-to-Speech (TTS)
 
@@ -28,6 +29,7 @@ This document lists all speech-to-text (STT), text-to-speech (TTS), and audio-to
 | **ElevenLabs** | WebSocket | Voice cloning, 29 languages, emotional expression | `ELEVENLABS_API_KEY` |
 | **OpenAI** | REST | TTS-1/TTS-1-HD models, 6 voices | `OPENAI_API_KEY` |
 | **Cartesia** | WebSocket | Sonic model, ultra-low latency, voice cloning | `CARTESIA_API_KEY` |
+| **Amazon Polly** | AWS SDK | 60+ voices, neural/standard/generative engines, SSML, 30+ languages | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
 
 ### Audio-to-Audio (Realtime)
 
@@ -108,6 +110,44 @@ This document lists all speech-to-text (STT), text-to-speech (TTS), and audio-to
 - **Model:** Sonic
 - **Special Features:** Ultra-low latency (<100ms), voice cloning, emotion control
 
+### Amazon Transcribe
+
+- **Website:** https://aws.amazon.com/transcribe
+- **Documentation:** https://docs.aws.amazon.com/transcribe
+- **Capabilities:** STT
+- **Protocol:** AWS SDK (HTTP/2 streaming)
+- **Languages:** 100+ languages
+- **Regions:** 16 AWS regions (us-east-1, us-west-2, eu-west-1, etc.)
+- **Audio Formats:** PCM (16-bit LE), FLAC, OGG-OPUS
+- **Sample Rates:** 8kHz - 48kHz
+- **Special Features:**
+  - Real-time streaming transcription
+  - Speaker diarization (2-10 speakers)
+  - Custom vocabularies and language models
+  - Content redaction (PII masking)
+  - Automatic language detection
+  - Partial results stabilization (high/medium/low)
+  - Channel identification for multi-channel audio
+- **Authentication:** AWS access keys, IAM roles, or AWS credentials file
+
+### Amazon Polly
+
+- **Website:** https://aws.amazon.com/polly
+- **Documentation:** https://docs.aws.amazon.com/polly
+- **Capabilities:** TTS
+- **Protocol:** AWS SDK (SynthesizeSpeech API)
+- **Voices:** 60+ voices across 30+ languages
+- **Engines:** Standard, Neural, Long-Form, Generative
+- **Output Formats:** MP3, OGG-Vorbis, PCM (16-bit LE)
+- **Sample Rates:** MP3/OGG (8-24kHz), PCM (8-16kHz)
+- **Special Features:**
+  - Neural voices for natural-sounding speech
+  - SSML support for pronunciation control
+  - Custom lexicons (up to 5 per request)
+  - Long-form engine for audiobooks/articles
+  - Generative engine for highest quality
+- **Authentication:** AWS access keys, IAM roles, or AWS credentials file
+
 ---
 
 ## Configuration Examples
@@ -136,6 +176,11 @@ export ASSEMBLYAI_API_KEY="your-assemblyai-key"
 
 # Cartesia
 export CARTESIA_API_KEY="your-cartesia-key"
+
+# AWS (Amazon Transcribe / Polly)
+export AWS_ACCESS_KEY_ID="your-aws-access-key"
+export AWS_SECRET_ACCESS_KEY="your-aws-secret-key"
+export AWS_REGION="us-east-1"  # Optional, defaults to us-east-1
 ```
 
 ### YAML Configuration
@@ -152,6 +197,10 @@ providers:
     region: ${AZURE_SPEECH_REGION}
   google:
     credentials_path: ${GOOGLE_APPLICATION_CREDENTIALS}
+  aws:
+    access_key_id: ${AWS_ACCESS_KEY_ID}
+    secret_access_key: ${AWS_SECRET_ACCESS_KEY}
+    region: ${AWS_REGION}
 ```
 
 ### WebSocket Configuration Message
@@ -177,9 +226,9 @@ providers:
 | **Low latency** | Deepgram, Cartesia | Cartesia, ElevenLabs |
 | **High accuracy** | AssemblyAI, Google | Google Neural2, Azure |
 | **Voice cloning** | - | ElevenLabs, Cartesia |
-| **Multi-language** | AssemblyAI (99), Google (125+) | Azure (140+), Google (40+) |
+| **Multi-language** | AssemblyAI (99), Amazon Transcribe (100+), Google (125+) | Azure (140+), Amazon Polly (30+), Google (40+) |
 | **Cost-effective** | Deepgram, OpenAI | OpenAI, Deepgram |
-| **Enterprise/HIPAA** | Azure, Google | Azure, Google |
+| **Enterprise/HIPAA** | Azure, Google, Amazon Transcribe | Azure, Google, Amazon Polly |
 | **Conversational AI** | - | OpenAI Realtime |
 
 ---
@@ -188,7 +237,6 @@ providers:
 
 The following providers are planned for future releases:
 
-- Amazon Transcribe / Polly
 - IBM Watson Speech
 - Groq (Whisper hosting)
 - Hume AI (emotional TTS)

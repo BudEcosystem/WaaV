@@ -10,10 +10,10 @@
 | Metric | Count |
 |--------|-------|
 | **Total Cloud Providers** | 70 |
-| **Implemented** | 7 |
+| **Implemented** | 9 |
 | **In Progress** | 0 |
-| **Yet to Start** | 63 |
-| **Estimated Days Remaining** | 34-45 |
+| **Yet to Start** | 61 |
+| **Estimated Days Remaining** | 32-43 |
 
 ---
 
@@ -350,8 +350,8 @@ RUSTFLAGS="-Zsanitizer=address" cargo +nightly test [provider]
 |---|----------|------|--------|------------|-------|
 | 1 | OpenAI | STT+TTS+A2A | [DONE] | 2026-01-06 | Whisper STT, TTS API, Realtime WebSocket |
 | 2 | AssemblyAI | STT | [DONE] | 2026-01-06 | Streaming API v3, immutable transcripts, 99 languages |
-| 3 | Amazon Transcribe | STT | [TODO] | - | AWS SDK required |
-| 4 | Amazon Polly | TTS | [TODO] | - | AWS SDK required |
+| 3 | Amazon Transcribe | STT | [DONE] | 2026-01-06 | AWS SDK, 100+ languages, streaming WebSocket |
+| 4 | Amazon Polly | TTS | [DONE] | 2026-01-06 | AWS SDK, 60+ voices, Neural/Standard/Generative engines |
 | 5 | IBM Watson STT | STT | [TODO] | - | Enterprise |
 | 6 | IBM Watson TTS | TTS | [TODO] | - | Enterprise |
 | 7 | Groq | STT | [TODO] | - | Fastest Whisper hosting |
@@ -522,6 +522,31 @@ These require the Python inference engine to be completed first:
 ---
 
 ## Session Log
+
+### Session: 2026-01-06 (Update 4)
+**Status:** Amazon Transcribe STT and Amazon Polly TTS implementation complete
+**Completed:**
+- Amazon Transcribe STT (WebSocket Streaming) - `src/core/stt/aws_transcribe/`
+  - `config.rs`: AwsTranscribeSTTConfig, TranscribeLanguage, MediaEncoding, VocabularyFilterMethod
+  - `messages.rs`: TranscribeMessage, AudioEvent, TranscriptEvent, Result structs
+  - `client.rs`: AwsTranscribeSTT implementing BaseSTT trait via AWS SDK
+  - `tests.rs`: Comprehensive unit tests
+  - Key features: 100+ languages, real-time streaming, vocabulary filtering, PII redaction, speaker diarization
+- Amazon Polly TTS (AWS SDK-based) - `src/core/tts/aws_polly/`
+  - `config.rs`: AwsPollyTTSConfig, PollyEngine, PollyOutputFormat, PollyVoice, TextType
+  - `provider.rs`: AwsPollyTTS implementing BaseTTS trait via AWS SDK
+  - `tests.rs`: Comprehensive unit tests
+  - Key features: 60+ voices across 30+ languages, Neural/Standard/Generative/Long-form engines
+  - Auto sample rate adjustment for PCM output format (8000/16000 Hz only)
+- Factory integration in `src/core/stt/mod.rs` and `src/core/tts/mod.rs`
+- AWS SDK dependencies: aws-sdk-polly v1.96.0, aws-sdk-transcribestreaming v1.95.0
+**Quality Gates:** All passed (cargo fmt, clippy, 123 tests passing, 3 integration tests ignored)
+**Key Design Decisions:**
+- Used AWS SDK directly (not HTTP REST) for better integration with AWS auth mechanisms
+- Implemented auto sample rate adjustment for Polly PCM format compatibility
+- Used try_write() for callback registration to avoid async runtime panics
+**Next Steps:**
+- Continue with Batch 1: IBM Watson STT/TTS or Groq
 
 ### Session: 2026-01-06 (Update 3)
 **Status:** AssemblyAI STT implementation complete

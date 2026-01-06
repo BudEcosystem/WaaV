@@ -109,7 +109,7 @@ pub(crate) enum ConnectionState {
 ///
 ///     // Send audio data (raw PCM S16LE bytes)
 ///     let audio_data = vec![0u8; 3200]; // 100ms at 16kHz
-///     stt.send_audio(audio_data).await?;
+///     stt.send_audio(audio_data.into()).await?;
 ///
 ///     Ok(())
 /// }
