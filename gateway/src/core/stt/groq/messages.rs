@@ -5,6 +5,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Default confidence value when actual confidence is unavailable.
+/// Using 0.5 (neutral) to avoid overconfidence in systems that rely on this value.
+/// This indicates "unknown confidence" rather than "high confidence".
+pub const DEFAULT_UNKNOWN_CONFIDENCE: f64 = 0.5;
+
 // =============================================================================
 // Simple Transcription Response
 // =============================================================================
@@ -109,16 +114,38 @@ impl Segment {
     /// Calculate confidence score (0.0 to 1.0) from avg_logprob.
     ///
     /// The log probability is typically negative, with values closer to 0
-    /// indicating higher confidence.
+    /// indicating higher confidence. Based on empirical observation:
+    /// - avg_logprob around -0.2 to -0.5 = very high confidence
+    /// - avg_logprob around -0.5 to -1.0 = high confidence
+    /// - avg_logprob around -1.0 to -2.0 = medium confidence
+    /// - avg_logprob below -2.0 = low confidence
+    ///
+    /// This implementation uses exponential mapping to preserve precision
+    /// across the full range of log probabilities.
     pub fn confidence(&self) -> f64 {
         self.avg_logprob
             .map(|lp| {
-                // Convert log probability to a 0-1 confidence score
-                // avg_logprob typically ranges from -1.0 (high confidence) to -10.0 (low confidence)
-                let normalized = (lp + 1.0).clamp(-1.0, 0.0);
-                1.0 + normalized // Maps to 0.0 - 1.0
+                // Use exponential transformation: e^(logprob) gives probability
+                // Then scale to 0-1 range with reasonable bounds
+                // avg_logprob of 0 -> confidence 1.0
+                // avg_logprob of -1 -> confidence ~0.37
+                // avg_logprob of -2 -> confidence ~0.14
+                // avg_logprob of -5 -> confidence ~0.007
+                //
+                // We use a slightly modified formula to keep confidence
+                // in a more useful range (0.1 to 1.0):
+                // confidence = max(0.1, e^(logprob * 0.5))
+                //
+                // This gives:
+                // avg_logprob of 0 -> confidence 1.0
+                // avg_logprob of -0.5 -> confidence ~0.78
+                // avg_logprob of -1.0 -> confidence ~0.61
+                // avg_logprob of -2.0 -> confidence ~0.37
+                // avg_logprob of -5.0 -> confidence ~0.1 (clamped)
+                let raw_confidence = (lp * 0.5).exp();
+                raw_confidence.clamp(0.1, 1.0)
             })
-            .unwrap_or(0.8) // Default to reasonable confidence if not available
+            .unwrap_or(DEFAULT_UNKNOWN_CONFIDENCE)
     }
 
     /// Check if this segment likely contains actual speech.
@@ -200,19 +227,33 @@ impl TranscriptionResult {
     /// Get the overall confidence score (0.0 to 1.0).
     ///
     /// For verbose responses, this is the average confidence across segments.
-    /// For simple responses, returns a default value.
+    /// For simple/text responses, returns `DEFAULT_UNKNOWN_CONFIDENCE` since
+    /// these formats don't include confidence information.
     pub fn confidence(&self) -> f64 {
         match self {
-            Self::Simple(_) => 0.9, // High confidence assumed for simple format
+            Self::Simple(_) => DEFAULT_UNKNOWN_CONFIDENCE, // No confidence info available
             Self::Verbose(r) => {
                 if r.segments.is_empty() {
-                    0.9
+                    DEFAULT_UNKNOWN_CONFIDENCE // No segments to calculate from
                 } else {
-                    let total: f64 = r.segments.iter().map(|s| s.confidence()).sum();
-                    total / r.segments.len() as f64
+                    // Calculate weighted average based on segment duration
+                    let total_duration: f64 = r.segments.iter().map(|s| s.end - s.start).sum();
+                    if total_duration > 0.0 {
+                        // Duration-weighted average confidence
+                        let weighted_sum: f64 = r
+                            .segments
+                            .iter()
+                            .map(|s| s.confidence() * (s.end - s.start))
+                            .sum();
+                        weighted_sum / total_duration
+                    } else {
+                        // Fallback to simple average if durations are zero
+                        let total: f64 = r.segments.iter().map(|s| s.confidence()).sum();
+                        total / r.segments.len() as f64
+                    }
                 }
             }
-            Self::PlainText(_) => 0.9,
+            Self::PlainText(_) => DEFAULT_UNKNOWN_CONFIDENCE, // No confidence info available
         }
     }
 
@@ -264,16 +305,82 @@ impl TranscriptionResult {
 /// Since Groq's API expects audio files, we need to package raw PCM
 /// data into a WAV container.
 pub mod wav {
+    /// WAV creation error.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum WavError {
+        /// Sample rate cannot be zero.
+        ZeroSampleRate,
+        /// Channels cannot be zero.
+        ZeroChannels,
+        /// PCM data size exceeds maximum WAV file size (4GB limit).
+        DataTooLarge,
+    }
+
+    impl std::fmt::Display for WavError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::ZeroSampleRate => write!(f, "Sample rate cannot be zero"),
+                Self::ZeroChannels => write!(f, "Number of channels cannot be zero"),
+                Self::DataTooLarge => write!(f, "PCM data exceeds maximum WAV file size (4GB)"),
+            }
+        }
+    }
+
+    impl std::error::Error for WavError {}
+
     /// Create a WAV file from raw PCM data.
     ///
     /// # Arguments
     /// * `pcm_data` - Raw PCM samples (16-bit signed little-endian)
-    /// * `sample_rate` - Sample rate in Hz (typically 16000)
-    /// * `channels` - Number of audio channels (1 for mono, 2 for stereo)
+    /// * `sample_rate` - Sample rate in Hz (typically 16000). Must be > 0.
+    /// * `channels` - Number of audio channels (1 for mono, 2 for stereo). Must be > 0.
     ///
     /// # Returns
     /// A Vec<u8> containing the complete WAV file.
+    ///
+    /// # Panics
+    /// This function panics if sample_rate or channels is zero.
+    /// Use `try_create_wav` for a non-panicking version.
     pub fn create_wav(pcm_data: &[u8], sample_rate: u32, channels: u16) -> Vec<u8> {
+        try_create_wav(pcm_data, sample_rate, channels).expect("Invalid WAV parameters")
+    }
+
+    /// Create a WAV file from raw PCM data (fallible version).
+    ///
+    /// # Arguments
+    /// * `pcm_data` - Raw PCM samples (16-bit signed little-endian)
+    /// * `sample_rate` - Sample rate in Hz (typically 16000). Must be > 0.
+    /// * `channels` - Number of audio channels (1 for mono, 2 for stereo). Must be > 0.
+    ///
+    /// # Returns
+    /// * `Ok(Vec<u8>)` - The complete WAV file
+    /// * `Err(WavError)` - If validation fails
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// use waav_gateway::core::stt::groq::messages::wav::try_create_wav;
+    ///
+    /// let pcm_data = vec![0u8; 100];
+    /// let wav = try_create_wav(&pcm_data, 16000, 1)?;
+    /// ```
+    pub fn try_create_wav(
+        pcm_data: &[u8],
+        sample_rate: u32,
+        channels: u16,
+    ) -> Result<Vec<u8>, WavError> {
+        if sample_rate == 0 {
+            return Err(WavError::ZeroSampleRate);
+        }
+        if channels == 0 {
+            return Err(WavError::ZeroChannels);
+        }
+
+        // WAV format uses 32-bit values for sizes, so max is ~4GB
+        // Check if data_size + header would overflow u32
+        if pcm_data.len() > (u32::MAX as usize - 36) {
+            return Err(WavError::DataTooLarge);
+        }
+
         let bits_per_sample: u16 = 16;
         let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
         let block_align = channels * bits_per_sample / 8;
@@ -302,7 +409,7 @@ pub mod wav {
         wav.extend_from_slice(&data_size.to_le_bytes());
         wav.extend_from_slice(pcm_data);
 
-        wav
+        Ok(wav)
     }
 
     /// Get the WAV header size (44 bytes).

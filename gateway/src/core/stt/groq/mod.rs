@@ -129,7 +129,7 @@ pub mod messages;
 #[cfg(test)]
 mod tests;
 
-pub use client::GroqSTT;
+pub use client::{GroqSTT, RateLimitInfo, DEFAULT_UNKNOWN_CONFIDENCE};
 pub use config::{
     AudioInputFormat, FlushStrategy, GroqResponseFormat, GroqSTTConfig, GroqSTTModel,
     SilenceDetectionConfig, TimestampGranularity, DEFAULT_MAX_FILE_SIZE, DEV_TIER_MAX_FILE_SIZE,
@@ -138,4 +138,6 @@ pub use config::{
 pub use messages::{
     GroqError, GroqErrorResponse, GroqMetadata, Segment, TranscriptionResponse,
     TranscriptionResult, VerboseTranscriptionResponse, Word,
+    wav::{WavError, try_create_wav, create_wav, HEADER_SIZE as WAV_HEADER_SIZE},
+    DEFAULT_UNKNOWN_CONFIDENCE as MESSAGE_DEFAULT_UNKNOWN_CONFIDENCE,
 };

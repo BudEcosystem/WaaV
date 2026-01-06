@@ -61,6 +61,22 @@ const MAX_RETRIES: u32 = 3;
 /// Base delay for exponential backoff (milliseconds).
 const BASE_RETRY_DELAY_MS: u64 = 500;
 
+/// Default connect timeout in seconds.
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+
+/// Minimum buffer size before silence detection is active (bytes).
+/// ~0.5 seconds at 16kHz 16-bit mono = 16KB
+const MIN_BUFFER_FOR_SILENCE_DETECTION: usize = 16 * 1024;
+
+/// User-Agent header value for API requests.
+const USER_AGENT: &str = concat!("WaaV-Gateway/", env!("CARGO_PKG_VERSION"));
+
+/// Default confidence value when actual confidence is unavailable (f32 version).
+/// This is derived from the canonical f64 constant in messages.rs.
+/// Using 0.5 (neutral) instead of 0.9 to avoid overconfidence.
+pub const DEFAULT_UNKNOWN_CONFIDENCE: f32 =
+    super::messages::DEFAULT_UNKNOWN_CONFIDENCE as f32;
+
 // =============================================================================
 // Type Aliases
 // =============================================================================
@@ -82,6 +98,90 @@ type AsyncErrorCallback = Box<
 // =============================================================================
 // Groq STT Client
 // =============================================================================
+
+/// Rate limit information from API response headers.
+#[derive(Debug, Clone, Default)]
+pub struct RateLimitInfo {
+    /// Remaining requests in current window.
+    pub remaining_requests: Option<u32>,
+    /// Remaining tokens in current window.
+    pub remaining_tokens: Option<u32>,
+    /// Unix timestamp when rate limit resets.
+    pub reset_requests_at: Option<u64>,
+    /// Unix timestamp when token limit resets.
+    pub reset_tokens_at: Option<u64>,
+    /// Retry-After value from 429 response (milliseconds).
+    pub retry_after_ms: Option<u64>,
+}
+
+impl RateLimitInfo {
+    /// Parse rate limit headers from HTTP response.
+    pub fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
+        Self {
+            remaining_requests: headers
+                .get("x-ratelimit-remaining-requests")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok()),
+            remaining_tokens: headers
+                .get("x-ratelimit-remaining-tokens")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok()),
+            reset_requests_at: headers
+                .get("x-ratelimit-reset-requests")
+                .and_then(|v| v.to_str().ok())
+                .and_then(Self::parse_reset_time),
+            reset_tokens_at: headers
+                .get("x-ratelimit-reset-tokens")
+                .and_then(|v| v.to_str().ok())
+                .and_then(Self::parse_reset_time),
+            retry_after_ms: headers
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(Self::parse_retry_after),
+        }
+    }
+
+    /// Parse reset time from header value.
+    /// Can be either a Unix timestamp or duration string like "1s", "500ms".
+    fn parse_reset_time(s: &str) -> Option<u64> {
+        // Try parsing as Unix timestamp first
+        if let Ok(ts) = s.parse::<u64>() {
+            return Some(ts);
+        }
+        // Try parsing duration string (e.g., "1s", "500ms")
+        Self::parse_duration_string(s).map(|ms| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() + (ms / 1000))
+                .unwrap_or(0)
+        })
+    }
+
+    /// Parse Retry-After header value.
+    /// Can be seconds (integer) or duration string.
+    pub fn parse_retry_after(s: &str) -> Option<u64> {
+        // Try parsing as seconds (integer)
+        if let Ok(secs) = s.parse::<u64>() {
+            return Some(secs * 1000); // Convert to ms
+        }
+        // Try parsing as duration string
+        Self::parse_duration_string(s)
+    }
+
+    /// Parse duration strings like "1s", "500ms", "1m".
+    pub fn parse_duration_string(s: &str) -> Option<u64> {
+        let s = s.trim();
+        if s.ends_with("ms") {
+            s.trim_end_matches("ms").parse().ok()
+        } else if s.ends_with('s') {
+            s.trim_end_matches('s').parse::<u64>().ok().map(|v| v * 1000)
+        } else if s.ends_with('m') {
+            s.trim_end_matches('m').parse::<u64>().ok().map(|v| v * 60 * 1000)
+        } else {
+            None
+        }
+    }
+}
 
 /// Groq STT (Whisper) client implementing the BaseSTT trait.
 ///
@@ -148,6 +248,15 @@ pub struct GroqSTT {
     pub(crate) total_bytes_received: u64,
 
     // ==========================================================================
+    // Rate Limit Tracking
+    // ==========================================================================
+    /// Last known rate limit information from API response headers.
+    pub rate_limit_info: RateLimitInfo,
+
+    /// Last request ID from Groq API (for debugging/support).
+    pub last_request_id: Option<String>,
+
+    // ==========================================================================
     // Silence Detection State
     // ==========================================================================
     /// Timestamp when audio was first received (for min duration check).
@@ -175,7 +284,9 @@ impl GroqSTT {
         // Create HTTP client with sensible defaults
         let http_client = Client::builder()
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
             .pool_max_idle_per_host(4) // Connection pooling
+            .user_agent(USER_AGENT)
             .build()
             .map_err(|e| {
                 STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
@@ -194,6 +305,8 @@ impl GroqSTT {
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
             total_bytes_received: 0,
+            rate_limit_info: RateLimitInfo::default(),
+            last_request_id: None,
             first_audio_time: None,
             silence_start_time: None,
             last_was_silent: false,
@@ -303,7 +416,8 @@ impl GroqSTT {
                     // Reset silence state for next utterance
                     self.silence_start_time = None;
                     self.first_audio_time = None;
-                    self.last_was_silent = true;
+                    // Set to false so next audio chunk starts fresh (not "resuming from silence")
+                    self.last_was_silent = false;
                     return true;
                 }
             }
@@ -350,23 +464,65 @@ impl GroqSTT {
         }
 
         // Create WAV file from buffered PCM data
-        let wav_data = wav::create_wav(
-            &self.audio_buffer,
-            config.base.sample_rate,
-            config.base.channels,
-        );
+        // Clone config values we need since we can't borrow config across await
+        let sample_rate = config.base.sample_rate;
+        let channels = config.base.channels;
+        let wav_data = wav::create_wav(&self.audio_buffer, sample_rate, channels);
+
+        // Clone config for use in retry loop (needed because send_request takes &mut self)
+        let config_clone = config.clone();
 
         // Try with retries for transient errors
+        // Use Option to allow moving ownership on final attempt (avoids unnecessary clone)
+        let mut wav_data = Some(wav_data);
         let mut last_error = None;
         for attempt in 0..MAX_RETRIES {
             if attempt > 0 {
-                let delay = BASE_RETRY_DELAY_MS * 2u64.pow(attempt - 1);
-                debug!("Retry attempt {} after {}ms delay", attempt + 1, delay);
+                // Use Retry-After header if available, otherwise exponential backoff
+                let delay = self
+                    .rate_limit_info
+                    .retry_after_ms
+                    .unwrap_or_else(|| BASE_RETRY_DELAY_MS * 2u64.pow(attempt - 1));
+
+                debug!(
+                    "Retry attempt {} after {}ms delay{}",
+                    attempt + 1,
+                    delay,
+                    if self.rate_limit_info.retry_after_ms.is_some() {
+                        " (from Retry-After header)"
+                    } else {
+                        " (exponential backoff)"
+                    }
+                );
                 tokio::time::sleep(Duration::from_millis(delay)).await;
+
+                // Clear retry_after for next iteration
+                self.rate_limit_info.retry_after_ms = None;
             }
 
-            match self.send_request(&wav_data, config).await {
+            // Get wav_data: clone if more retries possible, move ownership on final attempt
+            let is_last_attempt = attempt == MAX_RETRIES - 1;
+            let wav_data_for_request = if is_last_attempt {
+                // Final attempt: move ownership (no clone needed)
+                wav_data.take().expect("wav_data should be present")
+            } else {
+                // More attempts possible: clone (preserves original for retry)
+                wav_data.as_ref().expect("wav_data should be present").clone()
+            };
+
+            match self.send_request(wav_data_for_request, &config_clone).await {
                 Ok(result) => {
+                    // Update last_request_id from response body if available
+                    if let TranscriptionResult::Simple(ref resp) = result
+                        && let Some(ref x_groq) = resp.x_groq
+                    {
+                        self.last_request_id = Some(x_groq.id.clone());
+                    } else if let TranscriptionResult::Verbose(ref resp) = result
+                        && let Some(ref x_groq) = resp.x_groq
+                    {
+                        self.last_request_id = Some(x_groq.id.clone());
+                    }
+
                     // Create STT result and invoke callback
                     let stt_result = STTResult::new(
                         result.text().to_string(),
@@ -376,9 +532,13 @@ impl GroqSTT {
                     );
 
                     info!(
-                        "Transcription complete: {} characters, confidence: {:.2}",
+                        "Transcription complete: {} characters, confidence: {:.2}{}",
                         stt_result.transcript.len(),
-                        stt_result.confidence
+                        stt_result.confidence,
+                        self.last_request_id
+                            .as_ref()
+                            .map(|id| format!(" [request_id: {}]", id))
+                            .unwrap_or_default()
                     );
 
                     // Invoke callback
@@ -429,13 +589,16 @@ impl GroqSTT {
     }
 
     /// Send a single request to the Groq API.
+    ///
+    /// Takes ownership of wav_data to avoid unnecessary copies.
+    /// Updates self.rate_limit_info and self.last_request_id from response headers.
     async fn send_request(
-        &self,
-        wav_data: &[u8],
+        &mut self,
+        wav_data: Vec<u8>,
         config: &GroqSTTConfig,
     ) -> Result<TranscriptionResult, STTError> {
-        // Build multipart form
-        let file_part = Part::bytes(wav_data.to_vec())
+        // Build multipart form - wav_data ownership is transferred here (no copy)
+        let file_part = Part::bytes(wav_data)
             .file_name(format!("audio.{}", config.audio_input_format.extension()))
             .mime_str(config.audio_input_format.mime_type())
             .map_err(|e| STTError::ConfigurationError(format!("Invalid MIME type: {e}")))?;
@@ -483,6 +646,26 @@ impl GroqSTT {
             .await
             .map_err(|e| STTError::NetworkError(format!("Request failed: {e}")))?;
 
+        // Extract rate limit headers before consuming response
+        let rate_limit_info = RateLimitInfo::from_headers(response.headers());
+        self.rate_limit_info = rate_limit_info;
+
+        // Extract request ID for debugging
+        self.last_request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
+        if let Some(ref request_id) = self.last_request_id {
+            debug!("Groq request ID: {}", request_id);
+        }
+
+        // Log rate limit info
+        if let Some(remaining) = self.rate_limit_info.remaining_requests {
+            debug!("Rate limit remaining requests: {}", remaining);
+        }
+
         // Check response status
         let status = response.status();
         let response_text = response
@@ -503,27 +686,46 @@ impl GroqSTT {
                 format!("Groq API error ({}): {}", status, response_text)
             };
 
-            // Classify error type
+            // Classify error type - include request ID for debugging
+            let request_id_suffix = self
+                .last_request_id
+                .as_ref()
+                .map(|id| format!(" [request_id: {}]", id))
+                .unwrap_or_default();
+
             let stt_error = match status.as_u16() {
-                400 => STTError::ConfigurationError(error_msg),
-                401 => STTError::AuthenticationFailed(error_msg),
+                400 => STTError::ConfigurationError(format!("{}{}", error_msg, request_id_suffix)),
+                401 => STTError::AuthenticationFailed(format!("{}{}", error_msg, request_id_suffix)),
                 413 => STTError::AudioProcessingError(format!(
-                    "File too large: {}",
-                    error_msg
+                    "File too large: {}{}",
+                    error_msg, request_id_suffix
                 )),
-                429 => STTError::ProviderError(format!("Rate limit exceeded: {}", error_msg)),
+                429 => {
+                    // Include retry-after info in error message
+                    let retry_info = self
+                        .rate_limit_info
+                        .retry_after_ms
+                        .map(|ms| format!(" (retry after {}ms)", ms))
+                        .unwrap_or_default();
+                    STTError::ProviderError(format!(
+                        "Rate limit exceeded: {}{}{}",
+                        error_msg, retry_info, request_id_suffix
+                    ))
+                }
                 498 => STTError::ProviderError(format!(
-                    "Flex tier capacity exceeded: {}",
-                    error_msg
+                    "Flex tier capacity exceeded: {}{}",
+                    error_msg, request_id_suffix
                 )),
-                500..=599 => STTError::ProviderError(format!("Server error: {}", error_msg)),
-                _ => STTError::ProviderError(error_msg),
+                500..=599 => {
+                    STTError::ProviderError(format!("Server error: {}{}", error_msg, request_id_suffix))
+                }
+                _ => STTError::ProviderError(format!("{}{}", error_msg, request_id_suffix)),
             };
 
             return Err(stt_error);
         }
 
-        // Parse response based on format
+        // Parse response and extract request ID from response body if available
         self.parse_response(&response_text, config)
     }
 
@@ -586,8 +788,7 @@ impl GroqSTT {
                 // Check silence detection with the latest audio chunk
                 if let Some(audio_data) = last_audio_chunk {
                     // Only flush on silence if we have enough audio buffered
-                    // (at least 0.5 seconds at 16kHz mono = ~16KB)
-                    if self.audio_buffer.len() >= 16 * 1024 {
+                    if self.audio_buffer.len() >= MIN_BUFFER_FOR_SILENCE_DETECTION {
                         return self.update_silence_state(audio_data);
                     }
                 }
@@ -623,18 +824,111 @@ impl GroqSTT {
 
         billed_duration_hours * config.model.cost_per_hour()
     }
+
+    // =========================================================================
+    // Buffer Management Methods
+    // =========================================================================
+
+    /// Get the current buffer size in bytes.
+    ///
+    /// Useful for monitoring buffer growth and deciding when to flush.
+    #[inline]
+    pub fn buffer_len(&self) -> usize {
+        self.audio_buffer.len()
+    }
+
+    /// Check if the audio buffer is empty.
+    #[inline]
+    pub fn is_buffer_empty(&self) -> bool {
+        self.audio_buffer.is_empty()
+    }
+
+    /// Clear the audio buffer without triggering transcription.
+    ///
+    /// This discards all buffered audio data. Use with caution.
+    /// Useful for error recovery or when you want to start fresh.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Clear buffer after a failed operation
+    /// stt.clear_buffer();
+    /// // Start fresh
+    /// stt.send_audio(new_audio).await?;
+    /// ```
+    pub fn clear_buffer(&mut self) {
+        self.audio_buffer.clear();
+        self.first_audio_time = None;
+        self.silence_start_time = None;
+        self.last_was_silent = false;
+        debug!("Audio buffer cleared");
+    }
+
+    /// Take ownership of the audio buffer, replacing it with an empty buffer.
+    ///
+    /// This is useful for error recovery when you want to:
+    /// - Save the audio data to disk for later retry
+    /// - Send the audio to a different provider
+    /// - Debug/inspect the audio data
+    ///
+    /// The internal buffer is replaced with a new pre-allocated buffer.
+    ///
+    /// # Returns
+    /// The raw PCM audio data that was buffered.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Save failed audio for later retry
+    /// let audio_data = stt.take_buffer();
+    /// std::fs::write("failed_audio.pcm", &audio_data)?;
+    /// ```
+    pub fn take_buffer(&mut self) -> Vec<u8> {
+        // Pre-allocate new buffer with same capacity as before
+        let capacity = self.audio_buffer.capacity().max(32 * 1024 * 30);
+        let mut new_buffer = Vec::with_capacity(capacity);
+        std::mem::swap(&mut self.audio_buffer, &mut new_buffer);
+
+        // Reset silence detection state
+        self.first_audio_time = None;
+        self.silence_start_time = None;
+        self.last_was_silent = false;
+
+        debug!("Audio buffer taken ({} bytes)", new_buffer.len());
+        new_buffer
+    }
+
+    /// Get a reference to the audio buffer for inspection.
+    ///
+    /// This is useful for debugging or when you need to inspect
+    /// the buffered audio without taking ownership.
+    #[inline]
+    pub fn buffer(&self) -> &[u8] {
+        &self.audio_buffer
+    }
 }
 
 impl Default for GroqSTT {
     fn default() -> Self {
+        // Create HTTP client with sensible defaults matching with_config()
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
+            .pool_max_idle_per_host(4)
+            .user_agent(USER_AGENT)
+            .build()
+            .unwrap_or_else(|_| Client::new());
+
         Self {
             config: None,
-            http_client: Client::new(),
+            http_client,
             audio_buffer: Vec::with_capacity(32 * 1024 * 30),
             connected: AtomicBool::new(false),
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
             total_bytes_received: 0,
+            rate_limit_info: RateLimitInfo::default(),
+            last_request_id: None,
             first_audio_time: None,
             silence_start_time: None,
             last_was_silent: false,
@@ -684,22 +978,41 @@ impl BaseSTT for GroqSTT {
     /// Disconnect and flush any buffered audio.
     ///
     /// This triggers transcription of any accumulated audio data.
+    ///
+    /// # Error Handling
+    ///
+    /// If the flush fails, the error is returned to the caller so they can
+    /// decide how to handle it (e.g., retry, save audio to disk, etc.).
+    /// The connection state is still updated to disconnected.
     async fn disconnect(&mut self) -> Result<(), STTError> {
         if !self.connected.load(Ordering::Acquire) {
             return Ok(()); // Already disconnected
         }
 
-        // Flush any remaining audio
-        if !self.audio_buffer.is_empty()
-            && let Err(e) = self.flush_buffer().await
-        {
-            error!("Failed to flush audio buffer during disconnect: {}", e);
-            // Continue with disconnect even if flush fails
-        }
+        // Flush any remaining audio - capture the result
+        let flush_result = if !self.audio_buffer.is_empty() {
+            let buffer_len = self.audio_buffer.len();
+            match self.flush_buffer().await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // Log error with buffer size for debugging
+                    error!(
+                        "Failed to flush {} bytes of audio during disconnect: {}",
+                        buffer_len, e
+                    );
+                    // Audio buffer is NOT cleared here - caller can retrieve it
+                    // via audio_buffer field if needed for recovery
+                    Err(e)
+                }
+            }
+        } else {
+            Ok(())
+        };
 
-        // Clear state
+        // Update connection state regardless of flush result
         self.connected.store(false, Ordering::Release);
-        self.audio_buffer.clear();
+
+        // Only clear callbacks, not the audio buffer (preserve for error recovery)
         *self.result_callback.lock().await = None;
         *self.error_callback.lock().await = None;
 
@@ -707,7 +1020,9 @@ impl BaseSTT for GroqSTT {
             "Groq STT disconnected. Total bytes processed: {}",
             self.total_bytes_received
         );
-        Ok(())
+
+        // Return flush result - propagate error to caller
+        flush_result
     }
 
     /// Check if the client is ready to receive audio.

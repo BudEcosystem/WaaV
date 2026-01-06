@@ -117,11 +117,17 @@ impl GroqSTTModel {
     }
 
     /// Get the cost per hour in USD.
+    ///
+    /// Uses centralized pricing from `crate::config::pricing`.
+    /// Falls back to hardcoded values if not found in pricing database.
     pub fn cost_per_hour(&self) -> f64 {
-        match self {
-            Self::WhisperLargeV3 => 0.111,
-            Self::WhisperLargeV3Turbo => 0.04,
-        }
+        crate::config::get_stt_price_per_hour("groq", self.as_str()).unwrap_or_else(|| {
+            // Fallback to hardcoded values (should not happen if pricing db is up to date)
+            match self {
+                Self::WhisperLargeV3 => 0.111,
+                Self::WhisperLargeV3Turbo => 0.04,
+            }
+        })
     }
 }
 
@@ -275,7 +281,8 @@ impl AudioInputFormat {
 ///
 /// Since Groq Whisper is a REST API (not streaming WebSocket),
 /// we need to buffer audio and send it in batches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FlushStrategy {
     /// Only send on explicit disconnect - accumulate all audio first.
     /// Best for pre-recorded audio or when you want full context.
@@ -299,18 +306,22 @@ pub enum FlushStrategy {
 ///
 /// Used to detect when a speaker has stopped talking, triggering
 /// a flush of the audio buffer for transcription.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SilenceDetectionConfig {
     /// RMS energy threshold below which audio is considered silent.
-    /// Default is 0.01 (relative to normalized audio -1.0 to 1.0).
+    /// Valid range: 0.0 to 1.0 (relative to normalized audio -1.0 to 1.0).
+    /// Default is 0.01.
     pub rms_threshold: f32,
 
     /// Minimum duration of silence (in milliseconds) before triggering flush.
+    /// Valid range: 100 to 60000 (0.1 to 60 seconds).
     /// Default is 1000ms (1 second).
     pub silence_duration_ms: u32,
 
     /// Minimum audio duration (in milliseconds) before silence detection is active.
     /// Prevents premature flush for initial silence.
+    /// Valid range: 0 to 30000 (0 to 30 seconds).
     /// Default is 500ms.
     pub min_audio_duration_ms: u32,
 }
@@ -322,6 +333,34 @@ impl Default for SilenceDetectionConfig {
             silence_duration_ms: 1000,
             min_audio_duration_ms: 500,
         }
+    }
+}
+
+impl SilenceDetectionConfig {
+    /// Validate the silence detection configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(0.0..=1.0).contains(&self.rms_threshold) {
+            return Err(format!(
+                "RMS threshold must be between 0.0 and 1.0, got {}",
+                self.rms_threshold
+            ));
+        }
+
+        if !(100..=60000).contains(&self.silence_duration_ms) {
+            return Err(format!(
+                "Silence duration must be between 100ms and 60000ms, got {}ms",
+                self.silence_duration_ms
+            ));
+        }
+
+        if self.min_audio_duration_ms > 30000 {
+            return Err(format!(
+                "Minimum audio duration must be at most 30000ms, got {}ms",
+                self.min_audio_duration_ms
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -488,15 +527,26 @@ impl GroqSTTConfig {
         }
 
         if let Some(ref prompt) = self.prompt {
-            // Rough estimate: average 4 chars per token
-            let estimated_tokens = prompt.len() / 4;
+            // Token estimation is language-dependent:
+            // - English: ~4 chars per token (words avg 4-5 chars + spaces)
+            // - CJK (Chinese, Japanese, Korean): ~1-2 chars per token
+            // - Other languages vary
+            //
+            // We use a conservative estimate of 2 chars per token to avoid
+            // rejecting valid prompts in non-English languages.
+            // The API will return a proper error if the prompt is actually too long.
+            let estimated_tokens = prompt.len().div_ceil(2); // Conservative estimate
             if estimated_tokens > MAX_PROMPT_TOKENS {
                 return Err(format!(
-                    "Prompt too long: estimated {} tokens, max is {}",
+                    "Prompt likely too long: estimated ~{} tokens (at 2 chars/token), max is {}. \
+                     Note: Actual token count varies by language.",
                     estimated_tokens, MAX_PROMPT_TOKENS
                 ));
             }
         }
+
+        // Validate silence detection config
+        self.silence_detection.validate()?;
 
         Ok(())
     }

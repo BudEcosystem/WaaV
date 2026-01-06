@@ -33,11 +33,16 @@ use std::path::PathBuf;
 
 mod env;
 mod merge;
+pub mod pricing;
 mod sip;
 mod utils;
 mod validation;
 mod yaml;
 
+pub use pricing::{
+    ModelPricing, PricingUnit, estimate_stt_cost, estimate_tts_cost, get_stt_price_per_hour,
+    get_stt_pricing, get_tts_pricing, list_stt_models, list_tts_models,
+};
 pub use sip::{SipConfig, SipHookConfig};
 
 /// TLS configuration for HTTPS and WSS

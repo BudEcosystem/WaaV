@@ -319,6 +319,29 @@ providers:
 
 ---
 
+## Pricing Reference
+
+WaaV Gateway includes a centralized pricing database at `src/config/pricing.rs` that can be used to estimate costs for all providers. The pricing data is kept up-to-date and provides:
+
+- Per-provider, per-model pricing
+- Helper functions: `estimate_stt_cost()`, `estimate_tts_cost()`
+- Support for different pricing units (per-hour, per-minute, per-1K chars, per-1M chars)
+
+Example usage:
+```rust
+use waav_gateway::config::{estimate_stt_cost, estimate_tts_cost};
+
+// Estimate cost for 1 hour of Groq Whisper transcription
+let stt_cost = estimate_stt_cost("groq", "whisper-large-v3-turbo", 3600.0);
+// Returns: Some(0.04)
+
+// Estimate cost for 1000 characters of ElevenLabs TTS
+let tts_cost = estimate_tts_cost("elevenlabs", "eleven_multilingual_v2", 1000);
+// Returns: Some(0.24)
+```
+
+---
+
 ## Coming Soon
 
 The following providers are planned for future releases:

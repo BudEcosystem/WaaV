@@ -470,7 +470,8 @@ mod message_tests {
             temperature: None,
         };
 
-        assert!((segment.confidence() - 0.8).abs() < 0.001);
+        // Default confidence is 0.5 (DEFAULT_UNKNOWN_CONFIDENCE) when avg_logprob is None
+        assert!((segment.confidence() - 0.5).abs() < 0.001);
     }
 
     #[test]
@@ -977,5 +978,555 @@ mod constants_tests {
     #[test]
     fn test_max_prompt_tokens() {
         assert_eq!(MAX_PROMPT_TOKENS, 224);
+    }
+}
+
+// =============================================================================
+// Rate Limit Info Tests
+// =============================================================================
+
+mod rate_limit_tests {
+    use super::*;
+
+    #[test]
+    fn test_rate_limit_info_default() {
+        let info = RateLimitInfo::default();
+        assert!(info.remaining_requests.is_none());
+        assert!(info.remaining_tokens.is_none());
+        assert!(info.reset_requests_at.is_none());
+        assert!(info.reset_tokens_at.is_none());
+        assert!(info.retry_after_ms.is_none());
+    }
+
+    #[test]
+    fn test_rate_limit_parse_duration_string_ms() {
+        let result = RateLimitInfo::parse_duration_string("500ms");
+        assert_eq!(result, Some(500));
+    }
+
+    #[test]
+    fn test_rate_limit_parse_duration_string_seconds() {
+        let result = RateLimitInfo::parse_duration_string("5s");
+        assert_eq!(result, Some(5000));
+    }
+
+    #[test]
+    fn test_rate_limit_parse_duration_string_minutes() {
+        let result = RateLimitInfo::parse_duration_string("2m");
+        assert_eq!(result, Some(120_000));
+    }
+
+    #[test]
+    fn test_rate_limit_parse_duration_string_invalid() {
+        assert!(RateLimitInfo::parse_duration_string("invalid").is_none());
+        assert!(RateLimitInfo::parse_duration_string("").is_none());
+        assert!(RateLimitInfo::parse_duration_string("5h").is_none()); // hours not supported
+    }
+
+    #[test]
+    fn test_rate_limit_parse_retry_after_seconds() {
+        // Integer seconds should be converted to ms
+        let result = RateLimitInfo::parse_retry_after("5");
+        assert_eq!(result, Some(5000));
+    }
+
+    #[test]
+    fn test_rate_limit_parse_retry_after_duration_string() {
+        let result = RateLimitInfo::parse_retry_after("500ms");
+        assert_eq!(result, Some(500));
+    }
+
+    #[test]
+    fn test_rate_limit_from_headers() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-ratelimit-remaining-requests",
+            HeaderValue::from_static("100"),
+        );
+        headers.insert(
+            "x-ratelimit-remaining-tokens",
+            HeaderValue::from_static("50000"),
+        );
+        headers.insert("retry-after", HeaderValue::from_static("30"));
+
+        let info = RateLimitInfo::from_headers(&headers);
+        assert_eq!(info.remaining_requests, Some(100));
+        assert_eq!(info.remaining_tokens, Some(50000));
+        assert_eq!(info.retry_after_ms, Some(30_000)); // 30 seconds in ms
+    }
+
+    #[test]
+    fn test_rate_limit_from_headers_empty() {
+        let headers = reqwest::header::HeaderMap::new();
+        let info = RateLimitInfo::from_headers(&headers);
+        assert!(info.remaining_requests.is_none());
+        assert!(info.remaining_tokens.is_none());
+        assert!(info.retry_after_ms.is_none());
+    }
+}
+
+// =============================================================================
+// WAV Validation Tests
+// =============================================================================
+
+mod wav_validation_tests {
+    use super::messages::wav::{try_create_wav, WavError};
+
+    #[test]
+    fn test_wav_zero_sample_rate() {
+        let pcm_data = vec![0u8; 100];
+        let result = try_create_wav(&pcm_data, 0, 1);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), WavError::ZeroSampleRate);
+    }
+
+    #[test]
+    fn test_wav_zero_channels() {
+        let pcm_data = vec![0u8; 100];
+        let result = try_create_wav(&pcm_data, 16000, 0);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), WavError::ZeroChannels);
+    }
+
+    #[test]
+    fn test_wav_valid_params() {
+        let pcm_data = vec![0u8; 100];
+        let result = try_create_wav(&pcm_data, 16000, 1);
+        assert!(result.is_ok());
+        let wav = result.unwrap();
+        assert_eq!(wav.len(), 44 + 100); // header + data
+    }
+
+    #[test]
+    fn test_wav_error_display() {
+        assert_eq!(
+            WavError::ZeroSampleRate.to_string(),
+            "Sample rate cannot be zero"
+        );
+        assert_eq!(
+            WavError::ZeroChannels.to_string(),
+            "Number of channels cannot be zero"
+        );
+        assert_eq!(
+            WavError::DataTooLarge.to_string(),
+            "PCM data exceeds maximum WAV file size (4GB)"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid WAV parameters")]
+    fn test_wav_create_panics_on_zero_sample_rate() {
+        let pcm_data = vec![0u8; 100];
+        let _ = super::messages::wav::create_wav(&pcm_data, 0, 1);
+    }
+}
+
+// =============================================================================
+// Silence Detection Config Tests
+// =============================================================================
+
+mod silence_detection_config_tests {
+    use super::*;
+
+    #[test]
+    fn test_silence_config_default() {
+        let config = SilenceDetectionConfig::default();
+        assert!((config.rms_threshold - 0.01).abs() < f32::EPSILON);
+        assert_eq!(config.silence_duration_ms, 1000);
+        assert_eq!(config.min_audio_duration_ms, 500);
+    }
+
+    #[test]
+    fn test_silence_config_validate_valid() {
+        let config = SilenceDetectionConfig {
+            rms_threshold: 0.05,
+            silence_duration_ms: 500,
+            min_audio_duration_ms: 1000,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_silence_config_validate_invalid_rms_threshold_negative() {
+        let config = SilenceDetectionConfig {
+            rms_threshold: -0.01,
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("RMS threshold"));
+    }
+
+    #[test]
+    fn test_silence_config_validate_invalid_rms_threshold_high() {
+        let config = SilenceDetectionConfig {
+            rms_threshold: 1.5,
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("RMS threshold"));
+    }
+
+    #[test]
+    fn test_silence_config_validate_invalid_duration_too_short() {
+        let config = SilenceDetectionConfig {
+            silence_duration_ms: 50, // Below 100ms
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Silence duration"));
+    }
+
+    #[test]
+    fn test_silence_config_validate_invalid_duration_too_long() {
+        let config = SilenceDetectionConfig {
+            silence_duration_ms: 70000, // Above 60000ms
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Silence duration"));
+    }
+
+    #[test]
+    fn test_silence_config_validate_invalid_min_audio_duration() {
+        let config = SilenceDetectionConfig {
+            min_audio_duration_ms: 35000, // Above 30000ms
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Minimum audio duration"));
+    }
+
+    #[test]
+    fn test_silence_config_serialization() {
+        let config = SilenceDetectionConfig {
+            rms_threshold: 0.02,
+            silence_duration_ms: 500,
+            min_audio_duration_ms: 1000,
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: SilenceDetectionConfig = serde_json::from_str(&json).unwrap();
+
+        assert!((deserialized.rms_threshold - 0.02).abs() < f32::EPSILON);
+        assert_eq!(deserialized.silence_duration_ms, 500);
+        assert_eq!(deserialized.min_audio_duration_ms, 1000);
+    }
+
+    #[test]
+    fn test_silence_config_deserialization_defaults() {
+        // Empty JSON object should use defaults
+        let config: SilenceDetectionConfig = serde_json::from_str("{}").unwrap();
+        assert!((config.rms_threshold - 0.01).abs() < f32::EPSILON);
+        assert_eq!(config.silence_duration_ms, 1000);
+        assert_eq!(config.min_audio_duration_ms, 500);
+    }
+}
+
+// =============================================================================
+// Flush Strategy Tests
+// =============================================================================
+
+mod flush_strategy_tests {
+    use super::*;
+
+    #[test]
+    fn test_flush_strategy_default() {
+        assert_eq!(FlushStrategy::default(), FlushStrategy::OnDisconnect);
+    }
+
+    #[test]
+    fn test_flush_strategy_serialization() {
+        let strategies = [
+            (FlushStrategy::OnDisconnect, "\"on_disconnect\""),
+            (FlushStrategy::OnThreshold, "\"on_threshold\""),
+            (FlushStrategy::OnSilence, "\"on_silence\""),
+        ];
+
+        for (strategy, expected_json) in strategies {
+            let json = serde_json::to_string(&strategy).unwrap();
+            assert_eq!(json, expected_json);
+
+            let deserialized: FlushStrategy = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, strategy);
+        }
+    }
+}
+
+// =============================================================================
+// Buffer Management Tests
+// =============================================================================
+
+mod buffer_management_tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn test_buffer_len_empty() {
+        let config = STTConfig {
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+        let stt = <GroqSTT as BaseSTT>::new(config).unwrap();
+        assert_eq!(stt.buffer_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_buffer_len_with_data() {
+        let config = STTConfig {
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+        let mut stt = <GroqSTT as BaseSTT>::new(config).unwrap();
+        stt.connect().await.unwrap();
+
+        let audio: Bytes = vec![0u8; 1000].into();
+        stt.send_audio(audio).await.unwrap();
+        assert_eq!(stt.buffer_len(), 1000);
+    }
+
+    #[tokio::test]
+    async fn test_is_buffer_empty() {
+        let config = STTConfig {
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+        let mut stt = <GroqSTT as BaseSTT>::new(config).unwrap();
+        assert!(stt.is_buffer_empty());
+
+        stt.connect().await.unwrap();
+        let audio: Bytes = vec![0u8; 100].into();
+        stt.send_audio(audio).await.unwrap();
+        assert!(!stt.is_buffer_empty());
+    }
+
+    #[tokio::test]
+    async fn test_clear_buffer() {
+        let config = STTConfig {
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+        let mut stt = <GroqSTT as BaseSTT>::new(config).unwrap();
+        stt.connect().await.unwrap();
+
+        let audio: Bytes = vec![0u8; 1000].into();
+        stt.send_audio(audio).await.unwrap();
+        assert!(!stt.is_buffer_empty());
+
+        stt.clear_buffer();
+
+        assert!(stt.is_buffer_empty());
+        assert_eq!(stt.buffer_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_take_buffer() {
+        let config = STTConfig {
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+        let mut stt = <GroqSTT as BaseSTT>::new(config).unwrap();
+        stt.connect().await.unwrap();
+
+        let original_data = vec![1u8, 2, 3, 4, 5];
+        let audio: Bytes = original_data.clone().into();
+        stt.send_audio(audio).await.unwrap();
+
+        let taken = stt.take_buffer();
+
+        assert_eq!(taken, original_data);
+        assert!(stt.is_buffer_empty());
+    }
+
+    #[tokio::test]
+    async fn test_buffer_reference() {
+        let config = STTConfig {
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+        let mut stt = <GroqSTT as BaseSTT>::new(config).unwrap();
+        stt.connect().await.unwrap();
+
+        let data = vec![10u8, 20, 30];
+        let audio: Bytes = data.clone().into();
+        stt.send_audio(audio).await.unwrap();
+
+        let buffer_ref = stt.buffer();
+        assert_eq!(buffer_ref, &data[..]);
+    }
+
+    #[tokio::test]
+    async fn test_take_buffer_clears_state() {
+        let config = STTConfig {
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+        let mut stt = <GroqSTT as BaseSTT>::new(config).unwrap();
+        stt.connect().await.unwrap();
+
+        // Send audio
+        let audio: Bytes = vec![0u8; 1000].into();
+        stt.send_audio(audio).await.unwrap();
+
+        // Take the buffer
+        let taken = stt.take_buffer();
+        assert_eq!(taken.len(), 1000);
+
+        // Buffer should be empty but still usable
+        assert!(stt.is_buffer_empty());
+
+        // Can send more audio
+        let more_audio: Bytes = vec![1u8; 500].into();
+        stt.send_audio(more_audio).await.unwrap();
+        assert_eq!(stt.buffer_len(), 500);
+    }
+}
+
+// =============================================================================
+// Duration Weighted Confidence Tests
+// =============================================================================
+
+mod confidence_tests {
+    use super::*;
+
+    #[test]
+    fn test_transcription_result_confidence_weighted_by_duration() {
+        // Create a verbose response with segments of different durations and confidences
+        let verbose = TranscriptionResult::Verbose(VerboseTranscriptionResponse {
+            text: "Test".to_string(),
+            language: None,
+            duration: None,
+            segments: vec![
+                Segment {
+                    id: 0,
+                    seek: 0,
+                    start: 0.0,
+                    end: 1.0, // 1 second
+                    text: "Short".to_string(),
+                    avg_logprob: Some(-0.5), // Higher confidence
+                    no_speech_prob: None,
+                    compression_ratio: None,
+                    tokens: vec![],
+                    temperature: None,
+                },
+                Segment {
+                    id: 1,
+                    seek: 0,
+                    start: 1.0,
+                    end: 4.0, // 3 seconds
+                    text: "Longer segment".to_string(),
+                    avg_logprob: Some(-1.5), // Lower confidence
+                    no_speech_prob: None,
+                    compression_ratio: None,
+                    tokens: vec![],
+                    temperature: None,
+                },
+            ],
+            words: vec![],
+            x_groq: None,
+        });
+
+        let confidence = verbose.confidence();
+
+        // Weighted average should favor the longer segment (3 seconds vs 1 second)
+        // So overall confidence should be closer to the lower confidence segment
+        assert!(confidence > 0.0 && confidence < 1.0);
+
+        // Get individual segment confidences for comparison
+        let seg0_conf = verbose.segments().unwrap()[0].confidence();
+        let seg1_conf = verbose.segments().unwrap()[1].confidence();
+
+        // The weighted average should be between the two, but closer to seg1
+        // due to duration weighting (seg1 is 3x longer)
+        assert!(confidence < seg0_conf);
+        assert!(confidence > seg1_conf);
+    }
+
+    #[test]
+    fn test_transcription_result_confidence_empty_segments() {
+        let verbose = TranscriptionResult::Verbose(VerboseTranscriptionResponse {
+            text: "Test".to_string(),
+            language: None,
+            duration: None,
+            segments: vec![],
+            words: vec![],
+            x_groq: None,
+        });
+
+        // Should return DEFAULT_UNKNOWN_CONFIDENCE when no segments
+        assert!((verbose.confidence() - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_transcription_result_confidence_zero_duration_segments() {
+        // Test fallback when all segment durations are zero
+        let verbose = TranscriptionResult::Verbose(VerboseTranscriptionResponse {
+            text: "Test".to_string(),
+            language: None,
+            duration: None,
+            segments: vec![
+                Segment {
+                    id: 0,
+                    seek: 0,
+                    start: 0.0,
+                    end: 0.0, // Zero duration
+                    text: "A".to_string(),
+                    avg_logprob: Some(-0.3),
+                    no_speech_prob: None,
+                    compression_ratio: None,
+                    tokens: vec![],
+                    temperature: None,
+                },
+                Segment {
+                    id: 1,
+                    seek: 0,
+                    start: 0.0,
+                    end: 0.0, // Zero duration
+                    text: "B".to_string(),
+                    avg_logprob: Some(-0.7),
+                    no_speech_prob: None,
+                    compression_ratio: None,
+                    tokens: vec![],
+                    temperature: None,
+                },
+            ],
+            words: vec![],
+            x_groq: None,
+        });
+
+        // Should fallback to simple average
+        let confidence = verbose.confidence();
+        assert!(confidence > 0.0 && confidence < 1.0);
+    }
+}
+
+// =============================================================================
+// Default Unknown Confidence Constant Tests
+// =============================================================================
+
+mod confidence_constant_tests {
+    use super::*;
+
+    #[test]
+    fn test_default_confidence_constants_match() {
+        // Verify that the f32 and f64 constants are equivalent
+        let f32_const = DEFAULT_UNKNOWN_CONFIDENCE;
+        let f64_const = MESSAGE_DEFAULT_UNKNOWN_CONFIDENCE;
+
+        // f32 should be derived from f64
+        assert!((f32_const as f64 - f64_const).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_default_confidence_value() {
+        // Both should be 0.5
+        assert!((DEFAULT_UNKNOWN_CONFIDENCE - 0.5).abs() < f32::EPSILON);
+        assert!((MESSAGE_DEFAULT_UNKNOWN_CONFIDENCE - 0.5).abs() < f64::EPSILON);
     }
 }

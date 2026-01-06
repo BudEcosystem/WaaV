@@ -11,13 +11,17 @@ A high-performance real-time voice processing server built in Rust that provides
 - **Real-time Processing**: WebSocket-based bidirectional audio streaming
 - **LiveKit Integration**: WebRTC audio streaming with room-based communication
 - **Advanced Noise Filtering**: Optional DeepFilterNet integration (`noise-filter` feature)
-- **Provider Flexibility**: Pluggable architecture supporting multiple providers
+- **Provider Flexibility**: Pluggable architecture supporting 10+ providers
   - Deepgram (STT/TTS)
   - ElevenLabs (STT/TTS)
   - Google Cloud (STT/TTS) - WaveNet, Neural2, and Studio voices
   - Microsoft Azure (STT/TTS) - 400+ neural voices across 140+ languages
   - OpenAI (STT/TTS/Realtime) - Whisper, TTS-1, GPT-4o Realtime API
   - AssemblyAI (STT) - Streaming API v3, 99 languages, immutable transcripts
+  - Cartesia (STT/TTS) - Ultra-low latency Sonic model
+  - AWS Transcribe/Polly (STT/TTS) - Enterprise-grade with 100+ languages
+  - IBM Watson (STT/TTS) - 30+ languages, speaker diarization, neural voices
+  - Groq (STT) - Ultra-fast Whisper (216x real-time), $0.04/hour
 - **OpenAI Realtime API**: Full-duplex audio-to-audio streaming with GPT-4o
 - **Audio-Disabled Mode**: Development mode without API keys
 
@@ -136,6 +140,18 @@ For complete authentication setup and architecture details, see [docs/authentica
     "audio_disabled": false,
     "deepgram_model": "nova-2",
     "elevenlabs_voice_id": "voice_id_here"
+  }
+}
+```
+
+**Groq STT Configuration** (ultra-fast Whisper):
+```json
+{
+  "type": "config",
+  "config": {
+    "stt_provider": "groq",
+    "groq_model": "whisper-large-v3-turbo",
+    "language": "en"
   }
 }
 ```
@@ -276,6 +292,12 @@ docker run -p 3001:3001 --env-file .env waav-gateway
 | `AZURE_SPEECH_REGION` | Azure region (e.g., eastus, westeurope) | `eastus` | No* |
 | `OPENAI_API_KEY` | OpenAI API key (for STT, TTS, and Realtime) | - | No* |
 | `ASSEMBLYAI_API_KEY` | AssemblyAI API key (for streaming STT) | - | No* |
+| `CARTESIA_API_KEY` | Cartesia API key (for STT/TTS) | - | No* |
+| `AWS_ACCESS_KEY_ID` | AWS access key (for Transcribe/Polly) | - | No* |
+| `AWS_SECRET_ACCESS_KEY` | AWS secret key (for Transcribe/Polly) | - | No* |
+| `IBM_WATSON_API_KEY` | IBM Watson API key (for STT/TTS) | - | No* |
+| `IBM_WATSON_INSTANCE_ID` | IBM Watson service instance ID | - | No* |
+| `GROQ_API_KEY` | Groq API key (for ultra-fast Whisper STT) | - | No* |
 | `LIVEKIT_URL` | LiveKit server WebSocket URL | `ws://localhost:7880` | No |
 | `LIVEKIT_API_KEY` | LiveKit API key (for webhooks and token generation) | - | No*** |
 | `LIVEKIT_API_SECRET` | LiveKit API secret (for webhooks and token generation) | - | No*** |
