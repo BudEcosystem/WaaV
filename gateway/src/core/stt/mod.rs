@@ -6,6 +6,7 @@ pub mod cartesia;
 pub mod deepgram;
 pub mod elevenlabs;
 pub mod google;
+pub mod groq;
 pub mod ibm_watson;
 pub mod openai;
 
@@ -58,6 +59,16 @@ pub use ibm_watson::{
     IBM_IAM_URL, IBM_WATSON_STT_URL,
 };
 
+// Re-export Groq implementation
+pub use groq::{
+    AudioInputFormat as GroqAudioInputFormat, FlushStrategy as GroqFlushStrategy,
+    GroqResponseFormat, GroqSTT, GroqSTTConfig, GroqSTTModel,
+    SilenceDetectionConfig as GroqSilenceDetectionConfig,
+    TimestampGranularity as GroqTimestampGranularity, DEFAULT_MAX_FILE_SIZE as GROQ_DEFAULT_MAX_FILE_SIZE,
+    DEV_TIER_MAX_FILE_SIZE as GROQ_DEV_TIER_MAX_FILE_SIZE, GROQ_STT_URL, GROQ_TRANSLATION_URL,
+    MAX_PROMPT_TOKENS as GROQ_MAX_PROMPT_TOKENS,
+};
+
 /// Supported STT providers
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum STTProvider {
@@ -79,6 +90,8 @@ pub enum STTProvider {
     AwsTranscribe,
     /// IBM Watson Speech-to-Text WebSocket API
     IbmWatson,
+    /// Groq Whisper STT REST API (ultra-fast)
+    Groq,
 }
 
 impl std::fmt::Display for STTProvider {
@@ -93,6 +106,7 @@ impl std::fmt::Display for STTProvider {
             STTProvider::AssemblyAI => write!(f, "assemblyai"),
             STTProvider::AwsTranscribe => write!(f, "aws-transcribe"),
             STTProvider::IbmWatson => write!(f, "ibm-watson"),
+            STTProvider::Groq => write!(f, "groq"),
         }
     }
 }
@@ -113,8 +127,9 @@ impl std::str::FromStr for STTProvider {
                 Ok(STTProvider::AwsTranscribe)
             }
             "ibm-watson" | "ibm_watson" | "watson" | "ibm" => Ok(STTProvider::IbmWatson),
+            "groq" => Ok(STTProvider::Groq),
             _ => Err(STTError::ConfigurationError(format!(
-                "Unsupported STT provider: {s}. Supported providers: deepgram, google, elevenlabs, microsoft-azure, cartesia, openai, assemblyai, aws-transcribe, ibm-watson"
+                "Unsupported STT provider: {s}. Supported providers: deepgram, google, elevenlabs, microsoft-azure, cartesia, openai, assemblyai, aws-transcribe, ibm-watson, groq"
             ))),
         }
     }
@@ -201,6 +216,10 @@ pub fn create_stt_provider(
             let ibm_watson_stt = <IbmWatsonSTT as BaseSTT>::new(config)?;
             Ok(Box::new(ibm_watson_stt))
         }
+        STTProvider::Groq => {
+            let groq_stt = <GroqSTT as BaseSTT>::new(config)?;
+            Ok(Box::new(groq_stt))
+        }
     }
 }
 
@@ -276,6 +295,10 @@ pub fn create_stt_provider_from_enum(
             let ibm_watson_stt = <IbmWatsonSTT as BaseSTT>::new(config)?;
             Ok(Box::new(ibm_watson_stt))
         }
+        STTProvider::Groq => {
+            let groq_stt = <GroqSTT as BaseSTT>::new(config)?;
+            Ok(Box::new(groq_stt))
+        }
     }
 }
 
@@ -303,6 +326,7 @@ pub fn get_supported_stt_providers() -> Vec<&'static str> {
         "assemblyai",
         "aws-transcribe",
         "ibm-watson",
+        "groq",
     ]
 }
 
@@ -401,7 +425,9 @@ mod factory_tests {
                 "cartesia",
                 "openai",
                 "assemblyai",
-                "aws-transcribe"
+                "aws-transcribe",
+                "ibm-watson",
+                "groq",
             ]
         );
         assert!(providers.contains(&"deepgram"));
@@ -411,6 +437,9 @@ mod factory_tests {
         assert!(providers.contains(&"openai"));
         assert!(providers.contains(&"cartesia"));
         assert!(providers.contains(&"assemblyai"));
+        assert!(providers.contains(&"aws-transcribe"));
+        assert!(providers.contains(&"ibm-watson"));
+        assert!(providers.contains(&"groq"));
     }
 
     #[tokio::test]
@@ -794,6 +823,186 @@ mod factory_tests {
         assert!(result.is_err());
         if let Err(STTError::ConfigurationError(msg)) = result {
             assert!(msg.contains("assemblyai"));
+        }
+    }
+
+    // Groq STT provider tests
+
+    #[test]
+    fn test_stt_provider_enum_groq_from_string() {
+        // Test valid provider names - Groq
+        assert_eq!("groq".parse::<STTProvider>().unwrap(), STTProvider::Groq);
+        assert_eq!("Groq".parse::<STTProvider>().unwrap(), STTProvider::Groq);
+        assert_eq!("GROQ".parse::<STTProvider>().unwrap(), STTProvider::Groq);
+    }
+
+    #[test]
+    fn test_stt_provider_enum_groq_display() {
+        assert_eq!(STTProvider::Groq.to_string(), "groq");
+    }
+
+    #[test]
+    fn test_create_stt_provider_groq_valid() {
+        let config = STTConfig {
+            provider: "groq".to_string(),
+            api_key: "gsk_test_key_12345".to_string(),
+            language: "en".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "linear16".to_string(),
+            model: "whisper-large-v3-turbo".to_string(),
+        };
+
+        let result = create_stt_provider("groq", config);
+        assert!(result.is_ok());
+
+        let stt = result.unwrap();
+        assert_eq!(stt.get_provider_info(), "Groq Whisper STT");
+        assert!(!stt.is_ready()); // Not connected yet (REST-based, always ready after connect)
+    }
+
+    #[test]
+    fn test_create_stt_provider_groq_empty_api_key() {
+        let config = STTConfig {
+            provider: "groq".to_string(),
+            api_key: String::new(), // Empty API key should fail
+            language: "en".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "linear16".to_string(),
+            model: "whisper-large-v3-turbo".to_string(),
+        };
+
+        let result = create_stt_provider("groq", config);
+        assert!(result.is_err());
+
+        if let Err(STTError::AuthenticationFailed(msg)) = result {
+            assert!(msg.contains("API key is required"));
+        } else {
+            panic!("Expected AuthenticationFailed error");
+        }
+    }
+
+    #[test]
+    fn test_create_stt_provider_from_enum_groq() {
+        let config = STTConfig {
+            provider: "groq".to_string(),
+            api_key: "gsk_test_key_12345".to_string(),
+            language: "en".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "linear16".to_string(),
+            model: "whisper-large-v3-turbo".to_string(),
+        };
+
+        let result = create_stt_provider_from_enum(STTProvider::Groq, config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_error_message_includes_groq() {
+        let result = "invalid".parse::<STTProvider>();
+        assert!(result.is_err());
+        if let Err(STTError::ConfigurationError(msg)) = result {
+            assert!(msg.contains("groq"));
+        }
+    }
+
+    // IBM Watson STT provider tests
+
+    #[test]
+    fn test_stt_provider_enum_ibm_watson_from_string() {
+        // Test valid provider names - IBM Watson
+        assert_eq!(
+            "ibm-watson".parse::<STTProvider>().unwrap(),
+            STTProvider::IbmWatson
+        );
+        assert_eq!(
+            "ibm_watson".parse::<STTProvider>().unwrap(),
+            STTProvider::IbmWatson
+        );
+        assert_eq!(
+            "watson".parse::<STTProvider>().unwrap(),
+            STTProvider::IbmWatson
+        );
+        assert_eq!("ibm".parse::<STTProvider>().unwrap(), STTProvider::IbmWatson);
+    }
+
+    #[test]
+    fn test_stt_provider_enum_ibm_watson_display() {
+        assert_eq!(STTProvider::IbmWatson.to_string(), "ibm-watson");
+    }
+
+    #[test]
+    fn test_create_stt_provider_ibm_watson_valid() {
+        let config = STTConfig {
+            provider: "ibm-watson".to_string(),
+            api_key: "test_api_key".to_string(),
+            language: "en-US".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "audio/l16".to_string(),
+            model: "en-US_Telephony".to_string(),
+        };
+
+        let result = create_stt_provider("ibm-watson", config);
+        assert!(result.is_ok());
+
+        let stt = result.unwrap();
+        assert_eq!(stt.get_provider_info(), "IBM Watson Speech-to-Text");
+        assert!(!stt.is_ready()); // Not connected yet
+    }
+
+    #[test]
+    fn test_create_stt_provider_ibm_watson_empty_api_key() {
+        let config = STTConfig {
+            provider: "ibm-watson".to_string(),
+            api_key: String::new(), // Empty API key should fail
+            language: "en-US".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "audio/l16".to_string(),
+            model: "en-US_Telephony".to_string(),
+        };
+
+        let result = create_stt_provider("ibm-watson", config);
+        assert!(result.is_err());
+
+        if let Err(STTError::AuthenticationFailed(msg)) = result {
+            assert!(msg.contains("API key is required"));
+        } else {
+            panic!("Expected AuthenticationFailed error");
+        }
+    }
+
+    #[test]
+    fn test_create_stt_provider_from_enum_ibm_watson() {
+        let config = STTConfig {
+            provider: "ibm-watson".to_string(),
+            api_key: "test_api_key".to_string(),
+            language: "en-US".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "audio/l16".to_string(),
+            model: "en-US_Telephony".to_string(),
+        };
+
+        let result = create_stt_provider_from_enum(STTProvider::IbmWatson, config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_error_message_includes_ibm_watson() {
+        let result = "invalid".parse::<STTProvider>();
+        assert!(result.is_err());
+        if let Err(STTError::ConfigurationError(msg)) = result {
+            assert!(msg.contains("ibm-watson"));
         }
     }
 }

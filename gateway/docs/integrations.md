@@ -19,6 +19,7 @@ This document lists all speech-to-text (STT), text-to-speech (TTS), and audio-to
 | **Cartesia** | WebSocket | Low-latency streaming, word-level timestamps | `CARTESIA_API_KEY` |
 | **Amazon Transcribe** | AWS SDK | 100+ languages, streaming, speaker diarization, content redaction | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
 | **IBM Watson** | WebSocket | 30+ languages, speaker diarization, smart formatting, background noise suppression | `IBM_WATSON_API_KEY`, `IBM_WATSON_INSTANCE_ID` |
+| **Groq** | REST | Ultra-fast Whisper (216x real-time), translation to English | `GROQ_API_KEY` |
 
 ### Text-to-Speech (TTS)
 
@@ -185,6 +186,40 @@ This document lists all speech-to-text (STT), text-to-speech (TTS), and audio-to
   - **Chinese:** LiNa, WangWei, ZhangJing
 - **Authentication:** IAM token-based (API key exchanged for bearer token)
 
+### Groq (Whisper)
+
+- **Website:** https://groq.com
+- **Documentation:** https://console.groq.com/docs/speech-to-text
+- **Capabilities:** STT
+- **Protocol:** HTTP REST (OpenAI-compatible API format)
+- **Models:**
+  - **whisper-large-v3:** 10.3% WER, 189x real-time, $0.111/hour
+  - **whisper-large-v3-turbo:** 12% WER, 216x real-time, $0.04/hour (default)
+- **Audio Formats:** FLAC, MP3, MP4, MPEG, MPGA, M4A, OGG, WAV, WebM
+- **Sample Rates:** Downsampled to 16kHz mono internally
+- **File Size Limits:**
+  - Free tier: 25MB max
+  - Dev tier: 100MB max
+- **Features:**
+  - Ultra-fast transcription (fastest Whisper hosting)
+  - OpenAI-compatible API format
+  - Translation endpoint (any language to English)
+  - Word and segment-level timestamps (verbose_json format)
+  - Automatic retry with exponential backoff for rate limits
+  - Silence detection for automatic flushing
+- **Response Formats:**
+  - `json` - Simple text response
+  - `verbose_json` - With timestamps, segments, and words
+  - `text` - Plain text output
+- **Endpoints:**
+  - Transcription: `https://api.groq.com/openai/v1/audio/transcriptions`
+  - Translation: `https://api.groq.com/openai/v1/audio/translations`
+- **Rate Limits:**
+  - Applied at organization level
+  - 429 errors include retry-after header
+  - Automatic retry with exponential backoff recommended
+- **Authentication:** Bearer token (API key starting with `gsk_`)
+
 ---
 
 ## Configuration Examples
@@ -223,6 +258,9 @@ export AWS_REGION="us-east-1"  # Optional, defaults to us-east-1
 export IBM_WATSON_API_KEY="your-ibm-watson-key"
 export IBM_WATSON_INSTANCE_ID="your-instance-id"
 export IBM_WATSON_REGION="us-south"  # Optional, defaults to us-south
+
+# Groq
+export GROQ_API_KEY="gsk_your-groq-api-key"
 ```
 
 ### YAML Configuration
@@ -247,6 +285,7 @@ providers:
     api_key: ${IBM_WATSON_API_KEY}
     instance_id: ${IBM_WATSON_INSTANCE_ID}
     region: ${IBM_WATSON_REGION}
+  groq_api_key: ${GROQ_API_KEY}
 ```
 
 ### WebSocket Configuration Message
@@ -269,11 +308,12 @@ providers:
 
 | Use Case | Recommended STT | Recommended TTS |
 |----------|-----------------|-----------------|
+| **Ultra-fast** | Groq (216x real-time) | Cartesia, ElevenLabs |
 | **Low latency** | Deepgram, Cartesia | Cartesia, ElevenLabs |
 | **High accuracy** | AssemblyAI, Google | Google Neural2, Azure |
 | **Voice cloning** | - | ElevenLabs, Cartesia |
 | **Multi-language** | AssemblyAI (99), Amazon Transcribe (100+), Google (125+), IBM Watson (30+) | Azure (140+), Amazon Polly (30+), Google (40+), IBM Watson (15+) |
-| **Cost-effective** | Deepgram, OpenAI | OpenAI, Deepgram |
+| **Cost-effective** | Deepgram, Groq ($0.04/hr), OpenAI | OpenAI, Deepgram |
 | **Enterprise/HIPAA** | Azure, Google, Amazon Transcribe, IBM Watson | Azure, Google, Amazon Polly, IBM Watson |
 | **Conversational AI** | - | OpenAI Realtime |
 
@@ -283,7 +323,6 @@ providers:
 
 The following providers are planned for future releases:
 
-- Groq (Whisper hosting)
 - Hume AI (emotional TTS)
 - LMNT
 - Play.ht

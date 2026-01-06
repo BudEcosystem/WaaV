@@ -28,10 +28,10 @@
 
 **WaaV Gateway** is a high-performance, real-time voice processing server built in Rust. It provides a unified interface for Speech-to-Text (STT) and Text-to-Speech (TTS) services across multiple cloud providers, with advanced audio processing capabilities including noise suppression and intelligent turn detection.
 
-WaaV eliminates the complexity of integrating with multiple voice AI providers by providing a single WebSocket and REST API that abstracts away provider-specific implementations. Switch between Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, or IBM Watson with a simple configuration change—no code modifications required.
+WaaV eliminates the complexity of integrating with multiple voice AI providers by providing a single WebSocket and REST API that abstracts away provider-specific implementations. Switch between Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, IBM Watson, or Groq with a simple configuration change—no code modifications required.
 
 **Key Highlights:**
-- **9 STT/TTS Providers** - Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, IBM Watson
+- **10 STT/TTS Providers** - Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, IBM Watson, Groq
 - **OpenAI Realtime API** - Full-duplex audio-to-audio streaming with GPT-4o
 - **WebSocket Streaming** - Real-time bidirectional audio with sub-second latency
 - **LiveKit Integration** - WebRTC rooms and SIP telephony support
@@ -196,6 +196,7 @@ cargo build --release --features turn-detect,noise-filter,openapi
 | **OpenAI** | REST | whisper-1, gpt-4o-transcribe | Batch transcription, 57+ languages |
 | **Amazon Transcribe** | AWS SDK | Streaming | 100+ languages, speaker diarization, PII redaction |
 | **IBM Watson** | WebSocket | Next-gen models | 30+ languages, speaker diarization, smart formatting |
+| **Groq** | REST | whisper-large-v3, whisper-large-v3-turbo | Ultra-fast (216x real-time), translation endpoint |
 
 ### Text-to-Speech (TTS)
 
@@ -549,6 +550,7 @@ providers:
   ibm_watson_api_key: ""                # ENV: IBM_WATSON_API_KEY
   ibm_watson_instance_id: ""            # ENV: IBM_WATSON_INSTANCE_ID
   ibm_watson_region: "us-south"         # ENV: IBM_WATSON_REGION
+  groq_api_key: ""                      # ENV: GROQ_API_KEY
 
 # LiveKit configuration (optional)
 livekit:

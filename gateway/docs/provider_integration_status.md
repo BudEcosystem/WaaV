@@ -10,10 +10,10 @@
 | Metric | Count |
 |--------|-------|
 | **Total Cloud Providers** | 70 |
-| **Implemented** | 11 |
+| **Implemented** | 12 |
 | **In Progress** | 0 |
-| **Yet to Start** | 59 |
-| **Estimated Days Remaining** | 31-42 |
+| **Yet to Start** | 58 |
+| **Estimated Days Remaining** | 30-41 |
 
 ---
 
@@ -354,7 +354,7 @@ RUSTFLAGS="-Zsanitizer=address" cargo +nightly test [provider]
 | 4 | Amazon Polly | TTS | [DONE] | 2026-01-06 | AWS SDK, 60+ voices, Neural/Standard/Generative engines |
 | 5 | IBM Watson STT | STT | [DONE] | 2026-01-06 | IAM auth, 30+ languages, WebSocket streaming |
 | 6 | IBM Watson TTS | TTS | [DONE] | 2026-01-06 | V3 neural voices, SSML support, 15+ languages |
-| 7 | Groq | STT | [TODO] | - | Fastest Whisper hosting |
+| 7 | Groq | STT | [DONE] | 2026-01-06 | Fastest Whisper hosting (216x real-time), REST API |
 | 8 | Hume AI | TTS+A2A | [TODO] | - | Emotional expression |
 
 ---
@@ -522,6 +522,37 @@ These require the Python inference engine to be completed first:
 ---
 
 ## Session Log
+
+### Session: 2026-01-06 (Update 6)
+**Status:** Groq STT implementation complete
+**Completed:**
+- Groq Whisper STT (REST API) - `src/core/stt/groq/`
+  - `config.rs`: GroqSTTConfig, GroqSTTModel (whisper-large-v3, whisper-large-v3-turbo), GroqResponseFormat
+  - `messages.rs`: TranscriptionResponse, VerboseTranscriptionResponse, Segment, Word, wav module
+  - `client.rs`: GroqSTT implementing BaseSTT trait via HTTP REST with audio buffering
+  - `tests.rs`: 105 comprehensive unit tests
+  - Key features:
+    - Ultra-fast transcription (216x real-time for whisper-large-v3-turbo)
+    - OpenAI-compatible API format
+    - Two models: whisper-large-v3 (10.3% WER) and whisper-large-v3-turbo (12% WER, faster)
+    - Audio buffering with configurable flush strategies (OnDisconnect, OnThreshold, OnSilence, Manual)
+    - Silence detection using RMS energy analysis
+    - Automatic retry with exponential backoff for transient errors (429, 503)
+    - Translation endpoint for any language to English
+    - WAV file generation for REST API submission
+  - REST URL: `https://api.groq.com/openai/v1/audio/transcriptions`
+  - Translation URL: `https://api.groq.com/openai/v1/audio/translations`
+- Factory integration in `src/core/stt/mod.rs`
+- Provider alias: `groq`
+**Quality Gates:** All passed (cargo fmt, clippy, 105 Groq tests + 37 factory tests passing)
+**Key Design Decisions:**
+- Used REST API (Groq doesn't support WebSocket streaming)
+- Audio buffering pattern similar to OpenAI Whisper implementation
+- Silence detection for automatic flushing
+- Exponential backoff retry for rate limits (429) and service unavailable (503)
+- File size limits: 25MB (free tier), 100MB (dev tier)
+**Next Steps:**
+- Continue with Batch 1: Hume AI (TTS+A2A)
 
 ### Session: 2026-01-06 (Update 5)
 **Status:** IBM Watson STT and TTS implementation complete
