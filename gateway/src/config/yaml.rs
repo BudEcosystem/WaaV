@@ -123,6 +123,8 @@ pub struct ProvidersYaml {
     pub assemblyai_api_key: Option<String>,
     /// Hume AI API key for TTS (Octave) and EVI
     pub hume_api_key: Option<String>,
+    /// LMNT API key for ultra-low latency TTS and voice cloning
+    pub lmnt_api_key: Option<String>,
 }
 
 /// Recording S3 configuration from YAML

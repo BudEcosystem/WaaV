@@ -363,7 +363,7 @@ RUSTFLAGS="-Zsanitizer=address" cargo +nightly test [provider]
 
 | # | Provider | Type | Status | Start Date | Notes |
 |---|----------|------|--------|------------|-------|
-| 9 | LMNT | TTS+Clone | [TODO] | - | Ultra-low latency |
+| 9 | LMNT | TTS+Clone | [COMPLETE] | 2026-01-07 | Ultra-low latency (~150ms), 22+ languages, voice cloning |
 | 10 | Play.ht | TTS+Clone | [TODO] | - | 142 languages |
 | 11 | Murf.ai | TTS+Clone | [TODO] | - | 120+ voices |
 | 12 | WellSaid Labs | TTS+Clone | [TODO] | - | Premium quality |

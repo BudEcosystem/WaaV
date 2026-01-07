@@ -75,6 +75,13 @@ providers:
   # Get from Hume dashboard: https://beta.hume.ai/
   hume_api_key: ""                               # ENV: HUME_API_KEY
 
+  # LMNT API key (used for TTS and voice cloning)
+  # TTS: Ultra-low latency (~150ms) text-to-speech with 22+ languages
+  # Voice Cloning: Create custom voices from 5+ second audio samples
+  # Supports HTTP streaming and WebSocket for real-time synthesis
+  # Get from LMNT dashboard: https://app.lmnt.com/
+  lmnt_api_key: ""                               # ENV: LMNT_API_KEY
+
   # AWS credentials for Amazon Transcribe (STT) and Amazon Polly (TTS)
   # Uses AWS SDK credential chain:
   # 1. These explicit credentials (if provided)
@@ -111,7 +118,7 @@ providers:
 
 # TTS Provider Configuration (optional - can also be set via WebSocket config)
 # tts:
-#   provider: elevenlabs  # Options: "deepgram", "elevenlabs", "google", "azure", "cartesia", "openai", "aws-polly", "hume"
+#   provider: elevenlabs  # Options: "deepgram", "elevenlabs", "google", "azure", "cartesia", "openai", "aws-polly", "hume", "lmnt"
 #   # Cartesia-specific settings (only used when provider is "cartesia")
 #   cartesia:
 #     model: sonic-3           # Options: sonic-3, sonic-3-2025-10-27
@@ -125,6 +132,16 @@ providers:
 #     output_format: pcm       # Options: pcm, mp3, ogg_vorbis
 #     sample_rate: 16000       # PCM: 8000, 16000 | MP3/OGG: 8000, 16000, 22050, 24000
 #     text_type: text          # Options: text, ssml
+#   # LMNT-specific settings (only used when provider is "lmnt")
+#   lmnt:
+#     voice: lily              # Options: lily, daniel, or custom voice IDs
+#     model: blizzard          # Options: blizzard (current default model)
+#     language: auto           # Options: auto, en, es, fr, de, it, pt, ja, ko, zh, etc. (22+ languages)
+#     audio_format: linear16   # Options: linear16/pcm, mp3, ulaw, webm
+#     sample_rate: 24000       # Options: 8000, 16000, 24000
+#     top_p: 0.8               # Speech stability (0.0-1.0, lower = more stable)
+#     temperature: 1.0         # Expressiveness (≥0, higher = more varied)
+#     speed: 1.0               # Speech speed (0.25-2.0)
 
 # LiveKit recording configuration (S3)
 recording:

@@ -34,6 +34,7 @@ This document lists all speech-to-text (STT), text-to-speech (TTS), and audio-to
 | **Amazon Polly** | AWS SDK | 60+ voices, neural/standard/generative engines, SSML, 30+ languages | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
 | **IBM Watson** | HTTP | 30+ V3 neural voices, 15+ languages, SSML, rate/pitch control | `IBM_WATSON_API_KEY`, `IBM_WATSON_INSTANCE_ID` |
 | **Hume AI** | HTTP/WebSocket | Octave TTS, natural language emotion control, voice cloning, acting instructions | `HUME_API_KEY` |
+| **LMNT** | HTTP | Low-latency (~150ms), voice cloning, 22+ languages, top_p/temperature control | `LMNT_API_KEY` |
 
 ### Audio-to-Audio (Realtime)
 
@@ -127,6 +128,41 @@ This document lists all speech-to-text (STT), text-to-speech (TTS), and audio-to
   - EVI 3: Starting ~$0.02/min (volume), $0.072/min standard
   - Octave TTS: Free tier (10K chars), Starter $3/mo (30K chars), Creator $10/mo (100K chars)
 - **Authentication:** API key header (`X-HUME-API-KEY`)
+
+### LMNT
+
+- **Website:** https://lmnt.com
+- **Documentation:** https://docs.lmnt.com
+- **Capabilities:** TTS, Voice Cloning
+- **Protocol:** HTTP streaming
+- **Typical Latency:** ~150ms
+- **Max Text Length:** 5000 characters per request
+- **Languages:** 22+ languages (auto-detect, Arabic, German, English, Spanish, French, Hindi, Indonesian, Italian, Japanese, Korean, Dutch, Polish, Portuguese, Russian, Swedish, Thai, Turkish, Ukrainian, Urdu, Vietnamese, Chinese)
+- **Audio Formats:**
+  - **MP3** - 96kbps, streamable (default)
+  - **PCM S16LE** - 16-bit signed PCM, streamable
+  - **PCM F32LE** - 32-bit float PCM, streamable
+  - **µ-law** - 8-bit G711, streamable
+  - **WebM** - Opus codec, streamable
+  - **WAV** - Not streamable
+  - **AAC** - Not streamable
+- **Sample Rates:** 8000 Hz, 16000 Hz, 24000 Hz (default)
+- **Voice Parameters:**
+  - `top_p` (0-1): Speech stability control (default: 0.8)
+  - `temperature` (≥0): Expressiveness range (default: 1.0)
+  - `speed` (0.25-2.0): Speech rate control (default: 1.0)
+  - `seed`: Deterministic output (optional)
+- **Voice Cloning:**
+  - Minimum audio: 5 seconds
+  - Maximum files: 20 attachments
+  - Maximum total size: 250 MB
+  - Supported formats: WAV, MP3, MP4, M4A, WebM
+  - Enhancement option: Process noisy audio automatically
+- **Endpoints:**
+  - HTTP Streaming: `POST https://api.lmnt.com/v1/ai/speech/bytes`
+  - Voice List: `GET https://api.lmnt.com/v1/ai/voice/list`
+  - Voice Clone: `POST https://api.lmnt.com/v1/ai/voice`
+- **Authentication:** `X-API-Key` header
 
 ### AssemblyAI
 
@@ -303,6 +339,9 @@ export GROQ_API_KEY="gsk_your-groq-api-key"
 
 # Hume AI
 export HUME_API_KEY="your-hume-api-key"
+
+# LMNT
+export LMNT_API_KEY="your-lmnt-api-key"
 ```
 
 ### YAML Configuration
@@ -329,6 +368,7 @@ providers:
     region: ${IBM_WATSON_REGION}
   groq_api_key: ${GROQ_API_KEY}
   hume_api_key: ${HUME_API_KEY}
+  lmnt_api_key: ${LMNT_API_KEY}
 ```
 
 ### WebSocket Configuration Message
@@ -351,12 +391,12 @@ providers:
 
 | Use Case | Recommended STT | Recommended TTS |
 |----------|-----------------|-----------------|
-| **Ultra-fast** | Groq (216x real-time) | Cartesia, ElevenLabs |
-| **Low latency** | Deepgram, Cartesia | Cartesia, ElevenLabs |
+| **Ultra-fast** | Groq (216x real-time) | Cartesia, ElevenLabs, LMNT |
+| **Low latency** | Deepgram, Cartesia | Cartesia, ElevenLabs, LMNT |
 | **High accuracy** | AssemblyAI, Google | Google Neural2, Azure |
-| **Voice cloning** | - | ElevenLabs, Cartesia, Hume AI |
+| **Voice cloning** | - | ElevenLabs, Cartesia, Hume AI, LMNT |
 | **Emotion control** | - | Hume AI, ElevenLabs, Azure |
-| **Multi-language** | AssemblyAI (99), Amazon Transcribe (100+), Google (125+), IBM Watson (30+) | Azure (140+), Amazon Polly (30+), Google (40+), IBM Watson (15+) |
+| **Multi-language** | AssemblyAI (99), Amazon Transcribe (100+), Google (125+), IBM Watson (30+) | Azure (140+), Amazon Polly (30+), Google (40+), LMNT (22+), IBM Watson (15+) |
 | **Cost-effective** | Deepgram, Groq ($0.04/hr), OpenAI | OpenAI, Deepgram |
 | **Enterprise/HIPAA** | Azure, Google, Amazon Transcribe, IBM Watson | Azure, Google, Amazon Polly, IBM Watson |
 | **Conversational AI** | - | OpenAI Realtime, Hume AI EVI |
@@ -390,7 +430,6 @@ let tts_cost = estimate_tts_cost("elevenlabs", "eleven_multilingual_v2", 1000);
 
 The following providers are planned for future releases:
 
-- LMNT
 - Play.ht
 - Speechmatics
 - Gladia

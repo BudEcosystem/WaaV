@@ -17,12 +17,13 @@ use waav_gateway::core::realtime::{
     get_supported_realtime_providers,
 };
 
-/// Test that OpenAI is included in supported providers
+/// Test that OpenAI and Hume are included in supported providers
 #[test]
 fn test_openai_in_supported_realtime_providers() {
     let providers = get_supported_realtime_providers();
     assert!(providers.contains(&"openai"));
-    assert_eq!(providers.len(), 1); // Only OpenAI for now
+    assert!(providers.contains(&"hume"));
+    assert_eq!(providers.len(), 2); // OpenAI and Hume realtime providers
 }
 
 /// Test provider creation via string name

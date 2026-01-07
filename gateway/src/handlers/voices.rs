@@ -93,6 +93,21 @@ struct GoogleVoice {
     ssml_gender: Option<String>,
 }
 
+// LMNT API response structures
+#[derive(Debug, Deserialize)]
+struct LmntVoice {
+    id: String,
+    name: String,
+    owner: String,
+    state: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    gender: Option<String>,
+    #[serde(default)]
+    preview_url: Option<String>,
+}
+
 // Azure TTS Voices API response structures
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -533,6 +548,83 @@ async fn fetch_azure_voices(
     Ok(voices)
 }
 
+// Helper function to fetch voices from LMNT API
+async fn fetch_lmnt_voices(
+    api_key: &str,
+) -> Result<Vec<Voice>, Box<dyn std::error::Error + Send + Sync>> {
+    let client = reqwest::Client::new();
+
+    // LMNT voice list endpoint
+    let response = client
+        .get("https://api.lmnt.com/v1/ai/voice/list")
+        .header("X-API-Key", api_key)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        return Err(format!("LMNT API error ({}): {}", status, error_body).into());
+    }
+
+    let lmnt_voices: Vec<LmntVoice> = response.json().await?;
+
+    let voices = lmnt_voices
+        .into_iter()
+        .filter(|v| v.state == "ready") // Only include ready voices
+        .map(|voice| {
+            // Extract gender from the gender field or description
+            let gender = voice
+                .gender
+                .clone()
+                .map(|g| {
+                    let g_lower = g.to_lowercase();
+                    if g_lower.contains("male") && !g_lower.contains("female") {
+                        "Male".to_string()
+                    } else if g_lower.contains("female") {
+                        "Female".to_string()
+                    } else {
+                        g
+                    }
+                })
+                .or_else(|| {
+                    voice.description.as_ref().and_then(|desc| {
+                        let desc_lower = desc.to_lowercase();
+                        if desc_lower.contains("male") && !desc_lower.contains("female") {
+                            Some("Male".to_string())
+                        } else if desc_lower.contains("female") {
+                            Some("Female".to_string())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .unwrap_or_else(|| "Unknown".to_string());
+
+            // Determine accent based on owner type
+            let accent = match voice.owner.as_str() {
+                "system" => "Standard".to_string(),
+                "me" => "Custom".to_string(),
+                _ => "Shared".to_string(),
+            };
+
+            Voice {
+                id: voice.id,
+                sample: voice.preview_url.unwrap_or_default(),
+                name: voice.name,
+                accent,
+                gender,
+                language: "English".to_string(), // LMNT supports 22+ languages, default to English
+            }
+        })
+        .collect();
+
+    Ok(voices)
+}
+
 /// Handler for GET /voices - returns available voices per provider
 #[cfg_attr(
     feature = "openapi",
@@ -612,6 +704,20 @@ pub async fn list_voices(
         tracing::debug!("Azure Speech credentials not configured, skipping");
     }
 
+    // Fetch LMNT voices - skip if not configured
+    if let Ok(api_key) = state.config.get_api_key("lmnt") {
+        match fetch_lmnt_voices(&api_key).await {
+            Ok(voices) => {
+                voices_response.insert("lmnt".to_string(), voices);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch LMNT voices: {}", e);
+            }
+        }
+    } else {
+        tracing::debug!("LMNT API key not configured, skipping");
+    }
+
     Ok(Json(voices_response))
 }
 
@@ -628,6 +734,8 @@ pub enum VoiceCloneProvider {
     Hume,
     /// ElevenLabs instant voice cloning
     ElevenLabs,
+    /// LMNT instant voice cloning (5+ seconds of audio)
+    Lmnt,
 }
 
 impl std::fmt::Display for VoiceCloneProvider {
@@ -635,6 +743,7 @@ impl std::fmt::Display for VoiceCloneProvider {
         match self {
             Self::Hume => write!(f, "hume"),
             Self::ElevenLabs => write!(f, "elevenlabs"),
+            Self::Lmnt => write!(f, "lmnt"),
         }
     }
 }
@@ -1041,6 +1150,154 @@ async fn clone_voice_hume(
 }
 
 // =============================================================================
+// LMNT Voice Cloning
+// =============================================================================
+
+/// LMNT voice creation response.
+#[derive(Debug, Deserialize)]
+struct LmntVoiceCreateResponse {
+    id: String,
+    name: String,
+    state: String,
+}
+
+/// Clone a voice using LMNT API.
+///
+/// LMNT voice cloning requires:
+/// - Audio samples: 5+ seconds, max 20 files, 250MB total
+/// - Supported formats: wav, mp3, mp4, m4a, webm
+async fn clone_voice_lmnt(
+    api_key: &str,
+    request: &VoiceCloneRequest,
+) -> Result<VoiceCloneResponse, VoiceCloneError> {
+    use reqwest::multipart::{Form, Part};
+
+    // Validate audio samples (LMNT requires at least 5 seconds of audio)
+    if request.audio_samples.is_empty() {
+        return Err(VoiceCloneError {
+            code: "MISSING_AUDIO".to_string(),
+            message: "LMNT voice cloning requires at least one audio sample (5+ seconds)".to_string(),
+            details: Some(serde_json::json!({
+                "hint": "Provide 5+ seconds of clear audio for best results",
+                "max_files": 20,
+                "max_total_size": "250MB",
+                "supported_formats": ["wav", "mp3", "mp4", "m4a", "webm"]
+            })),
+        });
+    }
+
+    // LMNT limits: max 20 files, 250MB total
+    if request.audio_samples.len() > 20 {
+        return Err(VoiceCloneError {
+            code: "TOO_MANY_FILES".to_string(),
+            message: format!(
+                "LMNT supports max 20 audio files, got {}",
+                request.audio_samples.len()
+            ),
+            details: None,
+        });
+    }
+
+    let client = reqwest::Client::new();
+
+    // Build multipart form
+    let mut form = Form::new().text("name", request.name.clone());
+
+    // Add enhancement option if specified (process noisy audio)
+    // LMNT uses "enhance" parameter to clean up audio
+    if request.remove_background_noise {
+        form = form.text("enhance", "true");
+    }
+
+    // Decode and add audio samples
+    for (i, sample_b64) in request.audio_samples.iter().enumerate() {
+        // Handle potential data URL prefix
+        let audio_data = if sample_b64.contains(',') {
+            // Data URL format: data:audio/wav;base64,xxxxx
+            let parts: Vec<&str> = sample_b64.splitn(2, ',').collect();
+            if parts.len() == 2 {
+                parts[1]
+            } else {
+                sample_b64.as_str()
+            }
+        } else {
+            sample_b64.as_str()
+        };
+
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(audio_data)
+            .map_err(|e| VoiceCloneError {
+                code: "INVALID_AUDIO".to_string(),
+                message: format!("Failed to decode audio sample {}: {}", i, e),
+                details: None,
+            })?;
+
+        // Detect format from magic bytes
+        let (mime_type, extension) = detect_audio_format(&decoded);
+
+        let part = Part::bytes(decoded)
+            .file_name(format!("sample_{}.{}", i, extension))
+            .mime_str(mime_type)
+            .map_err(|e| VoiceCloneError {
+                code: "INTERNAL_ERROR".to_string(),
+                message: format!("Failed to set MIME type: {}", e),
+                details: None,
+            })?;
+
+        form = form.part("files", part);
+    }
+
+    // Make API request to LMNT voice clone endpoint
+    let response = client
+        .post("https://api.lmnt.com/v1/ai/voice")
+        .header("X-API-Key", api_key)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| VoiceCloneError {
+            code: "REQUEST_FAILED".to_string(),
+            message: format!("Failed to send request to LMNT: {}", e),
+            details: None,
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let error_body = response.text().await.unwrap_or_default();
+        return Err(VoiceCloneError {
+            code: format!("LMNT_{}", status.as_u16()),
+            message: format!("LMNT API error: {}", error_body),
+            details: Some(serde_json::json!({ "status": status.as_u16() })),
+        });
+    }
+
+    let lmnt_response: LmntVoiceCreateResponse = response.json().await.map_err(|e| {
+        VoiceCloneError {
+            code: "PARSE_ERROR".to_string(),
+            message: format!("Failed to parse LMNT response: {}", e),
+            details: None,
+        }
+    })?;
+
+    // LMNT voice states: "ready" or "training"
+    let status_str = if lmnt_response.state == "ready" {
+        "ready"
+    } else {
+        "processing"
+    };
+
+    Ok(VoiceCloneResponse {
+        voice_id: lmnt_response.id,
+        name: lmnt_response.name,
+        provider: VoiceCloneProvider::Lmnt,
+        status: status_str.to_string(),
+        created_at: time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+        metadata: None,
+    })
+}
+
+// =============================================================================
 // Audio Format Detection
 // =============================================================================
 
@@ -1175,6 +1432,23 @@ pub async fn clone_voice(
                 .map(Json)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(e)))
         }
+        VoiceCloneProvider::Lmnt => {
+            let api_key = state.config.get_api_key("lmnt").map_err(|_| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(VoiceCloneError {
+                        code: "MISSING_API_KEY".to_string(),
+                        message: "LMNT API key not configured".to_string(),
+                        details: None,
+                    }),
+                )
+            })?;
+
+            clone_voice_lmnt(&api_key, &request)
+                .await
+                .map(Json)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(e)))
+        }
     }
 }
 
@@ -1190,6 +1464,7 @@ mod tests {
     fn test_voice_clone_provider_display() {
         assert_eq!(VoiceCloneProvider::Hume.to_string(), "hume");
         assert_eq!(VoiceCloneProvider::ElevenLabs.to_string(), "elevenlabs");
+        assert_eq!(VoiceCloneProvider::Lmnt.to_string(), "lmnt");
     }
 
     #[test]
@@ -1200,8 +1475,14 @@ mod tests {
         let el: VoiceCloneProvider = serde_json::from_str("\"elevenlabs\"").unwrap();
         assert_eq!(el, VoiceCloneProvider::ElevenLabs);
 
+        let lmnt: VoiceCloneProvider = serde_json::from_str("\"lmnt\"").unwrap();
+        assert_eq!(lmnt, VoiceCloneProvider::Lmnt);
+
         let hume_json = serde_json::to_string(&VoiceCloneProvider::Hume).unwrap();
         assert_eq!(hume_json, "\"hume\"");
+
+        let lmnt_json = serde_json::to_string(&VoiceCloneProvider::Lmnt).unwrap();
+        assert_eq!(lmnt_json, "\"lmnt\"");
     }
 
     #[test]
@@ -1320,5 +1601,38 @@ mod tests {
         let labels = request.labels.unwrap();
         assert_eq!(labels.get("accent"), Some(&"british".to_string()));
         assert_eq!(labels.get("gender"), Some(&"male".to_string()));
+    }
+
+    #[test]
+    fn test_voice_clone_request_lmnt() {
+        let json = r#"{
+            "provider": "lmnt",
+            "name": "My LMNT Voice",
+            "audio_samples": ["base64data"],
+            "remove_background_noise": true
+        }"#;
+
+        let request: VoiceCloneRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.provider, VoiceCloneProvider::Lmnt);
+        assert_eq!(request.name, "My LMNT Voice");
+        assert_eq!(request.audio_samples.len(), 1);
+        assert!(request.remove_background_noise);
+    }
+
+    #[test]
+    fn test_voice_clone_response_lmnt() {
+        let response = VoiceCloneResponse {
+            voice_id: "voice_lmnt_123".to_string(),
+            name: "LMNT Voice".to_string(),
+            provider: VoiceCloneProvider::Lmnt,
+            status: "ready".to_string(),
+            created_at: "2026-01-07T12:00:00Z".to_string(),
+            metadata: None,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"voice_id\":\"voice_lmnt_123\""));
+        assert!(json.contains("\"provider\":\"lmnt\""));
+        assert!(json.contains("\"status\":\"ready\""));
     }
 }

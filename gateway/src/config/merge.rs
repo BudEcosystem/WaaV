@@ -189,6 +189,14 @@ pub fn merge_config(
             .and_then(|p| p.hume_api_key.clone())
     );
 
+    // LMNT API key (TTS and voice cloning)
+    let lmnt_api_key = get_optional!(
+        "LMNT_API_KEY",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.lmnt_api_key.clone())
+    );
+
     // Recording S3 configuration
     let recording_s3_bucket = get_optional!(
         "RECORDING_S3_BUCKET",
@@ -383,6 +391,7 @@ pub fn merge_config(
         openai_api_key,
         assemblyai_api_key,
         hume_api_key,
+        lmnt_api_key,
         recording_s3_bucket,
         recording_s3_region,
         recording_s3_endpoint,

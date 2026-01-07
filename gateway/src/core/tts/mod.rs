@@ -7,6 +7,7 @@ pub mod elevenlabs;
 pub mod google;
 pub mod hume;
 pub mod ibm_watson;
+pub mod lmnt;
 pub mod openai;
 pub mod provider;
 
@@ -27,6 +28,7 @@ pub use hume::{HUME_TTS_STREAM_URL, HumeTTS, HumeTTSConfig};
 pub use ibm_watson::{
     IBM_WATSON_TTS_URL, IbmOutputFormat, IbmVoice, IbmWatsonTTS, IbmWatsonTTSConfig,
 };
+pub use lmnt::{LmntAudioFormat, LmntTts, LmntTtsConfig, LmntVoice, LMNT_TTS_URL};
 pub use openai::{AudioOutputFormat, OPENAI_TTS_URL, OpenAITTS, OpenAITTSModel, OpenAIVoice};
 pub use provider::{TTSProvider, TTSRequestBuilder};
 use std::collections::HashMap;
@@ -44,6 +46,7 @@ use std::collections::HashMap;
 /// - `"aws-polly"` or `"amazon-polly"` or `"polly"` - Amazon Polly TTS API
 /// - `"ibm-watson"` or `"ibm_watson"` or `"watson"` or `"ibm"` - IBM Watson TTS API
 /// - `"hume"` or `"hume-ai"` - Hume AI Octave TTS API (natural language emotions)
+/// - `"lmnt"` or `"lmnt-ai"` - LMNT TTS API (ultra-low latency ~150ms)
 ///
 /// # Example
 ///
@@ -73,8 +76,9 @@ pub fn create_tts_provider(provider_type: &str, config: TTSConfig) -> TTSResult<
             Ok(Box::new(IbmWatsonTTS::new(config)?))
         }
         "hume" | "hume-ai" | "hume_ai" => Ok(Box::new(HumeTTS::new(config)?)),
+        "lmnt" | "lmnt-ai" | "lmnt_ai" => Ok(Box::new(LmntTts::new(config)?)),
         _ => Err(TTSError::InvalidConfiguration(format!(
-            "Unsupported TTS provider: {provider_type}. Supported providers: deepgram, elevenlabs, google, azure, cartesia, openai, aws-polly, ibm-watson, hume"
+            "Unsupported TTS provider: {provider_type}. Supported providers: deepgram, elevenlabs, google, azure, cartesia, openai, aws-polly, ibm-watson, hume, lmnt"
         ))),
     }
 }
@@ -96,6 +100,7 @@ pub fn get_tts_provider_urls() -> HashMap<String, String> {
     urls.insert("aws-polly".to_string(), AWS_POLLY_TTS_URL.to_string());
     urls.insert("ibm-watson".to_string(), IBM_WATSON_TTS_URL.to_string());
     urls.insert("hume".to_string(), HUME_TTS_STREAM_URL.to_string());
+    urls.insert("lmnt".to_string(), LMNT_TTS_URL.to_string());
     urls
 }
 
@@ -381,6 +386,77 @@ mod tests {
                 assert!(
                     msg.contains("ibm-watson"),
                     "Error message should mention ibm-watson as a supported provider"
+                );
+            }
+            Err(other) => panic!("Expected InvalidConfiguration error, got: {:?}", other),
+            Ok(_) => panic!("Expected error for invalid provider"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_lmnt_tts_provider() {
+        let config = TTSConfig {
+            provider: "lmnt".to_string(),
+            api_key: "test_key".to_string(),
+            voice_id: Some("lily".to_string()),
+            audio_format: Some("pcm".to_string()),
+            sample_rate: Some(24000),
+            ..Default::default()
+        };
+        let result = create_tts_provider("lmnt", config);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_lmnt_tts_provider_aliases() {
+        let config = TTSConfig {
+            provider: "lmnt".to_string(),
+            api_key: "test_key".to_string(),
+            voice_id: Some("lily".to_string()),
+            ..Default::default()
+        };
+
+        // All aliases should work
+        let result = create_tts_provider("lmnt-ai", config.clone());
+        assert!(result.is_ok());
+
+        let result = create_tts_provider("lmnt_ai", config);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_lmnt_tts_provider_case_insensitive() {
+        let config = TTSConfig {
+            provider: "lmnt".to_string(),
+            api_key: "test_key".to_string(),
+            voice_id: Some("lily".to_string()),
+            ..Default::default()
+        };
+        // Case should not matter
+        let result = create_tts_provider("LMNT", config.clone());
+        assert!(result.is_ok());
+
+        let result = create_tts_provider("Lmnt", config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_tts_provider_urls_includes_lmnt() {
+        let urls = get_tts_provider_urls();
+        assert!(urls.contains_key("lmnt"));
+        assert_eq!(urls.get("lmnt").unwrap(), LMNT_TTS_URL);
+    }
+
+    #[test]
+    fn test_invalid_provider_error_message_includes_lmnt() {
+        let config = TTSConfig::default();
+        let result = create_tts_provider("invalid_provider", config);
+
+        match result {
+            Err(TTSError::InvalidConfiguration(msg)) => {
+                assert!(
+                    msg.contains("lmnt"),
+                    "Error message should mention lmnt as a supported provider"
                 );
             }
             Err(other) => panic!("Expected InvalidConfiguration error, got: {:?}", other),

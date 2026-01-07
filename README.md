@@ -28,10 +28,10 @@
 
 **WaaV Gateway** is a high-performance, real-time voice processing server built in Rust. It provides a unified interface for Speech-to-Text (STT) and Text-to-Speech (TTS) services across multiple cloud providers, with advanced audio processing capabilities including noise suppression and intelligent turn detection.
 
-WaaV eliminates the complexity of integrating with multiple voice AI providers by providing a single WebSocket and REST API that abstracts away provider-specific implementations. Switch between Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, IBM Watson, or Groq with a simple configuration change—no code modifications required.
+WaaV eliminates the complexity of integrating with multiple voice AI providers by providing a single WebSocket and REST API that abstracts away provider-specific implementations. Switch between Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, IBM Watson, Groq, or LMNT with a simple configuration change—no code modifications required.
 
 **Key Highlights:**
-- **11 STT/TTS Providers** - Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, IBM Watson, Groq, Hume AI
+- **12 STT/TTS Providers** - Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, IBM Watson, Groq, Hume AI, LMNT
 - **OpenAI & Hume AI Realtime** - Full-duplex audio-to-audio streaming with GPT-4o and Hume EVI
 - **WebSocket Streaming** - Real-time bidirectional audio with sub-second latency
 - **LiveKit Integration** - WebRTC rooms and SIP telephony support
@@ -241,6 +241,7 @@ cargo build --release --features turn-detect,noise-filter,openapi
 | **Amazon Polly** | AWS SDK | 60+ voices (Joanna, Matthew, etc.) | Neural, Standard, Generative engines, SSML |
 | **IBM Watson** | HTTP | 30+ V3 neural voices | 15+ languages, SSML, rate/pitch control |
 | **Hume AI** | HTTP/WebSocket | Octave voices | Natural language emotion control, voice cloning, acting instructions |
+| **LMNT** | HTTP | lily, and custom clones | Low-latency (~150ms), voice cloning, 22+ languages |
 
 ### Audio-to-Audio (Realtime)
 
@@ -290,6 +291,7 @@ graph TB
             IBM[IBM Watson<br/>STT/TTS]
             GRQ[Groq<br/>REST]
             HUM[Hume AI<br/>TTS/EVI]
+            LMNT[LMNT<br/>HTTP]
         end
     end
 
@@ -620,6 +622,7 @@ providers:
   ibm_watson_region: "us-south"         # ENV: IBM_WATSON_REGION
   groq_api_key: ""                      # ENV: GROQ_API_KEY
   hume_api_key: ""                      # ENV: HUME_API_KEY
+  lmnt_api_key: ""                      # ENV: LMNT_API_KEY
 
 # LiveKit configuration (optional)
 livekit:

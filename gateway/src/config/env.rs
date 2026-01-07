@@ -85,6 +85,9 @@ impl ServerConfig {
         // Hume AI API key (used for TTS and EVI)
         let hume_api_key = env::var("HUME_API_KEY").ok();
 
+        // LMNT API key (used for TTS and voice cloning)
+        let lmnt_api_key = env::var("LMNT_API_KEY").ok();
+
         // LiveKit recording S3 configuration
         let recording_s3_bucket = env::var("RECORDING_S3_BUCKET").ok();
         let recording_s3_region = env::var("RECORDING_S3_REGION").ok();
@@ -181,6 +184,7 @@ impl ServerConfig {
             openai_api_key,
             assemblyai_api_key,
             hume_api_key,
+            lmnt_api_key,
             recording_s3_bucket,
             recording_s3_region,
             recording_s3_endpoint,
