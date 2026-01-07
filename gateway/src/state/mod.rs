@@ -1,4 +1,6 @@
+use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::auth::AuthClient;
 use crate::config::ServerConfig;
@@ -7,6 +9,7 @@ use crate::core::cache::store::CacheStore;
 use crate::livekit::room_handler::{LiveKitRoomHandler, RecordingConfig};
 use crate::livekit::sip_handler::{DispatchConfig, LiveKitSipHandler, TrunkConfig};
 use crate::utils::req_manager::ReqManager;
+use dashmap::DashMap;
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 
@@ -30,6 +33,10 @@ pub struct AppState {
     pub livekit_sip_handler: Option<Arc<LiveKitSipHandler>>,
     /// Authentication client for validating bearer tokens (if auth is enabled)
     pub auth_client: Option<Arc<AuthClient>>,
+    /// Active WebSocket connection count (for global limit enforcement)
+    pub active_ws_connections: Arc<AtomicUsize>,
+    /// Connection count per IP address (for per-IP limit enforcement)
+    pub connections_per_ip: Arc<DashMap<IpAddr, AtomicUsize>>,
 }
 
 impl AppState {
@@ -194,10 +201,16 @@ impl AppState {
                     api_secret.clone(),
                 );
 
-                // Build deterministic trunk and dispatch names based on room_prefix
+                // Build deterministic trunk and dispatch names based on naming_prefix and room_prefix
                 // This allows operators to predict resource names in the LiveKit UI
-                let trunk_name = format!("sayna-{}-trunk", sip_config.room_prefix);
-                let dispatch_name = format!("sayna-{}-dispatch", sip_config.room_prefix);
+                let trunk_name = format!(
+                    "{}-{}-trunk",
+                    sip_config.naming_prefix, sip_config.room_prefix
+                );
+                let dispatch_name = format!(
+                    "{}-{}-dispatch",
+                    sip_config.naming_prefix, sip_config.room_prefix
+                );
 
                 // Prepare trunk configuration
                 let trunk_config = TrunkConfig {
@@ -264,6 +277,8 @@ impl AppState {
             recording_bucket,
             livekit_sip_handler,
             auth_client,
+            active_ws_connections: Arc::new(AtomicUsize::new(0)),
+            connections_per_ip: Arc::new(DashMap::new()),
         })
     }
 
@@ -276,6 +291,100 @@ impl AppState {
     pub fn cache(&self) -> Arc<CacheStore> {
         self.core_state.cache.clone()
     }
+
+    /// Get the current number of active WebSocket connections
+    pub fn ws_connection_count(&self) -> usize {
+        self.active_ws_connections.load(Ordering::Relaxed)
+    }
+
+    /// Get the number of connections from a specific IP address
+    pub fn ip_connection_count(&self, ip: &IpAddr) -> usize {
+        self.connections_per_ip
+            .get(ip)
+            .map(|count| count.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Try to acquire a connection slot. Returns Ok(()) if successful, Err(reason) if limits exceeded.
+    /// This should be called before accepting a new WebSocket connection.
+    pub fn try_acquire_connection(&self, ip: IpAddr) -> Result<(), ConnectionLimitError> {
+        // Check global limit first
+        if let Some(max_ws) = self.config.max_websocket_connections {
+            let current = self.active_ws_connections.load(Ordering::Relaxed);
+            if current >= max_ws {
+                tracing::warn!(
+                    current = current,
+                    max = max_ws,
+                    "Global WebSocket connection limit reached"
+                );
+                return Err(ConnectionLimitError::GlobalLimitReached);
+            }
+        }
+
+        // Check per-IP limit
+        let max_per_ip = self.config.max_connections_per_ip;
+        let current_ip_count = self.ip_connection_count(&ip);
+        if current_ip_count >= max_per_ip as usize {
+            tracing::warn!(
+                ip = %ip,
+                current = current_ip_count,
+                max = max_per_ip,
+                "Per-IP connection limit reached"
+            );
+            return Err(ConnectionLimitError::PerIpLimitReached);
+        }
+
+        // Acquire both slots atomically
+        self.active_ws_connections.fetch_add(1, Ordering::Relaxed);
+        self.connections_per_ip
+            .entry(ip)
+            .or_insert_with(|| AtomicUsize::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+
+        tracing::debug!(
+            ip = %ip,
+            total_connections = self.active_ws_connections.load(Ordering::Relaxed),
+            ip_connections = self.ip_connection_count(&ip),
+            "Connection acquired"
+        );
+
+        Ok(())
+    }
+
+    /// Release a connection slot. Should be called when a WebSocket connection closes.
+    pub fn release_connection(&self, ip: IpAddr) {
+        // Decrement global count
+        let prev = self.active_ws_connections.fetch_sub(1, Ordering::Relaxed);
+        if prev == 0 {
+            // This shouldn't happen, but guard against underflow
+            self.active_ws_connections.store(0, Ordering::Relaxed);
+        }
+
+        // Decrement per-IP count
+        if let Some(count) = self.connections_per_ip.get(&ip) {
+            let prev_ip = count.fetch_sub(1, Ordering::Relaxed);
+            if prev_ip <= 1 {
+                // Remove the entry when count reaches 0 to prevent memory leak
+                drop(count);
+                self.connections_per_ip.remove(&ip);
+            }
+        }
+
+        tracing::debug!(
+            ip = %ip,
+            total_connections = self.active_ws_connections.load(Ordering::Relaxed),
+            "Connection released"
+        );
+    }
+}
+
+/// Error type for connection limit checks
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionLimitError {
+    /// Global WebSocket connection limit has been reached
+    GlobalLimitReached,
+    /// Per-IP connection limit has been reached
+    PerIpLimitReached,
 }
 
 #[cfg(test)]
@@ -304,6 +413,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -354,6 +472,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -372,6 +499,7 @@ mod tests {
                 allowed_addresses: vec!["192.168.1.0/24".to_string()],
                 hooks: vec![],
                 hook_secret: None,
+                naming_prefix: "waav".to_string(),
             }),
             cors_allowed_origins: None,
             rate_limit_requests_per_second: 60,
@@ -389,20 +517,30 @@ mod tests {
     #[test]
     fn test_trunk_and_dispatch_name_generation() {
         // This test verifies the deterministic naming scheme for trunk and dispatch
+        // with the default naming prefix "waav"
+        let naming_prefix = "waav";
         let room_prefix = "sip-";
-        let expected_trunk_name = format!("sayna-{}-trunk", room_prefix);
-        let expected_dispatch_name = format!("sayna-{}-dispatch", room_prefix);
+        let expected_trunk_name = format!("{}-{}-trunk", naming_prefix, room_prefix);
+        let expected_dispatch_name = format!("{}-{}-dispatch", naming_prefix, room_prefix);
 
-        assert_eq!(expected_trunk_name, "sayna-sip--trunk");
-        assert_eq!(expected_dispatch_name, "sayna-sip--dispatch");
+        assert_eq!(expected_trunk_name, "waav-sip--trunk");
+        assert_eq!(expected_dispatch_name, "waav-sip--dispatch");
 
-        // Test with different prefix
+        // Test with different room prefix
         let room_prefix2 = "test-call-";
-        let expected_trunk_name2 = format!("sayna-{}-trunk", room_prefix2);
-        let expected_dispatch_name2 = format!("sayna-{}-dispatch", room_prefix2);
+        let expected_trunk_name2 = format!("{}-{}-trunk", naming_prefix, room_prefix2);
+        let expected_dispatch_name2 = format!("{}-{}-dispatch", naming_prefix, room_prefix2);
 
-        assert_eq!(expected_trunk_name2, "sayna-test-call--trunk");
-        assert_eq!(expected_dispatch_name2, "sayna-test-call--dispatch");
+        assert_eq!(expected_trunk_name2, "waav-test-call--trunk");
+        assert_eq!(expected_dispatch_name2, "waav-test-call--dispatch");
+
+        // Test with custom naming prefix
+        let custom_naming_prefix = "mycompany";
+        let expected_trunk_name3 = format!("{}-{}-trunk", custom_naming_prefix, room_prefix);
+        let expected_dispatch_name3 = format!("{}-{}-dispatch", custom_naming_prefix, room_prefix);
+
+        assert_eq!(expected_trunk_name3, "mycompany-sip--trunk");
+        assert_eq!(expected_dispatch_name3, "mycompany-sip--dispatch");
     }
 
     #[test]

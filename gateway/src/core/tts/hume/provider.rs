@@ -39,7 +39,7 @@ use async_trait::async_trait;
 use tracing::{debug, info};
 use xxhash_rust::xxh3::xxh3_128;
 
-use super::config::{HumeTTSConfig, HUME_TTS_STREAM_URL};
+use super::config::{HUME_TTS_STREAM_URL, HumeTTSConfig};
 use super::messages::{HumeRequestFormat, HumeTTSRequest, HumeUtterance, HumeVoiceSpec};
 use crate::core::tts::base::{AudioCallback, BaseTTS, ConnectionState, TTSConfig, TTSResult};
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
@@ -118,8 +118,7 @@ impl HumeRequestBuilder {
     /// Builds the request body as JSON.
     fn build_request_body(&self, text: &str) -> HumeTTSRequest {
         // Create utterance with all configured settings
-        let mut utterance = HumeUtterance::new(text)
-            .with_voice(self.build_voice_spec());
+        let mut utterance = HumeUtterance::new(text).with_voice(self.build_voice_spec());
 
         // Add description (acting instructions) if configured
         if let Some(desc) = &self.hume_config.description {
@@ -199,7 +198,10 @@ impl TTSRequestBuilder for HumeRequestBuilder {
             .post(HUME_TTS_STREAM_URL)
             .header("X-Hume-Api-Key", &self.config.api_key)
             .header("Content-Type", "application/json")
-            .header("Accept", self.hume_config.output_format.format.content_type())
+            .header(
+                "Accept",
+                self.hume_config.output_format.format.content_type(),
+            )
             .json(&body)
     }
 
@@ -214,9 +216,7 @@ impl TTSRequestBuilder for HumeRequestBuilder {
 
         // Add context for continuity if previous text provided
         if let Some(prev) = previous_text {
-            body = body.with_context(
-                super::messages::HumeContext::with_previous_text(prev)
-            );
+            body = body.with_context(super::messages::HumeContext::with_previous_text(prev));
         }
 
         debug!(
@@ -229,7 +229,10 @@ impl TTSRequestBuilder for HumeRequestBuilder {
             .post(HUME_TTS_STREAM_URL)
             .header("X-Hume-Api-Key", &self.config.api_key)
             .header("Content-Type", "application/json")
-            .header("Accept", self.hume_config.output_format.format.content_type())
+            .header(
+                "Accept",
+                self.hume_config.output_format.format.content_type(),
+            )
             .json(&body)
     }
 
@@ -465,13 +468,12 @@ impl HumeTTS {
     pub fn set_description(&mut self, description: impl Into<String>) {
         let desc = description.into();
         // Truncate if too long
-        self.request_builder.hume_config.description = Some(
-            if desc.len() > super::config::MAX_DESCRIPTION_LENGTH {
+        self.request_builder.hume_config.description =
+            Some(if desc.len() > super::config::MAX_DESCRIPTION_LENGTH {
                 desc[..super::config::MAX_DESCRIPTION_LENGTH].to_string()
             } else {
                 desc
-            },
-        );
+            });
 
         // Recompute config hash since description affects cache
         self.config_hash = compute_hume_tts_config_hash(
@@ -494,10 +496,8 @@ impl HumeTTS {
     /// # Arguments
     /// * `speed` - Speed factor (0.5 to 2.0, 1.0 is normal)
     pub fn set_speed(&mut self, speed: f32) {
-        self.request_builder.hume_config.speed = Some(speed.clamp(
-            super::config::MIN_SPEED,
-            super::config::MAX_SPEED,
-        ));
+        self.request_builder.hume_config.speed =
+            Some(speed.clamp(super::config::MIN_SPEED, super::config::MAX_SPEED));
         self.config_hash = compute_hume_tts_config_hash(
             &self.request_builder.config,
             &self.request_builder.hume_config,
@@ -526,8 +526,7 @@ impl HumeTTS {
 
 impl Default for HumeTTS {
     fn default() -> Self {
-        Self::new(TTSConfig::default())
-            .expect("Default HumeTTS should have valid configuration")
+        Self::new(TTSConfig::default()).expect("Default HumeTTS should have valid configuration")
     }
 }
 
@@ -666,6 +665,7 @@ mod tests {
             request_timeout: Some(60),
             pronunciations: Vec::new(),
             request_pool_size: Some(4),
+            emotion_config: None,
         }
     }
 
@@ -681,18 +681,19 @@ mod tests {
         let builder = HumeRequestBuilder::new(config, hume_config);
 
         assert!(builder.pronunciation_replacer.is_none());
-        assert_eq!(builder.hume_config.output_format.format, HumeAudioFormat::Pcm16);
+        assert_eq!(
+            builder.hume_config.output_format.format,
+            HumeAudioFormat::Pcm16
+        );
     }
 
     #[test]
     fn test_hume_request_builder_with_pronunciations() {
         let mut config = create_test_config();
-        config.pronunciations = vec![
-            Pronunciation {
-                word: "API".to_string(),
-                pronunciation: "A P I".to_string(),
-            },
-        ];
+        config.pronunciations = vec![Pronunciation {
+            word: "API".to_string(),
+            pronunciation: "A P I".to_string(),
+        }];
 
         let hume_config = HumeTTSConfig::from_base(config.clone());
         let builder = HumeRequestBuilder::new(config, hume_config);
@@ -746,7 +747,10 @@ mod tests {
 
         assert_eq!(body.utterances.len(), 1);
         assert_eq!(body.utterances[0].text, "Hello world");
-        assert_eq!(body.utterances[0].description, Some("happy, energetic".to_string()));
+        assert_eq!(
+            body.utterances[0].description,
+            Some("happy, energetic".to_string())
+        );
         assert_eq!(body.utterances[0].speed, Some(1.2));
         assert!(body.format.is_some());
         assert_eq!(body.instant_mode, Some(true));
@@ -999,10 +1003,7 @@ mod tests {
         let mut tts = HumeTTS::new(config).unwrap();
 
         tts.set_generation_id("gen-123");
-        assert_eq!(
-            tts.hume_config().generation_id,
-            Some("gen-123".to_string())
-        );
+        assert_eq!(tts.hume_config().generation_id, Some("gen-123".to_string()));
     }
 
     #[test]

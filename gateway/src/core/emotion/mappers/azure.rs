@@ -73,7 +73,7 @@ impl AzureEmotionMapper {
             Emotion::Calm => Some("calm"),
             Emotion::Anxious => Some("fearful"),
             Emotion::Confident => Some("newscast-casual"), // Authoritative
-            Emotion::Confused => Some("gentle"), // Softer approach
+            Emotion::Confused => Some("gentle"),           // Softer approach
             Emotion::Empathetic => Some("empathetic"),
             Emotion::Sarcastic => Some("cheerful"), // No direct match
             Emotion::Hopeful => Some("hopeful"),
@@ -178,7 +178,7 @@ impl EmotionMapper for AzureEmotionMapper {
                 // Azure uses a separate SSML element for whisper
                 // We'll note this but can't fully express it through MappedEmotion
                 mapped.add_warning(
-                    "Whispered style requires Azure-specific SSML; consider using custom SSML"
+                    "Whispered style requires Azure-specific SSML; consider using custom SSML",
                 );
             }
         }

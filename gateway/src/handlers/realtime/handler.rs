@@ -115,11 +115,28 @@ async fn handle_realtime_socket(socket: WebSocket, app_state: Arc<AppState>, aut
     let mut realtime_provider: Option<Box<dyn BaseRealtime>> = None;
     let mut session_id: Option<String> = None;
 
+    // How often we check if the connection is stale
     let processing_timeout = Duration::from_secs(30);
+
+    // Maximum idle time before closing the connection (5 minutes with ±10% jitter)
+    // Jitter prevents thundering herd when many connections timeout simultaneously
+    let base_idle_secs: u64 = 300;
+    let jitter_range: u64 = 30; // ±10% = 30 seconds
+    let jitter_offset = (std::time::Instant::now().elapsed().as_nanos() as u64
+        % (jitter_range * 2)) as i64
+        - jitter_range as i64;
+    let idle_secs = (base_idle_secs as i64 + jitter_offset).max(1) as u64;
+    let idle_timeout = Duration::from_secs(idle_secs);
+
+    // Track last activity time for idle connection detection
+    let mut last_activity = std::time::Instant::now();
 
     loop {
         select! {
             msg_result = receiver.next() => {
+                // Update activity time on any message
+                last_activity = std::time::Instant::now();
+
                 match msg_result {
                     Some(Ok(msg)) => {
                         let continue_processing = process_realtime_message(
@@ -153,8 +170,23 @@ async fn handle_realtime_socket(socket: WebSocket, app_state: Arc<AppState>, aut
                 }
             }
             _ = tokio::time::sleep(processing_timeout) => {
-                debug!("Realtime WebSocket connection timeout check");
-                continue;
+                // Check if connection has been idle too long
+                if last_activity.elapsed() > idle_timeout {
+                    warn!(
+                        "Realtime WebSocket connection idle for {}s, closing stale connection",
+                        last_activity.elapsed().as_secs()
+                    );
+                    let _ = message_tx
+                        .send(RealtimeMessageRoute::Outgoing(
+                            RealtimeOutgoingMessage::Error {
+                                code: Some("idle_timeout".to_string()),
+                                message: "Connection closed due to inactivity".to_string(),
+                            },
+                        ))
+                        .await;
+                    break;
+                }
+                debug!("Realtime WebSocket connection idle check - still active");
             }
         }
     }
@@ -406,9 +438,10 @@ async fn handle_config(
         return true;
     }
 
-    // Get API key from config
+    // Get API key from config based on provider
     let api_key = match provider_name.to_lowercase().as_str() {
         "openai" => app_state.config.openai_api_key.clone(),
+        "hume" => app_state.config.hume_api_key.clone(),
         _ => None,
     };
 

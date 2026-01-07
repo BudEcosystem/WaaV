@@ -165,8 +165,8 @@ mod tests;
 
 pub use client::IbmWatsonSTT;
 pub use config::{
-    IbmAudioEncoding, IbmModel, IbmRegion, IbmWatsonSTTConfig, DEFAULT_INACTIVITY_TIMEOUT,
-    DEFAULT_MODEL, IBM_IAM_URL,
+    DEFAULT_INACTIVITY_TIMEOUT, DEFAULT_MODEL, IBM_IAM_URL, IbmAudioEncoding, IbmModel, IbmRegion,
+    IbmWatsonSTTConfig,
 };
 
 /// Default IBM Watson STT WebSocket URL template.

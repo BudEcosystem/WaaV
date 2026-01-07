@@ -129,15 +129,15 @@ pub mod messages;
 #[cfg(test)]
 mod tests;
 
-pub use client::{GroqSTT, RateLimitInfo, DEFAULT_UNKNOWN_CONFIDENCE};
+pub use client::{DEFAULT_UNKNOWN_CONFIDENCE, GroqSTT, RateLimitInfo};
 pub use config::{
-    AudioInputFormat, FlushStrategy, GroqResponseFormat, GroqSTTConfig, GroqSTTModel,
-    SilenceDetectionConfig, TimestampGranularity, DEFAULT_MAX_FILE_SIZE, DEV_TIER_MAX_FILE_SIZE,
-    GROQ_STT_URL, GROQ_TRANSLATION_URL, MAX_PROMPT_TOKENS,
+    AudioInputFormat, DEFAULT_MAX_FILE_SIZE, DEV_TIER_MAX_FILE_SIZE, FlushStrategy, GROQ_STT_URL,
+    GROQ_TRANSLATION_URL, GroqResponseFormat, GroqSTTConfig, GroqSTTModel, MAX_PROMPT_TOKENS,
+    SilenceDetectionConfig, TimestampGranularity,
 };
 pub use messages::{
-    GroqError, GroqErrorResponse, GroqMetadata, Segment, TranscriptionResponse,
-    TranscriptionResult, VerboseTranscriptionResponse, Word,
-    wav::{WavError, try_create_wav, create_wav, HEADER_SIZE as WAV_HEADER_SIZE},
-    DEFAULT_UNKNOWN_CONFIDENCE as MESSAGE_DEFAULT_UNKNOWN_CONFIDENCE,
+    DEFAULT_UNKNOWN_CONFIDENCE as MESSAGE_DEFAULT_UNKNOWN_CONFIDENCE, GroqError, GroqErrorResponse,
+    GroqMetadata, Segment, TranscriptionResponse, TranscriptionResult,
+    VerboseTranscriptionResponse, Word,
+    wav::{HEADER_SIZE as WAV_HEADER_SIZE, WavError, create_wav, try_create_wav},
 };

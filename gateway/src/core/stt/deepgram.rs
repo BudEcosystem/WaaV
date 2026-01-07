@@ -27,6 +27,10 @@ type AsyncErrorCallback = Box<
         + Sync,
 >;
 
+/// Per-message idle timeout for WebSocket message reception.
+/// Resets after each successful message. Catches stuck/dead connections.
+const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Simplified connection state with atomic updates
 #[derive(Debug, Clone)]
 enum ConnectionState {
@@ -164,9 +168,9 @@ pub struct DeepgramSTT {
     /// Shutdown signal sender
     shutdown_tx: Option<oneshot::Sender<()>>,
     /// Result channel sender
-    result_tx: Option<mpsc::UnboundedSender<STTResult>>,
+    result_tx: Option<mpsc::Sender<STTResult>>,
     /// Error channel sender for streaming errors
-    error_tx: Option<mpsc::UnboundedSender<STTError>>,
+    error_tx: Option<mpsc::Sender<STTError>>,
     /// Connection handle
     connection_handle: Option<tokio::task::JoinHandle<()>>,
     /// Result forwarding task handle
@@ -222,7 +226,7 @@ impl DeepgramSTT {
     /// Handle incoming WebSocket messages (optimized for hot path)
     fn handle_websocket_message(
         message: Message,
-        result_tx: &mpsc::UnboundedSender<STTResult>,
+        result_tx: &mpsc::Sender<STTResult>,
     ) -> Result<(), STTError> {
         match message {
             Message::Text(text) => {
@@ -243,9 +247,16 @@ impl DeepgramSTT {
                                         alternative.confidence,
                                     );
 
-                                    // Send result (non-blocking)
-                                    if result_tx.send(stt_result).is_err() {
-                                        warn!("Failed to send result - channel closed");
+                                    // Send result (non-blocking with bounded channel)
+                                    if let Err(e) = result_tx.try_send(stt_result) {
+                                        match e {
+                                            mpsc::error::TrySendError::Full(_) => {
+                                                warn!("STT result channel full - dropping result");
+                                            }
+                                            mpsc::error::TrySendError::Closed(_) => {
+                                                warn!("STT result channel closed");
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -303,8 +314,9 @@ impl DeepgramSTT {
         // Create channels for communication (bounded for backpressure)
         let (ws_tx, mut ws_rx) = mpsc::channel::<Bytes>(32);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-        let (result_tx, mut result_rx) = mpsc::unbounded_channel::<STTResult>();
-        let (error_tx, mut error_rx) = mpsc::unbounded_channel::<STTError>();
+        // Bounded channels for backpressure - 256 should handle bursts while preventing memory exhaustion
+        let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
+        let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         // Store channels
@@ -340,7 +352,7 @@ impl DeepgramSTT {
                         "Failed to create WebSocket request: {e}"
                     ));
                     error!("{}", stt_error);
-                    let _ = error_tx.send(stt_error);
+                    let _ = error_tx.try_send(stt_error);
                     return;
                 }
             };
@@ -351,7 +363,7 @@ impl DeepgramSTT {
                     let stt_error =
                         STTError::ConnectionFailed(format!("Failed to connect to Deepgram: {e}"));
                     error!("{}", stt_error);
-                    let _ = error_tx.send(stt_error);
+                    let _ = error_tx.try_send(stt_error);
                     return;
                 }
             };
@@ -380,33 +392,42 @@ impl DeepgramSTT {
                                 "Failed to send WebSocket message: {e}"
                             ));
                             error!("{}", stt_error);
-                            let _ = error_tx.send(stt_error);
+                            let _ = error_tx.try_send(stt_error);
                             break;
                         }
                         // Update last activity time when audio is sent
                         last_activity = Instant::now();
                     }
 
-                    // Handle incoming messages
-                    message = ws_stream.next() => {
+                    // Handle incoming messages with idle timeout
+                    message = timeout(WS_MESSAGE_TIMEOUT, ws_stream.next()) => {
                         match message {
-                            Some(Ok(msg)) => {
+                            Ok(Some(Ok(msg))) => {
                                 if let Err(e) = Self::handle_websocket_message(msg, &result_tx) {
                                     error!("Streaming error from Deepgram: {}", e);
-                                    let _ = error_tx.send(e);
+                                    let _ = error_tx.try_send(e);
                                     break;
                                 }
                             }
-                            Some(Err(e)) => {
+                            Ok(Some(Err(e))) => {
                                 let stt_error = STTError::NetworkError(format!(
                                     "WebSocket error: {e}"
                                 ));
                                 error!("{}", stt_error);
-                                let _ = error_tx.send(stt_error);
+                                let _ = error_tx.try_send(stt_error);
                                 break;
                             }
-                            None => {
+                            Ok(None) => {
                                 info!("WebSocket stream ended");
+                                break;
+                            }
+                            Err(_elapsed) => {
+                                // Idle timeout - no message received for 60s
+                                let stt_error = STTError::NetworkError(
+                                    "WebSocket idle timeout - no message for 60 seconds".into()
+                                );
+                                error!("Deepgram STT idle timeout: {}", stt_error);
+                                let _ = error_tx.try_send(stt_error);
                                 break;
                             }
                         }
@@ -423,7 +444,7 @@ impl DeepgramSTT {
                                     "Failed to send keep-alive message: {e}"
                                 ));
                                 error!("{}", stt_error);
-                                let _ = error_tx.send(stt_error);
+                                let _ = error_tx.try_send(stt_error);
                                 break;
                             }
                             debug!("Sent keep-alive message to Deepgram");
@@ -791,7 +812,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_message_handling() {
-        let (result_tx, mut result_rx) = mpsc::unbounded_channel::<STTResult>();
+        let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
 
         let json_response = r#"
         {

@@ -132,20 +132,16 @@ pub mod types;
 // =============================================================================
 
 // Core types
-pub use types::{
-    DeliveryStyle, Emotion, EmotionConfig, EmotionIntensity, IntensityLevel,
-};
+pub use types::{DeliveryStyle, Emotion, EmotionConfig, EmotionIntensity, IntensityLevel};
 
 // Mapper trait and result
-pub use mapper::{
-    EmotionMapper, EmotionMethod, MappedEmotion, ProviderEmotionSupport,
-};
+pub use mapper::{EmotionMapper, EmotionMethod, MappedEmotion, ProviderEmotionSupport};
 
 // Provider mappers
 pub use mappers::{
-    AzureEmotionMapper, ElevenLabsEmotionMapper, FallbackEmotionMapper,
-    HumeEmotionMapper, get_mapper_for_provider, provider_supports_emotions,
-    providers_with_emotion_support, providers_without_emotion_support,
+    AzureEmotionMapper, ElevenLabsEmotionMapper, FallbackEmotionMapper, HumeEmotionMapper,
+    get_mapper_for_provider, provider_supports_emotions, providers_with_emotion_support,
+    providers_without_emotion_support,
 };
 
 // =============================================================================

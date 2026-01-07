@@ -43,25 +43,22 @@ use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio::time::timeout;
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::Message,
-};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use tracing::{debug, error, info, trace, warn};
 
 use super::config::HumeEVIConfig;
 use super::messages::{
-    AudioInput, AudioSettings, EVIClientMessage, EVIServerMessage, SessionSettings,
-    TextInput, ToolResponse, StopAssistant, serialize_client_message, deserialize_server_message,
-    HUME_EVI_DEFAULT_SAMPLE_RATE,
+    AudioInput, AudioSettings, EVIClientMessage, EVIServerMessage, HUME_EVI_DEFAULT_SAMPLE_RATE,
+    SessionSettings, StopAssistant, TextInput, ToolResponse, deserialize_server_message,
+    serialize_client_message,
 };
 use crate::core::realtime::base::{
     AudioOutputCallback, BaseRealtime, ConnectionState, FunctionCallCallback, FunctionCallRequest,
     RealtimeAudioData, RealtimeConfig, RealtimeError, RealtimeErrorCallback, RealtimeResult,
-    ReconnectionCallback, ResponseDoneCallback, SpeechEvent,
-    SpeechEventCallback, TranscriptCallback, TranscriptResult, TranscriptRole,
+    ReconnectionCallback, ResponseDoneCallback, SpeechEvent, SpeechEventCallback,
+    TranscriptCallback, TranscriptResult, TranscriptRole,
 };
 
 // =============================================================================
@@ -134,19 +131,30 @@ impl HumeEVI {
 
     /// Get the chat ID for the current session.
     pub async fn get_chat_id(&self) -> Option<String> {
-        self.chat_metadata.read().await.as_ref().map(|m| m.chat_id.clone())
+        self.chat_metadata
+            .read()
+            .await
+            .as_ref()
+            .map(|m| m.chat_id.clone())
     }
 
     /// Get the chat group ID for resuming conversations.
     pub async fn get_chat_group_id(&self) -> Option<String> {
-        self.chat_metadata.read().await.as_ref().map(|m| m.chat_group_id.clone())
+        self.chat_metadata
+            .read()
+            .await
+            .as_ref()
+            .map(|m| m.chat_group_id.clone())
     }
 
     /// Connect to Hume EVI WebSocket.
     async fn connect_internal(&mut self) -> RealtimeResult<()> {
         // Build WebSocket URL with query parameters
         let url = self.config.build_websocket_url();
-        debug!("Connecting to Hume EVI: {}", url.split('?').next().unwrap_or(&url));
+        debug!(
+            "Connecting to Hume EVI: {}",
+            url.split('?').next().unwrap_or(&url)
+        );
 
         // Update state to connecting
         *self.state.write().await = ConnectionState::Connecting;
@@ -169,10 +177,7 @@ impl HumeEVI {
             }
         };
 
-        info!(
-            "Connected to Hume EVI (status: {})",
-            response.status()
-        );
+        info!("Connected to Hume EVI (status: {})", response.status());
 
         // Split the WebSocket stream
         let (ws_write, ws_read) = ws_stream.split();
@@ -431,10 +436,7 @@ impl HumeEVI {
             }
 
             EVIServerMessage::AssistantProsody(prosody) => {
-                trace!(
-                    "Assistant prosody for message {}",
-                    prosody.id
-                );
+                trace!("Assistant prosody for message {}", prosody.id);
                 // Prosody data for assistant's voice
                 if let Some(p) = prosody.models.prosody {
                     if let Some(dominant) = p.scores.dominant_emotion() {
@@ -745,8 +747,8 @@ mod tests {
 
     #[test]
     fn test_hume_evi_provider_info() {
-        let config = HumeEVIConfig::new("test-key")
-            .with_version(super::super::config::EVIVersion::V4Mini);
+        let config =
+            HumeEVIConfig::new("test-key").with_version(super::super::config::EVIVersion::V4Mini);
         let evi = HumeEVI::from_hume_config(config).unwrap();
 
         let info = evi.get_provider_info();

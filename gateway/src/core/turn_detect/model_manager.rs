@@ -157,7 +157,14 @@ impl ModelManager {
         ];
 
         // Lock the session mutex for inference
-        let mut session = self.session.lock().unwrap();
+        // Recover from poison if a previous inference panicked - inference should be resilient
+        let mut session = match self.session.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("Model session lock was poisoned (previous inference panicked), recovering");
+                poisoned.into_inner()
+            }
+        };
 
         // Get output name before running to avoid borrow conflicts
         let output_name = session.outputs[0].name.clone();

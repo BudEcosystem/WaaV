@@ -192,7 +192,10 @@ pub struct HumeOutputFormat {
 impl HumeOutputFormat {
     /// Create a new output format.
     pub fn new(format: HumeAudioFormat, sample_rate: u32) -> Self {
-        Self { format, sample_rate }
+        Self {
+            format,
+            sample_rate,
+        }
     }
 
     /// Create a PCM16 format (default for streaming).
@@ -413,7 +416,9 @@ impl HumeTTSConfig {
                     recommended_max = RECOMMENDED_MAX_SPEED,
                     "Hume TTS speed {} is outside the recommended range ({}-{}). \
                      Audio quality may be degraded.",
-                    speed, RECOMMENDED_MIN_SPEED, RECOMMENDED_MAX_SPEED
+                    speed,
+                    RECOMMENDED_MIN_SPEED,
+                    RECOMMENDED_MAX_SPEED
                 );
             }
         }
@@ -848,7 +853,10 @@ mod tests {
     fn test_config_with_description_truncates() {
         let long_desc = "a".repeat(150);
         let config = HumeTTSConfig::default().with_description(long_desc);
-        assert_eq!(config.description.as_ref().unwrap().len(), MAX_DESCRIPTION_LENGTH);
+        assert_eq!(
+            config.description.as_ref().unwrap().len(),
+            MAX_DESCRIPTION_LENGTH
+        );
     }
 
     #[test]

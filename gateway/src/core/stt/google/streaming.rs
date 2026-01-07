@@ -317,7 +317,7 @@ pub(super) fn handle_grpc_error(status: tonic::Status) -> STTError {
 
 pub(super) fn handle_streaming_response(
     response: StreamingRecognizeResponse,
-    result_tx: &mpsc::UnboundedSender<STTResult>,
+    result_tx: &mpsc::Sender<STTResult>,
 ) -> Result<(), STTError> {
     let event_type = SpeechEventType::try_from(response.speech_event_type)
         .unwrap_or(SpeechEventType::Unspecified);
@@ -388,8 +388,8 @@ pub(super) fn handle_streaming_response(
             "Sending transcription result"
         );
 
-        if result_tx.send(stt_result).is_err() {
-            warn!("Failed to send STT result - channel closed");
+        if result_tx.try_send(stt_result).is_err() {
+            warn!("Failed to send STT result - channel closed or full");
             return Err(STTError::ProviderError("Result channel closed".to_string()));
         }
     }

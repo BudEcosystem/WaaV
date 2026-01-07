@@ -205,7 +205,7 @@ fn test_build_audio_request() {
 
 #[test]
 fn test_handle_streaming_response_with_results() {
-    let (tx, mut rx) = mpsc::unbounded_channel::<STTResult>();
+    let (tx, mut rx) = mpsc::channel::<STTResult>(256);
 
     let response = StreamingRecognizeResponse {
         results: vec![StreamingRecognitionResult {
@@ -236,7 +236,7 @@ fn test_handle_streaming_response_with_results() {
 
 #[test]
 fn test_handle_streaming_response_empty_results() {
-    let (tx, mut rx) = mpsc::unbounded_channel::<STTResult>();
+    let (tx, mut rx) = mpsc::channel::<STTResult>(256);
 
     let response = StreamingRecognizeResponse {
         results: vec![],
@@ -252,7 +252,7 @@ fn test_handle_streaming_response_empty_results() {
 
 #[test]
 fn test_handle_streaming_response_empty_transcript() {
-    let (tx, mut rx) = mpsc::unbounded_channel::<STTResult>();
+    let (tx, mut rx) = mpsc::channel::<STTResult>(256);
 
     let response = StreamingRecognizeResponse {
         results: vec![StreamingRecognitionResult {
@@ -279,7 +279,7 @@ fn test_handle_streaming_response_empty_transcript() {
 
 #[test]
 fn test_handle_streaming_response_speech_events() {
-    let (tx, mut rx) = mpsc::unbounded_channel::<STTResult>();
+    let (tx, mut rx) = mpsc::channel::<STTResult>(256);
 
     let response = StreamingRecognizeResponse {
         results: vec![],
@@ -497,7 +497,7 @@ fn test_handle_grpc_error_unknown() {
 
 #[test]
 fn test_handle_streaming_response_interim_result() {
-    let (tx, mut rx) = mpsc::unbounded_channel::<STTResult>();
+    let (tx, mut rx) = mpsc::channel::<STTResult>(256);
 
     let response = StreamingRecognizeResponse {
         results: vec![StreamingRecognitionResult {
@@ -528,7 +528,7 @@ fn test_handle_streaming_response_interim_result() {
 
 #[test]
 fn test_handle_streaming_response_with_end_of_utterance() {
-    let (tx, mut rx) = mpsc::unbounded_channel::<STTResult>();
+    let (tx, mut rx) = mpsc::channel::<STTResult>(256);
 
     let response = StreamingRecognizeResponse {
         results: vec![StreamingRecognitionResult {
@@ -559,7 +559,7 @@ fn test_handle_streaming_response_with_end_of_utterance() {
 
 #[test]
 fn test_handle_streaming_response_speech_activity_end_with_final() {
-    let (tx, mut rx) = mpsc::unbounded_channel::<STTResult>();
+    let (tx, mut rx) = mpsc::channel::<STTResult>(256);
 
     let response = StreamingRecognizeResponse {
         results: vec![StreamingRecognitionResult {
@@ -588,7 +588,7 @@ fn test_handle_streaming_response_speech_activity_end_with_final() {
 
 #[test]
 fn test_handle_streaming_response_multiple_results() {
-    let (tx, mut rx) = mpsc::unbounded_channel::<STTResult>();
+    let (tx, mut rx) = mpsc::channel::<STTResult>(256);
 
     let response = StreamingRecognizeResponse {
         results: vec![
@@ -635,7 +635,7 @@ fn test_handle_streaming_response_multiple_results() {
 
 #[test]
 fn test_handle_streaming_response_no_alternatives() {
-    let (tx, mut rx) = mpsc::unbounded_channel::<STTResult>();
+    let (tx, mut rx) = mpsc::channel::<STTResult>(256);
 
     let response = StreamingRecognizeResponse {
         results: vec![StreamingRecognitionResult {
@@ -658,7 +658,7 @@ fn test_handle_streaming_response_no_alternatives() {
 
 #[test]
 fn test_handle_streaming_response_channel_closed() {
-    let (tx, rx) = mpsc::unbounded_channel::<STTResult>();
+    let (tx, rx) = mpsc::channel::<STTResult>(256);
     drop(rx);
 
     let response = StreamingRecognizeResponse {
@@ -691,7 +691,7 @@ fn test_handle_streaming_response_channel_closed() {
 
 #[test]
 fn test_handle_streaming_response_multiple_alternatives() {
-    let (tx, mut rx) = mpsc::unbounded_channel::<STTResult>();
+    let (tx, mut rx) = mpsc::channel::<STTResult>(256);
 
     let response = StreamingRecognizeResponse {
         results: vec![StreamingRecognitionResult {

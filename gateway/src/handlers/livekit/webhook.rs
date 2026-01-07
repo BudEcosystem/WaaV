@@ -25,6 +25,7 @@ use tracing::{debug, error, info, warn};
 use crate::AppState;
 use crate::state::SipHooksState;
 use crate::utils::req_manager::ReqManager;
+use crate::utils::url_validation::validate_webhook_url;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -122,6 +123,10 @@ pub enum SipForwardingError {
     /// Missing signing secret for webhook forwarding
     #[error("No signing secret configured for domain: {domain}")]
     MissingSigningSecret { domain: String },
+
+    /// Hook URL blocked due to SSRF protection (resolves to private IP)
+    #[error("Hook URL blocked for domain {domain}: {reason}")]
+    SsrfBlocked { domain: String, reason: String },
 }
 
 impl SipForwardingError {
@@ -205,14 +210,17 @@ impl SipForwardingError {
                 status,
                 body,
             } => {
+                // Log body length at WARN level to avoid leaking sensitive data
                 warn!(
                     event_id = %event_id,
                     room_name = ?room_name,
                     sip_domain = %domain,
                     status = %status,
-                    response_body = %body,
+                    response_body_length = body.len(),
                     "SIP forwarding failed: webhook returned non-2xx status"
                 );
+                // Full body only at TRACE level for debugging
+                tracing::trace!(response_body = %body, "Webhook error response body (debug only)");
             }
             SipForwardingError::MissingSigningSecret { domain } => {
                 error!(
@@ -220,6 +228,15 @@ impl SipForwardingError {
                     room_name = ?room_name,
                     sip_domain = %domain,
                     "SIP forwarding failed: no signing secret configured (set global hook_secret or per-hook secret)"
+                );
+            }
+            SipForwardingError::SsrfBlocked { domain, reason } => {
+                error!(
+                    event_id = %event_id,
+                    room_name = ?room_name,
+                    sip_domain = %domain,
+                    reason = %reason,
+                    "SIP forwarding blocked: webhook URL failed SSRF protection check"
                 );
             }
         }
@@ -657,6 +674,16 @@ async fn forward_to_sip_hook(
             hooks_guard.get_room_prefix().to_string(),
         )
     };
+
+    // Step 8.5: Defense-in-depth SSRF validation on hook URL
+    // This catches any URLs that may have bypassed the REST API validation
+    // (e.g., manually edited cache files or config with private IPs)
+    if let Err(e) = validate_webhook_url(&hook_url) {
+        return Err(SipForwardingError::SsrfBlocked {
+            domain: domain.clone(),
+            reason: e.to_string(),
+        });
+    }
 
     // Step 9: Build SIPHookEvent payload
     let sip_event = SIPHookEvent {

@@ -4,14 +4,16 @@
 //! at runtime. Changes are persisted to the cache directory and merged with the
 //! server configuration on startup.
 
-use axum::{extract::State, http::StatusCode, response::Json};
+use axum::{extract::State, http::StatusCode, response::Json, Extension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+use crate::auth::Auth;
 use crate::state::AppState;
 use crate::utils::sip_hooks::{self, CachedSipHook};
+use crate::utils::url_validation::validate_webhook_url;
 
 /// Request body for updating SIP hooks.
 ///
@@ -133,7 +135,20 @@ where
 )]
 pub async fn list_sip_hooks(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<Auth>,
 ) -> Result<Json<SipHooksResponse>, (StatusCode, Json<SipHooksErrorResponse>)> {
+    // Defensive auth check - SIP hooks management requires authentication
+    // The middleware should enforce this, but we add a defense-in-depth check
+    if state.config.auth_required && !auth.is_authenticated() {
+        warn!("Unauthenticated request to list SIP hooks");
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(SipHooksErrorResponse {
+                error: "Authentication required for SIP hooks management".to_string(),
+            }),
+        ));
+    }
+
     if let Some(hooks_state) = state.core_state.get_sip_hooks_state() {
         let hooks_guard = hooks_state.read().await;
         let hooks: Vec<SipHookEntry> = hooks_guard
@@ -185,8 +200,21 @@ pub async fn list_sip_hooks(
 )]
 pub async fn update_sip_hooks(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<Auth>,
     Json(request): Json<SipHooksRequest>,
 ) -> Result<Json<SipHooksResponse>, (StatusCode, Json<SipHooksErrorResponse>)> {
+    // Defensive auth check - SIP hooks management requires authentication
+    // The middleware should enforce this, but we add a defense-in-depth check
+    if state.config.auth_required && !auth.is_authenticated() {
+        warn!("Unauthenticated request to update SIP hooks");
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(SipHooksErrorResponse {
+                error: "Authentication required for SIP hooks management".to_string(),
+            }),
+        ));
+    }
+
     let cache_path = match &state.config.cache_path {
         Some(path) => path.clone(),
         None => {
@@ -201,6 +229,24 @@ pub async fn update_sip_hooks(
     };
 
     let protected_hosts = configured_sip_hosts(&state);
+
+    // Validate all webhook URLs for SSRF protection
+    for hook in &request.hooks {
+        if let Err(e) = validate_webhook_url(&hook.url) {
+            warn!(
+                url = %hook.url,
+                host = %hook.host,
+                error = %e,
+                "SIP hook URL validation failed (SSRF protection)"
+            );
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(SipHooksErrorResponse {
+                    error: format!("Invalid webhook URL for host '{}': {}", hook.host, e),
+                }),
+            ));
+        }
+    }
 
     // Convert request entries to CachedSipHook
     let new_hooks: Vec<CachedSipHook> = request
@@ -346,8 +392,21 @@ pub struct DeleteSipHooksRequest {
 )]
 pub async fn delete_sip_hooks(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<Auth>,
     Json(request): Json<DeleteSipHooksRequest>,
 ) -> Result<Json<SipHooksResponse>, (StatusCode, Json<SipHooksErrorResponse>)> {
+    // Defensive auth check - SIP hooks management requires authentication
+    // The middleware should enforce this, but we add a defense-in-depth check
+    if state.config.auth_required && !auth.is_authenticated() {
+        warn!("Unauthenticated request to delete SIP hooks");
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(SipHooksErrorResponse {
+                error: "Authentication required for SIP hooks management".to_string(),
+            }),
+        ));
+    }
+
     // Validate request has at least one host
     if request.hosts.is_empty() {
         return Err((

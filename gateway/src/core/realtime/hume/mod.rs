@@ -123,9 +123,8 @@ pub use client::HumeEVI;
 pub use config::{EVIVersion, HumeEVIConfig};
 pub use messages::{
     AudioEncoding, AudioInput, AudioOutput, AudioSettings, EVIClientMessage, EVIServerMessage,
-    ProsodyScores, SessionSettings, TextInput, ToolResponse,
     HUME_EVI_DEFAULT_CHANNELS, HUME_EVI_DEFAULT_SAMPLE_RATE, HUME_EVI_MAX_SESSION_DURATION,
-    HUME_EVI_WEBSOCKET_URL,
+    HUME_EVI_WEBSOCKET_URL, ProsodyScores, SessionSettings, TextInput, ToolResponse,
 };
 
 #[cfg(test)]

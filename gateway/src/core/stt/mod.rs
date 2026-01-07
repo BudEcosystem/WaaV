@@ -55,18 +55,18 @@ pub use aws_transcribe::{
 
 // Re-export IBM Watson implementation
 pub use ibm_watson::{
-    IbmAudioEncoding, IbmModel, IbmRegion, IbmWatsonSTT, IbmWatsonSTTConfig,
-    IBM_IAM_URL, IBM_WATSON_STT_URL,
+    IBM_IAM_URL, IBM_WATSON_STT_URL, IbmAudioEncoding, IbmModel, IbmRegion, IbmWatsonSTT,
+    IbmWatsonSTTConfig,
 };
 
 // Re-export Groq implementation
 pub use groq::{
-    AudioInputFormat as GroqAudioInputFormat, FlushStrategy as GroqFlushStrategy,
-    GroqResponseFormat, GroqSTT, GroqSTTConfig, GroqSTTModel,
-    SilenceDetectionConfig as GroqSilenceDetectionConfig,
-    TimestampGranularity as GroqTimestampGranularity, DEFAULT_MAX_FILE_SIZE as GROQ_DEFAULT_MAX_FILE_SIZE,
-    DEV_TIER_MAX_FILE_SIZE as GROQ_DEV_TIER_MAX_FILE_SIZE, GROQ_STT_URL, GROQ_TRANSLATION_URL,
+    AudioInputFormat as GroqAudioInputFormat, DEFAULT_MAX_FILE_SIZE as GROQ_DEFAULT_MAX_FILE_SIZE,
+    DEV_TIER_MAX_FILE_SIZE as GROQ_DEV_TIER_MAX_FILE_SIZE, FlushStrategy as GroqFlushStrategy,
+    GROQ_STT_URL, GROQ_TRANSLATION_URL, GroqResponseFormat, GroqSTT, GroqSTTConfig, GroqSTTModel,
     MAX_PROMPT_TOKENS as GROQ_MAX_PROMPT_TOKENS,
+    SilenceDetectionConfig as GroqSilenceDetectionConfig,
+    TimestampGranularity as GroqTimestampGranularity,
 };
 
 /// Supported STT providers
@@ -928,7 +928,10 @@ mod factory_tests {
             "watson".parse::<STTProvider>().unwrap(),
             STTProvider::IbmWatson
         );
-        assert_eq!("ibm".parse::<STTProvider>().unwrap(), STTProvider::IbmWatson);
+        assert_eq!(
+            "ibm".parse::<STTProvider>().unwrap(),
+            STTProvider::IbmWatson
+        );
     }
 
     #[test]

@@ -35,6 +35,10 @@ use tracing::{debug, error, info, warn};
 /// audio is ~96KB, so 256KB allows for ~2.5 seconds which is generous.
 const MAX_AUDIO_CHUNK_SIZE: usize = 256 * 1024;
 
+/// Per-message idle timeout for WebSocket message reception.
+/// Resets after each successful message. Catches stuck/dead connections.
+const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Minimum supported sample rate (8kHz for telephony)
 pub const MIN_SAMPLE_RATE: u32 = 8000;
 
@@ -146,10 +150,10 @@ pub struct AssemblyAISTT {
     shutdown_tx: Option<oneshot::Sender<()>>,
 
     /// Result channel sender
-    result_tx: Option<mpsc::UnboundedSender<STTResult>>,
+    result_tx: Option<mpsc::Sender<STTResult>>,
 
     /// Error channel sender
-    error_tx: Option<mpsc::UnboundedSender<STTError>>,
+    error_tx: Option<mpsc::Sender<STTError>>,
 
     /// Connection task handle
     connection_handle: Option<tokio::task::JoinHandle<()>>,
@@ -220,7 +224,7 @@ impl AssemblyAISTT {
     /// * `Err(STTError)` - Error occurred, close connection
     pub(crate) async fn handle_websocket_message(
         message: Message,
-        result_tx: &mpsc::UnboundedSender<STTResult>,
+        result_tx: &mpsc::Sender<STTResult>,
         session_id: &Arc<RwLock<Option<String>>>,
     ) -> Result<bool, STTError> {
         // Returns true if connection should continue, false if terminated
@@ -254,7 +258,7 @@ impl AssemblyAISTT {
                                 confidence.clamp(0.0, 1.0),
                             );
 
-                            if result_tx.send(stt_result).is_err() {
+                            if result_tx.try_send(stt_result).is_err() {
                                 warn!("Failed to send turn result - channel closed");
                             }
 
@@ -354,8 +358,9 @@ impl AssemblyAISTT {
         let (ws_tx, mut ws_rx) = mpsc::channel::<Bytes>(32);
         let (control_tx, mut control_rx) = mpsc::channel::<String>(8);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-        let (result_tx, mut result_rx) = mpsc::unbounded_channel::<STTResult>();
-        let (error_tx, mut error_rx) = mpsc::unbounded_channel::<STTError>();
+        // Bounded channels for backpressure - 256 should handle bursts while preventing memory exhaustion
+        let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
+        let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         // Store channels
@@ -394,7 +399,7 @@ impl AssemblyAISTT {
                         "Failed to create WebSocket request: {e}"
                     ));
                     error!("{}", stt_error);
-                    let _ = error_tx.send(stt_error);
+                    let _ = error_tx.try_send(stt_error);
                     return;
                 }
             };
@@ -406,7 +411,7 @@ impl AssemblyAISTT {
                     let stt_error =
                         STTError::ConnectionFailed(format!("Failed to connect to AssemblyAI: {e}"));
                     error!("{}", stt_error);
-                    let _ = error_tx.send(stt_error);
+                    let _ = error_tx.try_send(stt_error);
                     return;
                 }
             };
@@ -431,7 +436,7 @@ impl AssemblyAISTT {
                                 "Failed to send audio to AssemblyAI: {e}"
                             ));
                             error!("{}", stt_error);
-                            let _ = error_tx.send(stt_error);
+                            let _ = error_tx.try_send(stt_error);
                             break;
                         }
 
@@ -445,10 +450,10 @@ impl AssemblyAISTT {
                         }
                     }
 
-                    // Handle incoming messages
-                    message = ws_stream.next() => {
+                    // Handle incoming messages with idle timeout
+                    message = timeout(WS_MESSAGE_TIMEOUT, ws_stream.next()) => {
                         match message {
-                            Some(Ok(msg)) => {
+                            Ok(Some(Ok(msg))) => {
                                 match Self::handle_websocket_message(
                                     msg,
                                     &result_tx,
@@ -471,23 +476,33 @@ impl AssemblyAISTT {
                                     }
                                     Err(e) => {
                                         error!("AssemblyAI streaming error: {}", e);
-                                        let _ = error_tx.send(e);
+                                        let _ = error_tx.try_send(e);
                                         is_connected.store(false, Ordering::Release);
                                         break;
                                     }
                                 }
                             }
-                            Some(Err(e)) => {
+                            Ok(Some(Err(e))) => {
                                 let stt_error = STTError::NetworkError(format!(
                                     "WebSocket error: {e}"
                                 ));
                                 error!("{}", stt_error);
-                                let _ = error_tx.send(stt_error);
+                                let _ = error_tx.try_send(stt_error);
                                 is_connected.store(false, Ordering::Release);
                                 break;
                             }
-                            None => {
+                            Ok(None) => {
                                 info!("AssemblyAI WebSocket stream ended");
+                                is_connected.store(false, Ordering::Release);
+                                break;
+                            }
+                            Err(_elapsed) => {
+                                // Idle timeout - no message received for 60s
+                                let stt_error = STTError::NetworkError(
+                                    "WebSocket idle timeout - no message for 60 seconds".into()
+                                );
+                                error!("AssemblyAI STT idle timeout: {}", stt_error);
+                                let _ = error_tx.try_send(stt_error);
                                 is_connected.store(false, Ordering::Release);
                                 break;
                             }
@@ -996,7 +1011,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_begin_message() {
-        let (tx, _rx) = mpsc::unbounded_channel::<STTResult>();
+        let (tx, _rx) = mpsc::channel::<STTResult>(256);
         let session_id = Arc::new(RwLock::new(None));
 
         let msg = Message::Text(
@@ -1015,7 +1030,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_turn_message() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<STTResult>();
+        let (tx, mut rx) = mpsc::channel::<STTResult>(256);
         let session_id = Arc::new(RwLock::new(None));
 
         let msg = Message::Text(
@@ -1036,7 +1051,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_termination_message() {
-        let (tx, _rx) = mpsc::unbounded_channel::<STTResult>();
+        let (tx, _rx) = mpsc::channel::<STTResult>(256);
         let session_id = Arc::new(RwLock::new(None));
 
         let msg = Message::Text(
@@ -1051,7 +1066,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_error_message() {
-        let (tx, _rx) = mpsc::unbounded_channel::<STTResult>();
+        let (tx, _rx) = mpsc::channel::<STTResult>(256);
         let session_id = Arc::new(RwLock::new(None));
 
         let msg = Message::Text(
@@ -1071,7 +1086,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_rate_limit_error() {
-        let (tx, _rx) = mpsc::unbounded_channel::<STTResult>();
+        let (tx, _rx) = mpsc::channel::<STTResult>(256);
         let session_id = Arc::new(RwLock::new(None));
 
         let msg = Message::Text(

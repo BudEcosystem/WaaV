@@ -10,14 +10,57 @@ use axum::{
 use http_body_util::BodyExt;
 use std::sync::Arc;
 
+/// Extract authentication token from request
+///
+/// Supports multiple token sources for browser/WebSocket compatibility:
+/// 1. Authorization header: `Authorization: Bearer <token>` (preferred)
+/// 2. Query parameter: `?token=<token>` (for WebSocket connections)
+///
+/// # Arguments
+/// * `request` - The incoming HTTP request
+///
+/// # Returns
+/// * `Result<String, AuthError>` - The extracted token or an error
+fn extract_token(request: &Request) -> Result<String, AuthError> {
+    // Try Authorization header first (preferred method)
+    if let Some(auth_header) = request.headers().get("authorization") {
+        let auth_str = auth_header
+            .to_str()
+            .map_err(|_| AuthError::InvalidAuthHeader)?;
+
+        if let Some(token) = auth_str.strip_prefix("Bearer ") {
+            tracing::debug!("Token extracted from Authorization header");
+            return Ok(token.to_string());
+        }
+        return Err(AuthError::InvalidAuthHeader);
+    }
+
+    // Try query parameter (for WebSocket browser connections)
+    if let Some(query) = request.uri().query() {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            if key == "token" {
+                tracing::debug!("Token extracted from query parameter");
+                return Ok(value.to_string());
+            }
+        }
+    }
+
+    // No token found
+    Err(AuthError::MissingAuthHeader)
+}
+
 /// Authentication middleware that validates bearer tokens
 ///
 /// This middleware supports two authentication modes:
 /// 1. **API Secret Mode**: Simple bearer token comparison against configured API secrets
 /// 2. **JWT Mode**: External validation service with signed JWT requests
 ///
+/// Token extraction priority (for browser/WebSocket compatibility):
+/// 1. Authorization header: `Authorization: Bearer <token>`
+/// 2. Query parameter: `?token=<token>` (for WebSocket connections where headers can't be set)
+///
 /// The middleware:
-/// 1. Extracts the Authorization header and parses the bearer token
+/// 1. Extracts the token from Authorization header or query parameter
 /// 2. For API secret mode: compares token directly with configured API secrets
 /// 3. For JWT mode: buffers body, filters headers, and validates with auth service
 /// 4. Inserts an AuthContext into request extensions on successful validation
@@ -53,20 +96,25 @@ pub async fn auth_middleware(
         "Starting authentication validation"
     );
 
-    // Extract the Authorization header
-    let auth_header = request
-        .headers()
-        .get("authorization")
-        .ok_or(AuthError::MissingAuthHeader)?
-        .to_str()
-        .map_err(|_| AuthError::InvalidAuthHeader)?
-        .to_string();
-
-    // Parse the Bearer token
-    let token = auth_header
-        .strip_prefix("Bearer ")
-        .ok_or(AuthError::InvalidAuthHeader)?
-        .to_string();
+    // Extract token from Authorization header or query parameter
+    // Priority: Authorization header > query parameter (for WebSocket browser compatibility)
+    let token = match extract_token(&request) {
+        Ok(t) => t,
+        Err(e) => {
+            // For WebSocket connections, allow deferred auth (first-message auth)
+            // This enables browser clients to authenticate after connection
+            if request_path == "/ws" {
+                tracing::info!(
+                    path = %request_path,
+                    "WebSocket connection without token, enabling first-message auth"
+                );
+                request.extensions_mut().insert(Auth::pending());
+                return Ok(next.run(request).await);
+            }
+            // For non-WebSocket routes, require immediate authentication
+            return Err(e);
+        }
+    };
 
     // Check authentication mode and validate accordingly
     // Priority: API secret mode first (simpler), then JWT mode

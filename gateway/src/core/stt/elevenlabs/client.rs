@@ -13,6 +13,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
+use url::form_urlencoded;
 
 use super::config::{CommitStrategy, ElevenLabsAudioFormat, ElevenLabsRegion, ElevenLabsSTTConfig};
 use super::messages::{ElevenLabsMessage, InputAudioChunk};
@@ -51,6 +52,14 @@ pub(crate) enum ConnectionState {
     Connected,
     Error(String),
 }
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Per-message idle timeout for WebSocket message reception.
+/// Resets after each successful message. Catches stuck/dead connections.
+const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // =============================================================================
 // ElevenLabsSTT Client
@@ -108,10 +117,10 @@ pub struct ElevenLabsSTT {
     shutdown_tx: Option<oneshot::Sender<()>>,
 
     /// Result channel sender
-    result_tx: Option<mpsc::UnboundedSender<STTResult>>,
+    result_tx: Option<mpsc::Sender<STTResult>>,
 
     /// Error channel sender
-    error_tx: Option<mpsc::UnboundedSender<STTError>>,
+    error_tx: Option<mpsc::Sender<STTError>>,
 
     /// Connection task handle
     connection_handle: Option<tokio::task::JoinHandle<()>>,
@@ -158,6 +167,11 @@ impl ElevenLabsSTT {
         &self,
         config: &ElevenLabsSTTConfig,
     ) -> Result<String, STTError> {
+        // URL-encode parameters that could contain special characters
+        let encode = |s: &str| -> String {
+            form_urlencoded::byte_serialize(s.as_bytes()).collect()
+        };
+
         // Pre-allocate with estimated capacity
         let mut url = String::with_capacity(512);
 
@@ -165,15 +179,15 @@ impl ElevenLabsSTT {
         url.push_str(config.region.websocket_base_url());
         url.push_str("/v1/speech-to-text/realtime?");
 
-        // Required: model_id
+        // Required: model_id (URL encoded for safety)
         url.push_str("model_id=");
-        url.push_str(&config.model_id);
+        url.push_str(&encode(&config.model_id));
 
-        // Required: audio_format
+        // Required: audio_format (safe: enum value)
         url.push_str("&audio_format=");
         url.push_str(config.audio_format.as_str());
 
-        // Optional: language_code (extract just the language code part)
+        // Optional: language_code (URL encoded, extract just the language code part)
         if !config.base.language.is_empty() {
             url.push_str("&language_code=");
             let lang = if config.base.language.contains('-') {
@@ -186,14 +200,14 @@ impl ElevenLabsSTT {
             } else {
                 &config.base.language
             };
-            url.push_str(lang);
+            url.push_str(&encode(lang));
         }
 
-        // Commit strategy
+        // Commit strategy (safe: enum value)
         url.push_str("&commit_strategy=");
         url.push_str(config.commit_strategy.as_str());
 
-        // Include timestamps
+        // Include timestamps (safe: boolean literal)
         url.push_str("&include_timestamps=");
         url.push_str(if config.include_timestamps {
             "true"
@@ -201,7 +215,7 @@ impl ElevenLabsSTT {
             "false"
         });
 
-        // Optional VAD parameters
+        // Optional VAD parameters (safe: numeric values)
         if let Some(threshold) = config.vad_silence_threshold_secs {
             url.push_str("&vad_silence_threshold_secs=");
             url.push_str(&threshold.to_string());
@@ -222,7 +236,7 @@ impl ElevenLabsSTT {
             url.push_str(&duration.to_string());
         }
 
-        // Enable logging (for debugging)
+        // Enable logging (safe: boolean literal)
         if config.enable_logging {
             url.push_str("&enable_logging=true");
         }
@@ -253,7 +267,7 @@ impl ElevenLabsSTT {
     /// - Non-blocking result transmission
     pub(crate) fn handle_websocket_message(
         message: Message,
-        result_tx: &mpsc::UnboundedSender<STTResult>,
+        result_tx: &mpsc::Sender<STTResult>,
         session_id: &mut Option<String>,
     ) -> Result<(), STTError> {
         match message {
@@ -276,7 +290,7 @@ impl ElevenLabsSTT {
                                     0.0,   // No confidence for partials
                                 );
 
-                                if result_tx.send(stt_result).is_err() {
+                                if result_tx.try_send(stt_result).is_err() {
                                     warn!("Failed to send partial result - channel closed");
                                 }
                             }
@@ -290,7 +304,7 @@ impl ElevenLabsSTT {
                                 1.0,  // High confidence for committed
                             );
 
-                            if result_tx.send(stt_result).is_err() {
+                            if result_tx.try_send(stt_result).is_err() {
                                 warn!("Failed to send committed result - channel closed");
                             }
                         }
@@ -306,7 +320,7 @@ impl ElevenLabsSTT {
                                 confidence.clamp(0.0, 1.0),
                             );
 
-                            if result_tx.send(stt_result).is_err() {
+                            if result_tx.try_send(stt_result).is_err() {
                                 warn!("Failed to send timestamped result - channel closed");
                             }
                         }
@@ -386,8 +400,9 @@ impl ElevenLabsSTT {
         // Create channels for communication
         let (ws_tx, mut ws_rx) = mpsc::channel::<Bytes>(32);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-        let (result_tx, mut result_rx) = mpsc::unbounded_channel::<STTResult>();
-        let (error_tx, mut error_rx) = mpsc::unbounded_channel::<STTError>();
+        // Bounded channels for backpressure - 256 should handle bursts while preventing memory exhaustion
+        let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
+        let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         // Store channels
@@ -420,7 +435,7 @@ impl ElevenLabsSTT {
                         "Failed to create WebSocket request: {e}"
                     ));
                     error!("{}", stt_error);
-                    let _ = error_tx.send(stt_error);
+                    let _ = error_tx.try_send(stt_error);
                     return;
                 }
             };
@@ -432,7 +447,7 @@ impl ElevenLabsSTT {
                     let stt_error =
                         STTError::ConnectionFailed(format!("Failed to connect to ElevenLabs: {e}"));
                     error!("{}", stt_error);
-                    let _ = error_tx.send(stt_error);
+                    let _ = error_tx.try_send(stt_error);
                     return;
                 }
             };
@@ -460,7 +475,7 @@ impl ElevenLabsSTT {
                                     "Failed to serialize audio chunk: {e}"
                                 ));
                                 error!("{}", stt_error);
-                                let _ = error_tx.send(stt_error);
+                                let _ = error_tx.try_send(stt_error);
                                 continue;
                             }
                         };
@@ -471,24 +486,24 @@ impl ElevenLabsSTT {
                                 "Failed to send audio to ElevenLabs: {e}"
                             ));
                             error!("{}", stt_error);
-                            let _ = error_tx.send(stt_error);
+                            let _ = error_tx.try_send(stt_error);
                             break;
                         }
 
                         debug!("Sent {} bytes of audio to ElevenLabs", audio_data.len());
                     }
 
-                    // Handle incoming messages
-                    message = ws_stream.next() => {
+                    // Handle incoming messages with idle timeout
+                    message = timeout(WS_MESSAGE_TIMEOUT, ws_stream.next()) => {
                         match message {
-                            Some(Ok(msg)) => {
+                            Ok(Some(Ok(msg))) => {
                                 if let Err(e) = Self::handle_websocket_message(
                                     msg,
                                     &result_tx,
                                     &mut session_id,
                                 ) {
                                     error!("ElevenLabs streaming error: {}", e);
-                                    let _ = error_tx.send(e);
+                                    let _ = error_tx.try_send(e);
                                     break;
                                 }
 
@@ -497,16 +512,25 @@ impl ElevenLabsSTT {
                                     let _ = tx.send(());
                                 }
                             }
-                            Some(Err(e)) => {
+                            Ok(Some(Err(e))) => {
                                 let stt_error = STTError::NetworkError(format!(
                                     "WebSocket error: {e}"
                                 ));
                                 error!("{}", stt_error);
-                                let _ = error_tx.send(stt_error);
+                                let _ = error_tx.try_send(stt_error);
                                 break;
                             }
-                            None => {
+                            Ok(None) => {
                                 info!("ElevenLabs WebSocket stream ended");
+                                break;
+                            }
+                            Err(_elapsed) => {
+                                // Idle timeout - no message received for 60s
+                                let stt_error = STTError::NetworkError(
+                                    "WebSocket idle timeout - no message for 60 seconds".into()
+                                );
+                                error!("ElevenLabs STT idle timeout: {}", stt_error);
+                                let _ = error_tx.try_send(stt_error);
                                 break;
                             }
                         }

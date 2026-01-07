@@ -34,6 +34,14 @@ use crate::core::stt::base::{
 };
 
 // =============================================================================
+// Constants
+// =============================================================================
+
+/// Per-message idle timeout for WebSocket message reception.
+/// Resets after each successful message. Catches stuck/dead connections.
+const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+// =============================================================================
 // Type Aliases
 // =============================================================================
 
@@ -131,10 +139,10 @@ pub struct CartesiaSTT {
     shutdown_tx: Option<oneshot::Sender<()>>,
 
     /// Result channel sender.
-    result_tx: Option<mpsc::UnboundedSender<STTResult>>,
+    result_tx: Option<mpsc::Sender<STTResult>>,
 
     /// Error channel sender for streaming errors.
-    error_tx: Option<mpsc::UnboundedSender<STTError>>,
+    error_tx: Option<mpsc::Sender<STTError>>,
 
     /// Connection task handle.
     connection_handle: Option<tokio::task::JoinHandle<()>>,
@@ -161,8 +169,8 @@ impl CartesiaSTT {
     /// - Non-blocking send via channel
     fn handle_websocket_message(
         message: Message,
-        result_tx: &mpsc::UnboundedSender<STTResult>,
-        error_tx: &mpsc::UnboundedSender<STTError>,
+        result_tx: &mpsc::Sender<STTResult>,
+        error_tx: &mpsc::Sender<STTError>,
     ) -> Result<bool, STTError> {
         match message {
             Message::Text(text) => {
@@ -174,7 +182,7 @@ impl CartesiaSTT {
                             let stt_result = transcript.to_stt_result();
 
                             // Send result (non-blocking)
-                            if result_tx.send(stt_result).is_err() {
+                            if result_tx.try_send(stt_result).is_err() {
                                 warn!("Failed to send result - channel closed");
                             }
                         }
@@ -187,7 +195,7 @@ impl CartesiaSTT {
                         }
                         CartesiaMessage::Error(e) => {
                             let stt_error = STTError::ProviderError(e.message);
-                            if error_tx.send(stt_error.clone()).is_err() {
+                            if error_tx.try_send(stt_error.clone()).is_err() {
                                 warn!("Failed to send error - channel closed");
                             }
                             return Err(stt_error);
@@ -235,8 +243,9 @@ impl CartesiaSTT {
         // Create channels for communication (bounded for backpressure on audio)
         let (ws_tx, mut ws_rx) = mpsc::channel::<Bytes>(32);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-        let (result_tx, mut result_rx) = mpsc::unbounded_channel::<STTResult>();
-        let (error_tx, mut error_rx) = mpsc::unbounded_channel::<STTError>();
+        // Bounded channels for backpressure - 256 should handle bursts while preventing memory exhaustion
+        let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
+        let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         // Store channels
@@ -281,15 +290,15 @@ impl CartesiaSTT {
                                 "Failed to send WebSocket message: {e}"
                             ));
                             error!("{}", stt_error);
-                            let _ = error_tx.send(stt_error);
+                            let _ = error_tx.try_send(stt_error);
                             break;
                         }
                     }
 
-                    // Handle incoming messages
-                    message = ws_stream.next() => {
+                    // Handle incoming messages with idle timeout
+                    message = timeout(WS_MESSAGE_TIMEOUT, ws_stream.next()) => {
                         match message {
-                            Some(Ok(msg)) => {
+                            Ok(Some(Ok(msg))) => {
                                 match Self::handle_websocket_message(msg, &result_tx, &error_tx) {
                                     Ok(should_close) => {
                                         if should_close {
@@ -303,16 +312,25 @@ impl CartesiaSTT {
                                     }
                                 }
                             }
-                            Some(Err(e)) => {
+                            Ok(Some(Err(e))) => {
                                 let stt_error = STTError::NetworkError(format!(
                                     "WebSocket error: {e}"
                                 ));
                                 error!("{}", stt_error);
-                                let _ = error_tx.send(stt_error);
+                                let _ = error_tx.try_send(stt_error);
                                 break;
                             }
-                            None => {
+                            Ok(None) => {
                                 info!("WebSocket stream ended");
+                                break;
+                            }
+                            Err(_elapsed) => {
+                                // Idle timeout - no message received for 60s
+                                let stt_error = STTError::NetworkError(
+                                    "WebSocket idle timeout - no message for 60 seconds".into()
+                                );
+                                error!("Cartesia STT idle timeout: {}", stt_error);
+                                let _ = error_tx.try_send(stt_error);
                                 break;
                             }
                         }
@@ -759,8 +777,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_websocket_message_transcript() {
-        let (result_tx, mut result_rx) = mpsc::unbounded_channel::<STTResult>();
-        let (error_tx, _error_rx) = mpsc::unbounded_channel::<STTError>();
+        let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
+        let (error_tx, _error_rx) = mpsc::channel::<STTError>(256);
 
         let json = r#"{"type": "transcript", "text": "Hello world", "is_final": true}"#;
         let message = Message::Text(json.to_string().into());
@@ -781,8 +799,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_websocket_message_done() {
-        let (result_tx, _result_rx) = mpsc::unbounded_channel::<STTResult>();
-        let (error_tx, _error_rx) = mpsc::unbounded_channel::<STTError>();
+        let (result_tx, _result_rx) = mpsc::channel::<STTResult>(256);
+        let (error_tx, _error_rx) = mpsc::channel::<STTError>(256);
 
         let json = r#"{"type": "done"}"#;
         let message = Message::Text(json.to_string().into());
@@ -794,8 +812,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_websocket_message_error() {
-        let (result_tx, _result_rx) = mpsc::unbounded_channel::<STTResult>();
-        let (error_tx, mut error_rx) = mpsc::unbounded_channel::<STTError>();
+        let (result_tx, _result_rx) = mpsc::channel::<STTResult>(256);
+        let (error_tx, mut error_rx) = mpsc::channel::<STTError>(256);
 
         let json = r#"{"type": "error", "message": "Invalid audio format"}"#;
         let message = Message::Text(json.to_string().into());
@@ -818,8 +836,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_websocket_message_flush_done() {
-        let (result_tx, _result_rx) = mpsc::unbounded_channel::<STTResult>();
-        let (error_tx, _error_rx) = mpsc::unbounded_channel::<STTError>();
+        let (result_tx, _result_rx) = mpsc::channel::<STTResult>(256);
+        let (error_tx, _error_rx) = mpsc::channel::<STTError>(256);
 
         let json = r#"{"type": "flush_done"}"#;
         let message = Message::Text(json.to_string().into());
@@ -831,8 +849,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_websocket_message_close() {
-        let (result_tx, _result_rx) = mpsc::unbounded_channel::<STTResult>();
-        let (error_tx, _error_rx) = mpsc::unbounded_channel::<STTError>();
+        let (result_tx, _result_rx) = mpsc::channel::<STTResult>(256);
+        let (error_tx, _error_rx) = mpsc::channel::<STTError>(256);
 
         let message = Message::Close(None);
 

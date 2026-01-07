@@ -47,6 +47,14 @@ use crate::core::stt::base::{
 };
 
 // =============================================================================
+// Constants
+// =============================================================================
+
+/// Timeout for receiving WebSocket messages (60 seconds)
+/// This prevents hung connections when Azure stops responding
+const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+// =============================================================================
 // Type Aliases
 // =============================================================================
 
@@ -160,10 +168,10 @@ pub struct AzureSTT {
     shutdown_tx: Option<oneshot::Sender<()>>,
 
     /// Result channel sender.
-    result_tx: Option<mpsc::UnboundedSender<STTResult>>,
+    result_tx: Option<mpsc::Sender<STTResult>>,
 
     /// Error channel sender.
-    error_tx: Option<mpsc::UnboundedSender<STTError>>,
+    error_tx: Option<mpsc::Sender<STTError>>,
 
     /// Connection task handle.
     connection_handle: Option<tokio::task::JoinHandle<()>>,
@@ -224,7 +232,7 @@ impl AzureSTT {
     /// - Errors -> error channel
     fn handle_websocket_message(
         message: Message,
-        result_tx: &mpsc::UnboundedSender<STTResult>,
+        result_tx: &mpsc::Sender<STTResult>,
         interim_results_enabled: bool,
     ) -> Result<(), STTError> {
         match message {
@@ -240,7 +248,7 @@ impl AzureSTT {
                         AzureMessage::SpeechHypothesis(hypothesis) => {
                             if interim_results_enabled && !hypothesis.text.is_empty() {
                                 let stt_result = hypothesis.to_stt_result();
-                                if result_tx.send(stt_result).is_err() {
+                                if result_tx.try_send(stt_result).is_err() {
                                     warn!("Failed to send hypothesis result - channel closed");
                                 }
                             }
@@ -258,7 +266,7 @@ impl AzureSTT {
 
                             // Only send results for successful recognition
                             if let Some(stt_result) = phrase.to_stt_result() {
-                                if result_tx.send(stt_result).is_err() {
+                                if result_tx.try_send(stt_result).is_err() {
                                     warn!("Failed to send phrase result - channel closed");
                                 }
                             } else if phrase.recognition_status == RecognitionStatus::NoMatch {
@@ -320,8 +328,9 @@ impl AzureSTT {
         // Create channels for communication
         let (ws_tx, mut ws_rx) = mpsc::channel::<Bytes>(32);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-        let (result_tx, mut result_rx) = mpsc::unbounded_channel::<STTResult>();
-        let (error_tx, mut error_rx) = mpsc::unbounded_channel::<STTError>();
+        // Bounded channels for backpressure - 256 should handle bursts while preventing memory exhaustion
+        let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
+        let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         // Store channels
@@ -362,7 +371,7 @@ impl AzureSTT {
                         "Failed to create WebSocket request: {e}"
                     ));
                     error!("{}", stt_error);
-                    let _ = error_tx.send(stt_error);
+                    let _ = error_tx.try_send(stt_error);
                     return;
                 }
             };
@@ -376,7 +385,7 @@ impl AzureSTT {
                             "Connection to Azure timed out after 30 seconds".to_string(),
                         );
                         error!("{}", stt_error);
-                        let _ = error_tx.send(stt_error);
+                        let _ = error_tx.try_send(stt_error);
                         return;
                     }
                 };
@@ -401,7 +410,7 @@ impl AzureSTT {
                         STTError::ConnectionFailed(error_msg)
                     };
                     error!("{}", stt_error);
-                    let _ = error_tx.send(stt_error);
+                    let _ = error_tx.try_send(stt_error);
                     return;
                 }
             };
@@ -436,37 +445,45 @@ impl AzureSTT {
                                 "Failed to send audio to Azure: {e}"
                             ));
                             error!("{}", stt_error);
-                            let _ = error_tx.send(stt_error);
+                            let _ = error_tx.try_send(stt_error);
                             break;
                         }
                         // Update last audio time for keep-alive tracking
                         last_audio_time = Instant::now();
                     }
 
-                    // Handle incoming messages
-                    message = ws_stream.next() => {
+                    // Handle incoming messages with timeout to detect hung connections
+                    message = timeout(WS_MESSAGE_TIMEOUT, ws_stream.next()) => {
                         match message {
-                            Some(Ok(msg)) => {
+                            Ok(Some(Ok(msg))) => {
                                 if let Err(e) = Self::handle_websocket_message(
                                     msg,
                                     &result_tx,
                                     interim_results_enabled,
                                 ) {
                                     error!("Azure streaming error: {}", e);
-                                    let _ = error_tx.send(e);
+                                    let _ = error_tx.try_send(e);
                                     break;
                                 }
                             }
-                            Some(Err(e)) => {
+                            Ok(Some(Err(e))) => {
                                 let stt_error = STTError::NetworkError(format!(
                                     "WebSocket error: {e}"
                                 ));
                                 error!("{}", stt_error);
-                                let _ = error_tx.send(stt_error);
+                                let _ = error_tx.try_send(stt_error);
                                 break;
                             }
-                            None => {
+                            Ok(None) => {
                                 info!("Azure WebSocket stream ended");
+                                break;
+                            }
+                            Err(_elapsed) => {
+                                let stt_error = STTError::NetworkError(
+                                    "Azure WebSocket timeout - no message received within 60 seconds".to_string()
+                                );
+                                error!("{}", stt_error);
+                                let _ = error_tx.try_send(stt_error);
                                 break;
                             }
                         }
@@ -486,7 +503,7 @@ impl AzureSTT {
                                     "Failed to send keep-alive: {e}"
                                 ));
                                 error!("{}", stt_error);
-                                let _ = error_tx.send(stt_error);
+                                let _ = error_tx.try_send(stt_error);
                                 break;
                             }
                             debug!("Sent keep-alive silence frame to Azure");

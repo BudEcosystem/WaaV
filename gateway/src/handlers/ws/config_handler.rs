@@ -150,6 +150,12 @@ pub async fn handle_config_message(
                 );
             }
 
+            // Get auth_id for tenant-scoped recording paths
+            let auth_id = {
+                let state_guard = state.read().await;
+                state_guard.auth.id.clone()
+            };
+
             match initialize_livekit_client(
                 livekit_ws_config,
                 tts_ws_config.as_ref(),
@@ -158,6 +164,7 @@ pub async fn handle_config_message(
                 message_tx,
                 app_state.livekit_room_handler.as_ref(),
                 &stream_id,
+                auth_id.as_deref(),
             )
             .await
             {
@@ -706,6 +713,7 @@ async fn initialize_livekit_client(
     message_tx: &mpsc::Sender<MessageRoute>,
     room_handler: Option<&Arc<crate::livekit::room_handler::LiveKitRoomHandler>>,
     stream_id: &str,
+    auth_id: Option<&str>,
 ) -> Option<(
     Arc<RwLock<LiveKitClient>>,
     Option<crate::livekit::OperationQueue>,
@@ -784,13 +792,13 @@ async fn initialize_livekit_client(
     // Start recording if requested
     let egress_id = if livekit_ws_config.enable_recording {
         match room_handler
-            .setup_room_recording(&livekit_ws_config.room_name, stream_id)
+            .setup_room_recording(&livekit_ws_config.room_name, auth_id, stream_id)
             .await
         {
             Ok(id) => {
                 info!(
-                    "Room recording started with egress ID: {} for stream: {}",
-                    id, stream_id
+                    "Room recording started with egress ID: {} for stream: {} auth_id: {:?}",
+                    id, stream_id, auth_id
                 );
                 Some(id)
             }

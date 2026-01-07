@@ -470,11 +470,15 @@ impl VoiceManager {
             }
         }
 
+        // Notify any waiters that the clear operation is complete
+        // This wakes up coroutines waiting on clear_notify.notified()
+        self.clear_notify.notify_one();
+
         // Use notification instead of sleep for better latency
-        // Wait for pending audio to be processed with timeout
+        // Wait briefly for any pending audio to be flushed through the pipeline
         let _ = tokio::time::timeout(
-            Duration::from_millis(50), // Reduced from 100ms
-            self.clear_notify.notified(),
+            Duration::from_millis(50), // Short timeout for pipeline flush
+            tokio::time::sleep(Duration::from_millis(10)),
         )
         .await;
 

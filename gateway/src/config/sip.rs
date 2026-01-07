@@ -52,6 +52,11 @@ pub struct SipConfig {
     pub hooks: Vec<SipHookConfig>,
     /// Global signing secret for webhook requests (can be overridden per hook)
     pub hook_secret: Option<String>,
+    /// Prefix for SIP trunk and dispatch naming.
+    /// Used to generate deterministic resource names in LiveKit.
+    /// Format: `{naming_prefix}-{room_prefix}-trunk` and `{naming_prefix}-{room_prefix}-dispatch`
+    /// Defaults to "waav" if not specified.
+    pub naming_prefix: String,
 }
 
 impl SipConfig {
@@ -65,6 +70,7 @@ impl SipConfig {
         allowed_addresses: Vec<String>,
         hooks: Vec<SipHookConfig>,
         hook_secret: Option<String>,
+        naming_prefix: Option<String>,
     ) -> Self {
         // Normalize addresses (trim whitespace)
         let allowed_addresses = allowed_addresses
@@ -85,11 +91,18 @@ impl SipConfig {
         // Normalize global secret (trim only, no logging)
         let hook_secret = hook_secret.map(|s| s.trim().to_string());
 
+        // Use provided naming prefix or default to "waav"
+        let naming_prefix = naming_prefix
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| "waav".to_string());
+
         Self {
             room_prefix,
             allowed_addresses,
             hooks,
             hook_secret,
+            naming_prefix,
         }
     }
 }
@@ -124,6 +137,7 @@ mod tests {
             vec!["192.168.1.0/24".to_string(), " 10.0.0.1 ".to_string()],
             hooks,
             Some("global-secret".to_string()),
+            None, // Use default naming prefix
         );
 
         assert_eq!(config.room_prefix, "sip-");
@@ -133,6 +147,7 @@ mod tests {
         assert_eq!(config.hooks.len(), 1);
         assert_eq!(config.hooks[0].host, "example.com");
         assert_eq!(config.hook_secret, Some("global-secret".to_string()));
+        assert_eq!(config.naming_prefix, "waav"); // default
     }
 
     #[test]
@@ -150,7 +165,7 @@ mod tests {
             },
         ];
 
-        let config = SipConfig::new("sip-".to_string(), vec![], hooks, None);
+        let config = SipConfig::new("sip-".to_string(), vec![], hooks, None, None);
 
         assert_eq!(config.hooks[0].host, "example.com"); // normalized to lowercase
         assert_eq!(config.hooks[1].host, "another.host"); // normalized to lowercase
@@ -162,6 +177,7 @@ mod tests {
             "sip-".to_string(),
             vec!["  192.168.1.0/24  ".to_string(), "\t10.0.0.1\n".to_string()],
             vec![],
+            None,
             None,
         );
 
@@ -182,9 +198,49 @@ mod tests {
             vec![],
             hooks,
             Some("  global-secret  ".to_string()),
+            None,
         );
 
         assert_eq!(config.hook_secret, Some("global-secret".to_string())); // trimmed
         assert_eq!(config.hooks[0].secret, Some("hook-secret".to_string())); // trimmed
+    }
+
+    #[test]
+    fn test_sip_config_custom_naming_prefix() {
+        let config = SipConfig::new(
+            "sip-".to_string(),
+            vec![],
+            vec![],
+            None,
+            Some("custom-prefix".to_string()),
+        );
+
+        assert_eq!(config.naming_prefix, "custom-prefix");
+    }
+
+    #[test]
+    fn test_sip_config_naming_prefix_trims_whitespace() {
+        let config = SipConfig::new(
+            "sip-".to_string(),
+            vec![],
+            vec![],
+            None,
+            Some("  trimmed  ".to_string()),
+        );
+
+        assert_eq!(config.naming_prefix, "trimmed");
+    }
+
+    #[test]
+    fn test_sip_config_empty_naming_prefix_uses_default() {
+        let config = SipConfig::new(
+            "sip-".to_string(),
+            vec![],
+            vec![],
+            None,
+            Some("   ".to_string()), // Empty after trim
+        );
+
+        assert_eq!(config.naming_prefix, "waav"); // Falls back to default
     }
 }

@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::time::MissedTickBehavior;
+use tracing::{error, warn};
 
 /// Performance metrics for monitoring request behavior
 #[derive(Debug, Default)]
@@ -209,14 +210,19 @@ impl<'a> ClientGuard<'a> {
         // Cap at max_delay
         let delay_ms = exponential_delay.min(max_delay);
 
-        // Add jitter (±25%)
+        // Add jitter (±25%) using monotonic clock for deterministic behavior
+        // Avoids SystemTime which can jump backwards (NTP sync) and .unwrap() panic risk
         let jitter_range = delay_ms / 4;
-        let jitter = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64
-            % jitter_range) as i64
-            - (jitter_range as i64 / 2);
+        let jitter = if jitter_range > 0 {
+            // Use monotonic Instant for pseudo-random jitter - sufficient for retry timing
+            static JITTER_BASE: std::sync::OnceLock<std::time::Instant> =
+                std::sync::OnceLock::new();
+            let base = JITTER_BASE.get_or_init(std::time::Instant::now);
+            let elapsed_nanos = base.elapsed().as_nanos() as u64;
+            (elapsed_nanos % jitter_range) as i64 - (jitter_range as i64 / 2)
+        } else {
+            0
+        };
 
         let final_delay = (delay_ms as i64 + jitter).max(0) as u64;
         Duration::from_millis(final_delay)
@@ -531,7 +537,7 @@ impl ReqManager {
                         }
                         Err(e) => {
                             if i < 5 {
-                                eprintln!("  Warmup stream {i} failed: {e}");
+                                warn!(stream = i, error = %e, "Warmup stream failed");
                             }
                             Err(e)
                         }
@@ -721,14 +727,19 @@ impl ReqManager {
 
                         // Stop after too many failures
                         if consecutive_failures > 10 {
-                            eprintln!(
-                                "Keep-alive task stopping after {consecutive_failures} failures"
+                            error!(
+                                consecutive_failures,
+                                "Keep-alive task stopping after too many failures"
                             );
                             break;
                         }
 
                         if consecutive_failures <= 3 {
-                            eprintln!("Keep-alive request failed (#{consecutive_failures}): {e}");
+                            warn!(
+                                consecutive_failures,
+                                error = %e,
+                                "Keep-alive request failed"
+                            );
                         }
                     }
                 }

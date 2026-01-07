@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::core::stt::base::{BaseSTT, STTConfig, STTError, STTResultCallback};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // =============================================================================
 // Configuration Tests
@@ -131,12 +131,18 @@ fn test_ibm_watson_stt_set_region() {
     let mut stt = <IbmWatsonSTT as BaseSTT>::new(config).unwrap();
 
     // Default region
-    assert_eq!(stt.get_ibm_config().unwrap().region, config::IbmRegion::UsSouth);
+    assert_eq!(
+        stt.get_ibm_config().unwrap().region,
+        config::IbmRegion::UsSouth
+    );
 
     // Set to EU region
     stt.set_region(config::IbmRegion::EuDe);
 
-    assert_eq!(stt.get_ibm_config().unwrap().region, config::IbmRegion::EuDe);
+    assert_eq!(
+        stt.get_ibm_config().unwrap().region,
+        config::IbmRegion::EuDe
+    );
 }
 
 #[test]
@@ -495,10 +501,7 @@ fn test_start_message_building() {
     assert_eq!(msg["speaker_labels"], true);
     assert_eq!(msg["profanity_filter"], true);
     assert_eq!(msg["inactivity_timeout"], 60);
-    assert!(msg["content-type"]
-        .as_str()
-        .unwrap()
-        .contains("audio/l16"));
+    assert!(msg["content-type"].as_str().unwrap().contains("audio/l16"));
 }
 
 // =============================================================================

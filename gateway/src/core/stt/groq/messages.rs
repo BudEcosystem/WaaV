@@ -571,20 +571,18 @@ mod tests {
             text: "Test".to_string(),
             language: None,
             duration: None,
-            segments: vec![
-                Segment {
-                    id: 0,
-                    seek: 0,
-                    start: 0.0,
-                    end: 1.0,
-                    text: "Test".to_string(),
-                    avg_logprob: Some(-0.3),
-                    no_speech_prob: None,
-                    compression_ratio: None,
-                    tokens: vec![],
-                    temperature: None,
-                }
-            ],
+            segments: vec![Segment {
+                id: 0,
+                seek: 0,
+                start: 0.0,
+                end: 1.0,
+                text: "Test".to_string(),
+                avg_logprob: Some(-0.3),
+                no_speech_prob: None,
+                compression_ratio: None,
+                tokens: vec![],
+                temperature: None,
+            }],
             words: vec![],
             x_groq: None,
         });

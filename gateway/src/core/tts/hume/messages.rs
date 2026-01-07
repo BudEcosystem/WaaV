@@ -418,8 +418,7 @@ mod tests {
 
     #[test]
     fn test_utterance_with_voice() {
-        let utterance =
-            HumeUtterance::new("Hello").with_voice(HumeVoiceSpec::by_name("Kora"));
+        let utterance = HumeUtterance::new("Hello").with_voice(HumeVoiceSpec::by_name("Kora"));
         assert!(utterance.voice.is_some());
     }
 
@@ -434,8 +433,7 @@ mod tests {
 
     #[test]
     fn test_utterance_with_description() {
-        let utterance =
-            HumeUtterance::new("Hello").with_description("happy, energetic");
+        let utterance = HumeUtterance::new("Hello").with_description("happy, energetic");
         assert_eq!(utterance.description, Some("happy, energetic".to_string()));
     }
 
@@ -551,18 +549,14 @@ mod tests {
 
     #[test]
     fn test_tts_request_with_utterances() {
-        let utterances = vec![
-            HumeUtterance::new("First"),
-            HumeUtterance::new("Second"),
-        ];
+        let utterances = vec![HumeUtterance::new("First"), HumeUtterance::new("Second")];
         let request = HumeTTSRequest::with_utterances(utterances);
         assert_eq!(request.utterances.len(), 2);
     }
 
     #[test]
     fn test_tts_request_with_format() {
-        let request = HumeTTSRequest::new("Hello")
-            .with_format(HumeRequestFormat::pcm16(24000));
+        let request = HumeTTSRequest::new("Hello").with_format(HumeRequestFormat::pcm16(24000));
         assert!(request.format.is_some());
         assert_eq!(request.format.as_ref().unwrap().format_type, "pcm16");
     }
@@ -627,21 +621,15 @@ mod tests {
     #[test]
     fn test_context_with_previous_text() {
         let context = HumeContext::with_previous_text("Previous sentence");
-        assert_eq!(
-            context.previous_text,
-            Some("Previous sentence".to_string())
-        );
+        assert_eq!(context.previous_text, Some("Previous sentence".to_string()));
         assert!(context.previous_generation_id.is_none());
     }
 
     #[test]
     fn test_context_with_previous_generation_id() {
-        let context = HumeContext::with_previous_text("Text")
-            .with_previous_generation_id("gen-456");
-        assert_eq!(
-            context.previous_generation_id,
-            Some("gen-456".to_string())
-        );
+        let context =
+            HumeContext::with_previous_text("Text").with_previous_generation_id("gen-456");
+        assert_eq!(context.previous_generation_id, Some("gen-456".to_string()));
     }
 
     // =========================================================================
@@ -714,10 +702,7 @@ mod tests {
 
         // Verify structure
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            parsed["utterances"][0]["text"],
-            "Hello, how are you today?"
-        );
+        assert_eq!(parsed["utterances"][0]["text"], "Hello, how are you today?");
         assert_eq!(
             parsed["utterances"][0]["description"],
             "warm, friendly, inviting"

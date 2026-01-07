@@ -31,8 +31,8 @@
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
 use tokio::time::{Instant, interval, timeout};
@@ -40,11 +40,19 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
 use url::form_urlencoded;
 
-use super::config::{IbmWatsonSTTConfig, IBM_IAM_URL};
+use super::config::{IBM_IAM_URL, IbmWatsonSTTConfig};
 use super::messages::{IbmWatsonMessage, StopMessage};
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Per-message idle timeout for WebSocket message reception.
+/// Resets after each successful message. Catches stuck/dead connections.
+const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // =============================================================================
 // Type Aliases
@@ -94,7 +102,14 @@ struct IamTokenResponse {
 
 /// Fetch IAM access token from IBM Cloud using API key.
 async fn fetch_iam_token(api_key: &str) -> Result<IamToken, STTError> {
-    let client = reqwest::Client::new();
+    // Create client with explicit timeouts to prevent indefinite hangs
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(4) // Limit connection pool size
+        .pool_idle_timeout(Duration::from_secs(90)) // Close idle connections after 90s
+        .build()
+        .map_err(|e| STTError::AuthenticationFailed(format!("Failed to create HTTP client: {e}")))?;
 
     // URL-encode the API key
     let encoded_api_key: String = form_urlencoded::byte_serialize(api_key.as_bytes()).collect();
@@ -231,10 +246,10 @@ pub struct IbmWatsonSTT {
     shutdown_tx: Option<oneshot::Sender<()>>,
 
     /// Result channel sender.
-    result_tx: Option<mpsc::UnboundedSender<STTResult>>,
+    result_tx: Option<mpsc::Sender<STTResult>>,
 
     /// Error channel sender.
-    error_tx: Option<mpsc::UnboundedSender<STTError>>,
+    error_tx: Option<mpsc::Sender<STTError>>,
 
     /// Connection task handle.
     connection_handle: Option<tokio::task::JoinHandle<()>>,
@@ -303,7 +318,9 @@ impl IbmWatsonSTT {
             .config
             .as_ref()
             .map(|c| c.base.api_key.clone())
-            .ok_or_else(|| STTError::ConfigurationError("No configuration available".to_string()))?;
+            .ok_or_else(|| {
+                STTError::ConfigurationError("No configuration available".to_string())
+            })?;
 
         // Check if we have a valid cached token
         {
@@ -331,8 +348,8 @@ impl IbmWatsonSTT {
     /// Handle incoming WebSocket messages from IBM Watson.
     fn handle_websocket_message(
         message: Message,
-        result_tx: &mpsc::UnboundedSender<STTResult>,
-        error_tx: &mpsc::UnboundedSender<STTError>,
+        result_tx: &mpsc::Sender<STTResult>,
+        error_tx: &mpsc::Sender<STTError>,
         interim_results_enabled: bool,
     ) -> Result<bool, STTError> {
         match message {
@@ -354,7 +371,7 @@ impl IbmWatsonSTT {
 
                                 if let Some(stt_result) = result.to_stt_result() {
                                     if !stt_result.transcript.is_empty() {
-                                        if result_tx.send(stt_result).is_err() {
+                                        if result_tx.try_send(stt_result).is_err() {
                                             warn!("Failed to send result - channel closed");
                                         }
                                     }
@@ -378,17 +395,15 @@ impl IbmWatsonSTT {
                             error!("IBM Watson error: {}", error_msg.error);
 
                             if error_msg.is_critical() {
-                                let stt_error =
-                                    STTError::ProviderError(error_msg.error.clone());
-                                let _ = error_tx.send(stt_error);
+                                let stt_error = STTError::ProviderError(error_msg.error.clone());
+                                let _ = error_tx.try_send(stt_error);
                                 return Ok(true); // Signal to close connection
                             } else if error_msg.is_inactivity_timeout() {
                                 warn!("IBM Watson inactivity timeout");
                                 // Don't close connection on inactivity, just warn
                             } else {
-                                let stt_error =
-                                    STTError::ProviderError(error_msg.error.clone());
-                                let _ = error_tx.send(stt_error);
+                                let stt_error = STTError::ProviderError(error_msg.error.clone());
+                                let _ = error_tx.try_send(stt_error);
                             }
                         }
                     },
@@ -400,7 +415,10 @@ impl IbmWatsonSTT {
 
             Message::Binary(data) => {
                 // IBM Watson may send binary data for certain responses
-                debug!("Received binary message from IBM Watson: {} bytes", data.len());
+                debug!(
+                    "Received binary message from IBM Watson: {} bytes",
+                    data.len()
+                );
             }
 
             Message::Close(close_frame) => {
@@ -448,8 +466,9 @@ impl IbmWatsonSTT {
         // Create channels for communication
         let (ws_tx, mut ws_rx) = mpsc::channel::<Bytes>(32);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-        let (result_tx, mut result_rx) = mpsc::unbounded_channel::<STTResult>();
-        let (error_tx, mut error_rx) = mpsc::unbounded_channel::<STTError>();
+        // Bounded channels for backpressure - 256 should handle bursts while preventing memory exhaustion
+        let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
+        let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         // Store channels
@@ -466,38 +485,39 @@ impl IbmWatsonSTT {
         // Start the connection task
         let connection_handle = tokio::spawn(async move {
             // Connect to IBM Watson with timeout
-            let connect_result = match timeout(Duration::from_secs(30), connect_async(&ws_url)).await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    let stt_error = STTError::ConnectionFailed(
-                        "Connection to IBM Watson timed out after 30 seconds".to_string(),
-                    );
-                    error!("{}", stt_error);
-                    let _ = error_tx.send(stt_error);
-                    return;
-                }
-            };
+            let connect_result =
+                match timeout(Duration::from_secs(30), connect_async(&ws_url)).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let stt_error = STTError::ConnectionFailed(
+                            "Connection to IBM Watson timed out after 30 seconds".to_string(),
+                        );
+                        error!("{}", stt_error);
+                        let _ = error_tx.try_send(stt_error);
+                        return;
+                    }
+                };
 
             let (ws_stream, _response) = match connect_result {
                 Ok(result) => result,
                 Err(e) => {
                     let error_msg = format!("Failed to connect to IBM Watson: {e}");
-                    let stt_error =
-                        if error_msg.contains("401") || error_msg.contains("Unauthorized") {
-                            STTError::AuthenticationFailed(
-                                "IBM Watson authentication failed. Check API key and instance ID."
-                                    .to_string(),
-                            )
-                        } else if error_msg.contains("403") || error_msg.contains("Forbidden") {
-                            STTError::AuthenticationFailed(
-                                "IBM Watson access forbidden. Check service permissions.".to_string(),
-                            )
-                        } else {
-                            STTError::ConnectionFailed(error_msg)
-                        };
+                    let stt_error = if error_msg.contains("401")
+                        || error_msg.contains("Unauthorized")
+                    {
+                        STTError::AuthenticationFailed(
+                            "IBM Watson authentication failed. Check API key and instance ID."
+                                .to_string(),
+                        )
+                    } else if error_msg.contains("403") || error_msg.contains("Forbidden") {
+                        STTError::AuthenticationFailed(
+                            "IBM Watson access forbidden. Check service permissions.".to_string(),
+                        )
+                    } else {
+                        STTError::ConnectionFailed(error_msg)
+                    };
                     error!("{}", stt_error);
-                    let _ = error_tx.send(stt_error);
+                    let _ = error_tx.try_send(stt_error);
                     return;
                 }
             };
@@ -512,7 +532,7 @@ impl IbmWatsonSTT {
                 let stt_error =
                     STTError::ConnectionFailed(format!("Failed to send start message: {e}"));
                 error!("{}", stt_error);
-                let _ = error_tx.send(stt_error);
+                let _ = error_tx.try_send(stt_error);
                 return;
             }
 
@@ -542,7 +562,7 @@ impl IbmWatsonSTT {
                         "Did not receive listening state from IBM Watson".to_string(),
                     );
                     error!("{}", stt_error);
-                    let _ = error_tx.send(stt_error);
+                    let _ = error_tx.try_send(stt_error);
                     return;
                 }
             }
@@ -566,16 +586,16 @@ impl IbmWatsonSTT {
                                 "Failed to send audio to IBM Watson: {e}"
                             ));
                             error!("{}", stt_error);
-                            let _ = error_tx.send(stt_error);
+                            let _ = error_tx.try_send(stt_error);
                             break;
                         }
                         last_audio_time = Instant::now();
                     }
 
-                    // Handle incoming messages
-                    message = ws_stream.next() => {
+                    // Handle incoming messages with idle timeout
+                    message = timeout(WS_MESSAGE_TIMEOUT, ws_stream.next()) => {
                         match message {
-                            Some(Ok(msg)) => {
+                            Ok(Some(Ok(msg))) => {
                                 match Self::handle_websocket_message(
                                     msg,
                                     &result_tx,
@@ -589,21 +609,30 @@ impl IbmWatsonSTT {
                                     }
                                     Err(e) => {
                                         error!("IBM Watson message handling error: {}", e);
-                                        let _ = error_tx.send(e);
+                                        let _ = error_tx.try_send(e);
                                         break;
                                     }
                                 }
                             }
-                            Some(Err(e)) => {
+                            Ok(Some(Err(e))) => {
                                 let stt_error = STTError::NetworkError(format!(
                                     "WebSocket error: {e}"
                                 ));
                                 error!("{}", stt_error);
-                                let _ = error_tx.send(stt_error);
+                                let _ = error_tx.try_send(stt_error);
                                 break;
                             }
-                            None => {
+                            Ok(None) => {
                                 info!("IBM Watson WebSocket stream ended");
+                                break;
+                            }
+                            Err(_elapsed) => {
+                                // Idle timeout - no message received for 60s
+                                let stt_error = STTError::NetworkError(
+                                    "WebSocket idle timeout - no message for 60 seconds".into()
+                                );
+                                error!("IBM Watson STT idle timeout: {}", stt_error);
+                                let _ = error_tx.try_send(stt_error);
                                 break;
                             }
                         }
@@ -621,7 +650,7 @@ impl IbmWatsonSTT {
                                     "Failed to send keep-alive: {e}"
                                 ));
                                 error!("{}", stt_error);
-                                let _ = error_tx.send(stt_error);
+                                let _ = error_tx.try_send(stt_error);
                                 break;
                             }
                             debug!("Sent keep-alive silence frame to IBM Watson");
@@ -868,10 +897,7 @@ impl BaseSTT for IbmWatsonSTT {
 
         let ibm_config = IbmWatsonSTTConfig {
             base: config,
-            region: existing
-                .as_ref()
-                .map(|c| c.region)
-                .unwrap_or_default(),
+            region: existing.as_ref().map(|c| c.region).unwrap_or_default(),
             instance_id: existing
                 .as_ref()
                 .map(|c| c.instance_id.clone())
@@ -880,10 +906,7 @@ impl BaseSTT for IbmWatsonSTT {
                 .as_ref()
                 .map(|c| c.model.clone())
                 .unwrap_or_default(),
-            encoding: existing
-                .as_ref()
-                .map(|c| c.encoding)
-                .unwrap_or_default(),
+            encoding: existing.as_ref().map(|c| c.encoding).unwrap_or_default(),
             interim_results: existing.as_ref().map(|c| c.interim_results).unwrap_or(true),
             word_timestamps: existing.as_ref().is_some_and(|c| c.word_timestamps),
             word_confidence: existing.as_ref().is_some_and(|c| c.word_confidence),
@@ -910,9 +933,7 @@ impl BaseSTT for IbmWatsonSTT {
                 .as_ref()
                 .is_some_and(|c| c.split_transcript_at_phrase_end),
             low_latency: existing.as_ref().is_some_and(|c| c.low_latency),
-            character_insertion_bias: existing
-                .as_ref()
-                .and_then(|c| c.character_insertion_bias),
+            character_insertion_bias: existing.as_ref().and_then(|c| c.character_insertion_bias),
         };
 
         self.config = Some(ibm_config);

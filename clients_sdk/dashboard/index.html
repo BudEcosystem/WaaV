@@ -3,439 +3,1190 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bud Foundry Dashboard</title>
+    <title>WaaV Dashboard</title>
     <link rel="stylesheet" href="css/styles.css">
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔊</text></svg>">
 </head>
 <body>
-    <div class="dashboard">
+    <a href="#main-content" class="skip-link">Skip to main content</a>
+
+    <div class="dashboard" id="app">
         <!-- Header -->
-        <header class="header">
+        <header class="header" role="banner">
             <div class="header-left">
-                <h1 class="logo">BUD FOUNDRY</h1>
-                <span class="subtitle">Testing Dashboard</span>
+                <button class="sidebar-toggle-btn" id="sidebar-toggle" aria-label="Toggle sidebar" title="Toggle sidebar (Ctrl+B)">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M3 12h18M3 6h18M3 18h18"/>
+                    </svg>
+                </button>
+                <div class="logo">
+                    <span class="logo-icon">🔊</span>
+                    <span class="logo-text">WaaV</span>
+                </div>
+                <span class="environment-badge" id="env-badge" data-env="development">DEV</span>
+            </div>
+            <div class="header-center">
+                <button class="command-palette-trigger" id="cmd-palette-trigger" aria-label="Open command palette (Ctrl+K)">
+                    <span class="search-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="11" cy="11" r="8"/>
+                            <path d="M21 21l-4.35-4.35"/>
+                        </svg>
+                    </span>
+                    <span class="search-placeholder">Search or run command...</span>
+                    <span class="search-shortcut">⌘K</span>
+                </button>
             </div>
             <div class="header-right">
-                <button id="theme-toggle" class="btn btn-icon" title="Toggle theme">
-                    <svg class="icon" viewBox="0 0 24 24">
-                        <path d="M12 3c.132 0 .263 0 .393 0a7.5 7.5 0 0 0 7.92 12.446a9 9 0 1 1 -8.313 -12.454z"/>
+                <div class="connection-quick-status" id="quick-conn-status">
+                    <span class="status-dot" data-status="disconnected"></span>
+                    <span class="status-label">Disconnected</span>
+                </div>
+                <button id="theme-toggle" class="btn btn-icon" title="Toggle theme (Ctrl+D)" aria-label="Toggle theme">
+                    <svg class="icon sun-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="5"/>
+                        <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                    </svg>
+                    <svg class="icon moon-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+                    </svg>
+                </button>
+                <button class="btn btn-icon" id="help-btn" title="Keyboard shortcuts (?)" aria-label="Help">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10"/>
+                        <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3M12 17h.01"/>
                     </svg>
                 </button>
             </div>
         </header>
 
-        <!-- Connection Bar -->
-        <section class="connection-bar">
-            <div class="connection-inputs">
-                <div class="input-group">
-                    <label for="server-url">Server</label>
-                    <input type="text" id="server-url" value="" placeholder="WebSocket URL">
-                </div>
-                <div class="input-group">
-                    <label for="api-key">API Key</label>
-                    <input type="password" id="api-key" placeholder="API Key (optional)">
-                </div>
-                <button id="connect-btn" class="btn btn-primary">Connect</button>
-            </div>
-            <div class="connection-status">
-                <span class="status-indicator" id="status-indicator"></span>
-                <span id="status-text">Disconnected</span>
-            </div>
-        </section>
+        <!-- Sidebar -->
+        <aside class="sidebar" id="sidebar" role="navigation" aria-label="Main navigation">
+            <nav class="sidebar-nav">
+                <ul class="nav-list">
+                    <li class="nav-item">
+                        <a href="#home" class="nav-link active" data-tab="home">
+                            <span class="nav-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+                                    <polyline points="9 22 9 12 15 12 15 22"/>
+                                </svg>
+                            </span>
+                            <span class="nav-label">Dashboard</span>
+                            <span class="nav-shortcut">⌘1</span>
+                        </a>
+                    </li>
 
-        <!-- Tabs -->
-        <nav class="tabs">
-            <button class="tab active" data-tab="stt">STT</button>
-            <button class="tab" data-tab="tts">TTS</button>
-            <button class="tab" data-tab="livekit">LiveKit</button>
-            <button class="tab" data-tab="sip">SIP</button>
-            <button class="tab" data-tab="api">API Explorer</button>
-            <button class="tab" data-tab="ws">WS Debug</button>
-            <button class="tab" data-tab="audio">Audio Tools</button>
-            <button class="tab" data-tab="metrics">Metrics</button>
-        </nav>
+                    <li class="nav-group">
+                        <span class="nav-group-label">Voice Lab</span>
+                        <ul class="nav-sublist">
+                            <li class="nav-item">
+                                <a href="#stt" class="nav-link" data-tab="stt">
+                                    <span class="nav-icon">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                                            <path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/>
+                                        </svg>
+                                    </span>
+                                    <span class="nav-label">Speech-to-Text</span>
+                                    <span class="nav-shortcut">⌘2</span>
+                                </a>
+                            </li>
+                            <li class="nav-item">
+                                <a href="#tts" class="nav-link" data-tab="tts">
+                                    <span class="nav-icon">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+                                            <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>
+                                        </svg>
+                                    </span>
+                                    <span class="nav-label">Text-to-Speech</span>
+                                    <span class="nav-shortcut">⌘3</span>
+                                </a>
+                            </li>
+                            <li class="nav-item">
+                                <a href="#compare" class="nav-link" data-tab="compare">
+                                    <span class="nav-icon">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/>
+                                        </svg>
+                                    </span>
+                                    <span class="nav-label">A/B Compare</span>
+                                </a>
+                            </li>
+                        </ul>
+                    </li>
+
+                    <li class="nav-group">
+                        <span class="nav-group-label">Integrations</span>
+                        <ul class="nav-sublist">
+                            <li class="nav-item">
+                                <a href="#livekit" class="nav-link" data-tab="livekit">
+                                    <span class="nav-icon">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path d="M5 12.55a11 11 0 0 1 14.08 0M1.42 9a16 16 0 0 1 21.16 0M8.53 16.11a6 6 0 0 1 6.95 0M12 20h.01"/>
+                                        </svg>
+                                    </span>
+                                    <span class="nav-label">LiveKit</span>
+                                    <span class="nav-shortcut">⌘4</span>
+                                </a>
+                            </li>
+                            <li class="nav-item">
+                                <a href="#sip" class="nav-link" data-tab="sip">
+                                    <span class="nav-icon">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/>
+                                        </svg>
+                                    </span>
+                                    <span class="nav-label">SIP</span>
+                                    <span class="nav-shortcut">⌘5</span>
+                                </a>
+                            </li>
+                        </ul>
+                    </li>
+
+                    <li class="nav-group">
+                        <span class="nav-group-label">Developer</span>
+                        <ul class="nav-sublist">
+                            <li class="nav-item">
+                                <a href="#api" class="nav-link" data-tab="api">
+                                    <span class="nav-icon">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <polyline points="16 18 22 12 16 6"/>
+                                            <polyline points="8 6 2 12 8 18"/>
+                                        </svg>
+                                    </span>
+                                    <span class="nav-label">API Explorer</span>
+                                    <span class="nav-shortcut">⌘6</span>
+                                </a>
+                            </li>
+                            <li class="nav-item">
+                                <a href="#ws" class="nav-link" data-tab="ws">
+                                    <span class="nav-icon">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>
+                                        </svg>
+                                    </span>
+                                    <span class="nav-label">WS Debug</span>
+                                    <span class="nav-shortcut">⌘7</span>
+                                </a>
+                            </li>
+                            <li class="nav-item">
+                                <a href="#audio" class="nav-link" data-tab="audio">
+                                    <span class="nav-icon">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path d="M9 18V5l12-2v13"/>
+                                            <circle cx="6" cy="18" r="3"/>
+                                            <circle cx="18" cy="16" r="3"/>
+                                        </svg>
+                                    </span>
+                                    <span class="nav-label">Audio Tools</span>
+                                    <span class="nav-shortcut">⌘8</span>
+                                </a>
+                            </li>
+                        </ul>
+                    </li>
+
+                    <li class="nav-item nav-item-bottom">
+                        <a href="#metrics" class="nav-link" data-tab="metrics">
+                            <span class="nav-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M18 20V10M12 20V4M6 20v-6"/>
+                                </svg>
+                            </span>
+                            <span class="nav-label">Metrics</span>
+                            <span class="nav-shortcut">⌘9</span>
+                        </a>
+                    </li>
+                </ul>
+            </nav>
+
+            <!-- Connection Panel in Sidebar -->
+            <div class="sidebar-connection">
+                <div class="connection-header">
+                    <span class="connection-title">Connection</span>
+                    <span class="connection-status-indicator" id="conn-indicator" data-status="disconnected"></span>
+                </div>
+                <div class="connection-form">
+                    <div class="input-group compact">
+                        <input type="text" id="server-url" value="" placeholder="wss://localhost:3001/ws" aria-label="Server URL">
+                    </div>
+                    <div class="input-group compact">
+                        <div class="password-input">
+                            <input type="password" id="api-key" placeholder="API Key (optional)" aria-label="API Key">
+                            <button class="toggle-visibility" id="toggle-api-key" aria-label="Show API key">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                                    <circle cx="12" cy="12" r="3"/>
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+                    <button id="connect-btn" class="btn btn-primary btn-block">
+                        <span class="btn-text">Connect</span>
+                        <span class="btn-loading hidden">
+                            <svg class="spinner" viewBox="0 0 24 24">
+                                <circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="3" stroke-dasharray="30 70"/>
+                            </svg>
+                        </span>
+                    </button>
+                </div>
+                <div class="connection-details" id="conn-details" hidden>
+                    <div class="detail-row">
+                        <span class="detail-label">Latency</span>
+                        <span class="detail-value" id="conn-latency">--ms</span>
+                    </div>
+                    <div class="detail-row">
+                        <span class="detail-label">Connected</span>
+                        <span class="detail-value" id="conn-time">--</span>
+                    </div>
+                </div>
+            </div>
+        </aside>
 
         <!-- Main Content -->
-        <main class="main-content">
-            <!-- Left Panel: Tab Content -->
-            <div class="panel-left">
-                <!-- STT Panel -->
-                <div class="tab-panel active" id="panel-stt">
-                    <h2>Speech-to-Text</h2>
-                    <div class="form-section">
-                        <h3>Configuration</h3>
-                        <div class="form-row">
-                            <div class="input-group">
-                                <label for="stt-provider">Provider</label>
-                                <select id="stt-provider">
-                                    <option value="deepgram">Deepgram</option>
-                                    <option value="whisper">Whisper</option>
-                                    <option value="azure">Azure</option>
-                                    <option value="google">Google</option>
-                                </select>
+        <main class="main-content" id="main-content">
+            <!-- Dashboard Home Panel -->
+            <div class="tab-panel active" id="panel-home">
+                <div class="panel-header">
+                    <h1>Dashboard</h1>
+                    <p class="panel-description">Monitor system status and quick access to voice processing tools</p>
+                </div>
+
+                <section class="system-status">
+                    <h2>System Status</h2>
+                    <div class="status-grid" id="provider-status-grid">
+                        <div class="status-card" data-provider="gateway">
+                            <div class="status-card-header">
+                                <span class="status-indicator" data-status="disconnected"></span>
+                                <span class="provider-name">Gateway</span>
                             </div>
-                            <div class="input-group">
-                                <label for="stt-api-key">Provider API Key</label>
-                                <input type="password" id="stt-api-key" placeholder="Enter API key for selected provider">
+                            <div class="status-card-body">
+                                <span class="provider-status">Not connected</span>
                             </div>
-                        </div>
-                        <div class="form-row">
-                            <div class="input-group">
-                                <label for="stt-language">Language</label>
-                                <select id="stt-language">
-                                    <option value="en-US">English (US)</option>
-                                    <option value="en-GB">English (UK)</option>
-                                    <option value="es">Spanish</option>
-                                    <option value="fr">French</option>
-                                    <option value="de">German</option>
-                                    <option value="ja">Japanese</option>
-                                    <option value="zh">Chinese</option>
-                                    <option value="ko">Korean</option>
-                                </select>
-                            </div>
-                            <div class="input-group">
-                                <label for="stt-model">Model</label>
-                                <input type="text" id="stt-model" value="nova-3" placeholder="Model name">
+                            <div class="status-card-footer">
+                                <span class="provider-latency">--</span>
                             </div>
                         </div>
-                        <div class="form-row">
-                            <h3>Feature Flags</h3>
+                        <div class="status-card" data-provider="deepgram">
+                            <div class="status-card-header">
+                                <span class="status-indicator" data-status="unknown"></span>
+                                <span class="provider-name">Deepgram</span>
+                            </div>
+                            <div class="status-card-body">
+                                <span class="provider-status">STT Provider</span>
+                            </div>
+                            <div class="status-card-footer">
+                                <span class="provider-latency">--</span>
+                            </div>
                         </div>
-                        <div class="form-row checkbox-row">
-                            <label class="checkbox">
-                                <input type="checkbox" id="stt-vad" checked>
-                                <span>VAD</span>
-                            </label>
-                            <label class="checkbox">
-                                <input type="checkbox" id="stt-interim" checked>
-                                <span>Interim Results</span>
-                            </label>
-                            <label class="checkbox">
-                                <input type="checkbox" id="stt-punctuation" checked>
-                                <span>Punctuation</span>
-                            </label>
-                            <label class="checkbox">
-                                <input type="checkbox" id="stt-diarization">
-                                <span>Diarization</span>
-                            </label>
-                            <label class="checkbox">
-                                <input type="checkbox" id="stt-noise">
-                                <span>Noise Cancel</span>
-                            </label>
-                        </div>
-                        <div class="form-row">
-                            <button id="stt-apply-config" class="btn btn-secondary">Apply STT Config</button>
+                        <div class="status-card" data-provider="elevenlabs">
+                            <div class="status-card-header">
+                                <span class="status-indicator" data-status="unknown"></span>
+                                <span class="provider-name">ElevenLabs</span>
+                            </div>
+                            <div class="status-card-body">
+                                <span class="provider-status">TTS Provider</span>
+                            </div>
+                            <div class="status-card-footer">
+                                <span class="provider-latency">--</span>
+                            </div>
                         </div>
                     </div>
-                    <div class="form-section">
-                        <h3>Input</h3>
-                        <div class="audio-controls">
-                            <button id="stt-record-btn" class="btn btn-primary">
-                                <svg class="icon" viewBox="0 0 24 24">
-                                    <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
-                                    <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+                </section>
+
+                <section class="quick-stats">
+                    <h2>Performance</h2>
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-header">
+                                <span class="stat-label">STT TTFT</span>
+                                <span class="stat-trend" id="stat-stt-trend"></span>
+                            </div>
+                            <span class="stat-value" id="stat-stt-ttft">--</span>
+                            <span class="stat-unit">ms (p95)</span>
+                            <div class="stat-sparkline" id="sparkline-stt"></div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-header">
+                                <span class="stat-label">TTS TTFB</span>
+                                <span class="stat-trend" id="stat-tts-trend"></span>
+                            </div>
+                            <span class="stat-value" id="stat-tts-ttfb">--</span>
+                            <span class="stat-unit">ms (p95)</span>
+                            <div class="stat-sparkline" id="sparkline-tts"></div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-header">
+                                <span class="stat-label">Sessions</span>
+                            </div>
+                            <span class="stat-value" id="stat-sessions">0</span>
+                            <span class="stat-unit">today</span>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-header">
+                                <span class="stat-label">Audio Processed</span>
+                            </div>
+                            <span class="stat-value" id="stat-audio">0</span>
+                            <span class="stat-unit">minutes</span>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="quick-actions">
+                    <h2>Quick Actions</h2>
+                    <div class="actions-grid">
+                        <button class="action-card" data-action="new-stt" id="action-stt">
+                            <span class="action-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                                    <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
                                 </svg>
-                                Start Recording
-                            </button>
-                            <input type="file" id="stt-file-input" accept="audio/*" class="hidden">
-                            <button id="stt-upload-btn" class="btn btn-secondary">Upload Audio</button>
-                        </div>
-                        <div class="visualizer" id="stt-visualizer"></div>
+                            </span>
+                            <span class="action-label">New STT Session</span>
+                            <span class="action-shortcut">Space</span>
+                        </button>
+                        <button class="action-card" data-action="new-tts" id="action-tts">
+                            <span class="action-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+                                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+                                </svg>
+                            </span>
+                            <span class="action-label">New TTS Request</span>
+                            <span class="action-shortcut">⌘S</span>
+                        </button>
+                        <button class="action-card" data-action="compare" id="action-compare">
+                            <span class="action-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/>
+                                </svg>
+                            </span>
+                            <span class="action-label">Compare Voices</span>
+                        </button>
+                        <button class="action-card" data-action="upload" id="action-upload">
+                            <span class="action-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                    <polyline points="17 8 12 3 7 8"/>
+                                    <line x1="12" y1="3" x2="12" y2="15"/>
+                                </svg>
+                            </span>
+                            <span class="action-label">Upload Audio</span>
+                        </button>
                     </div>
-                    <div class="form-section">
-                        <h3>Transcript</h3>
-                        <div class="transcript-box" id="stt-transcript">
-                            <div class="transcript-placeholder">Transcript will appear here...</div>
+                </section>
+
+                <section class="recent-activity">
+                    <div class="section-header">
+                        <h2>Recent Sessions</h2>
+                        <a href="#metrics" class="view-all-link" data-tab="metrics">View all →</a>
+                    </div>
+                    <div class="activity-list" id="recent-sessions">
+                        <div class="activity-empty">
+                            <p>No recent sessions. Start a new STT or TTS session to see activity here.</p>
+                        </div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- STT Panel -->
+            <div class="tab-panel" id="panel-stt">
+                <div class="panel-header">
+                    <h1>Speech-to-Text</h1>
+                    <p class="panel-description">Real-time speech recognition and transcription</p>
+                </div>
+
+                <div class="panel-grid">
+                    <div class="panel-main">
+                        <section class="form-section">
+                            <h2>Configuration</h2>
+                            <div class="form-row">
+                                <div class="input-group">
+                                    <label for="stt-provider">Provider</label>
+                                    <select id="stt-provider">
+                                        <option value="deepgram">Deepgram</option>
+                                        <option value="whisper">Whisper</option>
+                                        <option value="azure">Microsoft Azure</option>
+                                        <option value="google">Google Cloud</option>
+                                    </select>
+                                </div>
+                                <div class="input-group">
+                                    <label for="stt-api-key">Provider API Key</label>
+                                    <input type="password" id="stt-api-key" placeholder="Enter API key for selected provider">
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <div class="input-group">
+                                    <label for="stt-language">Language</label>
+                                    <select id="stt-language">
+                                        <option value="en-US">English (US)</option>
+                                        <option value="en-GB">English (UK)</option>
+                                        <option value="es">Spanish</option>
+                                        <option value="fr">French</option>
+                                        <option value="de">German</option>
+                                        <option value="ja">Japanese</option>
+                                        <option value="zh">Chinese</option>
+                                        <option value="ko">Korean</option>
+                                        <option value="pt">Portuguese</option>
+                                        <option value="it">Italian</option>
+                                        <option value="nl">Dutch</option>
+                                        <option value="hi">Hindi</option>
+                                    </select>
+                                </div>
+                                <div class="input-group">
+                                    <label for="stt-model">Model</label>
+                                    <input type="text" id="stt-model" value="nova-3" placeholder="Model name">
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <h3>Feature Flags</h3>
+                            </div>
+                            <div class="form-row checkbox-row">
+                                <label class="checkbox">
+                                    <input type="checkbox" id="stt-vad" checked>
+                                    <span>VAD</span>
+                                </label>
+                                <label class="checkbox">
+                                    <input type="checkbox" id="stt-interim" checked>
+                                    <span>Interim Results</span>
+                                </label>
+                                <label class="checkbox">
+                                    <input type="checkbox" id="stt-punctuation" checked>
+                                    <span>Punctuation</span>
+                                </label>
+                                <label class="checkbox">
+                                    <input type="checkbox" id="stt-diarization">
+                                    <span>Diarization</span>
+                                </label>
+                                <label class="checkbox">
+                                    <input type="checkbox" id="stt-noise">
+                                    <span>Noise Cancel</span>
+                                </label>
+                            </div>
+                            <div class="form-row">
+                                <button id="stt-apply-config" class="btn btn-secondary">Apply Config</button>
+                            </div>
+                        </section>
+
+                        <section class="form-section">
+                            <h2>Input</h2>
+                            <div class="audio-controls">
+                                <button id="stt-record-btn" class="btn btn-primary btn-large">
+                                    <span class="record-icon">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                                            <path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/>
+                                        </svg>
+                                    </span>
+                                    <span class="btn-text">Start Recording</span>
+                                    <span class="recording-time hidden">00:00</span>
+                                </button>
+                                <input type="file" id="stt-file-input" accept="audio/*" class="hidden" multiple>
+                                <button id="stt-upload-btn" class="btn btn-secondary">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                        <polyline points="17 8 12 3 7 8"/>
+                                        <line x1="12" y1="3" x2="12" y2="15"/>
+                                    </svg>
+                                    Upload Audio
+                                </button>
+                            </div>
+
+                            <!-- Waveform Visualization -->
+                            <div class="waveform-container" id="stt-waveform-container">
+                                <canvas id="stt-waveform" class="waveform-canvas"></canvas>
+                                <div class="audio-level-meter">
+                                    <div class="level-bar" id="stt-level-bar"></div>
+                                    <span class="level-value" id="stt-level-value">-60 dB</span>
+                                </div>
+                            </div>
+
+                            <!-- Batch Upload Queue -->
+                            <div class="batch-queue hidden" id="stt-batch-queue">
+                                <h3>Upload Queue</h3>
+                                <div class="queue-list" id="stt-queue-list"></div>
+                                <div class="queue-actions">
+                                    <button class="btn btn-primary" id="stt-process-queue">Process All</button>
+                                    <button class="btn btn-secondary" id="stt-clear-queue">Clear Queue</button>
+                                </div>
+                            </div>
+                        </section>
+
+                        <section class="form-section">
+                            <div class="section-header">
+                                <h2>Transcript</h2>
+                                <div class="transcript-actions">
+                                    <button class="btn btn-icon" id="stt-copy-transcript" title="Copy transcript">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                                        </svg>
+                                    </button>
+                                    <div class="dropdown">
+                                        <button class="btn btn-icon" id="stt-export-btn" title="Export transcript">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                                <polyline points="7 10 12 15 17 10"/>
+                                                <line x1="12" y1="15" x2="12" y2="3"/>
+                                            </svg>
+                                        </button>
+                                        <div class="dropdown-menu" id="stt-export-menu" hidden>
+                                            <button class="dropdown-item" data-format="text">Plain Text (.txt)</button>
+                                            <button class="dropdown-item" data-format="json">JSON</button>
+                                            <button class="dropdown-item" data-format="srt">SRT Subtitles</button>
+                                            <button class="dropdown-item" data-format="vtt">VTT Subtitles</button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="transcript-box" id="stt-transcript">
+                                <div class="transcript-placeholder">Transcript will appear here...</div>
+                            </div>
+                        </section>
+                    </div>
+
+                    <div class="panel-sidebar">
+                        <div class="sidebar-section">
+                            <h3>Session Metrics</h3>
+                            <div class="metrics-mini">
+                                <div class="metric-mini">
+                                    <span class="metric-label">TTFT</span>
+                                    <span class="metric-value" id="stt-metric-ttft">--</span>
+                                </div>
+                                <div class="metric-mini">
+                                    <span class="metric-label">Duration</span>
+                                    <span class="metric-value" id="stt-metric-duration">--</span>
+                                </div>
+                                <div class="metric-mini">
+                                    <span class="metric-label">Words</span>
+                                    <span class="metric-value" id="stt-metric-words">0</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="sidebar-section">
+                            <h3>Tips</h3>
+                            <ul class="tips-list">
+                                <li>Press <kbd>Space</kbd> to start/stop recording</li>
+                                <li>Drag & drop audio files to upload</li>
+                                <li>Enable diarization to identify speakers</li>
+                            </ul>
                         </div>
                     </div>
                 </div>
+            </div>
 
-                <!-- TTS Panel -->
-                <div class="tab-panel" id="panel-tts">
-                    <h2>Text-to-Speech</h2>
-                    <div class="form-section">
-                        <h3>Configuration</h3>
-                        <div class="form-row">
+            <!-- TTS Panel -->
+            <div class="tab-panel" id="panel-tts">
+                <div class="panel-header">
+                    <h1>Text-to-Speech</h1>
+                    <p class="panel-description">Generate natural speech from text</p>
+                </div>
+
+                <div class="panel-grid">
+                    <div class="panel-main">
+                        <section class="form-section">
+                            <h2>Configuration</h2>
+                            <div class="form-row">
+                                <div class="input-group">
+                                    <label for="tts-provider">Provider</label>
+                                    <select id="tts-provider">
+                                        <option value="deepgram">Deepgram</option>
+                                        <option value="elevenlabs">ElevenLabs</option>
+                                        <option value="cartesia">Cartesia</option>
+                                        <option value="azure">Microsoft Azure</option>
+                                        <option value="openai">OpenAI</option>
+                                    </select>
+                                </div>
+                                <div class="input-group">
+                                    <label for="tts-api-key">Provider API Key</label>
+                                    <input type="password" id="tts-api-key" placeholder="Enter API key for selected provider">
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <button id="tts-load-voices" class="btn btn-secondary">Load Voices</button>
+                                <button id="tts-apply-config" class="btn btn-secondary">Apply Config</button>
+                            </div>
+                        </section>
+
+                        <section class="form-section">
+                            <h2>Voice Selection</h2>
+                            <div class="voice-grid" id="tts-voice-grid">
+                                <div class="voice-loading">
+                                    <p>Click "Load Voices" to see available voices</p>
+                                </div>
+                            </div>
+                            <div class="form-row" id="tts-voice-select-row">
+                                <div class="input-group">
+                                    <label for="tts-voice">Selected Voice</label>
+                                    <select id="tts-voice">
+                                        <option value="">Select voice...</option>
+                                    </select>
+                                </div>
+                                <div class="input-group">
+                                    <label for="tts-model">Model</label>
+                                    <input type="text" id="tts-model" placeholder="Model name">
+                                </div>
+                            </div>
+                        </section>
+
+                        <section class="form-section">
+                            <div class="section-header">
+                                <h2>Text Input</h2>
+                                <div class="input-mode-toggle">
+                                    <button class="mode-btn active" data-mode="text" id="tts-mode-text">Plain Text</button>
+                                    <button class="mode-btn" data-mode="ssml" id="tts-mode-ssml">SSML Editor</button>
+                                </div>
+                            </div>
+
+                            <!-- Plain Text Mode -->
+                            <div class="text-input-container" id="tts-text-mode">
+                                <textarea id="tts-text" placeholder="Enter text to synthesize..." rows="4">Hello, I am a voice assistant powered by WaaV.</textarea>
+                                <div class="text-input-footer">
+                                    <span class="char-count"><span id="tts-char-count">45</span> characters</span>
+                                    <div class="text-actions">
+                                        <button class="btn btn-icon" id="tts-clear-text" title="Clear text">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                <line x1="18" y1="6" x2="6" y2="18"/>
+                                                <line x1="6" y1="6" x2="18" y2="18"/>
+                                            </svg>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- SSML Editor Mode -->
+                            <div class="ssml-editor-container hidden" id="tts-ssml-mode">
+                                <!-- SSML Editor will be mounted here by JS -->
+                            </div>
+
+                            <div class="form-row button-row">
+                                <button id="tts-speak-btn" class="btn btn-primary btn-large">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <polygon points="5 3 19 12 5 21 5 3"/>
+                                    </svg>
+                                    Speak
+                                </button>
+                                <button id="tts-stop-btn" class="btn btn-secondary">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <rect x="6" y="6" width="12" height="12"/>
+                                    </svg>
+                                    Stop
+                                </button>
+                            </div>
+                        </section>
+
+                        <section class="form-section">
+                            <h2>Audio Output</h2>
+                            <div class="audio-player-container" id="tts-player">
+                                <div class="player-waveform">
+                                    <canvas id="tts-output-waveform"></canvas>
+                                </div>
+                                <div class="player-controls">
+                                    <button class="player-btn" id="tts-play-pause" disabled>
+                                        <svg class="play-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <polygon points="5 3 19 12 5 21 5 3"/>
+                                        </svg>
+                                        <svg class="pause-icon hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <rect x="6" y="4" width="4" height="16"/>
+                                            <rect x="14" y="4" width="4" height="16"/>
+                                        </svg>
+                                    </button>
+                                    <div class="player-progress">
+                                        <div class="progress-bar">
+                                            <div class="progress-fill" id="tts-progress"></div>
+                                        </div>
+                                        <div class="progress-time">
+                                            <span id="tts-current-time">0:00</span>
+                                            <span>/</span>
+                                            <span id="tts-duration">0:00</span>
+                                        </div>
+                                    </div>
+                                    <div class="player-volume">
+                                        <button class="btn btn-icon" id="tts-mute">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+                                                <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+                                            </svg>
+                                        </button>
+                                        <input type="range" id="tts-volume" min="0" max="100" value="100">
+                                    </div>
+                                    <button class="btn btn-icon" id="tts-download" title="Download audio" disabled>
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                            <polyline points="7 10 12 15 17 10"/>
+                                            <line x1="12" y1="15" x2="12" y2="3"/>
+                                        </svg>
+                                    </button>
+                                </div>
+                                <div class="player-status">
+                                    <span id="tts-status">Ready</span>
+                                </div>
+                            </div>
+                        </section>
+                    </div>
+
+                    <div class="panel-sidebar">
+                        <div class="sidebar-section">
+                            <h3>Session Metrics</h3>
+                            <div class="metrics-mini">
+                                <div class="metric-mini">
+                                    <span class="metric-label">TTFB</span>
+                                    <span class="metric-value" id="tts-metric-ttfb">--</span>
+                                </div>
+                                <div class="metric-mini">
+                                    <span class="metric-label">Gen Time</span>
+                                    <span class="metric-value" id="tts-metric-gentime">--</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="sidebar-section">
+                            <h3>Tips</h3>
+                            <ul class="tips-list">
+                                <li>Press <kbd>⌘S</kbd> to speak text</li>
+                                <li>Use SSML for advanced control</li>
+                                <li>Preview voices before selecting</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- A/B Compare Panel -->
+            <div class="tab-panel" id="panel-compare">
+                <div class="panel-header">
+                    <h1>Voice A/B Comparison</h1>
+                    <p class="panel-description">Compare different voices side-by-side</p>
+                </div>
+
+                <section class="form-section">
+                    <h2>Test Text</h2>
+                    <textarea id="compare-text" placeholder="Enter text to compare..." rows="3">Hello, this is a voice comparison test. Which voice sounds better to you?</textarea>
+                </section>
+
+                <div class="compare-container">
+                    <div class="compare-voice" id="compare-voice-a">
+                        <div class="compare-header">
+                            <h3>Voice A</h3>
+                            <span class="blind-label hidden">Option 1</span>
+                        </div>
+                        <div class="compare-config">
                             <div class="input-group">
-                                <label for="tts-provider">Provider</label>
-                                <select id="tts-provider">
+                                <label for="compare-provider-a">Provider</label>
+                                <select id="compare-provider-a">
                                     <option value="deepgram">Deepgram</option>
                                     <option value="elevenlabs">ElevenLabs</option>
                                     <option value="cartesia">Cartesia</option>
-                                    <option value="azure">Azure</option>
-                                    <option value="openai">OpenAI</option>
                                 </select>
                             </div>
                             <div class="input-group">
-                                <label for="tts-api-key">Provider API Key</label>
-                                <input type="password" id="tts-api-key" placeholder="Enter API key for selected provider">
-                            </div>
-                        </div>
-                        <div class="form-row">
-                            <div class="input-group">
-                                <label for="tts-voice">Voice</label>
-                                <select id="tts-voice">
+                                <label for="compare-voice-a">Voice</label>
+                                <select id="compare-voice-a-select">
                                     <option value="">Select voice...</option>
                                 </select>
                             </div>
-                            <div class="input-group">
-                                <label for="tts-model">Model</label>
-                                <input type="text" id="tts-model" placeholder="Model name">
+                        </div>
+                        <div class="compare-player">
+                            <button class="btn btn-primary" id="compare-generate-a">Generate</button>
+                            <div class="compare-audio-player hidden">
+                                <audio id="compare-audio-a"></audio>
+                                <button class="btn btn-icon" id="compare-play-a">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <polygon points="5 3 19 12 5 21 5 3"/>
+                                    </svg>
+                                </button>
                             </div>
                         </div>
-                        <div class="form-row">
-                            <button id="tts-load-voices" class="btn btn-secondary">Load Voices</button>
-                            <button id="tts-apply-config" class="btn btn-secondary">Apply TTS Config</button>
+                        <div class="compare-metrics">
+                            <span class="metric">TTFB: <span id="compare-ttfb-a">--</span>ms</span>
+                            <span class="metric">Duration: <span id="compare-duration-a">--</span>s</span>
                         </div>
                     </div>
-                    <div class="form-section">
-                        <h3>Text Input</h3>
-                        <textarea id="tts-text" placeholder="Enter text to synthesize..." rows="4">Hello, I am a voice assistant powered by Bud Foundry.</textarea>
-                        <div class="form-row button-row">
-                            <button id="tts-speak-btn" class="btn btn-primary">Speak</button>
-                            <button id="tts-stop-btn" class="btn btn-secondary">Stop</button>
-                        </div>
-                    </div>
-                    <div class="form-section">
-                        <h3>Audio Output</h3>
-                        <div class="audio-player" id="tts-player">
-                            <div class="player-status">Ready</div>
-                        </div>
-                    </div>
-                </div>
 
-                <!-- LiveKit Panel -->
-                <div class="tab-panel" id="panel-livekit">
-                    <h2>LiveKit</h2>
-                    <div class="form-section">
-                        <h3>Token Generation</h3>
-                        <div class="form-row">
-                            <div class="input-group">
-                                <label for="lk-room">Room Name</label>
-                                <input type="text" id="lk-room" value="test-room" placeholder="Room name">
-                            </div>
-                            <div class="input-group">
-                                <label for="lk-identity">Identity</label>
-                                <input type="text" id="lk-identity" value="dashboard-user" placeholder="Participant identity">
-                            </div>
-                            <div class="input-group">
-                                <label for="lk-name">Display Name</label>
-                                <input type="text" id="lk-name" placeholder="Display name (optional)">
-                            </div>
-                        </div>
-                        <div class="form-row">
-                            <button id="lk-generate-token" class="btn btn-primary">Generate Token</button>
-                        </div>
-                        <div class="result-box" id="lk-token-result"></div>
+                    <div class="compare-divider">
+                        <span>VS</span>
                     </div>
-                    <div class="form-section">
-                        <h3>Rooms</h3>
-                        <div class="form-row">
-                            <button id="lk-list-rooms" class="btn btn-secondary">List Rooms</button>
-                        </div>
-                        <div class="result-box" id="lk-rooms-result"></div>
-                    </div>
-                </div>
 
-                <!-- SIP Panel -->
-                <div class="tab-panel" id="panel-sip">
-                    <h2>SIP Hooks</h2>
-                    <div class="form-section">
-                        <h3>Create Hook</h3>
-                        <div class="form-row">
+                    <div class="compare-voice" id="compare-voice-b">
+                        <div class="compare-header">
+                            <h3>Voice B</h3>
+                            <span class="blind-label hidden">Option 2</span>
+                        </div>
+                        <div class="compare-config">
                             <div class="input-group">
-                                <label for="sip-host">SIP Host</label>
-                                <input type="text" id="sip-host" placeholder="sip.example.com">
-                            </div>
-                            <div class="input-group">
-                                <label for="sip-webhook">Webhook URL</label>
-                                <input type="text" id="sip-webhook" placeholder="https://your-server.com/webhook">
-                            </div>
-                        </div>
-                        <div class="form-row">
-                            <button id="sip-create-hook" class="btn btn-primary">Create Hook</button>
-                        </div>
-                    </div>
-                    <div class="form-section">
-                        <h3>Existing Hooks</h3>
-                        <div class="form-row">
-                            <button id="sip-list-hooks" class="btn btn-secondary">Refresh</button>
-                        </div>
-                        <div class="result-box" id="sip-hooks-result"></div>
-                    </div>
-                </div>
-
-                <!-- API Explorer Panel -->
-                <div class="tab-panel" id="panel-api">
-                    <h2>API Explorer</h2>
-                    <div class="form-section">
-                        <div class="form-row">
-                            <div class="input-group" style="width: 120px;">
-                                <label for="api-method">Method</label>
-                                <select id="api-method">
-                                    <option value="GET">GET</option>
-                                    <option value="POST">POST</option>
-                                    <option value="PUT">PUT</option>
-                                    <option value="DELETE">DELETE</option>
+                                <label for="compare-provider-b">Provider</label>
+                                <select id="compare-provider-b">
+                                    <option value="deepgram">Deepgram</option>
+                                    <option value="elevenlabs">ElevenLabs</option>
+                                    <option value="cartesia">Cartesia</option>
                                 </select>
                             </div>
-                            <div class="input-group" style="flex: 1;">
-                                <label for="api-endpoint">Endpoint</label>
-                                <input type="text" id="api-endpoint" value="/" placeholder="/endpoint">
-                            </div>
-                        </div>
-                        <div class="form-row">
-                            <div class="input-group" style="flex: 1;">
-                                <label for="api-body">Request Body (JSON)</label>
-                                <textarea id="api-body" rows="4" placeholder='{"key": "value"}'></textarea>
-                            </div>
-                        </div>
-                        <div class="form-row">
-                            <button id="api-send" class="btn btn-primary">Send Request</button>
-                        </div>
-                    </div>
-                    <div class="form-section">
-                        <h3>Response</h3>
-                        <div class="result-box code" id="api-response"></div>
-                    </div>
-                </div>
-
-                <!-- WS Debug Panel -->
-                <div class="tab-panel" id="panel-ws">
-                    <h2>WebSocket Debug</h2>
-                    <div class="form-section">
-                        <h3>Send Message</h3>
-                        <div class="form-row">
-                            <div class="input-group" style="width: 150px;">
-                                <label for="ws-template">Template</label>
-                                <select id="ws-template">
-                                    <option value="">Custom</option>
-                                    <option value="config">Config</option>
-                                    <option value="speak">Speak</option>
-                                    <option value="clear">Clear</option>
-                                    <option value="ping">Ping</option>
+                            <div class="input-group">
+                                <label for="compare-voice-b">Voice</label>
+                                <select id="compare-voice-b-select">
+                                    <option value="">Select voice...</option>
                                 </select>
                             </div>
                         </div>
-                        <div class="form-row">
-                            <textarea id="ws-message" rows="6" placeholder='{"type": "..."}'></textarea>
+                        <div class="compare-player">
+                            <button class="btn btn-primary" id="compare-generate-b">Generate</button>
+                            <div class="compare-audio-player hidden">
+                                <audio id="compare-audio-b"></audio>
+                                <button class="btn btn-icon" id="compare-play-b">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <polygon points="5 3 19 12 5 21 5 3"/>
+                                    </svg>
+                                </button>
+                            </div>
                         </div>
-                        <div class="form-row">
-                            <button id="ws-send" class="btn btn-primary">Send</button>
+                        <div class="compare-metrics">
+                            <span class="metric">TTFB: <span id="compare-ttfb-b">--</span>ms</span>
+                            <span class="metric">Duration: <span id="compare-duration-b">--</span>s</span>
                         </div>
-                    </div>
-                    <div class="form-section">
-                        <h3>Message Log</h3>
-                        <div class="message-log" id="ws-log"></div>
                     </div>
                 </div>
 
-                <!-- Audio Tools Panel -->
-                <div class="tab-panel" id="panel-audio">
-                    <h2>Audio Tools</h2>
-                    <div class="form-section">
-                        <h3>Input Device</h3>
-                        <div class="form-row">
-                            <div class="input-group" style="flex: 1;">
-                                <label for="audio-input-device">Microphone</label>
-                                <select id="audio-input-device"></select>
-                            </div>
-                            <button id="audio-refresh-devices" class="btn btn-secondary">Refresh</button>
-                        </div>
-                        <div class="level-meter">
-                            <div class="level-bar" id="audio-input-level"></div>
-                        </div>
-                    </div>
-                    <div class="form-section">
-                        <h3>Test Recording</h3>
-                        <div class="form-row">
-                            <button id="audio-test-record" class="btn btn-primary">Record 5s</button>
-                            <button id="audio-test-play" class="btn btn-secondary" disabled>Play</button>
-                        </div>
-                    </div>
-                    <div class="form-section">
-                        <h3>Audio Visualization</h3>
-                        <canvas id="audio-waveform" width="600" height="100"></canvas>
-                    </div>
-                </div>
+                <section class="compare-actions">
+                    <button class="btn btn-primary btn-large" id="compare-both">Generate Both</button>
+                    <button class="btn btn-secondary" id="blind-test">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                            <circle cx="12" cy="12" r="3"/>
+                            <line x1="1" y1="1" x2="23" y2="23"/>
+                        </svg>
+                        Blind Test Mode
+                    </button>
+                </section>
 
-                <!-- Metrics Panel -->
-                <div class="tab-panel" id="panel-metrics">
-                    <h2>Performance Metrics</h2>
-                    <div class="metrics-grid">
-                        <div class="metric-card">
-                            <div class="metric-label">STT TTFT</div>
-                            <div class="metric-value" id="metric-stt-ttft">-</div>
-                            <div class="metric-unit">ms (p95)</div>
-                        </div>
-                        <div class="metric-card">
-                            <div class="metric-label">TTS TTFB</div>
-                            <div class="metric-value" id="metric-tts-ttfb">-</div>
-                            <div class="metric-unit">ms (p95)</div>
-                        </div>
-                        <div class="metric-card">
-                            <div class="metric-label">E2E Latency</div>
-                            <div class="metric-value" id="metric-e2e">-</div>
-                            <div class="metric-unit">ms (p95)</div>
-                        </div>
-                        <div class="metric-card">
-                            <div class="metric-label">WS Connect</div>
-                            <div class="metric-value" id="metric-ws-connect">-</div>
-                            <div class="metric-unit">ms</div>
-                        </div>
+                <section class="compare-rating hidden" id="compare-rating">
+                    <h3>Which sounds better?</h3>
+                    <div class="rating-buttons">
+                        <button class="rating-btn" data-choice="a">
+                            <span class="rating-label">Voice A</span>
+                            <span class="blind-label hidden">Option 1</span>
+                        </button>
+                        <button class="rating-btn" data-choice="tie">
+                            <span class="rating-label">Tie</span>
+                        </button>
+                        <button class="rating-btn" data-choice="b">
+                            <span class="rating-label">Voice B</span>
+                            <span class="blind-label hidden">Option 2</span>
+                        </button>
                     </div>
-                    <div class="form-section">
-                        <h3>SLO Status</h3>
-                        <div class="slo-grid">
-                            <div class="slo-item" id="slo-stt">
-                                <span class="slo-status">-</span>
-                                <span class="slo-label">STT TTFT < 200ms</span>
-                            </div>
-                            <div class="slo-item" id="slo-tts">
-                                <span class="slo-status">-</span>
-                                <span class="slo-label">TTS TTFB < 150ms</span>
-                            </div>
-                            <div class="slo-item" id="slo-e2e">
-                                <span class="slo-status">-</span>
-                                <span class="slo-label">E2E < 1000ms</span>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="form-section">
-                        <h3>Latency Timeline</h3>
-                        <canvas id="metrics-timeline" width="700" height="150"></canvas>
-                    </div>
-                    <div class="form-section">
-                        <div class="form-row">
-                            <button id="metrics-reset" class="btn btn-secondary">Reset Metrics</button>
-                            <button id="metrics-export" class="btn btn-secondary">Export CSV</button>
-                        </div>
-                    </div>
-                </div>
+                </section>
             </div>
 
-            <!-- Right Panel: Log & Status -->
-            <div class="panel-right">
-                <div class="panel-section">
-                    <h3>Quick Metrics</h3>
-                    <div class="quick-metrics">
-                        <div class="quick-metric">
-                            <span class="quick-metric-label">TTFT</span>
-                            <span class="quick-metric-value" id="quick-ttft">-</span>
+            <!-- LiveKit Panel -->
+            <div class="tab-panel" id="panel-livekit">
+                <div class="panel-header">
+                    <h1>LiveKit</h1>
+                    <p class="panel-description">WebRTC room management and token generation</p>
+                </div>
+
+                <section class="form-section">
+                    <h2>Token Generation</h2>
+                    <div class="form-row">
+                        <div class="input-group">
+                            <label for="lk-room">Room Name</label>
+                            <input type="text" id="lk-room" value="test-room" placeholder="Room name">
                         </div>
-                        <div class="quick-metric">
-                            <span class="quick-metric-label">TTFB</span>
-                            <span class="quick-metric-value" id="quick-ttfb">-</span>
+                        <div class="input-group">
+                            <label for="lk-identity">Identity</label>
+                            <input type="text" id="lk-identity" value="dashboard-user" placeholder="Participant identity">
+                        </div>
+                        <div class="input-group">
+                            <label for="lk-name">Display Name</label>
+                            <input type="text" id="lk-name" placeholder="Display name (optional)">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <button id="lk-generate-token" class="btn btn-primary">Generate Token</button>
+                    </div>
+                    <div class="result-box code" id="lk-token-result"></div>
+                </section>
+
+                <section class="form-section">
+                    <h2>Rooms</h2>
+                    <div class="form-row">
+                        <button id="lk-list-rooms" class="btn btn-secondary">List Rooms</button>
+                    </div>
+                    <div class="result-box" id="lk-rooms-result"></div>
+                </section>
+            </div>
+
+            <!-- SIP Panel -->
+            <div class="tab-panel" id="panel-sip">
+                <div class="panel-header">
+                    <h1>SIP Hooks</h1>
+                    <p class="panel-description">Configure SIP webhooks for telephony integration</p>
+                </div>
+
+                <section class="form-section">
+                    <h2>Create Hook</h2>
+                    <div class="form-row">
+                        <div class="input-group">
+                            <label for="sip-host">SIP Host</label>
+                            <input type="text" id="sip-host" placeholder="sip.example.com">
+                        </div>
+                        <div class="input-group">
+                            <label for="sip-webhook">Webhook URL</label>
+                            <input type="text" id="sip-webhook" placeholder="https://your-server.com/webhook">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <button id="sip-create-hook" class="btn btn-primary">Create Hook</button>
+                    </div>
+                </section>
+
+                <section class="form-section">
+                    <h2>Existing Hooks</h2>
+                    <div class="form-row">
+                        <button id="sip-list-hooks" class="btn btn-secondary">Refresh</button>
+                    </div>
+                    <div class="result-box" id="sip-hooks-result"></div>
+                </section>
+            </div>
+
+            <!-- API Explorer Panel -->
+            <div class="tab-panel" id="panel-api">
+                <div class="panel-header">
+                    <h1>API Explorer</h1>
+                    <p class="panel-description">Test REST API endpoints</p>
+                </div>
+
+                <section class="form-section">
+                    <div class="form-row">
+                        <div class="input-group" style="width: 120px;">
+                            <label for="api-method">Method</label>
+                            <select id="api-method">
+                                <option value="GET">GET</option>
+                                <option value="POST">POST</option>
+                                <option value="PUT">PUT</option>
+                                <option value="DELETE">DELETE</option>
+                            </select>
+                        </div>
+                        <div class="input-group" style="flex: 1;">
+                            <label for="api-endpoint">Endpoint</label>
+                            <input type="text" id="api-endpoint" value="/" placeholder="/endpoint">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="input-group" style="flex: 1;">
+                            <label for="api-body">Request Body (JSON)</label>
+                            <textarea id="api-body" rows="4" placeholder='{"key": "value"}'></textarea>
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <button id="api-send" class="btn btn-primary">Send Request</button>
+                    </div>
+                </section>
+
+                <section class="form-section">
+                    <h2>Response</h2>
+                    <div class="result-box code" id="api-response"></div>
+                </section>
+            </div>
+
+            <!-- WS Debug Panel -->
+            <div class="tab-panel" id="panel-ws">
+                <div class="panel-header">
+                    <h1>WebSocket Debug</h1>
+                    <p class="panel-description">Send and receive raw WebSocket messages</p>
+                </div>
+
+                <section class="form-section">
+                    <h2>Send Message</h2>
+                    <div class="form-row">
+                        <div class="input-group" style="width: 150px;">
+                            <label for="ws-template">Template</label>
+                            <select id="ws-template">
+                                <option value="">Custom</option>
+                                <option value="config">Config</option>
+                                <option value="speak">Speak</option>
+                                <option value="clear">Clear</option>
+                                <option value="ping">Ping</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <textarea id="ws-message" rows="6" placeholder='{"type": "..."}'></textarea>
+                    </div>
+                    <div class="form-row">
+                        <button id="ws-send" class="btn btn-primary">Send</button>
+                    </div>
+                </section>
+
+                <section class="form-section">
+                    <div class="section-header">
+                        <h2>Message Log</h2>
+                        <button class="btn btn-secondary btn-sm" id="ws-clear-log">Clear</button>
+                    </div>
+                    <div class="message-log" id="ws-log"></div>
+                </section>
+            </div>
+
+            <!-- Audio Tools Panel -->
+            <div class="tab-panel" id="panel-audio">
+                <div class="panel-header">
+                    <h1>Audio Tools</h1>
+                    <p class="panel-description">Test microphone and audio visualization</p>
+                </div>
+
+                <section class="form-section">
+                    <h2>Input Device</h2>
+                    <div class="form-row">
+                        <div class="input-group" style="flex: 1;">
+                            <label for="audio-input-device">Microphone</label>
+                            <select id="audio-input-device"></select>
+                        </div>
+                        <button id="audio-refresh-devices" class="btn btn-secondary">Refresh</button>
+                    </div>
+                    <div class="level-meter">
+                        <div class="level-bar" id="audio-input-level"></div>
+                    </div>
+                </section>
+
+                <section class="form-section">
+                    <h2>Test Recording</h2>
+                    <div class="form-row">
+                        <button id="audio-test-record" class="btn btn-primary">Record 5s</button>
+                        <button id="audio-test-play" class="btn btn-secondary" disabled>Play</button>
+                    </div>
+                </section>
+
+                <section class="form-section">
+                    <h2>Audio Visualization</h2>
+                    <canvas id="audio-waveform" width="600" height="100"></canvas>
+                </section>
+            </div>
+
+            <!-- Metrics Panel -->
+            <div class="tab-panel" id="panel-metrics">
+                <div class="panel-header">
+                    <h1>Performance Metrics</h1>
+                    <p class="panel-description">Monitor latency and SLO compliance</p>
+                </div>
+
+                <div class="metrics-grid">
+                    <div class="metric-card-enhanced">
+                        <div class="metric-header">
+                            <span class="metric-label">STT TTFT</span>
+                            <span class="metric-trend" id="metric-stt-trend"></span>
+                        </div>
+                        <div class="metric-value-row">
+                            <span class="metric-value" id="metric-stt-ttft">-</span>
+                            <span class="metric-unit">ms</span>
+                        </div>
+                        <div class="metric-sparkline">
+                            <canvas class="sparkline-canvas" id="sparkline-stt-ttft" width="100" height="30"></canvas>
+                        </div>
+                        <div class="metric-footer">
+                            <span class="metric-percentile">p95</span>
+                        </div>
+                    </div>
+                    <div class="metric-card-enhanced">
+                        <div class="metric-header">
+                            <span class="metric-label">TTS TTFB</span>
+                            <span class="metric-trend" id="metric-tts-trend"></span>
+                        </div>
+                        <div class="metric-value-row">
+                            <span class="metric-value" id="metric-tts-ttfb">-</span>
+                            <span class="metric-unit">ms</span>
+                        </div>
+                        <div class="metric-sparkline">
+                            <canvas class="sparkline-canvas" id="sparkline-tts-ttfb" width="100" height="30"></canvas>
+                        </div>
+                        <div class="metric-footer">
+                            <span class="metric-percentile">p95</span>
+                        </div>
+                    </div>
+                    <div class="metric-card-enhanced">
+                        <div class="metric-header">
+                            <span class="metric-label">E2E Latency</span>
+                            <span class="metric-trend" id="metric-e2e-trend"></span>
+                        </div>
+                        <div class="metric-value-row">
+                            <span class="metric-value" id="metric-e2e">-</span>
+                            <span class="metric-unit">ms</span>
+                        </div>
+                        <div class="metric-sparkline">
+                            <canvas class="sparkline-canvas" id="sparkline-e2e" width="100" height="30"></canvas>
+                        </div>
+                        <div class="metric-footer">
+                            <span class="metric-percentile">p95</span>
+                        </div>
+                    </div>
+                    <div class="metric-card-enhanced">
+                        <div class="metric-header">
+                            <span class="metric-label">WS Connect</span>
+                        </div>
+                        <div class="metric-value-row">
+                            <span class="metric-value" id="metric-ws-connect">-</span>
+                            <span class="metric-unit">ms</span>
+                        </div>
+                        <div class="metric-footer">
+                            <span class="metric-percentile">last</span>
                         </div>
                     </div>
                 </div>
-                <div class="panel-section log-section">
-                    <h3>Request Log</h3>
-                    <div class="request-log" id="request-log"></div>
-                </div>
+
+                <section class="form-section">
+                    <h2>SLO Status</h2>
+                    <div class="slo-grid">
+                        <div class="slo-item" id="slo-stt">
+                            <span class="slo-status"></span>
+                            <span class="slo-label">STT TTFT &lt; 200ms</span>
+                            <span class="slo-value" id="slo-stt-value">--</span>
+                        </div>
+                        <div class="slo-item" id="slo-tts">
+                            <span class="slo-status"></span>
+                            <span class="slo-label">TTS TTFB &lt; 150ms</span>
+                            <span class="slo-value" id="slo-tts-value">--</span>
+                        </div>
+                        <div class="slo-item" id="slo-e2e">
+                            <span class="slo-status"></span>
+                            <span class="slo-label">E2E &lt; 1000ms</span>
+                            <span class="slo-value" id="slo-e2e-value">--</span>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="form-section">
+                    <h2>Latency Timeline</h2>
+                    <canvas id="metrics-timeline" width="700" height="150"></canvas>
+                </section>
+
+                <section class="form-section">
+                    <div class="form-row">
+                        <button id="metrics-reset" class="btn btn-secondary">Reset Metrics</button>
+                        <button id="metrics-export" class="btn btn-secondary">Export CSV</button>
+                    </div>
+                </section>
             </div>
         </main>
     </div>
 
-    <script type="module" src="js/app.js?v=5"></script>
+    <!-- Keyboard Shortcuts Modal -->
+    <div class="modal" id="shortcuts-modal" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title" hidden>
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="shortcuts-title">Keyboard Shortcuts</h2>
+                <button class="modal-close" aria-label="Close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="shortcuts-list" id="shortcuts-list">
+                    <!-- Populated by JS -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div class="toast-container" id="toast-container" aria-live="polite"></div>
+
+    <script type="module" src="js/app.js?v=15"></script>
 </body>
 </html>

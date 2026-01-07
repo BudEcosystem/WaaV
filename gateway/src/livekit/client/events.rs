@@ -29,7 +29,7 @@ impl LiveKitClient {
             let is_connected = Arc::clone(&self.is_connected);
             let config = self.config.clone();
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 while let Some(event) = room_events.recv().await {
                     if let Err(e) = LiveKitClient::handle_room_event(
                         event,
@@ -47,6 +47,9 @@ impl LiveKitClient {
                 }
                 info!("Room event handler finished");
             });
+
+            // Store the handle for cleanup during disconnect/drop
+            self.event_handler_handle = Some(handle);
         }
 
         Ok(())

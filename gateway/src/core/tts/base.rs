@@ -79,6 +79,7 @@ use futures::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::core::emotion::EmotionConfig;
 use crate::utils::req_manager::ReqManager;
 
 /// Audio data structure for TTS output
@@ -188,6 +189,13 @@ pub struct TTSConfig {
     pub pronunciations: Vec<Pronunciation>,
     /// Request pool size for concurrent HTTP requests
     pub request_pool_size: Option<usize>,
+    /// Emotion configuration for TTS providers that support emotional expression
+    ///
+    /// When set, providers that support emotions (Hume, ElevenLabs, Azure) will
+    /// apply the emotional parameters to the synthesized speech. Providers that
+    /// don't support emotions will log a warning and proceed with default synthesis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emotion_config: Option<EmotionConfig>,
 }
 
 impl Default for TTSConfig {
@@ -204,6 +212,7 @@ impl Default for TTSConfig {
             request_timeout: Some(60),
             pronunciations: Vec::new(),
             request_pool_size: Some(4),
+            emotion_config: None,
         }
     }
 }
@@ -314,8 +323,16 @@ pub trait BaseTTS: Send + Sync {
 
     /// Flush the TTS provider
     ///
-    /// This method forces the TTS provider to start processing any queued text
-    /// immediately, rather than waiting for additional text or timeout.
+    /// Forces any queued text to be processed immediately.
+    ///
+    /// # Provider-Specific Behavior
+    ///
+    /// - **HTTP providers** (Deepgram, OpenAI, Play.ht): This is a no-op because
+    ///   each `speak()` call immediately sends an HTTP request. There is no
+    ///   internal queue to flush.
+    ///
+    /// - **WebSocket providers** (Cartesia, ElevenLabs streaming): Sends any
+    ///   buffered text to the server immediately.
     ///
     /// # Returns
     /// * `TTSResult<()>` - Success or failure of the flush operation

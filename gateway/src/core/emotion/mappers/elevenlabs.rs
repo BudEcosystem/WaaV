@@ -102,18 +102,30 @@ impl ElevenLabsEmotionMapper {
         match style {
             DeliveryStyle::Normal => (stability, similarity_boost, style_value),
             DeliveryStyle::Whispered => (stability + 0.1, similarity_boost, style_value - 0.1),
-            DeliveryStyle::Shouted => (stability - 0.15, similarity_boost - 0.05, style_value + 0.15),
+            DeliveryStyle::Shouted => (
+                stability - 0.15,
+                similarity_boost - 0.05,
+                style_value + 0.15,
+            ),
             DeliveryStyle::Rushed => (stability - 0.1, similarity_boost, style_value + 0.1),
-            DeliveryStyle::Measured => (stability + 0.15, similarity_boost + 0.05, style_value - 0.1),
+            DeliveryStyle::Measured => {
+                (stability + 0.15, similarity_boost + 0.05, style_value - 0.1)
+            }
             DeliveryStyle::Monotone => (0.8, similarity_boost, 0.0),
-            DeliveryStyle::Expressive => (stability - 0.2, similarity_boost - 0.05, style_value + 0.2),
+            DeliveryStyle::Expressive => {
+                (stability - 0.2, similarity_boost - 0.05, style_value + 0.2)
+            }
             DeliveryStyle::Professional => (0.6, similarity_boost + 0.05, style_value),
             DeliveryStyle::Casual => (stability - 0.1, similarity_boost, style_value + 0.1),
             DeliveryStyle::Storytelling => (stability - 0.15, similarity_boost, style_value + 0.15),
             DeliveryStyle::Soft => (stability + 0.1, similarity_boost + 0.05, style_value - 0.1),
             DeliveryStyle::Loud => (stability - 0.1, similarity_boost - 0.05, style_value + 0.1),
             DeliveryStyle::Cheerful => (stability - 0.1, similarity_boost, style_value + 0.15),
-            DeliveryStyle::Serious => (stability + 0.15, similarity_boost + 0.05, style_value - 0.05),
+            DeliveryStyle::Serious => (
+                stability + 0.15,
+                similarity_boost + 0.05,
+                style_value - 0.05,
+            ),
             DeliveryStyle::Formal => (0.6, similarity_boost + 0.05, style_value),
         }
     }

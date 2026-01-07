@@ -284,6 +284,35 @@ fn validate_hook_secret(
     Ok(())
 }
 
+/// Validate security-related configuration values
+///
+/// Ensures that rate limiting and connection parameters are positive values.
+/// A value of 0 would effectively disable protection, which could be unintentional.
+///
+/// # Arguments
+/// * `rate_limit_rps` - Rate limit in requests per second
+/// * `rate_limit_burst` - Maximum burst size for rate limiting
+/// * `max_connections_per_ip` - Maximum concurrent connections per IP address
+///
+/// # Errors
+/// Returns an error if any parameter is zero
+pub fn validate_security_config(
+    rate_limit_rps: u32,
+    rate_limit_burst: u32,
+    max_connections_per_ip: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if rate_limit_rps == 0 {
+        return Err("rate_limit must be positive (0 would disable rate limiting)".into());
+    }
+    if rate_limit_burst == 0 {
+        return Err("burst_size must be positive (0 would disable bursting)".into());
+    }
+    if max_connections_per_ip == 0 {
+        return Err("max_connections_per_ip must be positive (0 would disable connection limiting)".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +442,7 @@ mod tests {
                 secret: None,
             }],
             Some("global-secret-1234567890".to_string()),
+            None,
         );
 
         let result = validate_sip_config(&Some(config));
@@ -425,6 +455,7 @@ mod tests {
             "".to_string(),
             vec!["192.168.1.0/24".to_string()],
             vec![],
+            None,
             None,
         );
 
@@ -445,6 +476,7 @@ mod tests {
             vec!["192.168.1.0/24".to_string()],
             vec![],
             None,
+            None,
         );
 
         let result = validate_sip_config(&Some(config));
@@ -459,7 +491,7 @@ mod tests {
 
     #[test]
     fn test_validate_sip_config_empty_allowed_addresses() {
-        let config = SipConfig::new("sip-".to_string(), vec![], vec![], None);
+        let config = SipConfig::new("sip-".to_string(), vec![], vec![], None, None);
 
         let result = validate_sip_config(&Some(config));
         assert!(result.is_err());
@@ -477,6 +509,7 @@ mod tests {
             "sip-".to_string(),
             vec!["not-an-ip".to_string()],
             vec![],
+            None,
             None,
         );
 
@@ -508,6 +541,7 @@ mod tests {
                 },
             ],
             Some("global-secret-1234567890".to_string()),
+            None,
         );
 
         let result = validate_sip_config(&Some(config));
@@ -545,6 +579,7 @@ mod tests {
             vec!["192.168.1.0/24".to_string(), "10.0.0.0/8".to_string()],
             vec![],
             None,
+            None,
         );
 
         let result = validate_sip_config(&Some(config));
@@ -557,6 +592,7 @@ mod tests {
             "sip-call_123".to_string(),
             vec!["192.168.1.0/24".to_string()],
             vec![],
+            None,
             None,
         );
 
@@ -577,6 +613,7 @@ mod tests {
                 secret: None,
             }],
             None, // No global secret
+            None,
         );
 
         let result = validate_sip_config(&Some(config));
@@ -600,6 +637,7 @@ mod tests {
                 secret: None,
             }],
             Some("short".to_string()), // Too short
+            None,
         );
 
         let result = validate_sip_config(&Some(config));
@@ -623,6 +661,7 @@ mod tests {
                 secret: None,
             }],
             Some("                ".to_string()), // Whitespace only
+            None,
         );
 
         let result = validate_sip_config(&Some(config));
@@ -653,6 +692,7 @@ mod tests {
                 },
             ],
             Some("global-secret-1234567890".to_string()),
+            None,
         );
 
         let result = validate_sip_config(&Some(config));
@@ -670,6 +710,7 @@ mod tests {
                 secret: Some("short".to_string()), // Too short
             }],
             Some("global-secret-1234567890".to_string()),
+            None,
         );
 
         let result = validate_sip_config(&Some(config));

@@ -706,10 +706,7 @@ impl EmotionConfig {
     /// Gets the effective intensity value (defaults to 0.6 if not set).
     #[inline]
     pub fn effective_intensity(&self) -> f32 {
-        self.intensity
-            .as_ref()
-            .map(|i| i.as_f32())
-            .unwrap_or(0.6)
+        self.intensity.as_ref().map(|i| i.as_f32()).unwrap_or(0.6)
     }
 }
 
@@ -831,10 +828,7 @@ mod tests {
             DeliveryStyle::from_str("SHOUTED"),
             Some(DeliveryStyle::Shouted)
         );
-        assert_eq!(
-            DeliveryStyle::from_str("fast"),
-            Some(DeliveryStyle::Rushed)
-        );
+        assert_eq!(DeliveryStyle::from_str("fast"), Some(DeliveryStyle::Rushed));
         assert_eq!(DeliveryStyle::from_str("unknown"), None);
     }
 
@@ -874,10 +868,7 @@ mod tests {
     #[test]
     fn test_intensity_level_from_str() {
         assert_eq!(IntensityLevel::from_str("low"), Some(IntensityLevel::Low));
-        assert_eq!(
-            IntensityLevel::from_str("HIGH"),
-            Some(IntensityLevel::High)
-        );
+        assert_eq!(IntensityLevel::from_str("HIGH"), Some(IntensityLevel::High));
         assert_eq!(
             IntensityLevel::from_str("moderate"),
             Some(IntensityLevel::Medium)

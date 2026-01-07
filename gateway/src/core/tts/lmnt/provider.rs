@@ -45,7 +45,9 @@ use super::{
     DEFAULT_LANGUAGE, DEFAULT_MODEL, DEFAULT_SPEED, DEFAULT_TEMPERATURE, DEFAULT_TOP_P,
     LMNT_TTS_URL, MAX_TEXT_LENGTH,
 };
-use crate::core::tts::base::{AudioCallback, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult};
+use crate::core::tts::base::{
+    AudioCallback, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
+};
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
 use crate::utils::req_manager::ReqManager;
 
@@ -650,6 +652,7 @@ mod tests {
             request_timeout: Some(60),
             pronunciations: Vec::new(),
             request_pool_size: Some(4),
+            emotion_config: None,
         }
     }
 
@@ -803,7 +806,10 @@ mod tests {
         let builder = LmntRequestBuilder::new(config, lmnt_config);
 
         let client = reqwest::Client::new();
-        let request = builder.build_http_request(&client, "Hello world").build().unwrap();
+        let request = builder
+            .build_http_request(&client, "Hello world")
+            .build()
+            .unwrap();
 
         let body = request.body().unwrap().as_bytes().unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(body).unwrap();

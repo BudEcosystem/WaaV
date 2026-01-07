@@ -108,7 +108,11 @@ static STT_PRICING: LazyLock<HashMap<&'static str, ModelPricing>> = LazyLock::ne
     );
     m.insert(
         "groq:whisper-large-v3-turbo",
-        ModelPricing::with_notes(0.04, PricingUnit::PerHour, "12% WER, 216x real-time, min 10s billing"),
+        ModelPricing::with_notes(
+            0.04,
+            PricingUnit::PerHour,
+            "12% WER, 216x real-time, min 10s billing",
+        ),
     );
 
     // -------------------------------------------------------------------------
@@ -117,7 +121,11 @@ static STT_PRICING: LazyLock<HashMap<&'static str, ModelPricing>> = LazyLock::ne
     // -------------------------------------------------------------------------
     m.insert(
         "deepgram:nova-2",
-        ModelPricing::with_notes(0.0043 * 60.0, PricingUnit::PerHour, "Pay-as-you-go rate per minute"),
+        ModelPricing::with_notes(
+            0.0043 * 60.0,
+            PricingUnit::PerHour,
+            "Pay-as-you-go rate per minute",
+        ),
     );
     m.insert(
         "deepgram:nova-2-general",
@@ -179,7 +187,11 @@ static STT_PRICING: LazyLock<HashMap<&'static str, ModelPricing>> = LazyLock::ne
     );
     m.insert(
         "google:chirp_2",
-        ModelPricing::with_notes(0.016 * 60.0, PricingUnit::PerHour, "Chirp 2 universal model"),
+        ModelPricing::with_notes(
+            0.016 * 60.0,
+            PricingUnit::PerHour,
+            "Chirp 2 universal model",
+        ),
     );
 
     // -------------------------------------------------------------------------
@@ -227,7 +239,11 @@ static STT_PRICING: LazyLock<HashMap<&'static str, ModelPricing>> = LazyLock::ne
     // -------------------------------------------------------------------------
     m.insert(
         "elevenlabs:scribe_v1",
-        ModelPricing::with_notes(0.40 * 60.0, PricingUnit::PerHour, "99 languages, min 15s billing"),
+        ModelPricing::with_notes(
+            0.40 * 60.0,
+            PricingUnit::PerHour,
+            "99 languages, min 15s billing",
+        ),
     );
 
     // -------------------------------------------------------------------------
@@ -290,7 +306,11 @@ static TTS_PRICING: LazyLock<HashMap<&'static str, ModelPricing>> = LazyLock::ne
     );
     m.insert(
         "elevenlabs:eleven_flash_v2_5",
-        ModelPricing::with_notes(0.08, PricingUnit::Per1KChars, "Lower latency, lower quality"),
+        ModelPricing::with_notes(
+            0.08,
+            PricingUnit::Per1KChars,
+            "Lower latency, lower quality",
+        ),
     );
     m.insert(
         "elevenlabs:eleven_monolingual_v1",

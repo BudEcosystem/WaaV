@@ -115,7 +115,15 @@ pub fn providers_with_emotion_support() -> &'static [&'static str] {
 /// Note: LMNT supports `top_p`/`temperature` for expressiveness but not emotions.
 #[inline]
 pub fn providers_without_emotion_support() -> &'static [&'static str] {
-    &["deepgram", "cartesia", "google", "ibm-watson", "aws-polly", "openai", "lmnt"]
+    &[
+        "deepgram",
+        "cartesia",
+        "google",
+        "ibm-watson",
+        "aws-polly",
+        "openai",
+        "lmnt",
+    ]
 }
 
 // =============================================================================

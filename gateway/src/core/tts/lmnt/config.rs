@@ -301,10 +301,7 @@ impl LmntTtsConfig {
     /// Falls back to "lily" if no voice is specified.
     #[inline]
     pub fn voice_id(&self) -> &str {
-        self.base
-            .voice_id
-            .as_deref()
-            .unwrap_or("lily")
+        self.base.voice_id.as_deref().unwrap_or("lily")
     }
 
     /// Sets the model name.
@@ -626,6 +623,7 @@ mod tests {
             request_timeout: Some(60),
             pronunciations: Vec::new(),
             request_pool_size: Some(4),
+            emotion_config: None,
         }
     }
 

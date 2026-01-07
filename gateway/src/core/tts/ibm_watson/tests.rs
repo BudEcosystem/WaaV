@@ -26,10 +26,7 @@ mod voice_tests {
             IbmVoice::EnGbCharlotteV3Voice.as_str(),
             "en-GB_CharlotteV3Voice"
         );
-        assert_eq!(
-            IbmVoice::DeDeBirgitV3Voice.as_str(),
-            "de-DE_BirgitV3Voice"
-        );
+        assert_eq!(IbmVoice::DeDeBirgitV3Voice.as_str(), "de-DE_BirgitV3Voice");
         assert_eq!(IbmVoice::JaJpEmiV3Voice.as_str(), "ja-JP_EmiV3Voice");
     }
 
@@ -148,8 +145,14 @@ mod output_format_tests {
 
     #[test]
     fn test_output_format_default_sample_rate() {
-        assert_eq!(IbmOutputFormat::Wav.default_sample_rate(), DEFAULT_SAMPLE_RATE);
-        assert_eq!(IbmOutputFormat::Mp3.default_sample_rate(), DEFAULT_SAMPLE_RATE);
+        assert_eq!(
+            IbmOutputFormat::Wav.default_sample_rate(),
+            DEFAULT_SAMPLE_RATE
+        );
+        assert_eq!(
+            IbmOutputFormat::Mp3.default_sample_rate(),
+            DEFAULT_SAMPLE_RATE
+        );
         assert_eq!(IbmOutputFormat::Mulaw.default_sample_rate(), 8000);
         assert_eq!(IbmOutputFormat::Alaw.default_sample_rate(), 8000);
     }
@@ -273,10 +276,7 @@ mod config_tests {
     fn test_config_with_voice() {
         let config = IbmWatsonTTSConfig::with_voice(IbmVoice::EnGbJamesV3Voice);
         assert_eq!(config.voice, IbmVoice::EnGbJamesV3Voice);
-        assert_eq!(
-            config.base.voice_id,
-            Some("en-GB_JamesV3Voice".to_string())
-        );
+        assert_eq!(config.base.voice_id, Some("en-GB_JamesV3Voice".to_string()));
     }
 
     #[test]
@@ -395,7 +395,11 @@ mod config_tests {
         let config = IbmWatsonTTSConfig::default();
         let params = config.build_query_params();
 
-        assert!(params.iter().any(|(k, v)| *k == "voice" && v.contains("Allison")));
+        assert!(
+            params
+                .iter()
+                .any(|(k, v)| *k == "voice" && v.contains("Allison"))
+        );
     }
 
     #[test]
@@ -404,9 +408,11 @@ mod config_tests {
         config.customization_ids = vec!["cust-123".to_string()];
 
         let params = config.build_query_params();
-        assert!(params
-            .iter()
-            .any(|(k, v)| *k == "customization_id" && v == "cust-123"));
+        assert!(
+            params
+                .iter()
+                .any(|(k, v)| *k == "customization_id" && v == "cust-123")
+        );
     }
 
     #[test]
@@ -501,10 +507,7 @@ mod provider_tests {
 
         tts.set_output_format(IbmOutputFormat::Webm);
         assert_eq!(tts.output_format(), IbmOutputFormat::Webm);
-        assert_eq!(
-            tts.ibm_config().base.audio_format,
-            Some("webm".to_string())
-        );
+        assert_eq!(tts.ibm_config().base.audio_format, Some("webm".to_string()));
     }
 
     #[tokio::test]

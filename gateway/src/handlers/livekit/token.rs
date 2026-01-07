@@ -16,6 +16,13 @@ use tracing::{error, info};
 use crate::auth::Auth;
 use crate::state::AppState;
 
+/// Maximum allowed length for room names
+const MAX_ROOM_NAME_LENGTH: usize = 256;
+/// Maximum allowed length for participant display names
+const MAX_PARTICIPANT_NAME_LENGTH: usize = 128;
+/// Maximum allowed length for participant identities
+const MAX_PARTICIPANT_IDENTITY_LENGTH: usize = 256;
+
 /// Request body for generating a LiveKit token
 ///
 /// # Example
@@ -156,6 +163,37 @@ pub async fn generate_token(
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "Invalid request: participant_identity cannot be empty"
+            })),
+        )
+            .into_response();
+    }
+
+    // Validate field length limits to prevent resource exhaustion
+    if request.room_name.len() > MAX_ROOM_NAME_LENGTH {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Invalid request: room_name exceeds maximum length of {} characters", MAX_ROOM_NAME_LENGTH)
+            })),
+        )
+            .into_response();
+    }
+
+    if request.participant_name.len() > MAX_PARTICIPANT_NAME_LENGTH {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Invalid request: participant_name exceeds maximum length of {} characters", MAX_PARTICIPANT_NAME_LENGTH)
+            })),
+        )
+            .into_response();
+    }
+
+    if request.participant_identity.len() > MAX_PARTICIPANT_IDENTITY_LENGTH {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Invalid request: participant_identity exceeds maximum length of {} characters", MAX_PARTICIPANT_IDENTITY_LENGTH)
             })),
         )
             .into_response();

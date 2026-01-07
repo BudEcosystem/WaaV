@@ -55,6 +55,7 @@ fn test_incoming_message_serialization() {
     let config_msg = IncomingMessage::Config {
         stream_id: None,
         audio: Some(true),
+        audio_disabled: None,
         stt_config: Some(STTWebSocketConfig {
             api_key: None,
             provider: "deepgram".to_string(),
@@ -658,6 +659,7 @@ fn test_incoming_message_config_with_livekit() {
     let config_msg = IncomingMessage::Config {
         stream_id: None,
         audio: Some(true),
+        audio_disabled: None,
         stt_config: Some(STTWebSocketConfig {
             api_key: None,
             provider: "deepgram".to_string(),
@@ -704,6 +706,7 @@ fn test_incoming_message_config_without_livekit() {
     let config_msg = IncomingMessage::Config {
         stream_id: None,
         audio: Some(true),
+        audio_disabled: None,
         stt_config: Some(STTWebSocketConfig {
             api_key: None,
             provider: "deepgram".to_string(),
@@ -775,6 +778,7 @@ fn test_parse_config_message_with_livekit() {
         stt_config,
         tts_config,
         livekit,
+        ..
     } = parsed
     {
         assert_eq!(audio, Some(true));
@@ -873,6 +877,7 @@ fn test_parse_config_message_without_livekit() {
         stt_config,
         tts_config,
         livekit,
+        ..
     } = parsed
     {
         assert_eq!(audio, Some(true));
@@ -1011,6 +1016,7 @@ fn test_config_message_without_livekit_routing() {
     let config_msg = IncomingMessage::Config {
         stream_id: None,
         audio: Some(true),
+        audio_disabled: None,
         stt_config: Some(STTWebSocketConfig {
             api_key: None,
             provider: "deepgram".to_string(),
@@ -1062,6 +1068,7 @@ fn test_config_message_with_livekit_routing() {
     let config_msg = IncomingMessage::Config {
         stream_id: None,
         audio: Some(true),
+        audio_disabled: None,
         stt_config: Some(STTWebSocketConfig {
             api_key: None,
             provider: "deepgram".to_string(),
@@ -1273,6 +1280,7 @@ fn test_config_message_audio_disabled() {
     let config_msg = IncomingMessage::Config {
         stream_id: None,
         audio: Some(false),
+        audio_disabled: None,
         stt_config: None, // Not required when audio=false
         tts_config: None, // Not required when audio=false
         livekit: Some(LiveKitWebSocketConfig {
@@ -1301,6 +1309,7 @@ fn test_config_message_audio_disabled() {
         stt_config,
         tts_config,
         livekit,
+        ..
     } = parsed
     {
         assert_eq!(audio, Some(false));
@@ -1318,6 +1327,7 @@ fn test_config_message_audio_default() {
     let config_msg = IncomingMessage::Config {
         stream_id: None,
         audio: None, // Should default to true
+        audio_disabled: None,
         stt_config: Some(STTWebSocketConfig {
             api_key: None,
             provider: "deepgram".to_string(),
@@ -1360,6 +1370,7 @@ fn test_config_message_audio_default() {
         stt_config,
         tts_config,
         livekit,
+        ..
     } = parsed
     {
         assert_eq!(audio, Some(true)); // Should default to true via serde default

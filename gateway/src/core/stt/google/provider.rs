@@ -99,9 +99,9 @@ pub struct GoogleSTT {
     /// Audio sender uses Bytes for zero-copy transfer
     pub(super) audio_sender: Option<mpsc::Sender<Bytes>>,
     pub(super) shutdown_tx: Option<oneshot::Sender<()>>,
-    pub(super) result_tx: Option<mpsc::UnboundedSender<STTResult>>,
+    pub(super) result_tx: Option<mpsc::Sender<STTResult>>,
     /// Channel for propagating streaming errors to the client
-    pub(super) error_tx: Option<mpsc::UnboundedSender<STTError>>,
+    pub(super) error_tx: Option<mpsc::Sender<STTError>>,
     pub(super) connection_handle: Option<tokio::task::JoinHandle<()>>,
     pub(super) result_forward_handle: Option<tokio::task::JoinHandle<()>>,
     /// Handle for error forwarding task
@@ -156,8 +156,9 @@ impl GoogleSTT {
         // Use smaller buffer for lower latency - Bytes enables zero-copy
         let (audio_tx, audio_rx) = mpsc::channel::<Bytes>(AUDIO_CHANNEL_BUFFER_SIZE);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let (result_tx, mut result_rx) = mpsc::unbounded_channel::<STTResult>();
-        let (error_tx, mut error_rx) = mpsc::unbounded_channel::<STTError>();
+        // Bounded channels for backpressure - 256 should handle bursts while preventing memory exhaustion
+        let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
+        let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
         // Connection result channel - sends () on success when gRPC channel is established
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
@@ -184,7 +185,7 @@ impl GoogleSTT {
                     Err(e) => {
                         let stt_error = google_error_to_stt(e);
                         error!("Failed to create speech client: {}", stt_error);
-                        let _ = error_tx.send(stt_error);
+                        let _ = error_tx.try_send(stt_error);
                         return;
                     }
                 };
@@ -195,7 +196,7 @@ impl GoogleSTT {
                 Err(e) => {
                     let stt_error = google_error_to_stt(e);
                     error!("Failed to get authorization header: {}", stt_error);
-                    let _ = error_tx.send(stt_error);
+                    let _ = error_tx.try_send(stt_error);
                     return;
                 }
             };
@@ -208,7 +209,7 @@ impl GoogleSTT {
                         "Failed to parse authorization header".to_string(),
                     );
                     error!("{}", stt_error);
-                    let _ = error_tx.send(stt_error);
+                    let _ = error_tx.try_send(stt_error);
                     return;
                 }
             };
@@ -292,32 +293,46 @@ impl GoogleSTT {
                 Err(e) => {
                     let stt_error = handle_grpc_error(e);
                     error!("Failed to start streaming recognition: {}", stt_error);
-                    let _ = error_tx.send(stt_error);
+                    let _ = error_tx.try_send(stt_error);
                     return;
                 }
             };
 
             let mut response_stream = response.into_inner();
 
+            // Per-message idle timeout - resets after each successful message reception.
+            // This catches stuck/dead connections while allowing active streams to continue.
+            // 60 seconds is generous enough for slow transcription but catches hung connections.
+            const GRPC_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
             // Process all incoming messages from Google STT
             // Permission/auth errors will come through as gRPC errors and be sent via error_tx
             loop {
-                match response_stream.message().await {
-                    Ok(Some(msg)) => {
+                match tokio::time::timeout(GRPC_MESSAGE_TIMEOUT, response_stream.message()).await {
+                    Ok(Ok(Some(msg))) => {
                         if let Err(e) = handle_streaming_response(msg, &result_tx) {
                             error!("Error handling streaming response: {}", e);
-                            let _ = error_tx.send(e);
+                            let _ = error_tx.try_send(e);
                             break;
                         }
                     }
-                    Ok(None) => {
+                    Ok(Ok(None)) => {
                         info!("Google Speech-to-Text stream ended");
                         break;
                     }
-                    Err(status) => {
+                    Ok(Err(status)) => {
                         let stt_error = handle_grpc_error(status);
                         error!("Streaming error from Google STT: {}", stt_error);
-                        let _ = error_tx.send(stt_error);
+                        let _ = error_tx.try_send(stt_error);
+                        break;
+                    }
+                    Err(_elapsed) => {
+                        // Idle timeout - no message received for 60s, connection likely stuck
+                        let stt_error = STTError::NetworkError(
+                            "gRPC idle timeout - no message received for 60 seconds".into()
+                        );
+                        error!("Google STT gRPC idle timeout: {}", stt_error);
+                        let _ = error_tx.try_send(stt_error);
                         break;
                     }
                 }

@@ -177,7 +177,6 @@ pub struct TTSWebSocketConfig {
     // =========================================================================
     // Emotion Control (Unified Emotion System)
     // =========================================================================
-
     /// Emotion to express in speech synthesis.
     ///
     /// Supported by: Hume AI (all), ElevenLabs (core set), Azure (SSML styles).
@@ -230,6 +229,9 @@ impl TTSWebSocketConfig {
         // Start with defaults
         let defaults = TTSConfig::default();
 
+        // Extract emotion config from WebSocket config fields
+        let emotion_config = self.to_emotion_config();
+
         TTSConfig {
             provider: self.provider.clone(),
             api_key,
@@ -243,6 +245,7 @@ impl TTSWebSocketConfig {
             request_timeout: self.request_timeout.or(defaults.request_timeout),
             pronunciations: self.pronunciations.clone(),
             request_pool_size: defaults.request_pool_size,
+            emotion_config,
         }
     }
 

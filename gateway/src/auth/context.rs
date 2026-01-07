@@ -26,6 +26,11 @@ pub struct Auth {
     /// The authenticated client/project identifier (e.g., "project1", "client-a")
     #[serde(default)]
     pub id: Option<String>,
+    /// Whether authentication is pending (waiting for first-message auth).
+    /// Used for WebSocket connections where the token couldn't be provided
+    /// via header or query parameter.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
     // Future fields can be added here, e.g.:
     // pub org_id: Option<String>,
     // pub permissions: Vec<String>,
@@ -37,12 +42,35 @@ impl Auth {
     pub fn new(id: impl Into<String>) -> Self {
         Self {
             id: Some(id.into()),
+            pending: false,
         }
     }
 
-    /// Create an empty Auth (no id)
+    /// Create an empty Auth (no id, not pending)
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    /// Create a pending Auth (waiting for first-message authentication)
+    ///
+    /// Used for WebSocket connections where authentication is required
+    /// but no token was provided via header or query parameter.
+    /// The client must send an `auth` message as the first message.
+    pub fn pending() -> Self {
+        Self {
+            id: None,
+            pending: true,
+        }
+    }
+
+    /// Check if authentication is pending
+    pub fn is_pending(&self) -> bool {
+        self.pending
+    }
+
+    /// Check if this Auth is fully authenticated (has id and not pending)
+    pub fn is_authenticated(&self) -> bool {
+        self.id.is_some() && !self.pending
     }
 
     /// Normalizes a room name by prefixing it with the authenticated client's ID.
@@ -117,6 +145,7 @@ mod tests {
     fn test_normalize_room_name_empty_auth_id() {
         let auth = Auth {
             id: Some("".to_string()),
+            pending: false,
         };
         assert_eq!(auth.normalize_room_name("my-room"), "my-room");
     }

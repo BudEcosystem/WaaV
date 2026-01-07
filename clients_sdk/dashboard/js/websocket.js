@@ -68,8 +68,12 @@ export class WebSocketManager {
   }
 
   send(data) {
+    console.log('[WS] send() called, readyState:', this.ws?.readyState, 'data type:', data?.type);
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      console.log('[WS] Sending message:', JSON.stringify(data));
       this.ws.send(JSON.stringify(data));
+    } else {
+      console.warn('[WS] Cannot send - WebSocket not open. readyState:', this.ws?.readyState);
     }
   }
 

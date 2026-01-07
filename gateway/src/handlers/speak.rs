@@ -6,8 +6,16 @@ use axum::{
 use serde::Deserialize;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tracing::{error, info};
+use std::time::Duration;
+use tokio::sync::{Mutex, Notify};
+use tracing::{error, info, warn};
+
+/// Default timeout for TTS synthesis in seconds
+const DEFAULT_SPEAK_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum allowed text length in bytes (10KB)
+/// This prevents DoS attacks via very long text inputs
+const MAX_TEXT_LENGTH: usize = 10 * 1024;
 
 use crate::core::tts::{AudioCallback, AudioData, TTSError, create_tts_provider};
 use crate::handlers::ws::config::TTSWebSocketConfig;
@@ -31,6 +39,8 @@ struct AudioCollector {
     sample_rate: Arc<Mutex<Option<u32>>>,
     completed: Arc<Mutex<bool>>,
     error: Arc<Mutex<Option<TTSError>>>,
+    /// Notification for completion - more efficient than polling
+    notify: Arc<Notify>,
 }
 
 impl AudioCollector {
@@ -41,12 +51,37 @@ impl AudioCollector {
             sample_rate: Arc::new(Mutex::new(None)),
             completed: Arc::new(Mutex::new(false)),
             error: Arc::new(Mutex::new(None)),
+            notify: Arc::new(Notify::new()),
         }
     }
 
-    async fn wait_for_completion(&self) {
-        while !*self.completed.lock().await {
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    /// Wait for TTS synthesis to complete with a timeout
+    ///
+    /// Uses Notify for efficient waiting instead of polling.
+    ///
+    /// # Arguments
+    /// * `timeout_secs` - Maximum time to wait in seconds
+    ///
+    /// # Returns
+    /// * `Ok(())` - Synthesis completed within timeout
+    /// * `Err(&'static str)` - Timeout elapsed before completion
+    async fn wait_for_completion(&self, timeout_secs: u64) -> Result<(), &'static str> {
+        // Check if already completed (avoids unnecessary wait)
+        if *self.completed.lock().await {
+            return Ok(());
+        }
+
+        // Wait for notification with timeout (efficient, no polling)
+        let timeout = Duration::from_secs(timeout_secs);
+        match tokio::time::timeout(timeout, self.notify.notified()).await {
+            Ok(()) => Ok(()),
+            Err(_elapsed) => {
+                warn!(
+                    "TTS synthesis timeout after {}s",
+                    timeout_secs
+                );
+                Err("TTS synthesis timeout")
+            }
         }
     }
 
@@ -95,12 +130,16 @@ impl AudioCallback for AudioCollector {
         Box::pin(async move {
             *self.error.lock().await = Some(error);
             *self.completed.lock().await = true;
+            // Wake up any waiting task
+            self.notify.notify_waiters();
         })
     }
 
     fn on_complete(&self) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             *self.completed.lock().await = true;
+            // Wake up any waiting task
+            self.notify.notify_waiters();
         })
     }
 }
@@ -139,7 +178,7 @@ pub async fn speak_handler(
         request.text.len()
     );
 
-    // Validate text
+    // Validate text is not empty
     if request.text.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -150,21 +189,51 @@ pub async fn speak_handler(
             .into_response();
     }
 
-    // Get API key from config
-    let api_key = match state.config.get_api_key(&request.tts_config.provider) {
-        Ok(key) => key,
-        Err(e) => {
-            error!(
-                "Failed to get API key for {}: {}",
-                request.tts_config.provider, e
-            );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("API key not configured for provider: {}", request.tts_config.provider)
-                })),
-            )
-                .into_response();
+    // Validate text length to prevent DoS
+    if request.text.len() > MAX_TEXT_LENGTH {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Text too long: {} bytes exceeds maximum {} bytes",
+                    request.text.len(),
+                    MAX_TEXT_LENGTH
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    // Get API key: Client-provided key takes priority over server config (BYOK pattern)
+    // This allows multi-tenant setups where clients bring their own API keys
+    let api_key = if let Some(client_key) = request
+        .tts_config
+        .api_key
+        .as_ref()
+        .filter(|k| !k.is_empty())
+    {
+        info!(
+            "Using client-provided API key for provider: {}",
+            request.tts_config.provider
+        );
+        client_key.clone()
+    } else {
+        // Fall back to server config
+        match state.config.get_api_key(&request.tts_config.provider) {
+            Ok(key) => key,
+            Err(e) => {
+                error!(
+                    "Failed to get API key for {}: {}",
+                    request.tts_config.provider, e
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("API key not configured for provider: {}", request.tts_config.provider)
+                    })),
+                )
+                    .into_response();
+            }
         }
     };
 
@@ -242,8 +311,18 @@ pub async fn speak_handler(
             .into_response();
     }
 
-    // Wait for completion
-    collector.wait_for_completion().await;
+    // Wait for completion with timeout
+    if let Err(e) = collector.wait_for_completion(DEFAULT_SPEAK_TIMEOUT_SECS).await {
+        // Disconnect on timeout
+        let _ = tts_provider.disconnect().await;
+        return (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({
+                "error": e
+            })),
+        )
+            .into_response();
+    }
 
     // Disconnect
     let _ = tts_provider.disconnect().await;

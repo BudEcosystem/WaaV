@@ -5,7 +5,8 @@ use super::parse_auth_api_secrets_json;
 use super::sip::{SipConfig, SipHookConfig};
 use super::utils::parse_bool;
 use super::validation::{
-    validate_auth_api_secrets, validate_auth_required, validate_jwt_auth, validate_tls_config,
+    validate_auth_api_secrets, validate_auth_required, validate_jwt_auth, validate_security_config,
+    validate_tls_config,
 };
 use super::{AuthApiSecret, ServerConfig, TlsConfig};
 
@@ -88,6 +89,23 @@ impl ServerConfig {
         // LMNT API key (used for TTS and voice cloning)
         let lmnt_api_key = env::var("LMNT_API_KEY").ok();
 
+        // Groq API key (used for ultra-fast Whisper STT)
+        let groq_api_key = env::var("GROQ_API_KEY").ok();
+
+        // Play.ht credentials (used for TTS with voice cloning)
+        let playht_api_key = env::var("PLAYHT_API_KEY").ok();
+        let playht_user_id = env::var("PLAYHT_USER_ID").ok();
+
+        // IBM Watson credentials (used for STT/TTS)
+        let ibm_watson_api_key = env::var("IBM_WATSON_API_KEY").ok();
+        let ibm_watson_instance_id = env::var("IBM_WATSON_INSTANCE_ID").ok();
+        let ibm_watson_region = env::var("IBM_WATSON_REGION").ok();
+
+        // AWS credentials (used for Transcribe/Polly)
+        let aws_access_key_id = env::var("AWS_ACCESS_KEY_ID").ok();
+        let aws_secret_access_key = env::var("AWS_SECRET_ACCESS_KEY").ok();
+        let aws_region = env::var("AWS_REGION").ok();
+
         // LiveKit recording S3 configuration
         let recording_s3_bucket = env::var("RECORDING_S3_BUCKET").ok();
         let recording_s3_region = env::var("RECORDING_S3_REGION").ok();
@@ -167,6 +185,13 @@ impl ServerConfig {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(100);
 
+        // Validate security configuration
+        validate_security_config(
+            rate_limit_requests_per_second,
+            rate_limit_burst_size,
+            max_connections_per_ip,
+        )?;
+
         Ok(ServerConfig {
             host,
             port,
@@ -185,6 +210,15 @@ impl ServerConfig {
             assemblyai_api_key,
             hume_api_key,
             lmnt_api_key,
+            groq_api_key,
+            playht_api_key,
+            playht_user_id,
+            ibm_watson_api_key,
+            ibm_watson_instance_id,
+            ibm_watson_region,
+            aws_access_key_id,
+            aws_secret_access_key,
+            aws_region,
             recording_s3_bucket,
             recording_s3_region,
             recording_s3_endpoint,
@@ -216,6 +250,7 @@ impl ServerConfig {
 /// - SIP_ALLOWED_ADDRESSES: Comma-separated list of IP addresses/CIDRs
 /// - SIP_HOOKS_JSON: JSON array of hook objects with host/url/secret fields
 /// - SIP_HOOK_SECRET: Global signing secret for webhook requests
+/// - SIP_NAMING_PREFIX: Prefix for SIP trunk and dispatch naming (defaults to "waav")
 ///
 /// # Returns
 /// * `Result<Option<SipConfig>, Box<dyn std::error::Error>>` - The SIP config or None
@@ -229,12 +264,14 @@ fn parse_sip_env() -> Result<Option<SipConfig>, Box<dyn std::error::Error>> {
     let allowed_addresses_str = env::var("SIP_ALLOWED_ADDRESSES").ok();
     let hooks_json = env::var("SIP_HOOKS_JSON").ok();
     let hook_secret = env::var("SIP_HOOK_SECRET").ok();
+    let naming_prefix = env::var("SIP_NAMING_PREFIX").ok();
 
     // If none of the SIP env vars are set, return None
     if room_prefix.is_none()
         && allowed_addresses_str.is_none()
         && hooks_json.is_none()
         && hook_secret.is_none()
+        && naming_prefix.is_none()
     {
         return Ok(None);
     }
@@ -267,6 +304,7 @@ fn parse_sip_env() -> Result<Option<SipConfig>, Box<dyn std::error::Error>> {
         allowed_addresses,
         hooks,
         hook_secret,
+        naming_prefix,
     )))
 }
 

@@ -1,5 +1,5 @@
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
@@ -7,8 +7,9 @@ use axum::{
 use object_store::{Error as ObjectStoreError, ObjectStore, path::Path as ObjectPath};
 use serde_json::json;
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
+use crate::auth::Auth;
 use crate::state::AppState;
 
 const CONTENT_TYPE: &str = "audio/ogg";
@@ -17,17 +18,39 @@ fn is_valid_stream_id(stream_id: &str) -> bool {
     !stream_id.is_empty() && !stream_id.contains("..") && !stream_id.contains('/')
 }
 
-fn build_recording_object_key(prefix: Option<&String>, stream_id: &str) -> String {
-    match prefix {
-        Some(prefix) if !prefix.trim().is_empty() => {
-            let normalized_prefix = prefix.trim_end_matches('/');
-            format!("{}/{}/audio.ogg", normalized_prefix, stream_id)
-        }
-        _ => format!("{}/audio.ogg", stream_id),
+/// Build recording object key with optional auth_id for tenant isolation.
+///
+/// Path format:
+/// - With auth_id: `{prefix}/{auth_id}/{stream_id}/audio.ogg` (tenant-scoped)
+/// - Without auth_id: `{prefix}/{stream_id}/audio.ogg` (legacy format)
+///
+/// When auth is enabled, recordings are stored with auth_id prefix for isolation.
+fn build_recording_object_key(
+    prefix: Option<&String>,
+    auth_id: Option<&str>,
+    stream_id: &str,
+) -> String {
+    let normalized_prefix = prefix
+        .map(|p| p.trim().trim_end_matches('/'))
+        .filter(|p| !p.is_empty());
+
+    match (normalized_prefix, auth_id) {
+        // No prefix, no auth_id: stream_id/audio.ogg
+        (None, None) => format!("{}/audio.ogg", stream_id),
+        // No prefix, with auth_id: auth_id/stream_id/audio.ogg
+        (None, Some(auth)) => format!("{}/{}/audio.ogg", auth, stream_id),
+        // With prefix, no auth_id: prefix/stream_id/audio.ogg
+        (Some(prefix), None) => format!("{}/{}/audio.ogg", prefix, stream_id),
+        // With prefix, with auth_id: prefix/auth_id/stream_id/audio.ogg
+        (Some(prefix), Some(auth)) => format!("{}/{}/{}/audio.ogg", prefix, auth, stream_id),
     }
 }
 
 /// Download recording by stream ID from configured object storage
+///
+/// When authentication is enabled, recordings are scoped to the authenticated
+/// client's ID. Users can only download recordings that belong to their tenant.
+/// The recording path includes auth_id prefix: `{prefix}/{auth_id}/{stream_id}/audio.ogg`
 #[cfg_attr(
     feature = "openapi",
     utoipa::path(
@@ -55,9 +78,24 @@ fn build_recording_object_key(prefix: Option<&String>, stream_id: &str) -> Strin
 )]
 pub async fn download_recording(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<Auth>,
     Path(stream_id): Path<String>,
 ) -> Response {
-    info!("Recording download requested - stream_id={}", stream_id);
+    // Extract auth_id for tenant-scoped recording access
+    let auth_id = auth.id.as_deref();
+
+    info!(
+        "Recording download requested - stream_id={}, auth_id={:?}",
+        stream_id, auth_id
+    );
+
+    // Log warning if downloading without authentication (potentially insecure)
+    if auth_id.is_none() && state.config.auth_required {
+        warn!(
+            "Recording download without auth_id - stream_id={}. Enable authentication for tenant isolation.",
+            stream_id
+        );
+    }
 
     if !is_valid_stream_id(&stream_id) {
         error!(
@@ -95,8 +133,9 @@ pub async fn download_recording(
         }
     };
 
+    // Build object key with auth_id for tenant-scoped access
     let object_key =
-        build_recording_object_key(state.config.recording_s3_prefix.as_ref(), &stream_id);
+        build_recording_object_key(state.config.recording_s3_prefix.as_ref(), auth_id, &stream_id);
 
     let object_path = match ObjectPath::parse(object_key.clone()) {
         Ok(path) => path,
@@ -182,23 +221,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_build_key_with_prefix() {
+    fn test_build_key_with_prefix_no_auth() {
         let prefix = "recordings".to_string();
-        let key = build_recording_object_key(Some(&prefix), "abc123");
+        let key = build_recording_object_key(Some(&prefix), None, "abc123");
         assert_eq!(key, "recordings/abc123/audio.ogg");
     }
 
     #[test]
-    fn test_build_key_without_prefix() {
-        let key = build_recording_object_key(None, "abc123");
+    fn test_build_key_with_prefix_and_auth() {
+        let prefix = "recordings".to_string();
+        let key = build_recording_object_key(Some(&prefix), Some("project1"), "abc123");
+        assert_eq!(key, "recordings/project1/abc123/audio.ogg");
+    }
+
+    #[test]
+    fn test_build_key_without_prefix_no_auth() {
+        let key = build_recording_object_key(None, None, "abc123");
         assert_eq!(key, "abc123/audio.ogg");
+    }
+
+    #[test]
+    fn test_build_key_without_prefix_with_auth() {
+        let key = build_recording_object_key(None, Some("tenant1"), "abc123");
+        assert_eq!(key, "tenant1/abc123/audio.ogg");
     }
 
     #[test]
     fn test_build_key_with_trailing_slash() {
         let prefix = "recordings/".to_string();
-        let key = build_recording_object_key(Some(&prefix), "abc123");
+        let key = build_recording_object_key(Some(&prefix), None, "abc123");
         assert_eq!(key, "recordings/abc123/audio.ogg");
+    }
+
+    #[test]
+    fn test_build_key_with_trailing_slash_and_auth() {
+        let prefix = "recordings/".to_string();
+        let key = build_recording_object_key(Some(&prefix), Some("client1"), "abc123");
+        assert_eq!(key, "recordings/client1/abc123/audio.ogg");
     }
 
     #[test]

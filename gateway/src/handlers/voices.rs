@@ -946,13 +946,12 @@ async fn clone_voice_elevenlabs(
         });
     }
 
-    let el_response: ElevenLabsVoiceCreateResponse = response.json().await.map_err(|e| {
-        VoiceCloneError {
+    let el_response: ElevenLabsVoiceCreateResponse =
+        response.json().await.map_err(|e| VoiceCloneError {
             code: "PARSE_ERROR".to_string(),
             message: format!("Failed to parse ElevenLabs response: {}", e),
             details: None,
-        }
-    })?;
+        })?;
 
     Ok(VoiceCloneResponse {
         voice_id: el_response.voice_id,
@@ -1092,11 +1091,14 @@ async fn clone_voice_hume(
         details: None,
     })?;
 
-    let generation = tts_response.generations.first().ok_or_else(|| VoiceCloneError {
-        code: "NO_GENERATION".to_string(),
-        message: "Hume TTS did not return a generation".to_string(),
-        details: None,
-    })?;
+    let generation = tts_response
+        .generations
+        .first()
+        .ok_or_else(|| VoiceCloneError {
+            code: "NO_GENERATION".to_string(),
+            message: "Hume TTS did not return a generation".to_string(),
+            details: None,
+        })?;
 
     // Step 2: Save the voice using the generation_id
     let save_request = serde_json::json!({
@@ -1176,7 +1178,8 @@ async fn clone_voice_lmnt(
     if request.audio_samples.is_empty() {
         return Err(VoiceCloneError {
             code: "MISSING_AUDIO".to_string(),
-            message: "LMNT voice cloning requires at least one audio sample (5+ seconds)".to_string(),
+            message: "LMNT voice cloning requires at least one audio sample (5+ seconds)"
+                .to_string(),
             details: Some(serde_json::json!({
                 "hint": "Provide 5+ seconds of clear audio for best results",
                 "max_files": 20,
@@ -1270,13 +1273,12 @@ async fn clone_voice_lmnt(
         });
     }
 
-    let lmnt_response: LmntVoiceCreateResponse = response.json().await.map_err(|e| {
-        VoiceCloneError {
+    let lmnt_response: LmntVoiceCreateResponse =
+        response.json().await.map_err(|e| VoiceCloneError {
             code: "PARSE_ERROR".to_string(),
             message: format!("Failed to parse LMNT response: {}", e),
             details: None,
-        }
-    })?;
+        })?;
 
     // LMNT voice states: "ready" or "training"
     let status_str = if lmnt_response.state == "ready" {
@@ -1541,7 +1543,9 @@ mod tests {
         assert_eq!(detect_audio_format(mp3_id3), ("audio/mpeg", "mp3"));
 
         // MP3 sync word (needs at least 12 bytes)
-        let mp3_sync = &[0xFF, 0xFB, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mp3_sync = &[
+            0xFF, 0xFB, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
         assert_eq!(detect_audio_format(mp3_sync), ("audio/mpeg", "mp3"));
     }
 
@@ -1572,7 +1576,10 @@ mod tests {
     #[test]
     fn test_detect_audio_format_short_data() {
         let short = b"short";
-        assert_eq!(detect_audio_format(short), ("application/octet-stream", "bin"));
+        assert_eq!(
+            detect_audio_format(short),
+            ("application/octet-stream", "bin")
+        );
     }
 
     #[test]

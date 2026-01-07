@@ -113,7 +113,11 @@ impl HumeEmotionMapper {
         let truncated = &description[..MAX_DESCRIPTION_LENGTH];
         if let Some(pos) = truncated.rfind(|c| c == ',' || c == ' ') {
             // Trim both whitespace and trailing commas
-            description[..pos].trim().trim_end_matches(',').trim().to_string()
+            description[..pos]
+                .trim()
+                .trim_end_matches(',')
+                .trim()
+                .to_string()
         } else {
             truncated.trim().to_string()
         }
@@ -304,7 +308,11 @@ mod tests {
         // Neutral should produce empty or no description
         assert!(
             mapped.description.is_none()
-                || mapped.description.as_ref().map(|s| s.is_empty()).unwrap_or(true)
+                || mapped
+                    .description
+                    .as_ref()
+                    .map(|s| s.is_empty())
+                    .unwrap_or(true)
         );
     }
 
@@ -340,15 +348,17 @@ mod tests {
         ];
 
         for style in styles {
-            let config = EmotionConfig::new()
-                .emotion(Emotion::Happy)
-                .style(style);
+            let config = EmotionConfig::new().emotion(Emotion::Happy).style(style);
 
             let mapped = mapper.map_emotion(&config);
 
             if style != DeliveryStyle::Normal {
                 let desc = mapped.description.unwrap();
-                assert!(!desc.is_empty(), "Style {:?} should produce description", style);
+                assert!(
+                    !desc.is_empty(),
+                    "Style {:?} should produce description",
+                    style
+                );
             }
         }
     }
@@ -368,9 +378,9 @@ mod tests {
     #[test]
     fn test_hume_mapper_long_context_ignored() {
         let mapper = HumeEmotionMapper::new();
-        let config = EmotionConfig::new()
-            .emotion(Emotion::Happy)
-            .context("this is a very long context that should be ignored because it exceeds the limit");
+        let config = EmotionConfig::new().emotion(Emotion::Happy).context(
+            "this is a very long context that should be ignored because it exceeds the limit",
+        );
 
         let mapped = mapper.map_emotion(&config);
         let desc = mapped.description.unwrap();

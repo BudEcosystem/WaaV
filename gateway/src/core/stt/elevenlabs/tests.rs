@@ -708,7 +708,7 @@ mod websocket_handler_tests {
 
     #[tokio::test]
     async fn test_handle_session_started() {
-        let (result_tx, _result_rx) = mpsc::unbounded_channel::<STTResult>();
+        let (result_tx, _result_rx) = mpsc::channel::<STTResult>(256);
         let mut session_id: Option<String> = None;
 
         let json = r#"{"message_type": "session_started", "session_id": "test-session-123"}"#;
@@ -722,7 +722,7 @@ mod websocket_handler_tests {
 
     #[tokio::test]
     async fn test_handle_partial_transcript() {
-        let (result_tx, mut result_rx) = mpsc::unbounded_channel::<STTResult>();
+        let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
         let mut session_id: Option<String> = None;
 
         let json = r#"{"message_type": "partial_transcript", "text": "hello world"}"#;
@@ -744,7 +744,7 @@ mod websocket_handler_tests {
 
     #[tokio::test]
     async fn test_handle_committed_transcript() {
-        let (result_tx, mut result_rx) = mpsc::unbounded_channel::<STTResult>();
+        let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
         let mut session_id: Option<String> = None;
 
         let json = r#"{"message_type": "committed_transcript", "text": "hello world final"}"#;
@@ -767,7 +767,7 @@ mod websocket_handler_tests {
 
     #[tokio::test]
     async fn test_handle_auth_error() {
-        let (result_tx, _result_rx) = mpsc::unbounded_channel::<STTResult>();
+        let (result_tx, _result_rx) = mpsc::channel::<STTResult>(256);
         let mut session_id: Option<String> = None;
 
         let json = r#"{"message_type": "auth_error", "error": "Invalid API key"}"#;
@@ -786,7 +786,7 @@ mod websocket_handler_tests {
 
     #[tokio::test]
     async fn test_handle_quota_exceeded() {
-        let (result_tx, _result_rx) = mpsc::unbounded_channel::<STTResult>();
+        let (result_tx, _result_rx) = mpsc::channel::<STTResult>(256);
         let mut session_id: Option<String> = None;
 
         let json = r#"{"message_type": "quota_exceeded_error", "error": "Rate limit exceeded"}"#;
@@ -805,7 +805,7 @@ mod websocket_handler_tests {
 
     #[tokio::test]
     async fn test_handle_empty_partial() {
-        let (result_tx, mut result_rx) = mpsc::unbounded_channel::<STTResult>();
+        let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
         let mut session_id: Option<String> = None;
 
         let json = r#"{"message_type": "partial_transcript", "text": ""}"#;
@@ -822,7 +822,7 @@ mod websocket_handler_tests {
 
     #[tokio::test]
     async fn test_handle_committed_with_timestamps() {
-        let (result_tx, mut result_rx) = mpsc::unbounded_channel::<STTResult>();
+        let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
         let mut session_id: Option<String> = None;
 
         let json = r#"{
@@ -853,7 +853,7 @@ mod websocket_handler_tests {
 
     #[tokio::test]
     async fn test_handle_committed_with_timestamps_no_logprob() {
-        let (result_tx, mut result_rx) = mpsc::unbounded_channel::<STTResult>();
+        let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
         let mut session_id: Option<String> = None;
 
         let json = r#"{
@@ -882,7 +882,7 @@ mod websocket_handler_tests {
 
     #[tokio::test]
     async fn test_handle_generic_error() {
-        let (result_tx, _result_rx) = mpsc::unbounded_channel::<STTResult>();
+        let (result_tx, _result_rx) = mpsc::channel::<STTResult>(256);
         let mut session_id: Option<String> = None;
 
         let json = r#"{"message_type": "error", "error": "Generic error message"}"#;
@@ -901,7 +901,7 @@ mod websocket_handler_tests {
 
     #[tokio::test]
     async fn test_handle_unknown_message_type() {
-        let (result_tx, mut result_rx) = mpsc::unbounded_channel::<STTResult>();
+        let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
         let mut session_id: Option<String> = None;
 
         let json = r#"{"message_type": "some_future_type", "data": "something"}"#;
@@ -917,7 +917,7 @@ mod websocket_handler_tests {
 
     #[tokio::test]
     async fn test_handle_close_message() {
-        let (result_tx, _result_rx) = mpsc::unbounded_channel::<STTResult>();
+        let (result_tx, _result_rx) = mpsc::channel::<STTResult>(256);
         let mut session_id: Option<String> = None;
 
         let message = Message::Close(None);
@@ -929,7 +929,7 @@ mod websocket_handler_tests {
 
     #[tokio::test]
     async fn test_handle_ping_message() {
-        let (result_tx, _result_rx) = mpsc::unbounded_channel::<STTResult>();
+        let (result_tx, _result_rx) = mpsc::channel::<STTResult>(256);
         let mut session_id: Option<String> = None;
 
         let message = Message::Ping(vec![1, 2, 3].into());
@@ -941,7 +941,7 @@ mod websocket_handler_tests {
 
     #[tokio::test]
     async fn test_handle_pong_message() {
-        let (result_tx, _result_rx) = mpsc::unbounded_channel::<STTResult>();
+        let (result_tx, _result_rx) = mpsc::channel::<STTResult>(256);
         let mut session_id: Option<String> = None;
 
         let message = Message::Pong(vec![1, 2, 3].into());
@@ -953,7 +953,7 @@ mod websocket_handler_tests {
 
     #[tokio::test]
     async fn test_handle_binary_message() {
-        let (result_tx, _result_rx) = mpsc::unbounded_channel::<STTResult>();
+        let (result_tx, _result_rx) = mpsc::channel::<STTResult>(256);
         let mut session_id: Option<String> = None;
 
         let message = Message::Binary(vec![1, 2, 3].into());

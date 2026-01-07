@@ -628,6 +628,7 @@ impl Default for IbmWatsonTTSConfig {
                 request_timeout: Some(60),
                 pronunciations: Vec::new(),
                 request_pool_size: Some(4),
+                emotion_config: None,
             },
             region: IbmRegion::default(),
             instance_id: String::new(),

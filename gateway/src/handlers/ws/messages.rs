@@ -19,6 +19,14 @@ pub const MAX_MESSAGE_CONTENT_SIZE: usize = 50 * 1024;
 /// Phone numbers should never exceed this
 pub const MAX_SIP_TRANSFER_TO_SIZE: usize = 256;
 
+/// Maximum allowed size for stream_id field (256 bytes)
+/// UUID format is 36 chars, allow extra buffer for custom IDs
+pub const MAX_STREAM_ID_SIZE: usize = 256;
+
+/// Maximum allowed size for auth token (4 KB)
+/// JWTs and API keys should not exceed this
+pub const MAX_AUTH_TOKEN_SIZE: usize = 4 * 1024;
+
 use super::config::{
     LiveKitWebSocketConfig, STTWebSocketConfig, TTSWebSocketConfig, default_allow_interruption,
     default_audio_enabled,
@@ -47,6 +55,11 @@ pub enum IncomingMessage {
             skip_serializing_if = "Option::is_none"
         )]
         audio: Option<bool>,
+        /// DEPRECATED: Use `audio: false` instead. This field is for backward compatibility.
+        /// When `audio_disabled: true` is sent, it's equivalent to `audio: false`.
+        /// If both fields are present, `audio` takes precedence.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        audio_disabled: Option<bool>,
         /// STT configuration (required only when audio=true)
         #[serde(skip_serializing_if = "Option::is_none")]
         stt_config: Option<STTWebSocketConfig>,
@@ -103,6 +116,32 @@ pub enum IncomingMessage {
         /// Validation is performed by the handler, not during deserialization.
         #[cfg_attr(feature = "openapi", schema(example = "+1234567890"))]
         transfer_to: String,
+    },
+    /// Browser-friendly authentication message.
+    ///
+    /// This message type allows browser clients to authenticate after the WebSocket
+    /// connection is established, since browsers cannot set custom headers during
+    /// the WebSocket handshake. This must be the first message sent when using
+    /// first-message authentication.
+    ///
+    /// # Authentication Flow
+    /// 1. Client connects to `/ws` without Authorization header or query token
+    /// 2. Server accepts connection with pending auth state
+    /// 3. Client sends `{"type": "auth", "token": "<bearer_token>"}` as first message
+    /// 4. Server validates token and either:
+    ///    - Sends `{"type": "authenticated"}` on success
+    ///    - Closes connection with 4001 code on failure
+    ///
+    /// # Example
+    /// ```json
+    /// {"type": "auth", "token": "sk_test_my_api_key"}
+    /// ```
+    #[serde(rename = "auth")]
+    Auth {
+        /// Bearer token for authentication.
+        /// This should be the same token format as used in the Authorization header.
+        #[cfg_attr(feature = "openapi", schema(example = "sk_test_my_api_key_123456"))]
+        token: String,
     },
 }
 
@@ -210,6 +249,23 @@ pub enum OutgoingMessage {
         /// Error message describing why the transfer failed
         message: String,
     },
+    /// Authentication success response
+    ///
+    /// Sent after successful first-message authentication to confirm
+    /// the client is now authenticated and can proceed with other commands.
+    #[serde(rename = "authenticated")]
+    Authenticated {
+        /// The authenticated identity (API key ID or user ID from JWT)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    /// Authentication required notification
+    ///
+    /// Sent immediately after connection when authentication is required
+    /// but no token was provided via header or query parameter.
+    /// Client must send an `auth` message before any other commands.
+    #[serde(rename = "auth_required")]
+    AuthRequired,
 }
 
 /// Message routing for optimized throughput
@@ -229,6 +285,10 @@ pub enum MessageValidationError {
     MessageContentTooLarge { size: usize, max: usize },
     /// SIP transfer_to field exceeds maximum allowed size
     SipTransferToTooLarge { size: usize, max: usize },
+    /// Stream ID exceeds maximum allowed size
+    StreamIdTooLarge { size: usize, max: usize },
+    /// Auth token exceeds maximum allowed size
+    AuthTokenTooLarge { size: usize, max: usize },
 }
 
 impl std::fmt::Display for MessageValidationError {
@@ -252,6 +312,20 @@ impl std::fmt::Display for MessageValidationError {
                 write!(
                     f,
                     "SIP transfer_to too large: {} bytes (max: {} bytes)",
+                    size, max
+                )
+            }
+            Self::StreamIdTooLarge { size, max } => {
+                write!(
+                    f,
+                    "Stream ID too large: {} bytes (max: {} bytes)",
+                    size, max
+                )
+            }
+            Self::AuthTokenTooLarge { size, max } => {
+                write!(
+                    f,
+                    "Auth token too large: {} bytes (max: {} bytes)",
                     size, max
                 )
             }
@@ -301,8 +375,29 @@ impl IncomingMessage {
                     });
                 }
             }
-            // Config and Clear don't have user-provided text content that needs size limits
-            IncomingMessage::Config { .. } | IncomingMessage::Clear => {}
+            IncomingMessage::Config { stream_id, .. } => {
+                // Validate stream_id if provided
+                if let Some(id) = stream_id {
+                    let size = id.len();
+                    if size > MAX_STREAM_ID_SIZE {
+                        return Err(MessageValidationError::StreamIdTooLarge {
+                            size,
+                            max: MAX_STREAM_ID_SIZE,
+                        });
+                    }
+                }
+            }
+            IncomingMessage::Auth { token } => {
+                // Validate auth token length
+                let size = token.len();
+                if size > MAX_AUTH_TOKEN_SIZE {
+                    return Err(MessageValidationError::AuthTokenTooLarge {
+                        size,
+                        max: MAX_AUTH_TOKEN_SIZE,
+                    });
+                }
+            }
+            IncomingMessage::Clear => {}
         }
         Ok(())
     }
@@ -575,6 +670,7 @@ mod tests {
         let msg = IncomingMessage::Config {
             stream_id: Some("test".to_string()),
             audio: Some(true),
+            audio_disabled: None,
             stt_config: None,
             tts_config: None,
             livekit: None,

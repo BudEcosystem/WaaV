@@ -159,9 +159,11 @@ impl OpenAISTT {
         config.validate().map_err(STTError::ConfigurationError)?;
 
         // Create HTTP client with sensible defaults
+        // 30s timeout balances long audio transcription with timely failure detection
         let http_client = Client::builder()
-            .timeout(Duration::from_secs(120)) // Whisper can take time for long audio
+            .timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(4) // Connection pooling
+            .pool_idle_timeout(Duration::from_secs(90)) // Close idle connections after 90s
             .build()
             .map_err(|e| {
                 STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))

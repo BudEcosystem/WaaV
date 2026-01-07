@@ -4,11 +4,13 @@ use std::path::PathBuf;
 #[cfg(feature = "openapi")]
 use std::fs;
 
+use tracing::info;
+
 use axum::{Router, middleware};
 use axum_server::tls_rustls::RustlsConfig;
 use clap::{Parser, Subcommand};
 use http::{
-    Method,
+    Method, HeaderName,
     header::{AUTHORIZATION, CONTENT_TYPE},
 };
 use tokio::net::TcpListener;
@@ -21,7 +23,10 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use anyhow::anyhow;
 
 use waav_gateway::{
-    ServerConfig, init, middleware::auth::auth_middleware, routes, state::AppState,
+    ServerConfig, init,
+    middleware::{auth_middleware, connection_limit_middleware},
+    routes,
+    state::AppState,
 };
 
 /// WaaV Gateway - Real-time voice processing server
@@ -136,18 +141,28 @@ async fn main() -> anyhow::Result<()> {
         auth_middleware,
     ));
 
-    // Create WebSocket routes with auth middleware for tenant isolation
-    // When auth is enabled: requires valid auth token
-    // When auth is disabled: inserts empty Auth context for room name handling
-    let ws_routes = routes::ws::create_ws_router().layer(middleware::from_fn_with_state(
-        app_state.clone(),
-        auth_middleware,
-    ));
+    // Create WebSocket routes with connection limit and auth middleware
+    // Layer order (outer to inner): connection_limit -> auth -> handler
+    // - connection_limit_middleware: Enforces max connections (global and per-IP)
+    // - auth_middleware: Validates auth token (when enabled) or sets empty context
+    let ws_routes = routes::ws::create_ws_router()
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            auth_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            connection_limit_middleware,
+        ));
 
     // Create Realtime WebSocket routes for audio-to-audio streaming (OpenAI Realtime API)
-    let realtime_routes = routes::realtime::create_realtime_router().layer(
-        middleware::from_fn_with_state(app_state.clone(), auth_middleware),
-    );
+    // Also uses connection limit middleware for capacity management
+    let realtime_routes = routes::realtime::create_realtime_router()
+        .layer(middleware::from_fn_with_state(app_state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            connection_limit_middleware,
+        ));
 
     // Create webhook routes (no auth - uses LiveKit signature verification)
     let webhook_routes = routes::webhooks::create_webhook_router();
@@ -184,7 +199,7 @@ async fn main() -> anyhow::Result<()> {
                     Method::DELETE,
                     Method::OPTIONS,
                 ])
-                .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+                .allow_headers([AUTHORIZATION, CONTENT_TYPE, HeaderName::from_static("x-provider-api-key")])
                 .allow_credentials(false)
         } else {
             // Parse comma-separated origins
@@ -201,12 +216,22 @@ async fn main() -> anyhow::Result<()> {
                     Method::DELETE,
                     Method::OPTIONS,
                 ])
-                .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+                .allow_headers([AUTHORIZATION, CONTENT_TYPE, HeaderName::from_static("x-provider-api-key")])
                 .allow_credentials(true)
         }
     } else {
-        // No CORS configured - use permissive defaults for development
-        CorsLayer::permissive()
+        // No CORS configured - strict same-origin only for production security
+        // Cross-origin requests will be blocked. To enable CORS, set CORS_ALLOWED_ORIGINS
+        // environment variable or configure security.cors_allowed_origins in YAML.
+        info!(
+            "CORS not configured, defaulting to same-origin only. \
+             Set CORS_ALLOWED_ORIGINS to enable cross-origin access."
+        );
+        CorsLayer::new()
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_headers([AUTHORIZATION, CONTENT_TYPE, HeaderName::from_static("x-provider-api-key")])
+            .allow_credentials(false)
+        // No allow_origin = same-origin only (browsers block cross-origin requests)
     };
 
     // Security headers

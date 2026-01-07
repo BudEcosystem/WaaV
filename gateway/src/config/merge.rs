@@ -184,17 +184,71 @@ pub fn merge_config(
     // Hume AI API key (TTS and EVI)
     let hume_api_key = get_optional!(
         "HUME_API_KEY",
-        yaml.providers
-            .as_ref()
-            .and_then(|p| p.hume_api_key.clone())
+        yaml.providers.as_ref().and_then(|p| p.hume_api_key.clone())
     );
 
     // LMNT API key (TTS and voice cloning)
     let lmnt_api_key = get_optional!(
         "LMNT_API_KEY",
+        yaml.providers.as_ref().and_then(|p| p.lmnt_api_key.clone())
+    );
+
+    // Groq API key (ultra-fast Whisper STT)
+    let groq_api_key = get_optional!(
+        "GROQ_API_KEY",
+        yaml.providers.as_ref().and_then(|p| p.groq_api_key.clone())
+    );
+
+    // Play.ht credentials (TTS with voice cloning)
+    let playht_api_key = get_optional!(
+        "PLAYHT_API_KEY",
         yaml.providers
             .as_ref()
-            .and_then(|p| p.lmnt_api_key.clone())
+            .and_then(|p| p.playht_api_key.clone())
+    );
+    let playht_user_id = get_optional!(
+        "PLAYHT_USER_ID",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.playht_user_id.clone())
+    );
+
+    // IBM Watson credentials (STT/TTS)
+    let ibm_watson_api_key = get_optional!(
+        "IBM_WATSON_API_KEY",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.ibm_watson_api_key.clone())
+    );
+    let ibm_watson_instance_id = get_optional!(
+        "IBM_WATSON_INSTANCE_ID",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.ibm_watson_instance_id.clone())
+    );
+    let ibm_watson_region = get_optional!(
+        "IBM_WATSON_REGION",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.ibm_watson_region.clone())
+    );
+
+    // AWS credentials (Transcribe/Polly)
+    let aws_access_key_id = get_optional!(
+        "AWS_ACCESS_KEY_ID",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.aws_access_key_id.clone())
+    );
+    let aws_secret_access_key = get_optional!(
+        "AWS_SECRET_ACCESS_KEY",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.aws_secret_access_key.clone())
+    );
+    let aws_region = get_optional!(
+        "AWS_REGION",
+        yaml.providers.as_ref().and_then(|p| p.aws_region.clone())
     );
 
     // Recording S3 configuration
@@ -392,6 +446,15 @@ pub fn merge_config(
         assemblyai_api_key,
         hume_api_key,
         lmnt_api_key,
+        groq_api_key,
+        playht_api_key,
+        playht_user_id,
+        ibm_watson_api_key,
+        ibm_watson_instance_id,
+        ibm_watson_region,
+        aws_access_key_id,
+        aws_secret_access_key,
+        aws_region,
         recording_s3_bucket,
         recording_s3_region,
         recording_s3_endpoint,
@@ -426,11 +489,13 @@ fn merge_sip_config(
     let env_allowed_addresses = env::var("SIP_ALLOWED_ADDRESSES").ok();
     let env_hooks_json = env::var("SIP_HOOKS_JSON").ok();
     let env_hook_secret = env::var("SIP_HOOK_SECRET").ok();
+    let env_naming_prefix = env::var("SIP_NAMING_PREFIX").ok();
 
     let has_env_sip = env_room_prefix.is_some()
         || env_allowed_addresses.is_some()
         || env_hooks_json.is_some()
-        || env_hook_secret.is_some();
+        || env_hook_secret.is_some()
+        || env_naming_prefix.is_some();
 
     // If no YAML and no ENV, return None
     if yaml_sip.is_none() && !has_env_sip {
@@ -486,11 +551,17 @@ fn merge_sip_config(
         .and_then(|s| s.hook_secret.clone())
         .or(env_hook_secret);
 
+    // Merge naming_prefix (YAML > ENV, defaults to "waav" in SipConfig::new)
+    let naming_prefix = yaml_sip
+        .and_then(|s| s.naming_prefix.clone())
+        .or(env_naming_prefix);
+
     Ok(Some(SipConfig::new(
         room_prefix,
         allowed_addresses,
         hooks,
         hook_secret,
+        naming_prefix,
     )))
 }
 
@@ -843,6 +914,7 @@ mod tests {
                     secret: None,
                 }],
                 hook_secret: Some("global-secret".to_string()),
+                naming_prefix: None,
             }),
             ..Default::default()
         };
@@ -856,6 +928,7 @@ mod tests {
         assert_eq!(sip.hooks.len(), 1);
         assert_eq!(sip.hooks[0].host, "example.com");
         assert_eq!(sip.hook_secret, Some("global-secret".to_string()));
+        assert_eq!(sip.naming_prefix, "waav"); // default
 
         cleanup_env_vars();
     }
@@ -871,6 +944,7 @@ mod tests {
                 allowed_addresses: vec!["192.168.1.0/24".to_string()],
                 hooks: vec![],
                 hook_secret: Some("yaml-secret".to_string()),
+                naming_prefix: None,
             }),
             ..Default::default()
         };
@@ -938,6 +1012,7 @@ mod tests {
                 allowed_addresses: vec![],
                 hooks: vec![],
                 hook_secret: None,
+                naming_prefix: None,
             }),
             ..Default::default()
         };
@@ -981,6 +1056,7 @@ mod tests {
                     },
                 ],
                 hook_secret: Some("global-secret".to_string()),
+                naming_prefix: Some("custom".to_string()), // test custom naming_prefix
             }),
             ..Default::default()
         };
@@ -992,6 +1068,7 @@ mod tests {
         assert_eq!(sip.hooks.len(), 2);
         assert_eq!(sip.hooks[0].secret, None); // will use global
         assert_eq!(sip.hooks[1].secret, Some("per-hook-override".to_string())); // overrides global
+        assert_eq!(sip.naming_prefix, "custom"); // custom naming prefix
 
         cleanup_env_vars();
     }

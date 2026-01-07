@@ -14,6 +14,9 @@ pub struct LiveKitManager {
     client: Arc<Mutex<Option<LiveKitClient>>>,
     connection_status: Arc<RwLock<ConnectionStatus>>,
     audio_sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    /// Audio receiver for forwarding audio data to subscribers
+    /// Must be kept alive to prevent channel send failures
+    audio_receiver: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
     participants: Arc<RwLock<Vec<ParticipantInfo>>>,
     room_info: Arc<RwLock<Option<RoomInfo>>>,
     // Use atomic bool for fast connection status checks
@@ -27,6 +30,7 @@ impl LiveKitManager {
             client: Arc::new(Mutex::new(None)),
             connection_status: Arc::new(RwLock::new(ConnectionStatus::Disconnected)),
             audio_sender: None,
+            audio_receiver: None,
             participants: Arc::new(RwLock::new(Vec::new())),
             room_info: Arc::new(RwLock::new(None)),
             is_connected_atomic: Arc::new(AtomicBool::new(false)),
@@ -44,8 +48,10 @@ impl LiveKitManager {
         let mut client = LiveKitClient::new(config);
 
         // Set up audio channel for forwarding audio data
-        let (audio_tx, _audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // Both sender and receiver must be kept alive to avoid channel send failures
+        let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         self.audio_sender = Some(audio_tx.clone());
+        self.audio_receiver = Some(audio_rx);
 
         // Set audio callback to forward audio data through the channel
         client.set_audio_callback(move |audio_data: Vec<u8>| {
@@ -139,6 +145,9 @@ impl LiveKitManager {
                     // Clear participants and room info
                     self.participants.write().await.clear();
                     *self.room_info.write().await = None;
+                    // Clean up audio channel
+                    self.audio_sender = None;
+                    self.audio_receiver = None;
                     Ok(())
                 }
                 Err(e) => {
@@ -148,6 +157,9 @@ impl LiveKitManager {
             }
         } else {
             warn!("No active LiveKit client to disconnect");
+            // Clean up audio channel even if no client
+            self.audio_sender = None;
+            self.audio_receiver = None;
             Ok(())
         }
     }

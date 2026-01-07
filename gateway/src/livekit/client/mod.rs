@@ -91,6 +91,7 @@ pub struct LiveKitClient {
     pub(crate) audio_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
     pub(crate) operation_queue: Option<OperationQueue>,
     pub(crate) operation_worker_handle: Option<tokio::task::JoinHandle<()>>,
+    pub(crate) event_handler_handle: Option<tokio::task::JoinHandle<()>>,
     pub(crate) stats: Arc<Mutex<QueueStats>>,
 }
 
@@ -153,6 +154,7 @@ impl LiveKitClient {
             audio_queue: Arc::new(Mutex::new(VecDeque::new())),
             operation_queue: None,
             operation_worker_handle: None,
+            event_handler_handle: None,
             stats: Arc::new(Mutex::new(QueueStats::default())),
         }
     }
@@ -198,8 +200,26 @@ impl LiveKitClient {
 
 impl Drop for LiveKitClient {
     fn drop(&mut self) {
-        if self.operation_worker_handle.is_some() {
-            warn!("LiveKitClient dropped without explicit disconnect call");
+        // Abort all active stream handles synchronously
+        if let Ok(mut streams) = self.active_streams.try_lock() {
+            for handle in streams.drain(..) {
+                handle.abort();
+            }
+        }
+
+        // Abort event handler task if running
+        if let Some(handle) = self.event_handler_handle.take() {
+            handle.abort();
+        }
+
+        // Abort operation worker task if running
+        if let Some(handle) = self.operation_worker_handle.take() {
+            handle.abort();
+        }
+
+        // Warn if client was connected but disconnect() wasn't called explicitly
+        if self.is_connected_atomic.load(std::sync::atomic::Ordering::Acquire) {
+            warn!("LiveKitClient dropped while still connected - call disconnect() explicitly for clean shutdown");
         }
     }
 }

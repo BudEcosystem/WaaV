@@ -272,8 +272,7 @@ mod tests {
     #[test]
     fn test_fallback_mapper_default_intensity_no_warning() {
         let mapper = FallbackEmotionMapper::new("test");
-        let config = EmotionConfig::new()
-            .intensity(EmotionIntensity::from_f32(0.6));
+        let config = EmotionConfig::new().intensity(EmotionIntensity::from_f32(0.6));
 
         let mapped = mapper.map_emotion(&config);
         // Default intensity shouldn't produce warning

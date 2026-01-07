@@ -21,8 +21,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::messages::{
-    AudioEncoding, HUME_EVI_DEFAULT_CHANNELS, HUME_EVI_DEFAULT_SAMPLE_RATE,
-    HUME_EVI_WEBSOCKET_URL,
+    AudioEncoding, HUME_EVI_DEFAULT_CHANNELS, HUME_EVI_DEFAULT_SAMPLE_RATE, HUME_EVI_WEBSOCKET_URL,
 };
 use crate::core::realtime::base::ReconnectionConfig;
 
@@ -285,10 +284,7 @@ impl HumeEVIConfig {
 
         // Add chat group ID for resuming
         if let Some(ref chat_group_id) = self.resumed_chat_group_id {
-            params.push(format!(
-                "resumed_chat_group_id={}",
-                encode(chat_group_id)
-            ));
+            params.push(format!("resumed_chat_group_id={}", encode(chat_group_id)));
         }
 
         // Add voice ID if present

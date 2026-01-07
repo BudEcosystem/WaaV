@@ -43,8 +43,8 @@
 //! }
 //! ```
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -54,9 +54,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use url::form_urlencoded;
 
-use super::config::{
-    IbmOutputFormat, IbmVoice, IbmWatsonTTSConfig, IBM_IAM_URL, MAX_TEXT_LENGTH,
-};
+use super::config::{IBM_IAM_URL, IbmOutputFormat, IbmVoice, IbmWatsonTTSConfig, MAX_TEXT_LENGTH};
 use crate::core::stt::ibm_watson::IbmRegion;
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
@@ -305,9 +303,9 @@ impl IbmWatsonTTS {
     async fn synthesize(&self, text: &str) -> TTSResult<Bytes> {
         let client = {
             let client_guard = self.client.read().await;
-            client_guard.clone().ok_or_else(|| {
-                TTSError::ProviderNotReady("HTTP client not initialized".into())
-            })?
+            client_guard
+                .clone()
+                .ok_or_else(|| TTSError::ProviderNotReady("HTTP client not initialized".into()))?
         };
 
         // Validate text length (IBM Watson counts bytes, not characters)
@@ -316,8 +314,7 @@ impl IbmWatsonTTS {
         if text_bytes > MAX_TEXT_LENGTH {
             return Err(TTSError::InvalidConfiguration(format!(
                 "Text size {} bytes exceeds maximum {} bytes (5KB)",
-                text_bytes,
-                MAX_TEXT_LENGTH
+                text_bytes, MAX_TEXT_LENGTH
             )));
         }
 
@@ -374,10 +371,7 @@ impl IbmWatsonTTS {
 
             // Classify error for proper handling
             let error = match status.as_u16() {
-                400 => TTSError::InvalidConfiguration(format!(
-                    "Bad request: {}",
-                    body
-                )),
+                400 => TTSError::InvalidConfiguration(format!("Bad request: {}", body)),
                 401 => {
                     // Clear cached token so next request will refresh
                     // Note: This is handled by caller through token refresh
@@ -402,10 +396,7 @@ impl IbmWatsonTTS {
                     "Server error ({}) - may be transient, retry recommended: {}",
                     status, body
                 )),
-                _ => TTSError::ProviderError(format!(
-                    "TTS API error ({}): {}",
-                    status, body
-                )),
+                _ => TTSError::ProviderError(format!("TTS API error ({}): {}", status, body)),
             };
 
             return Err(error);
@@ -493,9 +484,9 @@ impl IbmWatsonTTS {
             IbmOutputFormat::L16 | IbmOutputFormat::Mulaw | IbmOutputFormat::Alaw => {
                 // Raw audio: chunk into ~10ms segments for streaming
                 let bytes_per_sample = match self.config.output_format {
-                    IbmOutputFormat::L16 => 2,       // 16-bit
-                    IbmOutputFormat::Mulaw => 1,     // 8-bit
-                    IbmOutputFormat::Alaw => 1,      // 8-bit
+                    IbmOutputFormat::L16 => 2,   // 16-bit
+                    IbmOutputFormat::Mulaw => 1, // 8-bit
+                    IbmOutputFormat::Alaw => 1,  // 8-bit
                     _ => 2,
                 };
                 let samples_per_chunk = sample_rate / 100; // 10ms worth
@@ -509,9 +500,8 @@ impl IbmWatsonTTS {
                     let chunk = audio_vec[offset..end].to_vec();
                     let chunk_len = chunk.len();
 
-                    let duration_ms = Some(
-                        ((chunk_len / bytes_per_sample as usize) as u32 * 1000) / sample_rate,
-                    );
+                    let duration_ms =
+                        Some(((chunk_len / bytes_per_sample as usize) as u32 * 1000) / sample_rate);
 
                     let audio_data = AudioData {
                         data: chunk,
@@ -606,9 +596,8 @@ impl BaseTTS for IbmWatsonTTS {
             .connect_timeout(Duration::from_secs(
                 self.config.base.connection_timeout.unwrap_or(30),
             ))
-            .pool_max_idle_per_host(
-                self.config.base.request_pool_size.unwrap_or(4),
-            )
+            .pool_max_idle_per_host(self.config.base.request_pool_size.unwrap_or(4))
+            .pool_idle_timeout(Duration::from_secs(90)) // Close idle connections after 90s
             .build()
             .map_err(|e| {
                 TTSError::ConnectionFailed(format!("Failed to create HTTP client: {}", e))
@@ -881,7 +870,7 @@ mod tests {
 
         // Note: JSON escapes quotes, so we check for escaped versions
         assert!(body.contains("<speak"));
-        assert!(body.contains("xmlns="));  // SSML namespace
+        assert!(body.contains("xmlns=")); // SSML namespace
         assert!(body.contains("<prosody"));
         assert!(body.contains(r#"rate=\"+50%\""#));
         assert!(body.contains(r#"pitch=\"-25%\""#));

@@ -58,17 +58,31 @@ pub struct RecordingConfig {
     /// AWS S3 secret key
     pub secret_key: String,
     /// S3 path prefix for recordings.
-    /// Combined with stream_id to construct full path: `{prefix}/{stream_id}/audio.ogg`
+    /// Combined with auth_id and stream_id to construct full path:
+    /// - With auth_id: `{prefix}/{auth_id}/{stream_id}/audio.ogg`
+    /// - Without auth_id: `{prefix}/{stream_id}/audio.ogg`
     pub prefix: String,
 }
 
-// Build the full recording file path from prefix and stream_id.
-fn build_recording_filepath(prefix: &str, stream_id: &str) -> String {
-    if prefix.is_empty() {
-        format!("{stream_id}/audio.ogg")
-    } else {
-        let prefix = prefix.trim_end_matches('/');
-        format!("{prefix}/{stream_id}/audio.ogg")
+/// Build the full recording file path from prefix, optional auth_id, and stream_id.
+///
+/// Path format:
+/// - With auth_id: `{prefix}/{auth_id}/{stream_id}/audio.ogg` (tenant-scoped)
+/// - Without auth_id: `{prefix}/{stream_id}/audio.ogg` (legacy format)
+///
+/// The auth_id prefix ensures recording isolation between tenants.
+fn build_recording_filepath(prefix: &str, auth_id: Option<&str>, stream_id: &str) -> String {
+    let prefix = prefix.trim_end_matches('/');
+
+    match (prefix.is_empty(), auth_id) {
+        // No prefix, no auth_id: stream_id/audio.ogg
+        (true, None) => format!("{stream_id}/audio.ogg"),
+        // No prefix, with auth_id: auth_id/stream_id/audio.ogg
+        (true, Some(auth)) => format!("{auth}/{stream_id}/audio.ogg"),
+        // With prefix, no auth_id: prefix/stream_id/audio.ogg
+        (false, None) => format!("{prefix}/{stream_id}/audio.ogg"),
+        // With prefix, with auth_id: prefix/auth_id/stream_id/audio.ogg
+        (false, Some(auth)) => format!("{prefix}/{auth}/{stream_id}/audio.ogg"),
     }
 }
 
@@ -371,6 +385,7 @@ impl LiveKitRoomHandler {
     ///
     /// # Arguments
     /// * `room_name` - Name of the LiveKit room to record
+    /// * `auth_id` - Optional tenant/client ID for scoping recordings
     /// * `stream_id` - Unique identifier for the recording stream
     ///
     /// # Returns
@@ -378,12 +393,14 @@ impl LiveKitRoomHandler {
     ///
     /// # Path Construction
     ///
-    /// The recording path is constructed as: `{prefix}/{stream_id}/audio.ogg`
+    /// The recording path is constructed based on auth_id presence:
+    /// - With auth_id: `{prefix}/{auth_id}/{stream_id}/audio.ogg` (tenant-scoped)
+    /// - Without auth_id: `{prefix}/{stream_id}/audio.ogg` (legacy)
     ///
     /// Examples:
-    /// - Prefix: `recordings/prod`, Stream ID: `abc-123` -> `recordings/prod/abc-123/audio.ogg`
-    /// - Prefix: `""` (empty), Stream ID: `abc-123` -> `abc-123/audio.ogg`
-    /// - Prefix: `data/` (trailing slash), Stream ID: `xyz` -> `data/xyz/audio.ogg`
+    /// - Prefix: `recordings`, Auth: `project1`, Stream: `abc` -> `recordings/project1/abc/audio.ogg`
+    /// - Prefix: `recordings`, Auth: None, Stream: `abc` -> `recordings/abc/audio.ogg`
+    /// - Prefix: `""`, Auth: `client1`, Stream: `xyz` -> `client1/xyz/audio.ogg`
     ///
     /// # Example
     /// ```rust,no_run
@@ -405,9 +422,11 @@ impl LiveKitRoomHandler {
     ///     }),
     /// )?;
     ///
+    /// // With auth_id for tenant isolation
     /// let egress_id = handler
     ///     .setup_room_recording(
     ///         "my-room",
+    ///         Some("project1"),
     ///         "550e8400-e29b-41d4-a716-446655440000",
     ///     )
     ///     .await?;
@@ -417,6 +436,7 @@ impl LiveKitRoomHandler {
     pub async fn setup_room_recording(
         &self,
         room_name: &str,
+        auth_id: Option<&str>,
         stream_id: &str,
     ) -> Result<String, LiveKitError> {
         // Validate that recording configuration is present
@@ -435,8 +455,8 @@ impl LiveKitRoomHandler {
             ..Default::default()
         };
 
-        // Construct recording path: {prefix}/{stream_id}/audio.ogg
-        let filepath = build_recording_filepath(&config.prefix, stream_id);
+        // Construct recording path with optional auth_id for tenant isolation
+        let filepath = build_recording_filepath(&config.prefix, auth_id, stream_id);
 
         // Create encoded file output with S3 upload
         let file_output = proto::EncodedFileOutput {
@@ -858,35 +878,48 @@ mod tests {
     }
 
     #[test]
-    fn test_recording_path_construction_with_prefix() {
-        let filepath = build_recording_filepath("recordings/prod", "abc-123");
+    fn test_recording_path_construction_with_prefix_no_auth() {
+        let filepath = build_recording_filepath("recordings/prod", None, "abc-123");
         assert_eq!(filepath, "recordings/prod/abc-123/audio.ogg");
     }
 
     #[test]
-    fn test_recording_path_construction_empty_prefix() {
-        let filepath = build_recording_filepath("", "abc-123");
+    fn test_recording_path_construction_with_prefix_and_auth() {
+        let filepath = build_recording_filepath("recordings/prod", Some("project1"), "abc-123");
+        assert_eq!(filepath, "recordings/prod/project1/abc-123/audio.ogg");
+    }
+
+    #[test]
+    fn test_recording_path_construction_empty_prefix_no_auth() {
+        let filepath = build_recording_filepath("", None, "abc-123");
         assert_eq!(filepath, "abc-123/audio.ogg");
     }
 
     #[test]
+    fn test_recording_path_construction_empty_prefix_with_auth() {
+        let filepath = build_recording_filepath("", Some("tenant1"), "abc-123");
+        assert_eq!(filepath, "tenant1/abc-123/audio.ogg");
+    }
+
+    #[test]
     fn test_recording_path_construction_prefix_with_trailing_slash() {
-        let filepath = build_recording_filepath("recordings/prod/", "abc-123");
+        let filepath = build_recording_filepath("recordings/prod/", None, "abc-123");
         assert_eq!(filepath, "recordings/prod/abc-123/audio.ogg");
     }
 
     #[test]
     fn test_recording_path_construction_multiple_trailing_slashes() {
-        let filepath = build_recording_filepath("data///", "xyz");
+        let filepath = build_recording_filepath("data///", None, "xyz");
         assert_eq!(filepath, "data/xyz/audio.ogg");
     }
 
     #[test]
     fn test_recording_path_construction_uuid_stream_id() {
-        let filepath = build_recording_filepath("calls", "550e8400-e29b-41d4-a716-446655440000");
+        let filepath =
+            build_recording_filepath("calls", Some("client1"), "550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(
             filepath,
-            "calls/550e8400-e29b-41d4-a716-446655440000/audio.ogg"
+            "calls/client1/550e8400-e29b-41d4-a716-446655440000/audio.ogg"
         );
     }
 
@@ -901,7 +934,7 @@ mod tests {
         .unwrap();
 
         let result = handler
-            .setup_room_recording("test-room", "stream-123")
+            .setup_room_recording("test-room", None, "stream-123")
             .await;
         assert!(result.is_err());
         assert!(
@@ -936,7 +969,7 @@ mod tests {
         // This will fail at the API call stage, but that's expected since we don't have a real server
         // We're just validating that the configuration is accepted
         let result = handler
-            .setup_room_recording("test-room", "stream-123")
+            .setup_room_recording("test-room", Some("project1"), "stream-123")
             .await;
 
         // We expect an error because there's no real LiveKit server, but it shouldn't be a config error

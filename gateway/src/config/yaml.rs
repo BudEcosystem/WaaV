@@ -125,6 +125,24 @@ pub struct ProvidersYaml {
     pub hume_api_key: Option<String>,
     /// LMNT API key for ultra-low latency TTS and voice cloning
     pub lmnt_api_key: Option<String>,
+    /// Groq API key for ultra-fast Whisper STT
+    pub groq_api_key: Option<String>,
+    /// Play.ht API key for low-latency TTS with voice cloning
+    pub playht_api_key: Option<String>,
+    /// Play.ht user ID (required alongside playht_api_key)
+    pub playht_user_id: Option<String>,
+    /// IBM Watson API key for STT/TTS
+    pub ibm_watson_api_key: Option<String>,
+    /// IBM Watson service instance ID
+    pub ibm_watson_instance_id: Option<String>,
+    /// IBM Watson region (e.g., "us-south", "eu-gb")
+    pub ibm_watson_region: Option<String>,
+    /// AWS access key ID (for Transcribe/Polly)
+    pub aws_access_key_id: Option<String>,
+    /// AWS secret access key (for Transcribe/Polly)
+    pub aws_secret_access_key: Option<String>,
+    /// AWS region (e.g., "us-east-1", "eu-west-1")
+    pub aws_region: Option<String>,
 }
 
 /// Recording S3 configuration from YAML
@@ -179,6 +197,8 @@ pub struct SipYaml {
     #[serde(default)]
     pub hooks: Vec<SipHookYaml>,
     pub hook_secret: Option<String>,
+    /// Prefix for SIP trunk and dispatch naming (defaults to "waav")
+    pub naming_prefix: Option<String>,
 }
 
 /// SIP webhook hook configuration from YAML

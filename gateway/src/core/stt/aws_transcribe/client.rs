@@ -61,6 +61,7 @@ use aws_sdk_transcribestreaming::types::{
 };
 use aws_smithy_types::Blob;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
+use tokio::time::timeout;
 
 use super::config::{
     AwsRegion, AwsTranscribeSTTConfig, DEFAULT_CHUNK_DURATION_MS, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE,
@@ -89,6 +90,10 @@ type AsyncErrorCallback = Box<
         + Send
         + Sync,
 >;
+
+/// Per-message idle timeout for transcript stream reception.
+/// Resets after each successful message. Catches stuck/dead connections.
+const STREAM_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // =============================================================================
 // Connection State
@@ -148,10 +153,10 @@ pub struct AwsTranscribeSTT {
     shutdown_tx: Option<oneshot::Sender<()>>,
 
     /// Result channel sender for internal forwarding.
-    result_tx: Option<mpsc::UnboundedSender<STTResult>>,
+    result_tx: Option<mpsc::Sender<STTResult>>,
 
     /// Error channel sender for internal forwarding.
-    error_tx: Option<mpsc::UnboundedSender<STTError>>,
+    error_tx: Option<mpsc::Sender<STTError>>,
 
     /// Connection task handle.
     connection_handle: Option<tokio::task::JoinHandle<()>>,
@@ -268,8 +273,9 @@ impl AwsTranscribeSTT {
         // Create channels for communication
         let (audio_tx, mut audio_rx) = mpsc::channel::<Bytes>(AUDIO_CHANNEL_BUFFER_SIZE);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-        let (result_tx, mut result_rx) = mpsc::unbounded_channel::<STTResult>();
-        let (error_tx, mut error_rx) = mpsc::unbounded_channel::<STTError>();
+        // Bounded channels for backpressure - 256 should handle bursts while preventing memory exhaustion
+        let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
+        let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
         let (connected_tx, connected_rx) = oneshot::channel::<Result<(), STTError>>();
 
         // Store channels
@@ -401,11 +407,11 @@ impl AwsTranscribeSTT {
                     is_connected.store(true, Ordering::Release);
                     let _ = connected_tx.send(Ok(()));
 
-                    // Process the transcript result stream
+                    // Process the transcript result stream with idle timeout
                     let mut result_stream = output.transcript_result_stream;
                     loop {
-                        match result_stream.recv().await {
-                            Ok(Some(event)) => {
+                        match timeout(STREAM_MESSAGE_TIMEOUT, result_stream.recv()).await {
+                            Ok(Ok(Some(event))) => {
                                 match event {
                                     TranscriptResultStream::TranscriptEvent(transcript_event) => {
                                         if let Some(transcript) = transcript_event.transcript {
@@ -446,7 +452,7 @@ impl AwsTranscribeSTT {
                                                         confidence,
                                                     );
 
-                                                    if result_tx.send(stt_result).is_err() {
+                                                    if result_tx.try_send(stt_result).is_err() {
                                                         warn!(
                                                             "Failed to send STT result - channel closed"
                                                         );
@@ -460,17 +466,26 @@ impl AwsTranscribeSTT {
                                     }
                                 }
                             }
-                            Ok(None) => {
+                            Ok(Ok(None)) => {
                                 info!("Transcribe stream ended");
                                 break;
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 let stt_error = STTError::ProviderError(format!(
                                     "Amazon Transcribe stream error: {}",
                                     e
                                 ));
                                 error!("{}", stt_error);
-                                let _ = error_tx.send(stt_error);
+                                let _ = error_tx.try_send(stt_error);
+                                break;
+                            }
+                            Err(_elapsed) => {
+                                // Idle timeout - no message received for 60s
+                                let stt_error = STTError::NetworkError(
+                                    "Transcribe stream idle timeout - no message for 60 seconds".into()
+                                );
+                                error!("AWS Transcribe idle timeout: {}", stt_error);
+                                let _ = error_tx.try_send(stt_error);
                                 break;
                             }
                         }
@@ -483,7 +498,7 @@ impl AwsTranscribeSTT {
                     ));
                     error!("{}", stt_error);
                     let _ = connected_tx.send(Err(stt_error.clone()));
-                    let _ = error_tx.send(stt_error);
+                    let _ = error_tx.try_send(stt_error);
                 }
             }
 

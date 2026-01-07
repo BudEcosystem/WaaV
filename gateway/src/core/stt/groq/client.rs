@@ -74,8 +74,7 @@ const USER_AGENT: &str = concat!("WaaV-Gateway/", env!("CARGO_PKG_VERSION"));
 /// Default confidence value when actual confidence is unavailable (f32 version).
 /// This is derived from the canonical f64 constant in messages.rs.
 /// Using 0.5 (neutral) instead of 0.9 to avoid overconfidence.
-pub const DEFAULT_UNKNOWN_CONFIDENCE: f32 =
-    super::messages::DEFAULT_UNKNOWN_CONFIDENCE as f32;
+pub const DEFAULT_UNKNOWN_CONFIDENCE: f32 = super::messages::DEFAULT_UNKNOWN_CONFIDENCE as f32;
 
 // =============================================================================
 // Type Aliases
@@ -174,9 +173,15 @@ impl RateLimitInfo {
         if s.ends_with("ms") {
             s.trim_end_matches("ms").parse().ok()
         } else if s.ends_with('s') {
-            s.trim_end_matches('s').parse::<u64>().ok().map(|v| v * 1000)
+            s.trim_end_matches('s')
+                .parse::<u64>()
+                .ok()
+                .map(|v| v * 1000)
         } else if s.ends_with('m') {
-            s.trim_end_matches('m').parse::<u64>().ok().map(|v| v * 60 * 1000)
+            s.trim_end_matches('m')
+                .parse::<u64>()
+                .ok()
+                .map(|v| v * 60 * 1000)
         } else {
             None
         }
@@ -286,6 +291,7 @@ impl GroqSTT {
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
             .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
             .pool_max_idle_per_host(4) // Connection pooling
+            .pool_idle_timeout(Duration::from_secs(90)) // Close idle connections after 90s
             .user_agent(USER_AGENT)
             .build()
             .map_err(|e| {
@@ -451,8 +457,7 @@ impl GroqSTT {
         let buffer_size = self.audio_buffer.len();
         info!(
             "Sending {} bytes of audio to Groq Whisper API (model: {})",
-            buffer_size,
-            config.model
+            buffer_size, config.model
         );
 
         // Check file size limit
@@ -467,7 +472,8 @@ impl GroqSTT {
         // Clone config values we need since we can't borrow config across await
         let sample_rate = config.base.sample_rate;
         let channels = config.base.channels;
-        let wav_data = wav::create_wav(&self.audio_buffer, sample_rate, channels);
+        let wav_data = wav::try_create_wav(&self.audio_buffer, sample_rate, channels)
+            .map_err(|e| STTError::AudioProcessingError(format!("Failed to create WAV: {e}")))?;
 
         // Clone config for use in retry loop (needed because send_request takes &mut self)
         let config_clone = config.clone();
@@ -504,10 +510,17 @@ impl GroqSTT {
             let is_last_attempt = attempt == MAX_RETRIES - 1;
             let wav_data_for_request = if is_last_attempt {
                 // Final attempt: move ownership (no clone needed)
-                wav_data.take().expect("wav_data should be present")
+                wav_data.take().ok_or_else(|| {
+                    STTError::AudioProcessingError("WAV data unexpectedly empty on final retry".into())
+                })?
             } else {
                 // More attempts possible: clone (preserves original for retry)
-                wav_data.as_ref().expect("wav_data should be present").clone()
+                wav_data
+                    .as_ref()
+                    .ok_or_else(|| {
+                        STTError::AudioProcessingError("WAV data unexpectedly empty during retry".into())
+                    })?
+                    .clone()
             };
 
             match self.send_request(wav_data_for_request, &config_clone).await {
@@ -695,7 +708,9 @@ impl GroqSTT {
 
             let stt_error = match status.as_u16() {
                 400 => STTError::ConfigurationError(format!("{}{}", error_msg, request_id_suffix)),
-                401 => STTError::AuthenticationFailed(format!("{}{}", error_msg, request_id_suffix)),
+                401 => {
+                    STTError::AuthenticationFailed(format!("{}{}", error_msg, request_id_suffix))
+                }
                 413 => STTError::AudioProcessingError(format!(
                     "File too large: {}{}",
                     error_msg, request_id_suffix
@@ -716,9 +731,10 @@ impl GroqSTT {
                     "Flex tier capacity exceeded: {}{}",
                     error_msg, request_id_suffix
                 )),
-                500..=599 => {
-                    STTError::ProviderError(format!("Server error: {}{}", error_msg, request_id_suffix))
-                }
+                500..=599 => STTError::ProviderError(format!(
+                    "Server error: {}{}",
+                    error_msg, request_id_suffix
+                )),
                 _ => STTError::ProviderError(format!("{}{}", error_msg, request_id_suffix)),
             };
 
@@ -816,11 +832,12 @@ impl GroqSTT {
         let duration_hours = duration_seconds / 3600.0;
 
         // Apply minimum billing duration (10 seconds)
-        let billed_duration_hours = if duration_seconds < super::config::MIN_BILLED_DURATION_SECONDS as f64 {
-            super::config::MIN_BILLED_DURATION_SECONDS as f64 / 3600.0
-        } else {
-            duration_hours
-        };
+        let billed_duration_hours =
+            if duration_seconds < super::config::MIN_BILLED_DURATION_SECONDS as f64 {
+                super::config::MIN_BILLED_DURATION_SECONDS as f64 / 3600.0
+            } else {
+                duration_hours
+            };
 
         billed_duration_hours * config.model.cost_per_hour()
     }
@@ -915,6 +932,7 @@ impl Default for GroqSTT {
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
             .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
             .pool_max_idle_per_host(4)
+            .pool_idle_timeout(Duration::from_secs(90))
             .user_agent(USER_AGENT)
             .build()
             .unwrap_or_else(|_| Client::new());
@@ -1294,7 +1312,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_groq_stt_with_config() {
-        use super::super::config::{GroqSTTConfig, GroqSTTModel, GroqResponseFormat};
+        use super::super::config::{GroqResponseFormat, GroqSTTConfig, GroqSTTModel};
 
         let groq_config = GroqSTTConfig {
             base: STTConfig {
@@ -1318,7 +1336,10 @@ mod tests {
 
         let stored_config = stt.config.as_ref().unwrap();
         assert_eq!(stored_config.model, GroqSTTModel::WhisperLargeV3);
-        assert_eq!(stored_config.response_format, GroqResponseFormat::VerboseJson);
+        assert_eq!(
+            stored_config.response_format,
+            GroqResponseFormat::VerboseJson
+        );
         assert_eq!(stored_config.temperature, Some(0.2));
     }
 
@@ -1416,9 +1437,9 @@ mod tests {
         assert!(GroqSTT::is_retryable_error(&STTError::ProviderError(
             "503 Service Unavailable".to_string()
         )));
-        assert!(!GroqSTT::is_retryable_error(&STTError::AuthenticationFailed(
-            "Invalid API key".to_string()
-        )));
+        assert!(!GroqSTT::is_retryable_error(
+            &STTError::AuthenticationFailed("Invalid API key".to_string())
+        ));
         assert!(!GroqSTT::is_retryable_error(&STTError::ConfigurationError(
             "Invalid config".to_string()
         )));

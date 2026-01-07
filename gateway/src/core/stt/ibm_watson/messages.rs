@@ -77,7 +77,10 @@ impl ResultsMessage {
 
     /// Get all transcripts from this message.
     pub fn all_transcripts(&self) -> Vec<STTResult> {
-        self.results.iter().filter_map(|r| r.to_stt_result()).collect()
+        self.results
+            .iter()
+            .filter_map(|r| r.to_stt_result())
+            .collect()
     }
 }
 

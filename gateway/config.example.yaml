@@ -5,9 +5,9 @@
 #
 # Usage: waav-gateway -c config.yaml
 #
-# Priority: Environment variables > YAML values > Defaults
-# This means you can override any value in this file by setting
-# the corresponding environment variable.
+# Priority: YAML values > Environment variables > .env file > Defaults
+# This means YAML configuration takes precedence over environment variables,
+# allowing you to use env vars as base config and YAML for overrides.
 
 # Server configuration
 server:
@@ -203,6 +203,9 @@ auth:
 # Used for SIP trunk integration and webhook forwarding
 sip:
   room_prefix: "sip-"                         # ENV: SIP_ROOM_PREFIX
+  # Naming prefix for SIP trunk and dispatch resources in LiveKit (defaults to "waav")
+  # Format: {naming_prefix}-{room_prefix}-trunk and {naming_prefix}-{room_prefix}-dispatch
+  naming_prefix: "waav"                       # ENV: SIP_NAMING_PREFIX
   allowed_addresses:                          # ENV: SIP_ALLOWED_ADDRESSES (comma-separated)
     - "192.168.1.0/24"
     - "10.0.0.1"

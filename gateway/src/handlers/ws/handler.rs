@@ -12,12 +12,14 @@ use axum::{
     response::Response,
 };
 use futures::{SinkExt, StreamExt};
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tokio::{select, time::Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::auth::Auth;
+use crate::middleware::ClientIp;
 use crate::state::AppState;
 
 use super::{
@@ -40,6 +42,11 @@ const MAX_WS_FRAME_SIZE: usize = 10 * 1024 * 1024;
 /// This limits the total message size (can be multiple frames)
 const MAX_WS_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
+/// Maximum text message size before deserialization (1 MB)
+/// This prevents JSON parsing attacks with extremely large payloads
+/// Binary audio messages use MAX_WS_MESSAGE_SIZE instead
+const MAX_TEXT_MESSAGE_SIZE: usize = 1024 * 1024;
+
 /// WebSocket voice processing handler
 ///
 /// Upgrades the HTTP connection to WebSocket for real-time voice processing.
@@ -49,6 +56,7 @@ const MAX_WS_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 /// * `ws` - The WebSocket upgrade request from Axum
 /// * `state` - Application state containing configuration and shared resources
 /// * `auth` - Auth context from middleware for tenant isolation
+/// * `client_ip` - Optional client IP from connection limit middleware for releasing connection
 ///
 /// # Returns
 /// * `Response` - HTTP response that upgrades the connection to WebSocket
@@ -56,12 +64,17 @@ pub async fn ws_voice_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<Auth>,
+    client_ip: Option<Extension<ClientIp>>,
 ) -> Response {
     info!(
         auth_id = ?auth.id,
+        client_ip = ?client_ip.as_ref().map(|c| c.0.0),
         "WebSocket voice connection upgrade requested"
     );
     debug!("AppState extracted successfully, preparing upgrade");
+
+    // Extract the IP address if present (used for connection limit tracking)
+    let ip = client_ip.map(|Extension(ClientIp(ip))| ip);
 
     // Apply message size limits to prevent memory exhaustion attacks
     let response = ws
@@ -69,7 +82,7 @@ pub async fn ws_voice_handler(
         .max_message_size(MAX_WS_MESSAGE_SIZE)
         .on_upgrade(move |socket| {
             debug!("WebSocket upgrade callback triggered");
-            handle_voice_socket(socket, state, auth)
+            handle_voice_socket(socket, state, auth, ip)
         });
 
     debug!("WebSocket upgrade response created");
@@ -85,21 +98,39 @@ pub async fn ws_voice_handler(
 /// * `socket` - The established WebSocket connection
 /// * `app_state` - Application state containing shared resources
 /// * `auth` - Auth context for tenant isolation (room name prefixing)
+/// * `client_ip` - Optional client IP for connection limit tracking (releases on disconnect)
 ///
 /// # Lifecycle
 /// 1. Split socket into sender/receiver for bidirectional communication
 /// 2. Set up message routing channels with optimized buffer sizes
 /// 3. Spawn sender task for outgoing messages
 /// 4. Process incoming messages in a loop
-/// 5. Clean up resources on connection close
+/// 5. Clean up resources on connection close (including connection limit release)
 ///
 /// # Performance Optimizations
 /// - Large channel buffer (1024) for reduced contention
 /// - RwLock for connection state (frequent reads, rare writes)
 /// - Timeout handling for stale connection detection
-async fn handle_voice_socket(socket: WebSocket, app_state: Arc<AppState>, auth: Auth) {
+async fn handle_voice_socket(
+    socket: WebSocket,
+    app_state: Arc<AppState>,
+    auth: Auth,
+    client_ip: Option<IpAddr>,
+) {
     debug!("handle_voice_socket started");
-    info!(auth_id = ?auth.id, "WebSocket voice connection established");
+    info!(
+        auth_id = ?auth.id,
+        pending = %auth.pending,
+        client_ip = ?client_ip,
+        "WebSocket voice connection established"
+    );
+
+    // Create a connection guard that will release the connection when dropped
+    // This ensures the connection is released even if the function panics
+    let _connection_guard = client_ip.map(|ip| ConnectionGuard {
+        app_state: app_state.clone(),
+        ip,
+    });
 
     debug!("Splitting socket into sender and receiver");
     // Split the socket into sender and receiver
@@ -108,52 +139,111 @@ async fn handle_voice_socket(socket: WebSocket, app_state: Arc<AppState>, auth: 
 
     // Connection state with RwLock for rare writes, frequent reads
     // Initialize with auth context for room name normalization
-    let state = Arc::new(RwLock::new(ConnectionState::with_auth(auth)));
+    let state = Arc::new(RwLock::new(ConnectionState::with_auth(auth.clone())));
 
     let (message_tx, mut message_rx) = mpsc::channel::<MessageRoute>(CHANNEL_BUFFER_SIZE);
 
+    // If authentication is pending, send AuthRequired notification immediately
+    // This informs browser clients they need to send an auth message first
+    if auth.is_pending() {
+        info!("Auth pending - sending auth_required notification");
+        let auth_required_msg =
+            serde_json::to_string(&OutgoingMessage::AuthRequired).unwrap_or_default();
+        if let Err(e) = sender.send(Message::Text(auth_required_msg.into())).await {
+            error!("Failed to send auth_required message: {}", e);
+            return;
+        }
+    }
+
+    // Create shutdown channel for graceful sender task termination
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
     // Spawn task to handle outgoing messages - simple and direct for low latency
     let sender_task = tokio::spawn(async move {
-        while let Some(route) = message_rx.recv().await {
-            let should_close = matches!(route, MessageRoute::Close);
+        loop {
+            select! {
+                route_opt = message_rx.recv() => {
+                    let Some(route) = route_opt else {
+                        // Channel closed, exit gracefully
+                        break;
+                    };
+                    let should_close = matches!(route, MessageRoute::Close);
 
-            let result = match route {
-                MessageRoute::Outgoing(message) => {
-                    // Direct serialization and send - no batching for low latency
-                    match serde_json::to_string(&message) {
-                        Ok(json_str) => sender.send(Message::Text(json_str.into())).await,
-                        Err(e) => {
-                            error!("Failed to serialize outgoing message: {}", e);
-                            continue;
+                    let result = match route {
+                        MessageRoute::Outgoing(message) => {
+                            // Direct serialization and send - no batching for low latency
+                            match serde_json::to_string(&message) {
+                                Ok(json_str) => sender.send(Message::Text(json_str.into())).await,
+                                Err(e) => {
+                                    error!("Failed to serialize outgoing message: {}", e);
+                                    continue;
+                                }
+                            }
                         }
+                        MessageRoute::Binary(data) => sender.send(Message::Binary(data)).await,
+                        MessageRoute::Close => {
+                            info!("Closing WebSocket connection");
+                            sender.send(Message::Close(None)).await
+                        }
+                    };
+
+                    if let Err(e) = result {
+                        error!("Failed to send WebSocket message: {}", e);
+                        break;
+                    }
+
+                    // If we sent a Close message, break the loop
+                    if should_close {
+                        break;
                     }
                 }
-                MessageRoute::Binary(data) => sender.send(Message::Binary(data)).await,
-                MessageRoute::Close => {
-                    info!("Closing WebSocket connection");
-                    sender.send(Message::Close(None)).await
+                _ = &mut shutdown_rx => {
+                    // Graceful shutdown requested - drain remaining messages
+                    while let Ok(route) = message_rx.try_recv() {
+                        let result = match route {
+                            MessageRoute::Outgoing(message) => {
+                                match serde_json::to_string(&message) {
+                                    Ok(json_str) => sender.send(Message::Text(json_str.into())).await,
+                                    Err(_) => continue,
+                                }
+                            }
+                            MessageRoute::Binary(data) => sender.send(Message::Binary(data)).await,
+                            MessageRoute::Close => sender.send(Message::Close(None)).await,
+                        };
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                    // Send close frame for clean WebSocket termination
+                    let _ = sender.send(Message::Close(None)).await;
+                    break;
                 }
-            };
-
-            if let Err(e) = result {
-                error!("Failed to send WebSocket message: {}", e);
-                break;
-            }
-
-            // If we sent a Close message, break the loop
-            if should_close {
-                break;
             }
         }
     });
 
-    // Optimized timeout for low-latency audio processing
-    // Shorter timeout to detect stale connections faster
+    // Timeout for checking idle connections
+    // This determines how often we check if the connection is stale
     let processing_timeout = Duration::from_secs(10);
+
+    // Maximum idle time before closing the connection (5 minutes with ±10% jitter)
+    // Audio connections without activity for this long are likely stale
+    // Jitter prevents thundering herd when many connections timeout simultaneously
+    let base_idle_secs: u64 = 300;
+    let jitter_range: u64 = 30; // ±10% = 30 seconds
+    let jitter_offset = (std::time::Instant::now().elapsed().as_nanos() as u64 % (jitter_range * 2)) as i64 - jitter_range as i64;
+    let idle_secs = (base_idle_secs as i64 + jitter_offset).max(1) as u64;
+    let idle_timeout = Duration::from_secs(idle_secs);
+
+    // Track last activity time for idle connection detection
+    let mut last_activity = std::time::Instant::now();
 
     loop {
         select! {
             msg_result = receiver.next() => {
+                // Update activity time on any message
+                last_activity = std::time::Instant::now();
+
                 match msg_result {
                     Some(Ok(msg)) => {
                         let continue_processing = process_message(
@@ -181,15 +271,37 @@ async fn handle_voice_socket(socket: WebSocket, app_state: Arc<AppState>, auth: 
                 }
             }
             _ = tokio::time::sleep(processing_timeout) => {
-                // Handle connection timeout
-                debug!("WebSocket connection timeout check");
-                continue;
+                // Check if connection has been idle too long
+                if last_activity.elapsed() > idle_timeout {
+                    warn!(
+                        "WebSocket connection idle for {}s, closing stale connection",
+                        last_activity.elapsed().as_secs()
+                    );
+                    let _ = message_tx.send(MessageRoute::Outgoing(OutgoingMessage::Error {
+                        message: "Connection closed due to inactivity".to_string(),
+                    })).await;
+                    break;
+                }
+                debug!(
+                    "WebSocket connection alive, idle for {}s",
+                    last_activity.elapsed().as_secs()
+                );
             }
         }
     }
 
-    // Clean up resources
-    sender_task.abort();
+    // Clean up resources - graceful shutdown with timeout fallback
+    // Signal shutdown to sender task
+    let _ = shutdown_tx.send(());
+    // Wait for graceful completion with timeout, then abort if needed
+    match tokio::time::timeout(Duration::from_millis(500), sender_task).await {
+        Ok(_) => {
+            debug!("Sender task completed gracefully");
+        }
+        Err(_) => {
+            warn!("Sender task did not complete within timeout, connection may have stalled");
+        }
+    }
 
     // Snapshot state before cleanup so we can drop the read lock before awaiting
     let (voice_manager, livekit_client, recording_egress_id, room_name) = {
@@ -279,6 +391,25 @@ async fn process_message(
         Message::Text(text) => {
             debug!("Received text message: {} bytes", text.len());
 
+            // Pre-deserialization size check to prevent JSON parsing attacks
+            if text.len() > MAX_TEXT_MESSAGE_SIZE {
+                warn!(
+                    size = text.len(),
+                    max = MAX_TEXT_MESSAGE_SIZE,
+                    "Text message exceeds maximum size before deserialization"
+                );
+                let _ = message_tx
+                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
+                        message: format!(
+                            "Message too large: {} bytes (max {} bytes)",
+                            text.len(),
+                            MAX_TEXT_MESSAGE_SIZE
+                        ),
+                    }))
+                    .await;
+                return true;
+            }
+
             // Fast path JSON parsing with pre-validation
             let incoming_msg: IncomingMessage = match serde_json::from_str(&text) {
                 Ok(msg) => msg,
@@ -325,5 +456,21 @@ async fn process_message(
             info!("WebSocket connection closed by client");
             false
         }
+    }
+}
+
+/// Guard struct that releases a connection slot when dropped
+///
+/// This implements RAII pattern to ensure connection slots are always released,
+/// even if the WebSocket handler panics or encounters errors.
+struct ConnectionGuard {
+    app_state: Arc<AppState>,
+    ip: IpAddr,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        debug!(ip = %self.ip, "Releasing connection slot");
+        self.app_state.release_connection(self.ip);
     }
 }

@@ -75,6 +75,11 @@ impl LiveKitClient {
             let _ = tokio::time::timeout(std::time::Duration::from_millis(500), ack_rx).await;
         }
 
+        // Abort event handler task if running
+        if let Some(handle) = self.event_handler_handle.take() {
+            handle.abort();
+        }
+
         // Abort active streams
         let mut streams = self.active_streams.lock().await;
         for handle in streams.drain(..) {

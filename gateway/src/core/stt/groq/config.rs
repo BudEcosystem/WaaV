@@ -103,8 +103,8 @@ impl GroqSTTModel {
     /// Get the word error rate (WER) for this model.
     pub fn word_error_rate(&self) -> f32 {
         match self {
-            Self::WhisperLargeV3 => 0.103,      // 10.3%
-            Self::WhisperLargeV3Turbo => 0.12,  // 12%
+            Self::WhisperLargeV3 => 0.103,     // 10.3%
+            Self::WhisperLargeV3Turbo => 0.12, // 12%
         }
     }
 
@@ -463,8 +463,8 @@ impl Default for GroqSTTConfig {
             audio_input_format: AudioInputFormat::Wav,
             prompt: None,
             flush_strategy: FlushStrategy::OnDisconnect,
-            flush_threshold_bytes: 1024 * 1024,           // 1MB
-            max_file_size_bytes: DEFAULT_MAX_FILE_SIZE,   // 25MB
+            flush_threshold_bytes: 1024 * 1024,         // 1MB
+            max_file_size_bytes: DEFAULT_MAX_FILE_SIZE, // 25MB
             silence_detection: SilenceDetectionConfig::default(),
             translate_to_english: false,
             custom_endpoint: None,
@@ -760,8 +760,14 @@ mod tests {
 
     #[test]
     fn test_constants() {
-        assert_eq!(GROQ_STT_URL, "https://api.groq.com/openai/v1/audio/transcriptions");
-        assert_eq!(GROQ_TRANSLATION_URL, "https://api.groq.com/openai/v1/audio/translations");
+        assert_eq!(
+            GROQ_STT_URL,
+            "https://api.groq.com/openai/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            GROQ_TRANSLATION_URL,
+            "https://api.groq.com/openai/v1/audio/translations"
+        );
         assert_eq!(DEFAULT_MAX_FILE_SIZE, 25 * 1024 * 1024);
         assert_eq!(DEV_TIER_MAX_FILE_SIZE, 100 * 1024 * 1024);
         assert_eq!(MAX_PROMPT_TOKENS, 224);

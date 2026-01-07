@@ -568,6 +568,7 @@ impl Default for AwsPollyTTSConfig {
                 request_timeout: Some(60),
                 pronunciations: Vec::new(),
                 request_pool_size: Some(4),
+                emotion_config: None,
             },
             region: AwsRegion::default(),
             aws_access_key_id: None,

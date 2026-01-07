@@ -186,16 +186,15 @@ mod provider;
 
 // Configuration types
 pub use config::{
-    HumeAudioFormat, HumeOutputFormat, HumeTTSConfig, HumeVoice,
-    HUME_TTS_STREAM_URL, HUME_TTS_SYNC_URL,
-    DEFAULT_SPEED, DEFAULT_VOICE, MAX_DESCRIPTION_LENGTH,
-    MAX_SPEED, MIN_SPEED, SUPPORTED_SAMPLE_RATES,
+    DEFAULT_SPEED, DEFAULT_VOICE, HUME_TTS_STREAM_URL, HUME_TTS_SYNC_URL, HumeAudioFormat,
+    HumeOutputFormat, HumeTTSConfig, HumeVoice, MAX_DESCRIPTION_LENGTH, MAX_SPEED, MIN_SPEED,
+    SUPPORTED_SAMPLE_RATES,
 };
 
 // Message types
 pub use messages::{
-    HumeContext, HumeErrorResponse, HumeRequestFormat, HumeTTSMetadata,
-    HumeTTSRequest, HumeUtterance, HumeVoiceSpec,
+    HumeContext, HumeErrorResponse, HumeRequestFormat, HumeTTSMetadata, HumeTTSRequest,
+    HumeUtterance, HumeVoiceSpec,
 };
 
 // Provider types

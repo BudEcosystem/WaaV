@@ -151,7 +151,7 @@ mod provider;
 mod tests;
 
 pub use config::{
-    IbmOutputFormat, IbmVoice, IbmWatsonTTSConfig, DEFAULT_SAMPLE_RATE, DEFAULT_VOICE,
-    IBM_IAM_URL, MAX_TEXT_LENGTH,
+    DEFAULT_SAMPLE_RATE, DEFAULT_VOICE, IBM_IAM_URL, IbmOutputFormat, IbmVoice, IbmWatsonTTSConfig,
+    MAX_TEXT_LENGTH,
 };
-pub use provider::{IbmWatsonTTS, IBM_WATSON_TTS_URL};
+pub use provider::{IBM_WATSON_TTS_URL, IbmWatsonTTS};

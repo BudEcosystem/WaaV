@@ -59,13 +59,13 @@ pub use base::{
     SpeechEventCallback, ToolDefinition, TranscriptCallback, TranscriptResult, TranscriptRole,
     TurnDetectionConfig,
 };
+pub use hume::{
+    EVIVersion, HUME_EVI_DEFAULT_SAMPLE_RATE, HUME_EVI_WEBSOCKET_URL, HumeEVI, HumeEVIConfig,
+    ProsodyScores,
+};
 pub use openai::{
     Modality, OPENAI_REALTIME_SAMPLE_RATE, OPENAI_REALTIME_URL, OpenAIRealtime,
     OpenAIRealtimeAudioFormat, OpenAIRealtimeModel, OpenAIRealtimeVoice,
-};
-pub use hume::{
-    EVIVersion, HumeEVI, HumeEVIConfig, ProsodyScores,
-    HUME_EVI_DEFAULT_SAMPLE_RATE, HUME_EVI_WEBSOCKET_URL,
 };
 
 /// Supported realtime providers.
@@ -201,10 +201,7 @@ mod tests {
             RealtimeProvider::parse("HUME"),
             Some(RealtimeProvider::Hume)
         );
-        assert_eq!(
-            RealtimeProvider::parse("evi"),
-            Some(RealtimeProvider::Hume)
-        );
+        assert_eq!(RealtimeProvider::parse("evi"), Some(RealtimeProvider::Hume));
         assert_eq!(
             RealtimeProvider::parse("hume-evi"),
             Some(RealtimeProvider::Hume)

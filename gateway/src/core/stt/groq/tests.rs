@@ -73,7 +73,10 @@ mod model_tests {
 
     #[test]
     fn test_model_display() {
-        assert_eq!(format!("{}", GroqSTTModel::WhisperLargeV3), "whisper-large-v3");
+        assert_eq!(
+            format!("{}", GroqSTTModel::WhisperLargeV3),
+            "whisper-large-v3"
+        );
         assert_eq!(
             format!("{}", GroqSTTModel::WhisperLargeV3Turbo),
             "whisper-large-v3-turbo"
@@ -131,7 +134,10 @@ mod response_format_tests {
     #[test]
     fn test_response_format_display() {
         assert_eq!(format!("{}", GroqResponseFormat::Json), "json");
-        assert_eq!(format!("{}", GroqResponseFormat::VerboseJson), "verbose_json");
+        assert_eq!(
+            format!("{}", GroqResponseFormat::VerboseJson),
+            "verbose_json"
+        );
     }
 
     #[test]
@@ -624,12 +630,8 @@ mod wav_tests {
         assert_eq!(channels, 2);
 
         // Check sample rate (bytes 24-27)
-        let sample_rate = u32::from_le_bytes([
-            wav_file[24],
-            wav_file[25],
-            wav_file[26],
-            wav_file[27],
-        ]);
+        let sample_rate =
+            u32::from_le_bytes([wav_file[24], wav_file[25], wav_file[26], wav_file[27]]);
         assert_eq!(sample_rate, 44100);
     }
 
@@ -882,9 +884,9 @@ mod client_tests {
         )));
 
         // Non-retryable errors
-        assert!(!GroqSTT::is_retryable_error(&STTError::AuthenticationFailed(
-            "invalid key".to_string()
-        )));
+        assert!(!GroqSTT::is_retryable_error(
+            &STTError::AuthenticationFailed("invalid key".to_string())
+        ));
         assert!(!GroqSTT::is_retryable_error(&STTError::ConfigurationError(
             "invalid config".to_string()
         )));
@@ -1072,7 +1074,7 @@ mod rate_limit_tests {
 // =============================================================================
 
 mod wav_validation_tests {
-    use super::messages::wav::{try_create_wav, WavError};
+    use super::messages::wav::{WavError, try_create_wav};
 
     #[test]
     fn test_wav_zero_sample_rate() {

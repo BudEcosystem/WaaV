@@ -1,10 +1,29 @@
 {
-  "name": "bud-foundry-dashboard",
-  "version": "0.1.0",
-  "description": "Testing dashboard for Bud Foundry AI Gateway",
+  "name": "waav-dashboard",
+  "version": "1.0.0",
+  "description": "WaaV AI Voice Gateway Dashboard",
   "type": "module",
   "scripts": {
     "serve": "npx serve -l 8080",
-    "lint": "npx eslint js/*.js --env browser --env es2022 --parser-options=sourceType:module"
+    "serve:https": "python3 serve_https.py",
+    "lint": "npx eslint js/*.js --env browser --env es2022 --parser-options=sourceType:module",
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
+    "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
+    "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "jest-environment-jsdom": "^29.7.0",
+    "@testing-library/dom": "^9.3.4",
+    "@testing-library/jest-dom": "^6.4.2",
+    "eslint": "^8.57.0"
+  },
+  "jest": {
+    "testEnvironment": "jsdom",
+    "moduleFileExtensions": ["js", "mjs"],
+    "transform": {},
+    "testMatch": ["**/tests/**/*.test.js"],
+    "setupFilesAfterEnv": ["./tests/setup.js"],
+    "collectCoverageFrom": ["js/**/*.js", "!js/components/**"]
   }
 }

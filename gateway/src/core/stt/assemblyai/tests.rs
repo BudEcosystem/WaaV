@@ -503,7 +503,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_handle_message_begin_sets_session_id() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(256);
         let session_id = Arc::new(RwLock::new(None));
 
         let msg =
@@ -518,7 +518,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_handle_message_turn_sends_result() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(256);
         let session_id = Arc::new(RwLock::new(None));
 
         let msg = Message::Text(
@@ -540,7 +540,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_handle_message_termination_returns_false() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(256);
         let session_id = Arc::new(RwLock::new(None));
 
         let msg = Message::Text(
@@ -555,7 +555,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_handle_message_auth_error() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(256);
         let session_id = Arc::new(RwLock::new(None));
 
         let msg = Message::Text(
@@ -575,7 +575,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_handle_message_rate_limit_error() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(256);
         let session_id = Arc::new(RwLock::new(None));
 
         let msg = Message::Text(
@@ -596,7 +596,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_handle_message_audio_error() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(256);
         let session_id = Arc::new(RwLock::new(None));
 
         let msg = Message::Text(
@@ -617,7 +617,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_handle_message_close() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(256);
         let session_id = Arc::new(RwLock::new(None));
 
         let msg = Message::Close(None);
@@ -630,7 +630,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_handle_message_ping_continues() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(256);
         let session_id = Arc::new(RwLock::new(None));
 
         let msg = Message::Ping(vec![].into());
@@ -643,7 +643,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_handle_message_pong_continues() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(256);
         let session_id = Arc::new(RwLock::new(None));
 
         let msg = Message::Pong(vec![].into());
@@ -656,7 +656,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_handle_message_unknown_type_continues() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(256);
         let session_id = Arc::new(RwLock::new(None));
 
         let msg = Message::Text(r#"{"type":"FutureType","data":"value"}"#.into());
@@ -669,7 +669,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn test_handle_message_malformed_json() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(256);
         let session_id = Arc::new(RwLock::new(None));
 
         let msg = Message::Text("not valid json".into());

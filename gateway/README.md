@@ -23,7 +23,9 @@ A high-performance real-time voice processing server built in Rust that provides
   - IBM Watson (STT/TTS) - 30+ languages, speaker diarization, neural voices
   - Groq (STT) - Ultra-fast Whisper (216x real-time), $0.04/hour
   - Play.ht (TTS) - Low-latency (~190ms), PlayDialog multi-turn, 36+ languages, voice cloning
-- **OpenAI Realtime API**: Full-duplex audio-to-audio streaming with GPT-4o
+- **Realtime AI APIs**: Full-duplex audio-to-audio streaming
+  - OpenAI Realtime - GPT-4o voice conversations
+  - Hume EVI - Empathic Voice Interface with emotion understanding
 - **Audio-Disabled Mode**: Development mode without API keys
 
 ## Quick Start
@@ -120,6 +122,36 @@ curl -X POST http://localhost:3001/speak \
 ```
 
 For complete authentication setup and architecture details, see [docs/authentication.md](docs/authentication.md).
+
+## Security Features
+
+WaaV Gateway includes comprehensive security hardening for production deployments:
+
+### SSRF Protection
+All webhook URLs are validated to prevent Server-Side Request Forgery attacks:
+- HTTPS required for all webhooks
+- Raw IP addresses blocked (both IPv4 and IPv6)
+- DNS resolution checked against private IP ranges
+- Configurable for development mode with `validate_webhook_url_dev()`
+
+### Connection Limiting
+Per-IP connection limits prevent resource exhaustion:
+- Configurable via `MAX_CONNECTIONS_PER_IP` (default: 100)
+- Global rate limiting via `RATE_LIMIT_REQUESTS_PER_SECOND` (default: 60/s)
+- Burst allowance via `RATE_LIMIT_BURST_SIZE` (default: 10)
+
+### Tenant Isolation
+Multi-tenant deployments benefit from automatic resource scoping:
+- Recording paths include `auth_id` for tenant isolation
+- WebSocket sessions tracked by authentication context
+- SIP hooks support per-tenant webhook routing
+
+### Resource Management
+Production-grade resource controls:
+- Bounded channels prevent memory exhaustion under load
+- HTTP connection pools with explicit limits and idle timeouts
+- WebSocket idle timeout with jitter (prevents thundering herd)
+- Pre-deserialization message size validation
 
 ## API Endpoints
 
@@ -238,6 +270,7 @@ graph TB
     STT --> STTList
     TTS --> TTSList
     RT --> OA_RT["OpenAI Realtime<br/>GPT-4o"]
+    RT --> HU_RT["Hume EVI<br/>Empathic Voice"]
     LK --> LiveKit[(LiveKit Server)]
 ```
 
@@ -435,6 +468,7 @@ docker run -p 3001:3001 --env-file .env waav-gateway
 | `GROQ_API_KEY` | Groq API key (for ultra-fast Whisper STT) | - | No* |
 | `PLAYHT_API_KEY` | Play.ht API key (for TTS) | - | No* |
 | `PLAYHT_USER_ID` | Play.ht user ID (for TTS authentication) | - | No* |
+| `HUME_API_KEY` | Hume AI API key (for EVI realtime and TTS) | - | No* |
 | `LIVEKIT_URL` | LiveKit server WebSocket URL | `ws://localhost:7880` | No |
 | `LIVEKIT_API_KEY` | LiveKit API key (for webhooks and token generation) | - | No*** |
 | `LIVEKIT_API_SECRET` | LiveKit API secret (for webhooks and token generation) | - | No*** |

@@ -9,6 +9,12 @@ export class Logger {
   }
 
   log(method, endpoint, details = {}) {
+    // Guard against null element
+    if (!this.element) {
+      console.log(`[Logger] ${method} ${endpoint}`, details);
+      return;
+    }
+
     const entry = document.createElement('div');
     entry.className = 'log-entry';
 
@@ -36,6 +42,8 @@ export class Logger {
   }
 
   clear() {
-    this.element.innerHTML = '';
+    if (this.element) {
+      this.element.innerHTML = '';
+    }
   }
 }

@@ -260,6 +260,13 @@ impl TTSProvider {
                             "Successfully sent cached audio through channel for text: '{}' (receiver has read it)",
                             processed_text
                         );
+                        // Update previous_text for context continuity even on cache hit
+                        // This ensures next TTS request has proper context (e.g., for ElevenLabs)
+                        *previous_text_store.write().await = Some(processed_text.clone());
+                        debug!(
+                            "Updated previous_text on cache hit: '{}'",
+                            processed_text
+                        );
                     }
                     return;
                 }
@@ -992,7 +999,30 @@ impl TTSProvider {
         }
     }
 
-    /// Generic flush implementation
+    /// Generic flush implementation for HTTP-based TTS providers
+    ///
+    /// # Behavior
+    ///
+    /// For HTTP-based providers (Deepgram, OpenAI, Play.ht, etc.), flush is a no-op
+    /// because each speak() request is immediately sent as an HTTP request. There is
+    /// no internal queue to flush.
+    ///
+    /// The `flush` parameter in `speak(text, flush)` controls:
+    /// - `flush=true`: Start synthesis immediately, interrupting any current playback
+    /// - `flush=false`: Queue the text to be synthesized after current audio completes
+    ///
+    /// For WebSocket-based providers (Cartesia, ElevenLabs streaming), the provider's
+    /// own flush implementation handles sending queued text immediately.
+    ///
+    /// # Implementation Notes
+    ///
+    /// - HTTP providers use concurrent request dispatch - audio is sent to callback
+    ///   as it arrives from the API
+    /// - No internal buffering or queuing happens at the provider level
+    /// - Use `clear()` to cancel pending synthesis (if supported by the provider)
+    ///
+    /// # Returns
+    /// * `TTSResult<()>` - Always succeeds for HTTP providers
     pub async fn generic_flush(&self) -> TTSResult<()> {
         // No-op in concurrent mode; dispatcher processes items as they arrive
         Ok(())

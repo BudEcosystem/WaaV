@@ -111,6 +111,24 @@ pub struct ServerConfig {
     pub hume_api_key: Option<String>,
     /// LMNT API key for ultra-low latency TTS and voice cloning
     pub lmnt_api_key: Option<String>,
+    /// Groq API key for ultra-fast Whisper STT (216x real-time)
+    pub groq_api_key: Option<String>,
+    /// Play.ht API key for low-latency TTS with voice cloning
+    pub playht_api_key: Option<String>,
+    /// Play.ht user ID (required alongside playht_api_key)
+    pub playht_user_id: Option<String>,
+    /// IBM Watson API key for STT/TTS
+    pub ibm_watson_api_key: Option<String>,
+    /// IBM Watson service instance ID
+    pub ibm_watson_instance_id: Option<String>,
+    /// IBM Watson region (e.g., "us-south", "eu-gb")
+    pub ibm_watson_region: Option<String>,
+    /// AWS access key ID (for Transcribe/Polly)
+    pub aws_access_key_id: Option<String>,
+    /// AWS secret access key (for Transcribe/Polly)
+    pub aws_secret_access_key: Option<String>,
+    /// AWS region (e.g., "us-east-1", "eu-west-1")
+    pub aws_region: Option<String>,
 
     // LiveKit recording configuration
     pub recording_s3_bucket: Option<String>,
@@ -196,6 +214,21 @@ impl Drop for ServerConfig {
             key.zeroize();
         }
         if let Some(ref mut secret) = self.recording_s3_secret_key {
+            secret.zeroize();
+        }
+        if let Some(ref mut key) = self.groq_api_key {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.playht_api_key {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.ibm_watson_api_key {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.aws_access_key_id {
+            key.zeroize();
+        }
+        if let Some(ref mut secret) = self.aws_secret_access_key {
             secret.zeroize();
         }
         // Zeroize auth API secrets
@@ -402,15 +435,52 @@ impl ServerConfig {
             }
             "hume" => {
                 // Hume AI uses API key authentication for TTS (Octave) and EVI
-                self.hume_api_key.as_ref().cloned().ok_or_else(|| {
-                    "Hume API key not configured in server environment".to_string()
-                })
+                self.hume_api_key
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| "Hume API key not configured in server environment".to_string())
             }
             "lmnt" | "lmnt-ai" | "lmnt_ai" => {
                 // LMNT uses API key authentication for TTS and voice cloning
-                self.lmnt_api_key.as_ref().cloned().ok_or_else(|| {
-                    "LMNT API key not configured in server environment".to_string()
+                self.lmnt_api_key
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| "LMNT API key not configured in server environment".to_string())
+            }
+            "groq" => {
+                // Groq uses API key authentication for ultra-fast Whisper STT
+                self.groq_api_key
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| "Groq API key not configured in server environment".to_string())
+            }
+            "playht" | "play.ht" | "play-ht" => {
+                // Play.ht uses API key authentication for TTS
+                self.playht_api_key.as_ref().cloned().ok_or_else(|| {
+                    "Play.ht API key not configured in server environment".to_string()
                 })
+            }
+            "ibm-watson" | "ibm_watson" | "ibm" | "watson" => {
+                // IBM Watson uses API key authentication for STT/TTS
+                self.ibm_watson_api_key.as_ref().cloned().ok_or_else(|| {
+                    "IBM Watson API key not configured in server environment".to_string()
+                })
+            }
+            "aws" | "aws-transcribe" | "aws-polly" | "amazon" => {
+                // AWS uses access key ID for Transcribe/Polly
+                self.aws_access_key_id.as_ref().cloned().ok_or_else(|| {
+                    "AWS access key ID not configured in server environment".to_string()
+                })
+            }
+            "azure" => {
+                // Azure Speech Services alias for microsoft-azure
+                self.azure_speech_subscription_key
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| {
+                        "Azure Speech subscription key not configured in server environment"
+                            .to_string()
+                    })
             }
             _ => Err(format!("Unsupported provider: {provider}")),
         }
@@ -427,6 +497,74 @@ impl ServerConfig {
         self.azure_speech_region
             .clone()
             .unwrap_or_else(|| "eastus".to_string())
+    }
+
+    /// Get Play.ht credentials (API key and user ID)
+    ///
+    /// Play.ht uses dual-header authentication requiring both API key and user ID.
+    ///
+    /// # Returns
+    /// * `Result<(String, String), String>` - Tuple of (api_key, user_id) on success
+    pub fn get_playht_credentials(&self) -> Result<(String, String), String> {
+        let api_key = self
+            .playht_api_key
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "Play.ht API key not configured".to_string())?;
+        let user_id = self
+            .playht_user_id
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "Play.ht user ID not configured".to_string())?;
+        Ok((api_key, user_id))
+    }
+
+    /// Get AWS credentials (access key ID, secret access key, region)
+    ///
+    /// AWS Transcribe and Polly require all three components for authentication.
+    ///
+    /// # Returns
+    /// * `Result<(String, String, String), String>` - Tuple of (access_key_id, secret_access_key, region)
+    pub fn get_aws_credentials(&self) -> Result<(String, String, String), String> {
+        let access_key_id = self
+            .aws_access_key_id
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "AWS access key ID not configured".to_string())?;
+        let secret_access_key = self
+            .aws_secret_access_key
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "AWS secret access key not configured".to_string())?;
+        let region = self
+            .aws_region
+            .clone()
+            .unwrap_or_else(|| "us-east-1".to_string());
+        Ok((access_key_id, secret_access_key, region))
+    }
+
+    /// Get IBM Watson credentials (API key, instance ID, region)
+    ///
+    /// IBM Watson STT/TTS require API key and service instance ID.
+    ///
+    /// # Returns
+    /// * `Result<(String, String, String), String>` - Tuple of (api_key, instance_id, region)
+    pub fn get_ibm_watson_credentials(&self) -> Result<(String, String, String), String> {
+        let api_key = self
+            .ibm_watson_api_key
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "IBM Watson API key not configured".to_string())?;
+        let instance_id = self
+            .ibm_watson_instance_id
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "IBM Watson instance ID not configured".to_string())?;
+        let region = self
+            .ibm_watson_region
+            .clone()
+            .unwrap_or_else(|| "us-south".to_string());
+        Ok((api_key, instance_id, region))
     }
 }
 
@@ -479,6 +617,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -529,6 +676,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -575,6 +731,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -624,6 +789,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -673,6 +847,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -728,6 +911,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -770,6 +962,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -814,6 +1015,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -859,6 +1069,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -903,6 +1122,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -957,6 +1185,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1005,6 +1242,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1052,6 +1298,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1099,6 +1354,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1151,6 +1415,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1197,6 +1470,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1246,6 +1528,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1290,6 +1581,15 @@ mod tests {
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,

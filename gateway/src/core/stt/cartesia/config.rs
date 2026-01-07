@@ -7,6 +7,7 @@
 //! - Configuration validation
 
 use super::super::base::{STTConfig, STTError};
+use url::form_urlencoded;
 
 // =============================================================================
 // Audio Encoding
@@ -180,25 +181,30 @@ impl CartesiaSTTConfig {
     /// wss://api.cartesia.ai/stt/websocket?api_key=xxx&model=ink-whisper&language=en&encoding=pcm_s16le&sample_rate=16000
     /// ```
     pub fn build_websocket_url(&self, api_key: &str) -> String {
+        // URL-encode parameters that could contain special characters
+        let encode = |s: &str| -> String {
+            form_urlencoded::byte_serialize(s.as_bytes()).collect()
+        };
+
         // Pre-allocate URL string capacity for performance
         let mut url = String::with_capacity(256);
 
         // Base URL
         url.push_str(Self::WEBSOCKET_BASE_URL);
 
-        // Required parameters
+        // Required parameters - URL encode api_key, model, and language
         url.push_str("?api_key=");
-        url.push_str(api_key);
+        url.push_str(&encode(api_key));
         url.push_str("&model=");
-        url.push_str(&self.model);
+        url.push_str(&encode(&self.model));
         url.push_str("&language=");
-        url.push_str(&self.base.language);
+        url.push_str(&encode(&self.base.language));
         url.push_str("&encoding=");
-        url.push_str(self.encoding.as_str());
+        url.push_str(self.encoding.as_str()); // Safe: enum value
         url.push_str("&sample_rate=");
-        url.push_str(&self.base.sample_rate.to_string());
+        url.push_str(&self.base.sample_rate.to_string()); // Safe: numeric
 
-        // Optional VAD parameters
+        // Optional VAD parameters (numeric values, safe)
         if let Some(min_vol) = self.min_volume {
             url.push_str("&min_volume=");
             url.push_str(&min_vol.to_string());
@@ -211,7 +217,7 @@ impl CartesiaSTTConfig {
 
         if let Some(ref version) = self.cartesia_version {
             url.push_str("&cartesia_version=");
-            url.push_str(version);
+            url.push_str(&encode(version));
         }
 
         url
