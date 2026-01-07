@@ -10,10 +10,10 @@
 | Metric | Count |
 |--------|-------|
 | **Total Cloud Providers** | 70 |
-| **Implemented** | 12 |
+| **Implemented** | 13 |
 | **In Progress** | 0 |
-| **Yet to Start** | 58 |
-| **Estimated Days Remaining** | 30-41 |
+| **Yet to Start** | 57 |
+| **Estimated Days Remaining** | 29-40 |
 
 ---
 
@@ -364,7 +364,7 @@ RUSTFLAGS="-Zsanitizer=address" cargo +nightly test [provider]
 | # | Provider | Type | Status | Start Date | Notes |
 |---|----------|------|--------|------------|-------|
 | 9 | LMNT | TTS+Clone | [COMPLETE] | 2026-01-07 | Ultra-low latency (~150ms), 22+ languages, voice cloning |
-| 10 | Play.ht | TTS+Clone | [TODO] | - | 142 languages |
+| 10 | Play.ht | TTS+Clone | [COMPLETE] | 2026-01-07 | HTTP streaming (~190ms), 36+ languages, voice cloning, PlayDialog multi-turn |
 | 11 | Murf.ai | TTS+Clone | [TODO] | - | 120+ voices |
 | 12 | WellSaid Labs | TTS+Clone | [TODO] | - | Premium quality |
 | 13 | Resemble AI | TTS+A2A+Clone | [TODO] | - | Deepfake detection |
@@ -522,6 +522,38 @@ These require the Python inference engine to be completed first:
 ---
 
 ## Session Log
+
+### Session: 2026-01-07 (Update 8)
+**Status:** Play.ht TTS implementation complete
+**Completed:**
+- Play.ht TTS (HTTP Streaming) - `src/core/tts/playht/`
+  - `mod.rs`: Module exports, API constants (TTS URL, Voice List URL, WebSocket Auth URL, Clone URL)
+  - `config.rs`: PlayHtTtsConfig, PlayHtModel (5 engines), PlayHtAudioFormat (6 formats)
+  - `messages.rs`: PlayHtVoice, PlayHtTtsRequest, PlayHtWsAuthResponse, PlayHtWsMessage, PlayHtApiError
+  - `provider.rs`: PlayHtTts implementing BaseTTS trait via HTTP streaming, PlayHtRequestBuilder
+  - Key features:
+    - HTTP streaming endpoint: `https://api.play.ht/api/v2/tts/stream`
+    - Dual-header authentication: `X-USER-ID` + `AUTHORIZATION`
+    - 5 voice engines: Play3.0-mini (~190ms), PlayDialog (~350ms), PlayDialogMultilingual, PlayDialogArabic, PlayHT2.0-turbo
+    - PlayDialog multi-turn dialogue support with `voice_2`, `turn_prefix`, `turn_prefix_2`
+    - 36+ languages with auto-detection
+    - 6 audio formats: mp3, wav, mulaw, flac, ogg, raw (PCM)
+    - Sample rates: 8000, 16000, 24000, 44100, 48000 Hz
+    - Max text length: 20,000 characters
+    - Speed (0.5-2.0), temperature (0.0-1.0), seed for deterministic output
+    - Advanced guidance: text_guidance, voice_guidance, style_guidance (Play3.0 only)
+    - Voice cloning support (30+ second audio samples)
+- Factory integration in `src/core/tts/mod.rs`
+- Provider aliases: `playht`, `play-ht`, `play_ht`, `play.ht`
+- Environment variable: `PLAYHT_USER_ID` (required for authentication)
+**Quality Gates:** All passed (cargo fmt, clippy, 104 Play.ht tests passing)
+**Key Design Decisions:**
+- Used HTTP streaming (recommended by Play.ht for most use cases)
+- User ID from environment variable (PLAYHT_USER_ID) for dual-header auth
+- `with_user_id()` method for explicit user ID when needed
+- Follows LMNT implementation pattern (TTSRequestBuilder trait)
+**Next Steps:**
+- Continue with Batch 2: Murf.ai, WellSaid Labs, etc.
 
 ### Session: 2026-01-06 (Update 7)
 **Status:** Hume AI integration complete (TTS, EVI, Voice Cloning, Unified Emotion System)

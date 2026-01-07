@@ -9,6 +9,7 @@ pub mod hume;
 pub mod ibm_watson;
 pub mod lmnt;
 pub mod openai;
+pub mod playht;
 pub mod provider;
 
 pub use aws_polly::{
@@ -28,8 +29,11 @@ pub use hume::{HUME_TTS_STREAM_URL, HumeTTS, HumeTTSConfig};
 pub use ibm_watson::{
     IBM_WATSON_TTS_URL, IbmOutputFormat, IbmVoice, IbmWatsonTTS, IbmWatsonTTSConfig,
 };
-pub use lmnt::{LmntAudioFormat, LmntTts, LmntTtsConfig, LmntVoice, LMNT_TTS_URL};
+pub use lmnt::{LMNT_TTS_URL, LmntAudioFormat, LmntTts, LmntTtsConfig, LmntVoice};
 pub use openai::{AudioOutputFormat, OPENAI_TTS_URL, OpenAITTS, OpenAITTSModel, OpenAIVoice};
+pub use playht::{
+    PLAYHT_TTS_URL, PlayHtAudioFormat, PlayHtModel, PlayHtTts, PlayHtTtsConfig, PlayHtVoice,
+};
 pub use provider::{TTSProvider, TTSRequestBuilder};
 use std::collections::HashMap;
 
@@ -47,6 +51,7 @@ use std::collections::HashMap;
 /// - `"ibm-watson"` or `"ibm_watson"` or `"watson"` or `"ibm"` - IBM Watson TTS API
 /// - `"hume"` or `"hume-ai"` - Hume AI Octave TTS API (natural language emotions)
 /// - `"lmnt"` or `"lmnt-ai"` - LMNT TTS API (ultra-low latency ~150ms)
+/// - `"playht"` or `"play-ht"` or `"play.ht"` - Play.ht TTS API (voice cloning, ~190ms)
 ///
 /// # Example
 ///
@@ -72,13 +77,12 @@ pub fn create_tts_provider(provider_type: &str, config: TTSConfig) -> TTSResult<
         "aws-polly" | "aws_polly" | "amazon-polly" | "polly" => {
             Ok(Box::new(AwsPollyTTS::new(config)?))
         }
-        "ibm-watson" | "ibm_watson" | "watson" | "ibm" => {
-            Ok(Box::new(IbmWatsonTTS::new(config)?))
-        }
+        "ibm-watson" | "ibm_watson" | "watson" | "ibm" => Ok(Box::new(IbmWatsonTTS::new(config)?)),
         "hume" | "hume-ai" | "hume_ai" => Ok(Box::new(HumeTTS::new(config)?)),
         "lmnt" | "lmnt-ai" | "lmnt_ai" => Ok(Box::new(LmntTts::new(config)?)),
+        "playht" | "play-ht" | "play_ht" | "play.ht" => Ok(Box::new(PlayHtTts::new(config)?)),
         _ => Err(TTSError::InvalidConfiguration(format!(
-            "Unsupported TTS provider: {provider_type}. Supported providers: deepgram, elevenlabs, google, azure, cartesia, openai, aws-polly, ibm-watson, hume, lmnt"
+            "Unsupported TTS provider: {provider_type}. Supported providers: deepgram, elevenlabs, google, azure, cartesia, openai, aws-polly, ibm-watson, hume, lmnt, playht"
         ))),
     }
 }
@@ -101,6 +105,7 @@ pub fn get_tts_provider_urls() -> HashMap<String, String> {
     urls.insert("ibm-watson".to_string(), IBM_WATSON_TTS_URL.to_string());
     urls.insert("hume".to_string(), HUME_TTS_STREAM_URL.to_string());
     urls.insert("lmnt".to_string(), LMNT_TTS_URL.to_string());
+    urls.insert("playht".to_string(), PLAYHT_TTS_URL.to_string());
     urls
 }
 
@@ -457,6 +462,98 @@ mod tests {
                 assert!(
                     msg.contains("lmnt"),
                     "Error message should mention lmnt as a supported provider"
+                );
+            }
+            Err(other) => panic!("Expected InvalidConfiguration error, got: {:?}", other),
+            Ok(_) => panic!("Expected error for invalid provider"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_playht_tts_provider() {
+        // Set required environment variable for Play.ht auth
+        // SAFETY: Test-only environment setup, no concurrent access in tests
+        unsafe {
+            std::env::set_var("PLAYHT_USER_ID", "test-user-id");
+        }
+
+        let config = TTSConfig {
+            provider: "playht".to_string(),
+            api_key: "test_key".to_string(),
+            voice_id: Some("s3://voice-cloning-zero-shot/test/manifest.json".to_string()),
+            audio_format: Some("mp3".to_string()),
+            sample_rate: Some(48000),
+            ..Default::default()
+        };
+        let result = create_tts_provider("playht", config);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_playht_tts_provider_aliases() {
+        // Set required environment variable for Play.ht auth
+        // SAFETY: Test-only environment setup, no concurrent access in tests
+        unsafe {
+            std::env::set_var("PLAYHT_USER_ID", "test-user-id");
+        }
+
+        let config = TTSConfig {
+            provider: "playht".to_string(),
+            api_key: "test_key".to_string(),
+            voice_id: Some("s3://voice-cloning-zero-shot/test/manifest.json".to_string()),
+            ..Default::default()
+        };
+
+        // All aliases should work
+        let result = create_tts_provider("play-ht", config.clone());
+        assert!(result.is_ok());
+
+        let result = create_tts_provider("play_ht", config.clone());
+        assert!(result.is_ok());
+
+        let result = create_tts_provider("play.ht", config);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_playht_tts_provider_case_insensitive() {
+        // Set required environment variable for Play.ht auth
+        // SAFETY: Test-only environment setup, no concurrent access in tests
+        unsafe {
+            std::env::set_var("PLAYHT_USER_ID", "test-user-id");
+        }
+
+        let config = TTSConfig {
+            provider: "playht".to_string(),
+            api_key: "test_key".to_string(),
+            voice_id: Some("s3://voice-cloning-zero-shot/test/manifest.json".to_string()),
+            ..Default::default()
+        };
+        // Case should not matter
+        let result = create_tts_provider("PLAYHT", config.clone());
+        assert!(result.is_ok());
+
+        let result = create_tts_provider("PlayHt", config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_tts_provider_urls_includes_playht() {
+        let urls = get_tts_provider_urls();
+        assert!(urls.contains_key("playht"));
+        assert_eq!(urls.get("playht").unwrap(), PLAYHT_TTS_URL);
+    }
+
+    #[test]
+    fn test_invalid_provider_error_message_includes_playht() {
+        let config = TTSConfig::default();
+        let result = create_tts_provider("invalid_provider", config);
+
+        match result {
+            Err(TTSError::InvalidConfiguration(msg)) => {
+                assert!(
+                    msg.contains("playht"),
+                    "Error message should mention playht as a supported provider"
                 );
             }
             Err(other) => panic!("Expected InvalidConfiguration error, got: {:?}", other),

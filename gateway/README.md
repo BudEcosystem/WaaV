@@ -22,6 +22,7 @@ A high-performance real-time voice processing server built in Rust that provides
   - AWS Transcribe/Polly (STT/TTS) - Enterprise-grade with 100+ languages
   - IBM Watson (STT/TTS) - 30+ languages, speaker diarization, neural voices
   - Groq (STT) - Ultra-fast Whisper (216x real-time), $0.04/hour
+  - Play.ht (TTS) - Low-latency (~190ms), PlayDialog multi-turn, 36+ languages, voice cloning
 - **OpenAI Realtime API**: Full-duplex audio-to-audio streaming with GPT-4o
 - **Audio-Disabled Mode**: Development mode without API keys
 
@@ -211,7 +212,7 @@ graph TB
         GQ_S["Groq"]
     end
 
-    subgraph TTSList["TTS (8 providers)"]
+    subgraph TTSList["TTS (11 providers)"]
         DG_T["Deepgram"]
         GC_T["Google Cloud"]
         AZ_T["Azure"]
@@ -220,6 +221,9 @@ graph TB
         CA_T["Cartesia"]
         AWS_T["AWS Polly"]
         IBM_T["IBM Watson"]
+        HU_T["Hume AI"]
+        LM_T["LMNT"]
+        PH_T["Play.ht"]
     end
 
     Client((Client)) --> WS
@@ -429,6 +433,8 @@ docker run -p 3001:3001 --env-file .env waav-gateway
 | `IBM_WATSON_API_KEY` | IBM Watson API key (for STT/TTS) | - | No* |
 | `IBM_WATSON_INSTANCE_ID` | IBM Watson service instance ID | - | No* |
 | `GROQ_API_KEY` | Groq API key (for ultra-fast Whisper STT) | - | No* |
+| `PLAYHT_API_KEY` | Play.ht API key (for TTS) | - | No* |
+| `PLAYHT_USER_ID` | Play.ht user ID (for TTS authentication) | - | No* |
 | `LIVEKIT_URL` | LiveKit server WebSocket URL | `ws://localhost:7880` | No |
 | `LIVEKIT_API_KEY` | LiveKit API key (for webhooks and token generation) | - | No*** |
 | `LIVEKIT_API_SECRET` | LiveKit API secret (for webhooks and token generation) | - | No*** |
