@@ -218,8 +218,13 @@ impl Drop for LiveKitClient {
         }
 
         // Warn if client was connected but disconnect() wasn't called explicitly
-        if self.is_connected_atomic.load(std::sync::atomic::Ordering::Acquire) {
-            warn!("LiveKitClient dropped while still connected - call disconnect() explicitly for clean shutdown");
+        if self
+            .is_connected_atomic
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            warn!(
+                "LiveKitClient dropped while still connected - call disconnect() explicitly for clean shutdown"
+            );
         }
     }
 }

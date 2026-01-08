@@ -6,7 +6,9 @@ use std::io::ErrorKind;
 use tokio::net::TcpListener;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
-use waav_gateway::{ServerConfig, middleware::auth::auth_middleware, routes, state::AppState};
+use waav_gateway::{
+    ServerConfig, config::PluginConfig, middleware::auth::auth_middleware, routes, state::AppState,
+};
 
 #[tokio::test]
 async fn test_websocket_voice_config() {
@@ -38,6 +40,9 @@ async fn test_websocket_voice_config() {
         aws_access_key_id: None,
         aws_secret_access_key: None,
         aws_region: None,
+        gnani_token: None,
+        gnani_access_key: None,
+        gnani_certificate_path: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -57,6 +62,7 @@ async fn test_websocket_voice_config() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+        plugins: PluginConfig::default(),
     };
 
     // Create application state
@@ -225,6 +231,9 @@ async fn test_websocket_invalid_message() {
         aws_access_key_id: None,
         aws_secret_access_key: None,
         aws_region: None,
+        gnani_token: None,
+        gnani_access_key: None,
+        gnani_certificate_path: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -244,6 +253,7 @@ async fn test_websocket_invalid_message() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+        plugins: PluginConfig::default(),
     };
 
     // Create application state
@@ -344,6 +354,9 @@ async fn test_websocket_sip_transfer_without_livekit_config() {
         aws_access_key_id: None,
         aws_secret_access_key: None,
         aws_region: None,
+        gnani_token: None,
+        gnani_access_key: None,
+        gnani_certificate_path: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -363,6 +376,7 @@ async fn test_websocket_sip_transfer_without_livekit_config() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+        plugins: PluginConfig::default(),
     };
 
     // Create application state
@@ -466,6 +480,9 @@ async fn test_websocket_sip_transfer_invalid_phone_number() {
         aws_access_key_id: None,
         aws_secret_access_key: None,
         aws_region: None,
+        gnani_token: None,
+        gnani_access_key: None,
+        gnani_certificate_path: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -485,6 +502,7 @@ async fn test_websocket_sip_transfer_invalid_phone_number() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+        plugins: PluginConfig::default(),
     };
 
     // Create application state
@@ -588,6 +606,9 @@ async fn test_websocket_sip_transfer_empty_phone_number() {
         aws_access_key_id: None,
         aws_secret_access_key: None,
         aws_region: None,
+        gnani_token: None,
+        gnani_access_key: None,
+        gnani_certificate_path: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -607,6 +628,7 @@ async fn test_websocket_sip_transfer_empty_phone_number() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+        plugins: PluginConfig::default(),
     };
 
     // Create application state

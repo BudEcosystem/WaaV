@@ -7,7 +7,11 @@ use axum::{
 };
 use std::sync::Arc;
 use tower::ServiceExt;
-use waav_gateway::{config::ServerConfig, middleware::auth::auth_middleware, state::AppState};
+use waav_gateway::{
+    config::{PluginConfig, ServerConfig},
+    middleware::auth::auth_middleware,
+    state::AppState,
+};
 
 /// Helper to create a test AppState with auth disabled
 async fn create_test_state_auth_disabled() -> Arc<AppState> {
@@ -38,6 +42,9 @@ async fn create_test_state_auth_disabled() -> Arc<AppState> {
         aws_access_key_id: None,
         aws_secret_access_key: None,
         aws_region: None,
+        gnani_token: None,
+        gnani_access_key: None,
+        gnani_certificate_path: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -57,6 +64,7 @@ async fn create_test_state_auth_disabled() -> Arc<AppState> {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+        plugins: PluginConfig::default(),
     };
 
     AppState::new(config).await
@@ -193,6 +201,9 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -213,6 +224,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            plugins: PluginConfig::default(),
         };
 
         let state = AppState::new(config).await;
@@ -487,6 +499,9 @@ mod with_api_secret {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -507,6 +522,7 @@ mod with_api_secret {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            plugins: PluginConfig::default(),
         };
 
         AppState::new(config).await

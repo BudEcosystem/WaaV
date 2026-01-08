@@ -511,14 +511,18 @@ impl GroqSTT {
             let wav_data_for_request = if is_last_attempt {
                 // Final attempt: move ownership (no clone needed)
                 wav_data.take().ok_or_else(|| {
-                    STTError::AudioProcessingError("WAV data unexpectedly empty on final retry".into())
+                    STTError::AudioProcessingError(
+                        "WAV data unexpectedly empty on final retry".into(),
+                    )
                 })?
             } else {
                 // More attempts possible: clone (preserves original for retry)
                 wav_data
                     .as_ref()
                     .ok_or_else(|| {
-                        STTError::AudioProcessingError("WAV data unexpectedly empty during retry".into())
+                        STTError::AudioProcessingError(
+                            "WAV data unexpectedly empty during retry".into(),
+                        )
                     })?
                     .clone()
             };

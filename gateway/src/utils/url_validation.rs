@@ -226,7 +226,10 @@ pub fn validate_webhook_url(url: &str) -> Result<(), UrlValidationError> {
 /// # Arguments
 /// * `url` - The URL string to validate
 /// * `allow_localhost` - Whether to allow localhost addresses
-pub fn validate_webhook_url_dev(url: &str, allow_localhost: bool) -> Result<(), UrlValidationError> {
+pub fn validate_webhook_url_dev(
+    url: &str,
+    allow_localhost: bool,
+) -> Result<(), UrlValidationError> {
     // Parse the URL
     let parsed = Url::parse(url)?;
 

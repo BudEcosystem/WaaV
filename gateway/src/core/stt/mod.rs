@@ -5,6 +5,7 @@ mod base;
 pub mod cartesia;
 pub mod deepgram;
 pub mod elevenlabs;
+pub mod gnani;
 pub mod google;
 pub mod groq;
 pub mod ibm_watson;
@@ -67,6 +68,13 @@ pub use groq::{
     MAX_PROMPT_TOKENS as GROQ_MAX_PROMPT_TOKENS,
     SilenceDetectionConfig as GroqSilenceDetectionConfig,
     TimestampGranularity as GroqTimestampGranularity,
+};
+
+// Re-export Gnani.ai implementation
+pub use gnani::{
+    DecodeError as GnaniDecodeError, GnaniAudioFormat, GnaniGrpcError, GnaniLanguage, GnaniSTT,
+    GnaniSTTConfig, SpeechChunk as GnaniSpeechChunk, StreamingError as GnaniStreamingError,
+    StreamingRecognitionResponse as GnaniStreamingResponse, TranscriptChunk as GnaniTranscriptChunk,
 };
 
 /// Supported STT providers
@@ -177,50 +185,9 @@ pub fn create_stt_provider(
     provider: &str,
     config: STTConfig,
 ) -> Result<Box<dyn BaseSTT>, STTError> {
-    let provider_enum: STTProvider = provider.parse()?;
-
-    match provider_enum {
-        STTProvider::Deepgram => {
-            let deepgram_stt = <DeepgramSTT as BaseSTT>::new(config)?;
-            Ok(Box::new(deepgram_stt))
-        }
-        STTProvider::Google => {
-            let google_stt = <GoogleSTT as BaseSTT>::new(config)?;
-            Ok(Box::new(google_stt))
-        }
-        STTProvider::ElevenLabs => {
-            let elevenlabs_stt = <ElevenLabsSTT as BaseSTT>::new(config)?;
-            Ok(Box::new(elevenlabs_stt))
-        }
-        STTProvider::Azure => {
-            let azure_stt = <AzureSTT as BaseSTT>::new(config)?;
-            Ok(Box::new(azure_stt))
-        }
-        STTProvider::Cartesia => {
-            let cartesia_stt = <CartesiaSTT as BaseSTT>::new(config)?;
-            Ok(Box::new(cartesia_stt))
-        }
-        STTProvider::OpenAI => {
-            let openai_stt = <OpenAISTT as BaseSTT>::new(config)?;
-            Ok(Box::new(openai_stt))
-        }
-        STTProvider::AssemblyAI => {
-            let assemblyai_stt = <AssemblyAISTT as BaseSTT>::new(config)?;
-            Ok(Box::new(assemblyai_stt))
-        }
-        STTProvider::AwsTranscribe => {
-            let aws_transcribe_stt = <AwsTranscribeSTT as BaseSTT>::new(config)?;
-            Ok(Box::new(aws_transcribe_stt))
-        }
-        STTProvider::IbmWatson => {
-            let ibm_watson_stt = <IbmWatsonSTT as BaseSTT>::new(config)?;
-            Ok(Box::new(ibm_watson_stt))
-        }
-        STTProvider::Groq => {
-            let groq_stt = <GroqSTT as BaseSTT>::new(config)?;
-            Ok(Box::new(groq_stt))
-        }
-    }
+    // Delegate to the plugin registry
+    // This enables dynamic provider registration while maintaining backward compatibility
+    crate::plugin::global_registry().create_stt(provider, config)
 }
 
 /// Factory function to create STT providers using the enum directly
@@ -258,48 +225,8 @@ pub fn create_stt_provider_from_enum(
     provider: STTProvider,
     config: STTConfig,
 ) -> Result<Box<dyn BaseSTT>, STTError> {
-    match provider {
-        STTProvider::Deepgram => {
-            let deepgram_stt = <DeepgramSTT as BaseSTT>::new(config)?;
-            Ok(Box::new(deepgram_stt))
-        }
-        STTProvider::Google => {
-            let google_stt = <GoogleSTT as BaseSTT>::new(config)?;
-            Ok(Box::new(google_stt))
-        }
-        STTProvider::ElevenLabs => {
-            let elevenlabs_stt = <ElevenLabsSTT as BaseSTT>::new(config)?;
-            Ok(Box::new(elevenlabs_stt))
-        }
-        STTProvider::Azure => {
-            let azure_stt = <AzureSTT as BaseSTT>::new(config)?;
-            Ok(Box::new(azure_stt))
-        }
-        STTProvider::Cartesia => {
-            let cartesia_stt = <CartesiaSTT as BaseSTT>::new(config)?;
-            Ok(Box::new(cartesia_stt))
-        }
-        STTProvider::OpenAI => {
-            let openai_stt = <OpenAISTT as BaseSTT>::new(config)?;
-            Ok(Box::new(openai_stt))
-        }
-        STTProvider::AssemblyAI => {
-            let assemblyai_stt = <AssemblyAISTT as BaseSTT>::new(config)?;
-            Ok(Box::new(assemblyai_stt))
-        }
-        STTProvider::AwsTranscribe => {
-            let aws_transcribe_stt = <AwsTranscribeSTT as BaseSTT>::new(config)?;
-            Ok(Box::new(aws_transcribe_stt))
-        }
-        STTProvider::IbmWatson => {
-            let ibm_watson_stt = <IbmWatsonSTT as BaseSTT>::new(config)?;
-            Ok(Box::new(ibm_watson_stt))
-        }
-        STTProvider::Groq => {
-            let groq_stt = <GroqSTT as BaseSTT>::new(config)?;
-            Ok(Box::new(groq_stt))
-        }
-    }
+    // Delegate to the plugin registry using the provider's string representation
+    crate::plugin::global_registry().create_stt(&provider.to_string(), config)
 }
 
 /// Get a list of all supported STT providers

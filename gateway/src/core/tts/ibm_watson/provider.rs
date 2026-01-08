@@ -281,10 +281,10 @@ impl IbmWatsonTTS {
         // Check cached token
         {
             let token_guard = self.token.read().await;
-            if let Some(ref token) = *token_guard {
-                if !token.is_expired() {
-                    return Ok(token.access_token.clone());
-                }
+            if let Some(ref token) = *token_guard
+                && !token.is_expired()
+            {
+                return Ok(token.access_token.clone());
             }
         }
 

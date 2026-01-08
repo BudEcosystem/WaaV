@@ -10,7 +10,7 @@ use axum::{Router, middleware};
 use axum_server::tls_rustls::RustlsConfig;
 use clap::{Parser, Subcommand};
 use http::{
-    Method, HeaderName,
+    HeaderName, Method,
     header::{AUTHORIZATION, CONTENT_TYPE},
 };
 use tokio::net::TcpListener;
@@ -158,7 +158,10 @@ async fn main() -> anyhow::Result<()> {
     // Create Realtime WebSocket routes for audio-to-audio streaming (OpenAI Realtime API)
     // Also uses connection limit middleware for capacity management
     let realtime_routes = routes::realtime::create_realtime_router()
-        .layer(middleware::from_fn_with_state(app_state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            auth_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
             connection_limit_middleware,
@@ -199,7 +202,11 @@ async fn main() -> anyhow::Result<()> {
                     Method::DELETE,
                     Method::OPTIONS,
                 ])
-                .allow_headers([AUTHORIZATION, CONTENT_TYPE, HeaderName::from_static("x-provider-api-key")])
+                .allow_headers([
+                    AUTHORIZATION,
+                    CONTENT_TYPE,
+                    HeaderName::from_static("x-provider-api-key"),
+                ])
                 .allow_credentials(false)
         } else {
             // Parse comma-separated origins
@@ -216,7 +223,11 @@ async fn main() -> anyhow::Result<()> {
                     Method::DELETE,
                     Method::OPTIONS,
                 ])
-                .allow_headers([AUTHORIZATION, CONTENT_TYPE, HeaderName::from_static("x-provider-api-key")])
+                .allow_headers([
+                    AUTHORIZATION,
+                    CONTENT_TYPE,
+                    HeaderName::from_static("x-provider-api-key"),
+                ])
                 .allow_credentials(true)
         }
     } else {
@@ -229,7 +240,11 @@ async fn main() -> anyhow::Result<()> {
         );
         CorsLayer::new()
             .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-            .allow_headers([AUTHORIZATION, CONTENT_TYPE, HeaderName::from_static("x-provider-api-key")])
+            .allow_headers([
+                AUTHORIZATION,
+                CONTENT_TYPE,
+                HeaderName::from_static("x-provider-api-key"),
+            ])
             .allow_credentials(false)
         // No allow_origin = same-origin only (browsers block cross-origin requests)
     };

@@ -68,6 +68,7 @@ pub struct YamlConfig {
     pub auth: Option<AuthYaml>,
     pub sip: Option<SipYaml>,
     pub security: Option<SecurityYaml>,
+    pub plugins: Option<PluginsYaml>,
 }
 
 /// Server configuration from YAML
@@ -143,6 +144,12 @@ pub struct ProvidersYaml {
     pub aws_secret_access_key: Option<String>,
     /// AWS region (e.g., "us-east-1", "eu-west-1")
     pub aws_region: Option<String>,
+    /// Gnani.ai authentication token (required for Gnani STT/TTS)
+    pub gnani_token: Option<String>,
+    /// Gnani.ai access key (required for Gnani STT/TTS)
+    pub gnani_access_key: Option<String>,
+    /// Path to Gnani SSL certificate file (for mTLS authentication)
+    pub gnani_certificate_path: Option<String>,
 }
 
 /// Recording S3 configuration from YAML
@@ -234,6 +241,31 @@ pub struct SecurityYaml {
     pub max_websocket_connections: Option<usize>,
     /// Maximum connections per IP address
     pub max_connections_per_ip: Option<u32>,
+}
+
+/// Plugin configuration from YAML
+///
+/// # Example YAML structure
+/// ```yaml
+/// plugins:
+///   enabled: true
+///   plugin_dir: "/opt/waav/plugins"
+///   providers:
+///     deepgram:
+///       custom_endpoint: "https://custom.deepgram.com"
+///     my_custom_stt:
+///       api_key: "custom-key"
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct PluginsYaml {
+    /// Whether the plugin system is enabled (default: true for backward compatibility)
+    pub enabled: Option<bool>,
+    /// Directory to load external plugins from (optional)
+    pub plugin_dir: Option<String>,
+    /// Provider-specific configuration (keyed by provider name)
+    #[serde(default)]
+    pub providers: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl YamlConfig {

@@ -6,4 +6,4 @@ pub mod req_manager;
 pub mod sip_api_client;
 pub mod sip_hooks;
 pub mod url_validation;
-pub use url_validation::{validate_webhook_url, validate_webhook_url_dev, UrlValidationError};
+pub use url_validation::{UrlValidationError, validate_webhook_url, validate_webhook_url_dev};

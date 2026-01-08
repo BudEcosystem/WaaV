@@ -168,9 +168,8 @@ impl ElevenLabsSTT {
         config: &ElevenLabsSTTConfig,
     ) -> Result<String, STTError> {
         // URL-encode parameters that could contain special characters
-        let encode = |s: &str| -> String {
-            form_urlencoded::byte_serialize(s.as_bytes()).collect()
-        };
+        let encode =
+            |s: &str| -> String { form_urlencoded::byte_serialize(s.as_bytes()).collect() };
 
         // Pre-allocate with estimated capacity
         let mut url = String::with_capacity(512);

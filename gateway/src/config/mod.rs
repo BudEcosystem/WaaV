@@ -29,6 +29,7 @@
 //! # }
 //! ```
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 mod env;
@@ -59,6 +60,32 @@ pub struct TlsConfig {
 pub struct AuthApiSecret {
     pub id: String,
     pub secret: String,
+}
+
+/// Plugin system configuration
+///
+/// Controls how the plugin registry discovers and loads providers.
+/// This configuration is backward compatible - if not specified,
+/// the plugin system is enabled with all built-in providers.
+///
+/// # Example YAML
+/// ```yaml
+/// plugins:
+///   enabled: true
+///   plugin_dir: "/opt/waav/plugins"
+///   providers:
+///     deepgram:
+///       custom_endpoint: "https://custom.deepgram.com"
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct PluginConfig {
+    /// Whether the plugin system is enabled (default: true)
+    pub enabled: bool,
+    /// Directory to load external plugins from (optional, requires `plugins-dynamic` feature)
+    pub plugin_dir: Option<PathBuf>,
+    /// Provider-specific configuration (keyed by provider name)
+    /// This allows passing custom settings to individual providers
+    pub provider_config: HashMap<String, serde_json::Value>,
 }
 
 /// Server configuration
@@ -129,6 +156,12 @@ pub struct ServerConfig {
     pub aws_secret_access_key: Option<String>,
     /// AWS region (e.g., "us-east-1", "eu-west-1")
     pub aws_region: Option<String>,
+    /// Gnani.ai authentication token (required for Gnani STT/TTS)
+    pub gnani_token: Option<String>,
+    /// Gnani.ai access key (required for Gnani STT/TTS)
+    pub gnani_access_key: Option<String>,
+    /// Path to Gnani SSL certificate file (for mTLS authentication)
+    pub gnani_certificate_path: Option<PathBuf>,
 
     // LiveKit recording configuration
     pub recording_s3_bucket: Option<String>,
@@ -174,6 +207,11 @@ pub struct ServerConfig {
     /// Maximum connections per IP address
     /// Default: 100
     pub max_connections_per_ip: u32,
+
+    // Plugin configuration
+    /// Plugin system configuration (optional, backward compatible)
+    /// If not specified, the plugin system is enabled with built-in providers only
+    pub plugins: PluginConfig,
 }
 
 /// Implement Drop to zeroize all secret fields when ServerConfig is dropped.
@@ -230,6 +268,12 @@ impl Drop for ServerConfig {
         }
         if let Some(ref mut secret) = self.aws_secret_access_key {
             secret.zeroize();
+        }
+        if let Some(ref mut token) = self.gnani_token {
+            token.zeroize();
+        }
+        if let Some(ref mut key) = self.gnani_access_key {
+            key.zeroize();
         }
         // Zeroize auth API secrets
         for secret in &mut self.auth_api_secrets {
@@ -482,6 +526,13 @@ impl ServerConfig {
                             .to_string()
                     })
             }
+            "gnani" | "gnani-ai" | "gnani.ai" | "vachana" => {
+                // Gnani.ai uses token-based authentication for STT/TTS
+                // Returns token as the "api_key" - access_key and certificate are handled separately
+                self.gnani_token.as_ref().cloned().ok_or_else(|| {
+                    "Gnani token not configured in server environment (GNANI_TOKEN)".to_string()
+                })
+            }
             _ => Err(format!("Unsupported provider: {provider}")),
         }
     }
@@ -597,9 +648,9 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_get_api_key_deepgram_success() {
-        let config = ServerConfig {
+    /// Helper function to create a test ServerConfig with defaults
+    fn test_config() -> ServerConfig {
+        ServerConfig {
             host: "localhost".to_string(),
             port: 3001,
             tls: None,
@@ -607,7 +658,7 @@ mod tests {
             livekit_public_url: "http://localhost:7880".to_string(),
             livekit_api_key: None,
             livekit_api_secret: None,
-            deepgram_api_key: Some("test-deepgram-key".to_string()),
+            deepgram_api_key: None,
             elevenlabs_api_key: None,
             google_credentials: None,
             azure_speech_subscription_key: None,
@@ -626,12 +677,15 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
             recording_s3_access_key: None,
             recording_s3_secret_key: None,
-            recording_s3_prefix: Some("recordings/base".to_string()),
+            recording_s3_prefix: None,
             cache_path: None,
             cache_ttl_seconds: Some(3600),
             auth_service_url: None,
@@ -645,7 +699,15 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
-        };
+            plugins: PluginConfig::default(),
+        }
+    }
+
+    #[test]
+    fn test_get_api_key_deepgram_success() {
+        let mut config = test_config();
+        config.deepgram_api_key = Some("test-deepgram-key".to_string());
+        config.recording_s3_prefix = Some("recordings/base".to_string());
 
         let result = config.get_api_key("deepgram");
         assert!(result.is_ok());
@@ -685,6 +747,9 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -704,6 +769,7 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            plugins: PluginConfig::default(),
         };
 
         let result = config.get_api_key("elevenlabs");
@@ -740,6 +806,9 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -759,6 +828,7 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            plugins: PluginConfig::default(),
         };
 
         let result = config.get_api_key("deepgram");
@@ -798,6 +868,9 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -817,6 +890,7 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            plugins: PluginConfig::default(),
         };
 
         let result = config.get_api_key("unsupported_provider");
@@ -856,6 +930,9 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -875,6 +952,7 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            plugins: PluginConfig::default(),
         };
 
         // Test uppercase
@@ -920,6 +998,9 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -939,6 +1020,7 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            plugins: PluginConfig::default(),
         };
 
         assert!(config_with_jwt.has_jwt_auth());
@@ -971,6 +1053,9 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -990,6 +1075,7 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            plugins: PluginConfig::default(),
         };
 
         assert!(!config_without_jwt.has_jwt_auth());
@@ -1024,6 +1110,9 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1046,6 +1135,7 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            plugins: PluginConfig::default(),
         };
 
         assert!(config_with_api_secret.has_api_secret_auth());
@@ -1078,6 +1168,9 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1097,6 +1190,7 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            plugins: PluginConfig::default(),
         };
 
         assert!(!config_without_api_secret.has_api_secret_auth());
@@ -1131,6 +1225,9 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1159,6 +1256,7 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            plugins: PluginConfig::default(),
         };
 
         assert_eq!(config.find_api_secret_id("token-a"), Some("client-a"));
@@ -1194,6 +1292,9 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1213,6 +1314,7 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            plugins: PluginConfig::default(),
         };
 
         // Google returns the credentials path/content when configured
@@ -1251,6 +1353,9 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1270,6 +1375,7 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            plugins: PluginConfig::default(),
         };
 
         // Google returns the inline JSON credentials when configured
@@ -1307,6 +1413,9 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1326,6 +1435,7 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            plugins: PluginConfig::default(),
         };
 
         // Google returns empty string when not configured, allowing ADC to be used
@@ -1363,6 +1473,9 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1382,6 +1495,7 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            plugins: PluginConfig::default(),
         };
 
         // Test uppercase
@@ -1424,6 +1538,9 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1443,6 +1560,7 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            plugins: PluginConfig::default(),
         };
 
         let result = config.get_api_key("microsoft-azure");
@@ -1479,6 +1597,9 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1498,6 +1619,7 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            plugins: PluginConfig::default(),
         };
 
         let result = config.get_api_key("microsoft-azure");
@@ -1537,6 +1659,9 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1556,6 +1681,7 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            plugins: PluginConfig::default(),
         };
 
         assert_eq!(config.get_azure_speech_region(), "westeurope");
@@ -1590,6 +1716,9 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -1609,6 +1738,7 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            plugins: PluginConfig::default(),
         };
 
         // Default is "eastus"

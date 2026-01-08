@@ -5,7 +5,7 @@ use super::parse_auth_api_secrets_json;
 use super::sip::{SipConfig, SipHookConfig};
 use super::utils::parse_bool;
 use super::yaml::YamlConfig;
-use super::{AuthApiSecret, ServerConfig, TlsConfig};
+use super::{AuthApiSecret, PluginConfig, ServerConfig, TlsConfig};
 
 /// Merge YAML configuration with environment variables
 ///
@@ -251,6 +251,24 @@ pub fn merge_config(
         yaml.providers.as_ref().and_then(|p| p.aws_region.clone())
     );
 
+    // Gnani.ai credentials
+    let gnani_token = get_optional!(
+        "GNANI_TOKEN",
+        yaml.providers.as_ref().and_then(|p| p.gnani_token.clone())
+    );
+    let gnani_access_key = get_optional!(
+        "GNANI_ACCESS_KEY",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.gnani_access_key.clone())
+    );
+    let gnani_certificate_path: Option<PathBuf> = yaml
+        .providers
+        .as_ref()
+        .and_then(|p| p.gnani_certificate_path.clone())
+        .or_else(|| env::var("GNANI_CERTIFICATE_PATH").ok())
+        .map(PathBuf::from);
+
     // Recording S3 configuration
     let recording_s3_bucket = get_optional!(
         "RECORDING_S3_BUCKET",
@@ -428,6 +446,37 @@ pub fn merge_config(
         })
         .unwrap_or(100);
 
+    // Plugin configuration (backward compatible: enabled by default)
+    let plugins_enabled = yaml
+        .plugins
+        .as_ref()
+        .and_then(|p| p.enabled)
+        .or_else(|| {
+            env::var("PLUGINS_ENABLED")
+                .ok()
+                .and_then(|s| parse_bool(&s))
+        })
+        .unwrap_or(true); // Enabled by default for backward compatibility
+
+    let plugins_dir = yaml
+        .plugins
+        .as_ref()
+        .and_then(|p| p.plugin_dir.clone())
+        .or_else(|| env::var("PLUGINS_DIR").ok())
+        .map(PathBuf::from);
+
+    let plugins_provider_config = yaml
+        .plugins
+        .as_ref()
+        .map(|p| p.providers.clone())
+        .unwrap_or_default();
+
+    let plugins = PluginConfig {
+        enabled: plugins_enabled,
+        plugin_dir: plugins_dir,
+        provider_config: plugins_provider_config,
+    };
+
     Ok(ServerConfig {
         host,
         port,
@@ -455,6 +504,9 @@ pub fn merge_config(
         aws_access_key_id,
         aws_secret_access_key,
         aws_region,
+        gnani_token,
+        gnani_access_key,
+        gnani_certificate_path,
         recording_s3_bucket,
         recording_s3_region,
         recording_s3_endpoint,
@@ -474,6 +526,7 @@ pub fn merge_config(
         rate_limit_burst_size,
         max_websocket_connections,
         max_connections_per_ip,
+        plugins,
     })
 }
 

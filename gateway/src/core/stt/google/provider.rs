@@ -329,7 +329,7 @@ impl GoogleSTT {
                     Err(_elapsed) => {
                         // Idle timeout - no message received for 60s, connection likely stuck
                         let stt_error = STTError::NetworkError(
-                            "gRPC idle timeout - no message received for 60 seconds".into()
+                            "gRPC idle timeout - no message received for 60 seconds".into(),
                         );
                         error!("Google STT gRPC idle timeout: {}", stt_error);
                         let _ = error_tx.try_send(stt_error);

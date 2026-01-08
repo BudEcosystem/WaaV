@@ -111,14 +111,8 @@ mod tests {
         let global = ConnectionLimitError::GlobalLimitReached;
         let per_ip = ConnectionLimitError::PerIpLimitReached;
 
-        assert_eq!(
-            format!("{:?}", global),
-            "GlobalLimitReached"
-        );
-        assert_eq!(
-            format!("{:?}", per_ip),
-            "PerIpLimitReached"
-        );
+        assert_eq!(format!("{:?}", global), "GlobalLimitReached");
+        assert_eq!(format!("{:?}", per_ip), "PerIpLimitReached");
     }
 
     #[tokio::test]
@@ -153,6 +147,9 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -172,6 +169,7 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: Some(10),
             max_connections_per_ip: 3,
+            plugins: crate::config::PluginConfig::default(),
         };
 
         let state = AppState::new(config).await;
@@ -244,6 +242,9 @@ mod tests {
             aws_access_key_id: None,
             aws_secret_access_key: None,
             aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
             recording_s3_bucket: None,
             recording_s3_region: None,
             recording_s3_endpoint: None,
@@ -261,8 +262,9 @@ mod tests {
             cors_allowed_origins: None,
             rate_limit_requests_per_second: 60,
             rate_limit_burst_size: 10,
-            max_websocket_connections: Some(5),  // Global limit of 5
-            max_connections_per_ip: 10,           // Per-IP limit higher than global
+            max_websocket_connections: Some(5), // Global limit of 5
+            max_connections_per_ip: 10,         // Per-IP limit higher than global
+            plugins: crate::config::PluginConfig::default(),
         };
 
         let state = AppState::new(config).await;

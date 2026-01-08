@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tower::util::ServiceExt;
 
-use waav_gateway::{ServerConfig, routes, state::AppState};
+use waav_gateway::{ServerConfig, config::PluginConfig, routes, state::AppState};
 
 /// Helper to create a minimal test configuration with LiveKit credentials
 fn create_test_config_with_livekit() -> ServerConfig {
@@ -39,6 +39,9 @@ fn create_test_config_with_livekit() -> ServerConfig {
         aws_access_key_id: None,
         aws_secret_access_key: None,
         aws_region: None,
+        gnani_token: None,
+        gnani_access_key: None,
+        gnani_certificate_path: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -58,6 +61,7 @@ fn create_test_config_with_livekit() -> ServerConfig {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+        plugins: PluginConfig::default(),
     }
 }
 
@@ -90,6 +94,9 @@ fn create_test_config_without_livekit() -> ServerConfig {
         aws_access_key_id: None,
         aws_secret_access_key: None,
         aws_region: None,
+        gnani_token: None,
+        gnani_access_key: None,
+        gnani_certificate_path: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -109,6 +116,7 @@ fn create_test_config_without_livekit() -> ServerConfig {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+        plugins: PluginConfig::default(),
     }
 }
 

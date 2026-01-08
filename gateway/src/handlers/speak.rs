@@ -76,10 +76,7 @@ impl AudioCollector {
         match tokio::time::timeout(timeout, self.notify.notified()).await {
             Ok(()) => Ok(()),
             Err(_elapsed) => {
-                warn!(
-                    "TTS synthesis timeout after {}s",
-                    timeout_secs
-                );
+                warn!("TTS synthesis timeout after {}s", timeout_secs);
                 Err("TTS synthesis timeout")
             }
         }
@@ -312,7 +309,10 @@ pub async fn speak_handler(
     }
 
     // Wait for completion with timeout
-    if let Err(e) = collector.wait_for_completion(DEFAULT_SPEAK_TIMEOUT_SECS).await {
+    if let Err(e) = collector
+        .wait_for_completion(DEFAULT_SPEAK_TIMEOUT_SECS)
+        .await
+    {
         // Disconnect on timeout
         let _ = tts_provider.disconnect().await;
         return (

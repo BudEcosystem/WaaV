@@ -5,7 +5,7 @@ use axum::{
 use serde_json::{Value, json};
 use tower::util::ServiceExt;
 
-use waav_gateway::{ServerConfig, routes, state::AppState};
+use waav_gateway::{ServerConfig, config::PluginConfig, routes, state::AppState};
 
 #[tokio::test]
 async fn test_health_check() {
@@ -37,6 +37,9 @@ async fn test_health_check() {
         aws_access_key_id: None,
         aws_secret_access_key: None,
         aws_region: None,
+        gnani_token: None,
+        gnani_access_key: None,
+        gnani_certificate_path: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -56,6 +59,7 @@ async fn test_health_check() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+        plugins: PluginConfig::default(),
     };
 
     // Create app state
@@ -115,6 +119,9 @@ async fn test_speak_endpoint_missing_api_key() {
         aws_access_key_id: None,
         aws_secret_access_key: None,
         aws_region: None,
+        gnani_token: None,
+        gnani_access_key: None,
+        gnani_certificate_path: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -134,6 +141,7 @@ async fn test_speak_endpoint_missing_api_key() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+        plugins: PluginConfig::default(),
     };
 
     // Create app state
@@ -201,6 +209,9 @@ async fn test_speak_endpoint_empty_text() {
         aws_access_key_id: None,
         aws_secret_access_key: None,
         aws_region: None,
+        gnani_token: None,
+        gnani_access_key: None,
+        gnani_certificate_path: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -220,6 +231,7 @@ async fn test_speak_endpoint_empty_text() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+        plugins: PluginConfig::default(),
     };
 
     // Create app state
@@ -293,6 +305,9 @@ async fn test_speak_endpoint_with_pronunciations() {
         aws_access_key_id: None,
         aws_secret_access_key: None,
         aws_region: None,
+        gnani_token: None,
+        gnani_access_key: None,
+        gnani_certificate_path: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -313,6 +328,7 @@ async fn test_speak_endpoint_with_pronunciations() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+        plugins: PluginConfig::default(),
     };
 
     // Create app state
@@ -388,6 +404,9 @@ async fn test_speak_endpoint_invalid_provider() {
         aws_access_key_id: None,
         aws_secret_access_key: None,
         aws_region: None,
+        gnani_token: None,
+        gnani_access_key: None,
+        gnani_certificate_path: None,
         recording_s3_bucket: None,
         recording_s3_region: None,
         recording_s3_endpoint: None,
@@ -408,6 +427,7 @@ async fn test_speak_endpoint_invalid_provider() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+        plugins: PluginConfig::default(),
     };
 
     // Create app state

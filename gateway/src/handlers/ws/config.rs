@@ -285,7 +285,7 @@ impl TTSWebSocketConfig {
 
         Some(EmotionConfig {
             emotion: self.emotion,
-            intensity: self.emotion_intensity.clone(),
+            intensity: self.emotion_intensity,
             style: self.delivery_style,
             description: self.emotion_description.clone(),
             context: None, // Context is not exposed in WebSocket config for simplicity

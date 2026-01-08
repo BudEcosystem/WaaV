@@ -182,9 +182,8 @@ impl CartesiaSTTConfig {
     /// ```
     pub fn build_websocket_url(&self, api_key: &str) -> String {
         // URL-encode parameters that could contain special characters
-        let encode = |s: &str| -> String {
-            form_urlencoded::byte_serialize(s.as_bytes()).collect()
-        };
+        let encode =
+            |s: &str| -> String { form_urlencoded::byte_serialize(s.as_bytes()).collect() };
 
         // Pre-allocate URL string capacity for performance
         let mut url = String::with_capacity(256);

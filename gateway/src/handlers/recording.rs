@@ -134,8 +134,11 @@ pub async fn download_recording(
     };
 
     // Build object key with auth_id for tenant-scoped access
-    let object_key =
-        build_recording_object_key(state.config.recording_s3_prefix.as_ref(), auth_id, &stream_id);
+    let object_key = build_recording_object_key(
+        state.config.recording_s3_prefix.as_ref(),
+        auth_id,
+        &stream_id,
+    );
 
     let object_path = match ObjectPath::parse(object_key.clone()) {
         Ok(path) => path,

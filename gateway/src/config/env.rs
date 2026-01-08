@@ -8,7 +8,7 @@ use super::validation::{
     validate_auth_api_secrets, validate_auth_required, validate_jwt_auth, validate_security_config,
     validate_tls_config,
 };
-use super::{AuthApiSecret, ServerConfig, TlsConfig};
+use super::{AuthApiSecret, PluginConfig, ServerConfig, TlsConfig};
 
 impl ServerConfig {
     /// Load configuration from environment variables
@@ -106,6 +106,11 @@ impl ServerConfig {
         let aws_secret_access_key = env::var("AWS_SECRET_ACCESS_KEY").ok();
         let aws_region = env::var("AWS_REGION").ok();
 
+        // Gnani.ai credentials (used for Indic STT/TTS)
+        let gnani_token = env::var("GNANI_TOKEN").ok();
+        let gnani_access_key = env::var("GNANI_ACCESS_KEY").ok();
+        let gnani_certificate_path = env::var("GNANI_CERTIFICATE_PATH").ok().map(PathBuf::from);
+
         // LiveKit recording S3 configuration
         let recording_s3_bucket = env::var("RECORDING_S3_BUCKET").ok();
         let recording_s3_region = env::var("RECORDING_S3_REGION").ok();
@@ -192,6 +197,20 @@ impl ServerConfig {
             max_connections_per_ip,
         )?;
 
+        // Plugin configuration (backward compatible: enabled by default)
+        let plugins_enabled = env::var("PLUGINS_ENABLED")
+            .ok()
+            .and_then(|v| parse_bool(&v))
+            .unwrap_or(true); // Enabled by default
+
+        let plugins_dir = env::var("PLUGINS_DIR").ok().map(PathBuf::from);
+
+        let plugins = PluginConfig {
+            enabled: plugins_enabled,
+            plugin_dir: plugins_dir,
+            provider_config: Default::default(), // No provider config from env vars
+        };
+
         Ok(ServerConfig {
             host,
             port,
@@ -219,6 +238,9 @@ impl ServerConfig {
             aws_access_key_id,
             aws_secret_access_key,
             aws_region,
+            gnani_token,
+            gnani_access_key,
+            gnani_certificate_path,
             recording_s3_bucket,
             recording_s3_region,
             recording_s3_endpoint,
@@ -239,6 +261,7 @@ impl ServerConfig {
             rate_limit_burst_size,
             max_websocket_connections,
             max_connections_per_ip,
+            plugins,
         })
     }
 }

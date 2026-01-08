@@ -308,7 +308,9 @@ pub fn validate_security_config(
         return Err("burst_size must be positive (0 would disable bursting)".into());
     }
     if max_connections_per_ip == 0 {
-        return Err("max_connections_per_ip must be positive (0 would disable connection limiting)".into());
+        return Err(
+            "max_connections_per_ip must be positive (0 would disable connection limiting)".into(),
+        );
     }
     Ok(())
 }

@@ -482,7 +482,8 @@ impl AwsTranscribeSTT {
                             Err(_elapsed) => {
                                 // Idle timeout - no message received for 60s
                                 let stt_error = STTError::NetworkError(
-                                    "Transcribe stream idle timeout - no message for 60 seconds".into()
+                                    "Transcribe stream idle timeout - no message for 60 seconds"
+                                        .into(),
                                 );
                                 error!("AWS Transcribe idle timeout: {}", stt_error);
                                 let _ = error_tx.try_send(stt_error);

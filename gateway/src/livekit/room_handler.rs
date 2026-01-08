@@ -915,8 +915,11 @@ mod tests {
 
     #[test]
     fn test_recording_path_construction_uuid_stream_id() {
-        let filepath =
-            build_recording_filepath("calls", Some("client1"), "550e8400-e29b-41d4-a716-446655440000");
+        let filepath = build_recording_filepath(
+            "calls",
+            Some("client1"),
+            "550e8400-e29b-41d4-a716-446655440000",
+        );
         assert_eq!(
             filepath,
             "calls/client1/550e8400-e29b-41d4-a716-446655440000/audio.ogg"

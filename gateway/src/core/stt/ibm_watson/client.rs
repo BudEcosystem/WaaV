@@ -109,7 +109,9 @@ async fn fetch_iam_token(api_key: &str) -> Result<IamToken, STTError> {
         .pool_max_idle_per_host(4) // Limit connection pool size
         .pool_idle_timeout(Duration::from_secs(90)) // Close idle connections after 90s
         .build()
-        .map_err(|e| STTError::AuthenticationFailed(format!("Failed to create HTTP client: {e}")))?;
+        .map_err(|e| {
+            STTError::AuthenticationFailed(format!("Failed to create HTTP client: {e}"))
+        })?;
 
     // URL-encode the API key
     let encoded_api_key: String = form_urlencoded::byte_serialize(api_key.as_bytes()).collect();

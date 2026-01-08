@@ -1135,8 +1135,9 @@ async fn test_factory_rejects_unknown_provider() {
     if let Err(e) = result {
         let error_msg = e.to_string();
         assert!(
-            error_msg.contains("Unsupported TTS provider"),
-            "Error should indicate unsupported provider: {error_msg}"
+            error_msg.contains("Unknown TTS provider")
+                || error_msg.contains("Unsupported TTS provider"),
+            "Error should indicate unknown/unsupported provider: {error_msg}"
         );
     }
 }

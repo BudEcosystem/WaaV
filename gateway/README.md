@@ -2,30 +2,18 @@
 
 A high-performance real-time voice processing server built in Rust that provides unified Speech-to-Text (STT) and Text-to-Speech (TTS) services through WebSocket and REST APIs.
 
-
-
-
 ## Features
 
 - **Unified Voice API**: Single interface for multiple STT/TTS providers
 - **Real-time Processing**: WebSocket-based bidirectional audio streaming
 - **LiveKit Integration**: WebRTC audio streaming with room-based communication
 - **Advanced Noise Filtering**: Optional DeepFilterNet integration (`noise-filter` feature)
-- **Provider Flexibility**: Pluggable architecture supporting 10+ providers
-  - Deepgram (STT/TTS)
-  - ElevenLabs (STT/TTS)
-  - Google Cloud (STT/TTS) - WaveNet, Neural2, and Studio voices
-  - Microsoft Azure (STT/TTS) - 400+ neural voices across 140+ languages
-  - OpenAI (STT/TTS/Realtime) - Whisper, TTS-1, GPT-4o Realtime API
-  - AssemblyAI (STT) - Streaming API v3, 99 languages, immutable transcripts
-  - Cartesia (STT/TTS) - Ultra-low latency Sonic model
-  - AWS Transcribe/Polly (STT/TTS) - Enterprise-grade with 100+ languages
-  - IBM Watson (STT/TTS) - 30+ languages, speaker diarization, neural voices
-  - Groq (STT) - Ultra-fast Whisper (216x real-time), $0.04/hour
-  - Play.ht (TTS) - Low-latency (~190ms), PlayDialog multi-turn, 36+ languages, voice cloning
-- **Realtime AI APIs**: Full-duplex audio-to-audio streaming
-  - OpenAI Realtime - GPT-4o voice conversations
-  - Hume EVI - Empathic Voice Interface with emotion understanding
+- **Plugin Architecture**: Extensible capability-based plugin system with O(1) provider lookup
+- **25 Built-in Providers**: Comprehensive coverage of cloud and enterprise STT/TTS services
+  - **STT (11 providers)**: Deepgram, Google Cloud, ElevenLabs, Microsoft Azure, OpenAI Whisper, AssemblyAI, Cartesia, AWS Transcribe, IBM Watson, Groq, Gnani
+  - **TTS (12 providers)**: Deepgram Aura, ElevenLabs, Google Cloud, Microsoft Azure, OpenAI, Cartesia Sonic, AWS Polly, IBM Watson, Hume AI, LMNT, Play.ht, Gnani
+  - **Realtime (2 providers)**: OpenAI GPT-4o Realtime, Hume EVI
+- **Indic Language Support**: Gnani provider with 14 STT languages and 12 TTS languages
 - **Audio-Disabled Mode**: Development mode without API keys
 
 ## Quick Start
@@ -189,6 +177,22 @@ Production-grade resource controls:
 }
 ```
 
+**Gnani STT Configuration** (Indic languages):
+```json
+{
+  "type": "config",
+  "config": {
+    "stt_provider": "gnani",
+    "language": "hi-IN",
+    "tts_provider": "gnani",
+    "gnani_language_code": "Hi-IN",
+    "gnani_voice_name": "speaker1"
+  }
+}
+```
+
+Gnani supports 14 STT languages (kn-IN, hi-IN, ta-IN, te-IN, gu-IN, mr-IN, bn-IN, ml-IN, pa-guru-IN, ur-IN, en-IN, en-GB, en-US, en-SG) and 12 TTS languages with multi-speaker support.
+
 **Audio Input**: Binary audio data (16kHz, 16-bit PCM)
 
 **Text Input**:
@@ -213,25 +217,71 @@ Production-grade resource controls:
 
 ## Architecture Overview
 
+### Plugin Architecture
+
+WaaV Gateway uses a **capability-based plugin architecture** that enables dynamic provider registration with O(1) lookup performance. For complete plugin documentation, see [docs/plugins.md](docs/plugins.md).
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#4a90d9', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#2c5aa0', 'lineColor': '#5c6bc0', 'secondaryColor': '#81c784', 'tertiaryColor': '#fff3e0', 'background': '#fafafa', 'mainBkg': '#ffffff', 'nodeBorder': '#424242', 'clusterBkg': '#f5f5f5', 'clusterBorder': '#bdbdbd', 'titleColor': '#212121', 'edgeLabelBackground': '#ffffff'}}}%%
+flowchart TB
+    subgraph Registration["Plugin Registration Layer"]
+        direction LR
+        INV["inventory crate<br/>(compile-time)"]
+        PHF["PHF Static Map<br/>(O(1) lookup)"]
+        DASH["DashMap Registry<br/>(runtime)"]
+        INV --> PHF --> DASH
+    end
+
+    subgraph Capabilities["Capability Types"]
+        direction LR
+        STT_CAP["STTCapability<br/>11 providers"]
+        TTS_CAP["TTSCapability<br/>12 providers"]
+        RT_CAP["RealtimeCapability<br/>2 providers"]
+        PROC_CAP["AudioProcessor<br/>VAD, Noise Filter"]
+        MW_CAP["Middleware<br/>Auth, Rate Limit"]
+        WS_CAP["WSHandler<br/>Custom Messages"]
+    end
+
+    subgraph Isolation["Safety Layer"]
+        CATCH["catch_unwind<br/>Panic Isolation"]
+        LIFE["Lifecycle Manager<br/>State Machine"]
+    end
+
+    Registration --> Capabilities
+    Capabilities --> Isolation
+
+    style Registration fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    style Capabilities fill:#e8f5e9,stroke:#388e3c,stroke-width:2px
+    style Isolation fill:#fff3e0,stroke:#f57c00,stroke-width:2px
+```
+
+**Key Features:**
+- **O(1) Provider Lookup**: PHF perfect hash maps for built-in providers
+- **Panic Isolation**: Plugin panics are caught and converted to errors
+- **Lifecycle Management**: Plugins transition through defined states
+- **Concurrent Access**: Thread-safe DashMap for runtime registration
+
 ### Core Components
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#4a90d9', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#2c5aa0', 'lineColor': '#5c6bc0', 'secondaryColor': '#81c784', 'tertiaryColor': '#fff3e0', 'background': '#fafafa', 'mainBkg': '#ffffff', 'nodeBorder': '#424242', 'clusterBkg': '#f5f5f5', 'clusterBorder': '#bdbdbd', 'titleColor': '#212121'}}}%%
 graph TB
     subgraph Gateway["WaaV Gateway"]
         WS["WebSocket Handler<br/>/ws endpoint"]
         REST["REST API<br/>/speak, /voices"]
+        REG["Plugin Registry<br/>O(1) Provider Lookup"]
         VM["VoiceManager<br/>Central Coordinator"]
         NF["DeepFilterNet<br/>Noise Reduction"]
         LK["LiveKit Integration<br/>WebRTC Streaming"]
     end
 
-    subgraph Providers["Provider System"]
-        STT["STT Providers"]
-        TTS["TTS Providers"]
-        RT["Realtime Providers"]
+    subgraph Providers["Provider System (25 providers)"]
+        STT["STT Providers<br/>(11)"]
+        TTS["TTS Providers<br/>(12)"]
+        RT["Realtime Providers<br/>(2)"]
     end
 
-    subgraph STTList["STT (10 providers)"]
+    subgraph STTList["STT Providers"]
         DG_S["Deepgram"]
         GC_S["Google Cloud"]
         AZ_S["Azure"]
@@ -242,9 +292,10 @@ graph TB
         AWS_S["AWS Transcribe"]
         IBM_S["IBM Watson"]
         GQ_S["Groq"]
+        GN_S["Gnani"]
     end
 
-    subgraph TTSList["TTS (11 providers)"]
+    subgraph TTSList["TTS Providers"]
         DG_T["Deepgram"]
         GC_T["Google Cloud"]
         AZ_T["Azure"]
@@ -256,30 +307,39 @@ graph TB
         HU_T["Hume AI"]
         LM_T["LMNT"]
         PH_T["Play.ht"]
+        GN_T["Gnani"]
     end
 
     Client((Client)) --> WS
     Client --> REST
     WS --> VM
     REST --> VM
+    VM --> REG
+    REG --> STT
+    REG --> TTS
+    REG --> RT
     VM --> NF
-    VM --> STT
-    VM --> TTS
-    VM --> RT
     VM --> LK
     STT --> STTList
     TTS --> TTSList
     RT --> OA_RT["OpenAI Realtime<br/>GPT-4o"]
     RT --> HU_RT["Hume EVI<br/>Empathic Voice"]
     LK --> LiveKit[(LiveKit Server)]
+
+    style Gateway fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    style Providers fill:#e8f5e9,stroke:#388e3c,stroke-width:2px
+    style STTList fill:#fff3e0,stroke:#f57c00,stroke-width:1px
+    style TTSList fill:#fce4ec,stroke:#c2185b,stroke-width:1px
 ```
 
 ### Request Flow
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#4a90d9', 'primaryTextColor': '#212121', 'lineColor': '#5c6bc0', 'actorBkg': '#e3f2fd', 'actorBorder': '#1976d2', 'actorTextColor': '#212121', 'signalColor': '#424242', 'signalTextColor': '#212121', 'labelBoxBkgColor': '#f5f5f5', 'labelBoxBorderColor': '#bdbdbd', 'labelTextColor': '#212121', 'loopTextColor': '#212121', 'noteBkgColor': '#fff3e0', 'noteTextColor': '#212121', 'noteBorderColor': '#f57c00', 'activationBkgColor': '#e8f5e9', 'activationBorderColor': '#388e3c'}}}%%
 sequenceDiagram
     participant C as Client
     participant WS as WebSocket Handler
+    participant REG as Plugin Registry
     participant VM as VoiceManager
     participant NF as Noise Filter
     participant STT as STT Provider
@@ -288,7 +348,8 @@ sequenceDiagram
     Note over C,TTS: Speech-to-Text Flow
     C->>WS: 1. Connect to /ws
     C->>WS: 2. Send config message
-    WS->>VM: Configure providers
+    WS->>REG: Lookup provider (O(1))
+    REG->>VM: Create provider instance
     VM-->>C: Ready confirmation
 
     C->>WS: 3. Send audio data (PCM)
@@ -310,19 +371,20 @@ sequenceDiagram
 ### Audio Processing Pipeline
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#4a90d9', 'primaryTextColor': '#212121', 'primaryBorderColor': '#2c5aa0', 'lineColor': '#5c6bc0', 'background': '#fafafa', 'mainBkg': '#ffffff', 'nodeBorder': '#424242', 'clusterBkg': '#f5f5f5', 'clusterBorder': '#bdbdbd'}}}%%
 flowchart LR
-    subgraph Input
-        A[Audio Input<br/>16kHz 16-bit PCM]
+    subgraph Input["Input"]
+        A["Audio Input<br/>16kHz 16-bit PCM"]
     end
 
     subgraph Processing["WaaV Gateway Processing"]
-        B{Noise Filter<br/>Enabled?}
-        C[DeepFilterNet<br/>Noise Reduction]
-        D[STT Provider<br/>Transcription]
+        B{"Noise Filter<br/>Enabled?"}
+        C["DeepFilterNet<br/>Noise Reduction"]
+        D["STT Provider<br/>(via Plugin Registry)"]
     end
 
-    subgraph Output
-        E[Text Output<br/>JSON Response]
+    subgraph Output["Output"]
+        E["Text Output<br/>JSON Response"]
     end
 
     A --> B
@@ -331,38 +393,49 @@ flowchart LR
     C --> D
     D --> E
 
-    style A fill:#e1f5fe
-    style E fill:#e8f5e9
-    style C fill:#fff3e0
-    style D fill:#fce4ec
+    style Input fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    style Processing fill:#f5f5f5,stroke:#bdbdbd,stroke-width:2px
+    style Output fill:#e8f5e9,stroke:#388e3c,stroke-width:2px
+    style A fill:#bbdefb,stroke:#1976d2
+    style B fill:#fff3e0,stroke:#f57c00
+    style C fill:#ffecb3,stroke:#ffa000
+    style D fill:#fce4ec,stroke:#c2185b
+    style E fill:#c8e6c9,stroke:#388e3c
 ```
 
 ### LiveKit Integration
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#4a90d9', 'primaryTextColor': '#212121', 'primaryBorderColor': '#2c5aa0', 'lineColor': '#5c6bc0', 'background': '#fafafa', 'mainBkg': '#ffffff', 'nodeBorder': '#424242', 'clusterBkg': '#f5f5f5', 'clusterBorder': '#bdbdbd'}}}%%
 flowchart TB
     subgraph Clients["Clients"]
-        Web[Web Client]
-        Mobile[Mobile App]
-        SIP[SIP Phone]
+        Web["Web Client"]
+        Mobile["Mobile App"]
+        SIP["SIP Phone"]
     end
 
     subgraph LiveKit["LiveKit Server"]
-        Room[Room Manager]
-        Track[Audio Tracks]
+        Room["Room Manager"]
+        Track["Audio Tracks"]
     end
 
     subgraph Gateway["WaaV Gateway"]
-        LKI[LiveKit Integration]
-        VM2[VoiceManager]
-        Providers[STT/TTS Providers]
+        LKI["LiveKit Integration"]
+        REG["Plugin Registry"]
+        VM2["VoiceManager"]
+        Providers["STT/TTS/Realtime<br/>(25 providers)"]
     end
 
     Web & Mobile & SIP --> Room
     Room --> Track
     Track <--> LKI
     LKI <--> VM2
-    VM2 <--> Providers
+    VM2 <--> REG
+    REG <--> Providers
+
+    style Clients fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    style LiveKit fill:#e8f5e9,stroke:#388e3c,stroke-width:2px
+    style Gateway fill:#fff3e0,stroke:#f57c00,stroke-width:2px
 ```
 
 ## Development
@@ -469,6 +542,10 @@ docker run -p 3001:3001 --env-file .env waav-gateway
 | `PLAYHT_API_KEY` | Play.ht API key (for TTS) | - | No* |
 | `PLAYHT_USER_ID` | Play.ht user ID (for TTS authentication) | - | No* |
 | `HUME_API_KEY` | Hume AI API key (for EVI realtime and TTS) | - | No* |
+| `LMNT_API_KEY` | LMNT API key (for ultra-low latency TTS) | - | No* |
+| `GNANI_TOKEN` | Gnani.ai authentication token (for Indic STT/TTS) | - | No* |
+| `GNANI_ACCESS_KEY` | Gnani.ai access key (for Indic STT/TTS) | - | No* |
+| `GNANI_CERTIFICATE_PATH` | Path to Gnani SSL certificate (for mTLS auth) | - | No* |
 | `LIVEKIT_URL` | LiveKit server WebSocket URL | `ws://localhost:7880` | No |
 | `LIVEKIT_API_KEY` | LiveKit API key (for webhooks and token generation) | - | No*** |
 | `LIVEKIT_API_SECRET` | LiveKit API secret (for webhooks and token generation) | - | No*** |
@@ -520,6 +597,31 @@ sip:
 - **Async Processing**: Non-blocking WebSocket message handling
 - **Memory Management**: Careful buffer management in audio loops
 
+## Extending WaaV Gateway
+
+WaaV Gateway's plugin architecture makes it easy to add custom providers:
+
+### Adding a New Provider
+
+1. Implement the appropriate trait (`BaseSTT`, `BaseTTS`, or `BaseRealtime`)
+2. Create a metadata function describing your provider
+3. Register with `inventory::submit!`
+
+```rust
+use waav_gateway::plugin::prelude::*;
+
+fn my_provider_metadata() -> ProviderMetadata {
+    ProviderMetadata::stt("my-provider", "My Custom STT")
+        .with_features(["streaming", "word-timestamps"])
+}
+
+inventory::submit! {
+    PluginConstructor::stt("my-provider", my_provider_metadata, create_my_provider)
+}
+```
+
+For complete plugin development documentation, see [docs/plugins.md](docs/plugins.md).
+
 ## Contributing
 
 1. Review the development rules in `.cursor/rules/`:
@@ -528,9 +630,10 @@ sip:
    - `axum.mdc`: Framework patterns
    - `livekit.mdc`: LiveKit integration details
 
-2. Follow the existing code patterns and conventions
-3. Add tests for new features
-4. Ensure `cargo fmt` and `cargo clippy` pass
+2. Review plugin documentation in [docs/plugins.md](docs/plugins.md) for extending providers
+3. Follow the existing code patterns and conventions
+4. Add tests for new features
+5. Ensure `cargo fmt` and `cargo clippy` pass
 
 ## Support
 

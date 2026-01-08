@@ -4,6 +4,7 @@ mod base;
 pub mod cartesia;
 pub mod deepgram;
 pub mod elevenlabs;
+pub mod gnani;
 pub mod google;
 pub mod hume;
 pub mod ibm_watson;
@@ -35,6 +36,9 @@ pub use playht::{
     PLAYHT_TTS_URL, PlayHtAudioFormat, PlayHtModel, PlayHtTts, PlayHtTtsConfig, PlayHtVoice,
 };
 pub use provider::{TTSProvider, TTSRequestBuilder};
+
+// Re-export Gnani.ai implementation
+pub use gnani::{GnaniGender, GnaniTTS, GnaniTTSConfig, GnaniTTSLanguage};
 use std::collections::HashMap;
 
 /// Factory function to create a TTS provider.
@@ -67,24 +71,9 @@ use std::collections::HashMap;
 /// let provider = create_tts_provider("azure", config)?;
 /// ```
 pub fn create_tts_provider(provider_type: &str, config: TTSConfig) -> TTSResult<Box<dyn BaseTTS>> {
-    match provider_type.to_lowercase().as_str() {
-        "deepgram" => Ok(Box::new(DeepgramTTS::new(config)?)),
-        "elevenlabs" => Ok(Box::new(ElevenLabsTTS::new(config)?)),
-        "google" => Ok(Box::new(GoogleTTS::new(config)?)),
-        "azure" | "microsoft-azure" => Ok(Box::new(AzureTTS::new(config)?)),
-        "cartesia" => Ok(Box::new(CartesiaTTS::new(config)?)),
-        "openai" => Ok(Box::new(OpenAITTS::new(config)?)),
-        "aws-polly" | "aws_polly" | "amazon-polly" | "polly" => {
-            Ok(Box::new(AwsPollyTTS::new(config)?))
-        }
-        "ibm-watson" | "ibm_watson" | "watson" | "ibm" => Ok(Box::new(IbmWatsonTTS::new(config)?)),
-        "hume" | "hume-ai" | "hume_ai" => Ok(Box::new(HumeTTS::new(config)?)),
-        "lmnt" | "lmnt-ai" | "lmnt_ai" => Ok(Box::new(LmntTts::new(config)?)),
-        "playht" | "play-ht" | "play_ht" | "play.ht" => Ok(Box::new(PlayHtTts::new(config)?)),
-        _ => Err(TTSError::InvalidConfiguration(format!(
-            "Unsupported TTS provider: {provider_type}. Supported providers: deepgram, elevenlabs, google, azure, cartesia, openai, aws-polly, ibm-watson, hume, lmnt, playht"
-        ))),
-    }
+    // Delegate to the plugin registry for provider creation
+    // This enables extensibility: new providers can be registered without modifying this function
+    crate::plugin::global_registry().create_tts(provider_type, config)
 }
 
 /// Returns a map of provider names to their default API endpoint URLs.

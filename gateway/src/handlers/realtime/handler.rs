@@ -122,8 +122,8 @@ async fn handle_realtime_socket(socket: WebSocket, app_state: Arc<AppState>, aut
     // Jitter prevents thundering herd when many connections timeout simultaneously
     let base_idle_secs: u64 = 300;
     let jitter_range: u64 = 30; // ±10% = 30 seconds
-    let jitter_offset = (std::time::Instant::now().elapsed().as_nanos() as u64
-        % (jitter_range * 2)) as i64
+    let jitter_offset = (std::time::Instant::now().elapsed().as_nanos() as u64 % (jitter_range * 2))
+        as i64
         - jitter_range as i64;
     let idle_secs = (base_idle_secs as i64 + jitter_offset).max(1) as u64;
     let idle_timeout = Duration::from_secs(idle_secs);

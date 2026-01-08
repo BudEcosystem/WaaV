@@ -263,10 +263,7 @@ impl TTSProvider {
                         // Update previous_text for context continuity even on cache hit
                         // This ensures next TTS request has proper context (e.g., for ElevenLabs)
                         *previous_text_store.write().await = Some(processed_text.clone());
-                        debug!(
-                            "Updated previous_text on cache hit: '{}'",
-                            processed_text
-                        );
+                        debug!("Updated previous_text on cache hit: '{}'", processed_text);
                     }
                     return;
                 }

@@ -705,6 +705,7 @@ async fn register_final_tts_callback(
 }
 
 /// Initialize LiveKit client and set up callbacks
+#[allow(clippy::too_many_arguments)]
 async fn initialize_livekit_client(
     livekit_ws_config: LiveKitWebSocketConfig,
     tts_config: Option<&TTSWebSocketConfig>,

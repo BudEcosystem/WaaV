@@ -121,13 +121,9 @@ pub fn create_realtime_provider(
     provider_type: &str,
     config: RealtimeConfig,
 ) -> RealtimeResult<Box<dyn BaseRealtime>> {
-    match provider_type.to_lowercase().as_str() {
-        "openai" => Ok(Box::new(OpenAIRealtime::new(config)?)),
-        "hume" | "hume_evi" | "hume-evi" | "evi" => Ok(Box::new(HumeEVI::new(config)?)),
-        _ => Err(RealtimeError::InvalidConfiguration(format!(
-            "Unsupported realtime provider: {provider_type}. Supported providers: openai, hume"
-        ))),
-    }
+    // Delegate to the plugin registry for provider creation
+    // This enables extensibility: new providers can be registered without modifying this function
+    crate::plugin::global_registry().create_realtime(provider_type, config)
 }
 
 /// Create a realtime provider from enum.
@@ -135,10 +131,8 @@ pub fn create_realtime_provider_from_enum(
     provider: RealtimeProvider,
     config: RealtimeConfig,
 ) -> RealtimeResult<Box<dyn BaseRealtime>> {
-    match provider {
-        RealtimeProvider::OpenAI => Ok(Box::new(OpenAIRealtime::new(config)?)),
-        RealtimeProvider::Hume => Ok(Box::new(HumeEVI::new(config)?)),
-    }
+    // Delegate to the plugin registry using provider's string representation
+    crate::plugin::global_registry().create_realtime(&provider.to_string(), config)
 }
 
 /// Get list of supported realtime providers.

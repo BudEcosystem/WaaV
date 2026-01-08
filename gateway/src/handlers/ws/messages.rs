@@ -143,6 +143,27 @@ pub enum IncomingMessage {
         #[cfg_attr(feature = "openapi", schema(example = "sk_test_my_api_key_123456"))]
         token: String,
     },
+    /// Custom message type for plugin-defined message handlers.
+    ///
+    /// This variant allows plugins to define and handle their own message types
+    /// without modifying the core gateway code. Plugins register handlers for
+    /// specific message types, and the gateway routes messages accordingly.
+    ///
+    /// # Example
+    /// ```json
+    /// {"type": "custom", "message_type": "my_plugin_action", "payload": {"key": "value"}}
+    /// ```
+    #[serde(rename = "custom")]
+    Custom {
+        /// The plugin-defined message type identifier.
+        /// This is used to look up the appropriate handler in the plugin registry.
+        #[cfg_attr(feature = "openapi", schema(example = "analytics_event"))]
+        message_type: String,
+        /// The message payload as arbitrary JSON.
+        /// The plugin handler is responsible for parsing and validating this.
+        #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+        payload: serde_json::Value,
+    },
 }
 
 /// Unified message structure for all incoming messages from various sources
@@ -266,6 +287,17 @@ pub enum OutgoingMessage {
     /// Client must send an `auth` message before any other commands.
     #[serde(rename = "auth_required")]
     AuthRequired,
+    /// Plugin response message
+    ///
+    /// Generic response from a plugin handler for custom messages.
+    /// Contains the message type for client routing and arbitrary JSON payload.
+    #[serde(rename = "plugin_response")]
+    PluginResponse {
+        /// The message type this is a response to
+        message_type: String,
+        /// Response payload from the plugin
+        payload: serde_json::Value,
+    },
 }
 
 /// Message routing for optimized throughput
@@ -398,6 +430,26 @@ impl IncomingMessage {
                 }
             }
             IncomingMessage::Clear => {}
+            IncomingMessage::Custom {
+                message_type,
+                payload,
+            } => {
+                // Validate message_type length (same limit as stream_id)
+                if message_type.len() > MAX_STREAM_ID_SIZE {
+                    return Err(MessageValidationError::StreamIdTooLarge {
+                        size: message_type.len(),
+                        max: MAX_STREAM_ID_SIZE,
+                    });
+                }
+                // Validate serialized payload size
+                let payload_str = payload.to_string();
+                if payload_str.len() > MAX_MESSAGE_CONTENT_SIZE {
+                    return Err(MessageValidationError::MessageContentTooLarge {
+                        size: payload_str.len(),
+                        max: MAX_MESSAGE_CONTENT_SIZE,
+                    });
+                }
+            }
         }
         Ok(())
     }

@@ -4,7 +4,7 @@
 //! at runtime. Changes are persisted to the cache directory and merged with the
 //! server configuration on startup.
 
-use axum::{extract::State, http::StatusCode, response::Json, Extension};
+use axum::{Extension, extract::State, http::StatusCode, response::Json};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;

@@ -5,9 +5,11 @@
 
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::auth::{match_api_secret_id, Auth};
+use crate::auth::{Auth, match_api_secret_id};
+use crate::plugin::capabilities::{WSContext, WSResponse};
+use crate::plugin::global_registry;
 use crate::state::AppState;
 
 use super::{
@@ -126,6 +128,10 @@ pub async fn handle_incoming_message(
         IncomingMessage::SIPTransfer { transfer_to } => {
             handle_sip_transfer(transfer_to, state, message_tx, app_state).await
         }
+        IncomingMessage::Custom {
+            message_type,
+            payload,
+        } => handle_custom_message(message_type, payload, state, message_tx, app_state).await,
     }
 }
 
@@ -191,4 +197,118 @@ async fn handle_auth_message(
         let _ = message_tx.send(MessageRoute::Close).await;
         false
     }
+}
+
+/// Handle custom plugin message
+///
+/// Dispatches the message to all registered handlers for this message type.
+/// Handlers are called in registration order, and all handlers are invoked
+/// even if one fails (errors are logged but don't stop other handlers).
+///
+/// # Arguments
+/// * `message_type` - The plugin-defined message type identifier
+/// * `payload` - The message payload as JSON
+/// * `state` - Connection state for this WebSocket session
+/// * `message_tx` - Channel for sending response messages
+/// * `app_state` - Application state containing global configuration
+///
+/// # Returns
+/// * `bool` - Always true to continue processing (plugins can't close connections)
+async fn handle_custom_message(
+    message_type: String,
+    payload: serde_json::Value,
+    state: &Arc<RwLock<ConnectionState>>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+    _app_state: &Arc<AppState>,
+) -> bool {
+    let registry = global_registry();
+    let handlers = registry.get_ws_handlers(&message_type);
+
+    if handlers.is_empty() {
+        debug!(
+            message_type = %message_type,
+            "No handlers registered for custom message type"
+        );
+        let _ = message_tx
+            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
+                message: format!("Unknown custom message type: {}", message_type),
+            }))
+            .await;
+        return true;
+    }
+
+    // Build context for handlers
+    let ctx = {
+        let conn_state = state.read().await;
+        WSContext {
+            stream_id: conn_state.stream_id.clone().unwrap_or_default(),
+            authenticated: !conn_state.auth.is_pending(),
+            tenant_id: conn_state.auth.id.clone(),
+        }
+    };
+
+    // Call all registered handlers
+    for handler in handlers {
+        match handler(payload.clone(), ctx.clone()).await {
+            Ok(Some(response)) => {
+                // Convert response to outgoing message
+                match response {
+                    WSResponse::Json(json) => {
+                        let _ = message_tx
+                            .send(MessageRoute::Outgoing(OutgoingMessage::PluginResponse {
+                                message_type: message_type.clone(),
+                                payload: json,
+                            }))
+                            .await;
+                    }
+                    WSResponse::Binary(data) => {
+                        let _ = message_tx.send(MessageRoute::Binary(data)).await;
+                    }
+                    WSResponse::Multiple(responses) => {
+                        for resp in responses {
+                            match resp {
+                                WSResponse::Json(json) => {
+                                    let _ = message_tx
+                                        .send(MessageRoute::Outgoing(
+                                            OutgoingMessage::PluginResponse {
+                                                message_type: message_type.clone(),
+                                                payload: json,
+                                            },
+                                        ))
+                                        .await;
+                                }
+                                WSResponse::Binary(data) => {
+                                    let _ = message_tx.send(MessageRoute::Binary(data)).await;
+                                }
+                                WSResponse::Multiple(_) => {
+                                    // Don't recurse into nested multiples
+                                    warn!("Nested Multiple responses not supported");
+                                }
+                                WSResponse::None => {}
+                            }
+                        }
+                    }
+                    WSResponse::None => {}
+                }
+            }
+            Ok(None) => {
+                // Handler processed but no response needed
+                debug!(message_type = %message_type, "Plugin handler returned no response");
+            }
+            Err(e) => {
+                warn!(
+                    message_type = %message_type,
+                    error = %e,
+                    "Plugin handler failed"
+                );
+                let _ = message_tx
+                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
+                        message: format!("Plugin handler error: {}", e),
+                    }))
+                    .await;
+            }
+        }
+    }
+
+    true
 }
