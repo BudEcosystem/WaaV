@@ -66,13 +66,14 @@ pub mod registry;
 
 // Re-exports for convenience
 pub use capabilities::{
-    AudioProcessorCapability, AuthCapability, MiddlewareCapability, PluginCapability,
+    AudioFormat, AudioProcessor, AudioProcessorCapability, AudioProcessorError,
+    AuthCapability, MiddlewareCapability, PluginCapability, ProcessorMetadata,
     RealtimeCapability, STTCapability, TTSCapability, WSHandlerCapability,
 };
 pub use isolation::{PluginError, call_plugin_safely};
 pub use lifecycle::{PluginHealth, PluginLifecycle, PluginState};
 pub use metadata::{PluginManifest, ProviderMetadata};
-pub use registry::{PluginRegistry, global_registry};
+pub use registry::{AudioProcessorFactoryFn, PluginMetrics, PluginRegistry, global_registry};
 
 /// Prelude module for convenient imports
 ///
@@ -82,15 +83,16 @@ pub use registry::{PluginRegistry, global_registry};
 /// ```
 pub mod prelude {
     pub use super::capabilities::{
-        AudioProcessorCapability, AuthCapability, MiddlewareCapability, PluginCapability,
+        AudioFormat, AudioProcessor, AudioProcessorCapability, AudioProcessorError,
+        AuthCapability, MiddlewareCapability, PluginCapability, ProcessorMetadata,
         RealtimeCapability, STTCapability, TTSCapability, WSHandlerCapability,
     };
     pub use super::isolation::{PluginError, call_plugin_safely};
     pub use super::lifecycle::{PluginHealth, PluginLifecycle, PluginState};
     pub use super::metadata::{PluginManifest, ProviderMetadata};
     pub use super::registry::{
-        PluginConstructor, PluginRegistry, RealtimeFactoryFn, STTFactoryFn, TTSFactoryFn,
-        global_registry,
+        AudioProcessorFactoryFn, PluginConstructor, PluginRegistry, RealtimeFactoryFn,
+        STTFactoryFn, TTSFactoryFn, global_registry,
     };
 
     // Re-export commonly needed external crates

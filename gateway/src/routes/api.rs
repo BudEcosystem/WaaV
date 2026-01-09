@@ -4,7 +4,7 @@ use axum::{
 };
 use tower_http::trace::TraceLayer;
 
-use crate::handlers::{livekit, recording, sip, speak, voices};
+use crate::handlers::{livekit, plugins, recording, sip, speak, voices};
 use crate::state::AppState;
 use std::sync::Arc;
 
@@ -32,5 +32,13 @@ pub fn create_api_router() -> Router<Arc<AppState>> {
         )
         // SIP call transfer
         .route("/sip/transfer", post(sip::sip_transfer))
+        // Plugin discovery endpoints
+        .route("/plugins", get(plugins::list_plugins))
+        .route("/plugins/stt", get(plugins::list_stt_providers))
+        .route("/plugins/tts", get(plugins::list_tts_providers))
+        .route("/plugins/realtime", get(plugins::list_realtime_providers))
+        .route("/plugins/processors", get(plugins::list_processors))
+        .route("/plugins/{provider_id}", get(plugins::get_provider_info))
+        .route("/plugins/{provider_id}/health", get(plugins::get_provider_health))
         .layer(TraceLayer::new_for_http())
 }

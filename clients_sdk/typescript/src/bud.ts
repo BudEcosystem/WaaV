@@ -13,6 +13,7 @@ import type { MetricsSummary } from './types/metrics.js';
 import { getMetricsCollector, resetMetricsCollector } from './metrics/collector.js';
 import { SLOTracker } from './metrics/slo.js';
 import type { SLOThreshold, SLOStatus } from './types/metrics.js';
+import { ProviderRegistry } from './providers/index.js';
 
 /**
  * BudClient configuration
@@ -129,6 +130,30 @@ export class BudClient {
    */
   readonly rest: RestClient;
 
+  /**
+   * Provider discovery registry.
+   *
+   * Use this to discover available providers (STT, TTS, Realtime) from the gateway.
+   *
+   * @example
+   * ```typescript
+   * // Get all STT providers
+   * const sttProviders = await bud.providers.stt.all();
+   *
+   * // Find providers by language
+   * const spanishSTT = await bud.providers.stt.withLanguage('Spanish');
+   *
+   * // Find providers by feature
+   * const streamingSTT = await bud.providers.stt.withFeature('streaming');
+   *
+   * // Get specific provider info
+   * const deepgram = await bud.providers.get('deepgram');
+   * console.log(deepgram?.description);
+   * console.log(deepgram?.features);
+   * ```
+   */
+  readonly providers: ProviderRegistry;
+
   constructor(config: BudClientConfig) {
     this.config = config;
 
@@ -144,6 +169,9 @@ export class BudClient {
       headers: config.headers,
     });
     this.rest = this.restClient;
+
+    // Initialize provider registry
+    this.providers = new ProviderRegistry(this.restClient);
 
     // Initialize SLO tracker
     this.sloTracker = new SLOTracker();

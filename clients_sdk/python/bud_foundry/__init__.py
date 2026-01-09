@@ -82,6 +82,17 @@ from .pipelines import (
 from .rest import RestClient
 from .ws import WebSocketSession, SessionMetrics, ReconnectConfig
 from .audio import AudioProcessor
+from .providers import (
+    ProviderRegistry,
+    ProviderCategory,
+    ProviderInfo,
+    ProviderHealth,
+    ProviderHealthDetails,
+    ProviderMetrics,
+    LanguageInfo,
+    ProcessorInfo,
+    PluginListResponse,
+)
 
 __version__ = "0.1.0"
 __all__ = [
@@ -144,4 +155,14 @@ __all__ = [
     "WebSocketSession",
     "ReconnectConfig",
     "AudioProcessor",
+    # Provider discovery
+    "ProviderRegistry",
+    "ProviderCategory",
+    "ProviderInfo",
+    "ProviderHealth",
+    "ProviderHealthDetails",
+    "ProviderMetrics",
+    "LanguageInfo",
+    "ProcessorInfo",
+    "PluginListResponse",
 ]

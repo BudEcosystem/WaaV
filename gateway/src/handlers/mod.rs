@@ -3,6 +3,7 @@
 //! This module organizes all API handlers into logical groups:
 //! - `api` - Health check endpoint
 //! - `livekit` - LiveKit token generation and webhook handling
+//! - `plugins` - Plugin discovery endpoints for SDKs and dashboards
 //! - `realtime` - Realtime audio-to-audio WebSocket (OpenAI Realtime API)
 //! - `recording` - Recording download endpoint
 //! - `sip` - SIP hooks management and call transfer
@@ -12,6 +13,7 @@
 
 pub mod api;
 pub mod livekit;
+pub mod plugins;
 pub mod realtime;
 pub mod recording;
 pub mod sip;

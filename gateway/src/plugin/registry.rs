@@ -27,6 +27,7 @@ use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
 use super::capabilities::{
+    AudioProcessor, AudioProcessorCapability, AudioProcessorError, ProcessorMetadata,
     RealtimeCapability, STTCapability, TTSCapability, WSContext, WSError, WSResponse,
 };
 use super::dispatch::{resolve_realtime_provider, resolve_stt_provider, resolve_tts_provider};
@@ -46,6 +47,10 @@ pub type TTSFactoryFn = Arc<dyn Fn(TTSConfig) -> TTSResult<Box<dyn BaseTTS>> + S
 /// Factory function type for Realtime providers
 pub type RealtimeFactoryFn =
     Arc<dyn Fn(RealtimeConfig) -> RealtimeResult<Box<dyn BaseRealtime>> + Send + Sync>;
+
+/// Factory function type for Audio processors
+pub type AudioProcessorFactoryFn =
+    Arc<dyn Fn(serde_json::Value) -> Result<Box<dyn AudioProcessor>, AudioProcessorError> + Send + Sync>;
 
 /// Handler function type for WebSocket messages
 ///
@@ -75,6 +80,9 @@ pub type TTSFactoryPtr = fn(TTSConfig) -> TTSResult<Box<dyn BaseTTS>>;
 /// Factory function pointer type for Realtime providers (non-Arc version for PluginConstructor)
 pub type RealtimeFactoryPtr = fn(RealtimeConfig) -> RealtimeResult<Box<dyn BaseRealtime>>;
 
+/// Factory function pointer type for Audio processors (non-Arc version for PluginConstructor)
+pub type AudioProcessorFactoryPtr = fn(serde_json::Value) -> Result<Box<dyn AudioProcessor>, AudioProcessorError>;
+
 /// Plugin constructor for inventory-based registration
 ///
 /// Uses function pointers to defer non-const operations (metadata creation)
@@ -84,9 +92,13 @@ pub struct PluginConstructor {
     pub create_stt: Option<STTFactoryPtr>,
     pub create_tts: Option<TTSFactoryPtr>,
     pub create_realtime: Option<RealtimeFactoryPtr>,
+    pub create_audio_processor: Option<AudioProcessorFactoryPtr>,
 
     /// Provider metadata function (deferred creation for const compatibility)
     pub metadata_fn: MetadataFn,
+
+    /// Processor metadata function (for audio processors)
+    pub processor_metadata_fn: Option<fn() -> ProcessorMetadata>,
 
     /// Provider ID for lookup
     pub provider_id: &'static str,
@@ -106,7 +118,9 @@ impl PluginConstructor {
             create_stt: Some(factory),
             create_tts: None,
             create_realtime: None,
+            create_audio_processor: None,
             metadata_fn,
+            processor_metadata_fn: None,
             provider_id,
             aliases: &[],
         }
@@ -122,7 +136,9 @@ impl PluginConstructor {
             create_stt: None,
             create_tts: Some(factory),
             create_realtime: None,
+            create_audio_processor: None,
             metadata_fn,
+            processor_metadata_fn: None,
             provider_id,
             aliases: &[],
         }
@@ -138,8 +154,29 @@ impl PluginConstructor {
             create_stt: None,
             create_tts: None,
             create_realtime: Some(factory),
+            create_audio_processor: None,
             metadata_fn,
+            processor_metadata_fn: None,
             provider_id,
+            aliases: &[],
+        }
+    }
+
+    /// Create a new Audio Processor plugin constructor
+    pub const fn audio_processor(
+        processor_id: &'static str,
+        metadata_fn: MetadataFn,
+        processor_metadata_fn: fn() -> ProcessorMetadata,
+        factory: fn(serde_json::Value) -> Result<Box<dyn AudioProcessor>, AudioProcessorError>,
+    ) -> Self {
+        Self {
+            create_stt: None,
+            create_tts: None,
+            create_realtime: None,
+            create_audio_processor: Some(factory),
+            metadata_fn,
+            processor_metadata_fn: Some(processor_metadata_fn),
+            provider_id: processor_id,
             aliases: &[],
         }
     }
@@ -153,6 +190,11 @@ impl PluginConstructor {
     /// Get the metadata (calls the deferred function)
     pub fn metadata(&self) -> ProviderMetadata {
         (self.metadata_fn)()
+    }
+
+    /// Get the processor metadata (calls the deferred function)
+    pub fn processor_metadata(&self) -> Option<ProcessorMetadata> {
+        self.processor_metadata_fn.map(|f| f())
     }
 }
 
@@ -173,6 +215,9 @@ pub struct PluginRegistry {
     /// Realtime provider factories indexed by provider ID
     realtime_factories: DashMap<String, (RealtimeFactoryFn, ProviderMetadata)>,
 
+    /// Audio processor factories indexed by processor ID
+    audio_processor_factories: DashMap<String, (AudioProcessorFactoryFn, ProcessorMetadata)>,
+
     /// WebSocket message handlers indexed by message type
     ws_handlers: DashMap<String, Vec<WSHandlerFn>>,
 
@@ -190,6 +235,7 @@ impl PluginRegistry {
             stt_factories: DashMap::new(),
             tts_factories: DashMap::new(),
             realtime_factories: DashMap::new(),
+            audio_processor_factories: DashMap::new(),
             ws_handlers: DashMap::new(),
             capability_index: DashMap::new(),
             plugin_entries: DashMap::new(),
@@ -290,6 +336,31 @@ impl PluginRegistry {
             provider_id = %provider_id,
             aliases = ?metadata.aliases,
             "Registered Realtime provider"
+        );
+    }
+
+    /// Register an Audio Processor factory
+    pub fn register_audio_processor(
+        &self,
+        processor_id: &str,
+        factory: AudioProcessorFactoryFn,
+        metadata: ProcessorMetadata,
+    ) {
+        let id = processor_id.to_lowercase();
+
+        self.audio_processor_factories
+            .insert(id.clone(), (factory.clone(), metadata.clone()));
+
+        self.capability_index
+            .entry(TypeId::of::<dyn AudioProcessorCapability>())
+            .or_default()
+            .push(id.clone());
+
+        self.plugin_entries.entry(id).or_default();
+
+        tracing::debug!(
+            processor_id = %processor_id,
+            "Registered Audio Processor"
         );
     }
 
@@ -419,6 +490,45 @@ impl PluginRegistry {
         result
     }
 
+    /// Create an Audio Processor by ID
+    ///
+    /// Looks up the processor factory and creates an instance with the given config.
+    pub fn create_audio_processor(
+        &self,
+        processor_id: &str,
+        config: serde_json::Value,
+    ) -> Result<Box<dyn AudioProcessor>, AudioProcessorError> {
+        let id = processor_id.to_lowercase();
+
+        let factory_entry = self.audio_processor_factories.get(&id).ok_or_else(|| {
+            AudioProcessorError::ConfigurationError(format!(
+                "Unknown Audio Processor: '{}'. Available processors: {:?}",
+                processor_id,
+                self.get_audio_processor_names()
+            ))
+        })?;
+
+        let factory = factory_entry.0.clone();
+        drop(factory_entry);
+
+        let result = call_plugin_preserving_error(
+            std::panic::AssertUnwindSafe(|| factory(config)),
+            |panic_msg| {
+                AudioProcessorError::InternalError(format!("Plugin panicked: {}", panic_msg))
+            },
+        );
+
+        // Record success or failure AFTER the factory call
+        if let Some(mut entry) = self.plugin_entries.get_mut(&id) {
+            match &result {
+                Ok(_) => entry.record_success(),
+                Err(e) => entry.record_error(e.to_string()),
+            }
+        }
+
+        result
+    }
+
     /// Get all registered STT provider names (excluding aliases)
     pub fn get_stt_provider_names(&self) -> Vec<String> {
         self.capability_index
@@ -443,6 +553,14 @@ impl PluginRegistry {
             .unwrap_or_default()
     }
 
+    /// Get all registered Audio Processor names
+    pub fn get_audio_processor_names(&self) -> Vec<String> {
+        self.capability_index
+            .get(&TypeId::of::<dyn AudioProcessorCapability>())
+            .map(|v| v.clone())
+            .unwrap_or_default()
+    }
+
     /// Get provider metadata by name
     pub fn get_stt_metadata(&self, provider: &str) -> Option<ProviderMetadata> {
         self.stt_factories
@@ -461,6 +579,13 @@ impl PluginRegistry {
     pub fn get_realtime_metadata(&self, provider: &str) -> Option<ProviderMetadata> {
         self.realtime_factories
             .get(&provider.to_lowercase())
+            .map(|entry| entry.1.clone())
+    }
+
+    /// Get audio processor metadata by ID
+    pub fn get_audio_processor_metadata(&self, processor_id: &str) -> Option<ProcessorMetadata> {
+        self.audio_processor_factories
+            .get(&processor_id.to_lowercase())
             .map(|entry| entry.1.clone())
     }
 
@@ -497,6 +622,12 @@ impl PluginRegistry {
             .contains_key(&provider.to_lowercase())
     }
 
+    /// Check if an Audio Processor is registered
+    pub fn has_audio_processor(&self, processor_id: &str) -> bool {
+        self.audio_processor_factories
+            .contains_key(&processor_id.to_lowercase())
+    }
+
     /// Get the number of registered STT providers
     pub fn stt_provider_count(&self) -> usize {
         self.get_stt_provider_names().len()
@@ -510,6 +641,11 @@ impl PluginRegistry {
     /// Get the number of registered Realtime providers
     pub fn realtime_provider_count(&self) -> usize {
         self.get_realtime_provider_names().len()
+    }
+
+    /// Get the number of registered Audio Processors
+    pub fn audio_processor_count(&self) -> usize {
+        self.get_audio_processor_names().len()
     }
 
     /// Register a WebSocket message handler
@@ -555,6 +691,69 @@ impl PluginRegistry {
     pub fn ws_handler_count(&self) -> usize {
         self.ws_handlers.len()
     }
+
+    /// Get plugin health metrics for a specific provider
+    ///
+    /// Returns call count, error count, uptime, and idle time if the plugin exists.
+    pub fn get_plugin_metrics(&self, provider_id: &str) -> Option<PluginMetrics> {
+        let id = provider_id.to_lowercase();
+        self.plugin_entries.get(&id).map(|entry| PluginMetrics {
+            call_count: entry.call_count,
+            error_count: entry.error_count,
+            error_rate: if entry.call_count > 0 {
+                entry.error_count as f64 / entry.call_count as f64
+            } else {
+                0.0
+            },
+            last_error: entry.last_error.clone(),
+            uptime_seconds: entry.uptime().as_secs(),
+            idle_seconds: entry.idle_time().as_secs(),
+            state: entry.state.to_string(),
+        })
+    }
+
+    /// Get all plugin metrics for monitoring
+    pub fn get_all_plugin_metrics(&self) -> Vec<(String, PluginMetrics)> {
+        self.plugin_entries
+            .iter()
+            .map(|entry| {
+                let id = entry.key().clone();
+                let metrics = PluginMetrics {
+                    call_count: entry.call_count,
+                    error_count: entry.error_count,
+                    error_rate: if entry.call_count > 0 {
+                        entry.error_count as f64 / entry.call_count as f64
+                    } else {
+                        0.0
+                    },
+                    last_error: entry.last_error.clone(),
+                    uptime_seconds: entry.uptime().as_secs(),
+                    idle_seconds: entry.idle_time().as_secs(),
+                    state: entry.state.to_string(),
+                };
+                (id, metrics)
+            })
+            .collect()
+    }
+}
+
+/// Plugin metrics for health reporting
+#[derive(Debug, Clone)]
+pub struct PluginMetrics {
+    /// Number of times the plugin has been called
+    pub call_count: u64,
+    /// Number of errors encountered
+    pub error_count: u64,
+    /// Error rate (0.0 to 1.0)
+    pub error_rate: f64,
+    /// Last error message (if any)
+    pub last_error: Option<String>,
+    /// Uptime in seconds
+    pub uptime_seconds: u64,
+    /// Idle time in seconds
+    pub idle_seconds: u64,
+    /// Current plugin state
+    pub state: String,
 }
 
 impl Default for PluginRegistry {
@@ -629,12 +828,34 @@ pub fn global_registry() -> &'static PluginRegistry {
                     registry.register_realtime(alias, factory_arc.clone(), metadata.clone());
                 }
             }
+
+            // Register Audio Processor factory if present
+            if let Some(factory) = constructor.create_audio_processor {
+                let factory_arc: AudioProcessorFactoryFn = Arc::new(factory);
+                let proc_metadata = constructor.processor_metadata().unwrap_or_else(|| {
+                    ProcessorMetadata {
+                        id: constructor.provider_id.to_string(),
+                        name: constructor.provider_id.to_string(),
+                        ..Default::default()
+                    }
+                });
+                registry.register_audio_processor(
+                    constructor.provider_id,
+                    factory_arc.clone(),
+                    proc_metadata.clone(),
+                );
+
+                for alias in constructor.aliases {
+                    registry.register_audio_processor(alias, factory_arc.clone(), proc_metadata.clone());
+                }
+            }
         }
 
         tracing::info!(
             stt_count = registry.stt_provider_count(),
             tts_count = registry.tts_provider_count(),
             realtime_count = registry.realtime_provider_count(),
+            audio_processor_count = registry.audio_processor_count(),
             "Plugin registry initialized"
         );
 

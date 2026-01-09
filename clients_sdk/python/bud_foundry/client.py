@@ -9,6 +9,7 @@ from .pipelines.stt import BudSTT
 from .pipelines.tts import BudTTS
 from .pipelines.talk import BudTalk
 from .pipelines.transcribe import BudTranscribe
+from .providers import ProviderRegistry
 
 
 class BudClient:
@@ -78,6 +79,9 @@ class BudClient:
         self._talk = BudTalk(url=self._ws_url, api_key=self.api_key)
         self._transcribe = BudTranscribe(url=self._ws_url, api_key=self.api_key)
 
+        # Initialize provider registry
+        self._providers = ProviderRegistry(rest_client=self._rest_client)
+
     @property
     def stt(self) -> BudSTT:
         """Get the STT (Speech-to-Text) pipeline."""
@@ -102,6 +106,30 @@ class BudClient:
     def rest(self) -> RestClient:
         """Get the REST client for direct API access."""
         return self._rest_client
+
+    @property
+    def providers(self) -> ProviderRegistry:
+        """
+        Get the provider discovery registry.
+
+        Use this to discover available providers (STT, TTS, Realtime) from the gateway.
+
+        Example:
+            >>> # Get all STT providers
+            >>> stt_providers = await bud.providers.stt.all()
+            >>>
+            >>> # Find providers by language
+            >>> spanish_stt = await bud.providers.stt.with_language("Spanish")
+            >>>
+            >>> # Find providers by feature
+            >>> streaming_stt = await bud.providers.stt.with_feature("streaming")
+            >>>
+            >>> # Get specific provider info
+            >>> deepgram = await bud.providers.get("deepgram")
+            >>> print(deepgram.description)
+            >>> print(deepgram.features)
+        """
+        return self._providers
 
     async def health(self) -> dict[str, Any]:
         """
