@@ -26,12 +26,13 @@
 
 ---
 
-**WaaV Gateway** is a high-performance, real-time voice processing server built in Rust. It provides a unified interface for Speech-to-Text (STT) and Text-to-Speech (TTS) services across multiple cloud providers, with advanced audio processing capabilities including noise suppression and intelligent turn detection.
+**WaaV Gateway** is a high-performance, real-time voice processing server built in Rust. It provides a unified interface for Speech-to-Text (STT) and Text-to-Speech (TTS) services across multiple cloud providers, with advanced audio processing capabilities including noise suppression and intelligent turn detection. WaaV features a powerful DAG-based pipeline engine for building custom voice processing workflows with conditional routing and multi-provider orchestration.
 
 WaaV eliminates the complexity of integrating with multiple voice AI providers by providing a single WebSocket and REST API that abstracts away provider-specific implementations. Switch between Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, IBM Watson, Groq, or LMNT with a simple configuration change—no code modifications required.
 
 **Key Highlights:**
 - **12 STT/TTS Providers** - Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, IBM Watson, Groq, Hume AI, LMNT
+- **DAG Pipeline Engine** - Build custom voice workflows with conditional routing, multi-provider orchestration, and data transformations
 - **OpenAI & Hume AI Realtime** - Full-duplex audio-to-audio streaming with GPT-4o and Hume EVI
 - **WebSocket Streaming** - Real-time bidirectional audio with sub-second latency
 - **LiveKit Integration** - WebRTC rooms and SIP telephony support
@@ -45,6 +46,7 @@ WaaV eliminates the complexity of integrating with multiple voice AI providers b
 - [Quick Start](#quick-start)
 - [Audio Processing Pipeline](#audio-processing-pipeline)
 - [Features](#features)
+- [DAG Pipeline Engine](#dag-pipeline-engine)
 - [Providers](#providers)
 - [Architecture](#architecture)
 - [Installation](#installation)
@@ -201,13 +203,14 @@ Intelligent end-of-turn detection using ONNX Runtime with LiveKit's turn-detecto
 
 | Flag | Description | Use Case |
 |------|-------------|----------|
+| `dag-routing` | DAG-based pipeline engine | Custom voice workflows, multi-provider orchestration |
 | `turn-detect` | ONNX-based turn detection | Conversational AI, voice agents |
 | `noise-filter` | DeepFilterNet noise suppression | Noisy environments, mobile apps |
 | `openapi` | OpenAPI 3.1 spec generation | API documentation |
 
 ```bash
 # Enable all optional features
-cargo build --release --features turn-detect,noise-filter,openapi
+cargo build --release --features dag-routing,turn-detect,noise-filter,openapi
 ```
 
 ---
@@ -249,6 +252,61 @@ cargo build --release --features turn-detect,noise-filter,openapi
 |----------|----------|--------|----------|
 | **OpenAI** | WebSocket | gpt-4o-realtime-preview | Full-duplex streaming, function calling, VAD |
 | **Hume AI EVI** | WebSocket | EVI 3 | Empathic voice interface, 48 emotion dimensions, prosody analysis |
+
+---
+
+## DAG Pipeline Engine
+
+**Feature flag:** `--features dag-routing`
+
+WaaV's DAG (Directed Acyclic Graph) routing system enables flexible, customizable voice processing pipelines with conditional routing, multi-provider orchestration, and parallel processing.
+
+### Capabilities
+
+| Feature | Description |
+|---------|-------------|
+| **Custom Pipelines** | Chain STT, TTS, LLM, and custom processors in any configuration |
+| **External Routing** | Route to HTTP, gRPC, WebSocket, IPC, and LiveKit endpoints |
+| **Conditional Logic** | Use Rhai expressions or switch patterns for dynamic routing |
+| **Parallel Processing** | Split/Join patterns for concurrent branch execution |
+| **A/B Testing** | Route based on API key identity or custom conditions |
+| **Low Latency** | Pre-compiled graphs with lock-free data passing |
+
+### Node Types
+
+- **Input Nodes** - `audio_input`, `text_input`
+- **Provider Nodes** - `stt_provider`, `tts_provider`, `llm_provider`
+- **Processor Nodes** - `transform`, `filter`, `aggregate`
+- **Router Nodes** - `switch`, `conditional`, `split`, `join`
+- **Output Nodes** - `text_output`, `audio_output`, `webhook`
+- **Endpoint Nodes** - `http_endpoint`, `grpc_endpoint`, `websocket_endpoint`
+
+### Quick Example
+
+```json
+{
+  "dag": {
+    "id": "voice-bot",
+    "nodes": [
+      { "id": "input", "type": "audio_input" },
+      { "id": "stt", "type": "stt_provider", "provider": "deepgram" },
+      { "id": "llm", "type": "llm_provider", "provider": "openai" },
+      { "id": "tts", "type": "tts_provider", "provider": "elevenlabs" },
+      { "id": "output", "type": "audio_output" }
+    ],
+    "edges": [
+      { "from": "input", "to": "stt" },
+      { "from": "stt", "to": "llm" },
+      { "from": "llm", "to": "tts" },
+      { "from": "tts", "to": "output" }
+    ],
+    "entry_node": "input",
+    "exit_nodes": ["output"]
+  }
+}
+```
+
+See [docs/dag_routing.md](gateway/docs/dag_routing.md) for complete documentation.
 
 ---
 
@@ -747,6 +805,7 @@ waav/
 ├── gateway/                 # Rust gateway server
 │   ├── src/
 │   │   ├── core/           # STT/TTS providers, voice manager
+│   │   ├── dag/            # DAG pipeline engine (conditional routing)
 │   │   ├── handlers/       # WebSocket and REST handlers
 │   │   ├── livekit/        # LiveKit integration
 │   │   └── utils/          # Noise filter, caching, HTTP pooling
