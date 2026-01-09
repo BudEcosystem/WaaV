@@ -83,6 +83,7 @@ function init() {
   setupWSDebug();
   setupAudioTools();
   setupMetrics();
+  setupPlugins();
 
   // Setup keyboard shortcuts
   setupKeyboardShortcuts();
@@ -201,6 +202,7 @@ function switchTab(tabId) {
     ws: 'WebSocket Debug',
     audio: 'Audio Tools',
     metrics: 'Performance Metrics',
+    plugins: 'Plugin Explorer',
   };
   if (elements.headerTitle) {
     elements.headerTitle.textContent = titles[tabId] || 'Dashboard';
@@ -2087,6 +2089,253 @@ function exportMetrics() {
   const data = metrics.export();
   downloadFile(data, `waav-metrics-${Date.now()}.csv`, 'text/csv');
   showToast('success', 'Exported', 'Metrics exported to CSV');
+}
+
+/**
+ * Plugin Explorer
+ */
+let pluginsData = null;
+
+function setupPlugins() {
+  const refreshBtn = document.getElementById('plugins-refresh');
+  const filterType = document.getElementById('plugins-filter-type');
+  const filterHealth = document.getElementById('plugins-filter-health');
+
+  if (refreshBtn) {
+    refreshBtn.addEventListener('click', loadPlugins);
+  }
+
+  if (filterType) {
+    filterType.addEventListener('change', () => renderPlugins(pluginsData));
+  }
+
+  if (filterHealth) {
+    filterHealth.addEventListener('change', () => renderPlugins(pluginsData));
+  }
+
+  // Auto-load plugins when connected
+  // (Will be loaded when connection status changes to connected)
+}
+
+async function loadPlugins() {
+  const serverUrl = elements.serverUrl?.value || '';
+  if (!serverUrl) {
+    showToast('warning', 'No Server', 'Please configure server URL first');
+    return;
+  }
+
+  // Convert WS URL to HTTP URL for REST call
+  const baseUrl = serverUrl.replace('wss://', 'https://').replace('ws://', 'http://').replace('/ws', '');
+
+  try {
+    showToast('info', 'Loading', 'Fetching plugins from gateway...');
+
+    const response = await fetch(`${baseUrl}/plugins`, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(elements.apiKey?.value ? { 'Authorization': `Bearer ${elements.apiKey.value}` } : {}),
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    pluginsData = await response.json();
+    renderPlugins(pluginsData);
+    updatePluginCounts(pluginsData);
+    showToast('success', 'Loaded', `Found ${pluginsData.total_count || 0} plugins`);
+    logger?.log('Plugins', `Loaded ${pluginsData.total_count || 0} plugins`);
+
+    // Also update the STT/TTS provider dropdowns with discovered providers
+    updateProviderDropdowns(pluginsData);
+
+  } catch (error) {
+    console.error('[WaaV] Failed to load plugins:', error);
+    showToast('error', 'Error', `Failed to load plugins: ${error.message}`);
+    logger?.log('Plugins', `Error: ${error.message}`);
+  }
+}
+
+function updatePluginCounts(data) {
+  const sttCount = document.getElementById('plugins-stt-count');
+  const ttsCount = document.getElementById('plugins-tts-count');
+  const realtimeCount = document.getElementById('plugins-realtime-count');
+  const processorCount = document.getElementById('plugins-processor-count');
+
+  if (sttCount) sttCount.textContent = data.stt?.length || 0;
+  if (ttsCount) ttsCount.textContent = data.tts?.length || 0;
+  if (realtimeCount) realtimeCount.textContent = data.realtime?.length || 0;
+  if (processorCount) processorCount.textContent = data.processors?.length || 0;
+}
+
+function renderPlugins(data) {
+  if (!data) return;
+
+  const filterType = document.getElementById('plugins-filter-type')?.value || 'all';
+  const filterHealth = document.getElementById('plugins-filter-health')?.value || 'all';
+
+  // Render each category based on filters
+  if (filterType === 'all' || filterType === 'stt') {
+    renderProviderGrid('plugins-stt-grid', filterProviders(data.stt || [], filterHealth));
+  } else {
+    document.getElementById('plugins-stt-grid')?.closest('section')?.style.setProperty('display', 'none');
+  }
+
+  if (filterType === 'all' || filterType === 'tts') {
+    renderProviderGrid('plugins-tts-grid', filterProviders(data.tts || [], filterHealth));
+  } else {
+    document.getElementById('plugins-tts-grid')?.closest('section')?.style.setProperty('display', 'none');
+  }
+
+  if (filterType === 'all' || filterType === 'realtime') {
+    renderProviderGrid('plugins-realtime-grid', filterProviders(data.realtime || [], filterHealth));
+  } else {
+    document.getElementById('plugins-realtime-grid')?.closest('section')?.style.setProperty('display', 'none');
+  }
+
+  if (filterType === 'all' || filterType === 'processor') {
+    renderProcessorGrid('plugins-processor-grid', data.processors || []);
+  } else {
+    document.getElementById('plugins-processor-grid')?.closest('section')?.style.setProperty('display', 'none');
+  }
+
+  // Show sections that should be visible
+  if (filterType === 'all' || filterType === 'stt') {
+    document.getElementById('plugins-stt-grid')?.closest('section')?.style.removeProperty('display');
+  }
+  if (filterType === 'all' || filterType === 'tts') {
+    document.getElementById('plugins-tts-grid')?.closest('section')?.style.removeProperty('display');
+  }
+  if (filterType === 'all' || filterType === 'realtime') {
+    document.getElementById('plugins-realtime-grid')?.closest('section')?.style.removeProperty('display');
+  }
+  if (filterType === 'all' || filterType === 'processor') {
+    document.getElementById('plugins-processor-grid')?.closest('section')?.style.removeProperty('display');
+  }
+}
+
+function filterProviders(providers, healthFilter) {
+  if (healthFilter === 'all') return providers;
+  return providers.filter(p => p.health === healthFilter);
+}
+
+function renderProviderGrid(gridId, providers) {
+  const grid = document.getElementById(gridId);
+  if (!grid) return;
+
+  if (!providers || providers.length === 0) {
+    grid.innerHTML = `
+      <div class="plugin-empty">
+        <p>No providers match the current filters.</p>
+      </div>
+    `;
+    return;
+  }
+
+  grid.innerHTML = providers.map(provider => `
+    <div class="plugin-card" data-provider-id="${provider.id}">
+      <div class="plugin-card-header">
+        <div class="plugin-card-title">
+          <div class="plugin-name">${escapeHtml(provider.display_name || provider.id)}</div>
+          <div class="plugin-id">${escapeHtml(provider.id)}</div>
+        </div>
+        <div class="plugin-health ${provider.health || 'unknown'}">
+          <span class="plugin-health-dot"></span>
+          ${provider.health || 'unknown'}
+        </div>
+      </div>
+      <div class="plugin-description">${escapeHtml(provider.description || 'No description available')}</div>
+      ${provider.features && provider.features.length > 0 ? `
+        <div class="plugin-features">
+          ${provider.features.slice(0, 5).map(f => `<span class="plugin-feature">${escapeHtml(f)}</span>`).join('')}
+          ${provider.features.length > 5 ? `<span class="plugin-feature">+${provider.features.length - 5} more</span>` : ''}
+        </div>
+      ` : ''}
+      ${provider.languages && provider.languages.length > 0 ? `
+        <div class="plugin-languages">
+          ${provider.languages.slice(0, 8).map(l => `<span class="plugin-language">${escapeHtml(l.name || l.code)}</span>`).join('')}
+          ${provider.languages.length > 8 ? `<span class="plugin-language">+${provider.languages.length - 8}</span>` : ''}
+        </div>
+      ` : ''}
+      <div class="plugin-card-footer">
+        <span class="plugin-version">v${escapeHtml(provider.version || '1.0.0')}</span>
+        ${provider.models && provider.models.length > 0 ? `
+          <span class="plugin-models">
+            <svg class="plugin-models-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="3" width="7" height="7"/>
+              <rect x="14" y="3" width="7" height="7"/>
+              <rect x="14" y="14" width="7" height="7"/>
+              <rect x="3" y="14" width="7" height="7"/>
+            </svg>
+            ${provider.models.length} model${provider.models.length !== 1 ? 's' : ''}
+          </span>
+        ` : ''}
+      </div>
+    </div>
+  `).join('');
+}
+
+function renderProcessorGrid(gridId, processors) {
+  const grid = document.getElementById(gridId);
+  if (!grid) return;
+
+  if (!processors || processors.length === 0) {
+    grid.innerHTML = `
+      <div class="plugin-empty">
+        <p>No processors available.</p>
+      </div>
+    `;
+    return;
+  }
+
+  grid.innerHTML = processors.map(proc => `
+    <div class="processor-card" data-processor-id="${proc.id}">
+      <div class="processor-name">${escapeHtml(proc.name || proc.id)}</div>
+      <div class="processor-description">${escapeHtml(proc.description || 'No description')}</div>
+      ${proc.supported_formats && proc.supported_formats.length > 0 ? `
+        <div class="processor-formats">
+          ${proc.supported_formats.map(f => `<span class="processor-format">${escapeHtml(f)}</span>`).join('')}
+        </div>
+      ` : ''}
+    </div>
+  `).join('');
+}
+
+function updateProviderDropdowns(data) {
+  // Update STT provider dropdown
+  const sttProvider = document.getElementById('stt-provider');
+  if (sttProvider && data.stt && data.stt.length > 0) {
+    const currentValue = sttProvider.value;
+    sttProvider.innerHTML = data.stt.map(p => `
+      <option value="${escapeHtml(p.id)}">${escapeHtml(p.display_name || p.id)}</option>
+    `).join('');
+    // Try to restore the previous selection
+    if (data.stt.some(p => p.id === currentValue)) {
+      sttProvider.value = currentValue;
+    }
+  }
+
+  // Update TTS provider dropdown
+  const ttsProvider = document.getElementById('tts-provider');
+  if (ttsProvider && data.tts && data.tts.length > 0) {
+    const currentValue = ttsProvider.value;
+    ttsProvider.innerHTML = data.tts.map(p => `
+      <option value="${escapeHtml(p.id)}">${escapeHtml(p.display_name || p.id)}</option>
+    `).join('');
+    // Try to restore the previous selection
+    if (data.tts.some(p => p.id === currentValue)) {
+      ttsProvider.value = currentValue;
+    }
+  }
+}
+
+function escapeHtml(str) {
+  if (typeof str !== 'string') return '';
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
 }
 
 /**

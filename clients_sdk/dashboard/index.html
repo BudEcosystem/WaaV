@@ -184,6 +184,19 @@
                                     <span class="nav-shortcut">⌘8</span>
                                 </a>
                             </li>
+                            <li class="nav-item">
+                                <a href="#plugins" class="nav-link" data-tab="plugins">
+                                    <span class="nav-icon">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                                            <path d="M2 17l10 5 10-5"/>
+                                            <path d="M2 12l10 5 10-5"/>
+                                        </svg>
+                                    </span>
+                                    <span class="nav-label">Plugins</span>
+                                    <span class="nav-shortcut">⌘0</span>
+                                </a>
+                            </li>
                         </ul>
                     </li>
 
@@ -1162,6 +1175,112 @@
                     <div class="form-row">
                         <button id="metrics-reset" class="btn btn-secondary">Reset Metrics</button>
                         <button id="metrics-export" class="btn btn-secondary">Export CSV</button>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Plugins Panel -->
+            <div class="tab-panel" id="panel-plugins">
+                <div class="panel-header">
+                    <h1>Plugin Explorer</h1>
+                    <p class="panel-description">Discover available providers and their capabilities</p>
+                </div>
+
+                <section class="form-section">
+                    <div class="form-row">
+                        <button id="plugins-refresh" class="btn btn-primary">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                                <polyline points="23 4 23 10 17 10"/>
+                                <polyline points="1 20 1 14 7 14"/>
+                                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                            </svg>
+                            Refresh Plugins
+                        </button>
+                        <div class="input-group" style="flex: 0 0 200px;">
+                            <label for="plugins-filter-type">Filter by Type</label>
+                            <select id="plugins-filter-type">
+                                <option value="all">All Types</option>
+                                <option value="stt">STT Providers</option>
+                                <option value="tts">TTS Providers</option>
+                                <option value="realtime">Realtime Providers</option>
+                                <option value="processor">Processors</option>
+                            </select>
+                        </div>
+                        <div class="input-group" style="flex: 0 0 200px;">
+                            <label for="plugins-filter-health">Filter by Health</label>
+                            <select id="plugins-filter-health">
+                                <option value="all">All Status</option>
+                                <option value="healthy">Healthy</option>
+                                <option value="degraded">Degraded</option>
+                                <option value="unhealthy">Unhealthy</option>
+                            </select>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="form-section" id="plugins-summary">
+                    <h2>Summary</h2>
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-header">
+                                <span class="stat-label">STT Providers</span>
+                            </div>
+                            <span class="stat-value" id="plugins-stt-count">-</span>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-header">
+                                <span class="stat-label">TTS Providers</span>
+                            </div>
+                            <span class="stat-value" id="plugins-tts-count">-</span>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-header">
+                                <span class="stat-label">Realtime Providers</span>
+                            </div>
+                            <span class="stat-value" id="plugins-realtime-count">-</span>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-header">
+                                <span class="stat-label">Processors</span>
+                            </div>
+                            <span class="stat-value" id="plugins-processor-count">-</span>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="form-section">
+                    <h2>STT Providers</h2>
+                    <div class="plugins-grid" id="plugins-stt-grid">
+                        <div class="plugin-empty">
+                            <p>No STT providers loaded. Click "Refresh Plugins" to discover available providers.</p>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="form-section">
+                    <h2>TTS Providers</h2>
+                    <div class="plugins-grid" id="plugins-tts-grid">
+                        <div class="plugin-empty">
+                            <p>No TTS providers loaded. Click "Refresh Plugins" to discover available providers.</p>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="form-section">
+                    <h2>Realtime Providers</h2>
+                    <div class="plugins-grid" id="plugins-realtime-grid">
+                        <div class="plugin-empty">
+                            <p>No Realtime providers loaded. Click "Refresh Plugins" to discover available providers.</p>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="form-section">
+                    <h2>Audio Processors</h2>
+                    <div class="plugins-grid" id="plugins-processor-grid">
+                        <div class="plugin-empty">
+                            <p>No processors loaded. Click "Refresh Plugins" to discover available processors.</p>
+                        </div>
                     </div>
                 </section>
             </div>
