@@ -12,6 +12,7 @@ publish = false
 [features]
 default = []
 turn-detect = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
+vad = ["dep:ort", "dep:ndarray"]  # Voice Activity Detection with Silero VAD
 plugins-dynamic = ["dep:libloading"]  # Optional dynamic plugin loading
 noise-filter = [
     "dep:deep_filter",
