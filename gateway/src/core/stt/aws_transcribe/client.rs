@@ -255,7 +255,7 @@ impl AwsTranscribeSTT {
             "nl-nl" | "nl_nl" => Some(LanguageCode::NlNl),
             "sv-se" | "sv_se" => Some(LanguageCode::SvSe),
             "th-th" | "th_th" => Some(LanguageCode::ThTh),
-            "tr-tr" | "tr_tr" => Some(LanguageCode::TrTr),
+            // Note: tr-tr (Turkish) removed - not available in older AWS SDK versions
             "vi-vn" | "vi_vn" => Some(LanguageCode::ViVn),
             _ => {
                 // For unsupported codes, default to en-US with a warning

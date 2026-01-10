@@ -6,12 +6,20 @@ pub mod state;
 pub mod stt;
 pub mod tts;
 pub mod turn_detect;
+pub mod vad;
 pub mod voice_manager;
 
 #[cfg(feature = "turn-detect")]
 pub use turn_detect::{TurnDetector, TurnDetectorBuilder, TurnDetectorConfig};
 #[cfg(not(feature = "turn-detect"))]
 pub use turn_detect::{TurnDetector, TurnDetectorBuilder, TurnDetectorConfig};
+
+// VAD exports
+pub use vad::{VADConfig, VADBackend};
+#[cfg(feature = "vad")]
+pub use vad::{SileroVAD, VADResult, VoiceActivityDetector, create_vad};
+#[cfg(not(feature = "vad"))]
+pub use vad::{SileroVAD, VADResult, VoiceActivityDetector, create_vad};
 
 // Re-export commonly used types for convenience
 pub use stt::{

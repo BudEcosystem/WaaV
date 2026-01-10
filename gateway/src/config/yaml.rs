@@ -69,6 +69,7 @@ pub struct YamlConfig {
     pub sip: Option<SipYaml>,
     pub security: Option<SecurityYaml>,
     pub plugins: Option<PluginsYaml>,
+    pub vad: Option<VadYaml>,
 }
 
 /// Server configuration from YAML
@@ -266,6 +267,50 @@ pub struct PluginsYaml {
     /// Provider-specific configuration (keyed by provider name)
     #[serde(default)]
     pub providers: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Voice Activity Detection configuration from YAML
+///
+/// # Example YAML structure
+/// ```yaml
+/// vad:
+///   enabled: true
+///   backend: "silero"
+///   threshold: 0.5
+///   min_speech_duration_ms: 250
+///   min_silence_duration_ms: 300
+///   pre_speech_padding_ms: 100
+///   post_speech_padding_ms: 100
+///   sample_rate: 16000
+///   emit_probability_events: false
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct VadYaml {
+    /// Enable/disable VAD processing
+    pub enabled: Option<bool>,
+    /// VAD backend: "silero", "webrtc", or "energy"
+    pub backend: Option<String>,
+    /// Speech probability threshold (0.0 - 1.0)
+    pub threshold: Option<f32>,
+    /// Minimum speech duration before triggering speech_start (ms)
+    pub min_speech_duration_ms: Option<u32>,
+    /// Minimum silence duration before triggering speech_end (ms)
+    pub min_silence_duration_ms: Option<u32>,
+    /// Pre-speech audio padding (ms)
+    pub pre_speech_padding_ms: Option<u32>,
+    /// Post-speech audio padding (ms)
+    pub post_speech_padding_ms: Option<u32>,
+    /// Sample rate for audio processing (Hz)
+    pub sample_rate: Option<u32>,
+    /// Frame size in samples
+    pub frame_size: Option<usize>,
+    /// Path to the ONNX model file
+    pub model_path: Option<String>,
+    /// Number of threads for ONNX inference
+    pub num_threads: Option<usize>,
+    /// Emit speech probability events
+    pub emit_probability_events: Option<bool>,
 }
 
 impl YamlConfig {

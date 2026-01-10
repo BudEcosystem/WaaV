@@ -423,6 +423,71 @@ fn bench_json_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark VAD configuration operations
+#[cfg(feature = "vad")]
+fn bench_vad_config(c: &mut Criterion) {
+    use waav_gateway::core::vad::{VADConfig, VADBackend};
+
+    let mut group = c.benchmark_group("vad_config");
+    group.measurement_time(Duration::from_secs(5));
+
+    group.bench_function("config_default", |b| {
+        b.iter(|| VADConfig::default());
+    });
+
+    group.bench_function("config_low_latency", |b| {
+        b.iter(|| VADConfig::low_latency());
+    });
+
+    group.bench_function("config_high_accuracy", |b| {
+        b.iter(|| VADConfig::high_accuracy());
+    });
+
+    group.bench_function("config_validate", |b| {
+        let config = VADConfig::default();
+        b.iter(|| config.validate());
+    });
+
+    group.bench_function("frame_duration_calc", |b| {
+        let config = VADConfig::default();
+        b.iter(|| config.frame_duration_ms());
+    });
+
+    group.bench_function("frames_for_duration", |b| {
+        let config = VADConfig::default();
+        b.iter(|| config.frames_for_duration(black_box(300)));
+    });
+
+    group.finish();
+}
+
+/// Benchmark VAD stub operations (when vad feature is disabled)
+#[cfg(not(feature = "vad"))]
+fn bench_vad_stub(c: &mut Criterion) {
+    use waav_gateway::core::vad::{VADConfig, SileroVAD, VoiceActivityDetector};
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("vad_stub");
+    group.measurement_time(Duration::from_secs(5));
+
+    let config = VADConfig::default();
+    let vad = rt.block_on(async { SileroVAD::new(config).await.unwrap() });
+
+    // Test audio frame
+    let audio_frame = vec![0.0f32; 512];
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("process_frame_stub", |b| {
+        let mut vad = rt.block_on(async { SileroVAD::new(VADConfig::default()).await.unwrap() });
+        b.iter(|| {
+            let _ = vad.process_frame(black_box(&audio_frame));
+        });
+    });
+
+    group.finish();
+}
+
+#[cfg(feature = "vad")]
 criterion_group!(
     benches,
     bench_message_parsing,
@@ -433,5 +498,21 @@ criterion_group!(
     bench_cache_hashing,
     bench_audio_frame_validation,
     bench_json_throughput,
+    bench_vad_config,
 );
+
+#[cfg(not(feature = "vad"))]
+criterion_group!(
+    benches,
+    bench_message_parsing,
+    bench_message_validation,
+    bench_message_serialization,
+    bench_phone_validation,
+    bench_cache_operations,
+    bench_cache_hashing,
+    bench_audio_frame_validation,
+    bench_json_throughput,
+    bench_vad_stub,
+);
+
 criterion_main!(benches);
