@@ -364,6 +364,13 @@ impl LiveKitClient {
             ));
         }
 
+        // Validate channels before division to prevent panic
+        if channels == 0 {
+            return Err(AppError::InternalServerError(
+                "Invalid audio data: channels cannot be zero".to_string(),
+            ));
+        }
+
         let num_samples = audio_data.len() / 2;
         let samples_per_channel = num_samples / channels as usize;
 

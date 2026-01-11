@@ -3,8 +3,281 @@ Type definitions for bud-foundry SDK
 """
 
 from enum import Enum
-from typing import Any, Literal, Optional, Union
-from pydantic import BaseModel, Field
+from typing import Any, Callable, Literal, Optional, Union
+from pydantic import BaseModel, ConfigDict, Field
+
+
+# =============================================================================
+# Provider Types (Comprehensive List)
+# =============================================================================
+
+
+class STTProvider(str, Enum):
+    """
+    Supported Speech-to-Text providers.
+    All 10 providers supported by the gateway.
+    """
+
+    DEEPGRAM = "deepgram"
+    GOOGLE = "google"
+    AZURE = "azure"
+    CARTESIA = "cartesia"
+    GATEWAY = "gateway"
+    ASSEMBLYAI = "assemblyai"
+    AWS_TRANSCRIBE = "aws-transcribe"
+    IBM_WATSON = "ibm-watson"
+    GROQ = "groq"
+    OPENAI_WHISPER = "openai-whisper"
+
+
+class TTSProvider(str, Enum):
+    """
+    Supported Text-to-Speech providers.
+    All 12 providers supported by the gateway.
+    """
+
+    DEEPGRAM = "deepgram"
+    ELEVENLABS = "elevenlabs"
+    GOOGLE = "google"
+    AZURE = "azure"
+    CARTESIA = "cartesia"
+    OPENAI = "openai"
+    AWS_POLLY = "aws-polly"
+    IBM_WATSON = "ibm-watson"
+    HUME = "hume"
+    LMNT = "lmnt"
+    PLAYHT = "playht"
+    KOKORO = "kokoro"
+
+
+class RealtimeProvider(str, Enum):
+    """
+    Supported Realtime (Audio-to-Audio) providers.
+    """
+
+    OPENAI_REALTIME = "openai-realtime"
+    HUME_EVI = "hume-evi"
+
+
+# Provider capability definitions
+STT_PROVIDER_CAPABILITIES: dict[STTProvider, dict[str, Any]] = {
+    STTProvider.DEEPGRAM: {
+        "streaming": True,
+        "diarization": True,
+        "languages": ["en", "es", "fr", "de", "it", "pt", "nl", "ja", "ko", "zh"],
+        "models": ["nova-3", "nova-2", "enhanced", "base"],
+    },
+    STTProvider.GOOGLE: {
+        "streaming": True,
+        "diarization": True,
+        "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh"],
+        "models": ["default", "command_and_search", "phone_call", "video"],
+    },
+    STTProvider.AZURE: {
+        "streaming": True,
+        "diarization": True,
+        "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh"],
+        "models": ["default"],
+    },
+    STTProvider.CARTESIA: {
+        "streaming": True,
+        "diarization": False,
+        "languages": ["en"],
+        "models": ["default"],
+    },
+    STTProvider.GATEWAY: {
+        "streaming": True,
+        "diarization": True,
+        "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh"],
+        "models": ["whisper-large-v3", "whisper-medium", "whisper-small"],
+    },
+    STTProvider.ASSEMBLYAI: {
+        "streaming": True,
+        "diarization": True,
+        "languages": ["en", "es", "fr", "de", "it", "pt"],
+        "models": ["default", "nano"],
+    },
+    STTProvider.AWS_TRANSCRIBE: {
+        "streaming": True,
+        "diarization": True,
+        "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh"],
+        "models": ["default"],
+    },
+    STTProvider.IBM_WATSON: {
+        "streaming": True,
+        "diarization": True,
+        "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh"],
+        "models": ["default"],
+    },
+    STTProvider.GROQ: {
+        "streaming": False,
+        "diarization": False,
+        "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh"],
+        "models": ["whisper-large-v3-turbo"],
+    },
+    STTProvider.OPENAI_WHISPER: {
+        "streaming": False,
+        "diarization": False,
+        "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh"],
+        "models": ["whisper-1"],
+    },
+}
+
+
+TTS_PROVIDER_CAPABILITIES: dict[TTSProvider, dict[str, Any]] = {
+    TTSProvider.DEEPGRAM: {
+        "streaming": True,
+        "ssml": False,
+        "emotion": False,
+        "voice_cloning": False,
+        "languages": ["en"],
+        "models": ["aura-asteria-en", "aura-luna-en", "aura-stella-en"],
+    },
+    TTSProvider.ELEVENLABS: {
+        "streaming": True,
+        "ssml": True,
+        "emotion": True,
+        "voice_cloning": True,
+        "languages": ["en", "es", "fr", "de", "it", "pt", "pl", "hi", "ar"],
+        "models": ["eleven_turbo_v2_5", "eleven_multilingual_v2", "eleven_monolingual_v1"],
+    },
+    TTSProvider.GOOGLE: {
+        "streaming": True,
+        "ssml": True,
+        "emotion": False,
+        "voice_cloning": False,
+        "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh"],
+        "models": ["en-US-Studio-O", "en-US-Wavenet-D"],
+    },
+    TTSProvider.AZURE: {
+        "streaming": True,
+        "ssml": True,
+        "emotion": True,
+        "voice_cloning": True,
+        "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh"],
+        "models": ["en-US-JennyNeural", "en-US-GuyNeural"],
+    },
+    TTSProvider.CARTESIA: {
+        "streaming": True,
+        "ssml": False,
+        "emotion": True,
+        "voice_cloning": True,
+        "languages": ["en"],
+        "models": ["sonic-3"],
+    },
+    TTSProvider.OPENAI: {
+        "streaming": True,
+        "ssml": False,
+        "emotion": False,
+        "voice_cloning": False,
+        "languages": ["en"],
+        "models": ["tts-1", "tts-1-hd"],
+    },
+    TTSProvider.AWS_POLLY: {
+        "streaming": True,
+        "ssml": True,
+        "emotion": False,
+        "voice_cloning": False,
+        "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh"],
+        "models": ["standard", "neural", "generative"],
+    },
+    TTSProvider.IBM_WATSON: {
+        "streaming": True,
+        "ssml": True,
+        "emotion": True,
+        "voice_cloning": False,
+        "languages": ["en", "es", "fr", "de", "it", "pt", "ja"],
+        "models": ["en-US_MichaelV3Voice", "en-US_AllisonV3Voice"],
+    },
+    TTSProvider.HUME: {
+        "streaming": True,
+        "ssml": False,
+        "emotion": True,
+        "voice_cloning": True,
+        "languages": ["en"],
+        "models": ["octave"],
+    },
+    TTSProvider.LMNT: {
+        "streaming": True,
+        "ssml": False,
+        "emotion": False,
+        "voice_cloning": True,
+        "languages": ["en"],
+        "models": ["default"],
+    },
+    TTSProvider.PLAYHT: {
+        "streaming": True,
+        "ssml": False,
+        "emotion": True,
+        "voice_cloning": True,
+        "languages": ["en"],
+        "models": ["PlayHT2.0", "PlayHT2.0-turbo"],
+    },
+    TTSProvider.KOKORO: {
+        "streaming": True,
+        "ssml": False,
+        "emotion": False,
+        "voice_cloning": False,
+        "languages": ["en", "ja", "ko", "zh"],
+        "models": ["kokoro-v1"],
+    },
+}
+
+
+REALTIME_PROVIDER_CAPABILITIES: dict[RealtimeProvider, dict[str, Any]] = {
+    RealtimeProvider.OPENAI_REALTIME: {
+        "function_calling": True,
+        "vision": False,
+        "emotion_detection": False,
+        "models": ["gpt-4o-realtime-preview", "gpt-4o-mini-realtime-preview"],
+        "voices": ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"],
+    },
+    RealtimeProvider.HUME_EVI: {
+        "function_calling": True,
+        "vision": False,
+        "emotion_detection": True,
+        "models": ["evi-3", "evi-4-mini"],
+        "voices": [],  # Custom voice IDs only
+    },
+}
+
+
+def is_valid_stt_provider(provider: str) -> bool:
+    """Check if a string is a valid STT provider."""
+    return provider in [p.value for p in STTProvider]
+
+
+def is_valid_tts_provider(provider: str) -> bool:
+    """Check if a string is a valid TTS provider."""
+    return provider in [p.value for p in TTSProvider]
+
+
+def is_valid_realtime_provider(provider: str) -> bool:
+    """Check if a string is a valid realtime provider."""
+    return provider in [p.value for p in RealtimeProvider]
+
+
+def get_provider_capabilities(
+    provider: str,
+    provider_type: Literal["stt", "tts", "realtime"],
+) -> dict[str, Any] | None:
+    """Get capabilities for a provider."""
+    if provider_type == "stt":
+        try:
+            return STT_PROVIDER_CAPABILITIES.get(STTProvider(provider))
+        except ValueError:
+            return None
+    elif provider_type == "tts":
+        try:
+            return TTS_PROVIDER_CAPABILITIES.get(TTSProvider(provider))
+        except ValueError:
+            return None
+    elif provider_type == "realtime":
+        try:
+            return REALTIME_PROVIDER_CAPABILITIES.get(RealtimeProvider(provider))
+        except ValueError:
+            return None
+    return None
 
 
 # =============================================================================
@@ -338,6 +611,9 @@ class TranscriptEvent(BaseModel):
 
     words: Optional[list[WordInfo]] = None
     """Word-level details"""
+
+    role: Optional[Literal["user", "assistant"]] = None
+    """Speaker role for realtime conversations"""
 
 
 class AudioEvent(BaseModel):
@@ -914,3 +1190,476 @@ class ProsodyScores(BaseModel):
         """Get the dominant (highest scoring) emotion."""
         top = self.top_emotions(1)
         return top[0] if top else None
+
+
+# =============================================================================
+# DAG Routing Types
+# =============================================================================
+
+
+class DAGNodeType(str, Enum):
+    """Node types supported in DAG definitions."""
+
+    AUDIO_INPUT = "audio_input"
+    AUDIO_OUTPUT = "audio_output"
+    TEXT_INPUT = "text_input"
+    TEXT_OUTPUT = "text_output"
+    STT_PROVIDER = "stt_provider"
+    TTS_PROVIDER = "tts_provider"
+    LLM = "llm"
+    HTTP_ENDPOINT = "http_endpoint"
+    WEBHOOK = "webhook"
+    TRANSFORM = "transform"
+    ROUTER = "router"
+    BUFFER = "buffer"
+    SWITCH = "switch"
+
+
+class DAGNode(BaseModel):
+    """A node in the DAG pipeline."""
+
+    id: str
+    """Unique identifier for this node"""
+
+    type: DAGNodeType
+    """Type of the node"""
+
+    config: Optional[dict[str, Any]] = None
+    """Node-specific configuration"""
+
+
+class DAGEdge(BaseModel):
+    """An edge connecting two nodes in the DAG."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_node: str = Field(alias="from")
+    """Source node ID"""
+
+    to_node: str = Field(alias="to")
+    """Destination node ID"""
+
+    condition: Optional[str] = None
+    """Optional condition expression (Rhai script)"""
+
+
+class DAGDefinition(BaseModel):
+    """Complete DAG definition."""
+
+    id: str
+    """Unique identifier for this DAG"""
+
+    name: str
+    """Human-readable name"""
+
+    version: str
+    """Version string"""
+
+    description: Optional[str] = None
+    """Description of the DAG"""
+
+    nodes: list[DAGNode]
+    """Nodes in the DAG"""
+
+    edges: list[DAGEdge]
+    """Edges connecting nodes"""
+
+    metadata: Optional[dict[str, Any]] = None
+    """Optional metadata"""
+
+
+class DAGConfig(BaseModel):
+    """DAG configuration for WebSocket sessions."""
+
+    template: Optional[str] = None
+    """Name of a pre-registered template to use"""
+
+    definition: Optional[DAGDefinition] = None
+    """Inline DAG definition (takes precedence over template)"""
+
+    enable_metrics: bool = False
+    """Enable metrics collection for DAG execution"""
+
+    timeout_ms: int = 30000
+    """Maximum execution time in milliseconds"""
+
+
+class DAGValidationResult(BaseModel):
+    """Validation result for DAG definitions."""
+
+    valid: bool
+    """Whether the DAG is valid"""
+
+    errors: list[str]
+    """List of validation errors"""
+
+    warnings: list[str]
+    """List of validation warnings"""
+
+
+def validate_dag_definition(dag: DAGDefinition) -> DAGValidationResult:
+    """
+    Validate a DAG definition.
+
+    Checks for:
+    - Required fields
+    - Unique node IDs
+    - Valid edge references
+    - No cycles (DAG must be acyclic)
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    # Check required fields
+    if not dag.id:
+        errors.append("DAG id is required")
+    if not dag.name:
+        errors.append("DAG name is required")
+    if not dag.version:
+        errors.append("DAG version is required")
+
+    # Check for duplicate node IDs
+    node_ids: set[str] = set()
+    for node in dag.nodes:
+        if not node.id:
+            errors.append("Node id is required")
+            continue
+        if node.id in node_ids:
+            errors.append(f"Duplicate node id: {node.id}")
+        node_ids.add(node.id)
+
+    # Check edge references
+    for edge in dag.edges:
+        if edge.from_node not in node_ids:
+            errors.append(f"Edge references nonexistent source node: {edge.from_node}")
+        if edge.to_node not in node_ids:
+            errors.append(f"Edge references nonexistent target node: {edge.to_node}")
+
+    # Check for cycles using DFS
+    if not errors:
+        cycle_result = _detect_cycles(dag)
+        if cycle_result:
+            errors.append(f"DAG contains a cycle: {' -> '.join(cycle_result)}")
+
+    # Warnings
+    if len(dag.nodes) == 0:
+        warnings.append("DAG has no nodes")
+    if len(dag.edges) == 0 and len(dag.nodes) > 1:
+        warnings.append("DAG has multiple nodes but no edges")
+
+    # Check for disconnected nodes
+    connected_nodes: set[str] = set()
+    for edge in dag.edges:
+        connected_nodes.add(edge.from_node)
+        connected_nodes.add(edge.to_node)
+    for node in dag.nodes:
+        if len(dag.nodes) > 1 and node.id not in connected_nodes:
+            warnings.append(f"Node {node.id} is not connected to any other node")
+
+    return DAGValidationResult(valid=len(errors) == 0, errors=errors, warnings=warnings)
+
+
+def _detect_cycles(dag: DAGDefinition) -> list[str] | None:
+    """Detect cycles in the DAG using DFS."""
+    adjacency: dict[str, list[str]] = {node.id: [] for node in dag.nodes}
+    for edge in dag.edges:
+        adjacency[edge.from_node].append(edge.to_node)
+
+    visited: set[str] = set()
+    recursion_stack: set[str] = set()
+    path: list[str] = []
+
+    def dfs(node_id: str) -> bool:
+        visited.add(node_id)
+        recursion_stack.add(node_id)
+        path.append(node_id)
+
+        for neighbor in adjacency.get(node_id, []):
+            if neighbor not in visited:
+                if dfs(neighbor):
+                    return True
+            elif neighbor in recursion_stack:
+                path.append(neighbor)
+                return True
+
+        path.pop()
+        recursion_stack.remove(node_id)
+        return False
+
+    for node in dag.nodes:
+        if node.id not in visited:
+            if dfs(node.id):
+                cycle_start = path.index(path[-1])
+                return path[cycle_start:]
+
+    return None
+
+
+# Pre-built DAG templates
+TEMPLATE_SIMPLE_STT = DAGDefinition(
+    id="simple-stt",
+    name="Simple STT Pipeline",
+    version="1.0",
+    description="Convert audio to text using speech-to-text",
+    nodes=[
+        DAGNode(id="input", type=DAGNodeType.AUDIO_INPUT),
+        DAGNode(id="stt", type=DAGNodeType.STT_PROVIDER, config={"provider": "deepgram"}),
+        DAGNode(id="output", type=DAGNodeType.TEXT_OUTPUT),
+    ],
+    edges=[
+        DAGEdge(from_node="input", to_node="stt"),
+        DAGEdge(from_node="stt", to_node="output"),
+    ],
+)
+
+TEMPLATE_SIMPLE_TTS = DAGDefinition(
+    id="simple-tts",
+    name="Simple TTS Pipeline",
+    version="1.0",
+    description="Convert text to speech using text-to-speech",
+    nodes=[
+        DAGNode(id="input", type=DAGNodeType.TEXT_INPUT),
+        DAGNode(id="tts", type=DAGNodeType.TTS_PROVIDER, config={"provider": "elevenlabs"}),
+        DAGNode(id="output", type=DAGNodeType.AUDIO_OUTPUT),
+    ],
+    edges=[
+        DAGEdge(from_node="input", to_node="tts"),
+        DAGEdge(from_node="tts", to_node="output"),
+    ],
+)
+
+TEMPLATE_VOICE_ASSISTANT = DAGDefinition(
+    id="voice-assistant",
+    name="Voice Assistant Pipeline",
+    version="1.0",
+    description="Full voice assistant with STT, LLM, and TTS",
+    nodes=[
+        DAGNode(id="audio_in", type=DAGNodeType.AUDIO_INPUT),
+        DAGNode(id="stt", type=DAGNodeType.STT_PROVIDER, config={"provider": "deepgram"}),
+        DAGNode(id="llm", type=DAGNodeType.LLM, config={"provider": "openai", "model": "gpt-4"}),
+        DAGNode(id="tts", type=DAGNodeType.TTS_PROVIDER, config={"provider": "elevenlabs"}),
+        DAGNode(id="audio_out", type=DAGNodeType.AUDIO_OUTPUT),
+    ],
+    edges=[
+        DAGEdge(from_node="audio_in", to_node="stt"),
+        DAGEdge(from_node="stt", to_node="llm"),
+        DAGEdge(from_node="llm", to_node="tts"),
+        DAGEdge(from_node="tts", to_node="audio_out"),
+    ],
+)
+
+BUILTIN_TEMPLATES: dict[str, DAGDefinition] = {
+    "simple-stt": TEMPLATE_SIMPLE_STT,
+    "simple-tts": TEMPLATE_SIMPLE_TTS,
+    "voice-assistant": TEMPLATE_VOICE_ASSISTANT,
+}
+
+
+def get_builtin_template(name: str) -> DAGDefinition | None:
+    """Get a built-in template by name."""
+    return BUILTIN_TEMPLATES.get(name)
+
+
+# =============================================================================
+# Audio Features Types
+# =============================================================================
+
+
+class TurnDetectionConfig(BaseModel):
+    """Turn detection configuration."""
+
+    enabled: bool = False
+    """Enable turn detection"""
+
+    threshold: float = 0.5
+    """Detection threshold (0.0-1.0)"""
+
+    silence_ms: int = 500
+    """Silence duration in ms to trigger turn end"""
+
+    prefix_padding_ms: int = 200
+    """Padding before speech in ms"""
+
+    create_response_ms: int = 300
+    """Delay before creating response in ms"""
+
+
+class NoiseFilterConfig(BaseModel):
+    """Noise filtering configuration."""
+
+    enabled: bool = False
+    """Enable noise filtering"""
+
+    strength: Literal["low", "medium", "high"] = "medium"
+    """Noise reduction strength"""
+
+    strength_value: Optional[float] = None
+    """Numeric strength value (0.0-1.0), overrides strength if provided"""
+
+
+class VADModeType(str, Enum):
+    """VAD mode types."""
+
+    NORMAL = "normal"
+    AGGRESSIVE = "aggressive"
+    VERY_AGGRESSIVE = "very_aggressive"
+
+
+class ExtendedVADConfig(BaseModel):
+    """Extended VAD configuration."""
+
+    enabled: bool = True
+    """Enable VAD"""
+
+    threshold: float = 0.5
+    """Detection threshold (0.0-1.0)"""
+
+    mode: VADModeType = VADModeType.NORMAL
+    """VAD mode for different environments"""
+
+
+class AudioFeatures(BaseModel):
+    """Combined audio features configuration."""
+
+    turn_detection: Optional[TurnDetectionConfig] = None
+    """Turn detection settings"""
+
+    noise_filtering: Optional[NoiseFilterConfig] = None
+    """Noise filtering settings"""
+
+    vad: Optional[ExtendedVADConfig] = None
+    """Voice activity detection settings"""
+
+
+# Default configurations
+DEFAULT_TURN_DETECTION = TurnDetectionConfig()
+DEFAULT_NOISE_FILTER = NoiseFilterConfig()
+DEFAULT_VAD = ExtendedVADConfig()
+
+
+def create_audio_features(
+    turn_detection: Optional[dict[str, Any]] = None,
+    noise_filtering: Optional[dict[str, Any]] = None,
+    vad: Optional[dict[str, Any]] = None,
+) -> AudioFeatures:
+    """Create audio features configuration with defaults."""
+    features = AudioFeatures()
+
+    if turn_detection:
+        features.turn_detection = TurnDetectionConfig(**turn_detection)
+    else:
+        features.turn_detection = DEFAULT_TURN_DETECTION.model_copy()
+
+    if noise_filtering:
+        features.noise_filtering = NoiseFilterConfig(**noise_filtering)
+    else:
+        features.noise_filtering = DEFAULT_NOISE_FILTER.model_copy()
+
+    if vad:
+        features.vad = ExtendedVADConfig(**vad)
+    else:
+        features.vad = DEFAULT_VAD.model_copy()
+
+    return features
+
+
+# =============================================================================
+# Recording Types
+# =============================================================================
+
+
+class RecordingStatus(str, Enum):
+    """Recording status."""
+
+    RECORDING = "recording"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    PROCESSING = "processing"
+
+
+class RecordingFormat(str, Enum):
+    """Audio format for recordings."""
+
+    WAV = "wav"
+    MP3 = "mp3"
+    OGG = "ogg"
+    FLAC = "flac"
+    WEBM = "webm"
+
+
+class RecordingInfo(BaseModel):
+    """Information about a recording."""
+
+    stream_id: str
+    """Stream ID associated with the recording"""
+
+    room_name: Optional[str] = None
+    """Room name (for LiveKit recordings)"""
+
+    duration: float
+    """Duration in seconds"""
+
+    size: int
+    """Size in bytes"""
+
+    format: RecordingFormat
+    """Audio format"""
+
+    created_at: str
+    """Creation timestamp (ISO 8601)"""
+
+    status: RecordingStatus
+    """Current status"""
+
+    sample_rate: Optional[int] = None
+    """Sample rate in Hz"""
+
+    channels: Optional[int] = None
+    """Number of channels"""
+
+    bit_depth: Optional[int] = None
+    """Bit depth"""
+
+    metadata: Optional[dict[str, Any]] = None
+    """Optional metadata"""
+
+
+class RecordingFilter(BaseModel):
+    """Filter for listing recordings."""
+
+    room_name: Optional[str] = None
+    """Filter by room name"""
+
+    stream_id: Optional[str] = None
+    """Filter by stream ID"""
+
+    status: Optional[RecordingStatus] = None
+    """Filter by status"""
+
+    start_date: Optional[str] = None
+    """Start date (ISO 8601)"""
+
+    end_date: Optional[str] = None
+    """End date (ISO 8601)"""
+
+    format: Optional[RecordingFormat] = None
+    """Filter by format"""
+
+    limit: Optional[int] = None
+    """Maximum number of results"""
+
+    offset: Optional[int] = None
+    """Offset for pagination"""
+
+
+class RecordingList(BaseModel):
+    """Paginated list of recordings."""
+
+    recordings: list[RecordingInfo]
+    """Recordings in this page"""
+
+    total: int
+    """Total count of recordings matching filter"""
+
+    has_more: bool = False
+    """Whether there are more results"""

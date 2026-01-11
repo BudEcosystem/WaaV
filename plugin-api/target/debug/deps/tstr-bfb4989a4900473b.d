@@ -1,0 +1,14 @@
+/home/bud/Desktop/bud_waav/WaaV/plugin-api/target/debug/deps/tstr-bfb4989a4900473b.d: /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/lib.rs /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/asserts.rs /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/macros.rs /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/macros/cmp_macros.rs /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/make_tstr.rs /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/to_uint.rs /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/to_uint/impl_no_const_generics.rs /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/tstr_type.rs /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/utils.rs /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/./p.rs
+
+/home/bud/Desktop/bud_waav/WaaV/plugin-api/target/debug/deps/libtstr-bfb4989a4900473b.rmeta: /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/lib.rs /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/asserts.rs /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/macros.rs /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/macros/cmp_macros.rs /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/make_tstr.rs /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/to_uint.rs /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/to_uint/impl_no_const_generics.rs /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/tstr_type.rs /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/utils.rs /home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/./p.rs
+
+/home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/lib.rs:
+/home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/asserts.rs:
+/home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/macros.rs:
+/home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/macros/cmp_macros.rs:
+/home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/make_tstr.rs:
+/home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/to_uint.rs:
+/home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/to_uint/impl_no_const_generics.rs:
+/home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/tstr_type.rs:
+/home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/utils.rs:
+/home/bud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tstr-0.2.4/src/./p.rs:

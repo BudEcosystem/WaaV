@@ -9,7 +9,7 @@ use tracing::{debug, warn, info};
 use super::{DAGNode, DAGData, NodeCapability};
 use crate::dag::context::DAGContext;
 use crate::dag::error::{DAGError, DAGResult};
-use crate::plugin::{global_registry, AudioFormat};
+use crate::plugin::{global_registry, capabilities::AudioFormat};
 
 /// Plugin-based processor node
 ///

@@ -240,8 +240,29 @@ impl Default for LiveKitManager {
 
 impl Drop for LiveKitManager {
     fn drop(&mut self) {
-        // Note: We can't use async methods in Drop
-        warn!("LiveKitManager dropped - ensure disconnect() was called explicitly");
+        // Note: We can't use async methods in Drop, but we can do synchronous cleanup
+
+        // Close channels by dropping them - this will signal channel closed to any receivers/senders
+        if self.audio_sender.take().is_some() {
+            debug!("LiveKitManager Drop: Closed audio sender channel");
+        }
+        if self.audio_receiver.take().is_some() {
+            debug!("LiveKitManager Drop: Closed audio receiver channel");
+        }
+
+        // Set atomic flag to false to indicate disconnected state
+        self.is_connected_atomic.store(false, Ordering::SeqCst);
+
+        // Check if client was properly disconnected before drop
+        // We can't lock the mutex in drop (could deadlock), but we can try_lock
+        if let Ok(client_guard) = self.client.try_lock() {
+            if client_guard.is_some() {
+                warn!("LiveKitManager dropped with active client - call disconnect() explicitly for clean shutdown");
+            }
+        } else {
+            // Mutex is locked, meaning client is being used elsewhere
+            warn!("LiveKitManager dropped while client mutex was locked - potential resource leak");
+        }
     }
 }
 

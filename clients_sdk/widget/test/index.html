@@ -1,0 +1,1107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WaaV Voice Widget - End-to-End Test</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
+
+    :root {
+      --primary: #6366f1;
+      --primary-dark: #4f46e5;
+      --primary-light: #818cf8;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --error: #ef4444;
+      --dark: #0f172a;
+      --dark-lighter: #1e293b;
+      --dark-card: #1e293b;
+      --light: #f8fafc;
+      --text-secondary: rgba(248, 250, 252, 0.6);
+      --border: rgba(99, 102, 241, 0.2);
+    }
+
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--dark);
+      color: var(--light);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* Animated gradient background */
+    .gradient-bg {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: -2;
+      background: linear-gradient(135deg, var(--dark) 0%, #1a1a2e 50%, var(--dark) 100%);
+    }
+
+    /* Animated floating orbs */
+    .orb {
+      position: fixed;
+      border-radius: 50%;
+      filter: blur(80px);
+      z-index: -1;
+      animation: float 15s ease-in-out infinite;
+    }
+
+    .orb-1 {
+      width: 400px;
+      height: 400px;
+      background: radial-gradient(circle, rgba(99, 102, 241, 0.15) 0%, transparent 70%);
+      top: -100px;
+      left: -100px;
+      animation-delay: 0s;
+    }
+
+    .orb-2 {
+      width: 350px;
+      height: 350px;
+      background: radial-gradient(circle, rgba(16, 185, 129, 0.1) 0%, transparent 70%);
+      bottom: -100px;
+      right: -100px;
+      animation-delay: -5s;
+    }
+
+    @keyframes float {
+      0%, 100% { transform: translate(0, 0) scale(1); }
+      25% { transform: translate(30px, -30px) scale(1.05); }
+      50% { transform: translate(-20px, 20px) scale(0.95); }
+      75% { transform: translate(20px, 30px) scale(1.02); }
+    }
+
+    /* Main container */
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 40px 20px;
+    }
+
+    /* Header */
+    .header {
+      text-align: center;
+      margin-bottom: 40px;
+    }
+
+    .header h1 {
+      font-size: 2.5rem;
+      font-weight: 700;
+      margin: 0 0 12px;
+      background: linear-gradient(135deg, var(--primary-light), var(--success));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .header p {
+      color: var(--text-secondary);
+      font-size: 1.1rem;
+      margin: 0;
+    }
+
+    /* Status bar */
+    .status-bar {
+      display: flex;
+      justify-content: center;
+      gap: 24px;
+      margin-bottom: 32px;
+      flex-wrap: wrap;
+    }
+
+    .status-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 16px;
+      background: var(--dark-card);
+      border-radius: 100px;
+      border: 1px solid var(--border);
+      font-size: 14px;
+    }
+
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--text-secondary);
+      transition: background 0.3s ease;
+    }
+
+    .status-dot.connected { background: var(--success); }
+    .status-dot.listening { background: var(--success); animation: pulse-dot 1.5s infinite; }
+    .status-dot.speaking { background: var(--warning); }
+    .status-dot.error { background: var(--error); }
+
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.5; transform: scale(1.3); }
+    }
+
+    /* Main card */
+    .main-card {
+      background: var(--dark-card);
+      border-radius: 24px;
+      border: 1px solid var(--border);
+      overflow: hidden;
+      margin-bottom: 24px;
+    }
+
+    /* Visualizer area */
+    .visualizer-area {
+      padding: 60px 40px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      min-height: 300px;
+    }
+
+    /* Circular pulse visualizer */
+    .pulse-visualizer {
+      position: relative;
+      width: 160px;
+      height: 160px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .pulse-ring {
+      position: absolute;
+      border-radius: 50%;
+      border: 2px solid var(--primary);
+      opacity: 0;
+      animation: none;
+    }
+
+    .pulse-ring.active {
+      animation: pulse-expand 1.5s ease-out infinite;
+    }
+
+    .pulse-ring:nth-child(1) { width: 100%; height: 100%; animation-delay: 0s; }
+    .pulse-ring:nth-child(2) { width: 130%; height: 130%; animation-delay: 0.3s; }
+    .pulse-ring:nth-child(3) { width: 160%; height: 160%; animation-delay: 0.6s; }
+
+    @keyframes pulse-expand {
+      0% { transform: scale(0.8); opacity: 0.8; }
+      100% { transform: scale(1.2); opacity: 0; }
+    }
+
+    /* Microphone button */
+    .mic-button {
+      width: 100px;
+      height: 100px;
+      border-radius: 50%;
+      border: none;
+      background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+      color: white;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 10px 40px -10px rgba(99, 102, 241, 0.5);
+      transition: all 0.3s ease;
+      position: relative;
+      z-index: 10;
+    }
+
+    .mic-button:hover {
+      transform: scale(1.05);
+      box-shadow: 0 15px 50px -10px rgba(99, 102, 241, 0.6);
+    }
+
+    .mic-button:active {
+      transform: scale(0.95);
+    }
+
+    .mic-button.listening {
+      background: linear-gradient(135deg, var(--success), #059669);
+      box-shadow: 0 10px 40px -10px rgba(16, 185, 129, 0.5);
+    }
+
+    .mic-button.speaking {
+      background: linear-gradient(135deg, var(--warning), #d97706);
+      box-shadow: 0 10px 40px -10px rgba(245, 158, 11, 0.5);
+    }
+
+    .mic-button.error {
+      background: linear-gradient(135deg, var(--error), #dc2626);
+    }
+
+    .mic-button.connecting {
+      animation: connecting-pulse 1s ease-in-out infinite;
+    }
+
+    @keyframes connecting-pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.6; }
+    }
+
+    .mic-button svg {
+      width: 40px;
+      height: 40px;
+      fill: currentColor;
+    }
+
+    .mic-button.connecting svg {
+      animation: spin 1s linear infinite;
+    }
+
+    @keyframes spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+
+    /* Instructions */
+    .instructions {
+      margin-top: 24px;
+      text-align: center;
+      color: var(--text-secondary);
+      font-size: 14px;
+    }
+
+    .instructions .shortcut {
+      display: inline-block;
+      padding: 4px 10px;
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 6px;
+      font-family: ui-monospace, monospace;
+      margin: 0 4px;
+    }
+
+    /* Transcript area */
+    .transcript-area {
+      padding: 24px;
+      border-top: 1px solid var(--border);
+    }
+
+    .transcript-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+
+    .transcript-title {
+      font-weight: 600;
+      font-size: 16px;
+    }
+
+    .transcript-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .action-btn {
+      padding: 6px 12px;
+      font-size: 12px;
+      font-weight: 500;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--light);
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .action-btn:hover {
+      background: rgba(255, 255, 255, 0.1);
+    }
+
+    .action-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .transcript-content {
+      min-height: 120px;
+      max-height: 300px;
+      overflow-y: auto;
+      background: rgba(0, 0, 0, 0.2);
+      border-radius: 12px;
+      padding: 16px;
+      font-size: 16px;
+      line-height: 1.6;
+    }
+
+    .transcript-placeholder {
+      color: var(--text-secondary);
+      font-style: italic;
+      text-align: center;
+    }
+
+    .transcript-text {
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .transcript-interim {
+      color: var(--text-secondary);
+      font-style: italic;
+    }
+
+    /* Settings panel */
+    .settings-card {
+      background: var(--dark-card);
+      border-radius: 16px;
+      border: 1px solid var(--border);
+      padding: 24px;
+      margin-bottom: 24px;
+    }
+
+    .settings-title {
+      font-weight: 600;
+      font-size: 16px;
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .settings-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+    }
+
+    .setting-item {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .setting-label {
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .setting-select, .setting-input {
+      padding: 10px 14px;
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--light);
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.2s ease;
+    }
+
+    .setting-select:focus, .setting-input:focus {
+      border-color: var(--primary);
+    }
+
+    .setting-select option {
+      background: var(--dark);
+    }
+
+    /* Metrics panel */
+    .metrics-card {
+      background: var(--dark-card);
+      border-radius: 16px;
+      border: 1px solid var(--border);
+      padding: 24px;
+    }
+
+    .metrics-title {
+      font-weight: 600;
+      font-size: 16px;
+      margin-bottom: 20px;
+    }
+
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 16px;
+    }
+
+    .metric-item {
+      background: rgba(0, 0, 0, 0.2);
+      border-radius: 12px;
+      padding: 16px;
+      text-align: center;
+    }
+
+    .metric-value {
+      font-size: 24px;
+      font-weight: 700;
+      font-family: ui-monospace, monospace;
+      color: var(--primary-light);
+      margin-bottom: 4px;
+    }
+
+    .metric-label {
+      font-size: 12px;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    /* Toast notifications */
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%) translateY(100px);
+      padding: 12px 24px;
+      background: var(--dark-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      font-size: 14px;
+      opacity: 0;
+      transition: all 0.3s ease;
+      z-index: 1000;
+    }
+
+    .toast.show {
+      transform: translateX(-50%) translateY(0);
+      opacity: 1;
+    }
+
+    .toast.success { border-color: var(--success); }
+    .toast.error { border-color: var(--error); }
+
+    /* Responsive */
+    @media (max-width: 640px) {
+      .container {
+        padding: 20px 16px;
+      }
+
+      .header h1 {
+        font-size: 1.8rem;
+      }
+
+      .status-bar {
+        gap: 12px;
+      }
+
+      .visualizer-area {
+        padding: 40px 20px;
+        min-height: 250px;
+      }
+
+      .mic-button {
+        width: 80px;
+        height: 80px;
+      }
+
+      .mic-button svg {
+        width: 32px;
+        height: 32px;
+      }
+
+      .transcript-content {
+        min-height: 80px;
+      }
+    }
+
+    /* Copied feedback */
+    .copied-feedback {
+      position: absolute;
+      background: var(--success);
+      color: white;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      opacity: 0;
+      transform: translateY(10px);
+      transition: all 0.2s ease;
+    }
+
+    .copied-feedback.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  </style>
+</head>
+<body>
+  <div class="gradient-bg"></div>
+  <div class="orb orb-1"></div>
+  <div class="orb orb-2"></div>
+
+  <div class="container">
+    <!-- Header -->
+    <div class="header">
+      <h1>WaaV Voice Test</h1>
+      <p>End-to-end speech recognition testing with Deepgram</p>
+    </div>
+
+    <!-- Status Bar -->
+    <div class="status-bar">
+      <div class="status-item">
+        <span class="status-dot" id="connection-dot"></span>
+        <span id="connection-status">Disconnected</span>
+      </div>
+      <div class="status-item">
+        <span class="status-dot" id="state-dot"></span>
+        <span id="state-status">Idle</span>
+      </div>
+      <div class="status-item">
+        <span>Stream: <span id="stream-id">-</span></span>
+      </div>
+    </div>
+
+    <!-- Main Card -->
+    <div class="main-card">
+      <!-- Visualizer Area -->
+      <div class="visualizer-area">
+        <div class="pulse-visualizer" id="pulse-visualizer">
+          <div class="pulse-ring"></div>
+          <div class="pulse-ring"></div>
+          <div class="pulse-ring"></div>
+          <button class="mic-button" id="mic-button" aria-label="Toggle recording">
+            <svg id="mic-icon" viewBox="0 0 24 24">
+              <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
+              <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+            </svg>
+          </button>
+        </div>
+        <div class="instructions">
+          Click the microphone or press <span class="shortcut">Space</span> to start recording
+        </div>
+      </div>
+
+      <!-- Transcript Area -->
+      <div class="transcript-area">
+        <div class="transcript-header">
+          <span class="transcript-title">Transcript</span>
+          <div class="transcript-actions">
+            <button class="action-btn" id="copy-btn" disabled>Copy</button>
+            <button class="action-btn" id="clear-btn" disabled>Clear</button>
+          </div>
+        </div>
+        <div class="transcript-content" id="transcript-content">
+          <div class="transcript-placeholder">Your transcription will appear here...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings Panel -->
+    <div class="settings-card">
+      <div class="settings-title">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="3"></circle>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+        </svg>
+        Settings
+      </div>
+      <div class="settings-grid">
+        <div class="setting-item">
+          <label class="setting-label">STT Provider</label>
+          <select class="setting-select" id="stt-provider">
+            <option value="deepgram" selected>Deepgram (Nova-3)</option>
+            <option value="google">Google Cloud</option>
+            <option value="assemblyai">AssemblyAI</option>
+            <option value="openai">OpenAI Whisper</option>
+          </select>
+        </div>
+        <div class="setting-item">
+          <label class="setting-label">Language</label>
+          <select class="setting-select" id="language">
+            <option value="en-US" selected>English (US)</option>
+            <option value="en-GB">English (UK)</option>
+            <option value="es-ES">Spanish</option>
+            <option value="fr-FR">French</option>
+            <option value="de-DE">German</option>
+            <option value="ja-JP">Japanese</option>
+            <option value="zh-CN">Chinese</option>
+          </select>
+        </div>
+        <div class="setting-item">
+          <label class="setting-label">Gateway URL</label>
+          <input class="setting-input" type="text" id="gateway-url" value="ws://localhost:3001/ws">
+        </div>
+        <div class="setting-item">
+          <label class="setting-label">Sample Rate</label>
+          <select class="setting-select" id="sample-rate">
+            <option value="16000" selected>16000 Hz</option>
+            <option value="8000">8000 Hz</option>
+            <option value="44100">44100 Hz</option>
+            <option value="48000">48000 Hz</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- Metrics Panel -->
+    <div class="metrics-card">
+      <div class="metrics-title">Real-time Metrics</div>
+      <div class="metrics-grid">
+        <div class="metric-item">
+          <div class="metric-value" id="metric-ttft">-</div>
+          <div class="metric-label">STT TTFT</div>
+        </div>
+        <div class="metric-item">
+          <div class="metric-value" id="metric-ttfb">-</div>
+          <div class="metric-label">TTS TTFB</div>
+        </div>
+        <div class="metric-item">
+          <div class="metric-value" id="metric-sent">0</div>
+          <div class="metric-label">Msgs Sent</div>
+        </div>
+        <div class="metric-item">
+          <div class="metric-value" id="metric-received">0</div>
+          <div class="metric-label">Msgs Received</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Notification -->
+  <div class="toast" id="toast"></div>
+
+  <!-- Load the Bud Widget -->
+  <script src="../dist/bud-widget.js"></script>
+
+  <script>
+    // State management
+    let isConnected = false;
+    let isListening = false;
+    let ws = null;
+    let mediaRecorder = null;
+    let audioContext = null;
+    let analyser = null;
+    let streamId = null;
+    let fullTranscript = '';
+    let interimTranscript = '';
+    let audioSendTime = null;
+
+    // DOM elements
+    const micButton = document.getElementById('mic-button');
+    const micIcon = document.getElementById('mic-icon');
+    const pulseVisualizer = document.getElementById('pulse-visualizer');
+    const connectionDot = document.getElementById('connection-dot');
+    const connectionStatus = document.getElementById('connection-status');
+    const stateDot = document.getElementById('state-dot');
+    const stateStatus = document.getElementById('state-status');
+    const streamIdEl = document.getElementById('stream-id');
+    const transcriptContent = document.getElementById('transcript-content');
+    const copyBtn = document.getElementById('copy-btn');
+    const clearBtn = document.getElementById('clear-btn');
+    const toast = document.getElementById('toast');
+
+    // Metrics elements
+    const metricTtft = document.getElementById('metric-ttft');
+    const metricTtfb = document.getElementById('metric-ttfb');
+    const metricSent = document.getElementById('metric-sent');
+    const metricReceived = document.getElementById('metric-received');
+
+    // Settings elements
+    const sttProvider = document.getElementById('stt-provider');
+    const language = document.getElementById('language');
+    const gatewayUrl = document.getElementById('gateway-url');
+    const sampleRate = document.getElementById('sample-rate');
+
+    // Counters
+    let messagesSent = 0;
+    let messagesReceived = 0;
+
+    // SVG icons
+    const icons = {
+      mic: `<path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>`,
+      loading: `<path d="M12 2v4m0 12v4m-7-9H1m22 0h-4m-2.636-6.364L14.12 8.88m-4.243 6.364l-2.121 2.122m12.727 0l-2.12-2.122M8.878 8.879L6.757 6.757"/>`,
+      speaker: `<path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>`,
+      error: `<circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>`
+    };
+
+    // Update UI state
+    function updateState(state) {
+      // Update status dots and text
+      const states = {
+        idle: { dot: '', text: 'Idle', button: '' },
+        connecting: { dot: '', text: 'Connecting...', button: 'connecting' },
+        connected: { dot: 'connected', text: 'Connected', button: '' },
+        listening: { dot: 'listening', text: 'Listening', button: 'listening' },
+        speaking: { dot: 'speaking', text: 'Speaking', button: 'speaking' },
+        error: { dot: 'error', text: 'Error', button: 'error' }
+      };
+
+      const s = states[state] || states.idle;
+
+      stateDot.className = 'status-dot ' + s.dot;
+      stateStatus.textContent = s.text;
+      micButton.className = 'mic-button ' + s.button;
+
+      // Update pulse animation
+      const pulseRings = pulseVisualizer.querySelectorAll('.pulse-ring');
+      if (state === 'listening') {
+        pulseRings.forEach(ring => ring.classList.add('active'));
+      } else {
+        pulseRings.forEach(ring => ring.classList.remove('active'));
+      }
+
+      // Update icon
+      if (state === 'connecting') {
+        micIcon.innerHTML = icons.loading;
+      } else if (state === 'speaking') {
+        micIcon.innerHTML = icons.speaker;
+      } else if (state === 'error') {
+        micIcon.innerHTML = icons.error;
+      } else {
+        micIcon.innerHTML = icons.mic;
+      }
+    }
+
+    // Update connection state
+    function updateConnection(connected) {
+      isConnected = connected;
+      connectionDot.className = 'status-dot ' + (connected ? 'connected' : '');
+      connectionStatus.textContent = connected ? 'Connected' : 'Disconnected';
+    }
+
+    // Show toast notification
+    function showToast(message, type = '') {
+      toast.textContent = message;
+      toast.className = 'toast show ' + type;
+      setTimeout(() => {
+        toast.className = 'toast';
+      }, 3000);
+    }
+
+    // Update transcript display
+    function updateTranscript() {
+      const full = fullTranscript.trim();
+      const interim = interimTranscript.trim();
+
+      if (!full && !interim) {
+        transcriptContent.innerHTML = '<div class="transcript-placeholder">Your transcription will appear here...</div>';
+        copyBtn.disabled = true;
+        clearBtn.disabled = true;
+      } else {
+        let html = '';
+        if (full) {
+          html += `<div class="transcript-text">${escapeHtml(full)}</div>`;
+        }
+        if (interim) {
+          html += `<div class="transcript-interim">${escapeHtml(interim)}</div>`;
+        }
+        transcriptContent.innerHTML = html;
+        copyBtn.disabled = false;
+        clearBtn.disabled = false;
+      }
+    }
+
+    // Escape HTML to prevent XSS
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    // Connect to WebSocket
+    async function connect() {
+      if (ws && ws.readyState === WebSocket.OPEN) return;
+
+      updateState('connecting');
+
+      try {
+        const url = gatewayUrl.value;
+        ws = new WebSocket(url);
+
+        ws.onopen = () => {
+          updateConnection(true);
+          // Send config - gateway expects stt_config and tts_config at top level
+          const config = {
+            type: 'config',
+            audio: true,
+            stt_config: {
+              provider: sttProvider.value,
+              model: 'nova-3',
+              language: language.value,
+              sample_rate: parseInt(sampleRate.value),
+              channels: 1,
+              punctuation: true,
+              encoding: 'linear16',
+              interim_results: true
+            },
+            tts_config: {
+              provider: 'deepgram',
+              model: 'aura-asteria-en',
+              voice_id: 'aura-asteria-en',
+              audio_format: 'linear16',
+              sample_rate: 24000
+            }
+          };
+          ws.send(JSON.stringify(config));
+          messagesSent++;
+          metricSent.textContent = messagesSent;
+        };
+
+        ws.onmessage = (event) => {
+          messagesReceived++;
+          metricReceived.textContent = messagesReceived;
+
+          try {
+            const data = JSON.parse(event.data);
+            handleMessage(data);
+          } catch (e) {
+            console.error('Failed to parse message:', e);
+          }
+        };
+
+        ws.onclose = () => {
+          updateConnection(false);
+          updateState('idle');
+          streamId = null;
+          streamIdEl.textContent = '-';
+          if (isListening) {
+            stopListening();
+          }
+        };
+
+        ws.onerror = (error) => {
+          console.error('WebSocket error:', error);
+          updateState('error');
+          showToast('Connection failed. Is the gateway running?', 'error');
+        };
+      } catch (error) {
+        console.error('Failed to connect:', error);
+        updateState('error');
+        showToast('Failed to connect: ' + error.message, 'error');
+      }
+    }
+
+    // Handle incoming messages
+    function handleMessage(data) {
+      switch (data.type) {
+        case 'ready':
+          streamId = data.stream_id;
+          streamIdEl.textContent = streamId.slice(0, 8) + '...';
+          updateState('connected');
+          showToast('Connected! Click mic to start recording.', 'success');
+          break;
+
+        case 'stt_result':
+          // Calculate TTFT on first result
+          if (audioSendTime && !metricTtft.dataset.set) {
+            const ttft = Date.now() - audioSendTime;
+            metricTtft.textContent = ttft + 'ms';
+            metricTtft.dataset.set = 'true';
+          }
+
+          if (data.is_final) {
+            fullTranscript += data.transcript + ' ';
+            interimTranscript = '';
+          } else {
+            interimTranscript = data.transcript;
+          }
+          updateTranscript();
+          break;
+
+        case 'tts_audio':
+          // Calculate TTFB
+          metricTtfb.textContent = (data.latency_ms || '-') + 'ms';
+          updateState('speaking');
+          break;
+
+        case 'tts_playback_complete':
+          if (isListening) {
+            updateState('listening');
+          } else {
+            updateState('connected');
+          }
+          break;
+
+        case 'error':
+          console.error('Server error:', data.message);
+          showToast('Error: ' + data.message, 'error');
+          updateState('error');
+          setTimeout(() => updateState(isConnected ? 'connected' : 'idle'), 3000);
+          break;
+      }
+    }
+
+    // Start listening
+    async function startListening() {
+      if (isListening) return;
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            sampleRate: parseInt(sampleRate.value),
+            echoCancellation: true,
+            noiseSuppression: true
+          }
+        });
+
+        audioContext = new AudioContext({ sampleRate: parseInt(sampleRate.value) });
+        const source = audioContext.createMediaStreamSource(stream);
+        analyser = audioContext.createAnalyser();
+        source.connect(analyser);
+
+        // Use ScriptProcessor for raw audio
+        const processor = audioContext.createScriptProcessor(4096, 1, 1);
+        source.connect(processor);
+        processor.connect(audioContext.destination);
+
+        processor.onaudioprocess = (e) => {
+          if (!isListening || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+          const inputData = e.inputBuffer.getChannelData(0);
+          // Convert Float32 to Int16
+          const int16Data = new Int16Array(inputData.length);
+          for (let i = 0; i < inputData.length; i++) {
+            int16Data[i] = Math.max(-32768, Math.min(32767, Math.floor(inputData[i] * 32768)));
+          }
+
+          if (!audioSendTime) {
+            audioSendTime = Date.now();
+          }
+
+          ws.send(int16Data.buffer);
+          messagesSent++;
+          metricSent.textContent = messagesSent;
+        };
+
+        isListening = true;
+        updateState('listening');
+        showToast('Listening...', 'success');
+
+      } catch (error) {
+        console.error('Failed to start recording:', error);
+        showToast('Microphone access denied', 'error');
+        updateState('error');
+      }
+    }
+
+    // Stop listening
+    function stopListening() {
+      if (!isListening) return;
+
+      isListening = false;
+
+      if (audioContext) {
+        audioContext.close();
+        audioContext = null;
+      }
+
+      updateState(isConnected ? 'connected' : 'idle');
+    }
+
+    // Toggle recording
+    async function toggleRecording() {
+      if (!isConnected) {
+        await connect();
+        return;
+      }
+
+      if (isListening) {
+        stopListening();
+      } else {
+        await startListening();
+      }
+    }
+
+    // Event listeners
+    micButton.addEventListener('click', toggleRecording);
+
+    // Keyboard shortcut
+    document.addEventListener('keydown', (e) => {
+      if (e.code === 'Space' && !e.target.matches('input, textarea, select')) {
+        e.preventDefault();
+        toggleRecording();
+      }
+    });
+
+    // Copy transcript
+    copyBtn.addEventListener('click', () => {
+      const text = fullTranscript.trim();
+      if (text) {
+        navigator.clipboard.writeText(text).then(() => {
+          showToast('Copied to clipboard!', 'success');
+        }).catch(() => {
+          showToast('Failed to copy', 'error');
+        });
+      }
+    });
+
+    // Clear transcript
+    clearBtn.addEventListener('click', () => {
+      fullTranscript = '';
+      interimTranscript = '';
+      updateTranscript();
+      metricTtft.textContent = '-';
+      delete metricTtft.dataset.set;
+      audioSendTime = null;
+      showToast('Transcript cleared');
+    });
+
+    // Settings change handlers
+    sttProvider.addEventListener('change', () => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        const config = {
+          type: 'config',
+          audio: true,
+          stt_config: {
+            provider: sttProvider.value,
+            model: 'nova-3',
+            language: language.value,
+            sample_rate: parseInt(sampleRate.value),
+            channels: 1,
+            punctuation: true,
+            encoding: 'linear16',
+            interim_results: true
+          },
+          tts_config: {
+            provider: 'deepgram',
+            voice_id: 'aura-asteria-en',
+            audio_format: 'linear16',
+            sample_rate: 24000
+          }
+        };
+        ws.send(JSON.stringify(config));
+        showToast('Provider changed to ' + sttProvider.options[sttProvider.selectedIndex].text);
+      }
+    });
+
+    language.addEventListener('change', () => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        const config = {
+          type: 'config',
+          audio: true,
+          stt_config: {
+            provider: sttProvider.value,
+            model: 'nova-3',
+            language: language.value,
+            sample_rate: parseInt(sampleRate.value),
+            channels: 1,
+            punctuation: true,
+            encoding: 'linear16',
+            interim_results: true
+          },
+          tts_config: {
+            provider: 'deepgram',
+            voice_id: 'aura-asteria-en',
+            audio_format: 'linear16',
+            sample_rate: 24000
+          }
+        };
+        ws.send(JSON.stringify(config));
+        showToast('Language changed');
+      }
+    });
+
+    // Initialize
+    updateState('idle');
+    updateTranscript();
+
+    console.log('WaaV Voice Test initialized. Click mic or press Space to start.');
+  </script>
+</body>
+</html>

@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::base::{AudioCallback, AudioData, ConnectionState, TTSConfig, TTSError, TTSResult};
 use crate::core::cache::store::CacheStore;
@@ -307,17 +307,44 @@ impl TTSProvider {
                 if !response.status().is_success() {
                     info!("ERROR Response for text: {}", processed_text);
                     let status = response.status();
+
+                    // Parse Retry-After header for rate limiting (429)
+                    let retry_after_secs = response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok());
+
                     let error_body = response
                         .text()
                         .await
                         .unwrap_or_else(|_| "Unknown error".to_string());
-                    error!("TTS API error ({}): {}", status, error_body);
 
-                    let _ = sender
-                        .send(Err(TTSError::ProviderError(format!(
-                            "API error ({status}): {error_body}"
-                        ))))
-                        .await;
+                    // Handle specific HTTP status codes with appropriate error types
+                    let tts_error = match status.as_u16() {
+                        429 => {
+                            warn!(
+                                "TTS rate limited. Retry-After: {:?} seconds. Body: {}",
+                                retry_after_secs, error_body
+                            );
+                            TTSError::RateLimited {
+                                retry_after_secs,
+                                message: error_body,
+                            }
+                        }
+                        401 | 403 => {
+                            error!("TTS authentication failed ({}): {}", status, error_body);
+                            TTSError::AuthenticationFailed(format!(
+                                "API error ({status}): {error_body}"
+                            ))
+                        }
+                        _ => {
+                            error!("TTS API error ({}): {}", status, error_body);
+                            TTSError::ProviderError(format!("API error ({status}): {error_body}"))
+                        }
+                    };
+
+                    let _ = sender.send(Err(tts_error)).await;
                     return;
                 }
 

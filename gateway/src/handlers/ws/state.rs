@@ -15,6 +15,9 @@ use crate::{
     livekit::{LiveKitClient, operations::OperationQueue},
 };
 
+#[cfg(feature = "dag-routing")]
+use crate::dag::{compiler::CompiledDAG, context::DAGContext, executor::DAGExecutor};
+
 /// WebSocket connection state optimized for low latency
 ///
 /// Uses RwLock for state that changes rarely but is read frequently:
@@ -38,6 +41,20 @@ pub struct ConnectionState {
     pub recording_egress_id: Option<String>,
     /// Auth context for this connection (used for room name normalization)
     pub auth: Auth,
+
+    // DAG routing state (feature-gated)
+    /// Compiled DAG for this connection
+    #[cfg(feature = "dag-routing")]
+    pub compiled_dag: Option<Arc<CompiledDAG>>,
+    /// DAG executor instance
+    #[cfg(feature = "dag-routing")]
+    pub dag_executor: Option<Arc<DAGExecutor>>,
+    /// DAG execution context (holds auth, timing, node results)
+    #[cfg(feature = "dag-routing")]
+    pub dag_context: Option<DAGContext>,
+    /// Whether DAG routing is enabled for this connection
+    #[cfg(feature = "dag-routing")]
+    pub dag_enabled: AtomicBool,
 }
 
 impl Default for ConnectionState {
@@ -58,6 +75,14 @@ impl ConnectionState {
             livekit_local_identity: None,
             recording_egress_id: None,
             auth: Auth::empty(),
+            #[cfg(feature = "dag-routing")]
+            compiled_dag: None,
+            #[cfg(feature = "dag-routing")]
+            dag_executor: None,
+            #[cfg(feature = "dag-routing")]
+            dag_context: None,
+            #[cfg(feature = "dag-routing")]
+            dag_enabled: AtomicBool::new(false),
         }
     }
 
@@ -73,6 +98,14 @@ impl ConnectionState {
             livekit_local_identity: None,
             recording_egress_id: None,
             auth,
+            #[cfg(feature = "dag-routing")]
+            compiled_dag: None,
+            #[cfg(feature = "dag-routing")]
+            dag_executor: None,
+            #[cfg(feature = "dag-routing")]
+            dag_context: None,
+            #[cfg(feature = "dag-routing")]
+            dag_enabled: AtomicBool::new(false),
         }
     }
 
@@ -84,6 +117,24 @@ impl ConnectionState {
     /// Set audio enabled state
     pub fn set_audio_enabled(&self, enabled: bool) {
         self.audio_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Check if DAG routing is enabled
+    #[cfg(feature = "dag-routing")]
+    pub fn is_dag_enabled(&self) -> bool {
+        self.dag_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Set DAG enabled state
+    #[cfg(feature = "dag-routing")]
+    pub fn set_dag_enabled(&self, enabled: bool) {
+        self.dag_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Check if DAG routing is enabled (stub when feature disabled)
+    #[cfg(not(feature = "dag-routing"))]
+    pub fn is_dag_enabled(&self) -> bool {
+        false
     }
 }
 

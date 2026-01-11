@@ -64,6 +64,12 @@ pub mod macros;
 pub mod metadata;
 pub mod registry;
 
+// Dynamic plugin loading (feature-gated)
+#[cfg(feature = "plugins-dynamic")]
+pub mod dynamic_loader;
+#[cfg(feature = "plugins-dynamic")]
+pub mod ffi_adapters;
+
 // Re-exports for convenience
 pub use capabilities::{
     AudioProcessorCapability, AuthCapability, MiddlewareCapability, PluginCapability,
@@ -73,6 +79,12 @@ pub use isolation::{PluginError, call_plugin_safely};
 pub use lifecycle::{PluginHealth, PluginLifecycle, PluginState};
 pub use metadata::{PluginManifest, ProviderMetadata};
 pub use registry::{PluginRegistry, global_registry};
+
+// Dynamic loader re-exports (feature-gated)
+#[cfg(feature = "plugins-dynamic")]
+pub use dynamic_loader::{DynamicPluginLoader, LoadedPlugin, PluginCandidate, PluginLoadError};
+#[cfg(feature = "plugins-dynamic")]
+pub use ffi_adapters::{FFIRealtimeAdapter, FFISTTAdapter, FFITTSAdapter};
 
 /// Prelude module for convenient imports
 ///

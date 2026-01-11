@@ -28,8 +28,8 @@ pub const MAX_STREAM_ID_SIZE: usize = 256;
 pub const MAX_AUTH_TOKEN_SIZE: usize = 4 * 1024;
 
 use super::config::{
-    LiveKitWebSocketConfig, STTWebSocketConfig, TTSWebSocketConfig, default_allow_interruption,
-    default_audio_enabled,
+    DAGWebSocketConfig, LiveKitWebSocketConfig, STTWebSocketConfig, TTSWebSocketConfig,
+    default_allow_interruption, default_audio_enabled,
 };
 
 /// WebSocket message types for incoming messages
@@ -69,6 +69,10 @@ pub enum IncomingMessage {
         /// Optional LiveKit configuration for real-time audio streaming
         #[serde(skip_serializing_if = "Option::is_none")]
         livekit: Option<LiveKitWebSocketConfig>,
+        /// Optional DAG routing configuration for custom audio pipelines
+        /// When configured, audio flows through the DAG instead of direct STT→TTS
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dag_config: Option<DAGWebSocketConfig>,
     },
     #[serde(rename = "speak")]
     Speak {

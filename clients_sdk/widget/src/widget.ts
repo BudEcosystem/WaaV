@@ -26,6 +26,14 @@ export class BudWidget extends HTMLElement {
   private currentTranscript = '';
   private interimTranscript = '';
   private streamId: string | null = null;
+  private listenersAttached = false;
+
+  // Bound event handlers for cleanup
+  private boundHandleButtonClick: (() => void) | null = null;
+  private boundHandleButtonDown: (() => void) | null = null;
+  private boundHandleButtonUp: (() => void) | null = null;
+  private boundHandleTouchStart: ((e: TouchEvent) => void) | null = null;
+  private boundHandleTouchEnd: ((e: TouchEvent) => void) | null = null;
 
   constructor() {
     super();
@@ -75,7 +83,30 @@ export class BudWidget extends HTMLElement {
   }
 
   disconnectedCallback(): void {
+    this.removeEventListeners();
     this.disconnect();
+  }
+
+  private removeEventListeners(): void {
+    if (this.button && this.listenersAttached) {
+      if (this.boundHandleButtonClick) {
+        this.button.removeEventListener('click', this.boundHandleButtonClick);
+      }
+      if (this.boundHandleButtonDown) {
+        this.button.removeEventListener('mousedown', this.boundHandleButtonDown);
+      }
+      if (this.boundHandleButtonUp) {
+        this.button.removeEventListener('mouseup', this.boundHandleButtonUp);
+        this.button.removeEventListener('mouseleave', this.boundHandleButtonUp);
+      }
+      if (this.boundHandleTouchStart) {
+        this.button.removeEventListener('touchstart', this.boundHandleTouchStart);
+      }
+      if (this.boundHandleTouchEnd) {
+        this.button.removeEventListener('touchend', this.boundHandleTouchEnd);
+      }
+      this.listenersAttached = false;
+    }
   }
 
   attributeChangedCallback(name: string, oldValue: string, newValue: string): void {
@@ -87,9 +118,10 @@ export class BudWidget extends HTMLElement {
   }
 
   private render(): void {
+    // Note: customCss is intentionally NOT injected here due to security concerns
+    // Custom styling should be done via CSS custom properties (--bud-*) instead
     this.shadow.innerHTML = `
       <style>${widgetStyles}</style>
-      ${this.config.customCss ? `<style>${this.config.customCss}</style>` : ''}
       <div class="bud-widget">
         <div class="bud-panel" id="panel">
           <div class="bud-panel-header">
@@ -134,21 +166,31 @@ export class BudWidget extends HTMLElement {
     this.transcriptEl = this.shadow.getElementById('transcript') as HTMLDivElement;
     this.metricsEl = this.shadow.getElementById('metrics') as HTMLDivElement;
 
-    // Add event listeners
-    this.button.addEventListener('click', () => this.handleButtonClick());
-    this.button.addEventListener('mousedown', () => this.handleButtonDown());
-    this.button.addEventListener('mouseup', () => this.handleButtonUp());
-    this.button.addEventListener('mouseleave', () => this.handleButtonUp());
+    // Add event listeners (only once, use bound handlers for cleanup)
+    if (!this.listenersAttached) {
+      // Create bound handlers
+      this.boundHandleButtonClick = () => this.handleButtonClick();
+      this.boundHandleButtonDown = () => this.handleButtonDown();
+      this.boundHandleButtonUp = () => this.handleButtonUp();
+      this.boundHandleTouchStart = (e: TouchEvent) => {
+        e.preventDefault();
+        this.handleButtonDown();
+      };
+      this.boundHandleTouchEnd = (e: TouchEvent) => {
+        e.preventDefault();
+        this.handleButtonUp();
+      };
 
-    // Touch events for push-to-talk on mobile
-    this.button.addEventListener('touchstart', (e) => {
-      e.preventDefault();
-      this.handleButtonDown();
-    });
-    this.button.addEventListener('touchend', (e) => {
-      e.preventDefault();
-      this.handleButtonUp();
-    });
+      // Add listeners
+      this.button.addEventListener('click', this.boundHandleButtonClick);
+      this.button.addEventListener('mousedown', this.boundHandleButtonDown);
+      this.button.addEventListener('mouseup', this.boundHandleButtonUp);
+      this.button.addEventListener('mouseleave', this.boundHandleButtonUp);
+      this.button.addEventListener('touchstart', this.boundHandleTouchStart);
+      this.button.addEventListener('touchend', this.boundHandleTouchEnd);
+
+      this.listenersAttached = true;
+    }
   }
 
   private handleButtonClick(): void {
@@ -422,13 +464,28 @@ export class BudWidget extends HTMLElement {
     const fullTranscript = this.currentTranscript.trim();
     const interim = this.interimTranscript.trim();
 
+    // Clear existing content safely
+    this.transcriptEl.textContent = '';
+
     if (!fullTranscript && !interim) {
-      this.transcriptEl.innerHTML = '<div class="bud-transcript-empty">Listening...</div>';
+      const emptyDiv = document.createElement('div');
+      emptyDiv.className = 'bud-transcript-empty';
+      emptyDiv.textContent = 'Listening...';
+      this.transcriptEl.appendChild(emptyDiv);
     } else {
-      this.transcriptEl.innerHTML = `
-        <div class="bud-transcript-text">${fullTranscript}</div>
-        ${interim ? `<div class="bud-transcript-text interim">${interim}</div>` : ''}
-      `;
+      // Use textContent to prevent XSS - never use innerHTML with user content
+      if (fullTranscript) {
+        const textDiv = document.createElement('div');
+        textDiv.className = 'bud-transcript-text';
+        textDiv.textContent = fullTranscript;
+        this.transcriptEl.appendChild(textDiv);
+      }
+      if (interim) {
+        const interimDiv = document.createElement('div');
+        interimDiv.className = 'bud-transcript-text interim';
+        interimDiv.textContent = interim;
+        this.transcriptEl.appendChild(interimDiv);
+      }
     }
   }
 
@@ -469,9 +526,19 @@ export class BudWidget extends HTMLElement {
   /**
    * Speak text through TTS
    */
-  speak(text: string, flush = false): void {
+  speak(
+    text: string,
+    options?: {
+      flush?: boolean;
+      allowInterruption?: boolean;
+      emotion?: string;
+      emotionIntensity?: number | string;
+      deliveryStyle?: string;
+      emotionDescription?: string;
+    }
+  ): void {
     if (this.ws && this.state.isAny('connected', 'listening', 'speaking')) {
-      this.ws.speak(text, flush);
+      this.ws.speak(text, options);
     }
   }
 

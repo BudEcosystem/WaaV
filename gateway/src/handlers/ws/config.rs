@@ -15,6 +15,32 @@ use crate::{
     livekit::LiveKitConfig,
 };
 
+/// DAG configuration for WebSocket messages
+///
+/// Allows clients to specify a DAG pipeline for audio processing.
+/// The DAG can be specified either by template name or inline definition.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct DAGWebSocketConfig {
+    /// Name of a pre-registered DAG template to use
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(example = "voice-assistant"))]
+    pub template: Option<String>,
+
+    /// Inline DAG definition (takes precedence over template)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition: Option<serde_json::Value>,
+
+    /// Enable DAG metrics collection
+    #[serde(default)]
+    pub enable_metrics: bool,
+
+    /// Maximum execution timeout in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(example = 30000))]
+    pub timeout_ms: Option<u64>,
+}
+
 /// Default value for audio enabled flag (true)
 pub fn default_audio_enabled() -> Option<bool> {
     Some(true)

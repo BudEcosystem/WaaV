@@ -104,10 +104,27 @@ export class WebSocketConnection {
       this.connectResolve = resolve;
       this.connectReject = reject;
 
+      // Flag to prevent double callback after timeout or cleanup
+      let settled = false;
+
+      const safeResolve = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutId);
+        resolve();
+      };
+
+      const safeReject = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutId);
+        reject(error);
+      };
+
       const timeoutId = setTimeout(() => {
-        if (this.state === 'connecting') {
+        if (this.state === 'connecting' && !settled) {
           this.cleanup();
-          reject(new TimeoutError(`Connection to ${this.url} timed out after ${this.timeout}ms`, this.timeout, {
+          safeReject(new TimeoutError(`Connection to ${this.url} timed out after ${this.timeout}ms`, this.timeout, {
             operation: 'connect',
           }));
         }
@@ -118,35 +135,32 @@ export class WebSocketConnection {
         this.ws.binaryType = 'arraybuffer';
 
         this.ws.onopen = () => {
-          clearTimeout(timeoutId);
           this.state = 'connected';
           this.handlers.onOpen?.();
-          resolve();
+          safeResolve();
         };
 
         this.ws.onclose = (event) => {
-          clearTimeout(timeoutId);
           const wasConnecting = this.state === 'connecting';
           this.state = 'disconnected';
           this.handlers.onClose?.(event.code, event.reason);
 
           if (wasConnecting) {
-            reject(new ConnectionError(`Connection closed during handshake: ${event.reason || 'Unknown reason'}`, {
+            safeReject(new ConnectionError(`Connection closed during handshake: ${event.reason || 'Unknown reason'}`, {
               url: this.url,
               code: event.code,
             }));
           }
         };
 
-        this.ws.onerror = (event) => {
-          clearTimeout(timeoutId);
+        this.ws.onerror = () => {
           const error = new ConnectionError('WebSocket error occurred', {
             url: this.url,
           });
           this.handlers.onError?.(error);
 
           if (this.state === 'connecting') {
-            reject(error);
+            safeReject(error);
           }
         };
 
@@ -154,10 +168,9 @@ export class WebSocketConnection {
           this.handleMessage(event.data);
         };
       } catch (err) {
-        clearTimeout(timeoutId);
         this.state = 'disconnected';
         const error = err instanceof Error ? err : new Error(String(err));
-        reject(new ConnectionError(`Failed to create WebSocket: ${error.message}`, {
+        safeReject(new ConnectionError(`Failed to create WebSocket: ${error.message}`, {
           url: this.url,
           cause: error,
         }));
@@ -191,31 +204,37 @@ export class WebSocketConnection {
 
   /**
    * Send a message
+   * @returns true if sent successfully, false if not connected
    */
-  send(message: OutgoingMessage): void {
+  send(message: OutgoingMessage): boolean {
     if (!this.isConnected()) {
-      throw new ConnectionError('Cannot send message: not connected', {
-        url: this.url,
-        state: this.state,
-      });
+      return false;
     }
 
-    const data = serializeMessage(message);
-    this.ws!.send(data);
+    try {
+      const data = serializeMessage(message);
+      this.ws!.send(data);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
    * Send binary data
+   * @returns true if sent successfully, false if not connected
    */
-  sendBinary(data: ArrayBuffer | Uint8Array): void {
+  sendBinary(data: ArrayBuffer | Uint8Array): boolean {
     if (!this.isConnected()) {
-      throw new ConnectionError('Cannot send binary data: not connected', {
-        url: this.url,
-        state: this.state,
-      });
+      return false;
     }
 
-    this.ws!.send(data);
+    try {
+      this.ws!.send(data);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**

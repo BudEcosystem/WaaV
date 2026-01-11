@@ -1,0 +1,12 @@
+[package]
+name = "waav-plugin-test"
+version = "1.0.0"
+edition = "2021"
+description = "Test plugin for WaaV Gateway demonstrating dynamic plugin loading"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+waav-plugin-api = { path = "../../plugin-api" }
+abi_stable = "0.11"

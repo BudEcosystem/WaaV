@@ -83,6 +83,10 @@ function init() {
   setupWSDebug();
   setupAudioTools();
   setupMetrics();
+  setupDAGBuilder();
+  setupPlugins();
+  setupProviders();
+  setupSystem();
 
   // Setup keyboard shortcuts
   setupKeyboardShortcuts();
@@ -2222,6 +2226,203 @@ function formatDuration(ms) {
   if (ms < 1000) return `${ms}ms`;
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
   return `${Math.floor(ms / 60000)}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, '0')}`;
+}
+
+/**
+ * Setup DAG Builder panel
+ */
+function setupDAGBuilder() {
+  const validateBtn = document.getElementById('dag-validate');
+  const saveBtn = document.getElementById('dag-save');
+  const loadBtn = document.getElementById('dag-load-template');
+  const editor = document.getElementById('dag-yaml-editor');
+  const resultDiv = document.getElementById('dag-validation-result');
+  const templatesBody = document.getElementById('dag-templates-body');
+  const templateCards = document.querySelectorAll('.template-card');
+
+  // Template card selection
+  templateCards.forEach(card => {
+    card.addEventListener('click', () => {
+      templateCards.forEach(c => c.classList.remove('active'));
+      card.classList.add('active');
+      const templateName = card.dataset.template;
+      loadDAGTemplate(templateName);
+    });
+  });
+
+  // Validate button
+  if (validateBtn) {
+    validateBtn.addEventListener('click', async () => {
+      const yamlContent = editor?.value || '';
+      try {
+        // Try to parse as JSON first, then YAML
+        let dagDef;
+        try {
+          dagDef = JSON.parse(yamlContent);
+        } catch {
+          // Would need a YAML parser library for proper YAML support
+          resultDiv.className = 'dag-validation-result error';
+          resultDiv.textContent = 'Please use JSON format. YAML parsing requires additional library.';
+          return;
+        }
+
+        // Call API to validate
+        const response = await fetch(getApiUrl('/dag/validate'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dag: dagDef })
+        });
+
+        const result = await response.json();
+        if (result.valid) {
+          resultDiv.className = 'dag-validation-result success';
+          resultDiv.textContent = `✓ Valid DAG: ${result.node_count} nodes, ${result.edge_count} edges`;
+        } else {
+          resultDiv.className = 'dag-validation-result error';
+          resultDiv.textContent = `✗ Invalid: ${result.errors.join(', ')}`;
+        }
+      } catch (err) {
+        resultDiv.className = 'dag-validation-result error';
+        resultDiv.textContent = `Error: ${err.message}`;
+      }
+    });
+  }
+
+  // Load templates from API
+  loadDAGTemplates();
+
+  async function loadDAGTemplates() {
+    try {
+      const response = await fetch(getApiUrl('/dag/templates'));
+      if (response.ok) {
+        const data = await response.json();
+        renderDAGTemplates(data.templates);
+      }
+    } catch (err) {
+      console.log('Could not load DAG templates:', err.message);
+    }
+  }
+
+  function renderDAGTemplates(templates) {
+    if (!templatesBody) return;
+    if (templates.length === 0) {
+      templatesBody.innerHTML = '<tr><td colspan="4" class="empty-state">No templates available</td></tr>';
+      return;
+    }
+    templatesBody.innerHTML = templates.map(t => `
+      <tr>
+        <td>${t.name}</td>
+        <td>${t.version || '-'}</td>
+        <td>${t.description || '-'}</td>
+        <td><button class="btn btn-sm btn-secondary" onclick="loadDAGTemplate('${t.name}')">Load</button></td>
+      </tr>
+    `).join('');
+  }
+
+  async function loadDAGTemplate(name) {
+    try {
+      const response = await fetch(getApiUrl(`/dag/templates/${name}`));
+      if (response.ok) {
+        const data = await response.json();
+        if (editor) {
+          editor.value = JSON.stringify(data.template, null, 2);
+        }
+        showToast('success', 'Template Loaded', `Loaded template: ${name}`);
+      }
+    } catch (err) {
+      showToast('error', 'Load Failed', err.message);
+    }
+  }
+
+  // Make loadDAGTemplate globally available
+  window.loadDAGTemplate = loadDAGTemplate;
+}
+
+/**
+ * Setup Plugins panel
+ */
+function setupPlugins() {
+  const pluginsGrid = document.getElementById('plugins-grid');
+  const pluginsBody = document.getElementById('plugins-body');
+
+  // This would be populated when connected to the gateway
+  // For now, show placeholder
+}
+
+/**
+ * Setup Providers panel
+ */
+function setupProviders() {
+  const providerCards = document.querySelectorAll('.provider-card');
+
+  // Add save functionality for API keys
+  providerCards.forEach(card => {
+    const input = card.querySelector('.provider-api-key');
+    if (input) {
+      input.addEventListener('change', () => {
+        const provider = input.dataset.provider;
+        const key = input.value;
+        // Store in localStorage (encrypted in production)
+        localStorage.setItem(`waav-provider-${provider}`, key);
+        showToast('success', 'Saved', `API key saved for ${provider}`);
+      });
+
+      // Load saved key
+      const savedKey = localStorage.getItem(`waav-provider-${input.dataset.provider}`);
+      if (savedKey) {
+        input.value = savedKey;
+      }
+    }
+  });
+}
+
+/**
+ * Setup System panel
+ */
+function setupSystem() {
+  const vadSlider = document.getElementById('setting-vad-threshold');
+  const vadValue = document.getElementById('vad-threshold-value');
+  const noiseToggle = document.getElementById('setting-noise-filter');
+  const turnToggle = document.getElementById('setting-turn-detect');
+  const clearCacheBtn = document.getElementById('cache-clear');
+
+  // VAD threshold slider
+  if (vadSlider && vadValue) {
+    vadSlider.addEventListener('input', () => {
+      vadValue.textContent = `${vadSlider.value}%`;
+    });
+  }
+
+  // Clear cache button
+  if (clearCacheBtn) {
+    clearCacheBtn.addEventListener('click', () => {
+      showToast('info', 'Cache', 'Cache clear requested (feature pending)');
+    });
+  }
+
+  // Load saved settings
+  if (noiseToggle) {
+    noiseToggle.checked = localStorage.getItem('waav-noise-filter') === 'true';
+    noiseToggle.addEventListener('change', () => {
+      localStorage.setItem('waav-noise-filter', noiseToggle.checked);
+    });
+  }
+
+  if (turnToggle) {
+    turnToggle.checked = localStorage.getItem('waav-turn-detect') === 'true';
+    turnToggle.addEventListener('change', () => {
+      localStorage.setItem('waav-turn-detect', turnToggle.checked);
+    });
+  }
+}
+
+/**
+ * Get API URL from server URL
+ */
+function getApiUrl(path) {
+  const serverUrl = document.getElementById('server-url')?.value || 'ws://localhost:3001/ws';
+  const httpUrl = serverUrl.replace('wss://', 'https://').replace('ws://', 'http://').replace('/ws', '');
+  return httpUrl + path;
 }
 
 // Initialize when DOM is ready

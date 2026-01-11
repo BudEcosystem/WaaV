@@ -187,6 +187,58 @@
                         </ul>
                     </li>
 
+                    <li class="nav-group">
+                        <span class="nav-group-label">Configuration</span>
+                        <ul class="nav-sublist">
+                            <li class="nav-item">
+                                <a href="#dag" class="nav-link" data-tab="dag">
+                                    <span class="nav-icon">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
+                                            <path d="M22 6l-10 7L2 6"/>
+                                        </svg>
+                                    </span>
+                                    <span class="nav-label">DAG Builder</span>
+                                </a>
+                            </li>
+                            <li class="nav-item">
+                                <a href="#plugins" class="nav-link" data-tab="plugins">
+                                    <span class="nav-icon">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                                            <path d="M2 17l10 5 10-5"/>
+                                            <path d="M2 12l10 5 10-5"/>
+                                        </svg>
+                                    </span>
+                                    <span class="nav-label">Plugins</span>
+                                </a>
+                            </li>
+                            <li class="nav-item">
+                                <a href="#providers" class="nav-link" data-tab="providers">
+                                    <span class="nav-icon">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <circle cx="12" cy="12" r="3"/>
+                                            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+                                        </svg>
+                                    </span>
+                                    <span class="nav-label">Providers</span>
+                                </a>
+                            </li>
+                            <li class="nav-item">
+                                <a href="#system" class="nav-link" data-tab="system">
+                                    <span class="nav-icon">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/>
+                                            <line x1="8" y1="21" x2="16" y2="21"/>
+                                            <line x1="12" y1="17" x2="12" y2="21"/>
+                                        </svg>
+                                    </span>
+                                    <span class="nav-label">System</span>
+                                </a>
+                            </li>
+                        </ul>
+                    </li>
+
                     <li class="nav-item nav-item-bottom">
                         <a href="#metrics" class="nav-link" data-tab="metrics">
                             <span class="nav-icon">
@@ -1162,6 +1214,399 @@
                     <div class="form-row">
                         <button id="metrics-reset" class="btn btn-secondary">Reset Metrics</button>
                         <button id="metrics-export" class="btn btn-secondary">Export CSV</button>
+                    </div>
+                </section>
+            </div>
+
+            <!-- DAG Builder Panel -->
+            <div class="tab-panel" id="panel-dag">
+                <div class="panel-header">
+                    <h1>DAG Builder</h1>
+                    <p class="panel-description">Design and test audio processing pipelines</p>
+                </div>
+
+                <section class="form-section">
+                    <h2>DAG Templates</h2>
+                    <div class="template-grid" id="dag-template-grid">
+                        <div class="template-card" data-template="voice-assistant">
+                            <div class="template-icon">🎤</div>
+                            <div class="template-info">
+                                <span class="template-name">Voice Assistant</span>
+                                <span class="template-desc">STT → LLM → TTS pipeline</span>
+                            </div>
+                        </div>
+                        <div class="template-card" data-template="transcription">
+                            <div class="template-icon">📝</div>
+                            <div class="template-info">
+                                <span class="template-name">Transcription</span>
+                                <span class="template-desc">Audio to text only</span>
+                            </div>
+                        </div>
+                        <div class="template-card" data-template="custom">
+                            <div class="template-icon">⚙️</div>
+                            <div class="template-info">
+                                <span class="template-name">Custom</span>
+                                <span class="template-desc">Build from scratch</span>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="form-section">
+                    <h2>DAG Editor</h2>
+                    <div class="dag-editor-container">
+                        <div class="dag-toolbar">
+                            <button id="dag-load-template" class="btn btn-secondary">Load Template</button>
+                            <button id="dag-validate" class="btn btn-secondary">Validate</button>
+                            <button id="dag-save" class="btn btn-primary">Save</button>
+                        </div>
+                        <div class="dag-editor-wrapper">
+                            <label for="dag-yaml-editor">DAG Definition (YAML/JSON)</label>
+                            <textarea id="dag-yaml-editor" class="code-editor" rows="20" placeholder="# Enter your DAG definition here
+id: my-dag
+name: My Custom DAG
+version: '1.0'
+nodes:
+  - id: input
+    type: audio_input
+  - id: stt
+    type: stt_provider
+    config:
+      provider: deepgram
+  - id: output
+    type: text_output
+edges:
+  - from: input
+    to: stt
+  - from: stt
+    to: output"></textarea>
+                        </div>
+                        <div class="dag-validation-result" id="dag-validation-result"></div>
+                    </div>
+                </section>
+
+                <section class="form-section">
+                    <h2>Available Templates</h2>
+                    <div class="table-container">
+                        <table class="data-table" id="dag-templates-table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Version</th>
+                                    <th>Description</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="dag-templates-body">
+                                <tr>
+                                    <td colspan="4" class="empty-state">Loading templates...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Plugins Panel -->
+            <div class="tab-panel" id="panel-plugins">
+                <div class="panel-header">
+                    <h1>Plugin Manager</h1>
+                    <p class="panel-description">Manage and monitor loaded plugins</p>
+                </div>
+
+                <section class="form-section">
+                    <h2>Loaded Plugins</h2>
+                    <div class="plugins-grid" id="plugins-grid">
+                        <div class="plugin-card">
+                            <div class="plugin-header">
+                                <span class="plugin-status" data-status="active"></span>
+                                <span class="plugin-name">Loading...</span>
+                            </div>
+                            <div class="plugin-body">
+                                <span class="plugin-version">--</span>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="form-section">
+                    <h2>Plugin Details</h2>
+                    <div class="table-container">
+                        <table class="data-table" id="plugins-table">
+                            <thead>
+                                <tr>
+                                    <th>Plugin</th>
+                                    <th>Version</th>
+                                    <th>Type</th>
+                                    <th>Status</th>
+                                    <th>Capabilities</th>
+                                </tr>
+                            </thead>
+                            <tbody id="plugins-body">
+                                <tr>
+                                    <td colspan="5" class="empty-state">Connect to gateway to view plugins</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Providers Panel -->
+            <div class="tab-panel" id="panel-providers">
+                <div class="panel-header">
+                    <h1>Provider Configuration</h1>
+                    <p class="panel-description">Configure STT, TTS, and Realtime providers</p>
+                </div>
+
+                <section class="form-section">
+                    <h2>STT Providers</h2>
+                    <div class="providers-grid">
+                        <div class="provider-card" data-provider="deepgram">
+                            <div class="provider-header">
+                                <span class="provider-icon">🎙️</span>
+                                <span class="provider-name">Deepgram</span>
+                                <span class="provider-status" data-status="unknown"></span>
+                            </div>
+                            <div class="provider-config">
+                                <div class="input-group compact">
+                                    <input type="password" placeholder="API Key" class="provider-api-key" data-provider="deepgram">
+                                </div>
+                            </div>
+                        </div>
+                        <div class="provider-card" data-provider="google-stt">
+                            <div class="provider-header">
+                                <span class="provider-icon">🔵</span>
+                                <span class="provider-name">Google STT</span>
+                                <span class="provider-status" data-status="unknown"></span>
+                            </div>
+                            <div class="provider-config">
+                                <div class="input-group compact">
+                                    <input type="password" placeholder="Service Account JSON" class="provider-api-key" data-provider="google-stt">
+                                </div>
+                            </div>
+                        </div>
+                        <div class="provider-card" data-provider="azure-stt">
+                            <div class="provider-header">
+                                <span class="provider-icon">🟦</span>
+                                <span class="provider-name">Azure STT</span>
+                                <span class="provider-status" data-status="unknown"></span>
+                            </div>
+                            <div class="provider-config">
+                                <div class="input-group compact">
+                                    <input type="password" placeholder="Subscription Key" class="provider-api-key" data-provider="azure-stt">
+                                </div>
+                            </div>
+                        </div>
+                        <div class="provider-card" data-provider="whisper">
+                            <div class="provider-header">
+                                <span class="provider-icon">🤖</span>
+                                <span class="provider-name">OpenAI Whisper</span>
+                                <span class="provider-status" data-status="unknown"></span>
+                            </div>
+                            <div class="provider-config">
+                                <div class="input-group compact">
+                                    <input type="password" placeholder="API Key" class="provider-api-key" data-provider="whisper">
+                                </div>
+                            </div>
+                        </div>
+                        <div class="provider-card" data-provider="gladia">
+                            <div class="provider-header">
+                                <span class="provider-icon">📊</span>
+                                <span class="provider-name">Gladia</span>
+                                <span class="provider-status" data-status="unknown"></span>
+                            </div>
+                            <div class="provider-config">
+                                <div class="input-group compact">
+                                    <input type="password" placeholder="API Key" class="provider-api-key" data-provider="gladia">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="form-section">
+                    <h2>TTS Providers</h2>
+                    <div class="providers-grid">
+                        <div class="provider-card" data-provider="elevenlabs">
+                            <div class="provider-header">
+                                <span class="provider-icon">🔊</span>
+                                <span class="provider-name">ElevenLabs</span>
+                                <span class="provider-status" data-status="unknown"></span>
+                            </div>
+                            <div class="provider-config">
+                                <div class="input-group compact">
+                                    <input type="password" placeholder="API Key" class="provider-api-key" data-provider="elevenlabs">
+                                </div>
+                            </div>
+                        </div>
+                        <div class="provider-card" data-provider="cartesia">
+                            <div class="provider-header">
+                                <span class="provider-icon">🎵</span>
+                                <span class="provider-name">Cartesia</span>
+                                <span class="provider-status" data-status="unknown"></span>
+                            </div>
+                            <div class="provider-config">
+                                <div class="input-group compact">
+                                    <input type="password" placeholder="API Key" class="provider-api-key" data-provider="cartesia">
+                                </div>
+                            </div>
+                        </div>
+                        <div class="provider-card" data-provider="azure-tts">
+                            <div class="provider-header">
+                                <span class="provider-icon">🟦</span>
+                                <span class="provider-name">Azure TTS</span>
+                                <span class="provider-status" data-status="unknown"></span>
+                            </div>
+                            <div class="provider-config">
+                                <div class="input-group compact">
+                                    <input type="password" placeholder="Subscription Key" class="provider-api-key" data-provider="azure-tts">
+                                </div>
+                            </div>
+                        </div>
+                        <div class="provider-card" data-provider="google-tts">
+                            <div class="provider-header">
+                                <span class="provider-icon">🔵</span>
+                                <span class="provider-name">Google TTS</span>
+                                <span class="provider-status" data-status="unknown"></span>
+                            </div>
+                            <div class="provider-config">
+                                <div class="input-group compact">
+                                    <input type="password" placeholder="Service Account JSON" class="provider-api-key" data-provider="google-tts">
+                                </div>
+                            </div>
+                        </div>
+                        <div class="provider-card" data-provider="hume">
+                            <div class="provider-header">
+                                <span class="provider-icon">💜</span>
+                                <span class="provider-name">Hume AI</span>
+                                <span class="provider-status" data-status="unknown"></span>
+                            </div>
+                            <div class="provider-config">
+                                <div class="input-group compact">
+                                    <input type="password" placeholder="API Key" class="provider-api-key" data-provider="hume">
+                                </div>
+                            </div>
+                        </div>
+                        <div class="provider-card" data-provider="kokoro">
+                            <div class="provider-header">
+                                <span class="provider-icon">🔶</span>
+                                <span class="provider-name">Kokoro (Local)</span>
+                                <span class="provider-status" data-status="unknown"></span>
+                            </div>
+                            <div class="provider-config">
+                                <span class="provider-note">Local inference - no API key needed</span>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="form-section">
+                    <h2>Realtime Providers</h2>
+                    <div class="providers-grid">
+                        <div class="provider-card" data-provider="openai-realtime">
+                            <div class="provider-header">
+                                <span class="provider-icon">🤖</span>
+                                <span class="provider-name">OpenAI Realtime</span>
+                                <span class="provider-status" data-status="unknown"></span>
+                            </div>
+                            <div class="provider-config">
+                                <div class="input-group compact">
+                                    <input type="password" placeholder="API Key" class="provider-api-key" data-provider="openai-realtime">
+                                </div>
+                            </div>
+                        </div>
+                        <div class="provider-card" data-provider="gemini-realtime">
+                            <div class="provider-header">
+                                <span class="provider-icon">💎</span>
+                                <span class="provider-name">Gemini 2.0</span>
+                                <span class="provider-status" data-status="unknown"></span>
+                            </div>
+                            <div class="provider-config">
+                                <div class="input-group compact">
+                                    <input type="password" placeholder="API Key" class="provider-api-key" data-provider="gemini-realtime">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- System Panel -->
+            <div class="tab-panel" id="panel-system">
+                <div class="panel-header">
+                    <h1>System Configuration</h1>
+                    <p class="panel-description">Gateway settings and system information</p>
+                </div>
+
+                <section class="form-section">
+                    <h2>Gateway Information</h2>
+                    <div class="info-grid">
+                        <div class="info-card">
+                            <span class="info-label">Version</span>
+                            <span class="info-value" id="system-version">--</span>
+                        </div>
+                        <div class="info-card">
+                            <span class="info-label">Uptime</span>
+                            <span class="info-value" id="system-uptime">--</span>
+                        </div>
+                        <div class="info-card">
+                            <span class="info-label">Active Connections</span>
+                            <span class="info-value" id="system-connections">--</span>
+                        </div>
+                        <div class="info-card">
+                            <span class="info-label">Memory Usage</span>
+                            <span class="info-value" id="system-memory">--</span>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="form-section">
+                    <h2>Features</h2>
+                    <div class="features-grid">
+                        <div class="feature-item">
+                            <span class="feature-status" id="feature-dag" data-enabled="false"></span>
+                            <span class="feature-label">DAG Routing</span>
+                        </div>
+                        <div class="feature-item">
+                            <span class="feature-status" id="feature-plugins" data-enabled="false"></span>
+                            <span class="feature-label">Dynamic Plugins</span>
+                        </div>
+                        <div class="feature-item">
+                            <span class="feature-status" id="feature-noise" data-enabled="false"></span>
+                            <span class="feature-label">Noise Filtering</span>
+                        </div>
+                        <div class="feature-item">
+                            <span class="feature-status" id="feature-turn" data-enabled="false"></span>
+                            <span class="feature-label">Turn Detection</span>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="form-section">
+                    <h2>Audio Settings</h2>
+                    <div class="settings-form">
+                        <div class="setting-row">
+                            <label for="setting-noise-filter">Enable Noise Filtering</label>
+                            <input type="checkbox" id="setting-noise-filter" class="toggle-switch">
+                        </div>
+                        <div class="setting-row">
+                            <label for="setting-turn-detect">Enable Turn Detection</label>
+                            <input type="checkbox" id="setting-turn-detect" class="toggle-switch">
+                        </div>
+                        <div class="setting-row">
+                            <label for="setting-vad-threshold">VAD Threshold</label>
+                            <input type="range" id="setting-vad-threshold" min="0" max="100" value="50">
+                            <span class="setting-value" id="vad-threshold-value">50%</span>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="form-section">
+                    <h2>Cache</h2>
+                    <div class="form-row">
+                        <button id="cache-clear" class="btn btn-secondary">Clear TTS Cache</button>
+                        <span class="cache-info" id="cache-info">Cache size: --</span>
                     </div>
                 </section>
             </div>

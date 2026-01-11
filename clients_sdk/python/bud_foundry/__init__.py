@@ -30,6 +30,18 @@ Example:
 
 from .client import BudClient
 from .types import (
+    # Provider types
+    STTProvider,
+    TTSProvider,
+    RealtimeProvider,
+    STT_PROVIDER_CAPABILITIES,
+    TTS_PROVIDER_CAPABILITIES,
+    REALTIME_PROVIDER_CAPABILITIES,
+    is_valid_stt_provider,
+    is_valid_tts_provider,
+    is_valid_realtime_provider,
+    get_provider_capabilities,
+    # Configuration types
     STTConfig,
     TTSConfig,
     LiveKitConfig,
@@ -55,6 +67,35 @@ from .types import (
     EmotionIntensityLevel,
     EmotionConfig,
     intensity_to_number,
+    # DAG routing types
+    DAGNodeType,
+    DAGNode,
+    DAGEdge,
+    DAGDefinition,
+    DAGConfig,
+    DAGValidationResult,
+    validate_dag_definition,
+    TEMPLATE_SIMPLE_STT,
+    TEMPLATE_SIMPLE_TTS,
+    TEMPLATE_VOICE_ASSISTANT,
+    BUILTIN_TEMPLATES,
+    get_builtin_template,
+    # Audio features types
+    TurnDetectionConfig,
+    NoiseFilterConfig,
+    VADModeType,
+    ExtendedVADConfig,
+    AudioFeatures,
+    DEFAULT_TURN_DETECTION,
+    DEFAULT_NOISE_FILTER,
+    DEFAULT_VAD,
+    create_audio_features,
+    # Recording types
+    RecordingStatus,
+    RecordingFormat,
+    RecordingInfo,
+    RecordingFilter,
+    RecordingList,
 )
 from .errors import (
     BudError,
@@ -78,6 +119,17 @@ from .pipelines import (
     TalkEvent,
     BudTranscribe,
     TranscribeSession,
+    # Realtime pipeline
+    BudRealtime,
+    RealtimeSession,
+    RealtimeConfig,
+    RealtimeState,
+    ToolDefinition,
+    FunctionCallEvent,
+    RealtimeTranscriptEvent,
+    RealtimeAudioEvent,
+    EmotionEvent,
+    StateChangeEvent,
 )
 from .rest import RestClient
 from .ws import WebSocketSession, SessionMetrics, ReconnectConfig
@@ -87,6 +139,17 @@ __version__ = "0.1.0"
 __all__ = [
     # Main client
     "BudClient",
+    # Provider types
+    "STTProvider",
+    "TTSProvider",
+    "RealtimeProvider",
+    "STT_PROVIDER_CAPABILITIES",
+    "TTS_PROVIDER_CAPABILITIES",
+    "REALTIME_PROVIDER_CAPABILITIES",
+    "is_valid_stt_provider",
+    "is_valid_tts_provider",
+    "is_valid_realtime_provider",
+    "get_provider_capabilities",
     # Configuration types
     "STTConfig",
     "TTSConfig",
@@ -98,6 +161,35 @@ __all__ = [
     "EmotionIntensityLevel",
     "EmotionConfig",
     "intensity_to_number",
+    # DAG routing types
+    "DAGNodeType",
+    "DAGNode",
+    "DAGEdge",
+    "DAGDefinition",
+    "DAGConfig",
+    "DAGValidationResult",
+    "validate_dag_definition",
+    "TEMPLATE_SIMPLE_STT",
+    "TEMPLATE_SIMPLE_TTS",
+    "TEMPLATE_VOICE_ASSISTANT",
+    "BUILTIN_TEMPLATES",
+    "get_builtin_template",
+    # Audio features types
+    "TurnDetectionConfig",
+    "NoiseFilterConfig",
+    "VADModeType",
+    "ExtendedVADConfig",
+    "AudioFeatures",
+    "DEFAULT_TURN_DETECTION",
+    "DEFAULT_NOISE_FILTER",
+    "DEFAULT_VAD",
+    "create_audio_features",
+    # Recording types
+    "RecordingStatus",
+    "RecordingFormat",
+    "RecordingInfo",
+    "RecordingFilter",
+    "RecordingList",
     # Result types
     "STTResult",
     "TranscriptEvent",
@@ -139,6 +231,17 @@ __all__ = [
     "TalkEvent",
     "BudTranscribe",
     "TranscribeSession",
+    # Realtime pipeline
+    "BudRealtime",
+    "RealtimeSession",
+    "RealtimeConfig",
+    "RealtimeState",
+    "ToolDefinition",
+    "FunctionCallEvent",
+    "RealtimeTranscriptEvent",
+    "RealtimeAudioEvent",
+    "EmotionEvent",
+    "StateChangeEvent",
     # Utility classes
     "RestClient",
     "WebSocketSession",

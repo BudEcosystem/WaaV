@@ -128,7 +128,8 @@ impl STTResultProcessor {
                 old_handle.abort();
             }
 
-            state.text_buffer = format!("{}{}", state.text_buffer, result.transcript);
+            // Use push_str for O(1) amortized append instead of format!() which allocates a new string
+            state.text_buffer.push_str(&result.transcript);
 
             // Check if this is the first is_final for a new segment
             let is_new = state.segment_start_ms.load(Ordering::Acquire) == 0;

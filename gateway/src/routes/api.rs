@@ -4,7 +4,7 @@ use axum::{
 };
 use tower_http::trace::TraceLayer;
 
-use crate::handlers::{livekit, recording, sip, speak, voices};
+use crate::handlers::{dag, livekit, recording, sip, speak, voices};
 use crate::state::AppState;
 use std::sync::Arc;
 
@@ -32,5 +32,9 @@ pub fn create_api_router() -> Router<Arc<AppState>> {
         )
         // SIP call transfer
         .route("/sip/transfer", post(sip::sip_transfer))
+        // DAG routing endpoints
+        .route("/dag/templates", get(dag::list_templates))
+        .route("/dag/templates/{template_name}", get(dag::get_template))
+        .route("/dag/validate", post(dag::validate_dag))
         .layer(TraceLayer::new_for_http())
 }

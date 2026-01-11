@@ -65,6 +65,7 @@ export class WebSocketSession {
   private lastPingTime: number | null = null;
   private sessionId: string | null = null;
   private readyReceived = false;
+  private lastReadyEvent: ReadyEvent | null = null;
   private sttConfig?: STTConfig;
   private ttsConfig?: TTSConfig;
   private livekitConfig?: LiveKitConfig;
@@ -177,6 +178,7 @@ export class WebSocketSession {
     this.state = 'disconnected';
     this.metrics.setWSState('disconnected');
     this.readyReceived = false;
+    this.lastReadyEvent = null;
     this.stopPingInterval();
 
     this.emitter.emit('close', { code, reason });
@@ -264,6 +266,9 @@ export class WebSocketSession {
       capabilities: message.capabilities ?? [],
       raw: message,
     };
+
+    // Store the event for later retrieval by waitForReady()
+    this.lastReadyEvent = event;
 
     this.emitter.emit('ready', event);
   }
@@ -497,7 +502,22 @@ export class WebSocketSession {
    * Send audio data
    */
   sendAudio(data: ArrayBuffer | Uint8Array): void {
-    const buffer = data instanceof Uint8Array ? data.buffer : data;
+    // Extract the correct ArrayBuffer slice from Uint8Array views
+    // If Uint8Array is a view into a larger buffer, data.buffer returns the full buffer
+    // which would corrupt the data. We need to extract just the portion we're using.
+    let buffer: ArrayBuffer;
+    if (data instanceof Uint8Array) {
+      if (data.byteOffset === 0 && data.byteLength === data.buffer.byteLength) {
+        // Uint8Array uses the whole buffer, safe to use directly
+        buffer = data.buffer;
+      } else {
+        // Uint8Array is a view into a larger buffer, need to copy the slice
+        buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+      }
+    } else {
+      buffer = data;
+    }
+
     this.metrics.increment('ws.bytesSent', buffer.byteLength);
 
     if (this.connection.isConnected()) {
@@ -608,27 +628,23 @@ export class WebSocketSession {
    * Wait for ready state
    */
   waitForReady(timeout = 10000): Promise<ReadyEvent> {
-    if (this.readyReceived) {
-      return Promise.resolve({
-        sessionId: this.sessionId ?? undefined,
-        sttReady: true,
-        ttsReady: true,
-        livekitConnected: false,
-        capabilities: [],
-        raw: { type: 'ready' },
-      });
+    // Return stored event if already received (with actual values, not hardcoded)
+    if (this.readyReceived && this.lastReadyEvent) {
+      return Promise.resolve(this.lastReadyEvent);
     }
 
     return new Promise((resolve, reject) => {
-      const timeoutId = setTimeout(() => {
-        this.off('ready', handler);
-        reject(new ConnectionError('Timeout waiting for ready state', { timeout }));
-      }, timeout);
-
+      // Define handler before setTimeout to avoid temporal dead zone issues
+      // and ensure proper cleanup on timeout
       const handler = (event: ReadyEvent) => {
         clearTimeout(timeoutId);
         resolve(event);
       };
+
+      const timeoutId = setTimeout(() => {
+        this.off('ready', handler);
+        reject(new ConnectionError('Timeout waiting for ready state', { timeout }));
+      }, timeout);
 
       this.once('ready', handler);
     });

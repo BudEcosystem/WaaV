@@ -104,13 +104,28 @@ impl HumeEmotionMapper {
     }
 
     /// Truncates description to max length while preserving word boundaries.
+    /// Safely handles UTF-8 multi-byte characters by finding char boundaries.
     fn truncate_description(description: &str) -> String {
         if description.len() <= MAX_DESCRIPTION_LENGTH {
             return description.to_string();
         }
 
-        // Find last comma or space before the limit
-        let truncated = &description[..MAX_DESCRIPTION_LENGTH];
+        // Find the last valid UTF-8 char boundary at or before MAX_DESCRIPTION_LENGTH
+        // This prevents panics when MAX_DESCRIPTION_LENGTH falls in the middle of a multi-byte char
+        let safe_end = description
+            .char_indices()
+            .take_while(|(i, _)| *i < MAX_DESCRIPTION_LENGTH)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+
+        if safe_end == 0 {
+            return String::new();
+        }
+
+        let truncated = &description[..safe_end];
+
+        // Find last comma or space before the limit for word boundary
         if let Some(pos) = truncated.rfind(|c| c == ',' || c == ' ') {
             // Trim both whitespace and trailing commas
             description[..pos]

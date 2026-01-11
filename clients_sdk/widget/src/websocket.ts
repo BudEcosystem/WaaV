@@ -26,6 +26,7 @@ export class WidgetWebSocket {
     messagesReceived: 0,
     messagesSent: 0,
   };
+  private reconnectTimeoutId: ReturnType<typeof setTimeout> | null = null;
 
   constructor(config: WidgetConfig, handlers: MessageHandler) {
     this.config = config;
@@ -36,8 +37,47 @@ export class WidgetWebSocket {
     return { ...this._metrics };
   }
 
-  connect(): Promise<void> {
+  /**
+   * Reset metrics counters to prevent unbounded growth
+   */
+  resetMetrics(): void {
+    this._metrics = {
+      messagesReceived: 0,
+      messagesSent: 0,
+    };
+  }
+
+  connect(timeout = 10000): Promise<void> {
     return new Promise((resolve, reject) => {
+      let settled = false;
+      let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+      const settle = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        if (timeoutId !== null) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      };
+
+      // Set connection timeout
+      timeoutId = setTimeout(() => {
+        if (!settled) {
+          // Close WebSocket if still connecting
+          if (this.ws) {
+            this.ws.close();
+            this.ws = null;
+          }
+          settle(new Error(`Connection timeout after ${timeout}ms - no ready message received`));
+        }
+      }, timeout);
+
       try {
         const url = new URL(this.config.gatewayUrl);
 
@@ -56,29 +96,40 @@ export class WidgetWebSocket {
 
         this.ws.onmessage = (event) => {
           this._metrics.messagesReceived++;
-          this.handleMessage(event, resolve);
+          this.handleMessage(event, () => settle());
         };
 
-        this.ws.onerror = (event) => {
-          const error = new Error('WebSocket error');
-          reject(error);
+        this.ws.onerror = () => {
+          settle(new Error('WebSocket error'));
         };
 
         this.ws.onclose = () => {
           this.handlers.onClose();
-          this.attemptReconnect();
+          if (!settled) {
+            // Only attempt reconnect if we haven't settled yet (connection dropped before ready)
+            this.attemptReconnect();
+          }
         };
       } catch (error) {
-        reject(error);
+        settle(error instanceof Error ? error : new Error(String(error)));
       }
     });
   }
 
   disconnect(): void {
+    // Cancel any pending reconnect attempt
+    if (this.reconnectTimeoutId !== null) {
+      clearTimeout(this.reconnectTimeoutId);
+      this.reconnectTimeoutId = null;
+    }
+
     if (this.ws) {
       this.ws.close();
       this.ws = null;
     }
+
+    // Reset metrics on disconnect to prevent unbounded growth
+    this.resetMetrics();
   }
 
   private sendConfig(): void {
@@ -89,6 +140,7 @@ export class WidgetWebSocket {
       audio: true,
     };
 
+    // STT configuration
     if (this.config.stt) {
       config.stt_config = {
         provider: this.config.stt.provider,
@@ -101,13 +153,110 @@ export class WidgetWebSocket {
       };
     }
 
+    // TTS configuration with emotion support
     if (this.config.tts) {
-      config.tts_config = {
+      const ttsConfig: Record<string, unknown> = {
         provider: this.config.tts.provider,
         voice_id: this.config.tts.voiceId || this.config.tts.voice,
         sample_rate: this.config.tts.sampleRate || 24000,
         model: this.config.tts.model,
       };
+
+      // Add emotion settings if configured
+      if (this.config.tts.emotion) {
+        if (this.config.tts.emotion.emotion !== undefined) {
+          ttsConfig.emotion = this.config.tts.emotion.emotion;
+        }
+        if (this.config.tts.emotion.intensity !== undefined) {
+          ttsConfig.emotion_intensity = this.config.tts.emotion.intensity;
+        }
+        if (this.config.tts.emotion.deliveryStyle !== undefined) {
+          ttsConfig.delivery_style = this.config.tts.emotion.deliveryStyle;
+        }
+        if (this.config.tts.emotion.description !== undefined) {
+          ttsConfig.emotion_description = this.config.tts.emotion.description;
+        }
+      }
+
+      config.tts_config = ttsConfig;
+    }
+
+    // Audio features configuration
+    if (this.config.audioFeatures) {
+      const audioFeatures: Record<string, unknown> = {};
+
+      // Turn detection
+      if (this.config.audioFeatures.turnDetection) {
+        audioFeatures.turn_detection = {
+          enabled: this.config.audioFeatures.turnDetection.enabled,
+          threshold: this.config.audioFeatures.turnDetection.threshold,
+          silence_ms: this.config.audioFeatures.turnDetection.silenceMs,
+          prefix_padding_ms: this.config.audioFeatures.turnDetection.prefixPaddingMs,
+        };
+      }
+
+      // Noise filtering (matches Python SDK naming)
+      if (this.config.audioFeatures.noiseFilter) {
+        audioFeatures.noise_filtering = {
+          enabled: this.config.audioFeatures.noiseFilter.enabled,
+          strength: this.config.audioFeatures.noiseFilter.strength,
+        };
+      }
+
+      // VAD (Voice Activity Detection)
+      if (this.config.audioFeatures.vad) {
+        audioFeatures.vad = {
+          enabled: this.config.audioFeatures.vad.enabled,
+          threshold: this.config.audioFeatures.vad.threshold,
+          silence_ms: this.config.audioFeatures.vad.silenceMs,
+        };
+      }
+
+      if (Object.keys(audioFeatures).length > 0) {
+        config.audio_features = audioFeatures;
+      }
+    }
+
+    // Realtime configuration (OpenAI Realtime API / Hume EVI)
+    if (this.config.realtime) {
+      const realtimeConfig: Record<string, unknown> = {
+        provider: this.config.realtime.provider,
+        model: this.config.realtime.model,
+        system_prompt: this.config.realtime.systemPrompt,
+        voice_id: this.config.realtime.voiceId,
+        temperature: this.config.realtime.temperature,
+        max_tokens: this.config.realtime.maxTokens,
+      };
+
+      // Hume EVI specific fields
+      if (this.config.realtime.eviVersion !== undefined) {
+        realtimeConfig.evi_version = this.config.realtime.eviVersion;
+      }
+      if (this.config.realtime.verboseTranscription !== undefined) {
+        realtimeConfig.verbose_transcription = this.config.realtime.verboseTranscription;
+      }
+      if (this.config.realtime.resumedChatGroupId !== undefined) {
+        realtimeConfig.resumed_chat_group_id = this.config.realtime.resumedChatGroupId;
+      }
+
+      // OpenAI Realtime specific fields
+      if (this.config.realtime.inputAudioTranscription !== undefined) {
+        realtimeConfig.input_audio_transcription = {
+          model: this.config.realtime.inputAudioTranscription.model,
+        };
+      }
+
+      // Turn detection for realtime mode
+      if (this.config.realtime.turnDetection !== undefined) {
+        realtimeConfig.turn_detection = {
+          enabled: this.config.realtime.turnDetection.enabled,
+          threshold: this.config.realtime.turnDetection.threshold,
+          silence_ms: this.config.realtime.turnDetection.silenceMs,
+          prefix_padding_ms: this.config.realtime.turnDetection.prefixPaddingMs,
+        };
+      }
+
+      config.realtime_config = realtimeConfig;
     }
 
     this.configSentTime = performance.now();
@@ -116,14 +265,23 @@ export class WidgetWebSocket {
 
   private handleMessage(event: MessageEvent, resolveConnect?: (value: void) => void): void {
     if (event.data instanceof Blob) {
-      // Binary audio data
-      event.data.arrayBuffer().then((buffer) => {
-        if (this.speakStartTime !== null) {
-          this._metrics.ttsTtfb = performance.now() - this.speakStartTime;
-          this.speakStartTime = null;
-        }
-        this.handlers.onAudio(buffer, 'linear16', this.config.tts?.sampleRate || 24000, false);
-      });
+      // Binary audio data - handle async conversion with proper error handling
+      // Capture speakStartTime synchronously to avoid race conditions
+      const capturedSpeakStartTime = this.speakStartTime;
+      if (capturedSpeakStartTime !== null) {
+        this._metrics.ttsTtfb = performance.now() - capturedSpeakStartTime;
+        this.speakStartTime = null;
+      }
+
+      event.data
+        .arrayBuffer()
+        .then((buffer) => {
+          this.handlers.onAudio(buffer, 'linear16', this.config.tts?.sampleRate || 24000, false);
+        })
+        .catch((error) => {
+          console.error('Failed to convert Blob to ArrayBuffer:', error);
+          this.handlers.onError(new Error('Failed to process binary audio data'));
+        });
       return;
     }
 
@@ -185,13 +343,22 @@ export class WidgetWebSocket {
   }
 
   private base64ToArrayBuffer(base64: string): ArrayBuffer {
-    const binaryString = atob(base64);
-    const len = binaryString.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-      bytes[i] = binaryString.charCodeAt(i);
+    if (!base64 || base64.length === 0) {
+      return new ArrayBuffer(0);
     }
-    return bytes.buffer;
+
+    try {
+      const binaryString = atob(base64);
+      const len = binaryString.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      return bytes.buffer;
+    } catch (error) {
+      console.error('Failed to decode base64 audio data:', error);
+      return new ArrayBuffer(0);
+    }
   }
 
   private attemptReconnect(): void {
@@ -204,7 +371,9 @@ export class WidgetWebSocket {
     const delay = this.reconnectDelay * Math.pow(1.5, this.reconnectAttempts - 1);
     const jitter = delay * 0.2 * (Math.random() * 2 - 1);
 
-    setTimeout(() => {
+    // Store timeout ID so it can be cancelled on disconnect
+    this.reconnectTimeoutId = setTimeout(() => {
+      this.reconnectTimeoutId = null;
       this.connect().catch((error) => {
         this.handlers.onError(error);
       });
@@ -233,14 +402,61 @@ export class WidgetWebSocket {
     }
   }
 
-  speak(text: string, flush = false, allowInterruption = true): void {
+  speak(
+    text: string,
+    options?: {
+      flush?: boolean;
+      allowInterruption?: boolean;
+      emotion?: string;
+      emotionIntensity?: number | string;
+      deliveryStyle?: string;
+      emotionDescription?: string;
+    }
+  ): void {
     this.speakStartTime = performance.now();
-    this.send({
+    const message: Record<string, unknown> = {
       type: 'speak',
       text,
-      flush,
-      allow_interruption: allowInterruption,
-    });
+      flush: options?.flush ?? false,
+      allow_interruption: options?.allowInterruption ?? true,
+    };
+
+    // Add emotion settings for per-message control
+    if (options?.emotion !== undefined) {
+      message.emotion = options.emotion;
+    }
+    if (options?.emotionIntensity !== undefined) {
+      message.emotion_intensity = options.emotionIntensity;
+    }
+    if (options?.deliveryStyle !== undefined) {
+      message.delivery_style = options.deliveryStyle;
+    }
+    if (options?.emotionDescription !== undefined) {
+      message.emotion_description = options.emotionDescription;
+    }
+
+    // Use default emotion from config if not overridden
+    if (
+      options?.emotion === undefined &&
+      options?.emotionIntensity === undefined &&
+      options?.deliveryStyle === undefined &&
+      this.config.tts?.emotion
+    ) {
+      if (this.config.tts.emotion.emotion !== undefined) {
+        message.emotion = this.config.tts.emotion.emotion;
+      }
+      if (this.config.tts.emotion.intensity !== undefined) {
+        message.emotion_intensity = this.config.tts.emotion.intensity;
+      }
+      if (this.config.tts.emotion.deliveryStyle !== undefined) {
+        message.delivery_style = this.config.tts.emotion.deliveryStyle;
+      }
+      if (this.config.tts.emotion.description !== undefined) {
+        message.emotion_description = this.config.tts.emotion.description;
+      }
+    }
+
+    this.send(message);
   }
 
   clear(): void {

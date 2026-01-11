@@ -1,12 +1,19 @@
 /**
  * WebSocket Message Types
- * Maps to Sayna's IncomingMessage and OutgoingMessage in src/handlers/ws/messages.rs
+ *
+ * Message types are named from the CLIENT SDK perspective:
+ * - OutgoingMessage: Messages the CLIENT sends TO the server
+ * - IncomingMessage: Messages the CLIENT receives FROM the server
+ *
+ * Note: This is the opposite of Sayna's (server) naming convention in messages.rs
+ * where IncomingMessage = what server receives and OutgoingMessage = what server sends.
  */
 
-import type { STTConfig, TTSConfig, LiveKitConfig } from './config.js';
+import type { STTConfig, TTSConfig, LiveKitConfig, Emotion, DeliveryStyle, EmotionIntensityLevel } from './config.js';
 
 // ============================================================================
-// Incoming Messages (Client -> Server)
+// Outgoing Messages (Client -> Server)
+// These are messages the CLIENT SENDS to the server
 // ============================================================================
 
 /**
@@ -61,6 +68,26 @@ export interface SpeakMessage {
   flush?: boolean;
   /** Allow this TTS to be interrupted */
   allow_interruption?: boolean;
+  /** Voice name */
+  voice?: string;
+  /** Voice ID */
+  voiceId?: string;
+  /** TTS provider to use */
+  provider?: string;
+  /** TTS model to use */
+  model?: string;
+  /** Speed/rate adjustment */
+  speed?: number;
+  /** Pitch adjustment */
+  pitch?: number;
+  /** Primary emotion to express */
+  emotion?: Emotion;
+  /** Emotion intensity (0.0 to 1.0 or preset level) */
+  emotionIntensity?: number | EmotionIntensityLevel;
+  /** Delivery style */
+  deliveryStyle?: DeliveryStyle;
+  /** Free-form emotion description */
+  emotionDescription?: string;
 }
 
 /**
@@ -95,9 +122,9 @@ export interface SIPTransferMessage {
 }
 
 /**
- * Union type for all incoming messages
+ * Union type for all outgoing messages (sent by client to server)
  */
-export type IncomingMessage =
+export type OutgoingMessage =
   | ConfigMessage
   | SpeakMessage
   | ClearMessage
@@ -105,7 +132,8 @@ export type IncomingMessage =
   | SIPTransferMessage;
 
 // ============================================================================
-// Outgoing Messages (Server -> Client)
+// Incoming Messages (Server -> Client)
+// These are messages the CLIENT RECEIVES from the server
 // ============================================================================
 
 /**
@@ -267,9 +295,9 @@ export interface SIPTransferErrorMessage {
 }
 
 /**
- * Union type for all outgoing messages
+ * Union type for all incoming messages (received by client from server)
  */
-export type OutgoingMessage =
+export type IncomingMessage =
   | ReadyMessage
   | STTResultMessage
   | MessageMessage
@@ -392,15 +420,15 @@ export function toClearMessage(): ClearMessage {
 }
 
 /**
- * Parse an outgoing message from JSON
+ * Parse an incoming message from JSON (messages received from server)
  */
-export function parseOutgoingMessage(json: string): OutgoingMessage {
-  return JSON.parse(json) as OutgoingMessage;
+export function parseIncomingMessage(json: string): IncomingMessage {
+  return JSON.parse(json) as IncomingMessage;
 }
 
 /**
- * Serialize an incoming message to JSON
+ * Serialize an outgoing message to JSON (messages sent to server)
  */
-export function serializeIncomingMessage(message: IncomingMessage): string {
+export function serializeOutgoingMessage(message: OutgoingMessage): string {
   return JSON.stringify(message);
 }

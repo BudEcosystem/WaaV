@@ -128,61 +128,66 @@ export class ReconnectStrategy {
    * @returns Promise that resolves when connection succeeds or rejects when exhausted
    */
   async scheduleReconnect(connectFn: () => Promise<void>): Promise<void> {
-    if (this.aborted) {
-      throw new Error('Reconnection was aborted');
-    }
+    // Use iterative approach to avoid stack overflow from recursive calls
+    while (true) {
+      if (this.aborted) {
+        throw new Error('Reconnection was aborted');
+      }
 
-    if (this.state.exhausted) {
-      throw new Error('Reconnection attempts exhausted');
-    }
+      if (this.state.exhausted) {
+        throw new Error('Reconnection attempts exhausted');
+      }
 
-    // Check if we should reset based on last connection time
-    if (
-      this.state.lastConnectedAt &&
-      Date.now() - this.state.lastConnectedAt > this.config.resetAfter
-    ) {
-      this.reset();
-    }
+      // Check if we should reset based on last connection time
+      if (
+        this.state.lastConnectedAt &&
+        Date.now() - this.state.lastConnectedAt > this.config.resetAfter
+      ) {
+        this.reset();
+      }
 
-    this.state.attempt++;
-    this.state.reconnecting = true;
+      this.state.attempt++;
+      this.state.reconnecting = true;
 
-    // Check max attempts
-    if (this.state.attempt > this.config.maxAttempts) {
-      this.state.exhausted = true;
-      this.state.reconnecting = false;
-      this.handlers.onReconnectExhausted?.(this.getState());
-      throw new Error('Maximum reconnection attempts reached');
-    }
+      // Check max attempts
+      if (this.state.attempt > this.config.maxAttempts) {
+        this.state.exhausted = true;
+        this.state.reconnecting = false;
+        this.handlers.onReconnectExhausted?.(this.getState());
+        throw new Error('Maximum reconnection attempts reached');
+      }
 
-    this.handlers.onReconnecting?.(this.getState());
+      this.handlers.onReconnecting?.(this.getState());
 
-    // Wait for delay before attempting
-    await this.wait(this.state.delay);
+      // Wait for delay before attempting
+      await this.wait(this.state.delay);
 
-    if (this.aborted) {
-      throw new Error('Reconnection was aborted');
-    }
+      if (this.aborted) {
+        throw new Error('Reconnection was aborted');
+      }
 
-    try {
-      await connectFn();
+      try {
+        await connectFn();
 
-      // Success
-      this.state.lastConnectedAt = Date.now();
-      this.state.reconnecting = false;
-      this.handlers.onReconnected?.(this.getState());
+        // Success
+        this.state.lastConnectedAt = Date.now();
+        this.state.reconnecting = false;
+        this.handlers.onReconnected?.(this.getState());
 
-      // Reset delay for next time (but keep attempt count for metrics)
-      this.state.delay = this.config.initialDelay;
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      this.handlers.onReconnectFailed?.(error, this.getState());
+        // Reset delay for next time (but keep attempt count for metrics)
+        this.state.delay = this.config.initialDelay;
 
-      // Calculate next delay
-      this.state.delay = this.calculateNextDelay();
+        // Exit loop on success
+        return;
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        this.handlers.onReconnectFailed?.(error, this.getState());
 
-      // Try again
-      return this.scheduleReconnect(connectFn);
+        // Calculate next delay
+        this.state.delay = this.calculateNextDelay();
+
+        // Continue loop for next attempt (no recursive call)
+      }
     }
   }
 

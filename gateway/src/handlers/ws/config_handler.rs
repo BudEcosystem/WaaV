@@ -21,9 +21,19 @@ use crate::{
     state::AppState,
 };
 
+#[cfg(feature = "dag-routing")]
+use crate::dag::{
+    compiler::DAGCompiler,
+    context::DAGContext,
+    definition::DAGDefinition,
+    executor::DAGExecutor,
+    global_templates,
+};
+
 use super::{
     config::{
-        LiveKitWebSocketConfig, STTWebSocketConfig, TTSWebSocketConfig, compute_tts_config_hash,
+        DAGWebSocketConfig, LiveKitWebSocketConfig, STTWebSocketConfig, TTSWebSocketConfig,
+        compute_tts_config_hash,
     },
     messages::{MessageRoute, OutgoingMessage, ParticipantDisconnectedInfo, UnifiedMessage},
     state::ConnectionState,
@@ -56,6 +66,7 @@ fn resolve_stream_id(stream_id: Option<String>) -> String {
 /// - STT (Speech-to-Text) provider initialization
 /// - TTS (Text-to-Speech) provider initialization
 /// - LiveKit client connection (optional)
+/// - DAG routing initialization (optional, when dag_config provided)
 /// - Callback registration for audio routing
 ///
 /// # Arguments
@@ -64,6 +75,7 @@ fn resolve_stream_id(stream_id: Option<String>) -> String {
 /// * `stt_ws_config` - STT provider configuration
 /// * `tts_ws_config` - TTS provider configuration
 /// * `livekit_ws_config` - Optional LiveKit configuration
+/// * `dag_ws_config` - Optional DAG routing configuration
 /// * `state` - Connection state to update
 /// * `message_tx` - Channel for sending response messages
 /// * `app_state` - Application state containing API keys
@@ -77,6 +89,7 @@ pub async fn handle_config_message(
     stt_ws_config: Option<STTWebSocketConfig>,
     tts_ws_config: Option<TTSWebSocketConfig>,
     livekit_ws_config: Option<LiveKitWebSocketConfig>,
+    dag_ws_config: Option<DAGWebSocketConfig>,
     state: &Arc<RwLock<ConnectionState>>,
     message_tx: &mpsc::Sender<MessageRoute>,
     app_state: &Arc<AppState>,
@@ -201,6 +214,50 @@ pub async fn handle_config_message(
         .await;
     }
 
+    // Initialize DAG routing if configured
+    #[cfg(feature = "dag-routing")]
+    let dag_enabled = if let Some(dag_config) = dag_ws_config {
+        match initialize_dag_routing(
+            &dag_config,
+            &stream_id,
+            state,
+            message_tx,
+        )
+        .await
+        {
+            Ok(true) => {
+                info!("DAG routing initialized for stream {}", stream_id);
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                error!("DAG routing initialization failed: {}", e);
+                let _ = message_tx
+                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
+                        message: format!("DAG initialization failed: {}", e),
+                    }))
+                    .await;
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    // Log DAG status (stub when feature disabled)
+    #[cfg(not(feature = "dag-routing"))]
+    let dag_enabled = {
+        if dag_ws_config.is_some() {
+            warn!("DAG routing requested but feature not enabled. Build with --features dag-routing");
+            let _ = message_tx
+                .send(MessageRoute::Outgoing(OutgoingMessage::Error {
+                    message: "DAG routing is not enabled. Build with --features dag-routing".to_string(),
+                }))
+                .await;
+        }
+        false
+    };
+
     // Send ready message with optional LiveKit room information
     let _ = message_tx
         .send(MessageRoute::Outgoing(OutgoingMessage::Ready {
@@ -211,7 +268,14 @@ pub async fn handle_config_message(
             waav_participant_name: waav_name,
         }))
         .await;
-    info!("Voice manager ready and configured");
+
+    info!(
+        stream_id = %stream_id,
+        audio_enabled = audio_enabled,
+        dag_enabled = dag_enabled,
+        livekit = livekit_room_name.is_some(),
+        "Connection configured and ready"
+    );
 
     true
 }
@@ -1103,6 +1167,93 @@ async fn register_audio_clear_callback(
             warn!("Failed to register audio clear callback: {:?}", e);
         }
     }
+}
+
+/// Initialize DAG routing for the connection
+///
+/// Compiles a DAG from template or inline definition and sets up the executor.
+/// The DAG will route audio through its nodes instead of direct STT→TTS flow.
+///
+/// # Arguments
+/// * `dag_config` - DAG configuration from WebSocket message
+/// * `stream_id` - Session identifier for the DAG context
+/// * `state` - Connection state to store compiled DAG
+/// * `message_tx` - Channel for sending error messages
+///
+/// # Returns
+/// * `Ok(true)` - DAG successfully initialized and enabled
+/// * `Ok(false)` - DAG not configured or disabled
+/// * `Err(String)` - DAG initialization failed
+#[cfg(feature = "dag-routing")]
+async fn initialize_dag_routing(
+    dag_config: &DAGWebSocketConfig,
+    stream_id: &str,
+    state: &Arc<RwLock<ConnectionState>>,
+    _message_tx: &mpsc::Sender<MessageRoute>,
+) -> Result<bool, String> {
+    // Get DAG definition from template or inline
+    let dag_definition: DAGDefinition = if let Some(ref def) = dag_config.definition {
+        // Parse inline definition
+        serde_json::from_value(def.clone())
+            .map_err(|e| format!("Invalid DAG definition: {}", e))?
+    } else if let Some(ref template_name) = dag_config.template {
+        // Load from template registry
+        let templates = global_templates();
+        templates
+            .get(template_name)
+            .ok_or_else(|| format!("DAG template '{}' not found", template_name))?
+    } else {
+        // No DAG specified
+        return Ok(false);
+    };
+
+    info!(
+        dag_id = %dag_definition.id,
+        dag_name = %dag_definition.name,
+        nodes = dag_definition.nodes.len(),
+        edges = dag_definition.edges.len(),
+        "Compiling DAG for session"
+    );
+
+    // Compile the DAG
+    let compiler = DAGCompiler::new();
+    let compiled_dag = compiler
+        .compile(dag_definition)
+        .map_err(|e| format!("DAG compilation failed: {}", e))?;
+
+    let compiled_dag = Arc::new(compiled_dag);
+
+    // Create DAG context with auth info from connection state
+    let dag_context = {
+        let conn_state = state.read().await;
+        DAGContext::with_auth(
+            stream_id.to_string(),
+            None, // API key is not stored in Auth context (only in initial request)
+            conn_state.auth.id.clone(),
+        )
+    };
+
+    // Apply timeout if specified
+    let dag_context = if let Some(timeout_ms) = dag_config.timeout_ms {
+        dag_context.with_timeout(std::time::Duration::from_millis(timeout_ms))
+    } else {
+        dag_context
+    };
+
+    // Create executor (executor is decoupled from DAG - uses DAG at execute time)
+    let executor = Arc::new(DAGExecutor::new());
+
+    // Store DAG state in connection
+    {
+        let mut state_guard = state.write().await;
+        state_guard.compiled_dag = Some(compiled_dag);
+        state_guard.dag_executor = Some(executor);
+        state_guard.dag_context = Some(dag_context);
+        state_guard.set_dag_enabled(true);
+    }
+
+    info!(stream_id = %stream_id, "DAG routing enabled");
+    Ok(true)
 }
 
 #[cfg(test)]

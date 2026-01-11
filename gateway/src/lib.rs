@@ -1,6 +1,8 @@
 pub mod auth;
 pub mod config;
 pub mod core;
+#[cfg(feature = "dag-routing")]
+pub mod dag;
 pub mod docs;
 pub mod errors;
 pub mod handlers;

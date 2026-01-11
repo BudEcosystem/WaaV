@@ -57,8 +57,8 @@ export {
   toConfigMessage,
   toSpeakMessage,
   toClearMessage,
-  parseOutgoingMessage,
-  serializeIncomingMessage,
+  parseIncomingMessage,
+  serializeOutgoingMessage,
 } from './messages.js';
 
 // STT types
@@ -150,3 +150,86 @@ export type {
   IRealtimeSession,
 } from './realtime.js';
 export { REALTIME_DEFAULTS, createRealtimeConfig } from './realtime.js';
+
+// Provider types (comprehensive list)
+export type {
+  STTProvider,
+  TTSProvider,
+  RealtimeProvider as RealtimeProviderType,
+  STTCapabilities,
+  TTSCapabilities,
+  RealtimeCapabilities,
+  ProviderCapabilities,
+} from './providers.js';
+export {
+  STT_PROVIDERS,
+  TTS_PROVIDERS,
+  REALTIME_PROVIDERS,
+  isValidSTTProvider,
+  isValidTTSProvider,
+  isValidRealtimeProvider,
+  getProviderCapabilities,
+  getProvidersWithFeature,
+  getDefaultModel,
+  getDefaultVoice,
+} from './providers.js';
+
+// DAG routing types
+export type {
+  DAGNodeType,
+  DAGNode,
+  DAGEdge,
+  DAGDefinition,
+  DAGConfig,
+  DAGValidationResult,
+} from './dag.js';
+export {
+  DAG_NODE_TYPES,
+  DEFAULT_DAG_CONFIG,
+  validateDAGDefinition,
+  createDAGConfig,
+  serializeDAGConfig,
+  deserializeDAGConfig,
+  getBuiltinTemplate,
+  BUILTIN_TEMPLATES,
+  TEMPLATE_SIMPLE_STT,
+  TEMPLATE_SIMPLE_TTS,
+  TEMPLATE_VOICE_ASSISTANT,
+  TEMPLATE_TRANSCRIPTION,
+} from './dag.js';
+
+// Audio features types
+export type {
+  TurnDetectionConfig,
+  NoiseFilterConfig,
+  AudioFeatures,
+} from './audio-features.js';
+export {
+  DEFAULT_TURN_DETECTION,
+  DEFAULT_NOISE_FILTER,
+  DEFAULT_VAD,
+  createAudioFeatures,
+  serializeAudioFeatures,
+  deserializeAudioFeatures,
+} from './audio-features.js';
+
+// Voice cloning and recording types
+export type {
+  VoiceCloneProvider as VoiceCloneProviderType,
+  VoiceCloneRequest as VoiceCloneRequestType,
+  VoiceCloneResponse as VoiceCloneResponseType,
+  VoiceCloneFilter,
+  RecordingStatus,
+  RecordingFormat,
+  RecordingInfo,
+  RecordingFilter,
+  RecordingDownloadOptions,
+  RecordingList,
+} from './voice.js';
+export {
+  VOICE_CLONE_PROVIDERS,
+  deserializeRecordingInfo,
+  deserializeVoiceCloneResponse,
+  buildRecordingFilterQuery,
+  buildVoiceCloneFilterQuery,
+} from './voice.js';

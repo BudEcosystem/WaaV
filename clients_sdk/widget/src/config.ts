@@ -2,7 +2,20 @@
  * Widget configuration parsing
  */
 
-import type { WidgetConfig, STTConfig, TTSConfig, FeatureFlags } from './types';
+import type {
+  WidgetConfig,
+  STTConfig,
+  TTSConfig,
+  FeatureFlags,
+  EmotionConfig,
+  RealtimeConfig,
+  AudioFeatures,
+  STTProvider,
+  TTSProvider,
+  RealtimeProvider,
+  EmotionType,
+  DeliveryStyle,
+} from './types';
 
 /**
  * Parse configuration from data attributes
@@ -22,7 +35,7 @@ export function parseConfigFromAttributes(element: HTMLElement): WidgetConfig {
   const sttProvider = element.dataset.sttProvider;
   if (sttProvider) {
     config.stt = {
-      provider: sttProvider,
+      provider: sttProvider as STTProvider,
       language: element.dataset.sttLanguage || 'en-US',
       model: element.dataset.sttModel,
       sampleRate: parseInt(element.dataset.sttSampleRate || '16000', 10),
@@ -31,15 +44,43 @@ export function parseConfigFromAttributes(element: HTMLElement): WidgetConfig {
     };
   }
 
-  // Parse TTS config
+  // Parse TTS config with emotion support
   const ttsProvider = element.dataset.ttsProvider;
   if (ttsProvider) {
     config.tts = {
-      provider: ttsProvider,
+      provider: ttsProvider as TTSProvider,
       voice: element.dataset.ttsVoice,
       voiceId: element.dataset.ttsVoiceId,
       model: element.dataset.ttsModel,
       sampleRate: parseInt(element.dataset.ttsSampleRate || '24000', 10),
+    };
+
+    // Parse emotion config
+    const emotion = element.dataset.ttsEmotion;
+    if (emotion) {
+      config.tts.emotion = {
+        emotion: emotion as EmotionType,
+        intensity: parseEmotionIntensity(element.dataset.ttsEmotionIntensity),
+        deliveryStyle: element.dataset.ttsDeliveryStyle as DeliveryStyle | undefined,
+        description: element.dataset.ttsEmotionDescription,
+      };
+    }
+  }
+
+  // Parse realtime config
+  const realtimeProvider = element.dataset.realtimeProvider;
+  if (realtimeProvider) {
+    config.realtime = {
+      provider: realtimeProvider as RealtimeProvider,
+      model: element.dataset.realtimeModel,
+      systemPrompt: element.dataset.realtimeSystemPrompt,
+      voiceId: element.dataset.realtimeVoiceId,
+      temperature: element.dataset.realtimeTemperature
+        ? parseFloat(element.dataset.realtimeTemperature)
+        : undefined,
+      maxTokens: element.dataset.realtimeMaxTokens
+        ? parseInt(element.dataset.realtimeMaxTokens, 10)
+        : undefined,
     };
   }
 
@@ -55,7 +96,82 @@ export function parseConfigFromAttributes(element: HTMLElement): WidgetConfig {
     echoCancellation: element.dataset.echoCancellation !== 'false',
   };
 
+  // Parse audio features
+  config.audioFeatures = parseAudioFeatures(element);
+
   return config;
+}
+
+/**
+ * Parse emotion intensity from string
+ */
+function parseEmotionIntensity(
+  value: string | undefined
+): 'low' | 'medium' | 'high' | number | undefined {
+  if (!value) return undefined;
+  if (value === 'low' || value === 'medium' || value === 'high') {
+    return value;
+  }
+  const num = parseFloat(value);
+  if (!isNaN(num) && num >= 0 && num <= 1) {
+    return num;
+  }
+  return undefined;
+}
+
+/**
+ * Parse audio features from data attributes
+ */
+function parseAudioFeatures(element: HTMLElement): AudioFeatures {
+  const features: AudioFeatures = {};
+
+  // Turn detection
+  if (element.dataset.turnDetection !== undefined) {
+    features.turnDetection = {
+      enabled: element.dataset.turnDetection !== 'false',
+      threshold: element.dataset.turnDetectionThreshold
+        ? parseFloat(element.dataset.turnDetectionThreshold)
+        : undefined,
+      silenceMs: element.dataset.turnDetectionSilenceMs
+        ? parseInt(element.dataset.turnDetectionSilenceMs, 10)
+        : undefined,
+      prefixPaddingMs: element.dataset.turnDetectionPrefixPaddingMs
+        ? parseInt(element.dataset.turnDetectionPrefixPaddingMs, 10)
+        : undefined,
+    };
+  }
+
+  // Noise filter
+  if (element.dataset.noiseFilter !== undefined) {
+    features.noiseFilter = {
+      enabled: element.dataset.noiseFilter !== 'false',
+      strength: parseNoiseFilterStrength(element.dataset.noiseFilterStrength),
+    };
+  }
+
+  // VAD
+  if (element.dataset.vadEnabled !== undefined) {
+    features.vad = {
+      enabled: element.dataset.vadEnabled !== 'false',
+      threshold: element.dataset.vadThreshold
+        ? parseFloat(element.dataset.vadThreshold)
+        : undefined,
+      silenceMs: element.dataset.vadSilenceMs
+        ? parseInt(element.dataset.vadSilenceMs, 10)
+        : undefined,
+    };
+  }
+
+  return features;
+}
+
+function parseNoiseFilterStrength(
+  value: string | undefined
+): 'low' | 'medium' | 'high' | undefined {
+  if (value === 'low' || value === 'medium' || value === 'high') {
+    return value;
+  }
+  return undefined;
 }
 
 function parseTheme(value: string | undefined): 'light' | 'dark' | 'auto' {
@@ -79,8 +195,8 @@ function parsePosition(
   return 'bottom-right';
 }
 
-function parseMode(value: string | undefined): 'push-to-talk' | 'vad' {
-  if (value === 'push-to-talk' || value === 'vad') {
+function parseMode(value: string | undefined): 'push-to-talk' | 'vad' | 'realtime' {
+  if (value === 'push-to-talk' || value === 'vad' || value === 'realtime') {
     return value;
   }
   return 'vad';
@@ -109,6 +225,7 @@ export function mergeConfig(config: Partial<WidgetConfig>): WidgetConfig {
       provider: 'deepgram',
       sampleRate: 24000,
     },
+    realtime: config.realtime,
     features: {
       vad: config.features?.vad ?? true,
       noiseCancellation: config.features?.noiseCancellation ?? false,
@@ -119,5 +236,6 @@ export function mergeConfig(config: Partial<WidgetConfig>): WidgetConfig {
       smartFormat: config.features?.smartFormat ?? true,
       echoCancellation: config.features?.echoCancellation ?? true,
     },
+    audioFeatures: config.audioFeatures,
   };
 }

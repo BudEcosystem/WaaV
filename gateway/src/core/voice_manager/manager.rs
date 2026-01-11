@@ -724,8 +724,11 @@ impl VoiceManager {
                     let channels = 1;
                     let sample_rate = int_state.current_sample_rate.load(Ordering::Acquire);
 
+                    // Guard against division by zero - use default sample rate if zero
+                    let safe_sample_rate = if sample_rate == 0 { 24000 } else { sample_rate };
+
                     let chunk_duration_seconds = audio_data.data.len() as f32
-                        / (sample_rate as f32 * bytes_per_sample as f32 * channels as f32);
+                        / (safe_sample_rate as f32 * bytes_per_sample as f32 * channels as f32);
 
                     let chunk_duration_ms = (chunk_duration_seconds * 1000.0) as usize;
 

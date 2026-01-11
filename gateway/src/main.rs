@@ -23,11 +23,14 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use anyhow::anyhow;
 
 use waav_gateway::{
-    ServerConfig, init,
+    ServerConfig, global_registry, init,
     middleware::{auth_middleware, connection_limit_middleware},
     routes,
     state::AppState,
 };
+
+#[cfg(feature = "plugins-dynamic")]
+use waav_gateway::plugin::DynamicPluginLoader;
 
 /// WaaV Gateway - Real-time voice processing server
 #[derive(Parser, Debug)]
@@ -123,6 +126,32 @@ async fn main() -> anyhow::Result<()> {
     } else {
         ServerConfig::from_env().map_err(|e| anyhow!(e.to_string()))?
     };
+
+    // Initialize the plugin registry (including built-in plugins)
+    let registry = global_registry();
+
+    // Load dynamic plugins if the feature is enabled and a plugin directory is configured
+    #[cfg(feature = "plugins-dynamic")]
+    {
+        if config.plugins.enabled {
+            if let Some(ref plugin_dir) = config.plugins.plugin_dir {
+                info!("Loading dynamic plugins from: {}", plugin_dir.display());
+                let mut loader = DynamicPluginLoader::new();
+                match loader.load_all_from_directory(plugin_dir, registry) {
+                    Ok(count) => {
+                        if count > 0 {
+                            info!("Loaded {} dynamic plugin(s)", count);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to load dynamic plugins: {}", e);
+                    }
+                }
+            }
+        }
+    }
+    // Suppress unused variable warning when plugins-dynamic feature is not enabled
+    let _ = registry;
 
     let address = config.address();
     let tls_config = config.tls.clone();

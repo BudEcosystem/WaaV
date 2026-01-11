@@ -1,0 +1,1 @@
+/home/bud/Desktop/bud_waav/WaaV/examples/resemble-tts-plugin/target/release/libwaav_plugin_resemble.so: /home/bud/Desktop/bud_waav/WaaV/examples/resemble-tts-plugin/src/lib.rs /home/bud/Desktop/bud_waav/WaaV/plugin-api/src/lib.rs

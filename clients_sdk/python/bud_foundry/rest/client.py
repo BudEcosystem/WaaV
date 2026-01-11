@@ -315,6 +315,224 @@ class RestClient:
         """
         await self.delete(f"/sip/hooks/{host}")
 
+    # =========================================================================
+    # Voice Cloning Methods
+    # =========================================================================
+
+    async def clone_voice(
+        self,
+        name: str,
+        audio_files: list[bytes],
+        provider: str = "elevenlabs",
+        description: Optional[str] = None,
+        labels: Optional[dict[str, str]] = None,
+    ) -> dict[str, Any]:
+        """
+        Clone a voice from audio samples.
+
+        Args:
+            name: Name for the cloned voice.
+            audio_files: List of audio file data (bytes).
+            provider: Voice cloning provider (elevenlabs, playht, resemble).
+            description: Optional description for the voice.
+            labels: Optional labels/tags for the voice.
+
+        Returns:
+            Created voice information with voice_id.
+
+        Raises:
+            APIError: If cloning fails.
+        """
+        import base64
+
+        # Convert audio files to base64
+        audio_base64 = [base64.b64encode(audio).decode("utf-8") for audio in audio_files]
+
+        payload: dict[str, Any] = {
+            "name": name,
+            "provider": provider,
+            "audio_files": audio_base64,
+        }
+        if description:
+            payload["description"] = description
+        if labels:
+            payload["labels"] = labels
+
+        result: dict[str, Any] = await self.post("/voices/clone", json=payload)
+        return result
+
+    async def list_cloned_voices(
+        self,
+        provider: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """
+        List cloned voices.
+
+        Args:
+            provider: Optional provider to filter by.
+
+        Returns:
+            List of cloned voice information.
+        """
+        params: dict[str, str] = {}
+        if provider:
+            params["provider"] = provider
+            params["cloned"] = "true"
+
+        result: list[dict[str, Any]] = await self.get("/voices", params=params)
+        # Filter to only cloned voices
+        return [v for v in result if v.get("is_cloned", False)]
+
+    async def delete_cloned_voice(
+        self,
+        voice_id: str,
+        provider: str = "elevenlabs",
+    ) -> None:
+        """
+        Delete a cloned voice.
+
+        Args:
+            voice_id: The voice ID to delete.
+            provider: The voice cloning provider.
+        """
+        await self.delete(f"/voices/{voice_id}", params={"provider": provider})
+
+    async def get_cloned_voice(
+        self,
+        voice_id: str,
+        provider: str = "elevenlabs",
+    ) -> dict[str, Any]:
+        """
+        Get information about a cloned voice.
+
+        Args:
+            voice_id: The voice ID.
+            provider: The voice cloning provider.
+
+        Returns:
+            Voice information.
+        """
+        result: dict[str, Any] = await self.get(
+            f"/voices/{voice_id}", params={"provider": provider}
+        )
+        return result
+
+    # =========================================================================
+    # Recording Methods
+    # =========================================================================
+
+    async def get_recording(
+        self,
+        stream_id: str,
+    ) -> dict[str, Any]:
+        """
+        Get recording information by stream ID.
+
+        Args:
+            stream_id: The stream/session ID.
+
+        Returns:
+            Recording information including status, duration, format.
+        """
+        result: dict[str, Any] = await self.get(f"/recordings/{stream_id}")
+        return result
+
+    async def download_recording(
+        self,
+        stream_id: str,
+        format: str = "wav",
+    ) -> bytes:
+        """
+        Download a recording.
+
+        Args:
+            stream_id: The stream/session ID.
+            format: Output format (wav, mp3, ogg).
+
+        Returns:
+            Audio data as bytes.
+        """
+        params = {"format": format}
+        result: bytes = await self.get(f"/recordings/{stream_id}/download", params=params)
+        return result
+
+    async def list_recordings(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        status: Optional[str] = None,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        List recordings with optional filters.
+
+        Args:
+            limit: Maximum number of recordings to return.
+            offset: Pagination offset.
+            status: Filter by status (pending, processing, ready, failed).
+            from_date: Filter by start date (ISO 8601).
+            to_date: Filter by end date (ISO 8601).
+
+        Returns:
+            Dictionary with recordings list and pagination info.
+        """
+        params: dict[str, Any] = {
+            "limit": limit,
+            "offset": offset,
+        }
+        if status:
+            params["status"] = status
+        if from_date:
+            params["from_date"] = from_date
+        if to_date:
+            params["to_date"] = to_date
+
+        result: dict[str, Any] = await self.get("/recordings", params=params)
+        return result
+
+    async def delete_recording(
+        self,
+        stream_id: str,
+    ) -> None:
+        """
+        Delete a recording.
+
+        Args:
+            stream_id: The stream/session ID.
+        """
+        await self.delete(f"/recordings/{stream_id}")
+
+    # =========================================================================
+    # DAG Template Methods
+    # =========================================================================
+
+    async def list_dag_templates(self) -> list[dict[str, Any]]:
+        """
+        List available DAG templates.
+
+        Returns:
+            List of DAG template definitions.
+        """
+        result: list[dict[str, Any]] = await self.get("/dag/templates")
+        return result
+
+    async def validate_dag(
+        self,
+        definition: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Validate a DAG definition.
+
+        Args:
+            definition: DAG definition to validate.
+
+        Returns:
+            Validation result with is_valid and any errors.
+        """
+        result: dict[str, Any] = await self.post("/dag/validate", json=definition)
+        return result
+
     async def __aenter__(self) -> "RestClient":
         """Async context manager entry."""
         return self

@@ -221,23 +221,31 @@ class TranscribeSession:
                 # Small delay to avoid overwhelming the server
                 await asyncio.sleep(0.01)
 
-            # Wait for results
+            # Wait for results with proper timeout handling
+            # Use monotonic time (time.monotonic) to avoid clock jumps
+            import time
             timeout = 30.0  # Max wait time
-            start_time = asyncio.get_event_loop().time()
+            deadline = time.monotonic() + timeout
 
-            async for message in session:
-                if message.get("type") == "transcript":
-                    result: STTResult = message["result"]
-                    if result.is_final:
-                        full_text += result.text + " "
-                        final_result = result
+            # Use asyncio.timeout context manager (Python 3.11+) or wait_for
+            try:
+                async for message in session:
+                    # Check timeout BEFORE processing to avoid infinite wait
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
 
-                # Check timeout
-                if asyncio.get_event_loop().time() - start_time > timeout:
-                    break
+                    if message.get("type") == "transcript":
+                        result: STTResult = message["result"]
+                        if result.is_final:
+                            full_text += result.text + " "
+                            final_result = result
 
-                # Give some time for more results
-                await asyncio.sleep(0.1)
+                    # Give some time for more results, but respect timeout
+                    await asyncio.sleep(min(0.1, max(0, remaining)))
+            except asyncio.TimeoutError:
+                # Timeout during message iteration
+                pass
 
         # Return combined result
         if final_result is None:

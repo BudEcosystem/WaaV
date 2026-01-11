@@ -2,6 +2,7 @@
 //!
 //! This module organizes all API handlers into logical groups:
 //! - `api` - Health check endpoint
+//! - `dag` - DAG template management and validation
 //! - `livekit` - LiveKit token generation and webhook handling
 //! - `realtime` - Realtime audio-to-audio WebSocket (OpenAI Realtime API)
 //! - `recording` - Recording download endpoint
@@ -11,6 +12,7 @@
 //! - `ws` - WebSocket real-time voice processing
 
 pub mod api;
+pub mod dag;
 pub mod livekit;
 pub mod realtime;
 pub mod recording;

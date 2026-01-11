@@ -15,6 +15,8 @@ export class AudioPlayer {
   private currentSource: AudioBufferSourceNode | null = null;
   private onPlaybackEndCallback: (() => void) | null = null;
   private gainNode: GainNode | null = null;
+  // Track initialization to prevent race condition creating multiple AudioContexts
+  private initPromise: Promise<void> | null = null;
 
   constructor(options: PlayerOptions = {}) {
     this.options = {
@@ -24,6 +26,9 @@ export class AudioPlayer {
   }
 
   async initialize(): Promise<void> {
+    // Prevent multiple AudioContext creation
+    if (this.audioContext) return;
+
     this.audioContext = new AudioContext({
       sampleRate: this.options.sampleRate,
     });
@@ -32,8 +37,12 @@ export class AudioPlayer {
   }
 
   async play(audioData: ArrayBuffer): Promise<void> {
+    // Use a single Promise to prevent race condition on initialization
     if (!this.audioContext) {
-      await this.initialize();
+      if (!this.initPromise) {
+        this.initPromise = this.initialize();
+      }
+      await this.initPromise;
     }
 
     if (!this.audioContext || !this.gainNode) return;
@@ -137,5 +146,7 @@ export class AudioPlayer {
       this.audioContext.close();
       this.audioContext = null;
     }
+    // Reset initialization Promise so a new context can be created if needed
+    this.initPromise = null;
   }
 }

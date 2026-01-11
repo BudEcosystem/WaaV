@@ -121,6 +121,17 @@ pub enum TTSError {
 
     #[error("Internal error: {0}")]
     InternalError(String),
+
+    #[error("Rate limited: retry after {retry_after_secs:?} seconds")]
+    RateLimited {
+        /// Seconds to wait before retrying (from Retry-After header)
+        retry_after_secs: Option<u64>,
+        /// Original error message from provider
+        message: String,
+    },
+
+    #[error("Authentication failed: {0}")]
+    AuthenticationFailed(String),
 }
 
 /// Result type for TTS operations

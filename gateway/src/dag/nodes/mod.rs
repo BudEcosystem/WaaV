@@ -267,6 +267,42 @@ pub enum NodeCapability {
     Cancellable,
 }
 
+/// Audio processor trait for plugin-based audio processing
+///
+/// This trait defines the interface for audio processing plugins that can be
+/// used in a DAG pipeline. Implementations typically provide noise reduction,
+/// VAD, gain control, etc.
+#[async_trait]
+pub trait AudioProcessor: Send + Sync {
+    /// Process audio samples
+    ///
+    /// Takes raw audio bytes and returns processed audio bytes.
+    /// The format is defined by the AudioFormat parameter.
+    async fn process(
+        &self,
+        audio: Bytes,
+        format: &crate::plugin::capabilities::AudioFormat,
+    ) -> Result<Bytes, String>;
+
+    /// Get processing latency in milliseconds
+    ///
+    /// Returns the typical latency introduced by this processor.
+    fn latency_ms(&self) -> u64 {
+        0
+    }
+
+    /// Check if processor changes audio duration
+    ///
+    /// Returns true if the processor may change the duration of audio
+    /// (e.g., time-stretching, VAD-based trimming).
+    fn changes_duration(&self) -> bool {
+        false
+    }
+
+    /// Get processor name for logging
+    fn name(&self) -> &str;
+}
+
 /// Core trait for all DAG nodes
 ///
 /// All node types must implement this trait to be usable in a DAG pipeline.

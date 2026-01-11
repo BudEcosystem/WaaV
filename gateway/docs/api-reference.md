@@ -442,6 +442,90 @@ All responses use JSON unless otherwise noted. Errors follow the shape `{ "error
 
 **Note**: Deleting a host that exists in the original server configuration will cause it to revert to its config value (and config-defined hosts themselves cannot be removed). The runtime state is always a merge of config + cache, so removing a host from cache only affects runtime-added entries or cached overrides.
 
+#### DAG Routing Endpoints (Feature-Gated)
+
+These endpoints are only available when built with `--features dag-routing`.
+
+##### `GET /api/dag/templates`
+- **Purpose**: List available DAG pipeline templates.
+- **Success** `200 OK`:
+  ```json
+  {
+    "templates": [
+      {
+        "name": "voice-assistant",
+        "version": "1.0.0",
+        "description": "Voice assistant with STT -> LLM -> TTS"
+      }
+    ],
+    "count": 1
+  }
+  ```
+
+- **Failure** `501 Not Implemented`: Returned when DAG routing feature is not enabled.
+
+##### `POST /api/dag/validate`
+- **Purpose**: Validate a DAG definition without executing it.
+- **Request Body**:
+  ```json
+  {
+    "dag": {
+      "id": "my-pipeline",
+      "name": "My Pipeline",
+      "nodes": [...],
+      "edges": [...]
+    }
+  }
+  ```
+
+- **Success** `200 OK`:
+  ```json
+  {
+    "valid": true,
+    "errors": [],
+    "warnings": [],
+    "node_count": 5,
+    "edge_count": 4
+  }
+  ```
+
+- **Failure** `400 Bad Request`: When DAG definition is invalid.
+  ```json
+  {
+    "valid": false,
+    "errors": ["Entry node 'input' not found in nodes"],
+    "warnings": [],
+    "node_count": 0,
+    "edge_count": 0
+  }
+  ```
+
+For detailed DAG configuration and node types, see [dag_routing.md](dag_routing.md).
+
+#### Plugin System Endpoints
+
+##### `GET /api/plugins`
+- **Purpose**: List registered plugins and their capabilities.
+- **Success** `200 OK`:
+  ```json
+  {
+    "plugins": [
+      {
+        "id": "deepgram",
+        "name": "Deepgram",
+        "type": "builtin",
+        "capabilities": ["stt", "tts"],
+        "features": ["streaming", "word-timestamps"]
+      }
+    ],
+    "stt_count": 11,
+    "tts_count": 12,
+    "realtime_count": 2
+  }
+  ```
+
+For plugin development and custom provider registration, see [plugins.md](plugins.md).
+
 ### WebSocket Endpoint (`GET /ws`)
 
 #### Connection Lifecycle

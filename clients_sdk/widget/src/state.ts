@@ -103,9 +103,21 @@ export class StateMachine {
   }
 
   /**
-   * Reset to idle
+   * Reset to idle state and notify listeners
    */
   reset(): void {
+    const previousState = this._state;
     this._state = 'idle';
+
+    // Notify listeners of the reset (important for UI updates)
+    if (previousState !== 'idle') {
+      for (const listener of this._listeners) {
+        try {
+          listener('idle', previousState);
+        } catch (e) {
+          console.error('State listener error:', e);
+        }
+      }
+    }
   }
 }

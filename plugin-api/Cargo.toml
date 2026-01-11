@@ -1,0 +1,23 @@
+[package]
+name = "waav-plugin-api"
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "FFI-safe plugin API for WaaV Gateway - enables third-party provider plugins"
+keywords = ["waav", "plugin", "stt", "tts", "ffi"]
+categories = ["multimedia::audio", "api-bindings"]
+publish = false
+
+[dependencies]
+# ABI stability for FFI-safe trait objects
+abi_stable = "0.11"
+
+# Async FFI support for async methods across FFI boundary
+async-ffi = "0.5"
+
+# Serialization for config and results
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[features]
+default = []

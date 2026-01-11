@@ -12,7 +12,7 @@ publish = false
 [features]
 default = []
 turn-detect = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
-plugins-dynamic = ["dep:libloading"]  # Optional dynamic plugin loading
+plugins-dynamic = ["dep:libloading", "dep:abi_stable", "dep:waav-plugin-api"]  # Dynamic plugin loading with FFI-safe types
 noise-filter = [
     "dep:deep_filter",
     "dep:tract-core",
@@ -25,6 +25,7 @@ noise-filter = [
 openapi = [
     "dep:utoipa",
 ]
+dag-routing = ["dep:rhai", "dep:petgraph", "dep:rtrb"]  # DAG-based customizable voice processing pipelines with conditional routing
 
 [dependencies]
 async-trait = "0.1.88"
@@ -153,6 +154,13 @@ phf = { version = "0.11", features = ["macros"] }  # O(1) perfect hash lookup
 enum_dispatch = "0.3"       # Static dispatch for trait objects (10x faster than dyn)
 semver = { version = "1.0", features = ["serde"] }  # Version checking for plugin compatibility
 libloading = { version = "0.8", optional = true }  # Dynamic plugin loading (feature-gated)
+abi_stable = { version = "0.11", optional = true }  # FFI-safe ABI stability for dynamic plugins
+waav-plugin-api = { path = "../plugin-api", optional = true }  # Plugin API types
+
+# DAG routing dependencies
+rhai = { version = "1.17", optional = true, features = ["sync"] }  # Scripting engine for DAG expressions
+petgraph = { version = "0.6", optional = true }  # Graph data structure for DAG routing
+rtrb = { version = "0.3", optional = true }  # Lock-free ring buffer for inter-node communication
 
 [dev-dependencies]
 tower = { version = "0.5.2", features = ["util"] }

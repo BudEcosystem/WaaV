@@ -129,6 +129,10 @@ impl ModelManager {
         };
 
         // Build input values with names - ort 2.0 uses Vec<(&str, Value)>
+        // Validate input_names has at least one element
+        if self.input_names.is_empty() {
+            anyhow::bail!("Model has no input names defined");
+        }
         let input_name_0 = &self.input_names[0];
         let input_name_1 = if self.input_names.len() > 1 {
             &self.input_names[1]
@@ -167,6 +171,10 @@ impl ModelManager {
         };
 
         // Get output name before running to avoid borrow conflicts
+        // Validate session has at least one output
+        if session.outputs.is_empty() {
+            anyhow::bail!("Model has no outputs defined");
+        }
         let output_name = session.outputs[0].name.clone();
 
         let outputs = session.run(inputs)?;
@@ -190,17 +198,29 @@ impl ModelManager {
 
         // Handle different output formats based on shape dimensions
         let shape_dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+
+        // Validate data is not empty
+        if data.is_empty() {
+            warn!("Model returned empty data, using conservative fallback");
+            return Ok(0.3);
+        }
+
         let end_prob = if shape_dims.len() == 2 && shape_dims[1] == 2 {
             // Binary classification output [batch_size, 2]
             // Index 0: probability of continuing
             // Index 1: probability of turn completion
+            // Bounds check: need at least 2 elements
+            if data.len() < 2 {
+                warn!("Expected 2 elements for binary classification, got {}", data.len());
+                return Ok(0.3);
+            }
             let end_logit = data[1];
             let continue_logit = data[0];
             Self::softmax(end_logit, continue_logit)
         } else if shape_dims.len() == 2 && shape_dims[1] == 1 {
             // Single probability output [batch_size, 1]
             // Direct probability of turn completion
-            let prob = data[0];
+            let prob = data[0]; // Already checked data is not empty above
             // If it's already a probability (0-1), use it directly
             // If it's a logit, apply sigmoid
             if (0.0..=1.0).contains(&prob) {
@@ -211,7 +231,7 @@ impl ModelManager {
             }
         } else if shape_dims.len() == 1 {
             // Single value output
-            let prob = data[0];
+            let prob = data[0]; // Already checked data is not empty above
             // If it's already a probability (0-1), use it directly
             // If it's a logit, apply sigmoid
             if (0.0..=1.0).contains(&prob) {
@@ -232,8 +252,27 @@ impl ModelManager {
                 seq_len, num_classes
             );
 
+            // Guard against zero sequence length (would cause underflow)
+            if seq_len == 0 || num_classes == 0 {
+                warn!(
+                    "Invalid model output dimensions: seq_len={}, num_classes={}",
+                    seq_len, num_classes
+                );
+                return Ok(0.3); // Conservative fallback
+            }
+
             // Get all logits at the last sequence position
             let last_position_start = (seq_len - 1) * num_classes;
+
+            // Validate data has enough elements for the slice we need
+            let required_len = last_position_start + num_classes;
+            if data.len() < required_len {
+                warn!(
+                    "Data too short: have {} elements, need {} for position {}",
+                    data.len(), required_len, seq_len - 1
+                );
+                return Ok(0.3); // Conservative fallback
+            }
 
             // Get the logits for key tokens at the last position
             // Token 2 is </s> (standard end-of-sequence)

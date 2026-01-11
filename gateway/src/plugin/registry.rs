@@ -555,6 +555,29 @@ impl PluginRegistry {
     pub fn ws_handler_count(&self) -> usize {
         self.ws_handlers.len()
     }
+
+    /// Check if an audio processor plugin is registered
+    ///
+    /// Note: Audio processor plugins are not yet implemented.
+    /// This always returns false for now.
+    #[cfg(feature = "dag-routing")]
+    pub fn has_audio_processor(&self, _plugin_id: &str) -> bool {
+        // Audio processor plugins are not yet implemented
+        false
+    }
+
+    /// Create an audio processor by plugin ID
+    ///
+    /// Note: Audio processor plugins are not yet implemented.
+    /// This always returns an error for now.
+    #[cfg(feature = "dag-routing")]
+    pub fn create_audio_processor(
+        &self,
+        plugin_id: &str,
+        _config: serde_json::Value,
+    ) -> Result<Box<dyn crate::dag::nodes::AudioProcessor>, String> {
+        Err(format!("Audio processor '{}' not found - audio processor plugins are not yet implemented", plugin_id))
+    }
 }
 
 impl Default for PluginRegistry {

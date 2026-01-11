@@ -76,6 +76,7 @@ pub async fn handle_incoming_message(
             stt_config,
             tts_config,
             livekit,
+            dag_config,
         } => {
             // Handle backward compatibility for audio_disabled field
             // Priority: audio field takes precedence if explicitly set
@@ -107,6 +108,7 @@ pub async fn handle_incoming_message(
                 stt_config,
                 tts_config,
                 livekit,
+                dag_config,
                 state,
                 message_tx,
                 app_state,

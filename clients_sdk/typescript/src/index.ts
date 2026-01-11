@@ -118,6 +118,75 @@ export {
   mergeFeatures,
 } from './types/features.js';
 
+// Provider types (comprehensive list)
+export type {
+  STTProvider,
+  TTSProvider,
+  RealtimeProvider as RealtimeProviderType,
+  STTCapabilities,
+  TTSCapabilities,
+  RealtimeCapabilities,
+  ProviderCapabilities,
+} from './types/providers.js';
+export {
+  STT_PROVIDERS,
+  TTS_PROVIDERS,
+  REALTIME_PROVIDERS,
+  isValidSTTProvider,
+  isValidTTSProvider,
+  isValidRealtimeProvider,
+  getProviderCapabilities,
+  getProvidersWithFeature,
+  getDefaultModel,
+  getDefaultVoice,
+} from './types/providers.js';
+
+// DAG routing types
+export type {
+  DAGNodeType,
+  DAGNode,
+  DAGEdge,
+  DAGDefinition,
+  DAGConfig,
+  DAGValidationResult,
+} from './types/dag.js';
+export {
+  DAG_NODE_TYPES,
+  DEFAULT_DAG_CONFIG,
+  validateDAGDefinition,
+  createDAGConfig,
+  serializeDAGConfig,
+  deserializeDAGConfig,
+  getBuiltinTemplate,
+  BUILTIN_TEMPLATES,
+} from './types/dag.js';
+
+// Audio features types
+export type {
+  TurnDetectionConfig,
+  NoiseFilterConfig,
+  AudioFeatures,
+} from './types/audio-features.js';
+export {
+  DEFAULT_TURN_DETECTION,
+  DEFAULT_NOISE_FILTER,
+  DEFAULT_VAD,
+  createAudioFeatures,
+  serializeAudioFeatures,
+} from './types/audio-features.js';
+
+// Voice cloning and recording types
+export type {
+  VoiceCloneFilter,
+  RecordingStatus,
+  RecordingFormat,
+  RecordingInfo,
+  RecordingFilter,
+  RecordingDownloadOptions,
+  RecordingList,
+} from './types/voice.js';
+export { VOICE_CLONE_PROVIDERS } from './types/voice.js';
+
 // Errors
 export * from './errors/index.js';
 

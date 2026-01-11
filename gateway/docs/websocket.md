@@ -276,8 +276,63 @@ These are messages your application sends to WaaV Gateway.
 | `stt_config` | object | Conditional | - | Required when `audio=true`. Speech-to-text configuration. |
 | `tts_config` | object | Conditional | - | Required when `audio=true`. Text-to-speech configuration. |
 | `livekit` | object | No | - | Optional LiveKit room configuration. |
+| `emotion` | object | No | - | Emotion control settings for TTS. See [Emotion Control](#emotion-control). |
+| `dag_config` | object | No | - | DAG routing configuration. Requires `dag-routing` feature. See [dag_routing.md](dag_routing.md). |
+| `api_key` | string | No | - | Per-connection API key override. Allows different credentials per session. |
 
 See [Configuration](#configuration) section for detailed field specifications.
+
+##### Emotion Control
+
+Configure emotion for TTS synthesis:
+
+```json
+{
+  "emotion": {
+    "type": "excited",
+    "intensity": 0.8,
+    "delivery_style": "enthusiastic"
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | Emotion type: `neutral`, `happy`, `sad`, `angry`, `fearful`, `surprised`, `excited`, `calm`, etc. |
+| `intensity` | number | Emotion intensity from 0.0 to 1.0. Default: 0.5 |
+| `delivery_style` | string | Delivery style: `normal`, `whispered`, `shouted`, `professional`, `casual`, `storytelling`, etc. |
+
+Provider support varies. Hume supports natural language emotions with acting instructions. ElevenLabs and Azure use SSML-based emotion control.
+
+##### DAG Configuration
+
+Configure custom audio processing pipelines (requires `dag-routing` feature):
+
+```json
+{
+  "dag_config": {
+    "template": "voice-assistant"
+  }
+}
+```
+
+Or provide a full DAG definition:
+
+```json
+{
+  "dag_config": {
+    "definition": {
+      "id": "my-pipeline",
+      "nodes": [...],
+      "edges": [...]
+    },
+    "enable_metrics": true,
+    "timeout_ms": 30000
+  }
+}
+```
+
+See [dag_routing.md](dag_routing.md) for full DAG configuration reference.
 
 ---
 

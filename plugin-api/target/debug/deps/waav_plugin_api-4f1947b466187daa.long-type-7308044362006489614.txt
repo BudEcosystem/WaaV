@@ -1,0 +1,3 @@
+extern "C" fn(FFIRealtimeConfig) -> abi_stable::std_types::RResult<FFIBaseRealtime_TO<'static, RBox<()>>, abi_stable::std_types::RString>
+extern "C" fn(FFIRealtimeConfig) -> abi_stable::std_types::RResult<FFIBaseRealtime_TO<'static, RBox<()>>, abi_stable::std_types::RString>: abi_stable::StableAbi
+ROption<extern "C" fn(FFIRealtimeConfig) -> abi_stable::std_types::RResult<FFIBaseRealtime_TO<'static, RBox<()>>, abi_stable::std_types::RString>>

@@ -201,8 +201,9 @@ class WebSocketSession:
         self._connected = False
         self._connecting = False
         self._closed = False
-        self._ready_event = asyncio.Event()
-        self._message_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        # Lazy-initialized to avoid requiring a running event loop in __init__
+        self._ready_event: Optional[asyncio.Event] = None
+        self._message_queue: Optional[asyncio.Queue[dict[str, Any]]] = None
         self._pending_audio: list[bytes] = []
         self._receive_task: Optional[asyncio.Task[None]] = None
 
@@ -212,6 +213,12 @@ class WebSocketSession:
         # Timing for metrics
         self._config_sent_time: Optional[float] = None
         self._speak_start_time: Optional[float] = None
+
+        # Track async handler tasks to prevent orphaned exceptions
+        self._handler_tasks: set[asyncio.Task[Any]] = set()
+
+        # Lock for connect() to prevent race conditions
+        self._connect_lock: Optional[asyncio.Lock] = None
 
     @property
     def connected(self) -> bool:
@@ -256,9 +263,41 @@ class WebSocketSession:
             try:
                 result = handler(*args, **kwargs)
                 if asyncio.iscoroutine(result):
-                    asyncio.create_task(result)
+                    # Track the task to prevent orphaned exceptions
+                    task = asyncio.create_task(result)
+                    self._handler_tasks.add(task)
+                    task.add_done_callback(self._on_handler_task_done)
             except Exception as e:
                 self._emit("error", e)
+
+    def _on_handler_task_done(self, task: asyncio.Task[Any]) -> None:
+        """Callback when an async handler task completes."""
+        self._handler_tasks.discard(task)
+        # Log any exception from the handler
+        if not task.cancelled() and task.exception():
+            exc = task.exception()
+            # Emit error for handler exceptions (avoid infinite recursion)
+            if exc:
+                import sys
+                print(f"Async event handler error: {exc}", file=sys.stderr)
+
+    def _get_connect_lock(self) -> asyncio.Lock:
+        """Get or create the connect lock (lazy initialization for event loop safety)."""
+        if self._connect_lock is None:
+            self._connect_lock = asyncio.Lock()
+        return self._connect_lock
+
+    def _get_ready_event(self) -> asyncio.Event:
+        """Get or create the ready event (lazy initialization for event loop safety)."""
+        if self._ready_event is None:
+            self._ready_event = asyncio.Event()
+        return self._ready_event
+
+    def _get_message_queue(self) -> asyncio.Queue[dict[str, Any]]:
+        """Get or create the message queue (lazy initialization for event loop safety)."""
+        if self._message_queue is None:
+            self._message_queue = asyncio.Queue()
+        return self._message_queue
 
     async def connect(self, timeout: float = 10.0) -> None:
         """
@@ -271,72 +310,74 @@ class WebSocketSession:
             ConnectionError: If connection fails
             TimeoutError: If connection times out
         """
-        if self._connected or self._connecting:
-            return
+        async with self._get_connect_lock():
+            # Double-check inside lock to prevent race condition
+            if self._connected or self._connecting:
+                return
 
-        self._connecting = True
-        self._closed = False
-        start_time = time.time()
-
-        try:
-            headers = {}
-            if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
+            self._connecting = True
+            self._closed = False
+            start_time = time.monotonic()
 
             try:
-                self._ws = await asyncio.wait_for(
-                    websockets.connect(
-                        self.url,
-                        additional_headers=headers,
-                    ),
-                    timeout=timeout,
-                )
-            except asyncio.TimeoutError:
-                raise TimeoutError(
-                    message=f"WebSocket connection timed out after {timeout}s",
-                    timeout_ms=int(timeout * 1000),
-                    operation="connect",
-                )
-            except Exception as e:
-                raise ConnectionError(
-                    message=f"Failed to connect to {self.url}: {e}",
-                    url=self.url,
-                    cause=e,
-                )
+                headers = {}
+                if self.api_key:
+                    headers["Authorization"] = f"Bearer {self.api_key}"
 
-            connect_time = (time.time() - start_time) * 1000
-            self._metrics.record_ws_connect(connect_time)
+                try:
+                    self._ws = await asyncio.wait_for(
+                        websockets.connect(
+                            self.url,
+                            additional_headers=headers,
+                        ),
+                        timeout=timeout,
+                    )
+                except asyncio.TimeoutError:
+                    raise TimeoutError(
+                        message=f"WebSocket connection timed out after {timeout}s",
+                        timeout_ms=int(timeout * 1000),
+                        operation="connect",
+                    )
+                except Exception as e:
+                    raise ConnectionError(
+                        message=f"Failed to connect to {self.url}: {e}",
+                        url=self.url,
+                        cause=e,
+                    )
 
-            self._connected = True
-            self._connecting = False
+                connect_time = (time.monotonic() - start_time) * 1000
+                self._metrics.record_ws_connect(connect_time)
 
-            # Start receive task
-            self._receive_task = asyncio.create_task(self._receive_loop())
+                self._connected = True
+                self._connecting = False
 
-            # Send config message
-            await self._send_config()
+                # Start receive task
+                self._receive_task = asyncio.create_task(self._receive_loop())
 
-            # Wait for ready
-            try:
-                await asyncio.wait_for(self._ready_event.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
-                raise TimeoutError(
-                    message="Timeout waiting for ready message",
-                    timeout_ms=int(timeout * 1000),
-                    operation="ready",
-                )
+                # Send config message
+                await self._send_config()
 
-            # Send any pending audio
-            for audio in self._pending_audio:
-                await self.send_audio(audio)
-            self._pending_audio.clear()
+                # Wait for ready
+                try:
+                    await asyncio.wait_for(self._get_ready_event().wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    raise TimeoutError(
+                        message="Timeout waiting for ready message",
+                        timeout_ms=int(timeout * 1000),
+                        operation="ready",
+                    )
 
-            self._emit("ready", self._stream_id)
+                # Send any pending audio
+                for audio in self._pending_audio:
+                    await self.send_audio(audio)
+                self._pending_audio.clear()
 
-        except Exception:
-            self._connecting = False
-            self._connected = False
-            raise
+                self._emit("ready", self._stream_id)
+
+            except Exception:
+                self._connecting = False
+                self._connected = False
+                raise
 
     async def _send_config(self) -> None:
         """Send configuration message."""
@@ -367,7 +408,7 @@ class WebSocketSession:
         if self.livekit_config:
             config["livekit"] = self.livekit_config
 
-        self._config_sent_time = time.time()
+        self._config_sent_time = time.monotonic()
         await self._send_json(config)
 
     async def _send_json(self, data: dict[str, Any]) -> None:
@@ -393,7 +434,7 @@ class WebSocketSession:
 
                     # Calculate TTFB if this is first audio after speak
                     if self._speak_start_time:
-                        ttfb = (time.time() - self._speak_start_time) * 1000
+                        ttfb = (time.monotonic() - self._speak_start_time) * 1000
                         self._metrics.record_tts_ttfb(ttfb)
                         self._speak_start_time = None
 
@@ -404,7 +445,7 @@ class WebSocketSession:
                         sample_rate=self.tts_config.sample_rate if self.tts_config else 24000,
                     )
                     self._emit("audio", audio_event)
-                    await self._message_queue.put({"type": "audio", "audio": audio_event})
+                    await self._get_message_queue().put({"type": "audio", "audio": audio_event})
 
                 else:
                     # JSON message
@@ -417,12 +458,12 @@ class WebSocketSession:
 
                     if msg_type == "ready":
                         self._stream_id = data.get("stream_id")
-                        self._ready_event.set()
+                        self._get_ready_event().set()
 
                     elif msg_type == "stt_result":
                         # Calculate TTFT if this is first result after config
                         if self._config_sent_time:
-                            ttft = (time.time() - self._config_sent_time) * 1000
+                            ttft = (time.monotonic() - self._config_sent_time) * 1000
                             self._metrics.record_stt_ttft(ttft)
                             self._config_sent_time = None
 
@@ -433,7 +474,7 @@ class WebSocketSession:
                             speaker_id=data.get("speaker_id"),
                         )
                         self._emit("transcript", result)
-                        await self._message_queue.put({"type": "transcript", "result": result})
+                        await self._get_message_queue().put({"type": "transcript", "result": result})
 
                     elif msg_type == "tts_audio":
                         # Base64 encoded audio
@@ -442,7 +483,7 @@ class WebSocketSession:
                         self._metrics.record_audio_received(len(audio_data))
 
                         if self._speak_start_time:
-                            ttfb = (time.time() - self._speak_start_time) * 1000
+                            ttfb = (time.monotonic() - self._speak_start_time) * 1000
                             self._metrics.record_tts_ttfb(ttfb)
                             self._speak_start_time = None
 
@@ -453,19 +494,19 @@ class WebSocketSession:
                             sample_rate=data.get("sample_rate", 24000),
                         )
                         self._emit("audio", audio_event)
-                        await self._message_queue.put({"type": "audio", "audio": audio_event})
+                        await self._get_message_queue().put({"type": "audio", "audio": audio_event})
 
                     elif msg_type == "tts_playback_complete":
                         self._emit("playback_complete", data.get("timestamp"))
-                        await self._message_queue.put({"type": "playback_complete", "data": data})
+                        await self._get_message_queue().put({"type": "playback_complete", "data": data})
 
                     elif msg_type == "message":
                         self._emit("message", data.get("message"))
-                        await self._message_queue.put({"type": "message", "data": data.get("message")})
+                        await self._get_message_queue().put({"type": "message", "data": data.get("message")})
 
                     elif msg_type == "participant_disconnected":
                         self._emit("participant_disconnected", data.get("participant"))
-                        await self._message_queue.put({"type": "participant_disconnected", "data": data.get("participant")})
+                        await self._get_message_queue().put({"type": "participant_disconnected", "data": data.get("participant")})
 
                     elif msg_type == "error":
                         from ..errors import BudError
@@ -474,7 +515,7 @@ class WebSocketSession:
                             code=data.get("code"),
                         )
                         self._emit("error", error)
-                        await self._message_queue.put({"type": "error", "error": error})
+                        await self._get_message_queue().put({"type": "error", "error": error})
 
                     elif msg_type == "pong":
                         self._emit("pong", data.get("timestamp"))
@@ -495,14 +536,22 @@ class WebSocketSession:
         last_error: Optional[Exception] = None
 
         for attempt in range(self.reconnect_config.max_retries):
+            # Check if disconnect() was called - stop reconnecting
+            if self._closed:
+                return
+
             # Add jitter
             jitter = delay * self.reconnect_config.jitter * (random.random() * 2 - 1)
             wait_time = (delay + jitter) / 1000
 
             await asyncio.sleep(wait_time)
 
+            # Check again after sleep in case disconnect() was called during wait
+            if self._closed:
+                return
+
             try:
-                self._ready_event.clear()
+                self._get_ready_event().clear()
                 await self.connect()
                 self._metrics.record_reconnect()
                 self._emit("reconnect", attempt + 1)
@@ -533,6 +582,14 @@ class WebSocketSession:
             except asyncio.CancelledError:
                 pass
             self._receive_task = None
+
+        # Cancel any pending handler tasks
+        if self._handler_tasks:
+            for task in list(self._handler_tasks):
+                task.cancel()
+            # Wait for all tasks to complete (with suppressed CancelledError)
+            await asyncio.gather(*self._handler_tasks, return_exceptions=True)
+            self._handler_tasks.clear()
 
         if self._ws:
             await self._ws.close()
@@ -571,7 +628,7 @@ class WebSocketSession:
             flush: Whether to flush the TTS buffer immediately
             allow_interruption: Whether this TTS can be interrupted
         """
-        self._speak_start_time = time.time()
+        self._speak_start_time = time.monotonic()
         await self._send_json({
             "type": "speak",
             "text": text,
@@ -635,9 +692,10 @@ class WebSocketSession:
 
     async def __aiter__(self) -> AsyncIterator[dict[str, Any]]:
         """Iterate over incoming messages."""
-        while self._connected or not self._message_queue.empty():
+        queue = self._get_message_queue()
+        while self._connected or not queue.empty():
             try:
-                message = await asyncio.wait_for(self._message_queue.get(), timeout=0.1)
+                message = await asyncio.wait_for(queue.get(), timeout=0.1)
                 yield message
             except asyncio.TimeoutError:
                 if not self._connected:
