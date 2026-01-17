@@ -2,6 +2,8 @@
 
 A high-performance real-time voice processing server built in Rust that provides unified Speech-to-Text (STT) and Text-to-Speech (TTS) services through WebSocket and REST APIs.
 
+> **[View All 70+ Supported Providers](docs/SUPPORTED_PROVIDERS.md)** - Complete documentation for STT, TTS, and Realtime providers across all regions.
+
 ## Features
 
 - **Unified Voice API**: Single interface for multiple STT/TTS providers
@@ -9,11 +11,11 @@ A high-performance real-time voice processing server built in Rust that provides
 - **LiveKit Integration**: WebRTC audio streaming with room-based communication
 - **Advanced Noise Filtering**: Optional DeepFilterNet integration (`noise-filter` feature)
 - **Plugin Architecture**: Extensible capability-based plugin system with O(1) provider lookup
-- **25 Built-in Providers**: Comprehensive coverage of cloud and enterprise STT/TTS services
-  - **STT (11 providers)**: Deepgram, Google Cloud, ElevenLabs, Microsoft Azure, OpenAI Whisper, AssemblyAI, Cartesia, AWS Transcribe, IBM Watson, Groq, Gnani
-  - **TTS (12 providers)**: Deepgram Aura, ElevenLabs, Google Cloud, Microsoft Azure, OpenAI, Cartesia Sonic, AWS Polly, IBM Watson, Hume AI, LMNT, Play.ht, Gnani
-  - **Realtime (2 providers)**: OpenAI GPT-4o Realtime, Hume EVI
-- **Indic Language Support**: Gnani provider with 14 STT languages and 12 TTS languages
+- **70+ Cloud Providers**: Comprehensive coverage of global and regional STT/TTS services
+  - **STT (27 providers)**: Deepgram, Google Cloud, Azure, ElevenLabs, OpenAI, AssemblyAI, Cartesia, AWS Transcribe, IBM Watson, Groq, Gnani, Sarvam AI, Speechmatics, Gladia, Rev AI, Phonexia, Yandex, Tinkoff, SberDevices, Bhashini, iFlytek, Alibaba Cloud, Baidu, Tencent, Huawei, NAVER CLOVA, and more
+  - **TTS (32 providers)**: Deepgram, ElevenLabs, Google Cloud, Azure, OpenAI, Cartesia, AWS Polly, IBM Watson, Hume AI, LMNT, Play.ht, Murf.ai, WellSaid Labs, Resemble AI, Speechify, Unreal Speech, Smallest.ai, and regional providers
+  - **Realtime (2 providers)**: OpenAI GPT-4o Realtime, Hume EVI (48 emotion dimensions)
+- **Regional Language Support**: India (22 languages), China (25+ with dialects), Southeast Asia (Thai, Vietnamese, Indonesian)
 - **Audio-Disabled Mode**: Development mode without API keys
 
 ## Quick Start
@@ -234,8 +236,8 @@ flowchart TB
 
     subgraph Capabilities["Capability Types"]
         direction LR
-        STT_CAP["STTCapability<br/>11 providers"]
-        TTS_CAP["TTSCapability<br/>12 providers"]
+        STT_CAP["STTCapability<br/>27 providers"]
+        TTS_CAP["TTSCapability<br/>32 providers"]
         RT_CAP["RealtimeCapability<br/>2 providers"]
         PROC_CAP["AudioProcessor<br/>VAD, Noise Filter"]
         MW_CAP["Middleware<br/>Auth, Rate Limit"]
@@ -275,13 +277,13 @@ graph TB
         LK["LiveKit Integration<br/>WebRTC Streaming"]
     end
 
-    subgraph Providers["Provider System (25 providers)"]
-        STT["STT Providers<br/>(11)"]
-        TTS["TTS Providers<br/>(12)"]
+    subgraph Providers["Provider System (70+ providers)"]
+        STT["STT Providers<br/>(27)"]
+        TTS["TTS Providers<br/>(32)"]
         RT["Realtime Providers<br/>(2)"]
     end
 
-    subgraph STTList["STT Providers"]
+    subgraph STTList["STT Providers (27)"]
         DG_S["Deepgram"]
         GC_S["Google Cloud"]
         AZ_S["Azure"]
@@ -292,10 +294,12 @@ graph TB
         AWS_S["AWS Transcribe"]
         IBM_S["IBM Watson"]
         GQ_S["Groq"]
-        GN_S["Gnani"]
+        SM_S["Speechmatics"]
+        GL_S["Gladia"]
+        MORE_S["+ 15 Regional"]
     end
 
-    subgraph TTSList["TTS Providers"]
+    subgraph TTSList["TTS Providers (32)"]
         DG_T["Deepgram"]
         GC_T["Google Cloud"]
         AZ_T["Azure"]
@@ -307,7 +311,7 @@ graph TB
         HU_T["Hume AI"]
         LM_T["LMNT"]
         PH_T["Play.ht"]
-        GN_T["Gnani"]
+        MORE_T["+ 21 More"]
     end
 
     Client((Client)) --> WS
@@ -423,7 +427,7 @@ flowchart TB
         LKI["LiveKit Integration"]
         REG["Plugin Registry"]
         VM2["VoiceManager"]
-        Providers["STT/TTS/Realtime<br/>(25 providers)"]
+        Providers["STT/TTS/Realtime<br/>(70+ providers)"]
     end
 
     Web & Mobile & SIP --> Room

@@ -1,6 +1,8 @@
 # WaaV Gateway - Supported Integrations
 
-This document lists all speech-to-text (STT), text-to-speech (TTS), and audio-to-audio providers supported by WaaV Gateway.
+> **Note:** For the complete and up-to-date list of 70+ supported providers, see [SUPPORTED_PROVIDERS.md](./SUPPORTED_PROVIDERS.md).
+
+This document lists commonly used speech-to-text (STT), text-to-speech (TTS), and audio-to-audio providers supported by WaaV Gateway.
 
 ---
 
@@ -485,12 +487,28 @@ let tts_cost = estimate_tts_cost("elevenlabs", "eleven_multilingual_v2", 1000);
 
 ---
 
-## Coming Soon
+## Additional Implemented Providers
 
-The following providers are planned for future releases:
+Since this document was created, 30+ additional providers have been integrated:
 
-- Speechmatics
-- Gladia
-- And 60+ more regional providers
+### Voice Cloning Specialists
+- Murf.ai, WellSaid Labs, Resemble AI, Speechify, Unreal Speech, Smallest.ai
 
-See [provider_integration_status.md](provider_integration_status.md) for the full roadmap.
+### European Providers
+- Speechmatics (STT+TTS), Gladia (STT), Rev AI (STT), Phonexia (STT), Acapela Group (TTS), Cereproc (TTS)
+
+### Russia/CIS Providers
+- Yandex SpeechKit (STT+TTS), Tinkoff VoiceKit (STT+TTS), SberDevices (STT+TTS)
+
+### India Regional
+- Sarvam AI (STT+TTS), Reverie (STT+TTS), AI4Bharat/Bhashini (STT+TTS)
+
+### China & East Asia
+- iFlytek (STT+TTS), Alibaba Cloud DashScope (STT+TTS), Baidu AI (STT+TTS), Tencent Cloud (STT+TTS), Huawei Cloud (STT+TTS), NAVER CLOVA (STT+TTS), AmiVoice (STT)
+
+### Southeast Asia
+- Zalo AI (TTS), FPT.AI (STT+TTS), Viettel AI (STT+TTS), Prosa.ai (STT+TTS), NECTEC (STT+TTS)
+
+For the complete documentation including all 70+ providers, see **[SUPPORTED_PROVIDERS.md](./SUPPORTED_PROVIDERS.md)**.
+
+See [provider_integration_status.md](provider_integration_status.md) for the full roadmap and implementation details.
