@@ -10,6 +10,7 @@ mod processor;
 mod provider;
 mod endpoint;
 mod router;
+mod llm;
 pub mod transform;
 
 pub use input::{AudioInputNode, TextInputNode};
@@ -17,6 +18,7 @@ pub use output::{AudioOutputNode, TextOutputNode, WebhookOutputNode};
 pub use processor::ProcessorNode;
 pub use provider::{STTProviderNode, TTSProviderNode, RealtimeProviderNode};
 pub use endpoint::{HttpEndpointNode, GrpcEndpointNode, WebSocketEndpointNode, IpcEndpointNode, LiveKitEndpointNode};
+pub use llm::{LlmEndpointNode, LlmEndpointConfig, ChatMessage, ToolDefinition, ResponseFormat};
 pub use router::{SplitNode, JoinNode, RouterNode};
 pub use transform::{TransformNode, PassthroughNode};
 
@@ -37,6 +39,7 @@ pub mod prelude {
         STTProviderNode, TTSProviderNode, RealtimeProviderNode,
         HttpEndpointNode, GrpcEndpointNode, WebSocketEndpointNode,
         IpcEndpointNode, LiveKitEndpointNode,
+        LlmEndpointNode, LlmEndpointConfig, ChatMessage, ToolDefinition, ResponseFormat,
         SplitNode, JoinNode, RouterNode,
         TransformNode, PassthroughNode,
         STTResultData, TTSAudioData, WordTiming,

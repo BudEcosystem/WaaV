@@ -232,7 +232,8 @@ impl DAGCompiler {
                 Arc::new(ProcessorNode::new(&def.id, plugin))
             }
             NodeType::HttpEndpoint { url, method, headers, timeout_ms } => {
-                let mut node = HttpEndpointNode::new(&def.id, url)
+                // Use try_new() for SSRF protection
+                let mut node = HttpEndpointNode::try_new(&def.id, url)?
                     .with_method(method.clone());
                 for (key, value) in headers {
                     node = node.with_header(key, value);
@@ -250,7 +251,8 @@ impl DAGCompiler {
                 Arc::new(node)
             }
             NodeType::WebSocketEndpoint { url, headers } => {
-                let mut node = WebSocketEndpointNode::new(&def.id, url);
+                // Use try_new() for SSRF protection
+                let mut node = WebSocketEndpointNode::try_new(&def.id, url)?;
                 for (key, value) in headers {
                     node = node.with_header(key, value);
                 }
@@ -276,6 +278,43 @@ impl DAGCompiler {
                     node = node.with_track_type(t);
                 }
                 Arc::new(node)
+            }
+            NodeType::LlmEndpoint {
+                base_url,
+                model,
+                api_key,
+                system_prompt,
+                temperature,
+                max_tokens,
+                streaming,
+                tools,
+                assistant_id,
+                timeout_ms,
+                headers,
+            } => {
+                // Build LLM config from node definition
+                let mut llm_config = LlmEndpointConfig {
+                    base_url: base_url.clone(),
+                    model: model.clone(),
+                    api_key: api_key.clone(),
+                    system_prompt: system_prompt.clone(),
+                    temperature: *temperature,
+                    max_tokens: *max_tokens,
+                    streaming: *streaming,
+                    timeout_ms: timeout_ms.unwrap_or(60000),
+                    headers: headers.clone(),
+                    assistant_id: assistant_id.clone(),
+                    ..Default::default()
+                };
+
+                // Parse tools from JSON if provided
+                if let Some(tools_json) = tools {
+                    if let Ok(parsed_tools) = serde_json::from_value::<Vec<super::nodes::ToolDefinition>>(tools_json.clone()) {
+                        llm_config.tools = Some(parsed_tools);
+                    }
+                }
+
+                Arc::new(LlmEndpointNode::new(&def.id, llm_config))
             }
             NodeType::WebhookOutput { url, headers } => {
                 let mut node = WebhookOutputNode::new(&def.id, url);

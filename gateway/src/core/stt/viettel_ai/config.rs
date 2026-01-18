@@ -1,0 +1,343 @@
+//! Configuration types for Viettel AI STT API.
+//!
+//! This module provides configuration types for Viettel Group's
+//! AI Speech-to-Text service.
+//!
+//! # Overview
+//!
+//! Viettel AI STT converts Vietnamese audio to text with 96% accuracy
+//! using advanced deep neural network technology.
+//!
+//! # Features
+//!
+//! - High Vietnamese accuracy (96%)
+//! - Regional accent detection
+//! - Multiple input types (direct recording, phone, operator)
+//! - Enterprise-grade security
+//!
+//! # Authentication
+//!
+//! The API uses token-based authentication:
+//! - `token`: Your Viettel AI token from dashboard
+
+use crate::core::stt::base::{STTConfig, STTError};
+use serde::{Deserialize, Serialize};
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Viettel AI STT decode endpoint.
+pub const VIETTEL_STT_ENDPOINT: &str = "https://viettelgroup.ai/voice/api/asr/v1/rest/decode_file";
+
+/// Default request timeout in seconds.
+pub const DEFAULT_REQUEST_TIMEOUT: u64 = 60;
+
+/// Default sample rate.
+pub const DEFAULT_SAMPLE_RATE: u32 = 16000;
+
+/// Default audio channels.
+pub const DEFAULT_CHANNELS: u16 = 1;
+
+/// PCM format for signed 16-bit little endian.
+pub const PCM_FORMAT_S16LE: &str = "S16LE";
+
+/// Minimum audio buffer size in bytes before transcription.
+pub const MIN_AUDIO_BUFFER_SIZE: usize = 1600; // ~50ms at 16kHz mono 16-bit
+
+/// Maximum audio buffer size in bytes.
+pub const MAX_AUDIO_BUFFER_SIZE: usize = 9_600_000; // ~5 minutes at 16kHz mono 16-bit
+
+// =============================================================================
+// Configuration
+// =============================================================================
+
+/// Viettel AI STT configuration.
+#[derive(Debug, Clone)]
+pub struct ViettelSttConfig {
+    /// API token for authentication.
+    pub api_key: String,
+
+    /// Audio sample rate in Hz.
+    pub sample_rate: u32,
+
+    /// Audio format (e.g., "S16LE" for PCM).
+    pub format: String,
+
+    /// Number of audio channels.
+    pub channels: u16,
+
+    /// Optional ASR model code.
+    pub asr_model: Option<String>,
+
+    /// Request timeout in seconds.
+    pub request_timeout_secs: u64,
+}
+
+impl Default for ViettelSttConfig {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            sample_rate: DEFAULT_SAMPLE_RATE,
+            format: PCM_FORMAT_S16LE.to_string(),
+            channels: DEFAULT_CHANNELS,
+            asr_model: None,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
+        }
+    }
+}
+
+impl ViettelSttConfig {
+    /// Create configuration from base STTConfig.
+    pub fn from_base(config: &STTConfig) -> Result<Self, STTError> {
+        let api_key = config.api_key.clone();
+
+        if api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "Viettel AI API token is required".to_string(),
+            ));
+        }
+
+        let sample_rate = if config.sample_rate > 0 {
+            config.sample_rate
+        } else {
+            DEFAULT_SAMPLE_RATE
+        };
+
+        let channels = if config.channels > 0 {
+            config.channels
+        } else {
+            DEFAULT_CHANNELS
+        };
+
+        Ok(Self {
+            api_key,
+            sample_rate,
+            format: PCM_FORMAT_S16LE.to_string(),
+            channels,
+            asr_model: None,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
+        })
+    }
+
+    /// Validate the configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.api_key.is_empty() {
+            return Err("Viettel AI API token is required".to_string());
+        }
+
+        if self.sample_rate == 0 {
+            return Err("Sample rate must be greater than 0".to_string());
+        }
+
+        if self.channels == 0 {
+            return Err("Channels must be greater than 0".to_string());
+        }
+
+        Ok(())
+    }
+}
+
+// =============================================================================
+// Response Types
+// =============================================================================
+
+/// Viettel AI STT API response.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ViettelSttResponse {
+    /// Status code (0 = success).
+    #[serde(default)]
+    pub status: i32,
+
+    /// Transcription result.
+    #[serde(default)]
+    pub result: String,
+
+    /// Error message.
+    #[serde(default)]
+    pub message: String,
+}
+
+impl ViettelSttResponse {
+    /// Check if the response indicates success.
+    pub fn is_success(&self) -> bool {
+        self.status == 0
+    }
+
+    /// Get the transcription text if successful.
+    pub fn transcription(&self) -> Option<&str> {
+        if self.is_success() && !self.result.is_empty() {
+            Some(self.result.as_str())
+        } else {
+            None
+        }
+    }
+
+    /// Get status message based on status code.
+    pub fn status_message(&self) -> &str {
+        if !self.message.is_empty() {
+            return &self.message;
+        }
+
+        match self.status {
+            0 => "Success",
+            1 => "No voice detected",
+            401 => "Unauthorized - Invalid or expired token",
+            400 => "Bad request",
+            500 => "Server error",
+            _ => "Unknown error",
+        }
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_default() {
+        let config = ViettelSttConfig::default();
+        assert!(config.api_key.is_empty());
+        assert_eq!(config.sample_rate, DEFAULT_SAMPLE_RATE);
+        assert_eq!(config.channels, DEFAULT_CHANNELS);
+        assert_eq!(config.format, PCM_FORMAT_S16LE);
+        assert!(config.asr_model.is_none());
+    }
+
+    #[test]
+    fn test_config_validation_empty_key() {
+        let config = ViettelSttConfig::default();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_zero_sample_rate() {
+        let mut config = ViettelSttConfig::default();
+        config.api_key = "test_token".to_string();
+        config.sample_rate = 0;
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_zero_channels() {
+        let mut config = ViettelSttConfig::default();
+        config.api_key = "test_token".to_string();
+        config.channels = 0;
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_success() {
+        let mut config = ViettelSttConfig::default();
+        config.api_key = "test_token".to_string();
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_from_base_empty_key() {
+        let config = STTConfig {
+            api_key: String::new(),
+            ..Default::default()
+        };
+
+        let result = ViettelSttConfig::from_base(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_config_from_base_with_params() {
+        let config = STTConfig {
+            api_key: "test_token".to_string(),
+            sample_rate: 8000,
+            channels: 1,
+            ..Default::default()
+        };
+
+        let viettel_config = ViettelSttConfig::from_base(&config).unwrap();
+        assert_eq!(viettel_config.sample_rate, 8000);
+        assert_eq!(viettel_config.channels, 1);
+    }
+
+    #[test]
+    fn test_config_from_base_default_sample_rate() {
+        let config = STTConfig {
+            api_key: "test_token".to_string(),
+            sample_rate: 0,
+            ..Default::default()
+        };
+
+        let viettel_config = ViettelSttConfig::from_base(&config).unwrap();
+        assert_eq!(viettel_config.sample_rate, DEFAULT_SAMPLE_RATE);
+    }
+
+    #[test]
+    fn test_response_success() {
+        let response = ViettelSttResponse {
+            status: 0,
+            result: "Xin chào".to_string(),
+            message: String::new(),
+        };
+
+        assert!(response.is_success());
+        assert_eq!(response.transcription(), Some("Xin chào"));
+        assert_eq!(response.status_message(), "Success");
+    }
+
+    #[test]
+    fn test_response_no_voice() {
+        let response = ViettelSttResponse {
+            status: 1,
+            result: String::new(),
+            message: String::new(),
+        };
+
+        assert!(!response.is_success());
+        assert_eq!(response.transcription(), None);
+        assert_eq!(response.status_message(), "No voice detected");
+    }
+
+    #[test]
+    fn test_response_unauthorized() {
+        let response = ViettelSttResponse {
+            status: 401,
+            result: String::new(),
+            message: String::new(),
+        };
+
+        assert!(!response.is_success());
+        assert!(response.status_message().contains("Unauthorized"));
+    }
+
+    #[test]
+    fn test_response_custom_message() {
+        let response = ViettelSttResponse {
+            status: 500,
+            result: String::new(),
+            message: "Custom error".to_string(),
+        };
+
+        assert!(!response.is_success());
+        assert_eq!(response.status_message(), "Custom error");
+    }
+
+    #[test]
+    fn test_response_empty_result_not_success() {
+        let response = ViettelSttResponse {
+            status: 0,
+            result: String::new(),
+            message: String::new(),
+        };
+
+        // Status is 0 but result is empty, so is_success is true
+        // but transcription returns None
+        assert!(response.is_success());
+        assert_eq!(response.transcription(), None);
+    }
+}

@@ -1,1 +1,0 @@
-/home/bud/Desktop/bud_waav/WaaV/examples/test-plugin/target/release/libwaav_plugin_test.so: /home/bud/Desktop/bud_waav/WaaV/examples/test-plugin/src/lib.rs /home/bud/Desktop/bud_waav/WaaV/plugin-api/src/lib.rs

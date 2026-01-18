@@ -29,11 +29,12 @@ use tracing::{debug, error, info, warn};
 
 use super::super::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
+    SpeakerInfo, WordTiming,
 };
 use super::config::{FlushStrategy, OpenAISTTConfig, ResponseFormat};
 use super::messages::{
-    OpenAIErrorResponse, TranscriptionResponse, TranscriptionResult, VerboseTranscriptionResponse,
-    wav,
+    DiarizedTranscriptionResponse, OpenAIErrorResponse, TranscriptionResponse,
+    TranscriptionResult, VerboseTranscriptionResponse, wav,
 };
 
 // =============================================================================
@@ -440,18 +441,18 @@ impl OpenAISTT {
         // Parse response based on format
         let transcription_result = self.parse_response(&response_text, config)?;
 
-        // Create STT result and invoke callback
-        let stt_result = STTResult::new(
-            transcription_result.text().to_string(),
-            true, // Final result (Whisper doesn't do interim)
-            true, // Speech final
-            transcription_result.confidence(),
-        );
+        // Create enriched STT result with metadata
+        let stt_result = Self::create_enriched_result(&transcription_result);
 
         info!(
-            "Transcription complete: {} characters, confidence: {:.2}",
+            "Transcription complete: {} characters, confidence: {:.2}{}",
             stt_result.transcript.len(),
-            stt_result.confidence
+            stt_result.confidence,
+            if stt_result.has_diarization() {
+                format!(", speakers: {}", stt_result.speaker_count().unwrap_or(0))
+            } else {
+                String::new()
+            }
         );
 
         // Invoke callback
@@ -486,10 +487,112 @@ impl OpenAISTT {
                     })?;
                 Ok(TranscriptionResult::Verbose(response))
             }
+            ResponseFormat::DiarizedJson => {
+                let response: DiarizedTranscriptionResponse = serde_json::from_str(response_text)
+                    .map_err(|e| {
+                        STTError::ProviderError(format!("Failed to parse diarized response: {e}"))
+                    })?;
+                Ok(TranscriptionResult::Diarized(response))
+            }
             ResponseFormat::Text | ResponseFormat::Srt | ResponseFormat::Vtt => {
                 Ok(TranscriptionResult::PlainText(response_text.to_string()))
             }
         }
+    }
+
+    /// Create an enriched STTResult from the transcription result.
+    ///
+    /// Maps provider-specific response data to the unified STTResult structure,
+    /// including diarization metadata when available.
+    fn create_enriched_result(transcription_result: &TranscriptionResult) -> STTResult {
+        let mut result = STTResult::new(
+            transcription_result.text().to_string(),
+            true,  // Final result (Whisper doesn't do interim)
+            true,  // Speech final
+            transcription_result.confidence(),
+        );
+
+        // Set common metadata
+        result.detected_language = transcription_result.language().map(|s| s.to_string());
+        result.audio_duration = transcription_result.duration();
+
+        // Handle diarized responses with rich metadata
+        if let TranscriptionResult::Diarized(diarized) = transcription_result {
+            // Map speakers
+            if !diarized.speakers.is_empty() {
+                result.speakers = Some(
+                    diarized
+                        .speakers
+                        .iter()
+                        .map(|s| {
+                            let mut speaker = SpeakerInfo::new(s.id.clone());
+                            speaker.name = s.name.clone();
+                            speaker.confidence = s.confidence.map(|c| c as f32);
+                            speaker
+                        })
+                        .collect(),
+                );
+            }
+
+            // Map diarized words with speaker attribution
+            if !diarized.words.is_empty() {
+                result.words = Some(
+                    diarized
+                        .words
+                        .iter()
+                        .map(|w| {
+                            WordTiming::with_all(
+                                w.word.clone(),
+                                w.start,
+                                w.end,
+                                None, // OpenAI doesn't provide per-word confidence
+                                w.speaker.clone(),
+                                w.logprob,
+                            )
+                        })
+                        .collect(),
+                );
+            }
+
+            // Calculate average logprob if available
+            let logprobs: Vec<f64> = diarized
+                .segments
+                .iter()
+                .filter_map(|seg| seg.avg_logprob)
+                .collect();
+
+            if !logprobs.is_empty() {
+                let avg_logprob = logprobs.iter().sum::<f64>() / logprobs.len() as f64;
+                result.logprobs = Some(avg_logprob);
+            }
+        }
+        // Handle verbose responses with word timing (no speaker info)
+        else if let TranscriptionResult::Verbose(verbose) = transcription_result {
+            // Map words without speaker attribution
+            if !verbose.words.is_empty() {
+                result.words = Some(
+                    verbose
+                        .words
+                        .iter()
+                        .map(|w| WordTiming::new(w.word.clone(), w.start, w.end))
+                        .collect(),
+                );
+            }
+
+            // Calculate average logprob from segments
+            let logprobs: Vec<f64> = verbose
+                .segments
+                .iter()
+                .filter_map(|seg| seg.avg_logprob)
+                .collect();
+
+            if !logprobs.is_empty() {
+                let avg_logprob = logprobs.iter().sum::<f64>() / logprobs.len() as f64;
+                result.logprobs = Some(avg_logprob);
+            }
+        }
+
+        result
     }
 
     /// Check if buffer should be flushed based on strategy and threshold.

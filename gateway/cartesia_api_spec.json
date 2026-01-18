@@ -1,0 +1,437 @@
+{
+  "cartesia_apis": {
+    "stt": {
+      "service": "Ink-Whisper Speech-to-Text",
+      "endpoint": "wss://api.cartesia.ai/stt/websocket",
+      "models": [
+        {
+          "id": "ink-whisper",
+          "status": "stable",
+          "routing": "auto-routes to latest",
+          "recommended_for": "prototyping"
+        },
+        {
+          "id": "ink-whisper-2025-06-10",
+          "release_date": "2025-06-10",
+          "status": "stable",
+          "recommended_for": "production"
+        },
+        {
+          "id": "ink-whisper-2025-06-04",
+          "release_date": "2025-06-04",
+          "status": "stable",
+          "recommended_for": "consistency"
+        }
+      ],
+      "features": {
+        "dynamic_chunking": true,
+        "noise_robustness": true,
+        "telephony_artifacts": true,
+        "domain_terminology": true,
+        "word_timestamps": true,
+        "voice_activity_detection": true,
+        "language_support": "99+ languages"
+      },
+      "websocket_parameters": {
+        "required": [
+          {
+            "name": "model",
+            "type": "string",
+            "example": "ink-whisper",
+            "description": "Model identifier"
+          },
+          {
+            "name": "language",
+            "type": "string",
+            "format": "ISO-639-1",
+            "example": "en",
+            "description": "Language code (default: en)"
+          },
+          {
+            "name": "encoding",
+            "type": "string",
+            "example": "pcm_s16le",
+            "description": "Audio format (recommended)"
+          },
+          {
+            "name": "sample_rate",
+            "type": "integer",
+            "example": 16000,
+            "unit": "Hz",
+            "description": "Audio sample rate (recommended: 16000)"
+          },
+          {
+            "name": "api_key",
+            "type": "string",
+            "description": "Authentication key"
+          }
+        ],
+        "optional": [
+          {
+            "name": "min_volume",
+            "type": "float",
+            "range": [0.0, 1.0],
+            "example": 0.1,
+            "description": "Voice activity detection volume threshold"
+          },
+          {
+            "name": "max_silence_duration_secs",
+            "type": "float",
+            "example": 0.4,
+            "description": "Maximum silence duration before endpointing (seconds)"
+          }
+        ]
+      },
+      "client_messages": [
+        {
+          "type": "audio_stream",
+          "format": "binary",
+          "description": "Audio data in specified encoding/sample_rate"
+        },
+        {
+          "type": "finalize",
+          "format": "text",
+          "description": "Flush remaining audio, receive flush_done response"
+        },
+        {
+          "type": "done",
+          "format": "text",
+          "description": "Close session, receive done confirmation"
+        }
+      ],
+      "server_responses": [
+        {
+          "type": "transcript",
+          "structure": {
+            "text": "transcribed text",
+            "words": [
+              {
+                "text": "word",
+                "start": "float (seconds)",
+                "end": "float (seconds)"
+              }
+            ],
+            "is_final": "boolean"
+          }
+        },
+        {
+          "type": "flush_done",
+          "description": "Acknowledgment of finalize command"
+        },
+        {
+          "type": "done",
+          "description": "Session closure confirmation"
+        },
+        {
+          "type": "error",
+          "structure": {
+            "error": "error message",
+            "code": "error code"
+          }
+        }
+      ],
+      "supported_languages": [
+        "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr",
+        "pl", "ca", "nl", "ar", "sv", "it", "id", "hi", "fi", "vi",
+        "he", "uk", "el", "ms", "cs", "ro", "da", "hu", "ta", "no",
+        "th", "ur", "hr", "bg", "lt", "la", "mi", "ml", "cy", "sk",
+        "te", "fa", "lv", "bn", "sr", "az", "sl", "kn", "et", "mk",
+        "br", "eu", "is", "hy", "ne", "mn", "bs", "kk", "sq", "sw",
+        "gl", "mr", "pa", "si", "km", "sn", "yo", "so", "af", "oc",
+        "ka", "be", "tg", "sd", "gu", "am", "yi", "lo", "uz", "fo",
+        "ht", "ps", "tk", "nn", "mt", "sa", "lb", "my", "bo", "tl",
+        "mg", "as", "tt", "haw", "ln", "ha", "ba", "jw", "su", "yue"
+      ],
+      "performance": {
+        "chunking_recommendation": "100ms intervals for optimal latency",
+        "session_timeout": "3 minutes inactivity",
+        "pricing": "1 credit per 1 second"
+      }
+    },
+    "tts": {
+      "service": "Sonic Text-to-Speech",
+      "endpoint": "wss://api.cartesia.ai/tts/websocket",
+      "models": [
+        {
+          "id": "sonic-3",
+          "status": "stable",
+          "routing": "auto-routes to latest stable",
+          "recommended_for": "general use"
+        },
+        {
+          "id": "sonic-3-2026-01-12",
+          "release_date": "2026-01-12",
+          "status": "stable",
+          "recommended_for": "production"
+        },
+        {
+          "id": "sonic-3-2025-10-27",
+          "release_date": "2025-10-27",
+          "status": "stable",
+          "recommended_for": "previous version"
+        },
+        {
+          "id": "sonic-3-latest",
+          "status": "beta",
+          "recommended_for": "feature testing (non-production)"
+        }
+      ],
+      "features": {
+        "high_naturalness": true,
+        "accurate_transcript_following": true,
+        "industry_leading_latency": "135ms",
+        "volume_control": true,
+        "speed_control": true,
+        "emotion_control": "60+ emotional tones",
+        "laughter_generation": true,
+        "ssml_support": true,
+        "voice_cloning": "from 3 seconds audio",
+        "voice_mixing": true,
+        "voice_design": true,
+        "language_support": "42+ languages"
+      },
+      "websocket_parameters": {
+        "required": [
+          {
+            "name": "cartesia_version",
+            "type": "string",
+            "options": ["2024-06-10", "2024-11-13", "2025-04-16"],
+            "description": "API version"
+          },
+          {
+            "name": "api_key",
+            "type": "string",
+            "description": "Authentication key (query parameter for browser WebSocket)"
+          }
+        ],
+        "generation_request": [
+          {
+            "name": "model_id",
+            "type": "string",
+            "example": "sonic-3",
+            "description": "Model identifier"
+          },
+          {
+            "name": "transcript",
+            "type": "string",
+            "description": "Text to synthesize into audio"
+          },
+          {
+            "name": "language",
+            "type": "string",
+            "example": "en",
+            "description": "Language code"
+          },
+          {
+            "name": "context_id",
+            "type": "string",
+            "description": "Unique identifier for grouping related generations"
+          }
+        ],
+        "voice_selection": [
+          {
+            "name": "voice.mode",
+            "type": "string",
+            "value": "id",
+            "description": "Set to 'id' for voice selection"
+          },
+          {
+            "name": "voice.id",
+            "type": "string",
+            "format": "UUID",
+            "description": "UUID of desired voice"
+          }
+        ],
+        "audio_format": [
+          {
+            "name": "output_format.container",
+            "type": "string",
+            "value": "raw",
+            "description": "Container type for streaming"
+          },
+          {
+            "name": "output_format.encoding",
+            "type": "string",
+            "options": ["pcm_s16le", "pcm_f32le"],
+            "default": "pcm_s16le",
+            "description": "Audio codec"
+          },
+          {
+            "name": "output_format.sample_rate",
+            "type": "integer",
+            "options": [8000, 16000, 24000, 44100],
+            "unit": "Hz",
+            "description": "Sample rate"
+          }
+        ],
+        "control_parameters": [
+          {
+            "name": "add_timestamps",
+            "type": "boolean",
+            "description": "Include word-level timing metadata"
+          },
+          {
+            "name": "continue",
+            "type": "boolean",
+            "description": "Continuation handling in streaming"
+          },
+          {
+            "name": "generation_config.emotion",
+            "type": "string",
+            "description": "Emotion specification (SSML: <emotion value='excited'/>"
+          },
+          {
+            "name": "generation_config.speed",
+            "type": "float",
+            "description": "Speed ratio (SSML: <speed ratio='1.05'/>"
+          },
+          {
+            "name": "generation_config.volume",
+            "type": "float",
+            "description": "Volume level"
+          }
+        ]
+      },
+      "server_responses": [
+        {
+          "type": "audio_chunk",
+          "structure": {
+            "audio": "base64-encoded",
+            "status": 206,
+            "step_time": "timing metrics"
+          }
+        },
+        {
+          "type": "timestamps",
+          "structure": {
+            "words": [
+              {
+                "word": "text",
+                "start": "float (seconds)",
+                "end": "float (seconds)"
+              }
+            ]
+          }
+        },
+        {
+          "type": "flush_done",
+          "structure": {
+            "flush_id": "identifier"
+          }
+        },
+        {
+          "type": "done",
+          "description": "Generation completion signal"
+        },
+        {
+          "type": "error",
+          "structure": {
+            "error": "error message",
+            "code": "status code",
+            "context_id": "for tracking"
+          }
+        }
+      ],
+      "recommended_voices": [
+        {
+          "name": "Katie",
+          "id": "f786b574-daa5-4673-aa0c-cbe3e8534c02",
+          "category": "Voice Agents",
+          "characteristics": "Stable, realistic, neutral"
+        },
+        {
+          "name": "Kiefer",
+          "id": "228fca29-3a0a-435c-8728-5cb483251068",
+          "category": "Voice Agents",
+          "characteristics": "Stable, realistic, neutral"
+        },
+        {
+          "name": "Tessa",
+          "id": "6ccbfb76-1fc6-48f7-b71d-91ac6298247b",
+          "category": "Expressive Characters",
+          "characteristics": "Emotive, expressive"
+        },
+        {
+          "name": "Kyle",
+          "id": "c961b81c-a935-4c17-bfb3-ba2239de8c2f",
+          "category": "Expressive Characters",
+          "characteristics": "Emotive, expressive"
+        }
+      ],
+      "supported_languages": [
+        "en", "fr", "de", "es", "pt", "zh", "ja", "hi", "it", "ko",
+        "nl", "pl", "ru", "sv", "tr", "tl", "bg", "ro", "ar", "cs",
+        "el", "fi", "hr", "ms", "sk", "da", "ta", "uk", "hu", "no",
+        "vi", "bn", "th", "he", "ka", "id", "te", "gu", "kn", "ml",
+        "mr", "pa"
+      ],
+      "ssml_support": {
+        "emotion": "<emotion value='excited'>Text here</emotion>",
+        "speed": "<speed ratio='1.05'>Text here</speed>",
+        "volume": "<volume>Text here</volume>",
+        "laughter": "[laughter]"
+      },
+      "voice_cloning": {
+        "minimum_audio_duration": "3 seconds",
+        "quality": "Highly similar, lifelike",
+        "preservation": ["speaking style", "accent", "background", "emotion", "vocal characteristics"],
+        "api_method": "client.voices.clone()"
+      },
+      "audio_formats": {
+        "websocket_streaming": ["pcm_s16le", "pcm_f32le"],
+        "rest_endpoint": ["WAV", "MP3", "PCM"]
+      },
+      "performance": {
+        "model_latency": "135ms",
+        "first_chunk_latency": "~135ms",
+        "pricing": "1 credit per 1 second"
+      }
+    }
+  },
+  "integration_notes": {
+    "authentication": {
+      "method": "API key",
+      "delivery": ["query parameter (WebSocket compatible)", "HTTP header"],
+      "token_generation": "client.auth.access_token()"
+    },
+    "version_management": {
+      "tts_versions": ["2024-06-10", "2024-11-13", "2025-04-16"],
+      "stt_versions": "implicit in model selection",
+      "recommendation": "Use base model names for dev, date-versioned for production"
+    },
+    "python_sdk_methods": {
+      "tts": ["client.tts.bytes()", "client.tts.sse()"],
+      "stt": ["client.stt.transcribe()"],
+      "voices": ["client.voices.list()", "client.voices.clone()"],
+      "utilities": ["client.api_status.get()", "client.auth.access_token()"]
+    },
+    "zero_copy_optimization": [
+      "Use shared memory rings for IPC (Rust gateway ↔ Python)",
+      "Stream audio chunks directly without serialization",
+      "Parse timestamps in-stream for non-blocking I/O",
+      "Avoid materializing full responses"
+    ]
+  },
+  "documentation": {
+    "primary": "https://docs.cartesia.ai/",
+    "stt": {
+      "models": "https://docs.cartesia.ai/build-with-cartesia/stt-models",
+      "api_reference": "https://docs.cartesia.ai/api-reference/stt/stt"
+    },
+    "tts": {
+      "models": "https://docs.cartesia.ai/build-with-cartesia/tts-models/latest",
+      "api_reference": "https://docs.cartesia.ai/api-reference/tts/tts",
+      "product": "https://cartesia.ai/sonic",
+      "voices": "https://cartesia.ai/voices"
+    },
+    "sdks": {
+      "python": "https://github.com/cartesia-ai/cartesia-python",
+      "javascript": "https://github.com/cartesia-ai/cartesia-js",
+      "pypi": "https://pypi.org/project/cartesia/"
+    },
+    "integrations": {
+      "livekit": "https://docs.livekit.io/agents/models/tts/plugins/cartesia/",
+      "voice_agent_example": "https://github.com/cartesia-ai/cartesia-livekit-voice-agent"
+    }
+  }
+}

@@ -274,10 +274,11 @@ impl BaseTTS for ElevenLabsTTS {
             "connection_pooling": true,
             "supported_formats": ["mp3", "pcm", "ulaw"],
             "supported_sample_rates": [8000, 11025, 16000, 22050, 24000, 44100, 48000],
+            // Note: eleven_multilingual_v1 and eleven_monolingual_v1 were deprecated
+            // and removed by ElevenLabs on December 15, 2025
             "supported_models": [
+                "eleven_v3",
                 "eleven_multilingual_v2",
-                "eleven_multilingual_v1",
-                "eleven_monolingual_v1",
                 "eleven_turbo_v2",
                 "eleven_turbo_v2_5",
                 "eleven_flash_v2",

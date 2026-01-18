@@ -231,6 +231,7 @@ mod config_tests {
             min_silence_duration_ms: Some(500),
             enable_logging: true,
             region: ElevenLabsRegion::Us,
+            ..Default::default()
         };
 
         let url = config.build_websocket_url();
@@ -591,6 +592,7 @@ mod client_tests {
             min_silence_duration_ms: Some(500),
             enable_logging: false,
             region: ElevenLabsRegion::Default,
+            ..Default::default()
         };
 
         let url = stt.build_websocket_url(&config).unwrap();
@@ -1245,5 +1247,362 @@ mod base_stt_tests {
         stt.on_result(callback2).await.unwrap();
 
         assert!(stt.result_callback.lock().await.is_some());
+    }
+}
+
+// =============================================================================
+// Advanced Features Tests (Keyterms, Entity Detection, Diarization, PII/PHI)
+// =============================================================================
+
+mod advanced_features_tests {
+    use super::*;
+    use crate::core::stt::elevenlabs::config::{MAX_KEYTERMS, MAX_SPEAKERS};
+
+    #[test]
+    fn test_config_validate_valid_with_keyterms() {
+        let config = ElevenLabsSTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            keyterms: Some(vec!["ElevenLabs".to_string(), "WebSocket".to_string()]),
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validate_too_many_keyterms() {
+        let keyterms: Vec<String> = (0..=MAX_KEYTERMS)
+            .map(|i| format!("term_{}", i))
+            .collect();
+
+        let config = ElevenLabsSTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            keyterms: Some(keyterms),
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Too many keyterms"));
+    }
+
+    #[test]
+    fn test_config_validate_empty_keyterm() {
+        let config = ElevenLabsSTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            keyterms: Some(vec!["valid".to_string(), "   ".to_string()]),
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn test_config_validate_max_speakers_valid() {
+        let config = ElevenLabsSTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            enable_diarization: Some(true),
+            max_speakers: Some(10),
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validate_max_speakers_exceeds_limit() {
+        let config = ElevenLabsSTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            enable_diarization: Some(true),
+            max_speakers: Some(MAX_SPEAKERS + 1),
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("max_speakers"));
+    }
+
+    #[test]
+    fn test_config_validate_max_speakers_zero() {
+        let config = ElevenLabsSTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            enable_diarization: Some(true),
+            max_speakers: Some(0),
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("at least 1"));
+    }
+
+    #[test]
+    fn test_config_validate_missing_api_key() {
+        let config = ElevenLabsSTTConfig {
+            base: STTConfig {
+                api_key: "".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("API key"));
+    }
+
+    #[test]
+    fn test_build_websocket_url_with_keyterms() {
+        let config = ElevenLabsSTTConfig {
+            base: STTConfig::default(),
+            keyterms: Some(vec!["ElevenLabs".to_string(), "API".to_string()]),
+            ..Default::default()
+        };
+
+        let url = config.build_websocket_url();
+        assert!(url.contains("keyterms="));
+        assert!(url.contains("ElevenLabs"));
+        assert!(url.contains("API"));
+    }
+
+    #[test]
+    fn test_build_websocket_url_with_entity_detection() {
+        let config = ElevenLabsSTTConfig {
+            base: STTConfig::default(),
+            enable_entity_detection: Some(true),
+            ..Default::default()
+        };
+
+        let url = config.build_websocket_url();
+        assert!(url.contains("entity_detection=true"));
+    }
+
+    #[test]
+    fn test_build_websocket_url_with_diarization() {
+        let config = ElevenLabsSTTConfig {
+            base: STTConfig::default(),
+            enable_diarization: Some(true),
+            max_speakers: Some(5),
+            ..Default::default()
+        };
+
+        let url = config.build_websocket_url();
+        assert!(url.contains("diarization=true"));
+        assert!(url.contains("max_speakers=5"));
+    }
+
+    #[test]
+    fn test_build_websocket_url_with_pii_detection() {
+        let config = ElevenLabsSTTConfig {
+            base: STTConfig::default(),
+            enable_pii_detection: Some(true),
+            ..Default::default()
+        };
+
+        let url = config.build_websocket_url();
+        assert!(url.contains("pii_detection=true"));
+    }
+
+    #[test]
+    fn test_build_websocket_url_with_phi_detection() {
+        let config = ElevenLabsSTTConfig {
+            base: STTConfig::default(),
+            enable_phi_detection: Some(true),
+            ..Default::default()
+        };
+
+        let url = config.build_websocket_url();
+        assert!(url.contains("phi_detection=true"));
+    }
+
+    #[test]
+    fn test_build_websocket_url_with_all_features() {
+        let config = ElevenLabsSTTConfig {
+            base: STTConfig {
+                language: "en".to_string(),
+                ..Default::default()
+            },
+            keyterms: Some(vec!["term1".to_string(), "term2".to_string()]),
+            enable_entity_detection: Some(true),
+            enable_diarization: Some(true),
+            max_speakers: Some(10),
+            enable_pii_detection: Some(true),
+            enable_phi_detection: Some(true),
+            ..Default::default()
+        };
+
+        let url = config.build_websocket_url();
+        assert!(url.contains("keyterms="));
+        assert!(url.contains("entity_detection=true"));
+        assert!(url.contains("diarization=true"));
+        assert!(url.contains("max_speakers=10"));
+        assert!(url.contains("pii_detection=true"));
+        assert!(url.contains("phi_detection=true"));
+    }
+
+    #[test]
+    fn test_helper_methods() {
+        let mut config = ElevenLabsSTTConfig::default();
+
+        assert!(!config.has_entity_detection());
+        assert!(!config.has_diarization());
+        assert!(!config.has_pii_detection());
+        assert!(!config.has_phi_detection());
+        assert!(!config.has_sensitive_data_detection());
+
+        config.enable_entity_detection = Some(true);
+        config.enable_diarization = Some(true);
+        config.enable_pii_detection = Some(true);
+        config.enable_phi_detection = Some(true);
+
+        assert!(config.has_entity_detection());
+        assert!(config.has_diarization());
+        assert!(config.has_pii_detection());
+        assert!(config.has_phi_detection());
+        assert!(config.has_sensitive_data_detection());
+    }
+
+    #[tokio::test]
+    async fn test_handle_entities_detected_message() {
+        let (result_tx, _result_rx) = mpsc::channel::<STTResult>(256);
+        let mut session_id: Option<String> = None;
+
+        let json = r#"{
+            "message_type": "entities_detected",
+            "entities": [
+                {"text": "John Doe", "category": "person_name", "confidence": 0.95},
+                {"text": "Acme Corp", "category": "organization", "confidence": 0.87}
+            ]
+        }"#;
+        let message = Message::Text(json.into());
+
+        let result = ElevenLabsSTT::handle_websocket_message(message, &result_tx, &mut session_id);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_speaker_turns_message() {
+        let (result_tx, _result_rx) = mpsc::channel::<STTResult>(256);
+        let mut session_id: Option<String> = None;
+
+        let json = r#"{
+            "message_type": "speaker_turns",
+            "turns": [
+                {"speaker_id": "speaker_0", "start": 0.0, "end": 2.5, "confidence": 0.95},
+                {"speaker_id": "speaker_1", "start": 2.6, "end": 5.0, "confidence": 0.87}
+            ]
+        }"#;
+        let message = Message::Text(json.into());
+
+        let result = ElevenLabsSTT::handle_websocket_message(message, &result_tx, &mut session_id);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_sensitive_data_detected_message() {
+        let (result_tx, _result_rx) = mpsc::channel::<STTResult>(256);
+        let mut session_id: Option<String> = None;
+
+        let json = r#"{
+            "message_type": "sensitive_data_detected",
+            "items": [
+                {"data_type": "ssn", "category": "pii", "confidence": 0.99},
+                {"data_type": "phone_number", "category": "pii", "confidence": 0.95}
+            ],
+            "redacted": true,
+            "redacted_transcript": "My SSN is [REDACTED] and phone is [REDACTED]"
+        }"#;
+        let message = Message::Text(json.into());
+
+        let result = ElevenLabsSTT::handle_websocket_message(message, &result_tx, &mut session_id);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_message_parsing_entities() {
+        let json = r#"{
+            "message_type": "entities_detected",
+            "entities": [
+                {"text": "John", "category": "person_name", "start": 0.0, "end": 0.5, "confidence": 0.95}
+            ]
+        }"#;
+
+        let result = ElevenLabsMessage::parse(json);
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), ElevenLabsMessage::EntitiesDetected(_)));
+    }
+
+    #[test]
+    fn test_message_parsing_speaker_turns() {
+        let json = r#"{
+            "message_type": "speaker_turns",
+            "turns": [
+                {"speaker_id": "speaker_0", "start": 0.0, "end": 1.5, "text": "Hello"}
+            ]
+        }"#;
+
+        let result = ElevenLabsMessage::parse(json);
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), ElevenLabsMessage::SpeakerTurns(_)));
+    }
+
+    #[test]
+    fn test_message_parsing_sensitive_data() {
+        let json = r#"{
+            "message_type": "sensitive_data_detected",
+            "items": [
+                {"data_type": "email", "category": "pii"}
+            ],
+            "redacted": false
+        }"#;
+
+        let result = ElevenLabsMessage::parse(json);
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), ElevenLabsMessage::SensitiveDataDetected(_)));
+    }
+
+    #[test]
+    fn test_message_helper_methods() {
+        // Test entities detected
+        let json = r#"{"message_type": "entities_detected", "entities": []}"#;
+        let msg = ElevenLabsMessage::parse(json).unwrap();
+        assert!(msg.has_entities());
+        assert!(!msg.has_speaker_turns());
+        assert!(!msg.has_sensitive_data());
+
+        // Test speaker turns
+        let json = r#"{"message_type": "speaker_turns", "turns": []}"#;
+        let msg = ElevenLabsMessage::parse(json).unwrap();
+        assert!(!msg.has_entities());
+        assert!(msg.has_speaker_turns());
+        assert!(!msg.has_sensitive_data());
+
+        // Test sensitive data
+        let json = r#"{"message_type": "sensitive_data_detected", "items": [], "redacted": false}"#;
+        let msg = ElevenLabsMessage::parse(json).unwrap();
+        assert!(!msg.has_entities());
+        assert!(!msg.has_speaker_turns());
+        assert!(msg.has_sensitive_data());
     }
 }

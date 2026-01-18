@@ -324,6 +324,52 @@ impl ElevenLabsSTT {
                             }
                         }
 
+                        ElevenLabsMessage::EntitiesDetected(entities_msg) => {
+                            // Log detected entities for now
+                            // In future, this could be stored and attached to the STTResult
+                            debug!(
+                                "Detected {} entities in transcript",
+                                entities_msg.entities.len()
+                            );
+                            for entity in &entities_msg.entities {
+                                debug!(
+                                    "  Entity: '{}' ({}), confidence: {:?}",
+                                    entity.text, entity.category, entity.confidence
+                                );
+                            }
+                        }
+
+                        ElevenLabsMessage::SpeakerTurns(speaker_msg) => {
+                            // Log speaker turns for now
+                            // In future, this could be stored and attached to the STTResult
+                            debug!(
+                                "Received {} speaker turns",
+                                speaker_msg.turns.len()
+                            );
+                            for turn in &speaker_msg.turns {
+                                debug!(
+                                    "  Speaker {}: {:.2}s - {:.2}s, confidence: {:?}",
+                                    turn.speaker_id, turn.start, turn.end, turn.confidence
+                                );
+                            }
+                        }
+
+                        ElevenLabsMessage::SensitiveDataDetected(sensitive_msg) => {
+                            // Log sensitive data detection (without revealing actual values)
+                            // In future, this could be stored and attached to the STTResult
+                            debug!(
+                                "Detected {} sensitive data items (redacted: {})",
+                                sensitive_msg.items.len(),
+                                sensitive_msg.redacted
+                            );
+                            for item in &sensitive_msg.items {
+                                debug!(
+                                    "  Sensitive data type: '{}', category: {:?}",
+                                    item.data_type, item.category
+                                );
+                            }
+                        }
+
                         ElevenLabsMessage::Error(err) => {
                             let error_msg = format!(
                                 "ElevenLabs STT error ({}): {}",
@@ -641,6 +687,7 @@ impl BaseSTT for ElevenLabsSTT {
             min_silence_duration_ms: Some(300),    // 300ms silence for end-of-speech
             enable_logging: false,
             region: ElevenLabsRegion::Default,
+            ..Default::default()
         };
 
         Ok(Self {
@@ -782,6 +829,13 @@ impl BaseSTT for ElevenLabsSTT {
                 .as_ref()
                 .map(|c| c.region)
                 .unwrap_or(ElevenLabsRegion::Default),
+            // Preserve advanced feature settings from existing config
+            keyterms: existing.as_ref().and_then(|c| c.keyterms.clone()),
+            enable_entity_detection: existing.as_ref().and_then(|c| c.enable_entity_detection),
+            enable_diarization: existing.as_ref().and_then(|c| c.enable_diarization),
+            max_speakers: existing.as_ref().and_then(|c| c.max_speakers),
+            enable_pii_detection: existing.as_ref().and_then(|c| c.enable_pii_detection),
+            enable_phi_detection: existing.as_ref().and_then(|c| c.enable_phi_detection),
         };
 
         self.config = Some(elevenlabs_config);

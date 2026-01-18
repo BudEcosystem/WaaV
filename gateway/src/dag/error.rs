@@ -161,6 +161,14 @@ pub enum DAGError {
         error: String,
     },
 
+    /// Invalid input data for node
+    #[error("Node '{node_id}' received invalid input: expected {expected}, got {got}")]
+    InvalidInput {
+        node_id: String,
+        expected: String,
+        got: String,
+    },
+
     // ─────────────────────────────────────────────────────────────────────────────
     // Endpoint Errors
     // ─────────────────────────────────────────────────────────────────────────────
@@ -197,6 +205,14 @@ pub enum DAGError {
     /// LiveKit endpoint operation failed
     #[error("LiveKit endpoint operation failed: {0}")]
     LiveKitEndpointError(String),
+
+    /// LLM endpoint request failed
+    #[error("LLM endpoint '{provider}' model '{model}' request failed: {error}")]
+    LlmEndpointError {
+        provider: String,
+        model: String,
+        error: String,
+    },
 
     /// Webhook delivery failed
     #[error("Webhook delivery to '{url}' failed: {error}")]
@@ -322,6 +338,7 @@ impl DAGError {
                 | Self::HttpEndpointError { .. }
                 | Self::GrpcEndpointError { .. }
                 | Self::WebSocketEndpointError { .. }
+                | Self::LlmEndpointError { .. }
         )
     }
 

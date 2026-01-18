@@ -13,3 +13,5 @@ vertex.json
 libonnxruntime.so
 onnxruntime/
 dist/
+logs/
+.cargo_cleanup_daemon.pid

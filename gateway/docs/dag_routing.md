@@ -164,6 +164,74 @@ config:                  # Optional: Global DAG configuration
   type: livekit_endpoint
   room: null               # Use connection's room
   track_type: audio
+
+# LLM endpoint (OpenAI-compatible APIs)
+# Supports: OpenAI, Azure OpenAI, Ollama, vLLM, LiteLLM, Together AI, etc.
+- id: llm_chat
+  type: llm_endpoint
+  base_url: "https://api.openai.com/v1"    # Custom base URL
+  model: gpt-4o                             # Model identifier
+  api_key: "${OPENAI_API_KEY}"              # API key (env var syntax supported)
+  system_prompt: "You are a helpful voice assistant. Keep responses brief and conversational."
+  temperature: 0.7
+  max_tokens: 150
+  streaming: true                           # Enable SSE streaming
+  timeout_ms: 30000
+  headers:                                  # Extra headers (optional)
+    X-Custom-Header: "value"
+
+# LLM with Function Calling / Tools
+- id: llm_with_tools
+  type: llm_endpoint
+  base_url: "https://api.openai.com/v1"
+  model: gpt-4o
+  system_prompt: "You are a helpful assistant with access to tools."
+  tools:
+    - type: function
+      function:
+        name: get_weather
+        description: "Get current weather for a location"
+        parameters:
+          type: object
+          properties:
+            location:
+              type: string
+              description: "City name"
+          required: ["location"]
+    - type: function
+      function:
+        name: search_documents
+        description: "Search knowledge base"
+        parameters:
+          type: object
+          properties:
+            query:
+              type: string
+
+# Local LLM via Ollama
+- id: local_llm
+  type: llm_endpoint
+  base_url: "http://localhost:11434/v1"    # Ollama OpenAI-compatible endpoint
+  model: llama3.2
+  system_prompt: "You are a helpful assistant."
+  temperature: 0.8
+  streaming: true
+
+# Azure OpenAI
+- id: azure_llm
+  type: llm_endpoint
+  base_url: "https://YOUR_RESOURCE.openai.azure.com/openai/deployments/YOUR_DEPLOYMENT"
+  model: gpt-4                              # Deployment name
+  api_key: "${AZURE_OPENAI_KEY}"
+  headers:
+    api-version: "2024-02-15-preview"
+
+# OpenAI Assistant/Agent
+- id: assistant_llm
+  type: llm_endpoint
+  base_url: "https://api.openai.com/v1"
+  model: gpt-4o
+  assistant_id: "asst_abc123"              # Pre-configured OpenAI Assistant
 ```
 
 #### Output Nodes
@@ -441,6 +509,184 @@ edges:
     to: extract_response
   - from: extract_response
     to: tts
+  - from: tts
+    to: output
+
+entry_node: input
+exit_nodes: [output]
+```
+
+### Voice Bot with LLM Endpoint (Simplified)
+
+Using the dedicated `llm_endpoint` node type provides built-in conversation history, streaming support, and tool calling without manual transform nodes:
+
+```yaml
+id: voice-bot-llm-v2
+name: Voice Bot with LLM Endpoint
+nodes:
+  - id: input
+    type: audio_input
+  - id: stt
+    type: stt_provider
+    provider: deepgram
+    model: nova-2
+  - id: llm
+    type: llm_endpoint
+    base_url: "https://api.openai.com/v1"
+    model: gpt-4o
+    api_key: "${OPENAI_API_KEY}"
+    system_prompt: |
+      You are a helpful voice assistant. Keep your responses concise and conversational.
+      Respond in 1-2 sentences when possible.
+    temperature: 0.7
+    max_tokens: 150
+    streaming: true
+  - id: extract_content
+    type: transform
+    script: "data.content"
+  - id: tts
+    type: tts_provider
+    provider: elevenlabs
+    voice_id: rachel
+  - id: output
+    type: audio_output
+    destination: web_socket
+
+edges:
+  - from: input
+    to: stt
+  - from: stt
+    to: llm
+    condition: "is_speech_final"  # Only send final transcripts to LLM
+  - from: llm
+    to: extract_content
+  - from: extract_content
+    to: tts
+  - from: tts
+    to: output
+
+entry_node: input
+exit_nodes: [output]
+```
+
+### Voice Bot with Local Ollama
+
+```yaml
+id: local-voice-bot
+name: Voice Bot with Local Ollama
+nodes:
+  - id: input
+    type: audio_input
+  - id: stt
+    type: stt_provider
+    provider: deepgram
+  - id: llm
+    type: llm_endpoint
+    base_url: "http://localhost:11434/v1"  # Ollama OpenAI-compatible API
+    model: llama3.2
+    system_prompt: "You are a helpful assistant. Keep responses brief."
+    temperature: 0.8
+    streaming: true
+  - id: extract
+    type: transform
+    script: "data.content"
+  - id: tts
+    type: tts_provider
+    provider: elevenlabs
+  - id: output
+    type: audio_output
+    destination: web_socket
+
+edges:
+  - from: input
+    to: stt
+  - from: stt
+    to: llm
+    condition: "is_speech_final"
+  - from: llm
+    to: extract
+  - from: extract
+    to: tts
+  - from: tts
+    to: output
+
+entry_node: input
+exit_nodes: [output]
+```
+
+### Voice Bot with Function Calling
+
+```yaml
+id: voice-bot-tools
+name: Voice Bot with Tool Calling
+nodes:
+  - id: input
+    type: audio_input
+  - id: stt
+    type: stt_provider
+    provider: deepgram
+  - id: llm
+    type: llm_endpoint
+    base_url: "https://api.openai.com/v1"
+    model: gpt-4o
+    api_key: "${OPENAI_API_KEY}"
+    system_prompt: |
+      You are a voice assistant that can check the weather and search for information.
+      When the user asks about weather, use the get_weather function.
+      When they want to search, use the search function.
+    tools:
+      - type: function
+        function:
+          name: get_weather
+          description: "Get current weather for a city"
+          parameters:
+            type: object
+            properties:
+              city:
+                type: string
+                description: "City name"
+            required: ["city"]
+      - type: function
+        function:
+          name: search
+          description: "Search for information"
+          parameters:
+            type: object
+            properties:
+              query:
+                type: string
+            required: ["query"]
+  - id: check_tool_calls
+    type: router
+    routes:
+      - condition: "data.tool_calls != null"
+        target: tool_executor
+      - target: tts
+        default: true
+  - id: tool_executor
+    type: http_endpoint
+    url: "https://api.yourapp.com/execute-tool"
+    method: POST
+  - id: tts
+    type: tts_provider
+    provider: elevenlabs
+  - id: output
+    type: audio_output
+
+edges:
+  - from: input
+    to: stt
+  - from: stt
+    to: llm
+    condition: "is_speech_final"
+  - from: llm
+    to: check_tool_calls
+  - from: check_tool_calls
+    to: tool_executor
+  - from: check_tool_calls
+    to: tts
+  - from: tool_executor
+    to: llm  # Send tool results back to LLM
   - from: tts
     to: output
 

@@ -702,7 +702,7 @@ mod tests {
 
     #[test]
     fn test_sip_transfer_within_limit() {
-        let transfer_to = "+".to_string() + &"1".repeat(MAX_SIP_TRANSFER_TO_SIZE - 1);
+        let transfer_to = format!("+{}", "1".repeat(MAX_SIP_TRANSFER_TO_SIZE - 1));
         let msg = IncomingMessage::SIPTransfer { transfer_to };
         assert!(msg.validate_size().is_ok());
     }
@@ -730,6 +730,7 @@ mod tests {
             stt_config: None,
             tts_config: None,
             livekit: None,
+            dag_config: None,
         };
         assert!(msg.validate_size().is_ok());
     }

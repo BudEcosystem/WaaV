@@ -18,6 +18,175 @@ use crate::dag::definition::HttpMethod;
 use crate::dag::error::{DAGError, DAGResult};
 use crate::livekit::LiveKitClient;
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+/// Validate a URL for SSRF (Server-Side Request Forgery) protection
+///
+/// This function checks that the URL:
+/// - Is a valid URL with HTTP/HTTPS/WS/WSS scheme
+/// - Does not point to localhost, loopback, or link-local addresses
+/// - Does not point to private IP ranges
+/// - Does not use blocked cloud metadata endpoints
+///
+/// Returns the validated URL or an error if validation fails.
+pub fn validate_url_for_ssrf(url: &str) -> DAGResult<()> {
+    // Parse URL
+    let parsed = url::Url::parse(url).map_err(|e| {
+        DAGError::ConfigError(format!("Invalid URL '{}': {}", url, e))
+    })?;
+
+    // Check scheme
+    let scheme = parsed.scheme().to_lowercase();
+    if !["http", "https", "ws", "wss"].contains(&scheme.as_str()) {
+        return Err(DAGError::ConfigError(format!(
+            "URL scheme '{}' not allowed. Use http, https, ws, or wss",
+            scheme
+        )));
+    }
+
+    // Get host
+    let host = parsed.host_str().ok_or_else(|| {
+        DAGError::ConfigError(format!("URL '{}' has no host", url))
+    })?;
+
+    // Check for blocked hostnames (case-insensitive)
+    let host_lower = host.to_lowercase();
+    let blocked_hostnames = [
+        "localhost",
+        "localhost.localdomain",
+        "127.0.0.1",
+        "::1",
+        "0.0.0.0",
+        "[::1]",
+        "[::ffff:127.0.0.1]",
+        // AWS metadata endpoints
+        "169.254.169.254",
+        "metadata.google.internal",
+        "metadata.gcp.internal",
+        // Azure metadata endpoint
+        "169.254.169.254",
+        // Common internal hostnames
+        "internal",
+        "intranet",
+    ];
+
+    for blocked in blocked_hostnames.iter() {
+        if host_lower == *blocked {
+            return Err(DAGError::ConfigError(format!(
+                "URL host '{}' is blocked (SSRF protection)",
+                host
+            )));
+        }
+    }
+
+    // Try to parse as IP address
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_private_ip(&ip) {
+            return Err(DAGError::ConfigError(format!(
+                "URL points to private IP '{}' (SSRF protection)",
+                ip
+            )));
+        }
+    }
+
+    // Check for IPv6 addresses in brackets
+    if host.starts_with('[') && host.ends_with(']') {
+        let ip_str = &host[1..host.len() - 1];
+        if let Ok(ip) = ip_str.parse::<Ipv6Addr>() {
+            if is_private_ipv6(&ip) {
+                return Err(DAGError::ConfigError(format!(
+                    "URL points to private IPv6 '{}' (SSRF protection)",
+                    ip
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if an IP address is private/internal
+fn is_private_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_private_ipv4(v4),
+        IpAddr::V6(v6) => is_private_ipv6(v6),
+    }
+}
+
+/// Check if an IPv4 address is private/internal
+fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
+    // Loopback: 127.0.0.0/8
+    if ip.is_loopback() {
+        return true;
+    }
+
+    // Link-local: 169.254.0.0/16 (includes AWS metadata endpoint)
+    if ip.is_link_local() {
+        return true;
+    }
+
+    // Private ranges
+    // 10.0.0.0/8
+    if ip.octets()[0] == 10 {
+        return true;
+    }
+
+    // 172.16.0.0/12
+    let first = ip.octets()[0];
+    let second = ip.octets()[1];
+    if first == 172 && (16..=31).contains(&second) {
+        return true;
+    }
+
+    // 192.168.0.0/16
+    if first == 192 && second == 168 {
+        return true;
+    }
+
+    // 0.0.0.0/8 (current network)
+    if first == 0 {
+        return true;
+    }
+
+    // Broadcast
+    if ip.is_broadcast() {
+        return true;
+    }
+
+    false
+}
+
+/// Check if an IPv6 address is private/internal
+fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
+    // Loopback: ::1
+    if ip.is_loopback() {
+        return true;
+    }
+
+    // Unspecified: ::
+    if ip.is_unspecified() {
+        return true;
+    }
+
+    // IPv4-mapped addresses (check the embedded IPv4)
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_private_ipv4(&v4);
+    }
+
+    // Link-local: fe80::/10
+    let segments = ip.segments();
+    if segments[0] >= 0xfe80 && segments[0] <= 0xfebf {
+        return true;
+    }
+
+    // Unique local: fc00::/7
+    if segments[0] >= 0xfc00 && segments[0] <= 0xfdff {
+        return true;
+    }
+
+    false
+}
+
 /// Generic bytes codec for gRPC calls without proto definitions.
 ///
 /// This codec allows calling any gRPC service by sending and receiving
@@ -93,6 +262,9 @@ impl HttpEndpointNode {
     /// - Connection pooling enabled (default)
     /// - Keep-alive connections (default)
     /// - Automatic redirect following (default)
+    ///
+    /// Note: This constructor does NOT validate the URL for SSRF attacks.
+    /// Use `try_new()` for production code that needs SSRF protection.
     pub fn new(id: impl Into<String>, url: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -102,6 +274,27 @@ impl HttpEndpointNode {
             timeout_ms: 30000,
             client: reqwest::Client::new(),
         }
+    }
+
+    /// Create a new HTTP endpoint node with URL validation
+    ///
+    /// Validates the URL against SSRF attacks:
+    /// - Blocks localhost, loopback, link-local addresses
+    /// - Blocks private IP ranges (10.x.x.x, 172.16-31.x.x, 192.168.x.x)
+    /// - Blocks cloud metadata endpoints
+    ///
+    /// Returns an error if the URL is invalid or blocked.
+    pub fn try_new(id: impl Into<String>, url: impl Into<String>) -> DAGResult<Self> {
+        let url_str = url.into();
+        validate_url_for_ssrf(&url_str)?;
+        Ok(Self {
+            id: id.into(),
+            url: url_str,
+            method: HttpMethod::POST,
+            headers: HashMap::new(),
+            timeout_ms: 30000,
+            client: reqwest::Client::new(),
+        })
     }
 
     /// Set HTTP method
@@ -553,6 +746,9 @@ pub struct WebSocketEndpointNode {
 
 impl WebSocketEndpointNode {
     /// Create a new WebSocket endpoint node
+    ///
+    /// Note: This constructor does NOT validate the URL for SSRF attacks.
+    /// Use `try_new()` for production code that needs SSRF protection.
     pub fn new(id: impl Into<String>, url: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -560,6 +756,25 @@ impl WebSocketEndpointNode {
             headers: HashMap::new(),
             timeout_ms: 30000,
         }
+    }
+
+    /// Create a new WebSocket endpoint node with URL validation
+    ///
+    /// Validates the URL against SSRF attacks:
+    /// - Blocks localhost, loopback, link-local addresses
+    /// - Blocks private IP ranges
+    /// - Blocks cloud metadata endpoints
+    ///
+    /// Returns an error if the URL is invalid or blocked.
+    pub fn try_new(id: impl Into<String>, url: impl Into<String>) -> DAGResult<Self> {
+        let url_str = url.into();
+        validate_url_for_ssrf(&url_str)?;
+        Ok(Self {
+            id: id.into(),
+            url: url_str,
+            headers: HashMap::new(),
+            timeout_ms: 30000,
+        })
     }
 
     /// Add a header

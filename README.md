@@ -31,7 +31,7 @@
 WaaV eliminates the complexity of integrating with multiple voice AI providers by providing a single WebSocket and REST API that abstracts away provider-specific implementations. Switch between Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, IBM Watson, Groq, or LMNT with a simple configuration change—no code modifications required.
 
 **Key Highlights:**
-- **12 STT/TTS Providers** - Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, IBM Watson, Groq, Hume AI, LMNT
+- **[70+ Cloud Providers](gateway/docs/SUPPORTED_PROVIDERS.md)** - Global STT/TTS coverage including Deepgram, ElevenLabs, Google Cloud, Azure, OpenAI, plus regional providers for India (Sarvam, Gnani, Bhashini), China (Alibaba, Baidu, Tencent, iFlytek), Southeast Asia (Zalo, FPT, NECTEC), and more
 - **DAG Pipeline Engine** - Build custom voice workflows with conditional routing, multi-provider orchestration, and data transformations
 - **OpenAI & Hume AI Realtime** - Full-duplex audio-to-audio streaming with GPT-4o and Hume EVI
 - **WebSocket Streaming** - Real-time bidirectional audio with sub-second latency
@@ -184,7 +184,7 @@ Intelligent end-of-turn detection using ONNX Runtime with LiveKit's turn-detecto
 - **WebSocket Streaming** (`/ws`) - Real-time bidirectional audio/text with provider switching
 - **REST API** - TTS synthesis, voice listing, health checks
 - **LiveKit Integration** - WebRTC rooms, SIP webhooks, participant management
-- **Multi-Provider Support** - Unified interface across 12+ major providers
+- **Multi-Provider Support** - Unified interface across [70+ global providers](gateway/docs/SUPPORTED_PROVIDERS.md)
 - **Audio Caching** - Intelligent TTS response caching with XXH3 hashing
 - **Rate Limiting** - Token bucket per-IP rate limiting with configurable limits
 - **JWT Authentication** - Optional API authentication with external validation
@@ -217,41 +217,36 @@ cargo build --release --features dag-routing,turn-detect,noise-filter,openapi
 
 ## Providers
 
-### Speech-to-Text (STT)
+> **[View All 70+ Supported Providers](gateway/docs/SUPPORTED_PROVIDERS.md)** - Complete documentation for STT, TTS, and Realtime providers across all regions.
 
-| Provider | Protocol | Models | Features |
-|----------|----------|--------|----------|
-| **Deepgram** | WebSocket | nova-3, nova-2, whisper | Streaming, interim results, VAD, punctuation |
-| **Google Cloud** | gRPC | chirp, latest_long, latest_short | Streaming, automatic punctuation |
-| **ElevenLabs** | WebSocket | Flash, Eleven, ElevenScribe | Streaming STT, VAD-based |
-| **Azure** | WebSocket | Neural models | Streaming, interim results |
-| **Cartesia** | WebSocket | ink-whisper | Low-latency streaming |
-| **OpenAI** | REST | whisper-1, gpt-4o-transcribe | Batch transcription, 57+ languages |
-| **Amazon Transcribe** | AWS SDK | Streaming | 100+ languages, speaker diarization, PII redaction |
-| **IBM Watson** | WebSocket | Next-gen models | 30+ languages, speaker diarization, smart formatting |
-| **Groq** | REST | whisper-large-v3, whisper-large-v3-turbo | Ultra-fast (216x real-time), translation endpoint |
+WaaV Gateway supports **27 STT providers**, **32 TTS providers**, and **2 Realtime providers** with global coverage including specialized regional providers.
 
-### Text-to-Speech (TTS)
+### Speech-to-Text (STT) - 27 Providers
 
-| Provider | Protocol | Voices | Features |
-|----------|----------|--------|----------|
-| **Deepgram** | HTTP | 102 Aura voices | Multiple languages, streaming |
-| **ElevenLabs** | WebSocket | Premium voices | Voice tuning, pronunciation, streaming |
-| **Google Cloud** | gRPC | WaveNet, Neural2 | SSML support, multiple languages |
-| **Azure** | WebSocket | 400+ neural voices | SSML, streaming |
-| **Cartesia** | WebSocket | Sonic-3, custom clones | Low-latency, voice mixing |
-| **OpenAI** | HTTP | 11 voices (alloy, nova, etc.) | tts-1, tts-1-hd, gpt-4o-mini-tts |
-| **Amazon Polly** | AWS SDK | 60+ voices (Joanna, Matthew, etc.) | Neural, Standard, Generative engines, SSML |
-| **IBM Watson** | HTTP | 30+ V3 neural voices | 15+ languages, SSML, rate/pitch control |
-| **Hume AI** | HTTP/WebSocket | Octave voices | Natural language emotion control, voice cloning, acting instructions |
-| **LMNT** | HTTP | lily, and custom clones | Low-latency (~150ms), voice cloning, 22+ languages |
+| Category | Providers |
+|----------|-----------|
+| **Global Leaders** | Deepgram, Google Cloud, Azure, OpenAI, ElevenLabs, AssemblyAI, Cartesia, AWS Transcribe, IBM Watson, Groq |
+| **European** | Speechmatics, Gladia, Rev AI, Phonexia, Acapela, Cereproc |
+| **Russia/CIS** | Yandex SpeechKit, Tinkoff VoiceKit, SberDevices |
+| **India** | Sarvam AI, Gnani.ai, Reverie, Bhashini |
+| **China** | iFlytek, Alibaba Cloud, Baidu AI, Tencent Cloud, Huawei Cloud |
+| **East Asia** | NAVER CLOVA (Korea), AmiVoice (Japan) |
+| **Southeast Asia** | Zalo AI, FPT.AI, Viettel AI (Vietnam), Prosa.ai (Indonesia), NECTEC (Thailand) |
 
-### Audio-to-Audio (Realtime)
+### Text-to-Speech (TTS) - 32 Providers
 
-| Provider | Protocol | Models | Features |
-|----------|----------|--------|----------|
-| **OpenAI** | WebSocket | gpt-4o-realtime-preview | Full-duplex streaming, function calling, VAD |
-| **Hume AI EVI** | WebSocket | EVI 3 | Empathic voice interface, 48 emotion dimensions, prosody analysis |
+| Category | Providers |
+|----------|-----------|
+| **Global Leaders** | Deepgram, Google Cloud, Azure, OpenAI, ElevenLabs, Cartesia, AWS Polly, IBM Watson |
+| **Voice Cloning** | Hume AI, LMNT, Play.ht, Murf.ai, WellSaid Labs, Resemble AI, Speechify, Unreal Speech, Smallest.ai |
+| **Regional** | Yandex, Tinkoff, SberDevices, Sarvam AI, Gnani.ai, Reverie, Bhashini, iFlytek, Alibaba, Baidu, Tencent, Huawei, NAVER CLOVA, Zalo, FPT, Viettel, Prosa, NECTEC |
+
+### Audio-to-Audio (Realtime) - 2 Providers
+
+| Provider | Protocol | Features |
+|----------|----------|----------|
+| **OpenAI Realtime** | WebSocket | GPT-4o full-duplex streaming, function calling, VAD |
+| **Hume AI EVI** | WebSocket | Empathic voice interface, 48 emotion dimensions, prosody analysis |
 
 ---
 

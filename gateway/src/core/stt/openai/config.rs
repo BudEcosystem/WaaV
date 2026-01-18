@@ -72,6 +72,7 @@ impl std::fmt::Display for OpenAISTTModel {
 /// - `json`: Simple JSON with transcript text
 /// - `text`: Plain text transcript
 /// - `verbose_json`: JSON with word-level timestamps and metadata
+/// - `diarized_json`: JSON with speaker diarization (GPT-4o-transcribe only)
 /// - `srt`: SubRip subtitle format
 /// - `vtt`: WebVTT subtitle format
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -84,6 +85,12 @@ pub enum ResponseFormat {
     Text,
     /// Verbose JSON with word timestamps and metadata
     VerboseJson,
+    /// Diarized JSON with speaker labels (requires gpt-4o-transcribe)
+    ///
+    /// Returns segments with speaker assignments and word-level timing.
+    /// Each segment includes a `speaker` field identifying the speaker.
+    #[serde(rename = "diarized_json")]
+    DiarizedJson,
     /// SubRip subtitle format
     Srt,
     /// WebVTT subtitle format
@@ -98,9 +105,22 @@ impl ResponseFormat {
             Self::Json => "json",
             Self::Text => "text",
             Self::VerboseJson => "verbose_json",
+            Self::DiarizedJson => "diarized_json",
             Self::Srt => "srt",
             Self::Vtt => "vtt",
         }
+    }
+
+    /// Check if this format supports diarization.
+    #[inline]
+    pub fn supports_diarization(&self) -> bool {
+        matches!(self, Self::DiarizedJson)
+    }
+
+    /// Check if this format returns word-level timestamps.
+    #[inline]
+    pub fn has_word_timestamps(&self) -> bool {
+        matches!(self, Self::VerboseJson | Self::DiarizedJson)
     }
 }
 
@@ -194,6 +214,194 @@ impl AudioInputFormat {
             Self::M4a => "m4a",
             Self::Webm => "webm",
         }
+    }
+}
+
+// =============================================================================
+// Chunking Strategy (Server-side VAD)
+// =============================================================================
+
+/// Chunking strategy type for server-side processing.
+///
+/// Controls how the audio is chunked for processing. Currently only
+/// server_vad is supported for automatic voice activity detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChunkingStrategyType {
+    /// Server-side Voice Activity Detection
+    #[default]
+    #[serde(rename = "server_vad")]
+    ServerVad,
+}
+
+impl ChunkingStrategyType {
+    /// Convert to the API parameter value.
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ServerVad => "server_vad",
+        }
+    }
+}
+
+/// Configuration for server-side voice activity detection chunking.
+///
+/// When using `server_vad` chunking, the server automatically detects
+/// speech boundaries and segments the audio accordingly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkingStrategy {
+    /// The type of chunking strategy (currently only server_vad).
+    #[serde(rename = "type")]
+    pub strategy_type: ChunkingStrategyType,
+
+    /// Activation threshold for voice detection (0.0 to 1.0).
+    ///
+    /// Lower values make the VAD more sensitive to speech.
+    /// Default is 0.5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f32>,
+
+    /// Amount of audio to include before speech starts (in milliseconds).
+    ///
+    /// Helps capture the beginning of utterances.
+    /// Default is typically around 200-500ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_padding_ms: Option<u32>,
+
+    /// Duration of silence to wait before considering speech ended (in milliseconds).
+    ///
+    /// Higher values wait longer before segmenting, useful for speakers
+    /// with longer pauses.
+    /// Default is typically around 500-1000ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub silence_duration_ms: Option<u32>,
+}
+
+impl Default for ChunkingStrategy {
+    fn default() -> Self {
+        Self {
+            strategy_type: ChunkingStrategyType::default(),
+            threshold: Some(0.5),
+            prefix_padding_ms: Some(300),
+            silence_duration_ms: Some(500),
+        }
+    }
+}
+
+// =============================================================================
+// Speaker Reference (for Known Speaker Recognition)
+// =============================================================================
+
+/// Reference audio for a known speaker.
+///
+/// Used to provide sample audio of known speakers to improve
+/// speaker identification accuracy in diarization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeakerReference {
+    /// Name/identifier for this speaker.
+    ///
+    /// This name will be used in the diarization output instead of
+    /// generic speaker IDs like "speaker_0".
+    pub name: String,
+
+    /// Base64-encoded audio sample of this speaker.
+    ///
+    /// The audio should be a clear sample of the speaker's voice,
+    /// typically 3-10 seconds of speech.
+    pub audio: String,
+}
+
+impl SpeakerReference {
+    /// Create a new speaker reference.
+    pub fn new(name: impl Into<String>, audio_base64: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            audio: audio_base64.into(),
+        }
+    }
+}
+
+// =============================================================================
+// Diarization Configuration
+// =============================================================================
+
+/// Configuration for speaker diarization.
+///
+/// Controls how speakers are identified and labeled in the transcription.
+/// Only applies when using `DiarizedJson` response format.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DiarizationConfig {
+    /// Whether to include log probabilities in the output.
+    ///
+    /// When enabled, each token includes its log probability,
+    /// useful for confidence scoring.
+    #[serde(default)]
+    pub include_logprobs: bool,
+
+    /// List of known speaker names.
+    ///
+    /// If provided, the API will try to match detected speakers
+    /// to these names when possible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub known_speaker_names: Vec<String>,
+
+    /// Reference audio samples for known speakers.
+    ///
+    /// Providing audio samples helps the model identify specific
+    /// speakers more accurately.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speaker_references: Vec<SpeakerReference>,
+
+    /// Server-side chunking/VAD configuration.
+    ///
+    /// Controls how the audio is segmented for processing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunking_strategy: Option<ChunkingStrategy>,
+}
+
+impl DiarizationConfig {
+    /// Create a new diarization config with known speaker names.
+    pub fn with_speakers(names: Vec<String>) -> Self {
+        Self {
+            known_speaker_names: names,
+            ..Default::default()
+        }
+    }
+
+    /// Check if any speaker references are provided.
+    #[inline]
+    pub fn has_speaker_references(&self) -> bool {
+        !self.speaker_references.is_empty()
+    }
+
+    /// Validate the diarization configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        // Validate chunking strategy threshold
+        if let Some(ref strategy) = self.chunking_strategy {
+            if let Some(threshold) = strategy.threshold {
+                if !(0.0..=1.0).contains(&threshold) {
+                    return Err(format!(
+                        "Chunking threshold must be between 0.0 and 1.0, got {}",
+                        threshold
+                    ));
+                }
+            }
+        }
+
+        // Validate speaker references have both name and audio
+        for (i, speaker) in self.speaker_references.iter().enumerate() {
+            if speaker.name.is_empty() {
+                return Err(format!("Speaker reference {} has empty name", i));
+            }
+            if speaker.audio.is_empty() {
+                return Err(format!(
+                    "Speaker reference '{}' has empty audio",
+                    speaker.name
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -297,6 +505,12 @@ pub struct OpenAISTTConfig {
 
     /// Silence detection configuration for OnSilence flush strategy.
     pub silence_detection: SilenceDetectionConfig,
+
+    /// Diarization configuration for speaker identification.
+    ///
+    /// Only used when `response_format` is `DiarizedJson`.
+    /// Requires `gpt-4o-transcribe` or `gpt-4o-mini-transcribe` model.
+    pub diarization: DiarizationConfig,
 }
 
 /// Configuration for silence detection.
@@ -343,6 +557,7 @@ impl Default for OpenAISTTConfig {
             flush_threshold_bytes: 1024 * 1024,    // 1MB
             max_file_size_bytes: 25 * 1024 * 1024, // 25MB (OpenAI limit)
             silence_detection: SilenceDetectionConfig::default(),
+            diarization: DiarizationConfig::default(),
         }
     }
 }
@@ -393,7 +608,35 @@ impl OpenAISTTConfig {
             ));
         }
 
+        // Validate diarization configuration
+        self.diarization.validate()?;
+
+        // Validate that diarized_json format is only used with compatible models
+        if self.response_format == ResponseFormat::DiarizedJson {
+            if !self.supports_diarization() {
+                return Err(format!(
+                    "Diarized JSON format requires gpt-4o-transcribe or gpt-4o-mini-transcribe model, got {}",
+                    self.model
+                ));
+            }
+        }
+
         Ok(())
+    }
+
+    /// Check if the current model supports diarization.
+    #[inline]
+    pub fn supports_diarization(&self) -> bool {
+        matches!(
+            self.model,
+            OpenAISTTModel::Gpt4oTranscribe | OpenAISTTModel::Gpt4oMiniTranscribe
+        )
+    }
+
+    /// Check if diarization is enabled.
+    #[inline]
+    pub fn is_diarization_enabled(&self) -> bool {
+        self.response_format == ResponseFormat::DiarizedJson && self.supports_diarization()
     }
 }
 
@@ -513,5 +756,163 @@ mod tests {
         assert_eq!(config.temperature, Some(0.0));
         assert_eq!(config.flush_threshold_bytes, 1024 * 1024);
         assert_eq!(config.max_file_size_bytes, 25 * 1024 * 1024);
+    }
+
+    // =========================================================================
+    // Diarization Tests
+    // =========================================================================
+
+    #[test]
+    fn test_response_format_diarized_json() {
+        assert_eq!(ResponseFormat::DiarizedJson.as_str(), "diarized_json");
+        assert!(ResponseFormat::DiarizedJson.supports_diarization());
+        assert!(ResponseFormat::DiarizedJson.has_word_timestamps());
+        assert!(!ResponseFormat::Json.supports_diarization());
+    }
+
+    #[test]
+    fn test_chunking_strategy_default() {
+        let strategy = ChunkingStrategy::default();
+        assert_eq!(strategy.strategy_type, ChunkingStrategyType::ServerVad);
+        assert_eq!(strategy.threshold, Some(0.5));
+        assert_eq!(strategy.prefix_padding_ms, Some(300));
+        assert_eq!(strategy.silence_duration_ms, Some(500));
+    }
+
+    #[test]
+    fn test_speaker_reference_new() {
+        let reference = SpeakerReference::new("John", "base64audio==");
+        assert_eq!(reference.name, "John");
+        assert_eq!(reference.audio, "base64audio==");
+    }
+
+    #[test]
+    fn test_diarization_config_default() {
+        let config = DiarizationConfig::default();
+        assert!(!config.include_logprobs);
+        assert!(config.known_speaker_names.is_empty());
+        assert!(config.speaker_references.is_empty());
+        assert!(config.chunking_strategy.is_none());
+    }
+
+    #[test]
+    fn test_diarization_config_with_speakers() {
+        let config =
+            DiarizationConfig::with_speakers(vec!["Alice".to_string(), "Bob".to_string()]);
+        assert_eq!(config.known_speaker_names.len(), 2);
+        assert_eq!(config.known_speaker_names[0], "Alice");
+        assert_eq!(config.known_speaker_names[1], "Bob");
+    }
+
+    #[test]
+    fn test_diarization_config_validate_valid() {
+        let config = DiarizationConfig {
+            include_logprobs: true,
+            known_speaker_names: vec!["Alice".to_string()],
+            speaker_references: vec![SpeakerReference::new("Bob", "audio==")],
+            chunking_strategy: Some(ChunkingStrategy::default()),
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_diarization_config_validate_invalid_threshold() {
+        let config = DiarizationConfig {
+            chunking_strategy: Some(ChunkingStrategy {
+                strategy_type: ChunkingStrategyType::ServerVad,
+                threshold: Some(1.5), // Invalid: > 1.0
+                prefix_padding_ms: None,
+                silence_duration_ms: None,
+            }),
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("threshold"));
+    }
+
+    #[test]
+    fn test_diarization_config_validate_empty_speaker_name() {
+        let config = DiarizationConfig {
+            speaker_references: vec![SpeakerReference::new("", "audio==")],
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty name"));
+    }
+
+    #[test]
+    fn test_diarization_config_validate_empty_speaker_audio() {
+        let config = DiarizationConfig {
+            speaker_references: vec![SpeakerReference::new("Alice", "")],
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty audio"));
+    }
+
+    #[test]
+    fn test_config_supports_diarization() {
+        let whisper_config = OpenAISTTConfig {
+            model: OpenAISTTModel::Whisper1,
+            ..Default::default()
+        };
+        assert!(!whisper_config.supports_diarization());
+
+        let gpt4o_config = OpenAISTTConfig {
+            model: OpenAISTTModel::Gpt4oTranscribe,
+            ..Default::default()
+        };
+        assert!(gpt4o_config.supports_diarization());
+
+        let gpt4o_mini_config = OpenAISTTConfig {
+            model: OpenAISTTModel::Gpt4oMiniTranscribe,
+            ..Default::default()
+        };
+        assert!(gpt4o_mini_config.supports_diarization());
+    }
+
+    #[test]
+    fn test_config_is_diarization_enabled() {
+        let config = OpenAISTTConfig {
+            base: STTConfig {
+                api_key: "test".to_string(),
+                ..Default::default()
+            },
+            model: OpenAISTTModel::Gpt4oTranscribe,
+            response_format: ResponseFormat::DiarizedJson,
+            ..Default::default()
+        };
+        assert!(config.is_diarization_enabled());
+
+        let config_no_diarize = OpenAISTTConfig {
+            model: OpenAISTTModel::Gpt4oTranscribe,
+            response_format: ResponseFormat::VerboseJson,
+            ..Default::default()
+        };
+        assert!(!config_no_diarize.is_diarization_enabled());
+    }
+
+    #[test]
+    fn test_config_validate_diarization_wrong_model() {
+        let config = OpenAISTTConfig {
+            base: STTConfig {
+                api_key: "test".to_string(),
+                ..Default::default()
+            },
+            model: OpenAISTTModel::Whisper1,
+            response_format: ResponseFormat::DiarizedJson,
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("gpt-4o-transcribe"));
+    }
+
+    #[test]
+    fn test_chunking_strategy_type_as_str() {
+        assert_eq!(ChunkingStrategyType::ServerVad.as_str(), "server_vad");
     }
 }

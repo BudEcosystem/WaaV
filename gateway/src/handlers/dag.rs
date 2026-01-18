@@ -10,6 +10,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+#[cfg(feature = "dag-routing")]
 use tracing::{debug, warn};
 
 use crate::state::AppState;

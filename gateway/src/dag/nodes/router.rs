@@ -339,15 +339,17 @@ impl JoinNode {
 
         // Interpret the result
         if let Some(idx) = result.clone().try_cast::<i64>() {
-            // Result is an index
+            // Result is an index - validate bounds
             let idx = idx as usize;
-            if idx < results.len() {
-                return Ok(results.into_iter().nth(idx).unwrap());
-            } else {
+            if idx >= results.len() {
                 return Err(DAGError::ConditionError(format!(
                     "Selector returned invalid index {} for {} results", idx, results.len()
                 )));
             }
+            // Safe access using swap_remove for O(1) performance
+            // We know idx is valid from the bounds check above
+            let mut results = results;
+            return Ok(results.swap_remove(idx));
         }
 
         // Result might be a map/object - convert back to DAGData
@@ -759,10 +761,9 @@ mod tests {
         ]);
 
         let output = node.execute(input, &mut ctx).await.unwrap();
-        if let DAGData::Text(text) = output {
-            assert_eq!(text, "first");
-        } else {
-            panic!("Expected text output");
+        match output {
+            DAGData::Text(text) => assert_eq!(text, "first"),
+            other => panic!("Expected DAGData::Text, got {:?}", other.type_name()),
         }
     }
 

@@ -90,6 +90,54 @@ providers:
   playht_api_key: ""                             # ENV: PLAYHT_API_KEY
   playht_user_id: ""                             # ENV: PLAYHT_USER_ID (required for dual-header auth)
 
+  # Murf.ai API key (used for TTS)
+  # TTS: HTTP streaming with ultra-low latency (~130ms TTFA for Falcon model)
+  # Models: Falcon (real-time, low latency), Gen2 (studio quality with pitch/rate/style)
+  # 150+ voices across 35+ languages, 20+ speaking styles
+  # 12 regional endpoints for data residency and latency optimization
+  # Get from Murf dashboard: https://murf.ai/api/docs
+  murf_api_key: ""                               # ENV: MURF_API_KEY
+
+  # WellSaid Labs API key (used for TTS)
+  # TTS: HTTP streaming with premium AI voices, 10x faster than real-time
+  # Models: Legacy (20+ languages), Caruso (English only, AI Director pitch/tempo/loudness)
+  # 200+ voice avatars across multiple styles (Narration, Promo, Conversational)
+  # SOC2 certified, GDPR compliant, EU AI Act-ready
+  # Get from WellSaid dashboard: https://wellsaid.io
+  wellsaid_api_key: ""                           # ENV: WELLSAID_API_KEY
+
+  # Resemble AI API key (used for TTS)
+  # TTS: HTTP streaming with voice cloning and 149+ languages
+  # Models: Chatterbox (standard), Chatterbox-Turbo (low-latency 75ms), Chatterbox-Multilingual
+  # Features: Voice cloning (10s rapid, 10min professional), Speech-to-Speech, Deepfake detection
+  # Supports paralinguistic tags [cough], [laugh] with Turbo model
+  # Get from Resemble AI dashboard: https://app.resemble.ai
+  resemble_api_key: ""                           # ENV: RESEMBLE_API_KEY
+
+  # Speechify API key (used for TTS)
+  # TTS: HTTP streaming with 50+ languages and 1000+ voices
+  # Models: simba-english (English), simba-turbo (low-latency with emotion), simba-multilingual (50+ languages)
+  # Features: Voice cloning from 10-30s audio, SSML support, loudness normalization
+  # Pricing: $10/1M characters, 50K free tier
+  # Get from Speechify console: https://console.sws.speechify.com
+  speechify_api_key: ""                          # ENV: SPEECHIFY_API_KEY
+
+  # Unreal Speech API key (used for TTS)
+  # TTS: HTTP streaming with ultra-low latency (~300ms TTFA)
+  # Models: V8 Kokoro (48 voices, 8 languages) and Legacy (5 English voices)
+  # Features: Speed control (-1.0 to 1.0), Pitch control (0.5 to 1.5), Bitrate (16k-320k)
+  # Pricing: Free tier (250K chars/mo), $49-$4999/mo paid plans, 11x cheaper than ElevenLabs
+  # Get from Unreal Speech dashboard: https://unrealspeech.com
+  unrealspeech_api_key: ""                       # ENV: UNREALSPEECH_API_KEY
+
+  # Speechmatics API key (used for STT and TTS)
+  # STT: Real-time WebSocket streaming with 55+ languages
+  # TTS: HTTP streaming with expressive voice generation
+  # Features: Standard/Enhanced accuracy, diarization, custom vocab, entity recognition
+  # Regions: EU (eu.rt.speechmatics.com), US (us.rt.speechmatics.com)
+  # Get from Speechmatics Portal: https://portal.speechmatics.com
+  speechmatics_api_key: ""                       # ENV: SPEECHMATICS_API_KEY
+
   # AWS credentials for Amazon Transcribe (STT) and Amazon Polly (TTS)
   # Uses AWS SDK credential chain:
   # 1. These explicit credentials (if provided)
@@ -103,7 +151,7 @@ providers:
 
 # STT Provider Configuration (optional - can also be set via WebSocket config)
 # stt:
-#   provider: deepgram  # Options: "deepgram", "google", "elevenlabs", "microsoft-azure", "cartesia", "openai", "assemblyai", "aws-transcribe"
+#   provider: deepgram  # Options: "deepgram", "google", "elevenlabs", "microsoft-azure", "cartesia", "openai", "assemblyai", "aws-transcribe", "speechmatics"
 #   # Google-specific settings (only used when provider is "google")
 #   google:
 #     location: global           # Options: global, us, eu, asia-southeast1, etc.
@@ -123,10 +171,20 @@ providers:
 #     enable_partial_results: true      # Receive interim transcripts
 #     show_speaker_labels: false        # Enable speaker diarization
 #     vocabulary_filter_method: remove  # Options: remove, mask, tag (for profanity filtering)
+#   # Speechmatics-specific settings (only used when provider is "speechmatics")
+#   speechmatics:
+#     region: eu                # Options: eu, us
+#     language: en              # 55+ languages: en, es, fr, de, it, ja, ko, zh, etc.
+#     operating_point: standard # Options: standard, enhanced (enhanced = higher accuracy, more cost)
+#     max_delay: 2.0            # Maximum delay in seconds (0.5-10.0)
+#     enable_partials: true     # Enable partial transcripts
+#     enable_diarization: false # Enable speaker diarization
+#     max_speakers: 5           # Maximum speakers for diarization (2-25)
+#     sample_rate: 16000        # Options: 8000, 16000, 32000, 44100, 48000
 
 # TTS Provider Configuration (optional - can also be set via WebSocket config)
 # tts:
-#   provider: elevenlabs  # Options: "deepgram", "elevenlabs", "google", "azure", "cartesia", "openai", "aws-polly", "hume", "lmnt", "playht"
+#   provider: elevenlabs  # Options: "deepgram", "elevenlabs", "google", "azure", "cartesia", "openai", "aws-polly", "hume", "lmnt", "playht", "murf", "wellsaid", "resemble", "speechify", "unrealspeech", "speechmatics"
 #   # Cartesia-specific settings (only used when provider is "cartesia")
 #   cartesia:
 #     model: sonic-3           # Options: sonic-3, sonic-3-2025-10-27
@@ -169,6 +227,67 @@ providers:
 #     # voice_2: s3://...          # Second speaker voice URL
 #     # turn_prefix: "S1:"         # First speaker identifier
 #     # turn_prefix_2: "S2:"       # Second speaker identifier
+#
+#   # Murf.ai-specific settings (only used when provider is "murf")
+#   # Requires MURF_API_KEY environment variable
+#   murf:
+#     voice: en-US-natalie         # Voice ID (e.g., en-US-natalie, en-UK-hazel, hi-IN-sunita)
+#     model: falcon                # Options: falcon (~130ms TTFA), gen2 (studio quality)
+#     audio_format: pcm            # Options: wav, mp3, flac, pcm, ogg, alaw, ulaw
+#     sample_rate: 24000           # Options: 8000, 24000, 44100, 48000
+#     channel_type: mono           # Options: mono, stereo
+#     region: global               # Options: global, us-east, us-west, eu, uk, india, japan, australia, canada, south-korea, uae, brazil
+#     # Gen2-only parameters (ignored for falcon model):
+#     # rate: 0                    # Speech rate adjustment (-50 to +50)
+#     # pitch: 0                   # Pitch adjustment (-50 to +50)
+#     # style: null                # Speaking style (e.g., "Conversational", "Newscast")
+#     # variation: 1               # Output variation (0-5)
+#     # include_audio_duration: false  # Include duration in response
+#
+#   # WellSaid Labs-specific settings (only used when provider is "wellsaid")
+#   # Requires WELLSAID_API_KEY environment variable
+#   wellsaid:
+#     voice: "3"                   # Speaker ID (e.g., 3 = Alana B., 26 = Wade C.)
+#     model: legacy                # Options: legacy (20+ languages), caruso (English only, AI Director)
+#     # Caruso-only AI Director parameters (ignored for legacy model):
+#     # Use XML tags in text for fine-grained control:
+#     # <tempo value="0.5">Slower text</tempo>     # Range: 0.5-2.5
+#     # <loudness value="-10">Softer text</loudness>  # Range: -20 to 10
+#     # <pitch value="-200">Deeper text</pitch>    # Range: -250 to 500
+#     # <respell value="tuh-may-toe">tomato</respell>
+#
+#   # Resemble AI-specific settings (only used when provider is "resemble")
+#   # Requires RESEMBLE_API_KEY environment variable
+#   resemble:
+#     voice_uuid: ""               # Voice UUID from Resemble AI voices API
+#     model: chatterbox            # Options: chatterbox, chatterbox-turbo (75ms latency), chatterbox-multilingual
+#     precision: PCM_32            # Options: PCM_32 (highest), PCM_24, PCM_16, MULAW (telephony)
+#     sample_rate: 22050           # Options: 8000, 16000, 22050, 32000, 44100, 48000
+#     output_format: wav           # Options: wav, mp3
+#     use_hd: false                # Enable HD synthesis (higher quality)
+#     # Paralinguistic tags (Turbo model only):
+#     # [cough], [laugh], [chuckle], [sigh], [gasp] in text
+#
+#   # Speechify-specific settings (only used when provider is "speechify")
+#   # Requires SPEECHIFY_API_KEY environment variable
+#   speechify:
+#     voice_id: george             # Voice ID (e.g., george, henry, kristy, or custom cloned voice ID)
+#     model: simba-english         # Options: simba-english (default), simba-turbo (low-latency), simba-multilingual
+#     audio_format: wav_48000      # Options: wav_48000 (default), mp3_24000, ogg_24000, aac_24000
+#     language: en-US              # ISO 639-1 locale (auto-detected if not set)
+#     loudness_normalization: false  # Normalize to -14 LUFS (increases latency)
+#     text_normalization: false    # Convert numbers/dates to words
+#
+#   # Unreal Speech-specific settings (only used when provider is "unrealspeech")
+#   # Requires UNREALSPEECH_API_KEY environment variable
+#   unrealspeech:
+#     voice_id: Scarlett           # Voice ID - Standard: Scarlett, Dan, Will, Liv, Amy; Kokoro: af_bella, am_adam, etc.
+#     bitrate: 192k                # Options: 16k, 32k, 64k, 128k, 192k (default), 256k, 320k
+#     speed: 0                     # Speech speed: -1.0 (slow) to 1.0 (fast), 0 = normal
+#     pitch: 1.0                   # Voice pitch: 0.5 (low) to 1.5 (high), 1.0 = normal
+#     codec: libmp3lame            # Options: libmp3lame (MP3), pcm_mulaw (telephony)
+#     # Note: Max text length 1000 chars for /stream endpoint (real-time)
+#     # For longer text, use /speech (3000 chars) or /synthesisTasks (500K chars)
 
 # LiveKit recording configuration (S3)
 recording:

@@ -1,0 +1,359 @@
+================================================================================
+CARTESIA SONIC (TTS) AND INK-WHISPER (STT) RESEARCH SUMMARY
+================================================================================
+Research Date: January 17, 2026
+Duration: Full API research and documentation
+Scope: Official Cartesia APIs for Speech-to-Text and Text-to-Speech
+
+================================================================================
+RESEARCH COMPLETION STATUS
+================================================================================
+
+DELIVERABLES CREATED:
+✓ CARTESIA_API_RESEARCH.md (15KB)
+  - Comprehensive technical reference
+  - All STT features and parameters
+  - All TTS features and parameters
+  - Supported languages (STT: 99+, TTS: 42+)
+  - WebSocket API specifications
+  - Performance characteristics
+  - Quick reference table
+
+✓ cartesia_api_spec.json (14KB)
+  - Structured API specification
+  - All parameters in JSON format
+  - Model information and versioning
+  - Features matrix
+  - Recommended voices with UUIDs
+  - Language support lists
+  - Documentation links
+
+✓ CARTESIA_INTEGRATION_GUIDE.md (14KB)
+  - Implementation priority guide
+  - Phase 1: STT integration
+  - Phase 2: TTS integration
+  - Architecture integration points
+  - Buffer management strategies
+  - Error handling patterns
+  - Rate limiting and quotas
+  - Testing strategy
+  - Production checklist
+
+✓ CARTESIA_RESEARCH_SUMMARY.txt (this file)
+  - Complete research summary
+  - Key findings overview
+  - All important details
+
+================================================================================
+KEY FINDINGS SUMMARY
+================================================================================
+
+SPEECH-TO-TEXT (INK-WHISPER)
+────────────────────────────
+Endpoint: wss://api.cartesia.ai/stt/websocket
+Models: ink-whisper (latest), ink-whisper-2025-06-10 (prod), ink-whisper-2025-06-04
+Languages: 99+ including English, Chinese, Spanish, French, Japanese, Russian, etc.
+Features:
+  • Word-level timestamps (start/end times in seconds)
+  • Dynamic chunking for variable-length audio
+  • Voice Activity Detection (VAD) with configurable thresholds
+  • Noise robustness for real-world conditions
+  • Telephony artifact handling
+  • Domain-specific terminology support
+  • 3-minute session timeout with auto-disconnect
+
+WebSocket Parameters (Required):
+  - model: "ink-whisper"
+  - language: ISO-639-1 code (e.g., "en")
+  - encoding: "pcm_s16le" (recommended)
+  - sample_rate: 16000 Hz (recommended)
+  - api_key: Authentication key
+
+Voice Activity Detection Parameters (Optional):
+  - min_volume: 0.0-1.0 (e.g., 0.1 aggressive, 0.15 moderate)
+  - max_silence_duration_secs: silence threshold in seconds (0.4 to 2.0)
+
+Response Messages:
+  • transcript: Contains words array with text, start, end times
+  • flush_done: Acknowledgment of finalize command
+  • done: Session closure confirmation
+  • error: Error information with status codes
+
+Chunking Strategy:
+  • Send audio in 100ms intervals for optimal latency
+  • At 16000 Hz: 1600 samples per chunk
+  • Commands: "finalize" (flush), "done" (close)
+
+Performance:
+  • Pricing: 1 credit per 1 second
+  • Best accuracy with proper nouns and domain terms
+  • Optimized for real-time conversational AI
+  • Session auto-timeout: 3 minutes of inactivity
+
+────────────────────────────────────────────────────────────────────────────
+
+TEXT-TO-SPEECH (SONIC-3)
+────────────────────────
+Endpoint: wss://api.cartesia.ai/tts/websocket
+Models: sonic-3 (latest), sonic-3-2026-01-12 (current stable), sonic-3-2025-10-27
+Languages: 42+ including English, French, German, Spanish, Portuguese, Chinese, etc.
+Features:
+  • Ultra-realistic voice generation
+  • 135ms model latency (fastest TTS)
+  • Volume, speed, and emotion controls
+  • 60+ emotional tones (excited, calm, sad, friendly, professional, etc.)
+  • Automatic laughter generation via [laughter] tags
+  • SSML support for advanced markup
+  • Voice cloning from 3+ seconds of audio
+  • Voice mixing and voice design
+  • Multilingual voices with language auto-adaptation
+  • Word-level timestamp generation (optional)
+
+WebSocket Parameters (Required):
+  - cartesia_version: "2025-04-16" (or "2024-06-10", "2024-11-13")
+  - api_key: Authentication key (query parameter for browser compatibility)
+
+Generation Request Parameters:
+  - model_id: "sonic-3"
+  - transcript: Text to synthesize
+  - language: Language code (e.g., "en")
+  - context_id: Unique identifier for generation tracking
+  - voice.mode: "id" for voice selection
+  - voice.id: UUID of desired voice
+  - output_format.container: "raw"
+  - output_format.encoding: "pcm_s16le" or "pcm_f32le"
+  - output_format.sample_rate: 8000, 16000, 24000, or 44100 Hz
+  - add_timestamps: Boolean to include word-level timing
+  - generation_config.emotion: Emotion specification
+  - generation_config.speed: Speed ratio (1.05 = 5% faster)
+
+Recommended Voices:
+  • Katie (f786b574-daa5-4673-aa0c-cbe3e8534c02): Professional, neutral agent voice
+  • Kiefer (228fca29-3a0a-435c-8728-5cb483251068): Professional, neutral agent voice
+  • Tessa (6ccbfb76-1fc6-48f7-b71d-91ac6298247b): Emotive, expressive character
+  • Kyle (c961b81c-a935-4c17-bfb3-ba2239de8c2f): Emotive, expressive character
+  • Custom voices via cloning from audio samples
+
+Response Messages:
+  • audio_chunk: Base64-encoded PCM audio with step_time metrics (status 206)
+  • timestamps: Word-level timing data with start/end times
+  • flush_done: Acknowledgment of flush command
+  • done: Generation completion signal
+  • error: Error information with context ID
+
+SSML Support Examples:
+  <emotion value="excited">Text here</emotion>
+  <speed ratio="1.05">Slightly faster</speed>
+  <volume level="loud">IMPORTANT</volume>
+  [laughter] Insert automatic laughter
+
+Voice Cloning:
+  • Minimum: 3 seconds of audio
+  • Preserves: speaking style, accent, background, emotion, vocal characteristics
+  • API method: client.voices.clone(audio_bytes)
+  • Returns: New voice UUID for use in TTS requests
+
+Audio Encoding Options:
+  • WebSocket streaming: pcm_s16le (primary), pcm_f32le
+  • REST endpoint: WAV, MP3, PCM
+  • For real-time streaming: Use pcm_s16le at 16000 Hz
+
+Performance:
+  • Model latency: 135ms (Sonic-3)
+  • First audio chunk: ~135ms from request
+  • Continuous streaming: Chunks arrive progressively
+  • Pricing: 1 credit per 1 second
+  • Optimized for real-time interactive applications
+
+════════════════════════════════════════════════════════════════════════════════
+
+INTEGRATION ARCHITECTURE INSIGHTS
+════════════════════════════════════════════════════════════════════════════════
+
+Authentication:
+  • API key-based authentication
+  • Can be passed as query parameter (WebSocket) or HTTP header
+  • Token generation available via: client.auth.access_token()
+
+Version Management:
+  • TTS: cartesia_version parameter (2024-06-10, 2024-11-13, 2025-04-16)
+  • STT: Implicit in model selection
+  • Recommendation: Use base model names for development, date-versioned for production
+
+Python SDK Methods:
+  • TTS: client.tts.bytes(), client.tts.sse()
+  • STT: client.stt.transcribe()
+  • Voice management: client.voices.list(), client.voices.clone()
+  • Utilities: client.api_status.get(), client.auth.access_token()
+
+Zero-Copy Optimization:
+  • Use shared memory rings for IPC (Rust gateway ↔ Python inference)
+  • Stream audio chunks directly without serialization
+  • Parse timestamps in-stream for non-blocking I/O
+  • Avoid materializing full responses in memory
+  • Use numpy.frombuffer() for zero-copy views
+
+Rate Limiting & Quotas:
+  • Charging model: 1 credit per 1 second of audio (STT + TTS)
+  • Implement per-user credit tracking
+  • Sliding window rate limiting (60-second windows)
+  • Fair queuing for multi-user systems
+  • Graceful degradation when quota exceeded
+
+Error Handling Patterns:
+  • Circuit breaker for consecutive failures
+  • Exponential backoff for reconnection (100ms, 500ms, 2000ms)
+  • Voice fallback chain (primary, secondary, tertiary)
+  • Session timeout recovery (3 minutes for STT)
+  • Health check endpoints with degraded state reporting
+
+Performance Targets (Real-time SLOs):
+  • STT first result: < 100ms (p99)
+  • TTS first chunk: ~135ms (inherent model latency)
+  • End-to-end pipeline: < 500ms (p99, with LLM)
+
+════════════════════════════════════════════════════════════════════════════════
+
+LANGUAGE SUPPORT MATRICES
+════════════════════════════════════════════════════════════════════════════════
+
+STT (Ink-Whisper) - 99+ Languages:
+Primary: en, zh, de, es, ru, ko, fr, ja, pt, tr
+Extended: pl, ca, nl, ar, sv, it, id, hi, fi, vi, he, uk, el, ms, cs, ro, da,
+hu, ta, no, th, ur, hr, bg, lt, la, mi, ml, cy, sk, te, fa, lv, bn, sr, az,
+sl, kn, et, mk, br, eu, is, hy, ne, mn, bs, kk, sq, sw, gl, mr, pa, si, km,
+sn, yo, so, af, oc, ka, be, tg, sd, gu, am, yi, lo, uz, fo, ht, ps, tk, nn,
+mt, sa, lb, my, bo, tl, mg, as, tt, haw, ln, ha, ba, jw, su, yue
+
+TTS (Sonic-3) - 42+ Languages:
+en, fr, de, es, pt, zh, ja, hi, it, ko, nl, pl, ru, sv, tr, tl, bg, ro, ar,
+cs, el, fi, hr, ms, sk, da, ta, uk, hu, no, vi, bn, th, he, ka, id, te, gu,
+kn, ml, mr, pa
+
+Multilingual Support:
+  • TTS voices automatically adapt to input text language
+  • STT requires explicit language specification
+  • No automatic language detection in STT API
+
+════════════════════════════════════════════════════════════════════════════════
+
+CRITICAL IMPLEMENTATION NOTES
+════════════════════════════════════════════════════════════════════════════════
+
+For Bud Waav Gateway Integration:
+
+1. Audio Buffering:
+   ✓ Use ring buffers for zero-copy audio passing between components
+   ✓ Pre-allocate buffers during initialization (no heap allocs in hot path)
+   ✓ Implement at least 50-200ms output buffer for smooth TTS playback
+
+2. Latency Budget:
+   ✓ Audio capture to STT inference: < 10ms
+   ✓ STT result availability: < 100ms (p99)
+   ✓ TTS synthesis latency: 135ms (model inherent)
+   ✓ Total pipeline: < 500ms (p99) including LLM inference
+
+3. Voice Activity Detection Tuning:
+   ✓ Environment-dependent: Start with min_volume=0.1, adjust based on metrics
+   ✓ For short silences (natural speech pauses): max_silence_duration_secs=0.4
+   ✓ For longer thinking time: max_silence_duration_secs=2.0
+
+4. Voice Selection Strategy:
+   ✓ Agent conversations: Use Katie or Kiefer (professional, neutral)
+   ✓ Emotional responses: Use Tessa or Kyle (expressive)
+   ✓ Custom personalities: Clone from 3+ seconds of audio
+
+5. Error Recovery:
+   ✓ Implement automatic reconnection with exponential backoff
+   ✓ Fallback voice chain for TTS failures
+   ✓ Session refresh before 3-minute timeout (STT)
+   ✓ Circuit breaker pattern for API failures
+
+6. Monitoring & Observability:
+   ✓ Track per-user credit consumption
+   ✓ Measure pipeline latencies (p50, p99, p99.9)
+   ✓ Monitor connection health (reconnects, timeouts)
+   ✓ Alert on quota exhaustion or failures
+
+════════════════════════════════════════════════════════════════════════════════
+
+OFFICIAL DOCUMENTATION LINKS
+════════════════════════════════════════════════════════════════════════════════
+
+Primary: https://docs.cartesia.ai/
+
+STT Documentation:
+  • Models: https://docs.cartesia.ai/build-with-cartesia/stt-models
+  • API Reference: https://docs.cartesia.ai/api-reference/stt/stt
+  • Product: https://cartesia.ai/ink
+
+TTS Documentation:
+  • Models: https://docs.cartesia.ai/build-with-cartesia/tts-models/latest
+  • API Reference: https://docs.cartesia.ai/api-reference/tts/tts
+  • Product: https://cartesia.ai/sonic
+  • Voice Gallery: https://cartesia.ai/voices
+
+SDKs:
+  • Python: https://github.com/cartesia-ai/cartesia-python
+  • JavaScript: https://github.com/cartesia-ai/cartesia-js
+  • PyPI: https://pypi.org/project/cartesia/
+
+Integration Examples:
+  • LiveKit: https://docs.livekit.io/agents/models/tts/plugins/cartesia/
+  • Voice Agent: https://github.com/cartesia-ai/cartesia-livekit-voice-agent
+
+════════════════════════════════════════════════════════════════════════════════
+
+FILES CREATED FOR REFERENCE
+════════════════════════════════════════════════════════════════════════════════
+
+1. CARTESIA_API_RESEARCH.md (15KB)
+   Complete technical research with all API details, features, and parameters
+
+2. cartesia_api_spec.json (14KB)
+   Structured JSON specification for programmatic access to API definitions
+
+3. CARTESIA_INTEGRATION_GUIDE.md (14KB)
+   Implementation guide with code examples and integration patterns
+
+4. CARTESIA_RESEARCH_SUMMARY.txt (this file)
+   Executive summary of all research findings
+
+Location: /home/bud/Desktop/bud_waav/WaaV/gateway/
+
+════════════════════════════════════════════════════════════════════════════════
+
+NEXT STEPS FOR DEVELOPMENT
+════════════════════════════════════════════════════════════════════════════════
+
+Phase 1 - STT Integration:
+  1. Set up Ink-Whisper WebSocket connection
+  2. Implement 100ms audio chunk streaming
+  3. Parse transcript messages with word timestamps
+  4. Configure VAD parameters based on environment
+  5. Implement 3-minute session refresh logic
+
+Phase 2 - TTS Integration:
+  1. Set up Sonic-3 WebSocket connection
+  2. Implement request/response message handling
+  3. Decode base64 audio chunks to PCM
+  4. Select appropriate voice based on use case
+  5. Implement emotion/speed/volume controls
+
+Phase 3 - Full Pipeline:
+  1. Connect STT output → LLM inference → TTS input
+  2. Implement buffer management for zero-copy data flow
+  3. Add latency monitoring and tracking
+  4. Deploy load testing suite
+  5. Optimize for target SLOs
+
+Phase 4 - Production Hardening:
+  1. Implement error handling and recovery
+  2. Add observability and monitoring
+  3. Set up alerting for failures
+  4. Implement rate limiting and quotas
+  5. Deploy to production with gradual rollout
+
+════════════════════════════════════════════════════════════════════════════════
+End of Research Summary
+════════════════════════════════════════════════════════════════════════════════

@@ -1,15 +1,62 @@
+# =============================================================================
+# OOM Prevention Settings
+# =============================================================================
+# Limit parallel compilation jobs to prevent memory exhaustion
+# Rule of thumb: Each rustc instance can use 1-4GB RAM during linking
+[build]
+jobs = 4  # Limit to 4 parallel jobs (adjust based on RAM: jobs = RAM_GB / 4)
+
+# =============================================================================
+# Linux: Reduce linker memory usage (LLD-compatible flags)
+# =============================================================================
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    # Reduce debug info compression level (saves memory during linking)
+    "-C", "debuginfo=1",
+]
+
+# =============================================================================
 # Windows: Use static CRT to match webrtc-sys prebuilt binaries
+# =============================================================================
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
 
+# =============================================================================
+# macOS: ObjC linking required for WebRTC
+# =============================================================================
 [target.x86_64-apple-darwin]
 rustflags = ["-C", "link-arg=-ObjC"]
 
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "link-arg=-ObjC"]
 
-[target.aarch64-apple-ios]       # if you also build for iOS / visionOS
+[target.aarch64-apple-ios]
 rustflags = ["-C", "link-arg=-ObjC"]
 
+# =============================================================================
+# Registry settings
+# =============================================================================
 [registries.crates-io]
 protocol = "sparse"
+
+# =============================================================================
+# Environment variables for builds
+# =============================================================================
+[env]
+# Limit LLVM parallelism during codegen (reduces memory spikes)
+LLVM_PARALLEL_LINK_JOBS = "2"
+
+# =============================================================================
+# Build cache and artifact size management
+# =============================================================================
+[term]
+# Reduce verbosity (smaller logs)
+verbose = false
+
+# =============================================================================
+# Incremental compilation settings (managed via Cargo.toml profile settings)
+# Note: Incremental artifacts can grow large over time. Run periodic cleanup:
+#   cargo sweep --time 7    (remove artifacts older than 7 days)
+#   cargo sweep --installed (remove all non-installed artifacts)
+#   cargo clean --doc       (remove only doc artifacts)
+# =============================================================================

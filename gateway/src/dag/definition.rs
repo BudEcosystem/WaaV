@@ -426,6 +426,44 @@ pub enum NodeType {
         track_type: Option<String>,
     },
 
+    /// LLM endpoint for OpenAI-compatible APIs
+    ///
+    /// Supports custom base URLs for OpenAI, Azure, Ollama, vLLM, LiteLLM, etc.
+    /// Includes conversation history, tool calling, and agent attachment.
+    LlmEndpoint {
+        /// Custom base URL (e.g., "https://api.openai.com/v1", "http://localhost:11434/v1")
+        base_url: String,
+        /// Model identifier (e.g., "gpt-4o", "llama3", "claude-3-opus")
+        model: String,
+        /// API key (can use ${ENV_VAR} syntax for environment variables)
+        #[serde(default)]
+        api_key: Option<String>,
+        /// System prompt for the conversation
+        #[serde(default)]
+        system_prompt: Option<String>,
+        /// Temperature (0.0 - 2.0)
+        #[serde(default)]
+        temperature: Option<f32>,
+        /// Maximum tokens to generate
+        #[serde(default)]
+        max_tokens: Option<u32>,
+        /// Enable streaming responses
+        #[serde(default)]
+        streaming: bool,
+        /// Tool definitions for function calling (JSON array)
+        #[serde(default)]
+        tools: Option<serde_json::Value>,
+        /// Agent/Assistant ID (for OpenAI Assistants API)
+        #[serde(default)]
+        assistant_id: Option<String>,
+        /// Request timeout in milliseconds
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        /// Extra headers for the API request
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
+
     /// Webhook notification (fire-and-forget)
     WebhookOutput {
         url: String,

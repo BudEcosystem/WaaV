@@ -1,0 +1,753 @@
+//! SberDevices SaluteSpeech TTS Provider Implementation
+//!
+//! Implements the BaseTTS trait for SberDevices' REST-based Text-to-Speech service.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use tokio::sync::{Notify, RwLock};
+use tracing::{debug, info};
+use uuid::Uuid;
+
+use super::config::{
+    SberTtsConfig, MAX_TEXT_LENGTH, OAUTH_ENDPOINT, TOKEN_REFRESH_THRESHOLD_SECS,
+};
+use crate::core::tts::base::{
+    AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
+};
+
+// =============================================================================
+// OAuth Token Manager
+// =============================================================================
+
+/// Manages OAuth token lifecycle with automatic refresh
+#[derive(Debug)]
+struct TokenManager {
+    access_token: Option<String>,
+    expires_at: u64,
+}
+
+impl TokenManager {
+    fn new() -> Self {
+        Self {
+            access_token: None,
+            expires_at: 0,
+        }
+    }
+
+    fn is_token_valid(&self) -> bool {
+        if self.access_token.is_none() {
+            return false;
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let threshold_ms = TOKEN_REFRESH_THRESHOLD_SECS * 1000;
+        self.expires_at > now_ms + threshold_ms
+    }
+
+    fn set_token(&mut self, token: String, expires_at: u64) {
+        self.access_token = Some(token);
+        self.expires_at = expires_at;
+    }
+
+    fn get_token(&self) -> Option<&str> {
+        self.access_token.as_deref()
+    }
+
+    fn clear(&mut self) {
+        self.access_token = None;
+        self.expires_at = 0;
+    }
+}
+
+// =============================================================================
+// SberDevices TTS Provider
+// =============================================================================
+
+/// SberDevices SaluteSpeech TTS provider
+pub struct SberDevicesTts {
+    config: Option<SberTtsConfig>,
+    state: ConnectionState,
+    state_notify: Arc<Notify>,
+    client: reqwest::Client,
+    token_manager: Arc<RwLock<TokenManager>>,
+    audio_callback: Arc<RwLock<Option<Arc<dyn AudioCallback>>>>,
+    connected: AtomicBool,
+}
+
+impl Default for SberDevicesTts {
+    fn default() -> Self {
+        Self {
+            config: None,
+            state: ConnectionState::Disconnected,
+            state_notify: Arc::new(Notify::new()),
+            client: reqwest::Client::new(),
+            token_manager: Arc::new(RwLock::new(TokenManager::new())),
+            audio_callback: Arc::new(RwLock::new(None)),
+            connected: AtomicBool::new(false),
+        }
+    }
+}
+
+impl SberDevicesTts {
+    /// Obtain OAuth access token
+    async fn obtain_token(&self) -> TTSResult<String> {
+        let config = self.config.as_ref().ok_or_else(|| {
+            TTSError::InvalidConfiguration("No configuration available".to_string())
+        })?;
+
+        // Check if existing token is valid
+        {
+            let token_guard = self.token_manager.read().await;
+            if token_guard.is_token_valid() {
+                if let Some(token) = token_guard.get_token() {
+                    return Ok(token.to_string());
+                }
+            }
+        }
+
+        // Need to refresh token
+        debug!("Obtaining new OAuth token for SberDevices TTS");
+
+        let rq_uid = Uuid::new_v4().to_string();
+
+        let response = self
+            .client
+            .post(OAUTH_ENDPOINT)
+            .header("Authorization", config.oauth_auth_header())
+            .header("RqUID", &rq_uid)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(format!("scope={}", config.scope.as_str()))
+            .timeout(Duration::from_secs(config.connection_timeout_secs))
+            .send()
+            .await
+            .map_err(|e| TTSError::ConnectionFailed(format!("OAuth request failed: {}", e)))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(TTSError::AuthenticationFailed(format!(
+                "OAuth failed with status {}: {}",
+                status, body
+            )));
+        }
+
+        #[derive(serde::Deserialize)]
+        struct OAuthResponse {
+            access_token: String,
+            expires_at: u64,
+        }
+
+        let oauth_response: OAuthResponse = response.json().await.map_err(|e| {
+            TTSError::ConnectionFailed(format!("Failed to parse OAuth response: {}", e))
+        })?;
+
+        // Store the token
+        let token = oauth_response.access_token.clone();
+        {
+            let mut token_guard = self.token_manager.write().await;
+            token_guard.set_token(oauth_response.access_token, oauth_response.expires_at);
+        }
+
+        debug!("Successfully obtained OAuth token for SberDevices TTS");
+        Ok(token)
+    }
+
+    /// Synthesize text using REST API
+    async fn synthesize(&self, text: &str) -> TTSResult<Vec<u8>> {
+        let config = self.config.as_ref().ok_or_else(|| {
+            TTSError::InvalidConfiguration("No configuration available".to_string())
+        })?;
+
+        // Check text length
+        if text.len() > MAX_TEXT_LENGTH {
+            return Err(TTSError::InvalidConfiguration(format!(
+                "Text exceeds maximum length of {} characters",
+                MAX_TEXT_LENGTH
+            )));
+        }
+
+        // Get OAuth token
+        let token = self.obtain_token().await?;
+
+        // Build synthesis URL
+        let url = config.synthesis_url();
+
+        debug!(
+            text_len = text.len(),
+            voice = config.voice.as_str(),
+            format = config.audio_format.as_str(),
+            sample_rate = config.sample_rate,
+            "Synthesizing text with SberDevices TTS"
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/text")
+            .body(text.to_string())
+            .timeout(Duration::from_secs(config.request_timeout_secs))
+            .send()
+            .await
+            .map_err(|e| TTSError::NetworkError(format!("Synthesis request failed: {}", e)))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+
+            // Handle specific error codes
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                // Clear cached token on auth failure
+                self.token_manager.write().await.clear();
+                return Err(TTSError::AuthenticationFailed(format!(
+                    "Authentication failed: {}",
+                    body
+                )));
+            }
+
+            if status.as_u16() == 429 {
+                return Err(TTSError::RateLimited {
+                    retry_after_secs: None,
+                    message: "Rate limit exceeded".to_string(),
+                });
+            }
+
+            return Err(TTSError::AudioGenerationFailed(format!(
+                "Synthesis failed with status {}: {}",
+                status, body
+            )));
+        }
+
+        let audio_bytes = response.bytes().await.map_err(|e| {
+            TTSError::AudioGenerationFailed(format!("Failed to read audio response: {}", e))
+        })?;
+
+        debug!(audio_size = audio_bytes.len(), "Received audio from SberDevices TTS");
+        Ok(audio_bytes.to_vec())
+    }
+}
+
+#[async_trait]
+impl BaseTTS for SberDevicesTts {
+    fn new(config: TTSConfig) -> TTSResult<Self>
+    where
+        Self: Sized,
+    {
+        let sber_config =
+            SberTtsConfig::from_base(config).map_err(TTSError::InvalidConfiguration)?;
+
+        // Build HTTP client with timeouts
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(sber_config.connection_timeout_secs))
+            .timeout(Duration::from_secs(sber_config.request_timeout_secs))
+            .build()
+            .map_err(|e| TTSError::InternalError(format!("Failed to create HTTP client: {}", e)))?;
+
+        Ok(Self {
+            config: Some(sber_config),
+            state: ConnectionState::Disconnected,
+            state_notify: Arc::new(Notify::new()),
+            client,
+            token_manager: Arc::new(RwLock::new(TokenManager::new())),
+            audio_callback: Arc::new(RwLock::new(None)),
+            connected: AtomicBool::new(false),
+        })
+    }
+
+    async fn connect(&mut self) -> TTSResult<()> {
+        let config = self.config.clone().ok_or_else(|| {
+            TTSError::InvalidConfiguration("No configuration available".to_string())
+        })?;
+
+        // Validate configuration
+        config.validate().map_err(TTSError::InvalidConfiguration)?;
+
+        self.state = ConnectionState::Connecting;
+        self.state_notify.notify_waiters();
+
+        // Obtain initial OAuth token to verify credentials
+        match self.obtain_token().await {
+            Ok(_) => {
+                self.state = ConnectionState::Connected;
+                self.connected.store(true, Ordering::SeqCst);
+                self.state_notify.notify_waiters();
+                info!("Connected to SberDevices SaluteSpeech TTS");
+                Ok(())
+            }
+            Err(e) => {
+                self.state = ConnectionState::Error(e.to_string());
+                self.state_notify.notify_waiters();
+                Err(e)
+            }
+        }
+    }
+
+    async fn disconnect(&mut self) -> TTSResult<()> {
+        self.token_manager.write().await.clear();
+        *self.audio_callback.write().await = None;
+        self.connected.store(false, Ordering::SeqCst);
+
+        self.state = ConnectionState::Disconnected;
+        self.state_notify.notify_waiters();
+
+        info!("Disconnected from SberDevices SaluteSpeech TTS");
+        Ok(())
+    }
+
+    fn is_ready(&self) -> bool {
+        self.connected.load(Ordering::SeqCst) && self.config.is_some()
+    }
+
+    fn get_connection_state(&self) -> ConnectionState {
+        self.state.clone()
+    }
+
+    async fn speak(&mut self, text: &str, _flush: bool) -> TTSResult<()> {
+        if !self.is_ready() {
+            // Try to reconnect
+            self.connect().await?;
+        }
+
+        if text.is_empty() {
+            return Ok(());
+        }
+
+        let config = self.config.as_ref().ok_or_else(|| {
+            TTSError::InvalidConfiguration("No configuration available".to_string())
+        })?;
+
+        // Synthesize audio
+        let audio_bytes = self.synthesize(text).await?;
+
+        // Create AudioData and deliver via callback
+        let audio_data = AudioData {
+            data: audio_bytes,
+            sample_rate: config.sample_rate,
+            format: config.audio_format.mime_type().to_string(),
+            duration_ms: None,
+        };
+
+        let callback_guard = self.audio_callback.read().await;
+        if let Some(callback) = callback_guard.as_ref() {
+            callback.on_audio(audio_data).await;
+            callback.on_complete().await;
+        }
+
+        Ok(())
+    }
+
+    async fn clear(&mut self) -> TTSResult<()> {
+        // SberDevices TTS is request-based, no queue to clear
+        Ok(())
+    }
+
+    async fn flush(&self) -> TTSResult<()> {
+        // SberDevices TTS processes requests immediately, no buffering
+        Ok(())
+    }
+
+    fn on_audio(&mut self, callback: Arc<dyn AudioCallback>) -> TTSResult<()> {
+        let callback_ref = self.audio_callback.clone();
+        tokio::spawn(async move {
+            *callback_ref.write().await = Some(callback);
+        });
+        Ok(())
+    }
+
+    fn remove_audio_callback(&mut self) -> TTSResult<()> {
+        let callback_ref = self.audio_callback.clone();
+        tokio::spawn(async move {
+            *callback_ref.write().await = None;
+        });
+        Ok(())
+    }
+
+    fn get_provider_info(&self) -> serde_json::Value {
+        let config = self.config.as_ref();
+
+        serde_json::json!({
+            "provider": "sberdevices",
+            "name": "SberDevices SaluteSpeech TTS",
+            "version": "1.0.0",
+            "endpoint": super::SBER_TTS_SYNTHESIZE_URL,
+            "languages": ["ru-RU", "en-US"],
+            "voices": [
+                {
+                    "id": "Nec",
+                    "name": "Natalia",
+                    "gender": "female",
+                    "language": "ru-RU"
+                },
+                {
+                    "id": "Bys",
+                    "name": "Boris",
+                    "gender": "male",
+                    "language": "ru-RU"
+                },
+                {
+                    "id": "May",
+                    "name": "Martha",
+                    "gender": "female",
+                    "language": "ru-RU"
+                },
+                {
+                    "id": "Tur",
+                    "name": "Taras",
+                    "gender": "male",
+                    "language": "ru-RU"
+                },
+                {
+                    "id": "Ost",
+                    "name": "Alexandra",
+                    "gender": "female",
+                    "language": "ru-RU"
+                },
+                {
+                    "id": "Pon",
+                    "name": "Sergey",
+                    "gender": "male",
+                    "language": "ru-RU"
+                },
+                {
+                    "id": "Kin",
+                    "name": "Kira",
+                    "gender": "female",
+                    "language": "en-US"
+                }
+            ],
+            "formats": ["wav", "opus", "mp3"],
+            "sample_rates": [8000, 24000],
+            "features": {
+                "ssml": true,
+                "max_text_length": 4000
+            },
+            "current_config": config.map(|c| serde_json::json!({
+                "voice": c.voice.as_str(),
+                "format": c.audio_format.as_str(),
+                "sample_rate": c.sample_rate,
+                "scope": c.scope.as_str()
+            }))
+        })
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    fn create_test_config() -> TTSConfig {
+        TTSConfig {
+            provider: "sberdevices".to_string(),
+            api_key: "test_client:test_secret".to_string(),
+            voice_id: Some("Nec".to_string()),
+            audio_format: Some("wav".to_string()),
+            sample_rate: Some(24000),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_sberdevices_tts_new() {
+        let config = create_test_config();
+        let tts = SberDevicesTts::new(config);
+        assert!(tts.is_ok());
+
+        let tts = tts.unwrap();
+        assert!(!tts.is_ready());
+        assert!(tts.config.is_some());
+        assert_eq!(tts.get_connection_state(), ConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn test_sberdevices_tts_new_requires_credentials() {
+        let config = TTSConfig {
+            api_key: String::new(),
+            ..Default::default()
+        };
+
+        let result = SberDevicesTts::new(config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sberdevices_tts_default() {
+        let tts = SberDevicesTts::default();
+        assert!(!tts.is_ready());
+        assert!(tts.config.is_none());
+    }
+
+    #[test]
+    fn test_sberdevices_tts_get_provider_info() {
+        let config = create_test_config();
+        let tts = SberDevicesTts::new(config).unwrap();
+
+        let info = tts.get_provider_info();
+        assert_eq!(info["provider"], "sberdevices");
+        assert_eq!(info["name"], "SberDevices SaluteSpeech TTS");
+
+        let voices = info["voices"].as_array().unwrap();
+        assert_eq!(voices.len(), 7);
+
+        // Verify first voice
+        assert_eq!(voices[0]["id"], "Nec");
+        assert_eq!(voices[0]["name"], "Natalia");
+        assert_eq!(voices[0]["gender"], "female");
+        assert_eq!(voices[0]["language"], "ru-RU");
+
+        // Verify English voice
+        assert_eq!(voices[6]["id"], "Kin");
+        assert_eq!(voices[6]["language"], "en-US");
+
+        let formats = info["formats"].as_array().unwrap();
+        assert_eq!(formats.len(), 3);
+
+        let sample_rates = info["sample_rates"].as_array().unwrap();
+        assert_eq!(sample_rates.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_sberdevices_tts_speak_not_connected() {
+        let config = create_test_config();
+        let mut tts = SberDevicesTts::new(config).unwrap();
+
+        // Should fail because connect() will fail without real credentials
+        let result = tts.speak("Привет", false).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sberdevices_tts_speak_empty_text() {
+        let config = create_test_config();
+        let mut tts = SberDevicesTts::new(config).unwrap();
+
+        // Manually set connected state for testing empty text handling
+        tts.connected.store(true, Ordering::SeqCst);
+
+        let result = tts.speak("", false).await;
+        assert!(result.is_ok()); // Empty text should return Ok
+    }
+
+    #[tokio::test]
+    async fn test_sberdevices_tts_disconnect() {
+        let config = create_test_config();
+        let mut tts = SberDevicesTts::new(config).unwrap();
+
+        // Disconnect should succeed even when not connected
+        let result = tts.disconnect().await;
+        assert!(result.is_ok());
+        assert_eq!(tts.get_connection_state(), ConnectionState::Disconnected);
+        assert!(!tts.is_ready());
+    }
+
+    #[tokio::test]
+    async fn test_sberdevices_tts_clear() {
+        let config = create_test_config();
+        let mut tts = SberDevicesTts::new(config).unwrap();
+
+        // Clear should always succeed (no-op for request-based TTS)
+        let result = tts.clear().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sberdevices_tts_flush() {
+        let config = create_test_config();
+        let tts = SberDevicesTts::new(config).unwrap();
+
+        // Flush should always succeed (no buffering)
+        let result = tts.flush().await;
+        assert!(result.is_ok());
+    }
+
+    struct MockAudioCallback {
+        audio_count: AtomicUsize,
+        error_count: AtomicUsize,
+        complete_count: AtomicUsize,
+    }
+
+    impl MockAudioCallback {
+        fn new() -> Self {
+            Self {
+                audio_count: AtomicUsize::new(0),
+                error_count: AtomicUsize::new(0),
+                complete_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl AudioCallback for MockAudioCallback {
+        fn on_audio(&self, _audio_data: AudioData) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            self.audio_count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+
+        fn on_error(&self, _error: TTSError) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            self.error_count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+
+        fn on_complete(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            self.complete_count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sberdevices_tts_callback_registration() {
+        let config = create_test_config();
+        let mut tts = SberDevicesTts::new(config).unwrap();
+
+        let callback = Arc::new(MockAudioCallback::new());
+        let result = tts.on_audio(callback);
+        assert!(result.is_ok());
+
+        // Give the async task time to complete
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Verify callback was registered
+        let callback_guard = tts.audio_callback.read().await;
+        assert!(callback_guard.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_sberdevices_tts_callback_removal() {
+        let config = create_test_config();
+        let mut tts = SberDevicesTts::new(config).unwrap();
+
+        let callback = Arc::new(MockAudioCallback::new());
+        tts.on_audio(callback).unwrap();
+
+        // Give the async task time to complete
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let result = tts.remove_audio_callback();
+        assert!(result.is_ok());
+
+        // Give the async task time to complete
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Verify callback was removed
+        let callback_guard = tts.audio_callback.read().await;
+        assert!(callback_guard.is_none());
+    }
+
+    #[test]
+    fn test_sberdevices_tts_config_with_different_voices() {
+        let mut config = create_test_config();
+        config.voice_id = Some("Bys".to_string());
+
+        let tts = SberDevicesTts::new(config).unwrap();
+        let sber_config = tts.config.as_ref().unwrap();
+
+        assert_eq!(sber_config.voice.as_str(), "Bys");
+        assert_eq!(sber_config.voice.gender(), "male");
+        assert_eq!(sber_config.voice.display_name(), "Boris");
+    }
+
+    #[test]
+    fn test_sberdevices_tts_config_with_different_formats() {
+        let mut config = create_test_config();
+        config.audio_format = Some("opus".to_string());
+
+        let tts = SberDevicesTts::new(config).unwrap();
+        let sber_config = tts.config.as_ref().unwrap();
+
+        assert_eq!(sber_config.audio_format.as_str(), "opus");
+        assert_eq!(sber_config.audio_format.mime_type(), "audio/opus");
+    }
+
+    #[test]
+    fn test_sberdevices_tts_config_invalid_voice() {
+        let mut config = create_test_config();
+        config.voice_id = Some("invalid_voice".to_string());
+
+        let result = SberDevicesTts::new(config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sberdevices_tts_config_invalid_format() {
+        let mut config = create_test_config();
+        config.audio_format = Some("invalid_format".to_string());
+
+        let result = SberDevicesTts::new(config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sberdevices_tts_config_invalid_sample_rate() {
+        let mut config = create_test_config();
+        config.sample_rate = Some(16000); // Invalid - only 8000 or 24000
+
+        let result = SberDevicesTts::new(config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sberdevices_tts_config_with_english_voice() {
+        let mut config = create_test_config();
+        config.voice_id = Some("Kin".to_string());
+
+        let tts = SberDevicesTts::new(config).unwrap();
+        let sber_config = tts.config.as_ref().unwrap();
+
+        assert_eq!(sber_config.voice.as_str(), "Kin");
+        assert_eq!(sber_config.voice.language(), "en-US");
+        assert_eq!(sber_config.voice.display_name(), "Kira");
+    }
+
+    #[test]
+    fn test_token_manager() {
+        let mut manager = TokenManager::new();
+
+        // Initially no token
+        assert!(!manager.is_token_valid());
+        assert!(manager.get_token().is_none());
+
+        // Set a token that expires in 5 minutes
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        manager.set_token("test_token".to_string(), now_ms + 300_000);
+
+        assert!(manager.is_token_valid());
+        assert_eq!(manager.get_token(), Some("test_token"));
+
+        // Clear the token
+        manager.clear();
+        assert!(!manager.is_token_valid());
+        assert!(manager.get_token().is_none());
+    }
+
+    #[test]
+    fn test_token_manager_expired() {
+        let mut manager = TokenManager::new();
+
+        // Set an already expired token
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        manager.set_token("expired_token".to_string(), now_ms - 1000);
+
+        assert!(!manager.is_token_valid());
+    }
+}

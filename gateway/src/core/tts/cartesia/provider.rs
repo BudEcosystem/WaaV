@@ -182,8 +182,24 @@ impl TTSRequestBuilder for CartesiaRequestBuilder {
     /// # Returns
     /// A `reqwest::RequestBuilder` ready to be sent.
     fn build_http_request(&self, client: &reqwest::Client, text: &str) -> reqwest::RequestBuilder {
+        // Build generation_config with speed and emotion if present
+        let mut generation_config = serde_json::Map::new();
+
+        // Pass speaking_rate as speed (Cartesia API parameter)
+        if let Some(rate) = self.config.speaking_rate {
+            generation_config.insert("speed".to_string(), json!(rate));
+        }
+
+        // Pass emotion from emotion_config if present
+        if let Some(ref emotion_config) = self.config.emotion_config {
+            if let Some(ref emotion) = emotion_config.emotion {
+                // Convert emotion enum to string for Cartesia API
+                generation_config.insert("emotion".to_string(), json!(emotion.to_string().to_lowercase()));
+            }
+        }
+
         // Build the request body
-        let body = json!({
+        let mut body = json!({
             "model_id": &self.cartesia_config.model,
             "transcript": text,
             "voice": self.build_voice_json(),
@@ -191,11 +207,18 @@ impl TTSRequestBuilder for CartesiaRequestBuilder {
             "language": self.get_language()
         });
 
+        // Only add generation_config if it has values
+        if !generation_config.is_empty() {
+            body["generation_config"] = serde_json::Value::Object(generation_config);
+        }
+
         debug!(
-            "Building Cartesia TTS request: model={}, voice={:?}, format={:?}",
+            "Building Cartesia TTS request: model={}, voice={:?}, format={:?}, speed={:?}, emotion={:?}",
             self.cartesia_config.model,
             self.cartesia_config.voice_id(),
-            self.cartesia_config.output_format.container
+            self.cartesia_config.output_format.container,
+            self.config.speaking_rate,
+            self.config.emotion_config.as_ref().and_then(|e| e.emotion.as_ref())
         );
 
         // Build the HTTP request with all required headers
@@ -1116,5 +1139,94 @@ mod tests {
 
         // Different speaking rates should produce different hashes
         assert_ne!(hash1, hash2);
+    }
+
+    // =========================================================================
+    // Generation Config Tests (Speed and Emotion)
+    // =========================================================================
+
+    #[test]
+    fn test_build_http_request_with_speed() {
+        let mut config = create_test_config();
+        config.speaking_rate = Some(1.5);
+
+        let cartesia_config = CartesiaTTSConfig::from_base(config.clone());
+        let builder = CartesiaRequestBuilder::new(config, cartesia_config);
+
+        let client = reqwest::Client::new();
+        let request_builder = builder.build_http_request(&client, "Test");
+        let request = request_builder.build().unwrap();
+
+        let body = request.body().unwrap().as_bytes().unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(body).unwrap();
+
+        // Verify generation_config contains speed
+        assert!(body_json.get("generation_config").is_some());
+        assert_eq!(body_json["generation_config"]["speed"], 1.5);
+    }
+
+    #[test]
+    fn test_build_http_request_with_emotion() {
+        use crate::core::emotion::{Emotion, EmotionConfig as EmotionCfg};
+
+        let mut config = create_test_config();
+        config.emotion_config = Some(EmotionCfg::with_emotion(Emotion::Excited));
+
+        let cartesia_config = CartesiaTTSConfig::from_base(config.clone());
+        let builder = CartesiaRequestBuilder::new(config, cartesia_config);
+
+        let client = reqwest::Client::new();
+        let request_builder = builder.build_http_request(&client, "Test");
+        let request = request_builder.build().unwrap();
+
+        let body = request.body().unwrap().as_bytes().unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(body).unwrap();
+
+        // Verify generation_config contains emotion
+        assert!(body_json.get("generation_config").is_some());
+        assert_eq!(body_json["generation_config"]["emotion"], "excited");
+    }
+
+    #[test]
+    fn test_build_http_request_with_speed_and_emotion() {
+        use crate::core::emotion::{Emotion, EmotionConfig as EmotionCfg};
+
+        let mut config = create_test_config();
+        config.speaking_rate = Some(1.2);
+        config.emotion_config = Some(EmotionCfg::with_emotion(Emotion::Happy));
+
+        let cartesia_config = CartesiaTTSConfig::from_base(config.clone());
+        let builder = CartesiaRequestBuilder::new(config, cartesia_config);
+
+        let client = reqwest::Client::new();
+        let request_builder = builder.build_http_request(&client, "Test");
+        let request = request_builder.build().unwrap();
+
+        let body = request.body().unwrap().as_bytes().unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(body).unwrap();
+
+        // Verify generation_config contains both speed and emotion
+        assert!(body_json.get("generation_config").is_some());
+        // Use approximate comparison for floating point
+        let speed = body_json["generation_config"]["speed"].as_f64().unwrap();
+        assert!((speed - 1.2).abs() < 0.001, "speed should be approximately 1.2");
+        assert_eq!(body_json["generation_config"]["emotion"], "happy");
+    }
+
+    #[test]
+    fn test_build_http_request_no_generation_config_when_not_needed() {
+        let config = create_test_config();
+        let cartesia_config = CartesiaTTSConfig::from_base(config.clone());
+        let builder = CartesiaRequestBuilder::new(config, cartesia_config);
+
+        let client = reqwest::Client::new();
+        let request_builder = builder.build_http_request(&client, "Test");
+        let request = request_builder.build().unwrap();
+
+        let body = request.body().unwrap().as_bytes().unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(body).unwrap();
+
+        // Verify generation_config is not present when not needed
+        assert!(body_json.get("generation_config").is_none());
     }
 }

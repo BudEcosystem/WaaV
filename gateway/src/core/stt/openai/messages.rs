@@ -98,6 +98,123 @@ pub struct TranscriptionWord {
 }
 
 // =============================================================================
+// Diarization Response Types (for diarized_json format)
+// =============================================================================
+
+/// Diarized transcription response (diarized_json format).
+///
+/// Contains transcription with speaker identification, enabling attribution
+/// of speech to individual speakers. Available with gpt-4o-transcribe models.
+///
+/// API Reference: https://platform.openai.com/docs/api-reference/audio/createTranscription
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DiarizedTranscriptionResponse {
+    /// The full transcribed text.
+    pub text: String,
+
+    /// The language of the audio (ISO-639-1 code).
+    #[serde(default)]
+    pub language: Option<String>,
+
+    /// Duration of the audio in seconds.
+    #[serde(default)]
+    pub duration: Option<f64>,
+
+    /// List of speakers identified in the audio.
+    /// Each speaker has an ID and optional recognized name.
+    #[serde(default)]
+    pub speakers: Vec<DiarizedSpeaker>,
+
+    /// Transcription segments with speaker attribution.
+    #[serde(default)]
+    pub segments: Vec<DiarizedSegment>,
+
+    /// Word-level information with speaker attribution (if include_logprobs is true).
+    #[serde(default)]
+    pub words: Vec<DiarizedWord>,
+}
+
+/// Speaker information from diarization.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DiarizedSpeaker {
+    /// Unique speaker identifier (e.g., "speaker_0", "speaker_1").
+    pub id: String,
+
+    /// Recognized speaker name (if known speaker references were provided).
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// Confidence score for speaker identification (0.0 to 1.0).
+    #[serde(default)]
+    pub confidence: Option<f64>,
+}
+
+/// A segment of transcribed text with speaker attribution.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DiarizedSegment {
+    /// Segment ID (0-indexed).
+    pub id: i32,
+
+    /// Start time of the segment in seconds.
+    pub start: f64,
+
+    /// End time of the segment in seconds.
+    pub end: f64,
+
+    /// Transcribed text for this segment.
+    pub text: String,
+
+    /// Speaker ID for this segment (e.g., "speaker_0").
+    #[serde(default)]
+    pub speaker: Option<String>,
+
+    /// Average log probability of tokens in this segment.
+    #[serde(default)]
+    pub avg_logprob: Option<f64>,
+
+    /// Probability that this segment contains no speech.
+    #[serde(default)]
+    pub no_speech_prob: Option<f64>,
+
+    /// Token IDs for this segment.
+    #[serde(default)]
+    pub tokens: Vec<i32>,
+
+    /// Temperature used for this segment.
+    #[serde(default)]
+    pub temperature: Option<f64>,
+
+    /// Compression ratio of the segment.
+    #[serde(default)]
+    pub compression_ratio: Option<f64>,
+
+    /// Seek position in the audio.
+    #[serde(default)]
+    pub seek: Option<i32>,
+}
+
+/// A word with timing and speaker information from diarization.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DiarizedWord {
+    /// The word text.
+    pub word: String,
+
+    /// Start time of the word in seconds.
+    pub start: f64,
+
+    /// End time of the word in seconds.
+    pub end: f64,
+
+    /// Speaker ID for this word (e.g., "speaker_0").
+    #[serde(default)]
+    pub speaker: Option<String>,
+
+    /// Log probability of the word (available when include_logprobs is true).
+    #[serde(default)]
+    pub logprob: Option<f64>,
+}
+
+// =============================================================================
 // Error Types
 // =============================================================================
 
@@ -149,6 +266,8 @@ pub enum TranscriptionResult {
     Simple(TranscriptionResponse),
     /// Verbose response with metadata and timestamps.
     Verbose(VerboseTranscriptionResponse),
+    /// Diarized response with speaker identification.
+    Diarized(DiarizedTranscriptionResponse),
     /// Plain text (for text, srt, vtt formats).
     PlainText(String),
 }
@@ -159,11 +278,12 @@ impl TranscriptionResult {
         match self {
             Self::Simple(r) => &r.text,
             Self::Verbose(r) => &r.text,
+            Self::Diarized(r) => &r.text,
             Self::PlainText(s) => s,
         }
     }
 
-    /// Get word-level timestamps if available.
+    /// Get word-level timestamps if available (non-diarized).
     pub fn words(&self) -> Option<&[TranscriptionWord]> {
         match self {
             Self::Verbose(r) if !r.words.is_empty() => Some(&r.words),
@@ -171,10 +291,34 @@ impl TranscriptionResult {
         }
     }
 
-    /// Get segment-level timestamps if available.
+    /// Get diarized word-level information with speaker attribution.
+    pub fn diarized_words(&self) -> Option<&[DiarizedWord]> {
+        match self {
+            Self::Diarized(r) if !r.words.is_empty() => Some(&r.words),
+            _ => None,
+        }
+    }
+
+    /// Get segment-level timestamps if available (non-diarized).
     pub fn segments(&self) -> Option<&[TranscriptionSegment]> {
         match self {
             Self::Verbose(r) if !r.segments.is_empty() => Some(&r.segments),
+            _ => None,
+        }
+    }
+
+    /// Get diarized segment-level information with speaker attribution.
+    pub fn diarized_segments(&self) -> Option<&[DiarizedSegment]> {
+        match self {
+            Self::Diarized(r) if !r.segments.is_empty() => Some(&r.segments),
+            _ => None,
+        }
+    }
+
+    /// Get speaker information from diarization.
+    pub fn speakers(&self) -> Option<&[DiarizedSpeaker]> {
+        match self {
+            Self::Diarized(r) if !r.speakers.is_empty() => Some(&r.speakers),
             _ => None,
         }
     }
@@ -183,6 +327,7 @@ impl TranscriptionResult {
     pub fn language(&self) -> Option<&str> {
         match self {
             Self::Verbose(r) => r.language.as_deref(),
+            Self::Diarized(r) => r.language.as_deref(),
             _ => None,
         }
     }
@@ -191,8 +336,14 @@ impl TranscriptionResult {
     pub fn duration(&self) -> Option<f64> {
         match self {
             Self::Verbose(r) => r.duration,
+            Self::Diarized(r) => r.duration,
             _ => None,
         }
+    }
+
+    /// Check if this result contains diarization data.
+    pub fn has_diarization(&self) -> bool {
+        matches!(self, Self::Diarized(_))
     }
 
     /// Calculate confidence from average log probability of segments.
@@ -202,28 +353,35 @@ impl TranscriptionResult {
     pub fn confidence(&self) -> f32 {
         match self {
             Self::Verbose(r) if !r.segments.is_empty() => {
-                // Calculate average log probability across all segments
-                let (sum, count) = r.segments.iter().fold((0.0, 0), |(sum, count), seg| {
-                    if let Some(avg_logprob) = seg.avg_logprob {
-                        (sum + avg_logprob, count + 1)
-                    } else {
-                        (sum, count)
-                    }
-                });
-
-                if count > 0 {
-                    // Convert log probability to linear probability
-                    // avg_logprob is typically in range [-1, 0] for good transcriptions
-                    // We map this to [0, 1] confidence score
-                    let avg = sum / count as f64;
-                    // Clamp to reasonable range and convert
-                    let confidence = (avg + 1.0).clamp(0.0, 1.0);
-                    confidence as f32
-                } else {
-                    1.0
-                }
+                Self::calculate_confidence_from_logprobs(
+                    r.segments.iter().filter_map(|seg| seg.avg_logprob),
+                )
+            }
+            Self::Diarized(r) if !r.segments.is_empty() => {
+                Self::calculate_confidence_from_logprobs(
+                    r.segments.iter().filter_map(|seg| seg.avg_logprob),
+                )
             }
             _ => 1.0, // Default to high confidence if no log probs available
+        }
+    }
+
+    /// Helper function to calculate confidence from log probabilities.
+    fn calculate_confidence_from_logprobs(logprobs: impl Iterator<Item = f64>) -> f32 {
+        let (sum, count) = logprobs.fold((0.0, 0), |(sum, count), logprob| {
+            (sum + logprob, count + 1)
+        });
+
+        if count > 0 {
+            // Convert log probability to linear probability
+            // avg_logprob is typically in range [-1, 0] for good transcriptions
+            // We map this to [0, 1] confidence score
+            let avg = sum / count as f64;
+            // Clamp to reasonable range and convert
+            let confidence = (avg + 1.0).clamp(0.0, 1.0);
+            confidence as f32
+        } else {
+            1.0
         }
     }
 }
@@ -444,5 +602,292 @@ mod tests {
             format!("{}", error),
             "Rate limit exceeded (rate_limit_error)"
         );
+    }
+
+    // =========================================================================
+    // Diarization Tests
+    // =========================================================================
+
+    #[test]
+    fn test_diarized_response_parsing() {
+        let json = r#"{
+            "text": "Hello from speaker one. Hi from speaker two.",
+            "language": "en",
+            "duration": 5.0,
+            "speakers": [
+                {"id": "speaker_0", "name": "Alice", "confidence": 0.95},
+                {"id": "speaker_1", "confidence": 0.87}
+            ],
+            "segments": [
+                {
+                    "id": 0,
+                    "start": 0.0,
+                    "end": 2.5,
+                    "text": "Hello from speaker one.",
+                    "speaker": "speaker_0",
+                    "avg_logprob": -0.15
+                },
+                {
+                    "id": 1,
+                    "start": 2.6,
+                    "end": 5.0,
+                    "text": "Hi from speaker two.",
+                    "speaker": "speaker_1",
+                    "avg_logprob": -0.20
+                }
+            ],
+            "words": [
+                {"word": "Hello", "start": 0.0, "end": 0.5, "speaker": "speaker_0"},
+                {"word": "from", "start": 0.6, "end": 0.9, "speaker": "speaker_0"},
+                {"word": "speaker", "start": 1.0, "end": 1.5, "speaker": "speaker_0"},
+                {"word": "one", "start": 1.6, "end": 2.0, "speaker": "speaker_0"},
+                {"word": "Hi", "start": 2.6, "end": 2.9, "speaker": "speaker_1"},
+                {"word": "from", "start": 3.0, "end": 3.3, "speaker": "speaker_1"},
+                {"word": "speaker", "start": 3.4, "end": 3.9, "speaker": "speaker_1"},
+                {"word": "two", "start": 4.0, "end": 4.5, "speaker": "speaker_1"}
+            ]
+        }"#;
+
+        let response: DiarizedTranscriptionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.text, "Hello from speaker one. Hi from speaker two.");
+        assert_eq!(response.language, Some("en".to_string()));
+        assert_eq!(response.duration, Some(5.0));
+        assert_eq!(response.speakers.len(), 2);
+        assert_eq!(response.segments.len(), 2);
+        assert_eq!(response.words.len(), 8);
+
+        // Check speaker info
+        assert_eq!(response.speakers[0].id, "speaker_0");
+        assert_eq!(response.speakers[0].name, Some("Alice".to_string()));
+        assert_eq!(response.speakers[0].confidence, Some(0.95));
+        assert_eq!(response.speakers[1].id, "speaker_1");
+        assert!(response.speakers[1].name.is_none());
+
+        // Check segment speaker attribution
+        assert_eq!(response.segments[0].speaker, Some("speaker_0".to_string()));
+        assert_eq!(response.segments[1].speaker, Some("speaker_1".to_string()));
+
+        // Check word speaker attribution
+        assert_eq!(response.words[0].speaker, Some("speaker_0".to_string()));
+        assert_eq!(response.words[4].speaker, Some("speaker_1".to_string()));
+    }
+
+    #[test]
+    fn test_diarized_response_minimal() {
+        // Test parsing with minimal required fields
+        let json = r#"{
+            "text": "Hello world"
+        }"#;
+
+        let response: DiarizedTranscriptionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.text, "Hello world");
+        assert!(response.language.is_none());
+        assert!(response.duration.is_none());
+        assert!(response.speakers.is_empty());
+        assert!(response.segments.is_empty());
+        assert!(response.words.is_empty());
+    }
+
+    #[test]
+    fn test_transcription_result_diarized_text() {
+        let diarized = TranscriptionResult::Diarized(DiarizedTranscriptionResponse {
+            text: "Diarized text".to_string(),
+            language: Some("en".to_string()),
+            duration: Some(3.0),
+            speakers: vec![],
+            segments: vec![],
+            words: vec![],
+        });
+        assert_eq!(diarized.text(), "Diarized text");
+    }
+
+    #[test]
+    fn test_transcription_result_diarized_language() {
+        let diarized = TranscriptionResult::Diarized(DiarizedTranscriptionResponse {
+            text: "Test".to_string(),
+            language: Some("es".to_string()),
+            duration: None,
+            speakers: vec![],
+            segments: vec![],
+            words: vec![],
+        });
+        assert_eq!(diarized.language(), Some("es"));
+    }
+
+    #[test]
+    fn test_transcription_result_diarized_duration() {
+        let diarized = TranscriptionResult::Diarized(DiarizedTranscriptionResponse {
+            text: "Test".to_string(),
+            language: None,
+            duration: Some(10.5),
+            speakers: vec![],
+            segments: vec![],
+            words: vec![],
+        });
+        assert_eq!(diarized.duration(), Some(10.5));
+    }
+
+    #[test]
+    fn test_transcription_result_has_diarization() {
+        let simple = TranscriptionResult::Simple(TranscriptionResponse {
+            text: "Test".to_string(),
+        });
+        assert!(!simple.has_diarization());
+
+        let verbose = TranscriptionResult::Verbose(VerboseTranscriptionResponse {
+            text: "Test".to_string(),
+            language: None,
+            duration: None,
+            segments: vec![],
+            words: vec![],
+        });
+        assert!(!verbose.has_diarization());
+
+        let diarized = TranscriptionResult::Diarized(DiarizedTranscriptionResponse {
+            text: "Test".to_string(),
+            language: None,
+            duration: None,
+            speakers: vec![],
+            segments: vec![],
+            words: vec![],
+        });
+        assert!(diarized.has_diarization());
+    }
+
+    #[test]
+    fn test_transcription_result_speakers() {
+        let diarized = TranscriptionResult::Diarized(DiarizedTranscriptionResponse {
+            text: "Test".to_string(),
+            language: None,
+            duration: None,
+            speakers: vec![
+                DiarizedSpeaker {
+                    id: "speaker_0".to_string(),
+                    name: Some("Alice".to_string()),
+                    confidence: Some(0.95),
+                },
+                DiarizedSpeaker {
+                    id: "speaker_1".to_string(),
+                    name: None,
+                    confidence: None,
+                },
+            ],
+            segments: vec![],
+            words: vec![],
+        });
+
+        let speakers = diarized.speakers().unwrap();
+        assert_eq!(speakers.len(), 2);
+        assert_eq!(speakers[0].id, "speaker_0");
+        assert_eq!(speakers[0].name, Some("Alice".to_string()));
+        assert_eq!(speakers[1].id, "speaker_1");
+    }
+
+    #[test]
+    fn test_transcription_result_diarized_words() {
+        let diarized = TranscriptionResult::Diarized(DiarizedTranscriptionResponse {
+            text: "Hello world".to_string(),
+            language: None,
+            duration: None,
+            speakers: vec![],
+            segments: vec![],
+            words: vec![
+                DiarizedWord {
+                    word: "Hello".to_string(),
+                    start: 0.0,
+                    end: 0.5,
+                    speaker: Some("speaker_0".to_string()),
+                    logprob: Some(-0.1),
+                },
+                DiarizedWord {
+                    word: "world".to_string(),
+                    start: 0.6,
+                    end: 1.0,
+                    speaker: Some("speaker_0".to_string()),
+                    logprob: Some(-0.2),
+                },
+            ],
+        });
+
+        let words = diarized.diarized_words().unwrap();
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].word, "Hello");
+        assert_eq!(words[0].speaker, Some("speaker_0".to_string()));
+        assert_eq!(words[0].logprob, Some(-0.1));
+    }
+
+    #[test]
+    fn test_transcription_result_diarized_segments() {
+        let diarized = TranscriptionResult::Diarized(DiarizedTranscriptionResponse {
+            text: "Hello. World.".to_string(),
+            language: None,
+            duration: None,
+            speakers: vec![],
+            segments: vec![
+                DiarizedSegment {
+                    id: 0,
+                    start: 0.0,
+                    end: 1.0,
+                    text: "Hello.".to_string(),
+                    speaker: Some("speaker_0".to_string()),
+                    avg_logprob: Some(-0.15),
+                    no_speech_prob: None,
+                    tokens: vec![],
+                    temperature: None,
+                    compression_ratio: None,
+                    seek: None,
+                },
+                DiarizedSegment {
+                    id: 1,
+                    start: 1.1,
+                    end: 2.0,
+                    text: "World.".to_string(),
+                    speaker: Some("speaker_1".to_string()),
+                    avg_logprob: Some(-0.25),
+                    no_speech_prob: None,
+                    tokens: vec![],
+                    temperature: None,
+                    compression_ratio: None,
+                    seek: None,
+                },
+            ],
+            words: vec![],
+        });
+
+        let segments = diarized.diarized_segments().unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].text, "Hello.");
+        assert_eq!(segments[0].speaker, Some("speaker_0".to_string()));
+        assert_eq!(segments[1].text, "World.");
+        assert_eq!(segments[1].speaker, Some("speaker_1".to_string()));
+    }
+
+    #[test]
+    fn test_diarized_confidence_calculation() {
+        let diarized = TranscriptionResult::Diarized(DiarizedTranscriptionResponse {
+            text: "Test".to_string(),
+            language: None,
+            duration: None,
+            speakers: vec![],
+            segments: vec![
+                DiarizedSegment {
+                    id: 0,
+                    start: 0.0,
+                    end: 1.0,
+                    text: "Test".to_string(),
+                    speaker: None,
+                    avg_logprob: Some(-0.2), // Should map to ~0.8 confidence
+                    no_speech_prob: None,
+                    tokens: vec![],
+                    temperature: None,
+                    compression_ratio: None,
+                    seek: None,
+                },
+            ],
+            words: vec![],
+        });
+
+        let confidence = diarized.confidence();
+        assert!(confidence > 0.7 && confidence < 0.9);
     }
 }

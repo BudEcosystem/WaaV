@@ -66,6 +66,20 @@ pub enum BuiltinSTTProvider {
     IbmWatson = 8,
     Groq = 9,
     Gnani = 10,
+    Sarvam = 11,
+    Speechmatics = 12,
+    Gladia = 13,
+    RevAI = 14,
+    Phonexia = 15,
+    Reverie = 16,
+    Yandex = 17,
+    Tinkoff = 18,
+    SberDevices = 19,
+    Bhashini = 20,
+    IFlytek = 21,
+    AlibabaCloud = 22,
+    Baidu = 23,
+    Tencent = 24,
 }
 
 impl BuiltinSTTProvider {
@@ -84,6 +98,20 @@ impl BuiltinSTTProvider {
             Self::IbmWatson => "ibm-watson",
             Self::Groq => "groq",
             Self::Gnani => "gnani",
+            Self::Sarvam => "sarvam",
+            Self::Speechmatics => "speechmatics",
+            Self::Gladia => "gladia",
+            Self::RevAI => "revai",
+            Self::Phonexia => "phonexia",
+            Self::Reverie => "reverie",
+            Self::Yandex => "yandex",
+            Self::Tinkoff => "tinkoff",
+            Self::SberDevices => "sberdevices",
+            Self::Bhashini => "bhashini",
+            Self::IFlytek => "iflytek",
+            Self::AlibabaCloud => "alibaba-cloud",
+            Self::Baidu => "baidu",
+            Self::Tencent => "tencent",
         }
     }
 }
@@ -104,6 +132,24 @@ pub enum BuiltinTTSProvider {
     Lmnt = 9,
     PlayHt = 10,
     Gnani = 11,
+    Murf = 12,
+    WellSaid = 13,
+    Resemble = 14,
+    Speechify = 15,
+    Smallest = 16,
+    UnrealSpeech = 17,
+    Acapela = 18,
+    Cereproc = 19,
+    Speechmatics = 20,
+    AlibabaCloud = 21,
+    Baidu = 22,
+    Bhashini = 23,
+    IFlytek = 24,
+    Reverie = 25,
+    SberDevices = 26,
+    Tinkoff = 27,
+    Yandex = 28,
+    Tencent = 29,
 }
 
 impl BuiltinTTSProvider {
@@ -123,6 +169,24 @@ impl BuiltinTTSProvider {
             Self::Lmnt => "lmnt",
             Self::PlayHt => "playht",
             Self::Gnani => "gnani",
+            Self::Murf => "murf",
+            Self::WellSaid => "wellsaid",
+            Self::Resemble => "resemble",
+            Self::Speechify => "speechify",
+            Self::Smallest => "smallest",
+            Self::UnrealSpeech => "unrealspeech",
+            Self::Acapela => "acapela",
+            Self::Cereproc => "cereproc",
+            Self::Speechmatics => "speechmatics",
+            Self::AlibabaCloud => "alibaba-cloud",
+            Self::Baidu => "baidu",
+            Self::Bhashini => "bhashini",
+            Self::IFlytek => "iflytek",
+            Self::Reverie => "reverie",
+            Self::SberDevices => "sberdevices",
+            Self::Tinkoff => "tinkoff",
+            Self::Yandex => "yandex",
+            Self::Tencent => "tencent",
         }
     }
 }
@@ -165,6 +229,20 @@ pub static STT_PROVIDER_MAP: phf::Map<&'static str, BuiltinSTTProvider> = phf_ma
     "ibm-watson" => BuiltinSTTProvider::IbmWatson,
     "groq" => BuiltinSTTProvider::Groq,
     "gnani" => BuiltinSTTProvider::Gnani,
+    "sarvam" => BuiltinSTTProvider::Sarvam,
+    "speechmatics" => BuiltinSTTProvider::Speechmatics,
+    "gladia" => BuiltinSTTProvider::Gladia,
+    "revai" => BuiltinSTTProvider::RevAI,
+    "phonexia" => BuiltinSTTProvider::Phonexia,
+    "reverie" => BuiltinSTTProvider::Reverie,
+    "yandex" => BuiltinSTTProvider::Yandex,
+    "tinkoff" => BuiltinSTTProvider::Tinkoff,
+    "sberdevices" => BuiltinSTTProvider::SberDevices,
+    "bhashini" => BuiltinSTTProvider::Bhashini,
+    "iflytek" => BuiltinSTTProvider::IFlytek,
+    "alibaba-cloud" => BuiltinSTTProvider::AlibabaCloud,
+    "baidu" => BuiltinSTTProvider::Baidu,
+    "tencent" => BuiltinSTTProvider::Tencent,
     // Aliases
     "azure" => BuiltinSTTProvider::Azure,
     "aws_transcribe" => BuiltinSTTProvider::AwsTranscribe,
@@ -176,6 +254,57 @@ pub static STT_PROVIDER_MAP: phf::Map<&'static str, BuiltinSTTProvider> = phf_ma
     "gnani-ai" => BuiltinSTTProvider::Gnani,
     "gnani.ai" => BuiltinSTTProvider::Gnani,
     "vachana" => BuiltinSTTProvider::Gnani,
+    "sarvam-ai" => BuiltinSTTProvider::Sarvam,
+    "sarvam.ai" => BuiltinSTTProvider::Sarvam,
+    "saarika" => BuiltinSTTProvider::Sarvam,
+    // Speechmatics aliases
+    "speechmatics-stt" => BuiltinSTTProvider::Speechmatics,
+    // Gladia aliases
+    "gladia-stt" => BuiltinSTTProvider::Gladia,
+    // Rev AI aliases
+    "rev-ai" => BuiltinSTTProvider::RevAI,
+    "rev_ai" => BuiltinSTTProvider::RevAI,
+    "rev.ai" => BuiltinSTTProvider::RevAI,
+    // Phonexia aliases
+    "phonexia-stt" => BuiltinSTTProvider::Phonexia,
+    // Reverie aliases
+    "reverie-stt" => BuiltinSTTProvider::Reverie,
+    // Yandex aliases
+    "yandex-stt" => BuiltinSTTProvider::Yandex,
+    "yandex_stt" => BuiltinSTTProvider::Yandex,
+    "speechkit" => BuiltinSTTProvider::Yandex,
+    // Tinkoff aliases
+    "tinkoff-stt" => BuiltinSTTProvider::Tinkoff,
+    "tinkoff_stt" => BuiltinSTTProvider::Tinkoff,
+    "voicekit" => BuiltinSTTProvider::Tinkoff,
+    // SberDevices aliases
+    "sber" => BuiltinSTTProvider::SberDevices,
+    "sber-devices" => BuiltinSTTProvider::SberDevices,
+    "sber_devices" => BuiltinSTTProvider::SberDevices,
+    "salutespeech" => BuiltinSTTProvider::SberDevices,
+    // Bhashini aliases
+    "ulca" => BuiltinSTTProvider::Bhashini,
+    "ai4bharat" => BuiltinSTTProvider::Bhashini,
+    "meity" => BuiltinSTTProvider::Bhashini,
+    // iFlytek aliases
+    "ifly" => BuiltinSTTProvider::IFlytek,
+    "xfyun" => BuiltinSTTProvider::IFlytek,
+    "xunfei" => BuiltinSTTProvider::IFlytek,
+    // Alibaba Cloud aliases
+    "alibaba_cloud" => BuiltinSTTProvider::AlibabaCloud,
+    "alibabacloud" => BuiltinSTTProvider::AlibabaCloud,
+    "alibaba" => BuiltinSTTProvider::AlibabaCloud,
+    "dashscope" => BuiltinSTTProvider::AlibabaCloud,
+    "aliyun" => BuiltinSTTProvider::AlibabaCloud,
+    // Baidu aliases
+    "baidu-ai" => BuiltinSTTProvider::Baidu,
+    "baidu_ai" => BuiltinSTTProvider::Baidu,
+    "baiduai" => BuiltinSTTProvider::Baidu,
+    "baidu-speech" => BuiltinSTTProvider::Baidu,
+    // Tencent aliases
+    "tencent-cloud" => BuiltinSTTProvider::Tencent,
+    "tencent_cloud" => BuiltinSTTProvider::Tencent,
+    "tencentcloud" => BuiltinSTTProvider::Tencent,
 };
 
 /// PHF map for TTS provider name resolution (including aliases)
@@ -193,6 +322,24 @@ pub static TTS_PROVIDER_MAP: phf::Map<&'static str, BuiltinTTSProvider> = phf_ma
     "lmnt" => BuiltinTTSProvider::Lmnt,
     "playht" => BuiltinTTSProvider::PlayHt,
     "gnani" => BuiltinTTSProvider::Gnani,
+    "murf" => BuiltinTTSProvider::Murf,
+    "wellsaid" => BuiltinTTSProvider::WellSaid,
+    "resemble" => BuiltinTTSProvider::Resemble,
+    "speechify" => BuiltinTTSProvider::Speechify,
+    "smallest" => BuiltinTTSProvider::Smallest,
+    "unrealspeech" => BuiltinTTSProvider::UnrealSpeech,
+    "acapela" => BuiltinTTSProvider::Acapela,
+    "cereproc" => BuiltinTTSProvider::Cereproc,
+    "speechmatics" => BuiltinTTSProvider::Speechmatics,
+    "alibaba-cloud" => BuiltinTTSProvider::AlibabaCloud,
+    "baidu" => BuiltinTTSProvider::Baidu,
+    "bhashini" => BuiltinTTSProvider::Bhashini,
+    "iflytek" => BuiltinTTSProvider::IFlytek,
+    "reverie" => BuiltinTTSProvider::Reverie,
+    "sberdevices" => BuiltinTTSProvider::SberDevices,
+    "tinkoff" => BuiltinTTSProvider::Tinkoff,
+    "yandex" => BuiltinTTSProvider::Yandex,
+    "tencent" => BuiltinTTSProvider::Tencent,
     // Aliases
     "azure" => BuiltinTTSProvider::Azure,
     "aws_polly" => BuiltinTTSProvider::AwsPolly,
@@ -210,6 +357,68 @@ pub static TTS_PROVIDER_MAP: phf::Map<&'static str, BuiltinTTSProvider> = phf_ma
     "play.ht" => BuiltinTTSProvider::PlayHt,
     "gnani-ai" => BuiltinTTSProvider::Gnani,
     "gnani.ai" => BuiltinTTSProvider::Gnani,
+    "murf-ai" => BuiltinTTSProvider::Murf,
+    "murf_ai" => BuiltinTTSProvider::Murf,
+    "murf.ai" => BuiltinTTSProvider::Murf,
+    "wellsaid-labs" => BuiltinTTSProvider::WellSaid,
+    "wellsaidlabs" => BuiltinTTSProvider::WellSaid,
+    "wellsaid_labs" => BuiltinTTSProvider::WellSaid,
+    "well-said" => BuiltinTTSProvider::WellSaid,
+    "resemble-ai" => BuiltinTTSProvider::Resemble,
+    "resemble_ai" => BuiltinTTSProvider::Resemble,
+    "resembleai" => BuiltinTTSProvider::Resemble,
+    "resemble.ai" => BuiltinTTSProvider::Resemble,
+    "speechify-ai" => BuiltinTTSProvider::Speechify,
+    "speechify_ai" => BuiltinTTSProvider::Speechify,
+    "speechify.com" => BuiltinTTSProvider::Speechify,
+    // Smallest aliases
+    "smallest-ai" => BuiltinTTSProvider::Smallest,
+    "smallest.ai" => BuiltinTTSProvider::Smallest,
+    // UnrealSpeech aliases
+    "unreal-speech" => BuiltinTTSProvider::UnrealSpeech,
+    "unreal_speech" => BuiltinTTSProvider::UnrealSpeech,
+    // Acapela aliases
+    "acapela-tts" => BuiltinTTSProvider::Acapela,
+    // Cereproc aliases
+    "cereproc-tts" => BuiltinTTSProvider::Cereproc,
+    "cerevoice" => BuiltinTTSProvider::Cereproc,
+    // Speechmatics TTS aliases
+    "speechmatics-tts" => BuiltinTTSProvider::Speechmatics,
+    // Alibaba Cloud TTS aliases
+    "alibaba_cloud" => BuiltinTTSProvider::AlibabaCloud,
+    "alibabacloud" => BuiltinTTSProvider::AlibabaCloud,
+    "alibaba" => BuiltinTTSProvider::AlibabaCloud,
+    "dashscope" => BuiltinTTSProvider::AlibabaCloud,
+    "aliyun" => BuiltinTTSProvider::AlibabaCloud,
+    // Baidu TTS aliases
+    "baidu-ai" => BuiltinTTSProvider::Baidu,
+    "baidu_ai" => BuiltinTTSProvider::Baidu,
+    "baiduai" => BuiltinTTSProvider::Baidu,
+    // Tencent TTS aliases
+    "tencent-cloud" => BuiltinTTSProvider::Tencent,
+    "tencent_cloud" => BuiltinTTSProvider::Tencent,
+    "tencentcloud" => BuiltinTTSProvider::Tencent,
+    "tencent-tts" => BuiltinTTSProvider::Tencent,
+    "tencent_tts" => BuiltinTTSProvider::Tencent,
+    // Bhashini TTS aliases
+    "ulca" => BuiltinTTSProvider::Bhashini,
+    "ai4bharat" => BuiltinTTSProvider::Bhashini,
+    // iFlytek TTS aliases
+    "ifly" => BuiltinTTSProvider::IFlytek,
+    "xfyun" => BuiltinTTSProvider::IFlytek,
+    "xunfei" => BuiltinTTSProvider::IFlytek,
+    // Reverie TTS aliases
+    "reverie-tts" => BuiltinTTSProvider::Reverie,
+    // SberDevices TTS aliases
+    "sber" => BuiltinTTSProvider::SberDevices,
+    "sber-devices" => BuiltinTTSProvider::SberDevices,
+    "sber_devices" => BuiltinTTSProvider::SberDevices,
+    // Tinkoff TTS aliases
+    "tinkoff-tts" => BuiltinTTSProvider::Tinkoff,
+    "tinkoff_tts" => BuiltinTTSProvider::Tinkoff,
+    // Yandex TTS aliases
+    "yandex-tts" => BuiltinTTSProvider::Yandex,
+    "yandex_tts" => BuiltinTTSProvider::Yandex,
 };
 
 /// PHF map for Realtime provider name resolution (including aliases)
@@ -332,10 +541,10 @@ impl SmallString {
 // =============================================================================
 
 /// Number of built-in STT providers
-pub const BUILTIN_STT_COUNT: usize = 11;
+pub const BUILTIN_STT_COUNT: usize = 25;
 
 /// Number of built-in TTS providers
-pub const BUILTIN_TTS_COUNT: usize = 12;
+pub const BUILTIN_TTS_COUNT: usize = 29;
 
 /// Number of built-in Realtime providers
 pub const BUILTIN_REALTIME_COUNT: usize = 2;
@@ -361,6 +570,20 @@ pub const BUILTIN_STT_NAMES: [&str; BUILTIN_STT_COUNT] = [
     "ibm-watson",
     "groq",
     "gnani",
+    "sarvam",
+    "speechmatics",
+    "gladia",
+    "revai",
+    "phonexia",
+    "reverie",
+    "yandex",
+    "tinkoff",
+    "sberdevices",
+    "bhashini",
+    "iflytek",
+    "alibaba-cloud",
+    "baidu",
+    "tencent",
 ];
 
 /// All built-in TTS provider names (canonical only, no aliases)
@@ -377,6 +600,23 @@ pub const BUILTIN_TTS_NAMES: [&str; BUILTIN_TTS_COUNT] = [
     "lmnt",
     "playht",
     "gnani",
+    "murf",
+    "wellsaid",
+    "resemble",
+    "speechify",
+    "smallest",
+    "unrealspeech",
+    "acapela",
+    "cereproc",
+    "speechmatics",
+    "alibaba-cloud",
+    "baidu",
+    "bhashini",
+    "iflytek",
+    "reverie",
+    "sberdevices",
+    "tinkoff",
+    "yandex",
 ];
 
 /// All built-in Realtime provider names (canonical only, no aliases)

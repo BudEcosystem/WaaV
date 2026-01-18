@@ -1,20 +1,56 @@
+pub mod alibaba_cloud;
+pub mod amivoice;
 pub mod assemblyai;
 pub mod aws_transcribe;
 pub mod azure;
+pub mod baidu;
 mod base;
+pub mod bhashini;
 pub mod cartesia;
 pub mod deepgram;
 pub mod elevenlabs;
+pub mod fpt_ai;
+pub mod gladia;
 pub mod gnani;
 pub mod google;
 pub mod groq;
+pub mod huawei_cloud;
 pub mod ibm_watson;
+pub mod iflytek;
+pub mod naver_clova;
 pub mod openai;
+pub mod phonexia;
+pub mod prosa_ai;
+pub mod revai;
+pub mod reverie;
+pub mod sarvam;
+pub mod sberdevices;
+pub mod speechmatics;
+pub mod tencent;
+pub mod tinkoff;
+pub mod nectec;
+pub mod viettel_ai;
+pub mod yandex;
 
 // Re-export public types and traits
 pub use base::{
     BaseSTT, STTConfig, STTConnectionState, STTError, STTErrorCallback, STTFactory, STTHelper,
     STTResult, STTResultCallback, STTStats,
+};
+
+// Re-export Alibaba Cloud DashScope implementation
+pub use alibaba_cloud::{
+    DashScopeStt, DashScopeSttConfig, DashScopeRegion, DashScopeSttModel, DashScopeAudioFormat,
+    DashScopeLanguage, TurnDetectionMode,
+    DASHSCOPE_BEIJING_REALTIME_URL, DASHSCOPE_SINGAPORE_REALTIME_URL,
+    DASHSCOPE_BEIJING_INFERENCE_URL, DASHSCOPE_SINGAPORE_INFERENCE_URL,
+    DEFAULT_STT_MODEL as DASHSCOPE_DEFAULT_STT_MODEL,
+    DEFAULT_SAMPLE_RATE as DASHSCOPE_DEFAULT_SAMPLE_RATE,
+    DEFAULT_AUDIO_FORMAT as DASHSCOPE_DEFAULT_AUDIO_FORMAT,
+    DEFAULT_SILENCE_DURATION_MS as DASHSCOPE_DEFAULT_SILENCE_DURATION_MS,
+    QwenSessionUpdate, QwenAudioBufferAppend, QwenAudioBufferCommit, QwenSessionFinish,
+    QwenServerMessage, ParaformerRunTask, ParaformerFinishTask, ParaformerResponse,
+    DashScopeErrorCode,
 };
 
 // Re-export Deepgram implementation
@@ -54,6 +90,12 @@ pub use aws_transcribe::{
     PartialResultsStability,
 };
 
+// Re-export AmiVoice implementation
+pub use amivoice::{
+    AMIVOICE_HTTP_NOLOG_URL, AMIVOICE_HTTP_URL, AMIVOICE_WS_NOLOG_URL, AMIVOICE_WS_URL,
+    AmiVoiceAudioFormat, AmiVoiceEngine, AmiVoiceSTT, AmiVoiceSTTConfig, DEFAULT_ENGINE as AMIVOICE_DEFAULT_ENGINE,
+};
+
 // Re-export IBM Watson implementation
 pub use ibm_watson::{
     IBM_IAM_URL, IBM_WATSON_STT_URL, IbmAudioEncoding, IbmModel, IbmRegion, IbmWatsonSTT,
@@ -77,9 +119,187 @@ pub use gnani::{
     StreamingRecognitionResponse as GnaniStreamingResponse, TranscriptChunk as GnaniTranscriptChunk,
 };
 
+// Re-export Sarvam.ai implementation
+pub use sarvam::{
+    SarvamSTT, SarvamSTTConfig, SARVAM_STT_WS_URL, SUPPORTED_LANGUAGES as SarvamSupportedLanguages,
+};
+
+// Re-export Speechmatics implementation
+pub use speechmatics::{
+    SpeechmaticsEncoding, SpeechmaticsLanguage, SpeechmaticsOperatingPoint, SpeechmaticsRegion,
+    SpeechmaticsSTT, SpeechmaticsSTTConfig, SPEECHMATICS_WS_URL_EU, SPEECHMATICS_WS_URL_US,
+};
+
+// Re-export Gladia implementation
+pub use gladia::{
+    GladiaBitDepth, GladiaEncoding, GladiaLanguageConfig, GladiaMessagesConfig, GladiaRegion,
+    GladiaSTT, GladiaSTTConfig, GLADIA_LIVE_URL,
+};
+
+// Re-export Rev AI implementation
+pub use revai::{
+    RevAISampleFormat, RevAISTT, RevAISTTConfig, RevAITranscriber, REVAI_STREAM_URL,
+};
+
+// Re-export Phonexia implementation
+pub use phonexia::{
+    PhonexiaAuth, PhonexiaResultType, PhonexiaSTT, PhonexiaSTTConfig, WEBSOCKET_PATH as PHONEXIA_WEBSOCKET_PATH,
+};
+
+// Re-export Reverie implementation
+pub use reverie::{
+    ReverieAudioFormat, ReverieLanguage, ReverieLogging, ReverieSTT, ReverieSTTConfig,
+    REVERIE_STREAM_URL,
+};
+
+// Re-export Yandex implementation
+pub use yandex::{
+    YandexSTT, YandexSTTAudioFormat, YandexSTTConfig, YandexSTTLanguage, YandexSTTModel,
+    YANDEX_STT_RECOGNIZE_URL,
+};
+
+// Re-export Tinkoff implementation
+pub use tinkoff::{
+    TinkoffAudioEncoding, TinkoffGrpcError, TinkoffStt, TinkoffSttConfig, VadConfig as TinkoffVadConfig,
+    GRPC_SERVICE_PATH as TINKOFF_GRPC_SERVICE_PATH, TINKOFF_GRPC_ENDPOINT,
+};
+
+// Re-export SberDevices implementation
+pub use sberdevices::{
+    SberDevicesSTT, SberSTTConfig, SberSTTAudioFormat, SberSTTLanguage, SberScope,
+    OAUTH_ENDPOINT as SBER_OAUTH_ENDPOINT, STT_RECOGNIZE_ENDPOINT as SBER_STT_ENDPOINT,
+};
+
+// Re-export Bhashini implementation
+pub use bhashini::{
+    BhashiniStt, BhashiniSttConfig, BhashiniLanguage, BhashiniAudioFormat, BhashiniPipelineProvider,
+    LanguageFamily as BhashiniLanguageFamily,
+    BHASHINI_CONFIG_URL, BHASHINI_COMPUTE_URL, MEITY_PIPELINE_ID, AI4BHARAT_PIPELINE_ID,
+};
+
+// Re-export iFlytek implementation
+pub use iflytek::{
+    IFlytekStt, IFlytekSttConfig, IFlytekLanguage, IFlytekAudioEncoding, IFlytekAsrDomain,
+    IFlytekAsrMode, IFlytekAuth, IFlytekErrorCode, DataStatus as IFlytekDataStatus,
+    IFLYTEK_IAT_ENDPOINT, IFLYTEK_IST_ENDPOINT, IFLYTEK_IAT_HOST, IFLYTEK_IST_HOST,
+    DEFAULT_SAMPLE_RATE as IFLYTEK_DEFAULT_SAMPLE_RATE,
+    DEFAULT_FRAME_SIZE as IFLYTEK_DEFAULT_FRAME_SIZE,
+    DEFAULT_FRAME_INTERVAL_MS as IFLYTEK_FRAME_INTERVAL_MS,
+    MAX_SHORT_FORM_DURATION_SECS as IFLYTEK_MAX_SHORT_DURATION,
+    MAX_REALTIME_DURATION_SECS as IFLYTEK_MAX_REALTIME_DURATION,
+};
+
+// Re-export Baidu implementation
+pub use baidu::{
+    BaiduStt, BaiduSttConfig, BaiduSttModel, BaiduAudioFormat, BaiduSampleRate, BaiduErrorCode,
+    BaiduStartFrame, BaiduFinishFrame, BaiduCancelFrame, BaiduRealtimeResponse,
+    BaiduShortAsrRequest, BaiduShortAsrResponse, BaiduOAuthResponse, BaiduOAuthError,
+    BAIDU_OAUTH_URL, BAIDU_REALTIME_ASR_URL, BAIDU_SHORT_ASR_URL, BAIDU_SHORT_ASR_URL_HTTPS,
+    DEFAULT_MODEL as BAIDU_DEFAULT_MODEL,
+    DEFAULT_SAMPLE_RATE as BAIDU_DEFAULT_SAMPLE_RATE,
+    DEFAULT_AUDIO_FORMAT as BAIDU_DEFAULT_AUDIO_FORMAT,
+    TOKEN_VALIDITY_SECS as BAIDU_TOKEN_VALIDITY_SECS,
+    RECOMMENDED_CHUNK_DURATION_MS as BAIDU_CHUNK_DURATION_MS,
+    MAX_SHORT_AUDIO_DURATION_SECS as BAIDU_MAX_SHORT_DURATION,
+    MAX_REALTIME_AUDIO_DURATION_SECS as BAIDU_MAX_REALTIME_DURATION,
+};
+
+// Re-export Tencent implementation
+pub use tencent::{
+    TencentStt, TencentSttConfig, TencentEngineModel, TencentAudioFormat, TencentWordInfo,
+    TencentAsrResponse, TencentAsrResult, TencentWord, TencentAsrErrorCode, TencentSliceType,
+    TencentSignatureBuilder, SignatureError as TencentSignatureError,
+    TENCENT_ASR_WS_URL,
+    DEFAULT_ENGINE_MODEL as TENCENT_DEFAULT_ENGINE_MODEL,
+    DEFAULT_VOICE_FORMAT as TENCENT_DEFAULT_VOICE_FORMAT,
+    DEFAULT_SAMPLE_RATE as TENCENT_DEFAULT_SAMPLE_RATE,
+    RECOMMENDED_CHUNK_DURATION_MS as TENCENT_CHUNK_DURATION_MS,
+    SIGNATURE_VALIDITY_SECS as TENCENT_SIGNATURE_VALIDITY_SECS,
+    VAD_SILENCE_TIME_MIN as TENCENT_VAD_SILENCE_MIN,
+    VAD_SILENCE_TIME_MAX as TENCENT_VAD_SILENCE_MAX,
+};
+
+// Re-export Huawei Cloud implementation
+pub use huawei_cloud::{
+    HuaweiCloudStt, HuaweiCloudSttConfig, HuaweiCloudSttModel, HuaweiCloudAudioFormat,
+    HuaweiCloudRegion, HuaweiCloudAsrMode, HuaweiTokenManager,
+    HuaweiStartFrame, HuaweiEndFrame, HuaweiCancelFrame, HuaweiRealtimeResponse,
+    HuaweiShortAsrRequest, HuaweiShortAsrResponse, HuaweiAsrResult as HuaweiAsrResultType,
+    HuaweiSisErrorCode, HuaweiResponseType, HuaweiWordInfo as HuaweiWordInfoType,
+    SIS_CHINA_ENDPOINT_FORMAT, SIS_INTL_ENDPOINT_FORMAT,
+    DEFAULT_MODEL as HUAWEI_DEFAULT_MODEL,
+    DEFAULT_SAMPLE_RATE as HUAWEI_DEFAULT_SAMPLE_RATE,
+    DEFAULT_AUDIO_FORMAT as HUAWEI_DEFAULT_AUDIO_FORMAT,
+    TOKEN_VALIDITY_SECS as HUAWEI_TOKEN_VALIDITY_SECS,
+    RECOMMENDED_CHUNK_DURATION_MS as HUAWEI_CHUNK_DURATION_MS,
+    MAX_SHORT_AUDIO_DURATION_SECS as HUAWEI_MAX_SHORT_DURATION,
+    MAX_STREAMING_DURATION_SECS as HUAWEI_MAX_STREAMING_DURATION,
+    MAX_CONTINUOUS_DURATION_SECS as HUAWEI_MAX_CONTINUOUS_DURATION,
+};
+
+// Re-export NAVER CLOVA implementation
+pub use naver_clova::{
+    NaverClovaStt, NaverClovaSttConfig, NaverClovaLanguage, NaverClovaAudioFormat,
+    NaverClovaSttResponse, NaverClovaErrorResponse,
+    NAVER_CSR_ENDPOINT,
+    DEFAULT_SAMPLE_RATE as NAVER_DEFAULT_SAMPLE_RATE,
+    MIN_SAMPLE_RATE as NAVER_MIN_SAMPLE_RATE,
+    MAX_AUDIO_DURATION_SECONDS as NAVER_MAX_AUDIO_DURATION,
+};
+
+// Re-export FPT.AI implementation
+pub use fpt_ai::{
+    FptStt, FptSttConfig, FptSttResponse, FptSttHypothesis,
+    FPT_STT_ENDPOINT,
+    DEFAULT_REQUEST_TIMEOUT as FPT_DEFAULT_REQUEST_TIMEOUT,
+    MIN_AUDIO_DURATION_MS as FPT_MIN_AUDIO_DURATION_MS,
+    MAX_AUDIO_DURATION_MS as FPT_MAX_AUDIO_DURATION_MS,
+};
+
+// Re-export Viettel AI implementation
+pub use viettel_ai::{
+    ViettelStt, ViettelSttConfig, ViettelSttResponse,
+    VIETTEL_STT_ENDPOINT,
+    DEFAULT_REQUEST_TIMEOUT as VIETTEL_DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_SAMPLE_RATE as VIETTEL_DEFAULT_SAMPLE_RATE,
+    DEFAULT_CHANNELS as VIETTEL_DEFAULT_CHANNELS,
+    PCM_FORMAT_S16LE as VIETTEL_PCM_FORMAT,
+};
+
+// Re-export Prosa.ai implementation
+pub use prosa_ai::{
+    ProsaStt, ProsaSttConfig, ProsaSttModel, ProsaAudioFormat, ProsaSttResponse,
+    ProsaSttResult, ProsaSttSegment, ProsaSttWsMessage,
+    PROSA_STT_BASE_URL, PROSA_STT_WS_ENDPOINT,
+    DEFAULT_SAMPLE_RATE as PROSA_DEFAULT_SAMPLE_RATE,
+    DEFAULT_CHANNELS as PROSA_DEFAULT_CHANNELS,
+    DEFAULT_CHUNK_SIZE as PROSA_DEFAULT_CHUNK_SIZE,
+    DEFAULT_REQUEST_TIMEOUT as PROSA_DEFAULT_REQUEST_TIMEOUT,
+    MIN_AUDIO_BUFFER_SIZE as PROSA_MIN_AUDIO_BUFFER_SIZE,
+    MAX_SYNC_DURATION_SECS as PROSA_MAX_SYNC_DURATION,
+    MAX_SYNC_SIZE_BYTES as PROSA_MAX_SYNC_SIZE,
+    MAX_ASYNC_DURATION_SECS as PROSA_MAX_ASYNC_DURATION,
+};
+
+// Re-export NECTEC AI for Thai implementation
+pub use nectec::{
+    NectecStt, NectecSttConfig, NectecSttError, NectecSttModel,
+    Partii4OutputFormat, Partii4OutputLevel, Partii4Response, Partii5Response,
+    PARTII4_ENDPOINT, PARTII5_ENDPOINT, API_KEY_HEADER as NECTEC_API_KEY_HEADER,
+    DEFAULT_SAMPLE_RATE as NECTEC_DEFAULT_SAMPLE_RATE,
+    DEFAULT_CHANNELS as NECTEC_DEFAULT_CHANNELS,
+    DEFAULT_REQUEST_TIMEOUT as NECTEC_DEFAULT_REQUEST_TIMEOUT,
+    MAX_AUDIO_DURATION_MS as NECTEC_MAX_AUDIO_DURATION_MS,
+    MAX_AUDIO_SIZE_BYTES as NECTEC_MAX_AUDIO_SIZE_BYTES,
+};
+
 /// Supported STT providers
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum STTProvider {
+    /// Alibaba Cloud DashScope STT WebSocket API (25+ languages, Chinese dialects)
+    AlibabaCloud,
+    /// Baidu AI Cloud Speech STT WebSocket/REST API (百度语音, Chinese dialects)
+    Baidu,
     /// Deepgram STT WebSocket API
     Deepgram,
     /// Google Speech-to-Text v2 API
@@ -100,11 +320,49 @@ pub enum STTProvider {
     IbmWatson,
     /// Groq Whisper STT REST API (ultra-fast)
     Groq,
+    /// Sarvam.ai Saarika STT WebSocket API (Indian languages)
+    Sarvam,
+    /// Speechmatics Real-time STT WebSocket API (55+ languages)
+    Speechmatics,
+    /// Gladia Live STT v2 WebSocket API (110+ languages, EU-based)
+    Gladia,
+    /// Rev AI Streaming STT WebSocket API (9+ streaming languages)
+    RevAI,
+    /// Phonexia On-Premises STT WebSocket API (57-64 languages, voice biometrics)
+    Phonexia,
+    /// Reverie Language Technologies STT WebSocket API (22+ Indian languages)
+    Reverie,
+    /// Yandex SpeechKit STT API (Russia/CIS region)
+    Yandex,
+    /// Tinkoff VoiceKit STT gRPC API (Russian language specialized)
+    Tinkoff,
+    /// SberDevices SaluteSpeech STT REST API (Russian, CIS languages)
+    SberDevices,
+    /// Tencent Cloud ASR WebSocket API (11 languages, Chinese dialects)
+    Tencent,
+    /// Huawei Cloud SIS STT WebSocket/REST API (华为云语音, Chinese + minority languages)
+    HuaweiCloud,
+    /// NAVER CLOVA Speech Recognition REST API (Korean, Japanese, English, Chinese)
+    NaverClova,
+    /// Bhashini (ULCA) STT REST API (22+ Indian languages)
+    Bhashini,
+    /// iFlytek (科大讯飞) STT WebSocket API (30+ languages, Chinese leader)
+    IFlytek,
+    /// FPT.AI STT REST API (Vietnamese language, FPT Corporation)
+    FptAi,
+    /// Viettel AI STT REST API (Vietnamese language, 96% accuracy)
+    ViettelAi,
+    /// Prosa.ai STT WebSocket/REST API (Indonesian, Javanese, Sundanese, English)
+    ProsaAi,
+    /// NECTEC AI for Thai STT REST API (Partii4/Partii5, Thai language)
+    Nectec,
 }
 
 impl std::fmt::Display for STTProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            STTProvider::AlibabaCloud => write!(f, "alibaba-cloud"),
+            STTProvider::Baidu => write!(f, "baidu"),
             STTProvider::Deepgram => write!(f, "deepgram"),
             STTProvider::Google => write!(f, "google"),
             STTProvider::ElevenLabs => write!(f, "elevenlabs"),
@@ -115,6 +373,24 @@ impl std::fmt::Display for STTProvider {
             STTProvider::AwsTranscribe => write!(f, "aws-transcribe"),
             STTProvider::IbmWatson => write!(f, "ibm-watson"),
             STTProvider::Groq => write!(f, "groq"),
+            STTProvider::Sarvam => write!(f, "sarvam"),
+            STTProvider::Speechmatics => write!(f, "speechmatics"),
+            STTProvider::Gladia => write!(f, "gladia"),
+            STTProvider::RevAI => write!(f, "revai"),
+            STTProvider::Phonexia => write!(f, "phonexia"),
+            STTProvider::Reverie => write!(f, "reverie"),
+            STTProvider::Yandex => write!(f, "yandex"),
+            STTProvider::Tinkoff => write!(f, "tinkoff"),
+            STTProvider::SberDevices => write!(f, "sberdevices"),
+            STTProvider::Tencent => write!(f, "tencent"),
+            STTProvider::HuaweiCloud => write!(f, "huawei-cloud"),
+            STTProvider::NaverClova => write!(f, "naver-clova"),
+            STTProvider::Bhashini => write!(f, "bhashini"),
+            STTProvider::IFlytek => write!(f, "iflytek"),
+            STTProvider::FptAi => write!(f, "fpt-ai"),
+            STTProvider::ViettelAi => write!(f, "viettel-ai"),
+            STTProvider::ProsaAi => write!(f, "prosa-ai"),
+            STTProvider::Nectec => write!(f, "nectec"),
         }
     }
 }
@@ -124,6 +400,12 @@ impl std::str::FromStr for STTProvider {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "alibaba-cloud" | "alibaba_cloud" | "alibabacloud" | "alibaba" | "dashscope" | "aliyun" | "阿里云" | "qwen-asr" => {
+                Ok(STTProvider::AlibabaCloud)
+            }
+            "baidu" | "baidu-ai" | "baidu_ai" | "baiduai" | "百度" | "百度语音" | "baidu-speech" | "baidu_speech" => {
+                Ok(STTProvider::Baidu)
+            }
             "deepgram" => Ok(STTProvider::Deepgram),
             "google" => Ok(STTProvider::Google),
             "elevenlabs" => Ok(STTProvider::ElevenLabs),
@@ -136,8 +418,52 @@ impl std::str::FromStr for STTProvider {
             }
             "ibm-watson" | "ibm_watson" | "watson" | "ibm" => Ok(STTProvider::IbmWatson),
             "groq" => Ok(STTProvider::Groq),
+            "sarvam" | "sarvam-ai" | "sarvam.ai" | "saarika" => Ok(STTProvider::Sarvam),
+            "speechmatics" | "speech-matics" | "speech_matics" => Ok(STTProvider::Speechmatics),
+            "gladia" | "gladia.io" | "gladia-io" | "gladia_io" => Ok(STTProvider::Gladia),
+            "revai" | "rev-ai" | "rev_ai" | "rev.ai" => Ok(STTProvider::RevAI),
+            "phonexia" | "phonexia-stt" | "phonexia_stt" => Ok(STTProvider::Phonexia),
+            "reverie" | "reverie-ai" | "reverie_ai" | "reverie-stt" | "reverieinc" => {
+                Ok(STTProvider::Reverie)
+            }
+            "yandex" | "yandex-stt" | "yandex_stt" | "speechkit" | "yandex-speechkit" => {
+                Ok(STTProvider::Yandex)
+            }
+            "tinkoff" | "tinkoff-stt" | "tinkoff_stt" | "voicekit" | "tinkoff-voicekit" => {
+                Ok(STTProvider::Tinkoff)
+            }
+            "sberdevices" | "sber" | "sber-devices" | "sber_devices" | "salutespeech" | "salute-speech" | "smartspeech" => {
+                Ok(STTProvider::SberDevices)
+            }
+            "tencent" | "tencent-cloud" | "tencent_cloud" | "tencentcloud" | "腾讯云" | "腾讯" => {
+                Ok(STTProvider::Tencent)
+            }
+            "huawei-cloud" | "huawei_cloud" | "huaweicloud" | "huawei" | "华为云" | "华为" | "sis" | "huawei-sis" => {
+                Ok(STTProvider::HuaweiCloud)
+            }
+            "naver-clova" | "naver_clova" | "naverclova" | "naver" | "clova" | "csr" | "네이버" | "클로바" => {
+                Ok(STTProvider::NaverClova)
+            }
+            "bhashini" | "ulca" | "ai4bharat" | "meity" => {
+                Ok(STTProvider::Bhashini)
+            }
+            "iflytek" | "ifly" | "xfyun" | "xunfei" | "科大讯飞" | "讯飞" => {
+                Ok(STTProvider::IFlytek)
+            }
+            "fpt-ai" | "fpt_ai" | "fptai" | "fpt" => {
+                Ok(STTProvider::FptAi)
+            }
+            "viettel-ai" | "viettel_ai" | "viettelai" | "viettel" | "vtai" => {
+                Ok(STTProvider::ViettelAi)
+            }
+            "prosa-ai" | "prosa_ai" | "prosai" | "prosa" | "prosa.ai" => {
+                Ok(STTProvider::ProsaAi)
+            }
+            "nectec" | "aiforthai" | "ai4thai" | "partii" | "partii5" | "partii4" => {
+                Ok(STTProvider::Nectec)
+            }
             _ => Err(STTError::ConfigurationError(format!(
-                "Unsupported STT provider: {s}. Supported providers: deepgram, google, elevenlabs, microsoft-azure, cartesia, openai, assemblyai, aws-transcribe, ibm-watson, groq"
+                "Unsupported STT provider: {s}. Supported providers: alibaba-cloud, baidu, deepgram, google, elevenlabs, microsoft-azure, cartesia, openai, assemblyai, aws-transcribe, ibm-watson, groq, sarvam, speechmatics, gladia, revai, phonexia, reverie, yandex, tinkoff, sberdevices, tencent, huawei-cloud, naver-clova, bhashini, iflytek, fpt-ai, viettel-ai, prosa-ai, nectec"
             ))),
         }
     }
@@ -244,6 +570,8 @@ pub fn create_stt_provider_from_enum(
 /// ```
 pub fn get_supported_stt_providers() -> Vec<&'static str> {
     vec![
+        "alibaba-cloud",
+        "baidu",
         "deepgram",
         "google",
         "elevenlabs",
@@ -254,6 +582,24 @@ pub fn get_supported_stt_providers() -> Vec<&'static str> {
         "aws-transcribe",
         "ibm-watson",
         "groq",
+        "sarvam",
+        "speechmatics",
+        "gladia",
+        "revai",
+        "phonexia",
+        "reverie",
+        "yandex",
+        "tinkoff",
+        "sberdevices",
+        "tencent",
+        "huawei-cloud",
+        "naver-clova",
+        "bhashini",
+        "iflytek",
+        "fpt-ai",
+        "viettel-ai",
+        "prosa-ai",
+        "nectec",
     ]
 }
 
@@ -345,6 +691,8 @@ mod factory_tests {
         assert_eq!(
             providers,
             vec![
+                "alibaba-cloud",
+                "baidu",
                 "deepgram",
                 "google",
                 "elevenlabs",
@@ -355,8 +703,28 @@ mod factory_tests {
                 "aws-transcribe",
                 "ibm-watson",
                 "groq",
+                "sarvam",
+                "speechmatics",
+                "gladia",
+                "revai",
+                "phonexia",
+                "reverie",
+                "yandex",
+                "tinkoff",
+                "sberdevices",
+                "tencent",
+                "huawei-cloud",
+                "naver-clova",
+                "bhashini",
+                "iflytek",
+                "fpt-ai",
+                "viettel-ai",
+                "prosa-ai",
+                "nectec",
             ]
         );
+        assert!(providers.contains(&"alibaba-cloud"));
+        assert!(providers.contains(&"baidu"));
         assert!(providers.contains(&"deepgram"));
         assert!(providers.contains(&"google"));
         assert!(providers.contains(&"elevenlabs"));
@@ -367,6 +735,16 @@ mod factory_tests {
         assert!(providers.contains(&"aws-transcribe"));
         assert!(providers.contains(&"ibm-watson"));
         assert!(providers.contains(&"groq"));
+        assert!(providers.contains(&"phonexia"));
+        assert!(providers.contains(&"gladia"));
+        assert!(providers.contains(&"revai"));
+        assert!(providers.contains(&"reverie"));
+        assert!(providers.contains(&"yandex"));
+        assert!(providers.contains(&"tinkoff"));
+        assert!(providers.contains(&"sberdevices"));
+        assert!(providers.contains(&"fpt-ai"));
+        assert!(providers.contains(&"viettel-ai"));
+        assert!(providers.contains(&"prosa-ai"));
     }
 
     #[tokio::test]
@@ -933,6 +1311,104 @@ mod factory_tests {
         assert!(result.is_err());
         if let Err(STTError::ConfigurationError(msg)) = result {
             assert!(msg.contains("ibm-watson"));
+        }
+    }
+
+    // Gladia STT provider tests
+
+    #[test]
+    fn test_stt_provider_enum_gladia_from_string() {
+        // Test valid provider names - Gladia
+        assert_eq!(
+            "gladia".parse::<STTProvider>().unwrap(),
+            STTProvider::Gladia
+        );
+        assert_eq!(
+            "Gladia".parse::<STTProvider>().unwrap(),
+            STTProvider::Gladia
+        );
+        assert_eq!(
+            "GLADIA".parse::<STTProvider>().unwrap(),
+            STTProvider::Gladia
+        );
+        assert_eq!(
+            "gladia.io".parse::<STTProvider>().unwrap(),
+            STTProvider::Gladia
+        );
+    }
+
+    #[test]
+    fn test_stt_provider_enum_gladia_display() {
+        assert_eq!(STTProvider::Gladia.to_string(), "gladia");
+    }
+
+    #[test]
+    fn test_create_stt_provider_gladia_valid() {
+        let config = STTConfig {
+            provider: "gladia".to_string(),
+            api_key: "test_api_key".to_string(),
+            language: "en".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "pcm".to_string(),
+            model: "solaria-1".to_string(),
+        };
+
+        let result = create_stt_provider("gladia", config);
+        assert!(result.is_ok());
+
+        let stt = result.unwrap();
+        assert_eq!(stt.get_provider_info(), "Gladia STT (solaria-1)");
+        assert!(!stt.is_ready()); // Not connected yet
+    }
+
+    #[test]
+    fn test_create_stt_provider_gladia_empty_api_key() {
+        let config = STTConfig {
+            provider: "gladia".to_string(),
+            api_key: String::new(), // Empty API key should fail
+            language: "en".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "pcm".to_string(),
+            model: "solaria-1".to_string(),
+        };
+
+        let result = create_stt_provider("gladia", config);
+        assert!(result.is_err());
+
+        if let Err(STTError::AuthenticationFailed(msg)) = result {
+            assert!(msg.contains("API key"));
+        } else {
+            panic!("Expected AuthenticationFailed error");
+        }
+    }
+
+    #[test]
+    fn test_create_stt_provider_from_enum_gladia() {
+        let config = STTConfig {
+            provider: "gladia".to_string(),
+            api_key: "test_api_key".to_string(),
+            language: "en".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "pcm".to_string(),
+            model: "solaria-1".to_string(),
+        };
+
+        let result = create_stt_provider_from_enum(STTProvider::Gladia, config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_error_message_includes_gladia() {
+        let result = "invalid".parse::<STTProvider>();
+        assert!(result.is_err());
+        if let Err(STTError::ConfigurationError(msg)) = result {
+            assert!(msg.contains("gladia"));
         }
     }
 }

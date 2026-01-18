@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use petgraph::graph::NodeIndex;
 use rhai::{Dynamic, Scope};
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use super::compiler::CompiledDAG;
@@ -416,12 +417,13 @@ impl DAGExecutor {
         ctx: &DAGContext,
     ) -> DAGResult<DAGData> {
         // Create Rhai engine with security constraints
-        let mut engine = create_rhai_engine();
-
-        // Enable looping for transforms but with strict limits
-        engine.set_allow_looping(true);
-        engine.set_max_operations(1_000);
-        engine.set_max_call_levels(16);
+        // Note: create_rhai_engine() already sets:
+        // - set_allow_looping(false) - prevents DoS via infinite loops
+        // - set_max_operations(10_000)
+        // - set_max_call_levels(32)
+        // Edge transforms should use Rhai's built-in array methods (map, filter, reduce)
+        // instead of explicit loops for iteration.
+        let engine = create_rhai_engine();
 
         // Create scope with data and context
         let mut scope = Scope::new();
@@ -491,9 +493,20 @@ impl DAGExecutor {
         let start = Instant::now();
 
         // Special handling for Split nodes - execute branches in parallel
+        // All node executions are wrapped with timeout to prevent indefinite blocking
         let result = if node_type == "split" {
             // First execute the split node to get branch info
-            let split_result = node.execute(input.clone(), ctx).await?;
+            let split_result = match timeout(self.default_timeout, node.execute(input.clone(), ctx)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    warn!(
+                        node_id = %node_id,
+                        timeout_ms = %self.default_timeout.as_millis(),
+                        "Split node execution timed out"
+                    );
+                    return Err(DAGError::ExecutionTimeout(self.default_timeout.as_millis() as u64));
+                }
+            };
 
             // Get branches from context metadata (set by SplitNode)
             let branches: Vec<String> = ctx.metadata
@@ -505,11 +518,32 @@ impl DAGExecutor {
                 warn!(node_id = %node_id, "Split node has no branches");
                 Ok(split_result)
             } else {
-                // Execute branches in parallel
-                self.execute_split_branches(dag, &branches, input, ctx).await
+                // Execute branches in parallel (with per-branch timeout handled by execute_split_branches)
+                match timeout(self.default_timeout, self.execute_split_branches(dag, &branches, input, ctx)).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        warn!(
+                            node_id = %node_id,
+                            timeout_ms = %self.default_timeout.as_millis(),
+                            "Split branch execution timed out"
+                        );
+                        Err(DAGError::ExecutionTimeout(self.default_timeout.as_millis() as u64))
+                    }
+                }
             }
         } else {
-            node.execute(input, ctx).await
+            // Regular node execution with timeout
+            match timeout(self.default_timeout, node.execute(input, ctx)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(
+                        node_id = %node_id,
+                        timeout_ms = %self.default_timeout.as_millis(),
+                        "Node execution timed out"
+                    );
+                    Err(DAGError::ExecutionTimeout(self.default_timeout.as_millis() as u64))
+                }
+            }
         };
 
         let duration = start.elapsed();

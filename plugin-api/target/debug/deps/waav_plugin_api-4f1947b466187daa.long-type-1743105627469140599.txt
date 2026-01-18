@@ -1,2 +1,0 @@
-BorrowingFfiFuture<'static, abi_stable::std_types::RResult<(), abi_stable::std_types::RString>>
-BorrowingFfiFuture<'static, abi_stable::std_types::RResult<(), abi_stable::std_types::RString>>: abi_stable::StableAbi

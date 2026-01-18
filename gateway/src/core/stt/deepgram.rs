@@ -58,7 +58,7 @@ pub struct DeepgramSTTConfig {
     pub smart_format: bool,
     /// Keywords to boost recognition
     pub keywords: Vec<String>,
-    /// Redaction settings
+    /// Redaction settings (pii, numbers, ssn, etc.)
     pub redact: Vec<String>,
     /// Voice activity detection events
     pub vad_events: bool,
@@ -68,6 +68,17 @@ pub struct DeepgramSTTConfig {
     pub tag: Option<String>,
     /// Utterance end timeout in milliseconds
     pub utterance_end_ms: Option<u32>,
+    /// Use EU endpoint for data residency compliance.
+    ///
+    /// When enabled, requests are routed to api.eu.deepgram.com
+    /// for European data residency requirements.
+    pub use_eu_endpoint: bool,
+    /// Enable PHI (Protected Health Information) redaction.
+    ///
+    /// When enabled, medical and health-related sensitive data
+    /// will be redacted from transcripts. Useful for HIPAA compliance.
+    /// This adds `redact=phi` to the API request.
+    pub redact_phi: bool,
 }
 
 impl Default for DeepgramSTTConfig {
@@ -85,6 +96,8 @@ impl Default for DeepgramSTTConfig {
             endpointing: Some(200),
             tag: None,
             utterance_end_ms: Some(500),
+            use_eu_endpoint: false,
+            redact_phi: false,
         }
     }
 }
@@ -183,11 +196,24 @@ pub struct DeepgramSTT {
     error_callback: Arc<Mutex<Option<AsyncErrorCallback>>>,
 }
 
+/// Constants for Deepgram regional endpoints
+pub const DEEPGRAM_DEFAULT_ENDPOINT: &str = "wss://api.deepgram.com";
+pub const DEEPGRAM_EU_ENDPOINT: &str = "wss://api.eu.deepgram.com";
+
 impl DeepgramSTT {
     /// Build the WebSocket URL with query parameters (optimized string building)
     fn build_websocket_url(&self, config: &DeepgramSTTConfig) -> Result<String, STTError> {
         let mut url = String::with_capacity(256); // Pre-allocate expected size
-        url.push_str("wss://api.deepgram.com/v1/listen?model=");
+
+        // Select endpoint based on EU residency setting
+        let endpoint = if config.use_eu_endpoint {
+            DEEPGRAM_EU_ENDPOINT
+        } else {
+            DEEPGRAM_DEFAULT_ENDPOINT
+        };
+
+        url.push_str(endpoint);
+        url.push_str("/v1/listen?model=");
         url.push_str(&config.base.model);
         url.push_str("&language=");
         url.push_str(&config.base.language);
@@ -218,6 +244,45 @@ impl DeepgramSTT {
         if !config.keywords.is_empty() {
             url.push_str("&keywords=");
             url.push_str(&config.keywords.join(","));
+        }
+
+        // Add diarization (speaker identification)
+        if config.diarize {
+            url.push_str("&diarize=true");
+        }
+
+        // Add filler words detection (um, uh, etc.)
+        if config.filler_words {
+            url.push_str("&filler_words=true");
+        }
+
+        // Add profanity filtering
+        if config.profanity_filter {
+            url.push_str("&profanity_filter=true");
+        }
+
+        // Add VAD events (voice activity detection)
+        if config.vad_events {
+            url.push_str("&vad_events=true");
+        }
+
+        // Add redaction (PII, numbers, SSN, etc.)
+        if !config.redact.is_empty() {
+            for redact_item in &config.redact {
+                url.push_str("&redact=");
+                url.push_str(redact_item);
+            }
+        }
+
+        // Add PHI redaction (Protected Health Information) for HIPAA compliance
+        if config.redact_phi {
+            url.push_str("&redact=phi");
+        }
+
+        // Add utterance end timeout
+        if let Some(utterance_end_ms) = config.utterance_end_ms {
+            url.push_str("&utterance_end_ms=");
+            url.push_str(&utterance_end_ms.to_string());
         }
 
         Ok(url)
@@ -327,14 +392,19 @@ impl DeepgramSTT {
 
         // Clone necessary data for the connection task
         let api_key = config.base.api_key.clone();
+        let use_eu_endpoint = config.use_eu_endpoint;
 
         // Start the connection task
         let connection_handle = tokio::spawn(async move {
             // Update state to connecting (this will be set by the main thread)
             // state_notify.notify_waiters() - don't notify here, main thread handles connecting state
 
-            // Connect to Deepgram
-            let host = "api.deepgram.com";
+            // Connect to Deepgram (use EU endpoint if configured)
+            let host = if use_eu_endpoint {
+                "api.eu.deepgram.com"
+            } else {
+                "api.deepgram.com"
+            };
             let request = match tokio_tungstenite::tungstenite::http::Request::builder()
                 .method("GET")
                 .uri(&ws_url)
@@ -570,6 +640,7 @@ impl BaseSTT for DeepgramSTT {
             endpointing: Some(200),
             tag: None,
             utterance_end_ms: Some(500),
+            ..Default::default()
         };
 
         Ok(Self {
@@ -706,6 +777,7 @@ impl BaseSTT for DeepgramSTT {
             endpointing: Some(200),
             tag: None,
             utterance_end_ms: Some(500),
+            ..Default::default()
         };
         self.config = Some(deepgram_config);
 
@@ -863,5 +935,68 @@ mod tests {
             Message::Text(_) => {} // Success
             _ => panic!("Expected Text message"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_deepgram_advanced_config_url_building() {
+        let stt = DeepgramSTT::default();
+        let config = DeepgramSTTConfig {
+            base: STTConfig {
+                model: "nova-3".to_string(),
+                provider: "deepgram".to_string(),
+                api_key: "test_key".to_string(),
+                language: "en-US".to_string(),
+                sample_rate: 16000,
+                channels: 1,
+                punctuation: true,
+                encoding: "linear16".to_string(),
+            },
+            diarize: true,
+            interim_results: true,
+            filler_words: true,
+            profanity_filter: true,
+            smart_format: true,
+            keywords: vec!["hello".to_string()],
+            redact: vec!["pci".to_string(), "ssn".to_string()],
+            vad_events: true,
+            endpointing: Some(300),
+            tag: Some("test".to_string()),
+            utterance_end_ms: Some(750),
+            ..Default::default()
+        };
+
+        let url = stt.build_websocket_url(&config).unwrap();
+
+        // Verify all advanced parameters are included
+        assert!(url.contains("diarize=true"), "Missing diarize param");
+        assert!(url.contains("filler_words=true"), "Missing filler_words param");
+        assert!(
+            url.contains("profanity_filter=true"),
+            "Missing profanity_filter param"
+        );
+        assert!(url.contains("vad_events=true"), "Missing vad_events param");
+        assert!(url.contains("redact=pci"), "Missing redact=pci param");
+        assert!(url.contains("redact=ssn"), "Missing redact=ssn param");
+        assert!(
+            url.contains("utterance_end_ms=750"),
+            "Missing utterance_end_ms param"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deepgram_config_defaults() {
+        let config = DeepgramSTTConfig::default();
+
+        // Verify defaults
+        assert!(!config.diarize);
+        assert!(config.interim_results);
+        assert!(!config.filler_words);
+        assert!(!config.profanity_filter);
+        assert!(config.smart_format);
+        assert!(config.keywords.is_empty());
+        assert!(config.redact.is_empty());
+        assert!(config.vad_events);
+        assert_eq!(config.endpointing, Some(200));
+        assert_eq!(config.utterance_end_ms, Some(500));
     }
 }

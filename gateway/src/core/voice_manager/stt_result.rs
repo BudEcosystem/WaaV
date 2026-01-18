@@ -262,12 +262,7 @@ impl STTResultProcessor {
             );
 
             // Fire speech_final with empty result (we'll use buffered text)
-            let forced_result = STTResult {
-                transcript: String::new(),
-                is_final: true,
-                is_speech_final: false,
-                confidence: 1.0,
-            };
+            let forced_result = STTResult::new(String::new(), true, false, 1.0);
 
             Self::fire_speech_final(
                 forced_result,
@@ -427,12 +422,7 @@ impl STTResultProcessor {
                 state.hard_timeout_deadline_ms.store(0, Ordering::Release);
             }
 
-            let forced_result = STTResult {
-                transcript: String::new(),
-                is_final: true,
-                is_speech_final: true,
-                confidence: 1.0,
-            };
+            let forced_result = STTResult::new(String::new(), true, true, 1.0);
 
             info!("Forcing speech_final via {}", detection_method);
             callback(forced_result).await;
@@ -557,12 +547,7 @@ mod tests {
         }));
 
         // Send an is_final result (no speech_final)
-        let result = STTResult {
-            transcript: "Hello world".to_string(),
-            is_final: true,
-            is_speech_final: false,
-            confidence: 0.95,
-        };
+        let result = STTResult::new("Hello world".to_string(), true, false, 0.95);
 
         // Process the result - should trigger turn detection and hard timeout
         let processed = processor.process_result(result, state.clone(), None).await;
@@ -625,12 +610,7 @@ mod tests {
         }));
 
         // Send an is_final result
-        let is_final_result = STTResult {
-            transcript: "Hello".to_string(),
-            is_final: true,
-            is_speech_final: false,
-            confidence: 0.95,
-        };
+        let is_final_result = STTResult::new("Hello".to_string(), true, false, 0.95);
 
         processor
             .process_result(is_final_result, state.clone(), None)
@@ -640,12 +620,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Send real speech_final before hard timeout fires
-        let speech_final_result = STTResult {
-            transcript: "Hello world".to_string(),
-            is_final: true,
-            is_speech_final: true,
-            confidence: 0.95,
-        };
+        let speech_final_result = STTResult::new("Hello world".to_string(), true, true, 0.95);
 
         processor
             .process_result(speech_final_result, state.clone(), None)
@@ -699,12 +674,7 @@ mod tests {
         }));
 
         // Send first is_final at t=0
-        let result1 = STTResult {
-            transcript: "Hello".to_string(),
-            is_final: true,
-            is_speech_final: false,
-            confidence: 0.95,
-        };
+        let result1 = STTResult::new("Hello".to_string(), true, false, 0.95);
 
         processor.process_result(result1, state.clone(), None).await;
 
@@ -712,12 +682,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Send another is_final at t=100ms (person still talking)
-        let result2 = STTResult {
-            transcript: " world".to_string(),
-            is_final: true,
-            is_speech_final: false,
-            confidence: 0.95,
-        };
+        let result2 = STTResult::new(" world".to_string(), true, false, 0.95);
 
         processor.process_result(result2, state.clone(), None).await;
 
@@ -763,12 +728,7 @@ mod tests {
         }));
 
         // Send is_final
-        let result = STTResult {
-            transcript: "First utterance".to_string(),
-            is_final: true,
-            is_speech_final: false,
-            confidence: 0.95,
-        };
+        let result = STTResult::new("First utterance".to_string(), true, false, 0.95);
 
         processor.process_result(result, state.clone(), None).await;
 
@@ -780,12 +740,7 @@ mod tests {
         }
 
         // Send real speech_final
-        let speech_final = STTResult {
-            transcript: "First utterance complete".to_string(),
-            is_final: true,
-            is_speech_final: true,
-            confidence: 0.95,
-        };
+        let speech_final = STTResult::new("First utterance complete".to_string(), true, true, 0.95);
 
         processor
             .process_result(speech_final, state.clone(), None)
@@ -799,12 +754,7 @@ mod tests {
         }
 
         // Send new is_final for next utterance
-        let result2 = STTResult {
-            transcript: "Second utterance".to_string(),
-            is_final: true,
-            is_speech_final: false,
-            confidence: 0.95,
-        };
+        let result2 = STTResult::new("Second utterance".to_string(), true, false, 0.95);
 
         processor.process_result(result2, state.clone(), None).await;
 

@@ -7,6 +7,7 @@
 //! - Provider-specific configuration options
 
 use super::super::base::STTConfig;
+use url::form_urlencoded;
 
 // =============================================================================
 // Audio Format
@@ -229,6 +230,54 @@ pub struct ElevenLabsSTTConfig {
     ///
     /// Choose based on latency requirements or data residency needs.
     pub region: ElevenLabsRegion,
+
+    // =========================================================================
+    // Advanced Features (Entity Detection, Diarization, PII/PHI)
+    // =========================================================================
+
+    /// Key terms for improved transcription accuracy.
+    ///
+    /// A list of domain-specific terms, product names, or specialized vocabulary
+    /// that may not be in the standard vocabulary. Maximum 100 terms.
+    ///
+    /// Example: `["ElevenLabs", "WebSocket", "API"]`
+    pub keyterms: Option<Vec<String>>,
+
+    /// Enable entity detection in transcription.
+    ///
+    /// When enabled, the API will detect and return named entities such as
+    /// person names, organizations, locations, dates, numbers, etc.
+    /// Supports 56 entity categories.
+    pub enable_entity_detection: Option<bool>,
+
+    /// Enable speaker diarization.
+    ///
+    /// When enabled, the API will identify and label different speakers
+    /// in the audio. Requires `include_timestamps` to be true for full
+    /// speaker information per word.
+    pub enable_diarization: Option<bool>,
+
+    /// Maximum number of speakers for diarization.
+    ///
+    /// Specifies the expected maximum number of speakers in the audio.
+    /// Helps the model optimize speaker separation. Maximum 48 speakers.
+    /// Only applies when `enable_diarization` is true.
+    pub max_speakers: Option<u8>,
+
+    /// Enable PII (Personally Identifiable Information) detection.
+    ///
+    /// When enabled, the API will detect sensitive personal information
+    /// such as names, addresses, phone numbers, email addresses, SSNs, etc.
+    /// Results are returned in the sensitive_data field.
+    pub enable_pii_detection: Option<bool>,
+
+    /// Enable PHI (Protected Health Information) detection.
+    ///
+    /// When enabled, the API will detect health-related sensitive information
+    /// such as medical conditions, medications, patient IDs, etc.
+    /// Results are returned in the sensitive_data field.
+    /// Useful for HIPAA compliance in healthcare applications.
+    pub enable_phi_detection: Option<bool>,
 }
 
 impl Default for ElevenLabsSTTConfig {
@@ -247,11 +296,83 @@ impl Default for ElevenLabsSTTConfig {
             min_silence_duration_ms: Some(300),    // 300ms silence for end-of-speech
             enable_logging: false,
             region: ElevenLabsRegion::default(),
+            // Advanced features disabled by default
+            keyterms: None,
+            enable_entity_detection: None,
+            enable_diarization: None,
+            max_speakers: None,
+            enable_pii_detection: None,
+            enable_phi_detection: None,
         }
     }
 }
 
+/// Maximum number of keyterms allowed.
+pub const MAX_KEYTERMS: usize = 100;
+
+/// Maximum number of speakers for diarization.
+pub const MAX_SPEAKERS: u8 = 48;
+
 impl ElevenLabsSTTConfig {
+    /// Validate the configuration.
+    ///
+    /// Checks:
+    /// - API key is not empty
+    /// - Keyterms count doesn't exceed maximum (100)
+    /// - Max speakers doesn't exceed maximum (48)
+    ///
+    /// # Returns
+    /// * `Ok(())` if configuration is valid
+    /// * `Err(String)` with error description if invalid
+    pub fn validate(&self) -> Result<(), String> {
+        // Validate API key
+        if self.base.api_key.is_empty() {
+            return Err("API key is required".to_string());
+        }
+
+        // Validate keyterms count
+        if let Some(ref terms) = self.keyterms {
+            if terms.len() > MAX_KEYTERMS {
+                return Err(format!(
+                    "Too many keyterms: {} provided, maximum is {}",
+                    terms.len(),
+                    MAX_KEYTERMS
+                ));
+            }
+            // Validate each keyterm is not empty
+            for (i, term) in terms.iter().enumerate() {
+                if term.trim().is_empty() {
+                    return Err(format!("Keyterm at index {} is empty", i));
+                }
+            }
+        }
+
+        // Validate max speakers
+        if let Some(max) = self.max_speakers {
+            if max > MAX_SPEAKERS {
+                return Err(format!(
+                    "max_speakers {} exceeds maximum of {}",
+                    max, MAX_SPEAKERS
+                ));
+            }
+            if max == 0 {
+                return Err("max_speakers must be at least 1".to_string());
+            }
+        }
+
+        // Warn if diarization is enabled but timestamps are not
+        // (diarization requires timestamps for per-word speaker info)
+        if self.enable_diarization == Some(true) && !self.include_timestamps {
+            // Not an error, but diarization results will be limited
+            tracing::warn!(
+                "Diarization enabled without timestamps - \
+                 speaker info will only be at segment level, not per-word"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Build the WebSocket URL with query parameters.
     ///
     /// Constructs the full WebSocket URL including:
@@ -304,6 +425,41 @@ impl ElevenLabsSTTConfig {
             url.push_str("&enable_logging=true");
         }
 
+        // Add advanced feature parameters
+        if let Some(ref terms) = self.keyterms {
+            if !terms.is_empty() {
+                // URL-encode each keyterm and join with comma
+                // Use form_urlencoded to properly escape special characters
+                let encoded_terms: Vec<String> = terms
+                    .iter()
+                    .map(|t| {
+                        form_urlencoded::byte_serialize(t.as_bytes()).collect::<String>()
+                    })
+                    .collect();
+                url.push_str("&keyterms=");
+                url.push_str(&encoded_terms.join(","));
+            }
+        }
+
+        if self.enable_entity_detection == Some(true) {
+            url.push_str("&entity_detection=true");
+        }
+
+        if self.enable_diarization == Some(true) {
+            url.push_str("&diarization=true");
+            if let Some(max) = self.max_speakers {
+                url.push_str(&format!("&max_speakers={max}"));
+            }
+        }
+
+        if self.enable_pii_detection == Some(true) {
+            url.push_str("&pii_detection=true");
+        }
+
+        if self.enable_phi_detection == Some(true) {
+            url.push_str("&phi_detection=true");
+        }
+
         url
     }
 
@@ -317,5 +473,35 @@ impl ElevenLabsSTTConfig {
             audio_format,
             ..Default::default()
         }
+    }
+
+    /// Check if entity detection is enabled.
+    #[inline]
+    pub fn has_entity_detection(&self) -> bool {
+        self.enable_entity_detection == Some(true)
+    }
+
+    /// Check if diarization is enabled.
+    #[inline]
+    pub fn has_diarization(&self) -> bool {
+        self.enable_diarization == Some(true)
+    }
+
+    /// Check if PII detection is enabled.
+    #[inline]
+    pub fn has_pii_detection(&self) -> bool {
+        self.enable_pii_detection == Some(true)
+    }
+
+    /// Check if PHI detection is enabled.
+    #[inline]
+    pub fn has_phi_detection(&self) -> bool {
+        self.enable_phi_detection == Some(true)
+    }
+
+    /// Check if any sensitive data detection is enabled (PII or PHI).
+    #[inline]
+    pub fn has_sensitive_data_detection(&self) -> bool {
+        self.has_pii_detection() || self.has_phi_detection()
     }
 }

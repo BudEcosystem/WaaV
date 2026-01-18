@@ -83,6 +83,7 @@ fn test_incoming_message_serialization() {
             emotion_description: None,
         }),
         livekit: None,
+        dag_config: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -693,6 +694,7 @@ fn test_incoming_message_config_with_livekit() {
             waav_participant_name: None,
             listen_participants: vec![],
         }),
+        dag_config: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -734,6 +736,7 @@ fn test_incoming_message_config_without_livekit() {
             emotion_description: None,
         }),
         livekit: None,
+        dag_config: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1044,6 +1047,7 @@ fn test_config_message_without_livekit_routing() {
             emotion_description: None,
         }),
         livekit: None, // No LiveKit configuration
+        dag_config: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1102,6 +1106,7 @@ fn test_config_message_with_livekit_routing() {
             waav_participant_name: None,
             listen_participants: vec![],
         }),
+        dag_config: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1290,6 +1295,7 @@ fn test_config_message_audio_disabled() {
             waav_participant_name: None,
             listen_participants: vec![],
         }),
+        dag_config: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1355,6 +1361,7 @@ fn test_config_message_audio_default() {
             emotion_description: None,
         }),
         livekit: None,
+        dag_config: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();

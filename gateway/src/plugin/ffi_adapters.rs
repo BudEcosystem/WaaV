@@ -235,12 +235,12 @@ impl BaseSTT for FFISTTAdapter {
 
             unsafe {
                 let ffi_result = &*result;
-                let rust_result = STTResult {
-                    transcript: ffi_result.transcript.to_string(),
-                    is_final: ffi_result.is_final,
-                    is_speech_final: ffi_result.is_speech_final,
-                    confidence: ffi_result.confidence,
-                };
+                let rust_result = STTResult::new(
+                    ffi_result.transcript.to_string(),
+                    ffi_result.is_final,
+                    ffi_result.is_speech_final,
+                    ffi_result.confidence,
+                );
 
                 let callback = &*(user_data as *const STTResultCallback);
                 let future = callback(rust_result);
