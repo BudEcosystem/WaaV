@@ -299,6 +299,9 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: crate::config::PluginConfig::default(),
             dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
@@ -359,6 +362,9 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: crate::config::PluginConfig::default(),
             dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
@@ -434,6 +440,9 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: crate::config::PluginConfig::default(),
             dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
@@ -519,6 +528,9 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: crate::config::PluginConfig::default(),
             dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
@@ -603,6 +615,9 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: crate::config::PluginConfig::default(),
             dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
@@ -686,6 +701,9 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: crate::config::PluginConfig::default(),
             dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
@@ -771,6 +789,9 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: crate::config::PluginConfig::default(),
             dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
@@ -857,6 +878,9 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: crate::config::PluginConfig::default(),
             dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };

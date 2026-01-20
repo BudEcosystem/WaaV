@@ -1469,12 +1469,27 @@ pub mod example {
     }
 
     /// Factory function to create STT providers
+    ///
+    /// # Deprecated
+    /// This is an example placeholder. Use `create_stt_provider_from_enum` with a specific
+    /// provider type instead of this function.
+    ///
+    /// # Panics
+    /// This function always panics as it is not meant to be called directly.
+    /// It exists only for documentation purposes.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use create_stt_provider_from_enum() with a specific provider type instead"
+    )]
     pub fn create_stt_provider() -> Box<dyn BaseSTT> {
-        // This would return an actual provider implementation
-        // Use the new API pattern with trait method and config:
+        // This is a documentation example only (#[cfg(doc)] module).
+        // In production, use the new API pattern with trait method and config:
         // let config = STTConfig { ... };
         // let stt = <DeepgramSTT as BaseSTT>::new(config).await.unwrap();
         // Box::new(stt)
-        todo!("Implement actual STT provider")
+        unreachable!(
+            "create_stt_provider() is not implemented. \
+             Use create_stt_provider_from_enum() with a specific provider type."
+        )
     }
 }

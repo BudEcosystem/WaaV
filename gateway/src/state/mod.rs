@@ -157,13 +157,22 @@ impl AppState {
                     Some(Arc::new(client))
                 }
                 Err(e) => {
-                    // Fail fast when JWT auth is configured but client initialization fails
-                    tracing::error!("Failed to initialize auth client: {:?}", e);
-                    panic!(
-                        "JWT authentication configured but client initialization failed: {e:?}. \
-                        Cannot start server without authentication. \
-                        Please check AUTH_SERVICE_URL and AUTH_SIGNING_KEY_PATH configuration."
+                    // Graceful degradation when JWT auth fails at runtime
+                    // Config validation in config/validation.rs catches structural issues.
+                    // Runtime failures (network, service unavailable) degrade gracefully.
+                    tracing::error!(
+                        error = ?e,
+                        auth_service_url = ?config.auth_service_url,
+                        "Failed to initialize JWT auth client. \
+                         Authentication will be DISABLED for this session. \
+                         Check AUTH_SERVICE_URL and AUTH_SIGNING_KEY_PATH configuration."
                     );
+                    tracing::warn!(
+                        "SERVER RUNNING WITHOUT JWT AUTHENTICATION. \
+                         API secret auth may still be available if configured. \
+                         This is a security risk in production!"
+                    );
+                    None
                 }
             }
         } else if config.auth_required && config.has_api_secret_auth() {
@@ -219,12 +228,12 @@ impl AppState {
                 };
 
                 // Prepare dispatch configuration
-                // Note: max_participants is set to a sensible default of 3 (caller + Sayna + optional third party)
-                // This can be exposed in config later if needed
+                // max_participants is configurable via SIP_MAX_PARTICIPANTS env var or YAML config
+                // Default: 3 (caller + Sayna + optional third party)
                 let dispatch_config = DispatchConfig {
                     dispatch_name: dispatch_name.clone(),
                     room_prefix: sip_config.room_prefix.clone(),
-                    max_participants: 3,
+                    max_participants: config.sip_max_participants,
                 };
 
                 // Provision the trunk and dispatch rule (idempotent - won't recreate if they exist)
@@ -242,20 +251,20 @@ impl AppState {
                         Some(Arc::new(handler))
                     }
                     Err(e) => {
-                        // Fail fast if provisioning fails - LiveKit can't deliver SIP calls without these resources
+                        // Graceful degradation - SIP features will be disabled but server continues
                         tracing::error!(
-                            "Failed to provision SIP resources: trunk={}, dispatch={}, livekit_url={}, error={:?}",
-                            trunk_name,
-                            dispatch_name,
-                            config.livekit_url,
-                            e
+                            trunk = %trunk_name,
+                            dispatch = %dispatch_name,
+                            livekit_url = %config.livekit_url,
+                            error = ?e,
+                            "Failed to provision SIP resources. SIP features will be DISABLED."
                         );
-                        panic!(
-                            "SIP provisioning failed for trunk={}, dispatch={}: {e:?}. \
-                            Cannot start server with SIP enabled. \
-                            Please check LiveKit API credentials and server availability.",
-                            trunk_name, dispatch_name
+                        tracing::warn!(
+                            "SIP calls will not be routed to this server. \
+                             Check LiveKit server availability and API credentials. \
+                             The server will continue without SIP functionality."
                         );
+                        None
                     }
                 }
             } else {
@@ -307,39 +316,63 @@ impl AppState {
 
     /// Try to acquire a connection slot. Returns Ok(()) if successful, Err(reason) if limits exceeded.
     /// This should be called before accepting a new WebSocket connection.
+    ///
+    /// This method uses compare-exchange to atomically acquire the global connection slot,
+    /// preventing TOCTOU race conditions where multiple threads could bypass the limit.
     pub fn try_acquire_connection(&self, ip: IpAddr) -> Result<(), ConnectionLimitError> {
-        // Check global limit first
+        // Atomically acquire global slot using CAS loop to prevent TOCTOU race
         if let Some(max_ws) = self.config.max_websocket_connections {
-            let current = self.active_ws_connections.load(Ordering::Relaxed);
-            if current >= max_ws {
-                tracing::warn!(
-                    current = current,
-                    max = max_ws,
-                    "Global WebSocket connection limit reached"
-                );
-                return Err(ConnectionLimitError::GlobalLimitReached);
+            loop {
+                let current = self.active_ws_connections.load(Ordering::Acquire);
+                if current >= max_ws {
+                    tracing::warn!(
+                        current = current,
+                        max = max_ws,
+                        "Global WebSocket connection limit reached"
+                    );
+                    return Err(ConnectionLimitError::GlobalLimitReached);
+                }
+                // Try to claim slot atomically
+                if self
+                    .active_ws_connections
+                    .compare_exchange_weak(
+                        current,
+                        current + 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    break;
+                }
+                // CAS failed due to concurrent modification, retry
             }
+        } else {
+            // No global limit configured, just increment
+            self.active_ws_connections.fetch_add(1, Ordering::Relaxed);
         }
 
-        // Check per-IP limit
+        // Check and acquire per-IP slot
+        // Note: We increment first, then check, so we can rollback if limit exceeded
         let max_per_ip = self.config.max_connections_per_ip;
-        let current_ip_count = self.ip_connection_count(&ip);
-        if current_ip_count >= max_per_ip as usize {
+        let ip_entry = self
+            .connections_per_ip
+            .entry(ip)
+            .or_insert_with(|| AtomicUsize::new(0));
+
+        let current_ip = ip_entry.fetch_add(1, Ordering::Relaxed);
+        if current_ip >= max_per_ip as usize {
+            // Rollback both counters
+            ip_entry.fetch_sub(1, Ordering::Relaxed);
+            self.active_ws_connections.fetch_sub(1, Ordering::Relaxed);
             tracing::warn!(
                 ip = %ip,
-                current = current_ip_count,
+                current = current_ip,
                 max = max_per_ip,
                 "Per-IP connection limit reached"
             );
             return Err(ConnectionLimitError::PerIpLimitReached);
         }
-
-        // Acquire both slots atomically
-        self.active_ws_connections.fetch_add(1, Ordering::Relaxed);
-        self.connections_per_ip
-            .entry(ip)
-            .or_insert_with(|| AtomicUsize::new(0))
-            .fetch_add(1, Ordering::Relaxed);
 
         tracing::debug!(
             ip = %ip,
@@ -444,6 +477,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: crate::config::PluginConfig::default(),
             dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
@@ -514,6 +550,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: crate::config::PluginConfig::default(),
             dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };

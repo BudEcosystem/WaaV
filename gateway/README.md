@@ -161,6 +161,7 @@ Per-IP connection limits prevent resource exhaustion:
 - Configurable via `MAX_CONNECTIONS_PER_IP` (default: 100)
 - Global rate limiting via `RATE_LIMIT_REQUESTS_PER_SECOND` (default: 60/s)
 - Burst allowance via `RATE_LIMIT_BURST_SIZE` (default: 10)
+- **Race-condition-free**: Uses atomic compare-exchange for thread-safe connection tracking
 
 ### Tenant Isolation
 Multi-tenant deployments benefit from automatic resource scoping:
@@ -174,6 +175,13 @@ Production-grade resource controls:
 - HTTP connection pools with explicit limits and idle timeouts
 - WebSocket idle timeout with jitter (prevents thundering herd)
 - Pre-deserialization message size validation
+
+### Graceful Degradation
+WaaV Gateway uses graceful degradation instead of fail-fast for non-critical subsystems:
+- **Authentication**: If auth client initialization fails, server continues with auth disabled (logged as warning)
+- **SIP Provisioning**: If SIP resource provisioning fails, SIP features are disabled but server continues
+- **Cache Initialization**: Falls back to in-memory cache if configured cache backend fails
+- All degradation events are logged with clear warnings for monitoring
 
 ## API Endpoints
 
@@ -594,6 +602,9 @@ docker run -p 3001:3001 --env-file .env waav-gateway
 | `AUTH_SERVICE_URL` | External auth service endpoint | - | Yes** |
 | `AUTH_SIGNING_KEY_PATH` | Path to JWT signing private key | - | Yes** |
 | `AUTH_TIMEOUT_SECONDS` | Auth request timeout | `5` | No |
+| `WS_PROCESSING_TIMEOUT_SECS` | WebSocket message processing timeout | `10` | No |
+| `REALTIME_PROCESSING_TIMEOUT_SECS` | Realtime pipeline processing timeout | `30` | No |
+| `SIP_MAX_PARTICIPANTS` | Maximum participants per SIP room | `3` | No |
 
 *Not required when using audio-disabled mode
 **Required when `AUTH_REQUIRED=true` for the auth method you choose

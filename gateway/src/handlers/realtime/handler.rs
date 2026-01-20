@@ -115,8 +115,8 @@ async fn handle_realtime_socket(socket: WebSocket, app_state: Arc<AppState>, aut
     let mut realtime_provider: Option<Box<dyn BaseRealtime>> = None;
     let mut session_id: Option<String> = None;
 
-    // How often we check if the connection is stale
-    let processing_timeout = Duration::from_secs(30);
+    // How often we check if the connection is stale (configurable via REALTIME_PROCESSING_TIMEOUT_SECS)
+    let processing_timeout = Duration::from_secs(app_state.config.realtime_processing_timeout_secs);
 
     // Maximum idle time before closing the connection (5 minutes with ±10% jitter)
     // Jitter prevents thundering herd when many connections timeout simultaneously

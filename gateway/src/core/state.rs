@@ -54,11 +54,29 @@ impl CoreState {
                 ttl_seconds: config.cache_ttl_seconds,
             }
         };
-        let cache = Arc::new(
-            CacheStore::from_config(cache_cfg)
-                .await
-                .expect("cache init"),
-        );
+        let cache = match CacheStore::from_config(cache_cfg).await {
+            Ok(store) => {
+                tracing::info!("Cache store initialized successfully");
+                Arc::new(store)
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = ?e,
+                    "Cache initialization failed, falling back to in-memory cache"
+                );
+                // Fallback to simple in-memory cache with reasonable defaults
+                let fallback_cfg = CacheConfig::Memory {
+                    max_entries: 10_000,
+                    max_size_bytes: Some(50 * 1024 * 1024), // 50MB fallback
+                    ttl_seconds: config.cache_ttl_seconds,
+                };
+                Arc::new(
+                    CacheStore::from_config(fallback_cfg)
+                        .await
+                        .expect("fallback in-memory cache must succeed")
+                )
+            }
+        };
 
         let tts_provider_urls = get_tts_provider_urls();
         for (provider, url) in tts_provider_urls {

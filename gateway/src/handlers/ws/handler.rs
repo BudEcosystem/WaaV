@@ -222,9 +222,9 @@ async fn handle_voice_socket(
         }
     });
 
-    // Timeout for checking idle connections
+    // Timeout for checking idle connections (configurable via WS_PROCESSING_TIMEOUT_SECS)
     // This determines how often we check if the connection is stale
-    let processing_timeout = Duration::from_secs(10);
+    let processing_timeout = Duration::from_secs(app_state.config.ws_processing_timeout_secs);
 
     // Maximum idle time before closing the connection (5 minutes with ±10% jitter)
     // Audio connections without activity for this long are likely stale

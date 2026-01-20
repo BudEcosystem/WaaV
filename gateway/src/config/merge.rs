@@ -446,6 +446,41 @@ pub fn merge_config(
         })
         .unwrap_or(100);
 
+    // Timeout configuration
+    let ws_processing_timeout_secs = yaml
+        .security
+        .as_ref()
+        .and_then(|s| s.ws_processing_timeout_secs)
+        .or_else(|| {
+            env::var("WS_PROCESSING_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+        })
+        .unwrap_or(10);
+
+    let realtime_processing_timeout_secs = yaml
+        .security
+        .as_ref()
+        .and_then(|s| s.realtime_processing_timeout_secs)
+        .or_else(|| {
+            env::var("REALTIME_PROCESSING_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+        })
+        .unwrap_or(30);
+
+    // SIP configuration limits
+    let sip_max_participants = yaml
+        .sip
+        .as_ref()
+        .and_then(|s| s.max_participants)
+        .or_else(|| {
+            env::var("SIP_MAX_PARTICIPANTS")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+        })
+        .unwrap_or(3);
+
     // Plugin configuration (backward compatible: enabled by default)
     let plugins_enabled = yaml
         .plugins
@@ -590,6 +625,11 @@ pub fn merge_config(
         rate_limit_burst_size,
         max_websocket_connections,
         max_connections_per_ip,
+        // Timeout configuration
+        ws_processing_timeout_secs,
+        realtime_processing_timeout_secs,
+        // SIP configuration limits
+        sip_max_participants,
         plugins,
         dag_timeouts,
     })
@@ -1033,6 +1073,7 @@ mod tests {
                 }],
                 hook_secret: Some("global-secret".to_string()),
                 naming_prefix: None,
+                max_participants: None,
             }),
             ..Default::default()
         };
@@ -1063,6 +1104,7 @@ mod tests {
                 hooks: vec![],
                 hook_secret: Some("yaml-secret".to_string()),
                 naming_prefix: None,
+                max_participants: None,
             }),
             ..Default::default()
         };
@@ -1131,6 +1173,7 @@ mod tests {
                 hooks: vec![],
                 hook_secret: None,
                 naming_prefix: None,
+                max_participants: None,
             }),
             ..Default::default()
         };
@@ -1175,6 +1218,7 @@ mod tests {
                 ],
                 hook_secret: Some("global-secret".to_string()),
                 naming_prefix: Some("custom".to_string()), // test custom naming_prefix
+                max_participants: None,
             }),
             ..Default::default()
         };

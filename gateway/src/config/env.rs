@@ -197,6 +197,22 @@ impl ServerConfig {
             max_connections_per_ip,
         )?;
 
+        // Timeout configuration
+        let ws_processing_timeout_secs = env::var("WS_PROCESSING_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(10);
+        let realtime_processing_timeout_secs = env::var("REALTIME_PROCESSING_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+
+        // SIP configuration limits
+        let sip_max_participants = env::var("SIP_MAX_PARTICIPANTS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(3);
+
         // Plugin configuration (backward compatible: enabled by default)
         let plugins_enabled = env::var("PLUGINS_ENABLED")
             .ok()
@@ -289,6 +305,11 @@ impl ServerConfig {
             rate_limit_burst_size,
             max_websocket_connections,
             max_connections_per_ip,
+            // Timeout configuration
+            ws_processing_timeout_secs,
+            realtime_processing_timeout_secs,
+            // SIP configuration limits
+            sip_max_participants,
             plugins,
             dag_timeouts,
         })

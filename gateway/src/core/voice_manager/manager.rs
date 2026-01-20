@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use tokio::sync::{Notify, RwLock};
 use tokio::time::Duration;
-use tracing::debug;
+use tracing::{debug, trace, warn};
 
 use crate::core::cache::store::CacheStore;
 use crate::core::{
@@ -21,6 +21,9 @@ use crate::core::{
     turn_detect::TurnDetector,
 };
 
+#[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+use crate::core::smart_turn::{SmartTurnProcessor, SmartTurnProcessResult};
+
 use super::{
     callbacks::{
         AudioClearCallback, STTCallback, STTErrorCallback, TTSAudioCallback, TTSCompleteCallback,
@@ -31,6 +34,15 @@ use super::{
     state::{InterruptionState, SpeechFinalState},
     stt_result::{STTProcessingConfig, STTResultProcessor},
 };
+
+/// Callback type for smart turn detection results.
+#[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+pub type SmartTurnCallback = Arc<
+    dyn Fn(SmartTurnProcessResult) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 /// VoiceManager provides a unified interface for managing STT and TTS providers
 /// Optimized for extreme low-latency with lock-free atomics and pre-allocated buffers
@@ -51,6 +63,15 @@ pub struct VoiceManager {
 
     // Turn detection for better end-of-speech detection
     turn_detector: Option<Arc<RwLock<TurnDetector>>>,
+
+    // Audio-based smart turn processor (VAD + ML turn detection)
+    // Uses interior mutability so it can be initialized in start()
+    #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+    smart_turn_processor: Arc<RwLock<Option<SmartTurnProcessor>>>,
+
+    // Callback for smart turn detection results
+    #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+    smart_turn_callback: Arc<SyncRwLock<Option<SmartTurnCallback>>>,
 
     // Interruption control - mostly lock-free with atomics
     interruption_state: Arc<InterruptionState>,
@@ -128,6 +149,10 @@ impl VoiceManager {
                 hard_timeout_deadline_ms: AtomicUsize::new(0),
             })),
             turn_detector,
+            #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+            smart_turn_processor: Arc::new(RwLock::new(None)), // Initialized in start() if configured
+            #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+            smart_turn_callback: Arc::new(SyncRwLock::new(None)),
             interruption_state: Arc::new(InterruptionState {
                 allow_interruption: AtomicBool::new(true),
                 non_interruptible_until_ms: AtomicUsize::new(0),
@@ -190,6 +215,26 @@ impl VoiceManager {
             tts.connect().await.map_err(VoiceManagerError::TTSError)?;
         }
 
+        // Initialize Smart Turn Processor if configured
+        #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+        {
+            if let Some(ref smart_turn_config) = self.config.smart_turn_config {
+                debug!("Initializing SmartTurnProcessor...");
+                let processor = SmartTurnProcessor::new(smart_turn_config.clone())
+                    .await
+                    .map_err(|e| {
+                        VoiceManagerError::InitializationError(format!(
+                            "Failed to initialize SmartTurnProcessor: {}",
+                            e
+                        ))
+                    })?;
+
+                let mut smart_turn = self.smart_turn_processor.write().await;
+                *smart_turn = Some(processor);
+                debug!("SmartTurnProcessor initialized successfully");
+            }
+        }
+
         // Set up internal TTS callback - using parking_lot for faster access
         {
             let mut tts = self.tts.write().await;
@@ -248,6 +293,15 @@ impl VoiceManager {
             state.last_forced_text.clear();
             state.segment_start_ms.store(0, Ordering::Release);
             state.hard_timeout_deadline_ms.store(0, Ordering::Release);
+        }
+
+        // Reset smart turn processor
+        #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+        {
+            let mut smart_turn = self.smart_turn_processor.write().await;
+            if let Some(ref mut processor) = *smart_turn {
+                processor.reset();
+            }
         }
 
         // Disconnect STT provider
@@ -326,12 +380,67 @@ impl VoiceManager {
     /// # }
     /// ```
     pub async fn receive_audio(&self, audio: Bytes) -> VoiceManagerResult<()> {
+        // Process audio through Smart Turn Processor if enabled
+        #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+        {
+            let mut smart_turn_guard = self.smart_turn_processor.write().await;
+            if let Some(ref mut processor) = *smart_turn_guard {
+                // Convert bytes to f32 samples (assuming 16-bit PCM)
+                let samples = self.bytes_to_f32_samples(&audio);
+
+                // Process through smart turn detector
+                match processor.process_audio(&samples).await {
+                    Ok(result) => {
+                        // If turn was detected, call the callback
+                        if result.is_turn_complete {
+                            trace!(
+                                "Smart turn detected: prob={:.3}, silence={}ms",
+                                result.probability,
+                                result.silence_duration_ms
+                            );
+
+                            let callback_opt = self.smart_turn_callback.read().clone();
+                            if let Some(callback) = callback_opt {
+                                // Drop the lock before calling callback to avoid deadlock
+                                drop(smart_turn_guard);
+                                callback(result).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Smart turn processing error: {}", e);
+                    }
+                }
+            }
+        }
+
         // Send audio to STT provider (zero-copy pass-through)
         let mut stt = self.stt.write().await;
         stt.send_audio(audio)
             .await
             .map_err(VoiceManagerError::STTError)?;
         Ok(())
+    }
+
+    /// Convert raw audio bytes (16-bit PCM) to f32 samples normalized to [-1.0, 1.0]
+    #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+    #[inline]
+    fn bytes_to_f32_samples(&self, bytes: &[u8]) -> Vec<f32> {
+        // 16-bit PCM: 2 bytes per sample, little-endian
+        let sample_count = bytes.len() / 2;
+        let mut samples = Vec::with_capacity(sample_count);
+
+        for i in 0..sample_count {
+            let idx = i * 2;
+            if idx + 1 < bytes.len() {
+                // Little-endian 16-bit signed integer
+                let sample_i16 = i16::from_le_bytes([bytes[idx], bytes[idx + 1]]);
+                // Normalize to [-1.0, 1.0]
+                samples.push(sample_i16 as f32 / 32768.0);
+            }
+        }
+
+        samples
     }
 
     /// Send text to the TTS provider for synthesis
@@ -839,6 +948,93 @@ impl VoiceManager {
     {
         let mut audio_clear_callback = self.audio_clear_callback.write();
         *audio_clear_callback = Some(Arc::new(callback));
+        Ok(())
+    }
+
+    /// Register a callback for smart turn detection results.
+    ///
+    /// This callback is called when the audio-based turn detector determines
+    /// that the user has finished speaking. This provides earlier turn detection
+    /// than waiting for STT speech_final, enabling faster response times.
+    ///
+    /// # Arguments
+    /// * `callback` - Callback function to handle turn detection results
+    ///
+    /// # Returns
+    /// * `VoiceManagerResult<()>` - Success or error
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// # use waav_gateway::core::voice_manager::{VoiceManager, VoiceManagerConfig};
+    /// # use waav_gateway::core::stt::STTConfig;
+    /// # use waav_gateway::core::tts::TTSConfig;
+    /// # use waav_gateway::core::smart_turn::SmartTurnProcessorConfig;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let smart_turn_config = SmartTurnProcessorConfig::default();
+    /// # let config = VoiceManagerConfig::with_smart_turn(
+    /// #     STTConfig::default(),
+    /// #     TTSConfig::default(),
+    /// #     smart_turn_config,
+    /// # );
+    /// # let voice_manager = VoiceManager::new(config, None)?;
+    /// voice_manager.on_smart_turn(|result| {
+    ///     Box::pin(async move {
+    ///         if result.is_turn_complete {
+    ///             println!("Turn complete: prob={:.2}, silence={}ms",
+    ///                      result.probability, result.silence_duration_ms);
+    ///         }
+    ///     })
+    /// }).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+    pub async fn on_smart_turn<F>(&self, callback: F) -> VoiceManagerResult<()>
+    where
+        F: Fn(SmartTurnProcessResult) -> Pin<Box<dyn Future<Output = ()> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut smart_turn_callback = self.smart_turn_callback.write();
+        *smart_turn_callback = Some(Arc::new(callback));
+        Ok(())
+    }
+
+    /// Returns whether smart turn detection is enabled and initialized.
+    #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+    pub async fn is_smart_turn_enabled(&self) -> bool {
+        let guard = self.smart_turn_processor.read().await;
+        guard.is_some()
+    }
+
+    /// Returns the current speech state from smart turn processor.
+    ///
+    /// Returns `None` if smart turn is not enabled.
+    #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+    pub async fn smart_turn_is_speech(&self) -> Option<bool> {
+        let guard = self.smart_turn_processor.read().await;
+        guard.as_ref().map(|p| p.is_speech())
+    }
+
+    /// Returns the current silence duration from smart turn processor.
+    ///
+    /// Returns `None` if smart turn is not enabled.
+    #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+    pub async fn smart_turn_silence_duration_ms(&self) -> Option<f32> {
+        let guard = self.smart_turn_processor.read().await;
+        guard.as_ref().map(|p| p.silence_duration_ms())
+    }
+
+    /// Reset the smart turn processor state for a new conversation.
+    #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+    pub async fn reset_smart_turn(&self) -> VoiceManagerResult<()> {
+        let mut guard = self.smart_turn_processor.write().await;
+        if let Some(ref mut processor) = *guard {
+            processor.reset();
+            debug!("SmartTurnProcessor reset");
+        }
         Ok(())
     }
 

@@ -34,12 +34,15 @@ smart-turn = [
     "dep:mel_spec",
     "dep:rubato",
     "dep:realfft",
+    "dep:num",
+    "dep:dirs",
 ]
 
 # Silero VAD: Local neural network voice activity detection
 silero-vad = [
     "dep:ort",
     "dep:ndarray",
+    "dep:dirs",
 ]
 
 # Combined ensemble: Both audio-based (smart-turn) and text-based (turn-detect) turn detection
@@ -185,6 +188,12 @@ rtrb = { version = "0.3", optional = true }  # Lock-free ring buffer for inter-n
 mel_spec = { version = "0.3", optional = true }  # Whisper-compatible mel spectrogram extraction
 rubato = { version = "0.16", optional = true }  # High-quality audio resampling
 realfft = { version = "3.4", optional = true }  # FFT for mel spectrogram (fallback)
+
+# Silero VAD dependencies
+dirs = { version = "5.0", optional = true }  # Cache directory for model storage
+
+# Smart Turn additional dependencies
+num = { version = "0.4", optional = true }  # Complex number support for FFT
 
 [dev-dependencies]
 tower = { version = "0.5.2", features = ["util"] }

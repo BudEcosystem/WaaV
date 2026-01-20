@@ -169,6 +169,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: Some(10),
             max_connections_per_ip: 3,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: crate::config::PluginConfig::default(),
             dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
@@ -265,6 +268,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: Some(5), // Global limit of 5
             max_connections_per_ip: 10,         // Per-IP limit higher than global
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: crate::config::PluginConfig::default(),
             dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };

@@ -2,6 +2,9 @@
 
 use crate::core::{stt::STTConfig, tts::TTSConfig};
 
+#[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+use crate::core::smart_turn::SmartTurnProcessorConfig;
+
 /// Configuration for speech final timing control
 #[derive(Debug, Clone, Copy)]
 pub struct SpeechFinalConfig {
@@ -38,6 +41,11 @@ pub struct VoiceManagerConfig {
     pub tts_config: TTSConfig,
     /// Configuration for speech final timing control
     pub speech_final_config: SpeechFinalConfig,
+    /// Configuration for audio-based smart turn detection (optional).
+    /// When enabled, processes audio through VAD and/or ML-based turn detection
+    /// to determine when the user has finished speaking.
+    #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+    pub smart_turn_config: Option<SmartTurnProcessorConfig>,
 }
 
 impl VoiceManagerConfig {
@@ -47,6 +55,8 @@ impl VoiceManagerConfig {
             stt_config,
             tts_config,
             speech_final_config: SpeechFinalConfig::default(),
+            #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+            smart_turn_config: None,
         }
     }
 
@@ -60,6 +70,43 @@ impl VoiceManagerConfig {
             stt_config,
             tts_config,
             speech_final_config,
+            #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+            smart_turn_config: None,
+        }
+    }
+
+    /// Create a new VoiceManagerConfig with smart turn detection enabled.
+    ///
+    /// Smart turn detection uses audio-based analysis (VAD + ML model) to
+    /// determine when the user has finished speaking, complementing the
+    /// text-based turn detection.
+    #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+    pub fn with_smart_turn(
+        stt_config: STTConfig,
+        tts_config: TTSConfig,
+        smart_turn_config: SmartTurnProcessorConfig,
+    ) -> Self {
+        Self {
+            stt_config,
+            tts_config,
+            speech_final_config: SpeechFinalConfig::default(),
+            smart_turn_config: Some(smart_turn_config),
+        }
+    }
+
+    /// Create a new VoiceManagerConfig with all options specified.
+    #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+    pub fn with_all(
+        stt_config: STTConfig,
+        tts_config: TTSConfig,
+        speech_final_config: SpeechFinalConfig,
+        smart_turn_config: Option<SmartTurnProcessorConfig>,
+    ) -> Self {
+        Self {
+            stt_config,
+            tts_config,
+            speech_final_config,
+            smart_turn_config,
         }
     }
 }

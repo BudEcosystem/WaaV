@@ -252,6 +252,20 @@ pub struct ServerConfig {
     /// Default: 100
     pub max_connections_per_ip: u32,
 
+    // Timeout configuration
+    /// WebSocket processing timeout in seconds for checking idle connections
+    /// This determines how often we check if a connection is stale
+    /// Default: 10
+    pub ws_processing_timeout_secs: u64,
+    /// Realtime WebSocket processing timeout in seconds
+    /// Default: 30
+    pub realtime_processing_timeout_secs: u64,
+
+    // SIP configuration limits
+    /// Maximum participants per SIP room
+    /// Default: 3 (caller + Sayna + optional third party)
+    pub sip_max_participants: u32,
+
     // Plugin configuration
     /// Plugin system configuration (optional, backward compatible)
     /// If not specified, the plugin system is enabled with built-in providers only
@@ -748,6 +762,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         }
@@ -819,6 +836,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -879,6 +899,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -942,6 +965,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1005,6 +1031,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1074,6 +1103,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1130,6 +1162,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1191,6 +1226,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1247,6 +1285,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1314,6 +1355,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1373,6 +1417,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1435,6 +1482,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1496,6 +1546,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1557,6 +1610,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1623,6 +1679,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1683,6 +1742,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1746,6 +1808,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1804,6 +1869,9 @@ mod tests {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };

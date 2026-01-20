@@ -6,9 +6,12 @@ pub mod observability;
 pub mod pipeline;
 pub mod providers;
 pub mod realtime;
+pub mod silero_vad;
+pub mod smart_turn;
 pub mod state;
 pub mod stt;
 pub mod tts;
+pub mod turn_decision;
 pub mod turn_detect;
 pub mod voice_manager;
 pub mod websocket;
@@ -52,7 +55,10 @@ pub use emotion::{
 };
 
 // Re-export audio types for VAD
-pub use audio::{VADAnalyzer, VADParams, VADState, VADTransition};
+pub use audio::{AudioRingBuffer, VADAnalyzer, VADParams, VADState, VADTransition};
+
+// Re-export Silero VAD types
+pub use silero_vad::{SileroVAD, SileroVADConfig, SileroVADResult};
 
 // Re-export metrics types for provider monitoring
 pub use metrics::{ProviderMetrics, ProviderMetricsSnapshot, RequestTimer};
@@ -69,4 +75,18 @@ pub use pipeline::{FramePriority, FramePriorityQueue, PriorityFrame, QueueSnapsh
 pub use websocket::{
     ReconnectionConfig, ReconnectionConfigBuilder, ReconnectionManager, ReconnectionSnapshot,
     ReconnectionState,
+};
+
+// Re-export Smart Turn types for audio-based turn detection
+pub use smart_turn::{
+    MelExtractor, MelExtractorConfig,
+    SmartTurnDetector, SmartTurnDetectorBuilder, SmartTurnDetectorConfig, SmartTurnResult,
+    SMART_TURN_MAX_FRAMES, WHISPER_HOP_LENGTH, WHISPER_MAX_DURATION_SECS, WHISPER_MAX_FRAMES,
+    WHISPER_N_FFT, WHISPER_N_MELS, WHISPER_SAMPLE_RATE,
+};
+
+// Re-export Turn Decision Engine types for ensemble turn detection
+pub use turn_decision::{
+    TurnDecision, TurnDecisionEngine, TurnDecisionEngineBuilder, TurnDecisionEngineConfig,
+    TurnSignal, TurnState,
 };

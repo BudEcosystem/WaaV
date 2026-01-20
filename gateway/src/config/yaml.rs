@@ -207,6 +207,8 @@ pub struct SipYaml {
     pub hook_secret: Option<String>,
     /// Prefix for SIP trunk and dispatch naming (defaults to "waav")
     pub naming_prefix: Option<String>,
+    /// Maximum participants per SIP room (default: 3)
+    pub max_participants: Option<u32>,
 }
 
 /// SIP webhook hook configuration from YAML
@@ -242,6 +244,10 @@ pub struct SecurityYaml {
     pub max_websocket_connections: Option<usize>,
     /// Maximum connections per IP address
     pub max_connections_per_ip: Option<u32>,
+    /// WebSocket processing timeout in seconds (for checking idle connections)
+    pub ws_processing_timeout_secs: Option<u64>,
+    /// Realtime WebSocket processing timeout in seconds
+    pub realtime_processing_timeout_secs: Option<u64>,
 }
 
 /// Plugin configuration from YAML
