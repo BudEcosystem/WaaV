@@ -261,9 +261,11 @@ async fn handle_voice_socket(
                     }
                     Some(Err(e)) => {
                         warn!("WebSocket error: {}", e);
-                        let _ = message_tx.send(MessageRoute::Outgoing(OutgoingMessage::Error {
+                        if message_tx.send(MessageRoute::Outgoing(OutgoingMessage::Error {
                             message: format!("WebSocket error: {e}"),
-                        })).await;
+                        })).await.is_err() {
+                            warn!("Failed to send error message to WebSocket handler: channel closed");
+                        }
                         break;
                     }
                     None => {
@@ -279,9 +281,11 @@ async fn handle_voice_socket(
                         "WebSocket connection idle for {}s, closing stale connection",
                         last_activity.elapsed().as_secs()
                     );
-                    let _ = message_tx.send(MessageRoute::Outgoing(OutgoingMessage::Error {
+                    if message_tx.send(MessageRoute::Outgoing(OutgoingMessage::Error {
                         message: "Connection closed due to inactivity".to_string(),
-                    })).await;
+                    })).await.is_err() {
+                        warn!("Failed to send idle timeout error to WebSocket handler: channel closed");
+                    }
                     break;
                 }
                 debug!(

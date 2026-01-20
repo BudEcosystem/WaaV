@@ -46,6 +46,8 @@ pub struct DataMessage {
     pub data: Vec<u8>,
     /// Optional topic/channel for the data.
     pub topic: Option<String>,
+    /// Room name where the message was received.
+    pub room_name: String,
     /// Timestamp when the data was received.
     pub timestamp: u64,
 }

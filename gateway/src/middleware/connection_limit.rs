@@ -170,6 +170,7 @@ mod tests {
             max_websocket_connections: Some(10),
             max_connections_per_ip: 3,
             plugins: crate::config::PluginConfig::default(),
+            dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
 
         let state = AppState::new(config).await;
@@ -265,6 +266,7 @@ mod tests {
             max_websocket_connections: Some(5), // Global limit of 5
             max_connections_per_ip: 10,         // Per-IP limit higher than global
             plugins: crate::config::PluginConfig::default(),
+            dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
 
         let state = AppState::new(config).await;

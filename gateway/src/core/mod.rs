@@ -1,5 +1,9 @@
+pub mod audio;
 pub mod cache;
 pub mod emotion;
+pub mod metrics;
+pub mod observability;
+pub mod pipeline;
 pub mod providers;
 pub mod realtime;
 pub mod state;
@@ -7,6 +11,7 @@ pub mod stt;
 pub mod tts;
 pub mod turn_detect;
 pub mod voice_manager;
+pub mod websocket;
 
 #[cfg(feature = "turn-detect")]
 pub use turn_detect::{TurnDetector, TurnDetectorBuilder, TurnDetectorConfig};
@@ -44,4 +49,24 @@ pub use emotion::{
     DeliveryStyle, Emotion, EmotionConfig, EmotionIntensity, EmotionMapper, EmotionMethod,
     IntensityLevel, MappedEmotion, ProviderEmotionSupport, get_mapper_for_provider,
     map_emotion_for_provider, provider_supports_emotions, validate_emotion_config,
+};
+
+// Re-export audio types for VAD
+pub use audio::{VADAnalyzer, VADParams, VADState, VADTransition};
+
+// Re-export metrics types for provider monitoring
+pub use metrics::{ProviderMetrics, ProviderMetricsSnapshot, RequestTimer};
+
+// Re-export observability types for monitoring
+pub use observability::{
+    BotSpeakingState, LatencyMetrics, ObserverRegistry, UserBotLatencyObserver, VoiceObserver,
+};
+
+// Re-export pipeline types for audio processing
+pub use pipeline::{FramePriority, FramePriorityQueue, PriorityFrame, QueueSnapshot};
+
+// Re-export websocket types for reconnection
+pub use websocket::{
+    ReconnectionConfig, ReconnectionConfigBuilder, ReconnectionManager, ReconnectionSnapshot,
+    ReconnectionState,
 };

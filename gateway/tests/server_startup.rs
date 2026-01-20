@@ -12,7 +12,7 @@ use axum::{body::Body, http::Request, Router};
 use tokio::time::timeout;
 use tower::util::ServiceExt;
 
-use waav_gateway::{config::{PluginConfig, AuthApiSecret}, routes, state::AppState, ServerConfig};
+use waav_gateway::{config::{DAGTimeoutsConfig, PluginConfig, AuthApiSecret}, routes, state::AppState, ServerConfig};
 
 /// Helper function to create a minimal test configuration
 fn create_minimal_config(port: u16) -> ServerConfig {
@@ -66,6 +66,7 @@ fn create_minimal_config(port: u16) -> ServerConfig {
         max_websocket_connections: None,
         max_connections_per_ip: 100,
         plugins: PluginConfig::default(),
+        dag_timeouts: DAGTimeoutsConfig::default(),
     }
 }
 

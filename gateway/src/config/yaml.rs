@@ -69,6 +69,7 @@ pub struct YamlConfig {
     pub sip: Option<SipYaml>,
     pub security: Option<SecurityYaml>,
     pub plugins: Option<PluginsYaml>,
+    pub dag_timeouts: Option<DAGTimeoutsYaml>,
 }
 
 /// Server configuration from YAML
@@ -266,6 +267,35 @@ pub struct PluginsYaml {
     /// Provider-specific configuration (keyed by provider name)
     #[serde(default)]
     pub providers: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// DAG timeout configuration from YAML
+///
+/// # Example YAML structure
+/// ```yaml
+/// dag_timeouts:
+///   node_execution_secs: 30
+///   provider_operation_secs: 30
+///   stt_endpoint_secs: 60
+///   tts_endpoint_secs: 60
+///   llm_endpoint_secs: 120
+///   websocket_operation_secs: 30
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct DAGTimeoutsYaml {
+    /// Default node execution timeout in seconds
+    pub node_execution_secs: Option<u64>,
+    /// Provider operation timeout in seconds
+    pub provider_operation_secs: Option<u64>,
+    /// STT endpoint timeout in seconds
+    pub stt_endpoint_secs: Option<u64>,
+    /// TTS endpoint timeout in seconds
+    pub tts_endpoint_secs: Option<u64>,
+    /// LLM endpoint timeout in seconds
+    pub llm_endpoint_secs: Option<u64>,
+    /// WebSocket operation timeout in seconds
+    pub websocket_operation_secs: Option<u64>,
 }
 
 impl YamlConfig {

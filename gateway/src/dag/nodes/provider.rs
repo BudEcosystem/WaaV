@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::{DAGNode, DAGData, NodeCapability, STTResultData, TTSAudioData};
 use crate::dag::context::DAGContext;
@@ -40,14 +40,18 @@ impl AudioCallback for DAGTTSCallback {
     fn on_audio(&self, audio_data: AudioData) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         let tx = self.audio_tx.clone();
         Box::pin(async move {
-            let _ = tx.send(audio_data).await;
+            if tx.send(audio_data).await.is_err() {
+                trace!("TTS audio callback: channel closed, likely node execution completed");
+            }
         })
     }
 
     fn on_error(&self, error: TTSError) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         let tx = self.error_tx.clone();
         Box::pin(async move {
-            let _ = tx.send(error).await;
+            if tx.send(error).await.is_err() {
+                trace!("TTS error callback: channel closed, likely node execution completed");
+            }
         })
     }
 
@@ -222,7 +226,9 @@ impl DAGNode for STTProviderNode {
         let result_callback: STTResultCallback = Arc::new(move |result: STTResult| {
             let tx = result_sender.clone();
             Box::pin(async move {
-                let _ = tx.send(result).await;
+                if tx.send(result).await.is_err() {
+                    trace!("STT result callback: channel closed, likely node execution completed");
+                }
             }) as Pin<Box<dyn Future<Output = ()> + Send>>
         });
 
@@ -231,7 +237,9 @@ impl DAGNode for STTProviderNode {
         let error_callback: STTErrorCallback = Arc::new(move |error: STTError| {
             let tx = error_sender.clone();
             Box::pin(async move {
-                let _ = tx.send(error).await;
+                if tx.send(error).await.is_err() {
+                    trace!("STT error callback: channel closed, likely node execution completed");
+                }
             }) as Pin<Box<dyn Future<Output = ()> + Send>>
         });
 
@@ -918,7 +926,9 @@ impl DAGNode for RealtimeProviderNode {
         let transcript_callback: TranscriptCallback = Arc::new(move |result: TranscriptResult| {
             let tx = transcript_sender.clone();
             Box::pin(async move {
-                let _ = tx.send(result).await;
+                if tx.send(result).await.is_err() {
+                    trace!("Realtime transcript callback: channel closed, likely node execution completed");
+                }
             }) as Pin<Box<dyn Future<Output = ()> + Send>>
         });
 
@@ -927,7 +937,9 @@ impl DAGNode for RealtimeProviderNode {
         let audio_callback: AudioOutputCallback = Arc::new(move |audio: RealtimeAudioData| {
             let tx = audio_sender.clone();
             Box::pin(async move {
-                let _ = tx.send(audio).await;
+                if tx.send(audio).await.is_err() {
+                    trace!("Realtime audio callback: channel closed, likely node execution completed");
+                }
             }) as Pin<Box<dyn Future<Output = ()> + Send>>
         });
 
@@ -936,7 +948,9 @@ impl DAGNode for RealtimeProviderNode {
         let error_callback: RealtimeErrorCallback = Arc::new(move |error: RealtimeError| {
             let tx = error_sender.clone();
             Box::pin(async move {
-                let _ = tx.send(error).await;
+                if tx.send(error).await.is_err() {
+                    trace!("Realtime error callback: channel closed, likely node execution completed");
+                }
             }) as Pin<Box<dyn Future<Output = ()> + Send>>
         });
 

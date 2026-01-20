@@ -14,7 +14,7 @@ use tower::util::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use waav_gateway::{config::PluginConfig, routes, state::AppState, ServerConfig};
+use waav_gateway::{config::{DAGTimeoutsConfig, PluginConfig}, routes, state::AppState, ServerConfig};
 
 /// Helper function to create a minimal test configuration
 fn create_test_config(port: u16) -> ServerConfig {
@@ -68,6 +68,7 @@ fn create_test_config(port: u16) -> ServerConfig {
         max_websocket_connections: None,
         max_connections_per_ip: 1000,
         plugins: PluginConfig::default(),
+        dag_timeouts: DAGTimeoutsConfig::default(),
     }
 }
 

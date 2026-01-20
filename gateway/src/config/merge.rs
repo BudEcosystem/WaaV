@@ -5,7 +5,7 @@ use super::parse_auth_api_secrets_json;
 use super::sip::{SipConfig, SipHookConfig};
 use super::utils::parse_bool;
 use super::yaml::YamlConfig;
-use super::{AuthApiSecret, PluginConfig, ServerConfig, TlsConfig};
+use super::{AuthApiSecret, DAGTimeoutsConfig, PluginConfig, ServerConfig, TlsConfig};
 
 /// Merge YAML configuration with environment variables
 ///
@@ -477,6 +477,70 @@ pub fn merge_config(
         provider_config: plugins_provider_config,
     };
 
+    // DAG timeout configuration (uses defaults if not specified)
+    let dag_timeouts = DAGTimeoutsConfig {
+        node_execution_secs: yaml
+            .dag_timeouts
+            .as_ref()
+            .and_then(|d| d.node_execution_secs)
+            .or_else(|| {
+                env::var("DAG_NODE_EXECUTION_SECS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .unwrap_or(30),
+        provider_operation_secs: yaml
+            .dag_timeouts
+            .as_ref()
+            .and_then(|d| d.provider_operation_secs)
+            .or_else(|| {
+                env::var("DAG_PROVIDER_OPERATION_SECS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .unwrap_or(30),
+        stt_endpoint_secs: yaml
+            .dag_timeouts
+            .as_ref()
+            .and_then(|d| d.stt_endpoint_secs)
+            .or_else(|| {
+                env::var("DAG_STT_ENDPOINT_SECS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .unwrap_or(60),
+        tts_endpoint_secs: yaml
+            .dag_timeouts
+            .as_ref()
+            .and_then(|d| d.tts_endpoint_secs)
+            .or_else(|| {
+                env::var("DAG_TTS_ENDPOINT_SECS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .unwrap_or(60),
+        llm_endpoint_secs: yaml
+            .dag_timeouts
+            .as_ref()
+            .and_then(|d| d.llm_endpoint_secs)
+            .or_else(|| {
+                env::var("DAG_LLM_ENDPOINT_SECS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .unwrap_or(120),
+        websocket_operation_secs: yaml
+            .dag_timeouts
+            .as_ref()
+            .and_then(|d| d.websocket_operation_secs)
+            .or_else(|| {
+                env::var("DAG_WEBSOCKET_OPERATION_SECS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .unwrap_or(30),
+    };
+
     Ok(ServerConfig {
         host,
         port,
@@ -527,6 +591,7 @@ pub fn merge_config(
         max_websocket_connections,
         max_connections_per_ip,
         plugins,
+        dag_timeouts,
     })
 }
 

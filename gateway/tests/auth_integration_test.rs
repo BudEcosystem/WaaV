@@ -8,7 +8,7 @@ use axum::{
 use std::sync::Arc;
 use tower::ServiceExt;
 use waav_gateway::{
-    config::{PluginConfig, ServerConfig},
+    config::{DAGTimeoutsConfig, PluginConfig, ServerConfig},
     middleware::auth::auth_middleware,
     state::AppState,
 };
@@ -65,6 +65,7 @@ async fn create_test_state_auth_disabled() -> Arc<AppState> {
         max_websocket_connections: None,
         max_connections_per_ip: 100,
         plugins: PluginConfig::default(),
+        dag_timeouts: DAGTimeoutsConfig::default(),
     };
 
     AppState::new(config).await
@@ -225,6 +226,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         let state = AppState::new(config).await;
@@ -523,6 +525,7 @@ mod with_api_secret {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         AppState::new(config).await

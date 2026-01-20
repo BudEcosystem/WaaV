@@ -79,6 +79,38 @@ This mode is useful for:
 - Testing WebSocket message flows
 - Debugging non-audio features
 
+## WaaV CLI
+
+Interactive terminal interface for managing and monitoring the gateway. See [cli/README.md](cli/README.md) for complete documentation.
+
+### Installation
+
+```bash
+cd cli
+npm install && npm run build
+npm link  # Optional: install globally as 'waav'
+```
+
+### Quick Commands
+
+```bash
+waav                     # Interactive mode with main menu
+waav dashboard           # Real-time monitoring dashboard
+waav provider browse     # Browse and configure 70+ providers
+waav server status       # Check gateway status
+waav voice start         # Start voice conversation
+waav config show         # View configuration
+```
+
+### Features
+
+- **SPA Architecture**: Seamless navigation between screens with breadcrumbs and history
+- **Provider Browser**: Search and configure STT, TTS, and Realtime providers
+- **htop-style Dashboard**: Sparklines, gauges, latency histograms, sortable tables
+- **Voice Mode**: Interactive conversations with VAD or push-to-talk
+- **DAG Pipeline Editor**: Visual pipeline configuration
+- **Keyboard-Driven**: Full keyboard navigation (`ESC` back, `?` help, `Q` quit)
+
 ## Authentication (Optional)
 
 WaaV Gateway supports customer-based authentication that delegates token validation to an external authentication service. When enabled, protected API endpoints require a valid bearer token.

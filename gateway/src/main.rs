@@ -4,10 +4,11 @@ use std::path::PathBuf;
 #[cfg(feature = "openapi")]
 use std::fs;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use axum::{Router, middleware};
 use axum_server::tls_rustls::RustlsConfig;
+use axum_server::Handle;
 use clap::{Parser, Subcommand};
 use http::{
     HeaderName, Method,
@@ -323,7 +324,20 @@ async fn main() -> anyhow::Result<()> {
 
         println!("Server listening on https://{} (TLS enabled)", socket_addr);
 
+        // Create a handle for graceful shutdown
+        let handle = Handle::new();
+        let handle_clone = handle.clone();
+
+        // Spawn a task to handle shutdown signals
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            // Trigger graceful shutdown - wait up to 30 seconds for connections to drain
+            handle_clone.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
+        });
+
+        // Create and run the server
         axum_server::bind_rustls(socket_addr, rustls_config)
+            .handle(handle)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
             .map_err(|e| anyhow!("TLS server error: {}", e))?;
@@ -331,12 +345,48 @@ async fn main() -> anyhow::Result<()> {
         println!("Server listening on http://{}", socket_addr);
 
         let listener = TcpListener::bind(&socket_addr).await?;
+
+        // Use axum::serve with graceful shutdown
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
     }
 
+    info!("Server shutdown complete");
     Ok(())
+}
+
+/// Wait for shutdown signal (SIGINT or SIGTERM).
+/// Returns when a shutdown signal is received.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("Received SIGINT (Ctrl+C), initiating graceful shutdown...");
+        }
+        _ = terminate => {
+            info!("Received SIGTERM, initiating graceful shutdown...");
+        }
+    }
+
+    warn!("Shutdown signal received. Draining connections...");
 }

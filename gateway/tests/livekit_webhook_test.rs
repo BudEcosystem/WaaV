@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tower::util::ServiceExt;
 
-use waav_gateway::{ServerConfig, config::PluginConfig, routes, state::AppState};
+use waav_gateway::{ServerConfig, config::{DAGTimeoutsConfig, PluginConfig}, routes, state::AppState};
 
 /// Helper to create a minimal test configuration with LiveKit credentials
 fn create_test_config_with_livekit() -> ServerConfig {
@@ -62,6 +62,7 @@ fn create_test_config_with_livekit() -> ServerConfig {
         max_websocket_connections: None,
         max_connections_per_ip: 100,
         plugins: PluginConfig::default(),
+        dag_timeouts: DAGTimeoutsConfig::default(),
     }
 }
 
@@ -117,6 +118,7 @@ fn create_test_config_without_livekit() -> ServerConfig {
         max_websocket_connections: None,
         max_connections_per_ip: 100,
         plugins: PluginConfig::default(),
+        dag_timeouts: DAGTimeoutsConfig::default(),
     }
 }
 

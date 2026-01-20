@@ -7,7 +7,7 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use waav_gateway::{
-    ServerConfig, config::PluginConfig, middleware::auth::auth_middleware, routes, state::AppState,
+    ServerConfig, config::{DAGTimeoutsConfig, PluginConfig}, middleware::auth::auth_middleware, routes, state::AppState,
 };
 
 #[tokio::test]
@@ -63,6 +63,7 @@ async fn test_websocket_voice_config() {
         max_websocket_connections: None,
         max_connections_per_ip: 100,
         plugins: PluginConfig::default(),
+        dag_timeouts: DAGTimeoutsConfig::default(),
     };
 
     // Create application state
@@ -254,6 +255,7 @@ async fn test_websocket_invalid_message() {
         max_websocket_connections: None,
         max_connections_per_ip: 100,
         plugins: PluginConfig::default(),
+        dag_timeouts: DAGTimeoutsConfig::default(),
     };
 
     // Create application state
@@ -377,6 +379,7 @@ async fn test_websocket_sip_transfer_without_livekit_config() {
         max_websocket_connections: None,
         max_connections_per_ip: 100,
         plugins: PluginConfig::default(),
+        dag_timeouts: DAGTimeoutsConfig::default(),
     };
 
     // Create application state
@@ -503,6 +506,7 @@ async fn test_websocket_sip_transfer_invalid_phone_number() {
         max_websocket_connections: None,
         max_connections_per_ip: 100,
         plugins: PluginConfig::default(),
+        dag_timeouts: DAGTimeoutsConfig::default(),
     };
 
     // Create application state
@@ -629,6 +633,7 @@ async fn test_websocket_sip_transfer_empty_phone_number() {
         max_websocket_connections: None,
         max_connections_per_ip: 100,
         plugins: PluginConfig::default(),
+        dag_timeouts: DAGTimeoutsConfig::default(),
     };
 
     // Create application state

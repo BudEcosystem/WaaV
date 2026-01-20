@@ -88,6 +88,50 @@ pub struct PluginConfig {
     pub provider_config: HashMap<String, serde_json::Value>,
 }
 
+/// DAG timeout configuration
+///
+/// Configures timeout values for DAG (Directed Acyclic Graph) pipeline execution.
+/// Used when the `dag-routing` feature is enabled for custom voice processing pipelines.
+///
+/// # Example YAML
+/// ```yaml
+/// dag_timeouts:
+///   node_execution_secs: 30
+///   provider_operation_secs: 30
+///   stt_endpoint_secs: 60
+///   tts_endpoint_secs: 60
+///   llm_endpoint_secs: 120
+///   websocket_operation_secs: 30
+/// ```
+#[derive(Debug, Clone)]
+pub struct DAGTimeoutsConfig {
+    /// Default node execution timeout in seconds (default: 30)
+    pub node_execution_secs: u64,
+    /// Provider operation timeout in seconds (default: 30)
+    pub provider_operation_secs: u64,
+    /// STT endpoint timeout in seconds (default: 60)
+    pub stt_endpoint_secs: u64,
+    /// TTS endpoint timeout in seconds (default: 60)
+    pub tts_endpoint_secs: u64,
+    /// LLM endpoint timeout in seconds (default: 120)
+    pub llm_endpoint_secs: u64,
+    /// WebSocket operation timeout in seconds (default: 30)
+    pub websocket_operation_secs: u64,
+}
+
+impl Default for DAGTimeoutsConfig {
+    fn default() -> Self {
+        Self {
+            node_execution_secs: 30,
+            provider_operation_secs: 30,
+            stt_endpoint_secs: 60,
+            tts_endpoint_secs: 60,
+            llm_endpoint_secs: 120,
+            websocket_operation_secs: 30,
+        }
+    }
+}
+
 /// Server configuration
 ///
 /// Contains all configuration needed to run the WaaV Gateway server, including:
@@ -212,6 +256,11 @@ pub struct ServerConfig {
     /// Plugin system configuration (optional, backward compatible)
     /// If not specified, the plugin system is enabled with built-in providers only
     pub plugins: PluginConfig,
+
+    // DAG timeout configuration
+    /// DAG timeout configuration for pipeline execution (optional)
+    /// Only used when the `dag-routing` feature is enabled
+    pub dag_timeouts: DAGTimeoutsConfig,
 }
 
 /// Implement Drop to zeroize all secret fields when ServerConfig is dropped.
@@ -700,6 +749,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         }
     }
 
@@ -770,6 +820,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         let result = config.get_api_key("elevenlabs");
@@ -829,6 +880,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         let result = config.get_api_key("deepgram");
@@ -891,6 +943,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         let result = config.get_api_key("unsupported_provider");
@@ -953,6 +1006,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         // Test uppercase
@@ -1021,6 +1075,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         assert!(config_with_jwt.has_jwt_auth());
@@ -1076,6 +1131,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         assert!(!config_without_jwt.has_jwt_auth());
@@ -1136,6 +1192,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         assert!(config_with_api_secret.has_api_secret_auth());
@@ -1191,6 +1248,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         assert!(!config_without_api_secret.has_api_secret_auth());
@@ -1257,6 +1315,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         assert_eq!(config.find_api_secret_id("token-a"), Some("client-a"));
@@ -1315,6 +1374,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         // Google returns the credentials path/content when configured
@@ -1376,6 +1436,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         // Google returns the inline JSON credentials when configured
@@ -1436,6 +1497,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         // Google returns empty string when not configured, allowing ADC to be used
@@ -1496,6 +1558,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         // Test uppercase
@@ -1561,6 +1624,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         let result = config.get_api_key("microsoft-azure");
@@ -1620,6 +1684,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         let result = config.get_api_key("microsoft-azure");
@@ -1682,6 +1747,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         assert_eq!(config.get_azure_speech_region(), "westeurope");
@@ -1739,6 +1805,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         // Default is "eastus"

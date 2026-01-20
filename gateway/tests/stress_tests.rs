@@ -23,7 +23,7 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use waav_gateway::{config::PluginConfig, routes, state::AppState, ServerConfig, handlers, middleware::auth_middleware};
+use waav_gateway::{config::{DAGTimeoutsConfig, PluginConfig}, routes, state::AppState, ServerConfig, handlers, middleware::auth_middleware};
 
 mod common {
     use super::*;
@@ -86,6 +86,7 @@ mod common {
             max_websocket_connections: Some(1000),
             max_connections_per_ip: 500,
             plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
         }
     }
 

@@ -351,3 +351,25 @@ sip:
 
     - host: "another.com"
       url: "https://webhook2.example.com/events"
+
+# DAG timeout configuration (optional, requires dag-routing feature)
+# Configures timeout values for DAG pipeline execution
+# These timeouts control how long each operation type waits before timing out
+# Useful for tuning performance in different network conditions or for
+# different provider latency profiles
+#
+# Note: These settings only apply when the dag-routing feature is enabled
+# For normal STT/TTS operations, provider-specific timeouts are used instead
+dag_timeouts:
+  # Default node execution timeout in seconds
+  node_execution_secs: 30        # ENV: DAG_NODE_EXECUTION_SECS
+  # Provider operation timeout in seconds
+  provider_operation_secs: 30    # ENV: DAG_PROVIDER_OPERATION_SECS
+  # STT endpoint timeout in seconds (longer for audio processing)
+  stt_endpoint_secs: 60          # ENV: DAG_STT_ENDPOINT_SECS
+  # TTS endpoint timeout in seconds (longer for audio generation)
+  tts_endpoint_secs: 60          # ENV: DAG_TTS_ENDPOINT_SECS
+  # LLM endpoint timeout in seconds (longest due to generation time)
+  llm_endpoint_secs: 120         # ENV: DAG_LLM_ENDPOINT_SECS
+  # WebSocket operation timeout in seconds
+  websocket_operation_secs: 30   # ENV: DAG_WEBSOCKET_OPERATION_SECS

@@ -8,7 +8,7 @@ use super::validation::{
     validate_auth_api_secrets, validate_auth_required, validate_jwt_auth, validate_security_config,
     validate_tls_config,
 };
-use super::{AuthApiSecret, PluginConfig, ServerConfig, TlsConfig};
+use super::{AuthApiSecret, DAGTimeoutsConfig, PluginConfig, ServerConfig, TlsConfig};
 
 impl ServerConfig {
     /// Load configuration from environment variables
@@ -211,6 +211,34 @@ impl ServerConfig {
             provider_config: Default::default(), // No provider config from env vars
         };
 
+        // DAG timeout configuration
+        let dag_timeouts = DAGTimeoutsConfig {
+            node_execution_secs: env::var("DAG_NODE_EXECUTION_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(30),
+            provider_operation_secs: env::var("DAG_PROVIDER_OPERATION_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(30),
+            stt_endpoint_secs: env::var("DAG_STT_ENDPOINT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(60),
+            tts_endpoint_secs: env::var("DAG_TTS_ENDPOINT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(60),
+            llm_endpoint_secs: env::var("DAG_LLM_ENDPOINT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(120),
+            websocket_operation_secs: env::var("DAG_WEBSOCKET_OPERATION_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(30),
+        };
+
         Ok(ServerConfig {
             host,
             port,
@@ -262,6 +290,7 @@ impl ServerConfig {
             max_websocket_connections,
             max_connections_per_ip,
             plugins,
+            dag_timeouts,
         })
     }
 }

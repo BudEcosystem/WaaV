@@ -300,6 +300,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: crate::config::PluginConfig::default(),
+            dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
 
         let result = AuthClient::from_config(&config).await;
@@ -359,6 +360,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: crate::config::PluginConfig::default(),
+            dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
 
         let result = AuthClient::from_config(&config).await;
@@ -433,6 +435,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: crate::config::PluginConfig::default(),
+            dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
 
         let client = AuthClient::from_config(&config).await.unwrap();
@@ -517,6 +520,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: crate::config::PluginConfig::default(),
+            dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
 
         let client = AuthClient::from_config(&config).await.unwrap();
@@ -600,6 +604,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: crate::config::PluginConfig::default(),
+            dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
 
         let client = AuthClient::from_config(&config).await.unwrap();
@@ -682,6 +687,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: crate::config::PluginConfig::default(),
+            dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
 
         let client = AuthClient::from_config(&config).await.unwrap();
@@ -766,6 +772,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: crate::config::PluginConfig::default(),
+            dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
 
         let client = AuthClient::from_config(&config).await.unwrap();
@@ -851,6 +858,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: crate::config::PluginConfig::default(),
+            dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
 
         let client = AuthClient::from_config(&config).await.unwrap();

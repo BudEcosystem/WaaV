@@ -296,7 +296,8 @@ pub fn create_tts_provider(provider_type: &str, config: TTSConfig) -> TTSResult<
 pub fn get_tts_provider_urls() -> HashMap<String, String> {
     let mut urls = HashMap::new();
     urls.insert("acapela".to_string(), ACAPELA_COMMAND_URL.to_string());
-    urls.insert("alibaba-cloud".to_string(), ALIBABA_TTS_BEIJING_INFERENCE_URL.to_string());
+    // Alibaba Cloud DashScope uses WebSocket (wss://) - skip HTTP warmup
+    // urls.insert("alibaba-cloud".to_string(), ALIBABA_TTS_BEIJING_INFERENCE_URL.to_string());
     urls.insert("baidu".to_string(), BAIDU_TTS_URL_HTTPS.to_string());
     urls.insert("deepgram".to_string(), DEEPGRAM_TTS_URL.to_string());
     urls.insert("elevenlabs".to_string(), ELEVENLABS_TTS_URL.to_string());
@@ -305,7 +306,9 @@ pub fn get_tts_provider_urls() -> HashMap<String, String> {
     urls.insert("cartesia".to_string(), CARTESIA_TTS_URL.to_string());
     urls.insert("cereproc".to_string(), CEREVOICE_SPEAK_URL.to_string());
     urls.insert("openai".to_string(), OPENAI_TTS_URL.to_string());
-    urls.insert("aws-polly".to_string(), AWS_POLLY_TTS_URL.to_string());
+    // AWS Polly: Use us-east-1 as default region for warmup URL
+    // The actual region is determined by config at runtime via AWS SDK
+    urls.insert("aws-polly".to_string(), "https://polly.us-east-1.amazonaws.com/v1/speech".to_string());
     urls.insert("ibm-watson".to_string(), IBM_WATSON_TTS_URL.to_string());
     urls.insert("hume".to_string(), HUME_TTS_STREAM_URL.to_string());
     urls.insert("lmnt".to_string(), LMNT_TTS_URL.to_string());
@@ -321,9 +324,12 @@ pub fn get_tts_provider_urls() -> HashMap<String, String> {
     urls.insert("tinkoff".to_string(), TINKOFF_GRPC_ENDPOINT.to_string());
     urls.insert("sberdevices".to_string(), SBER_TTS_SYNTHESIZE_URL.to_string());
     urls.insert("bhashini".to_string(), BHASHINI_TTS_URL.to_string());
-    urls.insert("iflytek".to_string(), IFLYTEK_TTS_ENDPOINT.to_string());
+    // iFlytek uses WebSocket (wss://) - skip HTTP warmup, connection established on first use
+    // urls.insert("iflytek".to_string(), IFLYTEK_TTS_ENDPOINT.to_string());
     urls.insert("tencent".to_string(), TENCENT_TTS_INTL_URL.to_string());
-    urls.insert("huawei-cloud".to_string(), "https://sis.cn-north-4.myhuaweicloud.com/v1/{project_id}/tts".to_string());
+    // Huawei Cloud: Use a valid URL without placeholder for warmup
+    // The actual project_id is set at runtime via config
+    urls.insert("huawei-cloud".to_string(), "https://sis.cn-north-4.myhuaweicloud.com/v1/tts".to_string());
     urls.insert("zalo-ai".to_string(), ZALO_TTS_ENDPOINT.to_string());
     urls.insert("fpt-ai".to_string(), FPT_TTS_ENDPOINT.to_string());
     urls.insert("viettel-ai".to_string(), VIETTEL_TTS_ENDPOINT.to_string());
@@ -527,7 +533,8 @@ mod tests {
     fn test_get_tts_provider_urls_includes_aws_polly() {
         let urls = get_tts_provider_urls();
         assert!(urls.contains_key("aws-polly"));
-        assert_eq!(urls.get("aws-polly").unwrap(), AWS_POLLY_TTS_URL);
+        // URL uses default us-east-1 region for warmup (actual region set at runtime)
+        assert_eq!(urls.get("aws-polly").unwrap(), "https://polly.us-east-1.amazonaws.com/v1/speech");
     }
 
     #[test]

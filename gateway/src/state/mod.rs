@@ -445,6 +445,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: crate::config::PluginConfig::default(),
+            dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
 
         // We can't actually call AppState::new in a sync test, but we can verify
@@ -514,6 +515,7 @@ mod tests {
             max_websocket_connections: None,
             max_connections_per_ip: 100,
             plugins: crate::config::PluginConfig::default(),
+            dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
 
         // Verify that SIP config is present but credentials are missing

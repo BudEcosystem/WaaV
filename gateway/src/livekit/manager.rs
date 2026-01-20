@@ -79,21 +79,28 @@ impl LiveKitManager {
         }
     }
 
-    /// Set up an audio callback that will be called with incoming audio data
-    pub async fn set_audio_callback<F>(&self, callback: F) -> Result<(), AppError>
+    /// Sets a callback for audio data.
+    ///
+    /// **DEPRECATED**: This method is a legacy placeholder. Audio data flows through
+    /// the `audio_sender` channel to `LiveKitClient` event handlers. Use
+    /// `LiveKitClient::on_audio_data()` for audio callback registration.
+    ///
+    /// # Note
+    /// This method exists for API compatibility but does not process audio.
+    /// The actual audio pipeline uses the channel-based approach in `events.rs`.
+    /// Audio is forwarded via:
+    /// 1. `LiveKitClient::set_audio_callback()` during initialization
+    /// 2. Channel-based forwarding through `audio_sender`
+    /// 3. Event handlers in `src/livekit/client/events.rs`
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use LiveKitClient event handlers instead. Audio flows through the audio_sender channel."
+    )]
+    pub async fn set_audio_callback<F>(&self, _callback: F) -> Result<(), AppError>
     where
         F: Fn(Vec<u8>) + Send + Sync + 'static,
     {
-        // Note: This is a placeholder implementation
-        // In a real implementation, you'd want a proper way to handle multiple audio callbacks
-        if let Some(_audio_sender) = &self.audio_sender {
-            let _callback = Arc::new(callback);
-            // TODO: Implement proper audio callback handling for multiple subscribers
-            warn!(
-                "Audio callback set but not fully implemented - requires proper subscriber management"
-            );
-        }
-
+        warn!("set_audio_callback is deprecated. Audio flows through LiveKitClient event handlers via audio_sender channel.");
         Ok(())
     }
 
@@ -316,10 +323,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn test_livekit_manager_audio_callback_registration() {
         let manager = LiveKitManager::new();
 
         // Test setting audio callback without crashing
+        // Note: set_audio_callback is deprecated but we test it for backward compatibility
         let result = manager
             .set_audio_callback(|_audio_data| {
                 // Mock callback

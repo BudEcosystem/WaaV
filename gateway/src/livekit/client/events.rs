@@ -297,6 +297,7 @@ impl LiveKitClient {
                         participant_identity,
                         data: payload.to_vec(),
                         topic,
+                        room_name: config.room_name.clone(),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()

@@ -20,8 +20,8 @@ use waav_gateway::core::stt::{
 fn test_openai_in_supported_providers() {
     let providers = get_supported_stt_providers();
     assert!(providers.contains(&"openai"));
-    // deepgram, google, elevenlabs, microsoft-azure, cartesia, openai, assemblyai, aws-transcribe, groq, ibm-watson
-    assert_eq!(providers.len(), 10);
+    // Verify OpenAI is among the supported providers (don't hardcode count as more providers are added)
+    assert!(providers.len() >= 10, "Expected at least 10 STT providers");
 }
 
 /// Test provider creation via string name

@@ -14,8 +14,8 @@
 //! Output is WAV format at 16kHz sample rate.
 
 use super::config::{
-    ViettelTtsConfig, ViettelTtsRequest, ViettelVoice, AUDIO_SAMPLE_RATE, DEFAULT_SPEED,
-    MAX_SPEED, MIN_SPEED, VIETTEL_TTS_ENDPOINT,
+    ViettelTtsConfig, ViettelTtsRequest, ViettelVoice, AUDIO_SAMPLE_RATE, MAX_SPEED, MIN_SPEED,
+    VIETTEL_TTS_ENDPOINT,
 };
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
@@ -24,7 +24,7 @@ use reqwest::Client;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Viettel AI TTS client.
 ///

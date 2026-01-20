@@ -18,7 +18,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tower::util::ServiceExt;
 
-use waav_gateway::{config::PluginConfig, routes, state::AppState, ServerConfig};
+use waav_gateway::{config::{DAGTimeoutsConfig, PluginConfig}, routes, state::AppState, ServerConfig};
 
 // =============================================================================
 // SDK Client Types
@@ -145,6 +145,7 @@ fn create_test_config(port: u16) -> ServerConfig {
         max_websocket_connections: None,
         max_connections_per_ip: 1000,
         plugins: PluginConfig::default(),
+        dag_timeouts: DAGTimeoutsConfig::default(),
     }
 }
 

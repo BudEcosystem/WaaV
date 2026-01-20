@@ -996,26 +996,32 @@ fn setup_livekit_data_callback(
             );
 
             // Create unified message structure for LiveKit data
+            // Extract fields upfront to avoid borrow checker issues with if/else branches
+            let topic = data_message.topic.unwrap_or_else(|| "default".to_string());
+            let identity = data_message.participant_identity;
+            let room_name = data_message.room_name;
+            let timestamp = data_message.timestamp;
+
             let unified_message =
                 if let Ok(text_message) = String::from_utf8(data_message.data.clone()) {
                     // Data can be decoded as UTF-8 text
                     UnifiedMessage {
                         message: Some(text_message),
                         data: None,
-                        identity: data_message.participant_identity,
-                        topic: data_message.topic.unwrap_or_else(|| "default".to_string()),
-                        room: "livekit".to_string(), // TODO: Get actual room name from LiveKit client
-                        timestamp: data_message.timestamp,
+                        identity,
+                        topic,
+                        room: room_name,
+                        timestamp,
                     }
                 } else {
                     // Binary data - encode as base64
                     UnifiedMessage {
                         message: None,
                         data: Some(general_purpose::STANDARD.encode(&data_message.data)),
-                        identity: data_message.participant_identity,
-                        topic: data_message.topic.unwrap_or_else(|| "default".to_string()),
-                        room: "livekit".to_string(), // TODO: Get actual room name from LiveKit client
-                        timestamp: data_message.timestamp,
+                        identity,
+                        topic,
+                        room: room_name,
+                        timestamp,
                     }
                 };
 

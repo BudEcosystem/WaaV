@@ -27,6 +27,24 @@ openapi = [
 ]
 dag-routing = ["dep:rhai", "dep:petgraph", "dep:rtrb"]  # DAG-based customizable voice processing pipelines with conditional routing
 
+# Smart Turn: Audio-based semantic turn detection using Whisper encoder
+smart-turn = [
+    "dep:ort",
+    "dep:ndarray",
+    "dep:mel_spec",
+    "dep:rubato",
+    "dep:realfft",
+]
+
+# Silero VAD: Local neural network voice activity detection
+silero-vad = [
+    "dep:ort",
+    "dep:ndarray",
+]
+
+# Combined ensemble: Both audio-based (smart-turn) and text-based (turn-detect) turn detection
+turn-ensemble = ["smart-turn", "turn-detect", "silero-vad"]
+
 [dependencies]
 async-trait = "0.1.88"
 serde = { version = "1.0.219", features = ["derive"] }
@@ -162,6 +180,11 @@ waav-plugin-api = { path = "../plugin-api", optional = true }  # Plugin API type
 rhai = { version = "1.17", optional = true, features = ["sync"] }  # Scripting engine for DAG expressions
 petgraph = { version = "0.6", optional = true }  # Graph data structure for DAG routing
 rtrb = { version = "0.3", optional = true }  # Lock-free ring buffer for inter-node communication
+
+# Smart Turn dependencies (audio-based turn detection)
+mel_spec = { version = "0.3", optional = true }  # Whisper-compatible mel spectrogram extraction
+rubato = { version = "0.16", optional = true }  # High-quality audio resampling
+realfft = { version = "3.4", optional = true }  # FFT for mel spectrogram (fallback)
 
 [dev-dependencies]
 tower = { version = "0.5.2", features = ["util"] }
