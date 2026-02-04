@@ -9,6 +9,7 @@ from .session import (
     PercentileStats,
     ReconnectConfig,
 )
+from .queue import MessageQueue, QueueConfig, QueueStats
 
 __all__ = [
     "WebSocketSession",
@@ -16,4 +17,7 @@ __all__ = [
     "MetricsCollector",
     "PercentileStats",
     "ReconnectConfig",
+    "MessageQueue",
+    "QueueConfig",
+    "QueueStats",
 ]

@@ -6,7 +6,7 @@ import asyncio
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional, Union
 
-from ..types import STTConfig, STTResult, FeatureFlags
+from ..types import STTConfig, STTResult, FeatureFlags, AudioFeatures, DAGConfig
 from ..ws.session import WebSocketSession, SessionMetrics, ReconnectConfig
 
 
@@ -36,6 +36,9 @@ class BudTranscribe:
         model: Optional[str] = None,
         features: Optional[FeatureFlags] = None,
         reconnect: Optional[ReconnectConfig] = None,
+        audio_features: Optional[AudioFeatures] = None,
+        dag_config: Optional[DAGConfig] = None,
+        stream_id: Optional[str] = None,
     ) -> "TranscribeSession":
         """
         Create a Transcribe session.
@@ -47,6 +50,9 @@ class BudTranscribe:
             model: Model to use
             features: Feature flags
             reconnect: Reconnection configuration
+            audio_features: Audio features (turn detection, noise filter, VAD)
+            dag_config: DAG routing configuration
+            stream_id: Optional stream ID for session tracking
 
         Returns:
             Transcribe session
@@ -69,6 +75,9 @@ class BudTranscribe:
             config=config,
             features=features,
             reconnect=reconnect,
+            audio_features=audio_features,
+            dag_config=dag_config,
+            stream_id=stream_id,
         )
 
     async def file(
@@ -161,6 +170,9 @@ class TranscribeSession:
         config: Optional[STTConfig] = None,
         features: Optional[FeatureFlags] = None,
         reconnect: Optional[ReconnectConfig] = None,
+        audio_features: Optional[AudioFeatures] = None,
+        dag_config: Optional[DAGConfig] = None,
+        stream_id: Optional[str] = None,
     ):
         """
         Initialize Transcribe session.
@@ -171,6 +183,9 @@ class TranscribeSession:
             config: STT configuration
             features: Feature flags
             reconnect: Reconnection config
+            audio_features: Audio features (turn detection, noise filter, VAD)
+            dag_config: DAG routing configuration
+            stream_id: Optional stream ID for session tracking
         """
         self.config = config or STTConfig(provider="deepgram")
         self.features = features
@@ -178,6 +193,9 @@ class TranscribeSession:
         self._url = url
         self._api_key = api_key
         self._reconnect = reconnect
+        self._audio_features = audio_features
+        self._dag_config = dag_config
+        self._stream_id = stream_id
 
     async def transcribe_file(
         self,
@@ -208,6 +226,9 @@ class TranscribeSession:
             api_key=self._api_key,
             stt_config=self.config,
             reconnect=self._reconnect,
+            audio_features=self._audio_features,
+            dag_config=self._dag_config,
+            stream_id=self._stream_id,
         )
 
         full_text = ""
@@ -282,6 +303,9 @@ class TranscribeSession:
             api_key=self._api_key,
             stt_config=self.config,
             reconnect=self._reconnect,
+            audio_features=self._audio_features,
+            dag_config=self._dag_config,
+            stream_id=self._stream_id,
         )
 
         async with session:

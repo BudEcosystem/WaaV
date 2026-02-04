@@ -54,13 +54,25 @@ class TurnDetectionConfig:
 
 @dataclass
 class RealtimeConfig:
-    """Configuration for BudRealtime."""
+    """Configuration for BudRealtime.
+
+    Supports two connection modes:
+    1. **Gateway mode** (recommended): Set ``gateway_url`` to route through the
+       WaaV gateway's ``/realtime`` endpoint. The gateway handles provider auth
+       and protocol translation.
+    2. **Direct mode**: Set ``api_key`` to connect directly to a provider
+       endpoint. The client speaks the provider's native protocol.
+    """
 
     provider: RealtimeProvider
     """Realtime provider to use."""
 
-    api_key: str
-    """API key for the provider."""
+    api_key: str = ""
+    """API key for the provider (used for direct mode or sent to gateway)."""
+
+    gateway_url: Optional[str] = None
+    """WaaV gateway URL (e.g. 'ws://localhost:3001'). When set, routes through
+    the gateway's /realtime endpoint instead of connecting directly to providers."""
 
     model: Optional[str] = None
     """Model to use (OpenAI)."""
@@ -88,6 +100,18 @@ class RealtimeConfig:
 
     turn_detection: Optional[TurnDetectionConfig] = None
     """Turn detection settings."""
+
+    transcribe_input: bool = True
+    """Enable input audio transcription (gateway mode)."""
+
+    input_audio_format: str = "pcm16"
+    """Input audio format (pcm16)."""
+
+    output_audio_format: str = "pcm16"
+    """Output audio format (pcm16)."""
+
+    modalities: Optional[list[str]] = None
+    """Response modalities (e.g. ['text', 'audio'])."""
 
 
 @dataclass
@@ -209,6 +233,9 @@ class BudRealtime:
         ):
             self._config.evi_version = DEFAULT_EVI_VERSION
 
+        self._use_gateway = config.gateway_url is not None
+        self._session_id: Optional[str] = None
+
         self._ws: Optional[WebSocketClientProtocol] = None
         self._state: RealtimeState = RealtimeState.DISCONNECTED
         self._tools: list[ToolDefinition] = []
@@ -321,21 +348,38 @@ class BudRealtime:
         if self._connect_lock is None:
             self._connect_lock = asyncio.Lock()
 
-    async def connect(self, url: str, timeout: float = 10.0) -> None:
+    async def connect(self, url: Optional[str] = None, timeout: float = 10.0) -> None:
         """
-        Connect to the realtime gateway.
+        Connect to the realtime service.
+
+        In gateway mode (``gateway_url`` set in config), ``url`` is optional and
+        defaults to ``{gateway_url}/realtime``.
+
+        In direct mode, ``url`` must be provided and points to the provider
+        endpoint.
 
         Args:
-            url: WebSocket URL to connect to.
+            url: WebSocket URL to connect to. Optional when using gateway mode.
             timeout: Connection timeout in seconds.
 
         Raises:
+            ValueError: If no URL available (direct mode without url).
             Exception: If connection fails.
-
-        Note:
-            This method is thread-safe. Concurrent calls will be serialized
-            and only the first call will establish the connection.
         """
+        # Resolve the connection URL
+        if self._use_gateway and url is None:
+            gateway = self._config.gateway_url
+            assert gateway is not None
+            # Normalize: ws://host:port -> ws://host:port/realtime
+            connect_url = gateway.rstrip("/") + "/realtime"
+        elif url is not None:
+            connect_url = url
+        else:
+            raise ValueError(
+                "url is required when not using gateway mode "
+                "(set gateway_url in RealtimeConfig for gateway mode)"
+            )
+
         # Create locks lazily (requires running event loop)
         self._ensure_locks()
 
@@ -347,7 +391,7 @@ class BudRealtime:
             if self._state in (RealtimeState.CONNECTED, RealtimeState.CONNECTING):
                 return
 
-            self._url = url
+            self._url = connect_url
             self._set_state(RealtimeState.CONNECTING)
 
             try:
@@ -357,7 +401,7 @@ class BudRealtime:
                     headers["Authorization"] = f"Bearer {self._config.api_key}"
 
                 self._ws = await asyncio.wait_for(
-                    websockets.connect(url, additional_headers=headers),
+                    websockets.connect(connect_url, additional_headers=headers),
                     timeout=timeout,
                 )
 
@@ -426,7 +470,7 @@ class BudRealtime:
 
     async def send_audio(self, audio: bytes, timeout: Optional[float] = None) -> None:
         """
-        Send audio data to the gateway.
+        Send audio data to the gateway or provider.
 
         Args:
             audio: Raw audio data (PCM).
@@ -446,8 +490,12 @@ class BudRealtime:
             # Check state inside lock to prevent race conditions
             if self._state != RealtimeState.CONNECTED or not self._ws:
                 raise RuntimeError("Not connected")
-            if self._config.provider == RealtimeProvider.OPENAI_REALTIME:
-                # OpenAI Realtime: wrap in message format
+
+            if self._use_gateway:
+                # Gateway mode: send raw binary PCM frames directly
+                await asyncio.wait_for(self._ws.send(audio), timeout=send_timeout)
+            elif self._config.provider == RealtimeProvider.OPENAI_REALTIME:
+                # OpenAI Realtime direct: wrap in message format
                 base64_audio = base64.b64encode(audio).decode("utf-8")
                 await asyncio.wait_for(
                     self._ws.send(
@@ -461,7 +509,7 @@ class BudRealtime:
                     timeout=send_timeout,
                 )
             else:
-                # Hume EVI: send raw binary
+                # Hume EVI direct: send raw binary
                 await asyncio.wait_for(self._ws.send(audio), timeout=send_timeout)
 
     async def send_text(self, text: str, timeout: Optional[float] = None) -> None:
@@ -486,7 +534,14 @@ class BudRealtime:
             # Check state inside lock to prevent race conditions
             if self._state != RealtimeState.CONNECTED or not self._ws:
                 raise RuntimeError("Not connected")
-            if self._config.provider == RealtimeProvider.OPENAI_REALTIME:
+
+            if self._use_gateway:
+                # Gateway unified protocol
+                await asyncio.wait_for(
+                    self._ws.send(json.dumps({"type": "text", "text": text})),
+                    timeout=send_timeout,
+                )
+            elif self._config.provider == RealtimeProvider.OPENAI_REALTIME:
                 await asyncio.wait_for(
                     self._ws.send(
                         json.dumps(
@@ -582,7 +637,18 @@ class BudRealtime:
             if self._state != RealtimeState.CONNECTED or not self._ws:
                 raise RuntimeError("Not connected")
 
-            if self._config.provider == RealtimeProvider.OPENAI_REALTIME:
+            if self._use_gateway:
+                # Gateway unified protocol
+                await self._ws.send(
+                    json.dumps(
+                        {
+                            "type": "function_result",
+                            "call_id": call_id,
+                            "result": json.dumps(result),
+                        }
+                    )
+                )
+            elif self._config.provider == RealtimeProvider.OPENAI_REALTIME:
                 await self._ws.send(
                     json.dumps(
                         {
@@ -620,14 +686,16 @@ class BudRealtime:
             if self._state != RealtimeState.CONNECTED or not self._ws:
                 return
 
-            if self._config.provider == RealtimeProvider.OPENAI_REALTIME:
+            if self._use_gateway:
+                await self._ws.send(json.dumps({"type": "cancel_response"}))
+            elif self._config.provider == RealtimeProvider.OPENAI_REALTIME:
                 await self._ws.send(json.dumps({"type": "response.cancel"}))
             else:
                 # Hume EVI interrupt
                 await self._ws.send(json.dumps({"type": "user_interruption"}))
 
     async def commit_audio_buffer(self) -> None:
-        """Commit the audio buffer (OpenAI Realtime)."""
+        """Commit the audio buffer (OpenAI Realtime / gateway)."""
         # Ensure locks exist
         self._ensure_locks()
         assert self._ws_lock is not None
@@ -637,8 +705,39 @@ class BudRealtime:
             if self._state != RealtimeState.CONNECTED or not self._ws:
                 return
 
-            if self._config.provider == RealtimeProvider.OPENAI_REALTIME:
+            if self._use_gateway:
+                await self._ws.send(json.dumps({"type": "commit_audio"}))
+            elif self._config.provider == RealtimeProvider.OPENAI_REALTIME:
                 await self._ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+
+    async def clear_audio_buffer(self) -> None:
+        """Clear the audio buffer (gateway / OpenAI Realtime)."""
+        # Ensure locks exist
+        self._ensure_locks()
+        assert self._ws_lock is not None
+
+        async with self._ws_lock:
+            if self._state != RealtimeState.CONNECTED or not self._ws:
+                return
+
+            if self._use_gateway:
+                await self._ws.send(json.dumps({"type": "clear_audio"}))
+            elif self._config.provider == RealtimeProvider.OPENAI_REALTIME:
+                await self._ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+
+    async def create_response(self) -> None:
+        """Request the model to generate a response (gateway / OpenAI Realtime)."""
+        self._ensure_locks()
+        assert self._ws_lock is not None
+
+        async with self._ws_lock:
+            if self._state != RealtimeState.CONNECTED or not self._ws:
+                return
+
+            if self._use_gateway:
+                await self._ws.send(json.dumps({"type": "create_response"}))
+            elif self._config.provider == RealtimeProvider.OPENAI_REALTIME:
+                await self._ws.send(json.dumps({"type": "response.create"}))
 
     # =========================================================================
     # Private Methods
@@ -658,6 +757,9 @@ class BudRealtime:
         # Check state - caller must hold _ws_lock
         if not self._ws or self._state != RealtimeState.CONNECTED:
             return
+
+        if self._use_gateway:
+            return await self._send_gateway_config_unlocked()
 
         if self._config.provider == RealtimeProvider.OPENAI_REALTIME:
             session_config: dict[str, Any] = {
@@ -728,6 +830,118 @@ class BudRealtime:
 
             await self._ws.send(json.dumps(session_config))
 
+    async def _send_gateway_config_unlocked(self) -> None:
+        """Send session config using gateway unified protocol (must hold _ws_lock)."""
+        if not self._ws:
+            return
+
+        # Map provider enum to gateway provider string
+        provider_map = {
+            RealtimeProvider.OPENAI_REALTIME: "openai",
+            RealtimeProvider.HUME_EVI: "hume",
+        }
+        provider_str = provider_map.get(self._config.provider, "openai")
+
+        config_msg: dict[str, Any] = {
+            "type": "config",
+            "provider": provider_str,
+            "transcribe_input": self._config.transcribe_input,
+            "input_audio_format": self._config.input_audio_format,
+            "output_audio_format": self._config.output_audio_format,
+        }
+
+        if self._config.model:
+            config_msg["model"] = self._config.model
+        if self._config.voice_id:
+            config_msg["voice"] = self._config.voice_id
+        if self._config.system_prompt:
+            config_msg["instructions"] = self._config.system_prompt
+        if self._config.temperature is not None:
+            config_msg["temperature"] = self._config.temperature
+        if self._config.max_tokens is not None:
+            config_msg["max_response_tokens"] = self._config.max_tokens
+        if self._config.modalities:
+            config_msg["modalities"] = self._config.modalities
+
+        if self._config.turn_detection and self._config.turn_detection.enabled:
+            td: dict[str, Any] = {"mode": "server_vad"}
+            if self._config.turn_detection.threshold is not None:
+                td["threshold"] = self._config.turn_detection.threshold
+            if self._config.turn_detection.silence_ms is not None:
+                td["silence_duration_ms"] = self._config.turn_detection.silence_ms
+            if self._config.turn_detection.prefix_padding_ms is not None:
+                td["prefix_padding_ms"] = self._config.turn_detection.prefix_padding_ms
+            config_msg["turn_detection"] = td
+
+        if self._tools:
+            config_msg["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    },
+                }
+                for t in self._tools
+            ]
+
+        await self._ws.send(json.dumps(config_msg))
+
+    def _handle_gateway_message(self, msg_type: str, message: dict[str, Any]) -> None:
+        """Handle messages from the gateway's unified /realtime protocol."""
+        if msg_type == "session_created":
+            self._session_id = message.get("session_id")
+            logger.info(
+                f"Realtime session created: provider={message.get('provider')}, "
+                f"model={message.get('model')}, session_id={self._session_id}"
+            )
+
+        elif msg_type == "session_updated":
+            logger.debug("Realtime session updated")
+
+        elif msg_type == "transcript":
+            self._emit(
+                "transcript",
+                TranscriptEvent(
+                    text=message.get("text", ""),
+                    is_final=message.get("is_final", True),
+                    role=message.get("role", "assistant"),
+                ),
+            )
+
+        elif msg_type == "speech_event":
+            event_name = message.get("event", "")
+            if event_name == "started":
+                self._emit("speech_started", message)
+            elif event_name == "stopped":
+                self._emit("speech_stopped", message)
+
+        elif msg_type == "function_call":
+            self._emit(
+                "function_call",
+                FunctionCallEvent(
+                    name=message.get("name", ""),
+                    arguments=json.loads(message.get("arguments", "{}")),
+                    call_id=message.get("call_id", ""),
+                ),
+            )
+
+        elif msg_type == "response_started":
+            logger.debug(f"Response started: {message.get('response_id')}")
+
+        elif msg_type == "response_done":
+            logger.debug(f"Response done: {message.get('response_id')}")
+
+        elif msg_type == "error":
+            self._emit(
+                "error",
+                Exception(message.get("message", "Unknown error")),
+            )
+
+        elif msg_type == "closing":
+            logger.info(f"Server closing: {message.get('reason')}")
+
     async def _receive_loop(self) -> None:
         """Background task to receive and process messages."""
         if not self._ws:
@@ -763,7 +977,9 @@ class BudRealtime:
         """Route message to appropriate handler."""
         msg_type = message.get("type", "")
 
-        if self._config.provider == RealtimeProvider.OPENAI_REALTIME:
+        if self._use_gateway:
+            self._handle_gateway_message(msg_type, message)
+        elif self._config.provider == RealtimeProvider.OPENAI_REALTIME:
             self._handle_openai_message(msg_type, message)
         else:
             self._handle_hume_message(msg_type, message)

@@ -4,7 +4,7 @@ Tests for provider types and capabilities.
 
 import pytest
 
-from bud_foundry import (
+from bud_waav import (
     STTProvider,
     TTSProvider,
     RealtimeProvider,

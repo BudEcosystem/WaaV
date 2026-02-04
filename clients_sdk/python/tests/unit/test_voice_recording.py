@@ -6,7 +6,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 import base64
 
-from bud_foundry.rest.client import RestClient
+from bud_waav.rest.client import RestClient
 
 
 class TestVoiceCloning:
@@ -152,20 +152,14 @@ class TestRecordings:
 
     @pytest.mark.asyncio
     async def test_download_recording(self, client):
-        """Should download recording as bytes."""
+        """Should download recording from GET /recording/{stream_id} (singular)."""
         audio_data = b"\x00\x01\x02\x03" * 1000
         client.get = AsyncMock(return_value=audio_data)
 
-        result = await client.download_recording(
-            stream_id="stream_123",
-            format="wav",
-        )
+        result = await client.download_recording(stream_id="stream_123")
 
         assert result == audio_data
-        client.get.assert_called_once()
-        call_args = client.get.call_args
-        assert call_args[0][0] == "/recordings/stream_123/download"
-        assert call_args[1]["params"]["format"] == "wav"
+        client.get.assert_called_once_with("/recording/stream_123")
 
     @pytest.mark.asyncio
     async def test_list_recordings(self, client):
@@ -282,7 +276,7 @@ class TestDAGMethods:
         client.post.assert_called_once()
         call_args = client.post.call_args
         assert call_args[0][0] == "/dag/validate"
-        assert call_args[1]["json"] == definition
+        assert call_args[1]["json"] == {"dag": definition}
 
     @pytest.mark.asyncio
     async def test_validate_dag_invalid(self, client):

@@ -15,14 +15,18 @@ class TestGatewayHealth:
 
     def test_health_check(self):
         """Test that health endpoint responds."""
-        response = httpx.get(f"{BASE_URL}/")
+        response = httpx.get(f"{BASE_URL}/", timeout=10.0)
+        if response.status_code == 429:
+            pytest.skip("Rate limited")
         assert response.status_code == 200
         data = response.json()
         assert data.get("status") == "OK"
 
     def test_voices_endpoint(self):
         """Test voices endpoint returns data."""
-        response = httpx.get(f"{BASE_URL}/voices")
+        response = httpx.get(f"{BASE_URL}/voices", timeout=30.0)
+        if response.status_code == 429:
+            pytest.skip("Rate limited")
         assert response.status_code == 200
         data = response.json()
         assert data is not None
@@ -41,7 +45,10 @@ class TestGatewayHealth:
                     "sample_rate": 24000,
                 },
             },
+            timeout=10.0,
         )
+        if response.status_code == 429:
+            pytest.skip("Rate limited")
         # Should reject empty text with 400
         assert response.status_code == 400
 

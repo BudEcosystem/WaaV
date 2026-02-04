@@ -4,7 +4,7 @@ BudTTS - Text-to-Speech pipeline
 
 from typing import Any, AsyncIterator, Callable, Optional
 
-from ..types import TTSConfig, AudioEvent
+from ..types import TTSConfig, AudioEvent, AudioFeatures, DAGConfig
 from ..ws.session import WebSocketSession, SessionMetrics, ReconnectConfig
 from ..rest.client import RestClient
 
@@ -39,6 +39,9 @@ class BudTTS:
         model: Optional[str] = None,
         sample_rate: int = 24000,
         reconnect: Optional[ReconnectConfig] = None,
+        audio_features: Optional[AudioFeatures] = None,
+        dag_config: Optional[DAGConfig] = None,
+        stream_id: Optional[str] = None,
     ) -> "TTSSession":
         """
         Create a TTS session.
@@ -51,6 +54,9 @@ class BudTTS:
             model: Model to use
             sample_rate: Output sample rate
             reconnect: Reconnection configuration
+            audio_features: Audio features (turn detection, noise filter, VAD)
+            dag_config: DAG routing configuration
+            stream_id: Optional stream ID for session tracking
 
         Returns:
             TTS session
@@ -69,6 +75,9 @@ class BudTTS:
             api_key=self.api_key,
             config=config,
             reconnect=reconnect,
+            audio_features=audio_features,
+            dag_config=dag_config,
+            stream_id=stream_id,
         )
 
     async def connect(
@@ -80,6 +89,9 @@ class BudTTS:
         model: Optional[str] = None,
         sample_rate: int = 24000,
         reconnect: Optional[ReconnectConfig] = None,
+        audio_features: Optional[AudioFeatures] = None,
+        dag_config: Optional[DAGConfig] = None,
+        stream_id: Optional[str] = None,
     ) -> "TTSSession":
         """
         Create and connect a TTS session.
@@ -92,6 +104,9 @@ class BudTTS:
             model: Model to use
             sample_rate: Output sample rate
             reconnect: Reconnection configuration
+            audio_features: Audio features (turn detection, noise filter, VAD)
+            dag_config: DAG routing configuration
+            stream_id: Optional stream ID for session tracking
 
         Returns:
             Connected TTS session
@@ -104,6 +119,9 @@ class BudTTS:
             model=model,
             sample_rate=sample_rate,
             reconnect=reconnect,
+            audio_features=audio_features,
+            dag_config=dag_config,
+            stream_id=stream_id,
         )
         await session.connect()
         return session
@@ -157,6 +175,9 @@ class TTSSession:
         api_key: Optional[str] = None,
         config: Optional[TTSConfig] = None,
         reconnect: Optional[ReconnectConfig] = None,
+        audio_features: Optional[AudioFeatures] = None,
+        dag_config: Optional[DAGConfig] = None,
+        stream_id: Optional[str] = None,
     ):
         """
         Initialize TTS session.
@@ -166,6 +187,9 @@ class TTSSession:
             api_key: API key
             config: TTS configuration
             reconnect: Reconnection config
+            audio_features: Audio features (turn detection, noise filter, VAD)
+            dag_config: DAG routing configuration
+            stream_id: Optional stream ID for session tracking
         """
         self.config = config or TTSConfig(provider="deepgram")
 
@@ -174,6 +198,9 @@ class TTSSession:
             api_key=api_key,
             tts_config=self.config,
             reconnect=reconnect,
+            audio_features=audio_features,
+            dag_config=dag_config,
+            stream_id=stream_id,
         )
 
         self._audio_handlers: list[Callable[[AudioEvent], Any]] = []

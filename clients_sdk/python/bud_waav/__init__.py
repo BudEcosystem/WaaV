@@ -1,10 +1,10 @@
 """
-bud-foundry SDK
+bud-waav SDK
 
-Python SDK for Bud Foundry AI Gateway - Speech-to-Text, Text-to-Speech, and Voice AI
+Python SDK for Bud WaaV AI Gateway - Speech-to-Text, Text-to-Speech, and Voice AI
 
 Example:
-    >>> from bud_foundry import BudClient
+    >>> from bud_waav import BudClient
     >>>
     >>> async def main():
     ...     bud = BudClient(base_url="http://localhost:3001", api_key="your-api-key")
@@ -69,6 +69,9 @@ from .types import (
     intensity_to_number,
     # DAG routing types
     DAGNodeType,
+    OutputDestination,
+    JoinStrategy,
+    DAGDataType,
     DAGNode,
     DAGEdge,
     DAGDefinition,
@@ -96,6 +99,24 @@ from .types import (
     RecordingInfo,
     RecordingFilter,
     RecordingList,
+    # Realtime session types
+    VADConfig,
+    InputTranscriptionConfig,
+    RealtimeSessionConfig,
+    RealtimeTranscript,
+    RealtimeSpeechEvent,
+    RealtimeAudioChunk,
+    VOICE_DEFAULTS,
+    REALTIME_DEFAULTS,
+    # Voice cloning types
+    VoiceCloneProvider,
+    VoiceCloneRequest,
+    VoiceCloneStatus,
+    VoiceCloneResponse,
+    # Hume EVI types
+    HumeEVIVersion,
+    HumeEVIConfig,
+    ProsodyScores,
 )
 from .errors import (
     BudError,
@@ -132,8 +153,9 @@ from .pipelines import (
     StateChangeEvent,
 )
 from .rest import RestClient
-from .ws import WebSocketSession, SessionMetrics, ReconnectConfig
-from .audio import AudioProcessor
+from .ws import WebSocketSession, SessionMetrics, ReconnectConfig, MessageQueue, QueueConfig, QueueStats
+from .audio import AudioProcessor, VADConfig as AudioVADConfig, VADFrame, VADState, VoiceActivityDetector
+from .metrics.slo import SLOTracker, SLODefinition, SLOViolation, SLOComparison
 
 __version__ = "0.1.0"
 __all__ = [
@@ -163,6 +185,9 @@ __all__ = [
     "intensity_to_number",
     # DAG routing types
     "DAGNodeType",
+    "OutputDestination",
+    "JoinStrategy",
+    "DAGDataType",
     "DAGNode",
     "DAGEdge",
     "DAGDefinition",
@@ -190,6 +215,24 @@ __all__ = [
     "RecordingInfo",
     "RecordingFilter",
     "RecordingList",
+    # Realtime session types
+    "VADConfig",
+    "InputTranscriptionConfig",
+    "RealtimeSessionConfig",
+    "RealtimeTranscript",
+    "RealtimeSpeechEvent",
+    "RealtimeAudioChunk",
+    "VOICE_DEFAULTS",
+    "REALTIME_DEFAULTS",
+    # Voice cloning types
+    "VoiceCloneProvider",
+    "VoiceCloneRequest",
+    "VoiceCloneStatus",
+    "VoiceCloneResponse",
+    # Hume EVI types
+    "HumeEVIVersion",
+    "HumeEVIConfig",
+    "ProsodyScores",
     # Result types
     "STTResult",
     "TranscriptEvent",
@@ -247,4 +290,18 @@ __all__ = [
     "WebSocketSession",
     "ReconnectConfig",
     "AudioProcessor",
+    # Voice Activity Detection
+    "VoiceActivityDetector",
+    "AudioVADConfig",
+    "VADFrame",
+    "VADState",
+    # Message Queue
+    "MessageQueue",
+    "QueueConfig",
+    "QueueStats",
+    # SLO Tracking
+    "SLOTracker",
+    "SLODefinition",
+    "SLOViolation",
+    "SLOComparison",
 ]

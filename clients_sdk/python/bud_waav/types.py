@@ -1,5 +1,5 @@
 """
-Type definitions for bud-foundry SDK
+Type definitions for bud-waav SDK
 """
 
 from enum import Enum
@@ -568,6 +568,9 @@ class STTResult(BaseModel):
 
     is_final: bool
     """Whether this is a final result"""
+
+    is_speech_final: bool = False
+    """Whether the speaker has finished their utterance (speech endpoint detection)"""
 
     confidence: Optional[float] = None
     """Confidence score (0-1)"""
@@ -1180,7 +1183,7 @@ class ProsodyScores(BaseModel):
         """Get the top N emotions by score."""
         scores = [
             (name, getattr(self, name))
-            for name in self.model_fields
+            for name in self.__class__.model_fields
             if isinstance(getattr(self, name), float)
         ]
         scores.sort(key=lambda x: x[1], reverse=True)
@@ -1198,21 +1201,87 @@ class ProsodyScores(BaseModel):
 
 
 class DAGNodeType(str, Enum):
-    """Node types supported in DAG definitions."""
+    """Node types supported in DAG definitions.
 
+    Matches gateway NodeType enum with all 25 variants:
+    - Input nodes: audio_input, text_input
+    - Output nodes: audio_output, text_output, webhook_output
+    - Provider nodes: stt_provider, tts_provider, realtime_provider
+    - Processing nodes: processor, transform, passthrough
+    - Endpoint nodes: http_endpoint, grpc_endpoint, websocket_endpoint,
+                      ipc_endpoint, livekit_endpoint, llm_endpoint
+    - Router nodes: router, split, join
+    """
+
+    # Input nodes
     AUDIO_INPUT = "audio_input"
-    AUDIO_OUTPUT = "audio_output"
     TEXT_INPUT = "text_input"
+
+    # Output nodes
+    AUDIO_OUTPUT = "audio_output"
     TEXT_OUTPUT = "text_output"
+    WEBHOOK_OUTPUT = "webhook_output"
+
+    # Provider nodes
     STT_PROVIDER = "stt_provider"
     TTS_PROVIDER = "tts_provider"
-    LLM = "llm"
-    HTTP_ENDPOINT = "http_endpoint"
-    WEBHOOK = "webhook"
+    REALTIME_PROVIDER = "realtime_provider"
+
+    # Processing nodes
+    PROCESSOR = "processor"
     TRANSFORM = "transform"
+    PASSTHROUGH = "passthrough"
+
+    # Endpoint nodes
+    HTTP_ENDPOINT = "http_endpoint"
+    GRPC_ENDPOINT = "grpc_endpoint"
+    WEBSOCKET_ENDPOINT = "websocket_endpoint"
+    IPC_ENDPOINT = "ipc_endpoint"
+    LIVEKIT_ENDPOINT = "livekit_endpoint"
+    LLM_ENDPOINT = "llm_endpoint"
+
+    # Router nodes
     ROUTER = "router"
+    SPLIT = "split"
+    JOIN = "join"
+
+    # Legacy aliases (kept for backward compatibility)
+    LLM = "llm_endpoint"
+    WEBHOOK = "webhook_output"
     BUFFER = "buffer"
     SWITCH = "switch"
+
+
+class OutputDestination(str, Enum):
+    """Output destination for DAG output nodes."""
+
+    WEBSOCKET = "websocket"
+    LIVEKIT = "livekit"
+    ENDPOINT = "endpoint"
+    BROADCAST = "broadcast"
+    DISCARD = "discard"
+
+
+class JoinStrategy(str, Enum):
+    """Strategy for DAG Join nodes."""
+
+    FIRST = "first"
+    ALL = "all"
+    BEST = "best"
+    MERGE = "merge"
+
+
+class DAGDataType(str, Enum):
+    """Data types that flow between DAG nodes."""
+
+    AUDIO = "audio"
+    TEXT = "text"
+    STT_RESULT = "stt_result"
+    TTS_AUDIO = "tts_audio"
+    JSON = "json"
+    BINARY = "binary"
+    MULTIPLE = "multiple"
+    EMPTY = "empty"
 
 
 class DAGNode(BaseModel):
@@ -1285,7 +1354,10 @@ class DAGConfig(BaseModel):
 
 
 class DAGValidationResult(BaseModel):
-    """Validation result for DAG definitions."""
+    """Validation result for DAG definitions.
+
+    Matches gateway ValidateDAGResponse format.
+    """
 
     valid: bool
     """Whether the DAG is valid"""
@@ -1295,6 +1367,12 @@ class DAGValidationResult(BaseModel):
 
     warnings: list[str]
     """List of validation warnings"""
+
+    node_count: int = 0
+    """Number of nodes in the DAG"""
+
+    edge_count: int = 0
+    """Number of edges in the DAG"""
 
 
 def validate_dag_definition(dag: DAGDefinition) -> DAGValidationResult:
@@ -1356,7 +1434,13 @@ def validate_dag_definition(dag: DAGDefinition) -> DAGValidationResult:
         if len(dag.nodes) > 1 and node.id not in connected_nodes:
             warnings.append(f"Node {node.id} is not connected to any other node")
 
-    return DAGValidationResult(valid=len(errors) == 0, errors=errors, warnings=warnings)
+    return DAGValidationResult(
+        valid=len(errors) == 0,
+        errors=errors,
+        warnings=warnings,
+        node_count=len(dag.nodes),
+        edge_count=len(dag.edges),
+    )
 
 
 def _detect_cycles(dag: DAGDefinition) -> list[str] | None:

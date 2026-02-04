@@ -4,7 +4,7 @@ BudSTT - Speech-to-Text pipeline
 
 from typing import Any, AsyncIterator, Callable, Optional, Union
 
-from ..types import STTConfig, STTResult, FeatureFlags
+from ..types import STTConfig, STTResult, FeatureFlags, AudioFeatures, DAGConfig
 from ..ws.session import WebSocketSession, SessionMetrics, ReconnectConfig
 
 
@@ -34,6 +34,9 @@ class BudSTT:
         model: Optional[str] = None,
         features: Optional[FeatureFlags] = None,
         reconnect: Optional[ReconnectConfig] = None,
+        audio_features: Optional[AudioFeatures] = None,
+        dag_config: Optional[DAGConfig] = None,
+        stream_id: Optional[str] = None,
     ) -> "STTSession":
         """
         Create an STT session.
@@ -45,6 +48,9 @@ class BudSTT:
             model: Model to use
             features: Feature flags
             reconnect: Reconnection configuration
+            audio_features: Audio features (turn detection, noise filter, VAD)
+            dag_config: DAG routing configuration
+            stream_id: Optional stream ID for session tracking
 
         Returns:
             STT session
@@ -67,6 +73,9 @@ class BudSTT:
             config=config,
             features=features,
             reconnect=reconnect,
+            audio_features=audio_features,
+            dag_config=dag_config,
+            stream_id=stream_id,
         )
 
     async def connect(
@@ -77,6 +86,9 @@ class BudSTT:
         model: Optional[str] = None,
         features: Optional[FeatureFlags] = None,
         reconnect: Optional[ReconnectConfig] = None,
+        audio_features: Optional[AudioFeatures] = None,
+        dag_config: Optional[DAGConfig] = None,
+        stream_id: Optional[str] = None,
     ) -> "STTSession":
         """
         Create and connect an STT session.
@@ -88,6 +100,9 @@ class BudSTT:
             model: Model to use
             features: Feature flags
             reconnect: Reconnection configuration
+            audio_features: Audio features (turn detection, noise filter, VAD)
+            dag_config: DAG routing configuration
+            stream_id: Optional stream ID for session tracking
 
         Returns:
             Connected STT session
@@ -99,6 +114,9 @@ class BudSTT:
             model=model,
             features=features,
             reconnect=reconnect,
+            audio_features=audio_features,
+            dag_config=dag_config,
+            stream_id=stream_id,
         )
         await session.connect()
         return session
@@ -114,6 +132,9 @@ class STTSession:
         config: Optional[STTConfig] = None,
         features: Optional[FeatureFlags] = None,
         reconnect: Optional[ReconnectConfig] = None,
+        audio_features: Optional[AudioFeatures] = None,
+        dag_config: Optional[DAGConfig] = None,
+        stream_id: Optional[str] = None,
     ):
         """
         Initialize STT session.
@@ -124,6 +145,9 @@ class STTSession:
             config: STT configuration
             features: Feature flags
             reconnect: Reconnection config
+            audio_features: Audio features (turn detection, noise filter, VAD)
+            dag_config: DAG routing configuration
+            stream_id: Optional stream ID for session tracking
         """
         self.config = config or STTConfig(provider="deepgram")
         self.features = features
@@ -133,6 +157,9 @@ class STTSession:
             api_key=api_key,
             stt_config=self.config,
             reconnect=reconnect,
+            audio_features=audio_features,
+            dag_config=dag_config,
+            stream_id=stream_id,
         )
 
         self._transcript_handlers: list[Callable[[STTResult], Any]] = []

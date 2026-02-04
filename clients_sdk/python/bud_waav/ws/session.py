@@ -1,8 +1,9 @@
 """
-WebSocket session for Bud Foundry Gateway
+WebSocket session for Bud WaaV Gateway
 """
 
 import asyncio
+import base64
 import json
 import time
 import random
@@ -12,7 +13,10 @@ from dataclasses import dataclass, field
 import websockets
 from websockets.asyncio.client import ClientConnection
 
-from ..types import STTConfig, TTSConfig, STTResult, TranscriptEvent, AudioEvent
+from ..types import (
+    STTConfig, TTSConfig, STTResult, TranscriptEvent, AudioEvent,
+    AudioFeatures, DAGConfig, intensity_to_number,
+)
 from ..errors import ConnectionError, ReconnectError, TimeoutError
 
 
@@ -167,7 +171,7 @@ class MetricsCollector:
 
 
 class WebSocketSession:
-    """WebSocket session for real-time communication with Bud Foundry Gateway."""
+    """WebSocket session for real-time communication with Bud WaaV Gateway."""
 
     def __init__(
         self,
@@ -176,6 +180,9 @@ class WebSocketSession:
         stt_config: Optional[STTConfig] = None,
         tts_config: Optional[TTSConfig] = None,
         livekit_config: Optional[dict[str, Any]] = None,
+        audio_features: Optional[AudioFeatures] = None,
+        dag_config: Optional[DAGConfig] = None,
+        stream_id: Optional[str] = None,
         reconnect: Optional[ReconnectConfig] = None,
     ):
         """
@@ -187,6 +194,9 @@ class WebSocketSession:
             stt_config: STT configuration
             tts_config: TTS configuration
             livekit_config: LiveKit configuration
+            audio_features: Audio features (turn detection, noise filter, VAD) - client-side
+            dag_config: DAG routing configuration
+            stream_id: Optional stream ID for session tracking
             reconnect: Reconnection configuration
         """
         self.url = url
@@ -194,6 +204,9 @@ class WebSocketSession:
         self.stt_config = stt_config
         self.tts_config = tts_config
         self.livekit_config = livekit_config
+        self.audio_features = audio_features
+        self.dag_config = dag_config
+        self.requested_stream_id = stream_id
         self.reconnect_config = reconnect or ReconnectConfig()
 
         self._ws: Optional[ClientConnection] = None
@@ -201,8 +214,10 @@ class WebSocketSession:
         self._connected = False
         self._connecting = False
         self._closed = False
+        self._authenticated = False
         # Lazy-initialized to avoid requiring a running event loop in __init__
         self._ready_event: Optional[asyncio.Event] = None
+        self._auth_event: Optional[asyncio.Event] = None
         self._message_queue: Optional[asyncio.Queue[dict[str, Any]]] = None
         self._pending_audio: list[bytes] = []
         self._receive_task: Optional[asyncio.Task[None]] = None
@@ -293,6 +308,12 @@ class WebSocketSession:
             self._ready_event = asyncio.Event()
         return self._ready_event
 
+    def _get_auth_event(self) -> asyncio.Event:
+        """Get or create the auth event (lazy initialization for event loop safety)."""
+        if self._auth_event is None:
+            self._auth_event = asyncio.Event()
+        return self._auth_event
+
     def _get_message_queue(self) -> asyncio.Queue[dict[str, Any]]:
         """Get or create the message queue (lazy initialization for event loop safety)."""
         if self._message_queue is None:
@@ -380,14 +401,22 @@ class WebSocketSession:
                 raise
 
     async def _send_config(self) -> None:
-        """Send configuration message."""
+        """Send configuration message with all gateway-supported fields.
+
+        The gateway requires both stt_config and tts_config when audio=true.
+        If only one is provided, a minimal default for the other is included.
+        """
         config: dict[str, Any] = {
             "type": "config",
             "audio": True,
         }
 
+        # Include stream_id if requested
+        if self.requested_stream_id:
+            config["stream_id"] = self.requested_stream_id
+
         if self.stt_config:
-            config["stt_config"] = {
+            stt_dict: dict[str, Any] = {
                 "provider": self.stt_config.provider,
                 "language": self.stt_config.language,
                 "sample_rate": self.stt_config.sample_rate,
@@ -396,17 +425,72 @@ class WebSocketSession:
                 "encoding": self.stt_config.encoding,
                 "model": self.stt_config.model or "nova-3",
             }
+            # Include API key if provided (gateway allows per-request override)
+            if self.api_key:
+                stt_dict["api_key"] = self.api_key
+            config["stt_config"] = stt_dict
+        else:
+            # Gateway requires stt_config when audio=true - provide minimal default
+            config["stt_config"] = {
+                "provider": "deepgram",
+                "language": "en-US",
+                "sample_rate": 16000,
+                "channels": 1,
+                "punctuation": True,
+                "encoding": "linear16",
+                "model": "nova-3",
+            }
 
         if self.tts_config:
-            config["tts_config"] = {
+            tts_dict: dict[str, Any] = {
                 "provider": self.tts_config.provider,
                 "voice_id": self.tts_config.voice_id or self.tts_config.voice,
-                "sample_rate": self.tts_config.sample_rate,
                 "model": self.tts_config.model or "aura-asteria-en",
+            }
+            # Include optional TTS fields recognized by gateway
+            if self.tts_config.sample_rate:
+                tts_dict["sample_rate"] = self.tts_config.sample_rate
+            if self.tts_config.audio_format:
+                tts_dict["audio_format"] = self.tts_config.audio_format
+            if self.tts_config.speed is not None:
+                tts_dict["speaking_rate"] = self.tts_config.speed
+            # Include API key if provided (gateway allows per-request override)
+            if self.api_key:
+                tts_dict["api_key"] = self.api_key
+            # Emotion fields (Unified Emotion System - gateway supports these)
+            if self.tts_config.emotion is not None:
+                tts_dict["emotion"] = self.tts_config.emotion.value if hasattr(self.tts_config.emotion, 'value') else str(self.tts_config.emotion)
+            if self.tts_config.emotion_intensity is not None:
+                tts_dict["emotion_intensity"] = intensity_to_number(self.tts_config.emotion_intensity)
+            if self.tts_config.delivery_style is not None:
+                tts_dict["delivery_style"] = self.tts_config.delivery_style.value if hasattr(self.tts_config.delivery_style, 'value') else str(self.tts_config.delivery_style)
+            if self.tts_config.emotion_description is not None:
+                tts_dict["emotion_description"] = self.tts_config.emotion_description
+            config["tts_config"] = tts_dict
+        else:
+            # Gateway requires tts_config when audio=true - provide minimal default
+            config["tts_config"] = {
+                "provider": "deepgram",
+                "model": "aura-asteria-en",
+                "voice_id": "aura-asteria-en",
+                "sample_rate": 24000,
             }
 
         if self.livekit_config:
             config["livekit"] = self.livekit_config
+
+        # DAG routing configuration
+        if self.dag_config:
+            dag_dict: dict[str, Any] = {}
+            if self.dag_config.template:
+                dag_dict["template"] = self.dag_config.template
+            if self.dag_config.definition:
+                dag_dict["definition"] = self.dag_config.definition.model_dump(by_alias=True)
+            if self.dag_config.enable_metrics:
+                dag_dict["enable_metrics"] = self.dag_config.enable_metrics
+            if self.dag_config.timeout_ms != 30000:
+                dag_dict["timeout_ms"] = self.dag_config.timeout_ms
+            config["dag_config"] = dag_dict
 
         self._config_sent_time = time.monotonic()
         await self._send_json(config)
@@ -470,6 +554,7 @@ class WebSocketSession:
                         result = STTResult(
                             text=data.get("transcript", ""),
                             is_final=data.get("is_final", False),
+                            is_speech_final=data.get("is_speech_final", False),
                             confidence=data.get("confidence"),
                             speaker_id=data.get("speaker_id"),
                         )
@@ -478,7 +563,6 @@ class WebSocketSession:
 
                     elif msg_type == "tts_audio":
                         # Base64 encoded audio
-                        import base64
                         audio_data = base64.b64decode(data.get("audio", ""))
                         self._metrics.record_audio_received(len(audio_data))
 
@@ -496,9 +580,24 @@ class WebSocketSession:
                         self._emit("audio", audio_event)
                         await self._get_message_queue().put({"type": "audio", "audio": audio_event})
 
+                    elif msg_type == "audio_end":
+                        # End of TTS audio stream marker
+                        self._emit("audio_end", data)
+                        await self._get_message_queue().put({"type": "audio_end", "data": data})
+
                     elif msg_type == "tts_playback_complete":
                         self._emit("playback_complete", data.get("timestamp"))
                         await self._get_message_queue().put({"type": "playback_complete", "data": data})
+
+                    elif msg_type == "turn_completed":
+                        # Turn detection signals speaker finished their turn
+                        self._emit("turn_completed", data)
+                        await self._get_message_queue().put({"type": "turn_completed", "data": data})
+
+                    elif msg_type == "vad_event":
+                        # Voice Activity Detection event (speech_start/speech_end)
+                        self._emit("vad_event", data)
+                        await self._get_message_queue().put({"type": "vad_event", "data": data})
 
                     elif msg_type == "message":
                         self._emit("message", data.get("message"))
@@ -519,6 +618,42 @@ class WebSocketSession:
 
                     elif msg_type == "pong":
                         self._emit("pong", data.get("timestamp"))
+
+                    elif msg_type == "auth_required":
+                        # Server requires authentication - send token
+                        if self.api_key:
+                            await self._send_json({
+                                "type": "auth",
+                                "token": self.api_key,
+                            })
+                        else:
+                            from ..errors import BudError
+                            error = BudError(
+                                message="Server requires authentication but no API key provided",
+                                code="AUTH_REQUIRED",
+                            )
+                            self._emit("error", error)
+                            await self._get_message_queue().put({"type": "error", "error": error})
+
+                    elif msg_type == "authenticated":
+                        # Auth successful
+                        self._authenticated = True
+                        self._get_auth_event().set()
+                        self._emit("authenticated", data.get("id"))
+
+                    elif msg_type == "sip_transfer_error":
+                        from ..errors import BudError
+                        error = BudError(
+                            message=data.get("message", "SIP transfer failed"),
+                            code="SIP_TRANSFER_ERROR",
+                        )
+                        self._emit("error", error)
+                        await self._get_message_queue().put({"type": "error", "error": error})
+
+                    elif msg_type == "plugin_response":
+                        # Plugin-specific response
+                        self._emit("plugin_response", data)
+                        await self._get_message_queue().put({"type": "plugin_response", "data": data})
 
         except websockets.ConnectionClosed:
             self._connected = False
@@ -673,6 +808,24 @@ class WebSocketSession:
         await self._send_json({
             "type": "sip_transfer",
             "transfer_to": transfer_to,
+        })
+
+    async def send_audio_end(self) -> None:
+        """Signal end of audio input stream to the server."""
+        await self._send_json({"type": "audio_end"})
+
+    async def send_custom(self, message_type: str, payload: dict[str, Any]) -> None:
+        """
+        Send a custom plugin message.
+
+        Args:
+            message_type: Plugin message type identifier
+            payload: Message payload
+        """
+        await self._send_json({
+            "type": "custom",
+            "message_type": message_type,
+            "payload": payload,
         })
 
     async def ping(self) -> None:

@@ -4,7 +4,7 @@ Tests for DAG routing types and validation.
 
 import pytest
 
-from bud_foundry import (
+from bud_waav import (
     DAGNodeType,
     DAGNode,
     DAGEdge,
@@ -24,19 +24,42 @@ class TestDAGNodeType:
     """Tests for DAG node types."""
 
     def test_all_node_types_defined(self):
-        """All node types should be defined."""
+        """All gateway node types should be defined."""
         expected_types = [
+            # Input nodes
             "audio_input",
+            "text_input",
+            # Output nodes
             "audio_output",
+            "text_output",
+            "webhook_output",
+            # Provider nodes
             "stt_provider",
             "tts_provider",
-            "llm",
-            "http_endpoint",
-            "webhook",
+            "realtime_provider",
+            # Processing nodes
+            "processor",
             "transform",
+            "passthrough",
+            # Endpoint nodes
+            "http_endpoint",
+            "grpc_endpoint",
+            "websocket_endpoint",
+            "ipc_endpoint",
+            "livekit_endpoint",
+            "llm_endpoint",
+            # Router nodes
+            "router",
+            "split",
+            "join",
         ]
         for node_type in expected_types:
             assert DAGNodeType(node_type).value == node_type
+
+    def test_legacy_aliases(self):
+        """Legacy aliases should map to new values."""
+        assert DAGNodeType.LLM == DAGNodeType.LLM_ENDPOINT
+        assert DAGNodeType.WEBHOOK == DAGNodeType.WEBHOOK_OUTPUT
 
 
 class TestDAGNode:

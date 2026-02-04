@@ -5,7 +5,7 @@ BudTalk - Bidirectional voice pipeline
 from typing import Any, AsyncIterator, Callable, Optional, Union
 from dataclasses import dataclass
 
-from ..types import STTConfig, TTSConfig, STTResult, AudioEvent, FeatureFlags
+from ..types import STTConfig, TTSConfig, STTResult, AudioEvent, FeatureFlags, AudioFeatures, DAGConfig
 from ..ws.session import WebSocketSession, SessionMetrics, ReconnectConfig
 
 
@@ -14,7 +14,7 @@ class TalkEvent:
     """Event from a Talk session."""
 
     type: str
-    """Event type: transcript, audio, message, error, playback_complete"""
+    """Event type: transcript, audio, message, error, playback_complete, turn_completed, vad_event, audio_end"""
 
     transcript: Optional[STTResult] = None
     """Transcript result (if type is 'transcript')"""
@@ -27,6 +27,9 @@ class TalkEvent:
 
     error: Optional[Exception] = None
     """Error (if type is 'error')"""
+
+    data: Optional[dict[str, Any]] = None
+    """Raw data payload (for turn_completed, vad_event, audio_end)"""
 
 
 class BudTalk:
@@ -54,6 +57,9 @@ class BudTalk:
         livekit: Optional[dict[str, Any]] = None,
         features: Optional[FeatureFlags] = None,
         reconnect: Optional[ReconnectConfig] = None,
+        audio_features: Optional[AudioFeatures] = None,
+        dag_config: Optional[DAGConfig] = None,
+        stream_id: Optional[str] = None,
     ) -> "TalkSession":
         """
         Create a Talk session.
@@ -64,6 +70,9 @@ class BudTalk:
             livekit: LiveKit configuration
             features: Feature flags
             reconnect: Reconnection configuration
+            audio_features: Audio features (turn detection, noise filter, VAD)
+            dag_config: DAG routing configuration
+            stream_id: Optional stream ID for session tracking
 
         Returns:
             Talk session
@@ -114,6 +123,9 @@ class BudTalk:
             livekit_config=livekit,
             features=features,
             reconnect=reconnect,
+            audio_features=audio_features,
+            dag_config=dag_config,
+            stream_id=stream_id,
         )
 
     async def connect(
@@ -123,6 +135,9 @@ class BudTalk:
         livekit: Optional[dict[str, Any]] = None,
         features: Optional[FeatureFlags] = None,
         reconnect: Optional[ReconnectConfig] = None,
+        audio_features: Optional[AudioFeatures] = None,
+        dag_config: Optional[DAGConfig] = None,
+        stream_id: Optional[str] = None,
     ) -> "TalkSession":
         """
         Create and connect a Talk session.
@@ -133,6 +148,9 @@ class BudTalk:
             livekit: LiveKit configuration
             features: Feature flags
             reconnect: Reconnection configuration
+            audio_features: Audio features (turn detection, noise filter, VAD)
+            dag_config: DAG routing configuration
+            stream_id: Optional stream ID for session tracking
 
         Returns:
             Connected Talk session
@@ -143,6 +161,9 @@ class BudTalk:
             livekit=livekit,
             features=features,
             reconnect=reconnect,
+            audio_features=audio_features,
+            dag_config=dag_config,
+            stream_id=stream_id,
         )
         await session.connect()
         return session
@@ -160,6 +181,9 @@ class TalkSession:
         livekit_config: Optional[dict[str, Any]] = None,
         features: Optional[FeatureFlags] = None,
         reconnect: Optional[ReconnectConfig] = None,
+        audio_features: Optional[AudioFeatures] = None,
+        dag_config: Optional[DAGConfig] = None,
+        stream_id: Optional[str] = None,
     ):
         """
         Initialize Talk session.
@@ -172,6 +196,9 @@ class TalkSession:
             livekit_config: LiveKit configuration
             features: Feature flags
             reconnect: Reconnection config
+            audio_features: Audio features (turn detection, noise filter, VAD)
+            dag_config: DAG routing configuration
+            stream_id: Optional stream ID for session tracking
         """
         self.stt_config = stt_config
         self.tts_config = tts_config
@@ -185,6 +212,9 @@ class TalkSession:
             tts_config=tts_config,
             livekit_config=livekit_config,
             reconnect=reconnect,
+            audio_features=audio_features,
+            dag_config=dag_config,
+            stream_id=stream_id,
         )
 
         self._event_handlers: dict[str, list[Callable[..., Any]]] = {}
@@ -195,6 +225,9 @@ class TalkSession:
         self._session.on("message", self._on_message)
         self._session.on("error", self._on_error)
         self._session.on("playback_complete", self._on_playback_complete)
+        self._session.on("turn_completed", self._on_turn_completed)
+        self._session.on("vad_event", self._on_vad_event)
+        self._session.on("audio_end", self._on_audio_end)
 
     def _on_transcript(self, result: STTResult) -> None:
         """Handle transcript events."""
@@ -224,6 +257,24 @@ class TalkSession:
         """Handle playback complete events."""
         event = TalkEvent(type="playback_complete")
         self._emit("playback_complete")
+        self._emit("event", event)
+
+    def _on_turn_completed(self, data: dict[str, Any]) -> None:
+        """Handle turn completed events."""
+        event = TalkEvent(type="turn_completed", data=data)
+        self._emit("turn_completed", data)
+        self._emit("event", event)
+
+    def _on_vad_event(self, data: dict[str, Any]) -> None:
+        """Handle VAD events (speech_start/speech_end)."""
+        event = TalkEvent(type="vad_event", data=data)
+        self._emit("vad_event", data)
+        self._emit("event", event)
+
+    def _on_audio_end(self, data: dict[str, Any]) -> None:
+        """Handle audio end events."""
+        event = TalkEvent(type="audio_end", data=data)
+        self._emit("audio_end", data)
         self._emit("event", event)
 
     def _emit(self, event: str, *args: Any) -> None:
@@ -350,6 +401,12 @@ class TalkSession:
                 yield TalkEvent(type="error", error=message["error"])
             elif msg_type == "playback_complete":
                 yield TalkEvent(type="playback_complete")
+            elif msg_type == "turn_completed":
+                yield TalkEvent(type="turn_completed", data=message.get("data"))
+            elif msg_type == "vad_event":
+                yield TalkEvent(type="vad_event", data=message.get("data"))
+            elif msg_type == "audio_end":
+                yield TalkEvent(type="audio_end", data=message.get("data"))
 
     async def __aenter__(self) -> "TalkSession":
         """Async context manager entry."""

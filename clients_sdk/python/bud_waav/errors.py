@@ -1,5 +1,5 @@
 """
-Error classes for bud-foundry SDK
+Error classes for bud-waav SDK
 """
 
 from typing import Any, Optional

@@ -4,7 +4,7 @@ Tests for BudRealtime pipeline.
 
 import pytest
 
-from bud_foundry.pipelines.realtime import (
+from bud_waav.pipelines.realtime import (
     BudRealtime,
     RealtimeConfig,
     RealtimeProvider,

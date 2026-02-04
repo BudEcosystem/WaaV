@@ -5,13 +5,13 @@ import pytest
 
 def test_import_main_client():
     """Test importing the main BudClient."""
-    from bud_foundry import BudClient
+    from bud_waav import BudClient
     assert BudClient is not None
 
 
 def test_import_config_types():
     """Test importing configuration types."""
-    from bud_foundry import STTConfig, TTSConfig, LiveKitConfig, FeatureFlags
+    from bud_waav import STTConfig, TTSConfig, LiveKitConfig, FeatureFlags
     assert STTConfig is not None
     assert TTSConfig is not None
     assert LiveKitConfig is not None
@@ -20,7 +20,7 @@ def test_import_config_types():
 
 def test_import_result_types():
     """Test importing result types."""
-    from bud_foundry import STTResult, TranscriptEvent, AudioEvent, Voice
+    from bud_waav import STTResult, TranscriptEvent, AudioEvent, Voice
     assert STTResult is not None
     assert TranscriptEvent is not None
     assert AudioEvent is not None
@@ -29,7 +29,7 @@ def test_import_result_types():
 
 def test_import_error_types():
     """Test importing error types."""
-    from bud_foundry import (
+    from bud_waav import (
         BudError,
         ConnectionError,
         TimeoutError,
@@ -42,7 +42,7 @@ def test_import_error_types():
 
 def test_import_pipeline_classes():
     """Test importing pipeline classes."""
-    from bud_foundry import BudSTT, BudTTS, BudTalk, BudTranscribe
+    from bud_waav import BudSTT, BudTTS, BudTalk, BudTranscribe
     assert BudSTT is not None
     assert BudTTS is not None
     assert BudTalk is not None
@@ -51,7 +51,7 @@ def test_import_pipeline_classes():
 
 def test_import_utilities():
     """Test importing utility classes."""
-    from bud_foundry import RestClient, WebSocketSession, AudioProcessor
+    from bud_waav import RestClient, WebSocketSession, AudioProcessor
     assert RestClient is not None
     assert WebSocketSession is not None
     assert AudioProcessor is not None
@@ -59,7 +59,7 @@ def test_import_utilities():
 
 def test_create_stt_config():
     """Test creating STT config."""
-    from bud_foundry import STTConfig
+    from bud_waav import STTConfig
     
     config = STTConfig(
         provider="deepgram",
@@ -73,7 +73,7 @@ def test_create_stt_config():
 
 def test_create_tts_config():
     """Test creating TTS config."""
-    from bud_foundry import TTSConfig
+    from bud_waav import TTSConfig
     
     config = TTSConfig(
         provider="elevenlabs",
@@ -87,7 +87,7 @@ def test_create_tts_config():
 
 def test_create_feature_flags():
     """Test creating feature flags."""
-    from bud_foundry import FeatureFlags
+    from bud_waav import FeatureFlags
     
     flags = FeatureFlags(
         vad=True,
@@ -101,7 +101,7 @@ def test_create_feature_flags():
 
 def test_create_client():
     """Test creating the main client."""
-    from bud_foundry import BudClient
+    from bud_waav import BudClient
     
     client = BudClient(
         base_url="http://localhost:3001",
@@ -117,7 +117,7 @@ def test_create_client():
 
 def test_audio_processor_float_to_int():
     """Test audio conversion."""
-    from bud_foundry import AudioProcessor
+    from bud_waav import AudioProcessor
     import struct
     
     # Create float32 samples
@@ -135,7 +135,7 @@ def test_audio_processor_float_to_int():
 
 def test_audio_processor_silence_detection():
     """Test silence detection."""
-    from bud_foundry import AudioProcessor
+    from bud_waav import AudioProcessor
     import struct
     
     # Create silent audio

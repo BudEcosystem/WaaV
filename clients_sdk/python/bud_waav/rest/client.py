@@ -1,5 +1,5 @@
 """
-Async REST client for Bud Foundry Gateway
+Async REST client for Bud WaaV Gateway
 """
 
 from typing import Any, Optional
@@ -9,7 +9,7 @@ from ..errors import APIError, ConnectionError, TimeoutError
 
 
 class RestClient:
-    """Async REST client for Bud Foundry Gateway."""
+    """Async REST client for Bud WaaV Gateway."""
 
     def __init__(
         self,
@@ -21,7 +21,7 @@ class RestClient:
         Initialize REST client.
 
         Args:
-            base_url: Base URL of the Bud Foundry gateway
+            base_url: Base URL of the Bud WaaV gateway
             api_key: Optional API key for authentication
             timeout: Request timeout in seconds
         """
@@ -144,13 +144,23 @@ class RestClient:
         """Make a POST request."""
         return await self._request("POST", endpoint, json=json, params=params)
 
+    async def put(
+        self,
+        endpoint: str,
+        json: Optional[dict[str, Any]] = None,
+        params: Optional[dict[str, Any]] = None,
+    ) -> Any:
+        """Make a PUT request."""
+        return await self._request("PUT", endpoint, json=json, params=params)
+
     async def delete(
         self,
         endpoint: str,
         params: Optional[dict[str, Any]] = None,
+        json: Optional[dict[str, Any]] = None,
     ) -> Any:
         """Make a DELETE request."""
-        return await self._request("DELETE", endpoint, params=params)
+        return await self._request("DELETE", endpoint, params=params, json=json)
 
     async def health(self) -> dict[str, Any]:
         """
@@ -162,20 +172,26 @@ class RestClient:
         result: dict[str, Any] = await self.get("/")
         return result
 
-    async def list_voices(self, provider: Optional[str] = None) -> list[dict[str, Any]]:
+    async def list_voices(
+        self,
+        provider: Optional[str] = None,
+    ) -> dict[str, list[dict[str, Any]]]:
         """
         List available TTS voices.
 
+        The gateway returns voices grouped by provider name, e.g.
+        ``{"deepgram": [...], "elevenlabs": [...]}``.
+
         Args:
-            provider: Optional provider to filter voices
+            provider: Optional provider to filter voices.
 
         Returns:
-            List of available voices
+            Dictionary mapping provider names to lists of voice objects.
         """
         params: dict[str, str] = {}
         if provider:
             params["provider"] = provider
-        result: list[dict[str, Any]] = await self.get("/voices", params=params)
+        result: dict[str, list[dict[str, Any]]] = await self.get("/voices", params=params)
         return result
 
     async def speak(
@@ -190,6 +206,8 @@ class RestClient:
         """
         Synthesize text to speech (one-shot).
 
+        The gateway expects ``{"text": "...", "tts_config": {...}}``.
+
         Args:
             text: Text to synthesize
             provider: TTS provider
@@ -201,17 +219,20 @@ class RestClient:
         Returns:
             Audio data as bytes
         """
-        payload: dict[str, Any] = {
-            "text": text,
+        tts_config: dict[str, Any] = {
             "provider": provider,
+            "model": model or "aura-asteria-en",
             "sample_rate": sample_rate,
         }
-        if voice:
-            payload["voice"] = voice
         if voice_id:
-            payload["voice_id"] = voice_id
-        if model:
-            payload["model"] = model
+            tts_config["voice_id"] = voice_id
+        elif voice:
+            tts_config["voice_id"] = voice
+
+        payload: dict[str, Any] = {
+            "text": text,
+            "tts_config": tts_config,
+        }
 
         result: bytes = await self.post("/speak", json=payload)
         return result
@@ -306,14 +327,27 @@ class RestClient:
         result: dict[str, Any] = await self.post("/sip/hooks", json=payload)
         return result
 
-    async def delete_sip_hook(self, host: str) -> None:
+    async def delete_sip_hooks(self, hosts: list[str]) -> dict[str, Any]:
         """
-        Delete a SIP hook.
+        Delete SIP hooks by host names.
+
+        The gateway endpoint is DELETE /sip/hooks with a JSON body containing
+        host names to remove. Hosts defined in the server configuration cannot
+        be deleted (returns 405).
 
         Args:
-            host: SIP host to delete
+            hosts: List of SIP host names to delete (case-insensitive).
+
+        Returns:
+            Updated list of remaining SIP hooks.
+
+        Raises:
+            APIError: If hosts list is empty (400) or hosts are protected (405).
         """
-        await self.delete(f"/sip/hooks/{host}")
+        result: dict[str, Any] = await self.delete(
+            "/sip/hooks", json={"hosts": hosts}
+        )
+        return result
 
     # =========================================================================
     # Voice Cloning Methods
@@ -391,6 +425,11 @@ class RestClient:
         """
         Delete a cloned voice.
 
+        .. warning::
+            Gateway does not currently expose a DELETE /voices/{voice_id}
+            endpoint. This method will return a 404 until gateway support
+            is added. Use the provider's API directly in the meantime.
+
         Args:
             voice_id: The voice ID to delete.
             provider: The voice cloning provider.
@@ -404,6 +443,11 @@ class RestClient:
     ) -> dict[str, Any]:
         """
         Get information about a cloned voice.
+
+        .. warning::
+            Gateway does not currently expose a GET /voices/{voice_id}
+            endpoint. This method will return a 404 until gateway support
+            is added. Use the provider's API directly in the meantime.
 
         Args:
             voice_id: The voice ID.
@@ -426,7 +470,12 @@ class RestClient:
         stream_id: str,
     ) -> dict[str, Any]:
         """
-        Get recording information by stream ID.
+        Get recording metadata by stream ID.
+
+        .. warning::
+            Gateway does not currently expose a metadata-only recording
+            endpoint. This method will return a 404 until gateway support
+            is added. Use ``download_recording()`` to retrieve the audio.
 
         Args:
             stream_id: The stream/session ID.
@@ -440,20 +489,21 @@ class RestClient:
     async def download_recording(
         self,
         stream_id: str,
-        format: str = "wav",
     ) -> bytes:
         """
-        Download a recording.
+        Download a recording by stream ID.
+
+        The gateway serves recordings as audio/ogg from
+        GET /recording/{stream_id}. The response includes
+        Content-Disposition with a suggested filename.
 
         Args:
             stream_id: The stream/session ID.
-            format: Output format (wav, mp3, ogg).
 
         Returns:
-            Audio data as bytes.
+            Audio data as bytes (OGG format).
         """
-        params = {"format": format}
-        result: bytes = await self.get(f"/recordings/{stream_id}/download", params=params)
+        result: bytes = await self.get(f"/recording/{stream_id}")
         return result
 
     async def list_recordings(
@@ -466,6 +516,11 @@ class RestClient:
     ) -> dict[str, Any]:
         """
         List recordings with optional filters.
+
+        .. warning::
+            Gateway does not currently expose a GET /recordings list
+            endpoint. This method will return a 404 until gateway support
+            is added.
 
         Args:
             limit: Maximum number of recordings to return.
@@ -498,6 +553,11 @@ class RestClient:
         """
         Delete a recording.
 
+        .. warning::
+            Gateway does not currently expose a DELETE /recordings/{stream_id}
+            endpoint. This method will return a 404 until gateway support
+            is added.
+
         Args:
             stream_id: The stream/session ID.
         """
@@ -507,14 +567,17 @@ class RestClient:
     # DAG Template Methods
     # =========================================================================
 
-    async def list_dag_templates(self) -> list[dict[str, Any]]:
+    async def list_dag_templates(self) -> dict[str, Any]:
         """
         List available DAG templates.
 
         Returns:
-            List of DAG template definitions.
+            Dict with 'templates' list and 'count' integer matching gateway
+            ListTemplatesResponse format::
+
+                {"templates": [{"name": "...", "version": "...", "description": "..."}], "count": N}
         """
-        result: list[dict[str, Any]] = await self.get("/dag/templates")
+        result: dict[str, Any] = await self.get("/dag/templates")
         return result
 
     async def validate_dag(
@@ -522,15 +585,175 @@ class RestClient:
         definition: dict[str, Any],
     ) -> dict[str, Any]:
         """
-        Validate a DAG definition.
+        Validate a DAG definition server-side.
 
         Args:
             definition: DAG definition to validate.
 
         Returns:
-            Validation result with is_valid and any errors.
+            Gateway ValidateDAGResponse format::
+
+                {"valid": bool, "errors": [...], "warnings": [...],
+                 "node_count": int, "edge_count": int}
         """
-        result: dict[str, Any] = await self.post("/dag/validate", json=definition)
+        result: dict[str, Any] = await self.post("/dag/validate", json={"dag": definition})
+        return result
+
+    async def get_dag_template(self, name: str) -> dict[str, Any]:
+        """
+        Get a specific DAG template by name.
+
+        Args:
+            name: Template name.
+
+        Returns:
+            Dict with 'name' and 'template' (DAGDefinition) matching gateway response.
+
+        Raises:
+            APIError: If template not found (404).
+        """
+        result: dict[str, Any] = await self.get(f"/dag/templates/{name}")
+        return result
+
+    # =========================================================================
+    # LiveKit Participant Methods
+    # =========================================================================
+
+    async def remove_livekit_participant(
+        self,
+        room_name: str,
+        identity: str,
+    ) -> dict[str, Any]:
+        """
+        Remove a participant from a LiveKit room.
+
+        The gateway endpoint is DELETE /livekit/participant with a JSON body
+        containing room_name and participant_identity. The room name is
+        normalized with the auth.id prefix for tenant isolation.
+
+        Args:
+            room_name: Room name.
+            identity: Participant identity to remove.
+
+        Returns:
+            Removal response with status, room_name, and participant_identity.
+
+        Raises:
+            APIError: If participant not found (404) or LiveKit not configured (500).
+        """
+        payload: dict[str, Any] = {
+            "room_name": room_name,
+            "participant_identity": identity,
+        }
+        result: dict[str, Any] = await self.delete(
+            "/livekit/participant", json=payload
+        )
+        return result
+
+    async def mute_livekit_participant(
+        self,
+        room_name: str,
+        identity: str,
+        track_sid: str,
+        muted: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Mute or unmute a participant's track in a LiveKit room.
+
+        The gateway endpoint is POST /livekit/participant/mute with a JSON body.
+        The room name is normalized with the auth.id prefix for tenant isolation.
+
+        Args:
+            room_name: Room name.
+            identity: Participant identity.
+            track_sid: Session ID of the track to mute/unmute.
+            muted: Whether to mute (True) or unmute (False).
+
+        Returns:
+            Updated mute state with room_name, participant_identity,
+            track_sid, and muted fields.
+
+        Raises:
+            APIError: If participant/track not found (404) or LiveKit not configured (500).
+        """
+        payload: dict[str, Any] = {
+            "room_name": room_name,
+            "participant_identity": identity,
+            "track_sid": track_sid,
+            "muted": muted,
+        }
+        result: dict[str, Any] = await self.post(
+            "/livekit/participant/mute", json=payload
+        )
+        return result
+
+    # =========================================================================
+    # SIP Transfer Method
+    # =========================================================================
+
+    async def sip_transfer(
+        self,
+        stream_id: str,
+        transfer_to: str,
+    ) -> dict[str, Any]:
+        """
+        Transfer an active SIP call to another number.
+
+        Args:
+            stream_id: Active stream/session ID.
+            transfer_to: Phone number or SIP URI to transfer to.
+
+        Returns:
+            Transfer result.
+        """
+        payload: dict[str, Any] = {
+            "stream_id": stream_id,
+            "transfer_to": transfer_to,
+        }
+        result: dict[str, Any] = await self.post("/sip/transfer", json=payload)
+        return result
+
+    # =========================================================================
+    # Metrics Method
+    # =========================================================================
+
+    async def get_metrics(self) -> dict[str, Any]:
+        """
+        Get server performance metrics.
+
+        .. warning::
+            Gateway does not currently expose a GET /metrics endpoint.
+            This method will return a 404 until gateway support is added.
+            Use the SDK's local ``SessionMetrics`` for client-side metrics.
+
+        Returns:
+            Server metrics including STT/TTS latency, connection counts, etc.
+        """
+        result: dict[str, Any] = await self.get("/metrics")
+        return result
+
+    # =========================================================================
+    # Speak with TTS Config Method
+    # =========================================================================
+
+    async def speak_with_config(
+        self,
+        text: str,
+        tts_config: dict[str, Any],
+    ) -> bytes:
+        """
+        Synthesize text to speech with full TTS configuration.
+
+        Args:
+            text: Text to synthesize.
+            tts_config: Full TTS configuration dict including provider, voice,
+                       emotion, etc.
+
+        Returns:
+            Audio data as bytes.
+        """
+        payload: dict[str, Any] = {"text": text, "tts_config": tts_config}
+        result: bytes = await self.post("/speak", json=payload)
         return result
 
     async def __aenter__(self) -> "RestClient":

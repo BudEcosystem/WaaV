@@ -1,17 +1,17 @@
-# bud-foundry
+# bud-waav
 
-Python SDK for Bud Foundry AI Gateway - Speech-to-Text, Text-to-Speech, Realtime Audio-to-Audio, and Voice AI.
+Python SDK for Bud WaaV AI Gateway - Speech-to-Text, Text-to-Speech, Realtime Audio-to-Audio, and Voice AI.
 
 ## Installation
 
 ```bash
-pip install bud-foundry
+pip install bud-waav
 ```
 
 ## Quick Start
 
 ```python
-from bud_foundry import BudClient
+from bud_waav import BudClient
 import asyncio
 
 async def main():
@@ -98,7 +98,7 @@ asyncio.run(main())
 ## Configuration
 
 ```python
-from bud_foundry import BudClient, STTConfig, TTSConfig, FeatureFlags
+from bud_waav import BudClient, STTConfig, TTSConfig, FeatureFlags
 
 bud = BudClient(
     base_url="https://api.bud.ai",
@@ -131,7 +131,7 @@ Full-duplex bidirectional audio streaming with LLM integration.
 ### OpenAI Realtime
 
 ```python
-from bud_foundry.pipelines.realtime import BudRealtime, RealtimeConfig, RealtimeProvider
+from bud_waav.pipelines.realtime import BudRealtime, RealtimeConfig, RealtimeProvider
 
 realtime = BudRealtime(RealtimeConfig(
     provider=RealtimeProvider.OPENAI_REALTIME,
@@ -168,7 +168,7 @@ realtime.register_tool(ToolDefinition(
 ### Hume EVI (Empathic Voice Interface)
 
 ```python
-from bud_foundry.pipelines.realtime import BudRealtime, RealtimeConfig, RealtimeProvider
+from bud_waav.pipelines.realtime import BudRealtime, RealtimeConfig, RealtimeProvider
 
 realtime = BudRealtime(RealtimeConfig(
     provider=RealtimeProvider.HUME_EVI,
@@ -208,7 +208,7 @@ Unified emotion system with 22 emotions and 15 delivery styles.
 ### Using Emotions
 
 ```python
-from bud_foundry.types import Emotion, DeliveryStyle, EmotionIntensityLevel
+from bud_waav.types import Emotion, DeliveryStyle, EmotionIntensityLevel
 
 # With TTS configuration
 async with bud.tts.connect(
@@ -302,7 +302,7 @@ class DeliveryStyle(str, Enum):
 Clone voices from audio samples or descriptions.
 
 ```python
-from bud_foundry.types import VoiceCloneRequest, VoiceCloneProvider
+from bud_waav.types import VoiceCloneRequest, VoiceCloneProvider
 
 # Clone from audio samples (ElevenLabs)
 with open("voice_sample.mp3", "rb") as f:
@@ -344,7 +344,7 @@ clone_result = await bud.voice.clone(VoiceCloneRequest(
 Configure custom audio processing pipelines with DAG routing.
 
 ```python
-from bud_foundry.types import DAGConfig, DAGDefinition, DAGNode, DAGEdge, DAGNodeType
+from bud_waav.types import DAGConfig, DAGDefinition, DAGNode, DAGEdge, DAGNodeType
 
 # Define a custom voice bot pipeline
 dag = DAGDefinition(
@@ -387,7 +387,7 @@ async with bud.talk.connect(
 ### Built-in DAG Templates
 
 ```python
-from bud_foundry.types import get_builtin_template
+from bud_waav.types import get_builtin_template
 
 # Available templates
 templates = ["simple-stt", "simple-tts", "voice-assistant"]
@@ -403,7 +403,7 @@ voice_assistant = get_builtin_template("voice-assistant")
 Configure turn detection, noise filtering, and VAD.
 
 ```python
-from bud_foundry.types import (
+from bud_waav.types import (
     AudioFeatures, TurnDetectionConfig, NoiseFilterConfig,
     ExtendedVADConfig, VADModeType, create_audio_features
 )
@@ -443,7 +443,7 @@ features = create_audio_features(
 Track and download recordings.
 
 ```python
-from bud_foundry.types import RecordingFilter, RecordingStatus, RecordingFormat
+from bud_waav.types import RecordingFilter, RecordingStatus, RecordingFormat
 
 # List recordings
 recordings = await bud.recordings.list(RecordingFilter(
@@ -537,7 +537,7 @@ async with bud.talk.connect(
 Use OpenAI's Whisper for transcription and TTS-1/TTS-1-HD for speech synthesis:
 
 ```python
-from bud_foundry import BudClient, STTConfig, TTSConfig
+from bud_waav import BudClient, STTConfig, TTSConfig
 
 bud = BudClient(base_url="http://localhost:3001", api_key="your-api-key")
 
@@ -585,7 +585,7 @@ alloy, ash, ballad, coral, echo, fable, onyx, nova, sage, shimmer, verse
 When using Hume EVI, you receive 48 emotion dimensions in real-time.
 
 ```python
-from bud_foundry.types import ProsodyScores
+from bud_waav.types import ProsodyScores
 
 # Emotion events include full prosody scores
 def on_emotion(event):
@@ -622,7 +622,7 @@ shame, surprise_negative, surprise_positive, sympathy, tiredness, triumph
 For synchronous usage:
 
 ```python
-from bud_foundry.sync import BudClient
+from bud_waav.sync import BudClient
 
 bud = BudClient(base_url="http://localhost:3001", api_key="your-key")
 
@@ -639,7 +639,7 @@ print(result.text)
 ## Error Handling
 
 ```python
-from bud_foundry.errors import (
+from bud_waav.errors import (
     BudError,
     ConnectionError,
     APIError,
