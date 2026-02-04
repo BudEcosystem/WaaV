@@ -312,7 +312,10 @@ impl AmiVoiceSTT {
 
             Message::Binary(data) => {
                 // AmiVoice doesn't typically send binary responses
-                debug!("Received binary message from AmiVoice: {} bytes", data.len());
+                debug!(
+                    "Received binary message from AmiVoice: {} bytes",
+                    data.len()
+                );
             }
 
             Message::Close(close_frame) => {
@@ -371,18 +374,17 @@ impl AmiVoiceSTT {
         // Start the connection task
         let connection_handle = tokio::spawn(async move {
             // Connect to AmiVoice with timeout
-            let connect_result =
-                match timeout(WS_CONNECT_TIMEOUT, connect_async(ws_url)).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        let stt_error = STTError::ConnectionFailed(
-                            "Connection to AmiVoice timed out after 30 seconds".to_string(),
-                        );
-                        error!("{}", stt_error);
-                        let _ = error_tx.try_send(stt_error);
-                        return;
-                    }
-                };
+            let connect_result = match timeout(WS_CONNECT_TIMEOUT, connect_async(ws_url)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    let stt_error = STTError::ConnectionFailed(
+                        "Connection to AmiVoice timed out after 30 seconds".to_string(),
+                    );
+                    error!("{}", stt_error);
+                    let _ = error_tx.try_send(stt_error);
+                    return;
+                }
+            };
 
             let (ws_stream, _response) = match connect_result {
                 Ok(result) => result,
@@ -457,9 +459,8 @@ impl AmiVoiceSTT {
                     return;
                 }
                 _ => {
-                    let stt_error = STTError::ConnectionFailed(
-                        "Unexpected response from AmiVoice".to_string(),
-                    );
+                    let stt_error =
+                        STTError::ConnectionFailed("Unexpected response from AmiVoice".to_string());
                     error!("{}", stt_error);
                     let _ = error_tx.try_send(stt_error);
                     return;
@@ -829,7 +830,10 @@ impl BaseSTT for AmiVoiceSTT {
             base: config.clone(),
             app_key: config.api_key.clone(),
             engine: existing.as_ref().map(|c| c.engine).unwrap_or_default(),
-            audio_format: existing.as_ref().map(|c| c.audio_format).unwrap_or_default(),
+            audio_format: existing
+                .as_ref()
+                .map(|c| c.audio_format)
+                .unwrap_or_default(),
             no_logging: existing.as_ref().is_some_and(|c| c.no_logging),
             interim_results: existing.as_ref().map(|c| c.interim_results).unwrap_or(true),
             result_updated_interval: existing

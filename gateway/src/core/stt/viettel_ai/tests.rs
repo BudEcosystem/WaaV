@@ -3,8 +3,8 @@
 use super::*;
 use crate::core::stt::base::{BaseSTT, STTConfig, STTError, STTResult};
 use bytes::Bytes;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn make_test_config() -> STTConfig {
     STTConfig {
@@ -367,10 +367,11 @@ async fn test_on_result_callback() {
     let callback_count = Arc::new(AtomicUsize::new(0));
     let callback_count_clone = callback_count.clone();
 
-    let callback: crate::core::stt::base::STTResultCallback = Arc::new(move |_result: STTResult| {
-        callback_count_clone.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async {})
-    });
+    let callback: crate::core::stt::base::STTResultCallback =
+        Arc::new(move |_result: STTResult| {
+            callback_count_clone.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        });
 
     let result = stt.on_result(callback).await;
     assert!(result.is_ok());

@@ -33,20 +33,20 @@
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
 
+use super::config::{TENCENT_ASR_WS_URL, TencentSttConfig};
+use super::messages::TencentAsrResponse;
+use super::signature::TencentSignatureBuilder;
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
-use super::config::{TencentSttConfig, TENCENT_ASR_WS_URL};
-use super::messages::TencentAsrResponse;
-use super::signature::TencentSignatureBuilder;
 
 // =============================================================================
 // Constants
@@ -178,19 +178,17 @@ impl TencentStt {
 
     /// Build the WebSocket URL with signature.
     fn build_ws_url(&self) -> Result<String, STTError> {
-        let mut signature_builder = TencentSignatureBuilder::new(
-            &self.config.secret_id,
-            &self.config.secret_key,
-        )
-        .with_engine_model(self.config.engine_model_type.as_str())
-        .with_voice_format(self.config.voice_format.value())
-        .with_voice_id(&self.voice_id)
-        .with_needvad(self.config.needvad)
-        .with_filter_dirty(self.config.filter_dirty.value() as u32)
-        .with_filter_modal(self.config.filter_modal.value() as u32)
-        .with_filter_punc(self.config.filter_punc)
-        .with_word_info(self.config.word_info.value() as u32)
-        .with_convert_num_mode(self.config.convert_num_mode.value() as u32);
+        let mut signature_builder =
+            TencentSignatureBuilder::new(&self.config.secret_id, &self.config.secret_key)
+                .with_engine_model(self.config.engine_model_type.as_str())
+                .with_voice_format(self.config.voice_format.value())
+                .with_voice_id(&self.voice_id)
+                .with_needvad(self.config.needvad)
+                .with_filter_dirty(self.config.filter_dirty.value() as u32)
+                .with_filter_modal(self.config.filter_modal.value() as u32)
+                .with_filter_punc(self.config.filter_punc)
+                .with_word_info(self.config.word_info.value() as u32)
+                .with_convert_num_mode(self.config.convert_num_mode.value() as u32);
 
         // Add reinforce_hotword if enabled
         if self.config.reinforce_hotword {
@@ -310,7 +308,10 @@ impl BaseSTT for TencentStt {
         // Build URL with signature
         let url = self.build_ws_url()?;
 
-        info!("Connecting to Tencent ASR: {}", url.split('?').next().unwrap_or(&url));
+        info!(
+            "Connecting to Tencent ASR: {}",
+            url.split('?').next().unwrap_or(&url)
+        );
 
         // Connect with timeout
         let (ws_stream, _) = match timeout(WS_CONNECT_TIMEOUT, connect_async(&url)).await {
@@ -322,9 +323,7 @@ impl BaseSTT for TencentStt {
                 )));
             }
             Err(_) => {
-                return Err(STTError::ConnectionFailed(
-                    "Connection timeout".to_string(),
-                ));
+                return Err(STTError::ConnectionFailed("Connection timeout".to_string()));
             }
         };
 
@@ -357,7 +356,11 @@ impl BaseSTT for TencentStt {
             let send_task = tokio::spawn(async move {
                 while let Some(audio) = audio_rx.recv().await {
                     // Send binary audio data directly
-                    if write.send(Message::Binary(audio.to_vec().into())).await.is_err() {
+                    if write
+                        .send(Message::Binary(audio.to_vec().into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -379,7 +382,8 @@ impl BaseSTT for TencentStt {
                         }
                         Err(e) => {
                             error!("Tencent WebSocket error: {}", e);
-                            let _ = error_tx_clone.try_send(STTError::ConnectionFailed(e.to_string()));
+                            let _ =
+                                error_tx_clone.try_send(STTError::ConnectionFailed(e.to_string()));
                             break;
                         }
                         _ => {}
@@ -483,10 +487,9 @@ impl BaseSTT for TencentStt {
         }
 
         if let Some(sender) = &self.ws_sender {
-            sender
-                .send(audio)
-                .await
-                .map_err(|_| STTError::ProviderError("Failed to send audio to channel".to_string()))?;
+            sender.send(audio).await.map_err(|_| {
+                STTError::ProviderError("Failed to send audio to channel".to_string())
+            })?;
         }
 
         Ok(())

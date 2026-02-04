@@ -128,13 +128,29 @@ pub mod provider;
 
 // Re-export primary types
 pub use config::{
-    TencentTtsAudioFormat, TencentTtsConfig, TencentTtsResponse, TencentTtsResponseInner,
-    TencentTtsSampleRate, TencentTtsSubtitle, TencentTtsVoice, TencentVoiceCategory,
-    TencentTtsErrorInfo,
     // Constants
-    DEFAULT_PROJECT_ID, DEFAULT_SPEED, DEFAULT_VOICE_TYPE, DEFAULT_VOLUME, MAX_SPEED,
-    MAX_TEXT_LENGTH, MAX_VOLUME, MIN_SPEED, MIN_VOLUME, TENCENT_TTS_INTL_URL, TENCENT_TTS_URL,
-    TTS_ACTION, TTS_VERSION,
+    DEFAULT_PROJECT_ID,
+    DEFAULT_SPEED,
+    DEFAULT_VOICE_TYPE,
+    DEFAULT_VOLUME,
+    MAX_SPEED,
+    MAX_TEXT_LENGTH,
+    MAX_VOLUME,
+    MIN_SPEED,
+    MIN_VOLUME,
+    TENCENT_TTS_INTL_URL,
+    TENCENT_TTS_URL,
+    TTS_ACTION,
+    TTS_VERSION,
+    TencentTtsAudioFormat,
+    TencentTtsConfig,
+    TencentTtsErrorInfo,
+    TencentTtsResponse,
+    TencentTtsResponseInner,
+    TencentTtsSampleRate,
+    TencentTtsSubtitle,
+    TencentTtsVoice,
+    TencentVoiceCategory,
 };
 pub use provider::TencentTts;
 
@@ -225,7 +241,11 @@ mod tests {
             };
 
             let tts = TencentTts::new(config);
-            assert!(tts.is_ok(), "Failed to create provider with format: {}", format);
+            assert!(
+                tts.is_ok(),
+                "Failed to create provider with format: {}",
+                format
+            );
         }
     }
 

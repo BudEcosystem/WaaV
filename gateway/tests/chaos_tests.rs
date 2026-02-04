@@ -12,8 +12,8 @@
 use futures::{SinkExt, StreamExt};
 use serde_json::json;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
@@ -21,7 +21,14 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use wiremock::matchers::any;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use waav_gateway::{config::{DAGTimeoutsConfig, PluginConfig}, routes, state::AppState, ServerConfig, handlers, middleware::auth_middleware};
+use waav_gateway::{
+    ServerConfig,
+    config::{DAGTimeoutsConfig, PluginConfig},
+    handlers,
+    middleware::auth_middleware,
+    routes,
+    state::AppState,
+};
 
 mod common {
     use super::*;
@@ -83,6 +90,9 @@ mod common {
             rate_limit_burst_size: 100,
             max_websocket_connections: None,
             max_connections_per_ip: 500,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         }
@@ -90,14 +100,19 @@ mod common {
 
     fn create_combined_router(state: Arc<AppState>) -> Router {
         // WebSocket and realtime routes need auth middleware to inject Auth extension
-        let ws_routes = routes::ws::create_ws_router()
-            .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        let ws_routes = routes::ws::create_ws_router().layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
-        let realtime_routes = routes::realtime::create_realtime_router()
-            .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        let realtime_routes = routes::realtime::create_realtime_router().layer(
+            middleware::from_fn_with_state(state.clone(), auth_middleware),
+        );
 
-        let api_routes = routes::api::create_api_router()
-            .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        let api_routes = routes::api::create_api_router().layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
         Router::new()
             .route("/", axum::routing::get(handlers::api::health_check))
@@ -316,8 +331,7 @@ async fn test_connection_flood_and_close() {
     for _ in 0..50 {
         let url = ws_url.clone();
         handles.push(tokio::spawn(async move {
-            if let Ok(Ok((mut ws, _))) =
-                timeout(Duration::from_secs(5), connect_async(&url)).await
+            if let Ok(Ok((mut ws, _))) = timeout(Duration::from_secs(5), connect_async(&url)).await
             {
                 // Immediately close
                 let _ = ws.close(None).await;
@@ -472,7 +486,9 @@ async fn test_out_of_order_messages() {
 
             // Send speak before ready
             let _ = write
-                .send(common::text_message(&json!({"type": "speak", "text": "Hello"}).to_string()))
+                .send(common::text_message(
+                    &json!({"type": "speak", "text": "Hello"}).to_string(),
+                ))
                 .await;
 
             // Now send config
@@ -533,7 +549,10 @@ async fn test_multiple_config_changes() {
                 "stt_config": {"provider": "deepgram"},
                 "tts_config": {"provider": "elevenlabs"}
             });
-            write.send(common::text_message(&config.to_string())).await.ok();
+            write
+                .send(common::text_message(&config.to_string()))
+                .await
+                .ok();
 
             // Wait for ready
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -544,12 +563,18 @@ async fn test_multiple_config_changes() {
                     "type": "config",
                     "stt_config": {"provider": "deepgram"}
                 });
-                write.send(common::text_message(&new_config.to_string())).await.ok();
+                write
+                    .send(common::text_message(&new_config.to_string()))
+                    .await
+                    .ok();
             }
 
             // Send audio during config changes
             for _ in 0..5 {
-                write.send(common::binary_message(vec![0u8; 1600])).await.ok();
+                write
+                    .send(common::binary_message(vec![0u8; 1600]))
+                    .await
+                    .ok();
             }
 
             println!("Completed multiple config changes test");

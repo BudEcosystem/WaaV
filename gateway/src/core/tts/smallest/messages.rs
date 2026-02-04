@@ -218,9 +218,7 @@ impl SmallestTtsResponse {
 
     /// Get the error message.
     pub fn error_message(&self) -> Option<String> {
-        self.error
-            .clone()
-            .or_else(|| self.message.clone())
+        self.error.clone().or_else(|| self.message.clone())
     }
 }
 
@@ -438,8 +436,7 @@ mod tests {
 
     #[test]
     fn test_ws_request_serialization() {
-        let request = SmallestWsRequest::new("Test", "emily")
-            .with_continue(true);
+        let request = SmallestWsRequest::new("Test", "emily").with_continue(true);
 
         let json = serde_json::to_string(&request).unwrap();
 

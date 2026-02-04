@@ -83,7 +83,10 @@ impl HuaweiCloudRegion {
 
     /// Get the IAM endpoint for this region.
     pub fn iam_endpoint(&self) -> String {
-        format!("https://iam.{}.myhuaweicloud.com/v3/auth/tokens", self.code())
+        format!(
+            "https://iam.{}.myhuaweicloud.com/v3/auth/tokens",
+            self.code()
+        )
     }
 
     /// Parse region from string.
@@ -579,16 +582,44 @@ impl HuaweiCloudTtsConfig {
     pub fn supported_voices() -> Vec<(&'static str, &'static str, &'static str)> {
         vec![
             // Standard voices (name, property, type)
-            ("小琪 (Female, Standard)", "chinese_xiaoqi_common", "standard"),
+            (
+                "小琪 (Female, Standard)",
+                "chinese_xiaoqi_common",
+                "standard",
+            ),
             ("小雯 (Female, Soft)", "chinese_xiaowen_common", "standard"),
-            ("小燕 (Female, Gentle)", "chinese_xiaoyan_common", "standard"),
-            ("小倩 (Female, Mature)", "chinese_xiaoqian_common", "standard"),
-            ("小婧 (Female, Lively)", "chinese_xiaojing_common", "standard"),
+            (
+                "小燕 (Female, Gentle)",
+                "chinese_xiaoyan_common",
+                "standard",
+            ),
+            (
+                "小倩 (Female, Mature)",
+                "chinese_xiaoqian_common",
+                "standard",
+            ),
+            (
+                "小婧 (Female, Lively)",
+                "chinese_xiaojing_common",
+                "standard",
+            ),
             ("小宇 (Male, Standard)", "chinese_xiaoyu_common", "standard"),
-            ("小宋 (Male, Passionate)", "chinese_xiaosong_common", "standard"),
-            ("小王 (Child, Standard)", "chinese_xiaowang_common", "standard"),
+            (
+                "小宋 (Male, Passionate)",
+                "chinese_xiaosong_common",
+                "standard",
+            ),
+            (
+                "小王 (Child, Standard)",
+                "chinese_xiaowang_common",
+                "standard",
+            ),
             ("小呆 (Child, Cute)", "chinese_xiaodai_common", "standard"),
-            ("Cameal (Female, English)", "chinese_cameal_common", "standard"),
+            (
+                "Cameal (Female, English)",
+                "chinese_cameal_common",
+                "standard",
+            ),
             // Premium voices
             (
                 "华小夏 (Female, Sales)",
@@ -600,7 +631,11 @@ impl HuaweiCloudTtsConfig {
                 "chinese_huaxiaowei_common",
                 "premium",
             ),
-            ("华晓刚 (Male, News)", "chinese_huaxiaogang_common", "premium"),
+            (
+                "华晓刚 (Male, News)",
+                "chinese_huaxiaogang_common",
+                "premium",
+            ),
         ]
     }
 
@@ -718,7 +753,7 @@ impl HuaweiTtsResponse {
 
     /// Get audio data if present (base64-decoded).
     pub fn get_audio_data(&self) -> Option<Vec<u8>> {
-        use base64::{engine::general_purpose::STANDARD, Engine};
+        use base64::{Engine, engine::general_purpose::STANDARD};
 
         self.result
             .as_ref()
@@ -1191,9 +1226,11 @@ mod tests {
     fn test_supported_voices() {
         let voices = HuaweiCloudTtsConfig::supported_voices();
         assert!(!voices.is_empty());
-        assert!(voices
-            .iter()
-            .any(|(_, prop, _)| *prop == "chinese_xiaoyan_common"));
+        assert!(
+            voices
+                .iter()
+                .any(|(_, prop, _)| *prop == "chinese_xiaoyan_common")
+        );
     }
 
     #[test]

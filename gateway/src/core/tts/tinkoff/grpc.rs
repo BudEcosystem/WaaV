@@ -24,7 +24,10 @@ use tracing::info;
 
 use super::config::TinkoffTtsConfig;
 use super::messages::{SynthesizeSpeechRequest, SynthesizeSpeechResponse};
-use super::{GRPC_STREAMING_SYNTHESIZE_PATH, GRPC_SYNTHESIZE_PATH, JWT_EXPIRATION_SECS, TINKOFF_GRPC_ENDPOINT, TTS_SCOPE};
+use super::{
+    GRPC_STREAMING_SYNTHESIZE_PATH, GRPC_SYNTHESIZE_PATH, JWT_EXPIRATION_SECS,
+    TINKOFF_GRPC_ENDPOINT, TTS_SCOPE,
+};
 use crate::core::tts::base::TTSError;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -53,7 +56,11 @@ pub async fn create_tinkoff_tts_channel(config: &TinkoffTtsConfig) -> Result<Cha
 /// Tinkoff uses JWT with HMAC-SHA256 signing. The token structure:
 /// - Header: {"alg": "HS256", "typ": "JWT", "kid": "<api_key>"}
 /// - Payload: {"iss": "test_issuer", "sub": "test_user", "aud": "<scope>", "exp": <timestamp>}
-pub fn generate_jwt_token(api_key: &str, secret_key: &str, scope: &str) -> Result<String, TTSError> {
+pub fn generate_jwt_token(
+    api_key: &str,
+    secret_key: &str,
+    scope: &str,
+) -> Result<String, TTSError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| TTSError::InternalError(format!("System time error: {}", e)))?;
@@ -101,9 +108,9 @@ pub fn create_tinkoff_tts_metadata(
     let auth_value = format!("Bearer {}", token);
     metadata.insert(
         "authorization",
-        auth_value
-            .parse()
-            .map_err(|_| TTSError::InvalidConfiguration("Invalid authorization header".to_string()))?,
+        auth_value.parse().map_err(|_| {
+            TTSError::InvalidConfiguration("Invalid authorization header".to_string())
+        })?,
     );
 
     Ok(metadata)
@@ -158,10 +165,7 @@ impl TinkoffTtsGrpcClient {
 }
 
 /// Perform the Synthesize unary gRPC call
-async fn do_synthesize(
-    channel: Channel,
-    request: Request<Vec<u8>>,
-) -> Result<Bytes, TTSError> {
+async fn do_synthesize(channel: Channel, request: Request<Vec<u8>>) -> Result<Bytes, TTSError> {
     use tonic::codegen::http::uri::PathAndQuery;
 
     let mut grpc = tonic::client::Grpc::new(channel);
@@ -360,16 +364,12 @@ mod tests {
         assert_eq!(parts.len(), 3);
 
         // Verify header contains api_key
-        let header_json = String::from_utf8(
-            URL_SAFE_NO_PAD.decode(parts[0]).unwrap()
-        ).unwrap();
+        let header_json = String::from_utf8(URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
         assert!(header_json.contains("test-api-key"));
         assert!(header_json.contains("HS256"));
 
         // Verify payload contains scope
-        let payload_json = String::from_utf8(
-            URL_SAFE_NO_PAD.decode(parts[1]).unwrap()
-        ).unwrap();
+        let payload_json = String::from_utf8(URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
         assert!(payload_json.contains("tinkoff.cloud.tts"));
     }
 
@@ -382,9 +382,7 @@ mod tests {
         let token = generate_jwt_token(api_key, secret_key, scope).unwrap();
         let parts: Vec<&str> = token.split('.').collect();
 
-        let payload_json = String::from_utf8(
-            URL_SAFE_NO_PAD.decode(parts[1]).unwrap()
-        ).unwrap();
+        let payload_json = String::from_utf8(URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
         let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
 
         let exp = payload["exp"].as_u64().unwrap();
@@ -401,12 +399,30 @@ mod tests {
     #[test]
     fn test_tinkoff_tts_grpc_error_from_code() {
         assert_eq!(TinkoffTtsGrpcError::from_code(0), TinkoffTtsGrpcError::Ok);
-        assert_eq!(TinkoffTtsGrpcError::from_code(1), TinkoffTtsGrpcError::Cancelled);
-        assert_eq!(TinkoffTtsGrpcError::from_code(7), TinkoffTtsGrpcError::PermissionDenied);
-        assert_eq!(TinkoffTtsGrpcError::from_code(13), TinkoffTtsGrpcError::Internal);
-        assert_eq!(TinkoffTtsGrpcError::from_code(14), TinkoffTtsGrpcError::Unavailable);
-        assert_eq!(TinkoffTtsGrpcError::from_code(16), TinkoffTtsGrpcError::Unauthenticated);
-        assert_eq!(TinkoffTtsGrpcError::from_code(99), TinkoffTtsGrpcError::Unknown(99));
+        assert_eq!(
+            TinkoffTtsGrpcError::from_code(1),
+            TinkoffTtsGrpcError::Cancelled
+        );
+        assert_eq!(
+            TinkoffTtsGrpcError::from_code(7),
+            TinkoffTtsGrpcError::PermissionDenied
+        );
+        assert_eq!(
+            TinkoffTtsGrpcError::from_code(13),
+            TinkoffTtsGrpcError::Internal
+        );
+        assert_eq!(
+            TinkoffTtsGrpcError::from_code(14),
+            TinkoffTtsGrpcError::Unavailable
+        );
+        assert_eq!(
+            TinkoffTtsGrpcError::from_code(16),
+            TinkoffTtsGrpcError::Unauthenticated
+        );
+        assert_eq!(
+            TinkoffTtsGrpcError::from_code(99),
+            TinkoffTtsGrpcError::Unknown(99)
+        );
     }
 
     #[test]

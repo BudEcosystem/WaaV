@@ -379,9 +379,8 @@ impl RevAISTTConfig {
     /// Build the full WebSocket URL with all query parameters
     pub fn build_websocket_url(&self) -> String {
         // URL encode helper
-        let encode = |s: &str| -> String {
-            form_urlencoded::byte_serialize(s.as_bytes()).collect()
-        };
+        let encode =
+            |s: &str| -> String { form_urlencoded::byte_serialize(s.as_bytes()).collect() };
 
         let mut url = format!(
             "{}?access_token={}&content_type={}",
@@ -443,8 +442,8 @@ impl RevAISTTConfig {
 
     /// Create from base STTConfig
     pub fn from_base(config: &STTConfig) -> Result<Self, STTError> {
-        let sample_format = RevAISampleFormat::from_str(&config.encoding)
-            .unwrap_or(RevAISampleFormat::S16LE);
+        let sample_format =
+            RevAISampleFormat::from_str(&config.encoding).unwrap_or(RevAISampleFormat::S16LE);
 
         let revai_config = Self {
             api_key: config.api_key.clone(),
@@ -524,10 +523,7 @@ mod tests {
     #[test]
     fn test_audio_layout_as_str() {
         assert_eq!(RevAIAudioLayout::Interleaved.as_str(), "interleaved");
-        assert_eq!(
-            RevAIAudioLayout::NonInterleaved.as_str(),
-            "non-interleaved"
-        );
+        assert_eq!(RevAIAudioLayout::NonInterleaved.as_str(), "non-interleaved");
     }
 
     #[test]

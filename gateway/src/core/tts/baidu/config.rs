@@ -370,7 +370,10 @@ fn default_volume() -> u8 {
 }
 
 fn default_cuid() -> String {
-    format!("waav_gateway_{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string())
+    format!(
+        "waav_gateway_{}",
+        uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string()
+    )
 }
 
 fn default_use_https() -> bool {
@@ -642,7 +645,10 @@ mod tests {
 
     #[test]
     fn test_voice_category() {
-        assert_eq!(BaiduTtsVoice::DuXiaomei.category(), BaiduVoiceCategory::Basic);
+        assert_eq!(
+            BaiduTtsVoice::DuXiaomei.category(),
+            BaiduVoiceCategory::Basic
+        );
         assert_eq!(
             BaiduTtsVoice::Custom(5003).category(),
             BaiduVoiceCategory::Premium

@@ -369,9 +369,7 @@ impl BaiduSttConfig {
     pub fn get_oauth_url(&self) -> String {
         format!(
             "{}?grant_type=client_credentials&client_id={}&client_secret={}",
-            BAIDU_OAUTH_URL,
-            self.api_key,
-            self.secret_key
+            BAIDU_OAUTH_URL, self.api_key, self.secret_key
         )
     }
 
@@ -391,7 +389,8 @@ impl BaiduSttConfig {
 
     /// Calculate the recommended chunk size for WebSocket streaming.
     pub fn get_chunk_size(&self) -> usize {
-        self.sample_rate.chunk_size_for_duration(RECOMMENDED_CHUNK_DURATION_MS)
+        self.sample_rate
+            .chunk_size_for_duration(RECOMMENDED_CHUNK_DURATION_MS)
     }
 
     /// Check if the cached token is valid.
@@ -417,12 +416,18 @@ impl BaiduSttConfig {
     /// Get list of supported models.
     pub fn supported_models() -> Vec<&'static str> {
         vec![
-            "1537", "mandarin",
-            "1536", "mandarin_no_punct",
-            "1737", "english",
-            "1637", "cantonese",
-            "1837", "sichuan",
-            "1936", "mandarin_far_field",
+            "1537",
+            "mandarin",
+            "1536",
+            "mandarin_no_punct",
+            "1737",
+            "english",
+            "1637",
+            "cantonese",
+            "1837",
+            "sichuan",
+            "1936",
+            "mandarin_far_field",
         ]
     }
 
@@ -444,10 +449,10 @@ impl BaiduSttConfig {
         };
 
         let model = BaiduSttModel::from_str(&config.model);
-        let audio_format = BaiduAudioFormat::from_str(&config.encoding)
-            .unwrap_or(BaiduAudioFormat::Pcm);
-        let sample_rate = BaiduSampleRate::from_u32(config.sample_rate)
-            .unwrap_or(BaiduSampleRate::Rate16000);
+        let audio_format =
+            BaiduAudioFormat::from_str(&config.encoding).unwrap_or(BaiduAudioFormat::Pcm);
+        let sample_rate =
+            BaiduSampleRate::from_u32(config.sample_rate).unwrap_or(BaiduSampleRate::Rate16000);
 
         let baidu_config = Self {
             api_key,
@@ -511,7 +516,10 @@ mod tests {
         assert_eq!(BaiduSttModel::from_str("zh"), BaiduSttModel::Mandarin);
         assert_eq!(BaiduSttModel::from_str("english"), BaiduSttModel::English);
         assert_eq!(BaiduSttModel::from_str("1737"), BaiduSttModel::English);
-        assert_eq!(BaiduSttModel::from_str("cantonese"), BaiduSttModel::Cantonese);
+        assert_eq!(
+            BaiduSttModel::from_str("cantonese"),
+            BaiduSttModel::Cantonese
+        );
         assert_eq!(BaiduSttModel::from_str("sichuan"), BaiduSttModel::Sichuan);
     }
 
@@ -533,10 +541,22 @@ mod tests {
 
     #[test]
     fn test_audio_format_parsing() {
-        assert_eq!(BaiduAudioFormat::from_str("pcm"), Some(BaiduAudioFormat::Pcm));
-        assert_eq!(BaiduAudioFormat::from_str("wav"), Some(BaiduAudioFormat::Wav));
-        assert_eq!(BaiduAudioFormat::from_str("amr"), Some(BaiduAudioFormat::Amr));
-        assert_eq!(BaiduAudioFormat::from_str("m4a"), Some(BaiduAudioFormat::M4a));
+        assert_eq!(
+            BaiduAudioFormat::from_str("pcm"),
+            Some(BaiduAudioFormat::Pcm)
+        );
+        assert_eq!(
+            BaiduAudioFormat::from_str("wav"),
+            Some(BaiduAudioFormat::Wav)
+        );
+        assert_eq!(
+            BaiduAudioFormat::from_str("amr"),
+            Some(BaiduAudioFormat::Amr)
+        );
+        assert_eq!(
+            BaiduAudioFormat::from_str("m4a"),
+            Some(BaiduAudioFormat::M4a)
+        );
         assert_eq!(BaiduAudioFormat::from_str("invalid"), None);
     }
 

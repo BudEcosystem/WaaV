@@ -33,10 +33,10 @@ use tracing::{debug, error, info, warn};
 use super::super::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
-use super::config::{BhashiniSttConfig, BHASHINI_CONFIG_URL};
+use super::config::{BHASHINI_CONFIG_URL, BhashiniSttConfig};
 use super::messages::{
-    BhashiniErrorResponse, PipelineComputeRequest, PipelineComputeResponse,
-    PipelineConfigRequest, PipelineConfigResponse, wav,
+    BhashiniErrorResponse, PipelineComputeRequest, PipelineComputeResponse, PipelineConfigRequest,
+    PipelineConfigResponse, wav,
 };
 
 /// Bhashini provider identifier.
@@ -147,7 +147,9 @@ impl BhashiniStt {
             .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
             .user_agent(USER_AGENT)
             .build()
-            .map_err(|e| STTError::ConnectionFailed(format!("Failed to create HTTP client: {}", e)))?;
+            .map_err(|e| {
+                STTError::ConnectionFailed(format!("Failed to create HTTP client: {}", e))
+            })?;
 
         Ok(Self {
             base_config: config,
@@ -187,7 +189,9 @@ impl BhashiniStt {
             .json(&request)
             .send()
             .await
-            .map_err(|e| STTError::NetworkError(format!("Pipeline config request failed: {}", e)))?;
+            .map_err(|e| {
+                STTError::NetworkError(format!("Pipeline config request failed: {}", e))
+            })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -216,9 +220,7 @@ impl BhashiniStt {
             .map(|s| s.to_string())
             .or_else(|| self.config.custom_callback_url.clone())
             .ok_or_else(|| {
-                STTError::ProviderError(
-                    "No callback URL in pipeline config response".to_string(),
-                )
+                STTError::ProviderError("No callback URL in pipeline config response".to_string())
             })?;
 
         // Extract inference API key
@@ -261,9 +263,9 @@ impl BhashiniStt {
     async fn send_audio_to_compute(&self) -> Result<(), STTError> {
         let pipeline_config = {
             let guard = self.pipeline_config.lock().await;
-            guard.clone().ok_or_else(|| {
-                STTError::ConnectionFailed("Pipeline not configured".to_string())
-            })?
+            guard
+                .clone()
+                .ok_or_else(|| STTError::ConnectionFailed("Pipeline not configured".to_string()))?
         };
 
         // Get and clear buffer
@@ -300,18 +302,24 @@ impl BhashiniStt {
             if attempt > 0 {
                 let delay = Duration::from_millis(BASE_RETRY_DELAY_MS * 2u64.pow(attempt - 1));
                 tokio::time::sleep(delay).await;
-                warn!("Retrying Bhashini compute request (attempt {})", attempt + 1);
+                warn!(
+                    "Retrying Bhashini compute request (attempt {})",
+                    attempt + 1
+                );
             }
 
-            match self.execute_compute_request(&pipeline_config, &request).await {
+            match self
+                .execute_compute_request(&pipeline_config, &request)
+                .await
+            {
                 Ok(response) => {
                     // Extract transcription result
                     if let Some(text) = response.asr_result() {
                         let result = STTResult::new(
                             text.to_string(),
-                            true,  // is_final
-                            true,  // is_speech_final
-                            0.95,  // confidence (Bhashini doesn't return confidence)
+                            true, // is_final
+                            true, // is_speech_final
+                            0.95, // confidence (Bhashini doesn't return confidence)
                         );
 
                         // Invoke callback
@@ -336,9 +344,8 @@ impl BhashiniStt {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            STTError::ProviderError("Max retries exceeded".to_string())
-        }))
+        Err(last_error
+            .unwrap_or_else(|| STTError::ProviderError("Max retries exceeded".to_string())))
     }
 
     /// Execute a single compute request.
@@ -350,7 +357,10 @@ impl BhashiniStt {
         let response = self
             .client
             .post(&pipeline_config.callback_url)
-            .header(&pipeline_config.auth_header_name, &pipeline_config.auth_header_value)
+            .header(
+                &pipeline_config.auth_header_name,
+                &pipeline_config.auth_header_value,
+            )
             .header("Content-Type", "application/json")
             .json(request)
             .send()

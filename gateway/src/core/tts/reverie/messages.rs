@@ -237,10 +237,7 @@ mod tests {
 
     #[test]
     fn test_request_with_texts() {
-        let request = ReverieTtsRequest::with_texts(vec![
-            "Hello".to_string(),
-            "World".to_string(),
-        ]);
+        let request = ReverieTtsRequest::with_texts(vec!["Hello".to_string(), "World".to_string()]);
 
         assert_eq!(request.text.as_ref().unwrap().len(), 2);
     }
@@ -364,7 +361,10 @@ mod tests {
             message: Some("Additional details".to_string()),
         };
 
-        assert_eq!(error.display_message(), "Error occurred: Additional details");
+        assert_eq!(
+            error.display_message(),
+            "Error occurred: Additional details"
+        );
     }
 
     #[test]

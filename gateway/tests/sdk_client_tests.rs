@@ -4,21 +4,26 @@
 //! These tests verify the gateway works correctly from a client's perspective.
 
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use axum::{body::Body, http::Request, Router};
+use axum::{Router, body::Body, http::Request};
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tower::util::ServiceExt;
 
-use waav_gateway::{config::{DAGTimeoutsConfig, PluginConfig}, routes, state::AppState, ServerConfig};
+use waav_gateway::{
+    ServerConfig,
+    config::{DAGTimeoutsConfig, PluginConfig},
+    routes,
+    state::AppState,
+};
 
 // =============================================================================
 // SDK Client Types
@@ -144,6 +149,9 @@ fn create_test_config(port: u16) -> ServerConfig {
         rate_limit_burst_size: 100,
         max_websocket_connections: None,
         max_connections_per_ip: 1000,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     }

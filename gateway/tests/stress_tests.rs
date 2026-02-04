@@ -15,15 +15,22 @@ use futures::future::join_all;
 use futures::{SinkExt, StreamExt};
 use serde_json::json;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use waav_gateway::{config::{DAGTimeoutsConfig, PluginConfig}, routes, state::AppState, ServerConfig, handlers, middleware::auth_middleware};
+use waav_gateway::{
+    ServerConfig,
+    config::{DAGTimeoutsConfig, PluginConfig},
+    handlers,
+    middleware::auth_middleware,
+    routes,
+    state::AppState,
+};
 
 mod common {
     use super::*;
@@ -85,6 +92,9 @@ mod common {
             rate_limit_burst_size: 100,
             max_websocket_connections: Some(1000),
             max_connections_per_ip: 500,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         }
@@ -92,14 +102,19 @@ mod common {
 
     fn create_combined_router(state: Arc<AppState>) -> Router {
         // WebSocket and realtime routes need auth middleware to inject Auth extension
-        let ws_routes = routes::ws::create_ws_router()
-            .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        let ws_routes = routes::ws::create_ws_router().layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
-        let realtime_routes = routes::realtime::create_realtime_router()
-            .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        let realtime_routes = routes::realtime::create_realtime_router().layer(
+            middleware::from_fn_with_state(state.clone(), auth_middleware),
+        );
 
-        let api_routes = routes::api::create_api_router()
-            .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        let api_routes = routes::api::create_api_router().layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
         Router::new()
             .route("/", axum::routing::get(handlers::api::health_check))
@@ -367,9 +382,7 @@ async fn test_large_binary_websocket_message() {
             // Wait for ready
             let mut ready_received = false;
             for _ in 0..10 {
-                if let Ok(Some(Ok(msg))) =
-                    timeout(Duration::from_millis(500), read.next()).await
-                {
+                if let Ok(Some(Ok(msg))) = timeout(Duration::from_millis(500), read.next()).await {
                     if let Message::Text(text) = msg {
                         let text_str: &str = &text;
                         if text_str.contains("ready") {
@@ -389,10 +402,7 @@ async fn test_large_binary_websocket_message() {
                         println!("Large binary message sent successfully");
                     }
                     Err(e) => {
-                        println!(
-                            "Large binary message rejected (acceptable): {}",
-                            e
-                        );
+                        println!("Large binary message rejected (acceptable): {}", e);
                     }
                 }
             }
@@ -504,9 +514,7 @@ async fn test_websocket_message_throughput() {
             // Wait for ready
             let mut ready_received = false;
             for _ in 0..10 {
-                if let Ok(Some(Ok(msg))) =
-                    timeout(Duration::from_millis(500), read.next()).await
-                {
+                if let Ok(Some(Ok(msg))) = timeout(Duration::from_millis(500), read.next()).await {
                     if let Message::Text(text) = msg {
                         let text_str: &str = &text;
                         if text_str.contains("ready") {
@@ -525,7 +533,11 @@ async fn test_websocket_message_throughput() {
                 // Send audio chunks as fast as possible
                 while start.elapsed() < duration {
                     let audio_chunk = vec![0u8; 3200]; // 100ms at 16kHz
-                    if write.send(common::binary_message(audio_chunk)).await.is_ok() {
+                    if write
+                        .send(common::binary_message(audio_chunk))
+                        .await
+                        .is_ok()
+                    {
                         messages_sent += 1;
                     } else {
                         break;
@@ -587,10 +599,7 @@ async fn test_memory_stability_under_load() {
         if i > 0 && i % 100 == 0 {
             let elapsed = start.elapsed();
             let avg_latency = elapsed.as_millis() as f64 / i as f64;
-            println!(
-                "After {} requests: avg latency {:.2}ms",
-                i, avg_latency
-            );
+            println!("After {} requests: avg latency {:.2}ms", i, avg_latency);
 
             // Average latency should stay under 100ms
             assert!(
@@ -629,9 +638,7 @@ async fn test_connection_exhaustion_recovery() {
     let mut connections = Vec::new();
 
     for _ in 0..num_connections {
-        if let Ok(Ok((ws, _))) =
-            timeout(Duration::from_secs(5), connect_async(&ws_url)).await
-        {
+        if let Ok(Ok((ws, _))) = timeout(Duration::from_secs(5), connect_async(&ws_url)).await {
             connections.push(ws);
         }
     }
@@ -774,9 +781,7 @@ async fn test_malformed_websocket_messages() {
     }
 
     // Server should still be responsive for new connections
-    if let Ok(Ok(_)) =
-        timeout(Duration::from_secs(5), connect_async(&ws_url)).await
-    {
+    if let Ok(Ok(_)) = timeout(Duration::from_secs(5), connect_async(&ws_url)).await {
         println!("Server still accepts new connections after malformed messages");
     } else {
         panic!("Server not accepting new connections after malformed messages");

@@ -41,7 +41,7 @@ pub mod messages;
 
 // Re-export public types
 pub use client::RevAISTT;
-pub use config::{RevAISampleFormat, RevAISTTConfig, RevAITranscriber};
+pub use config::{RevAISTTConfig, RevAISampleFormat, RevAITranscriber};
 pub use messages::{
     ConnectedMessage, FinalTranscript, PartialTranscript, RevAICloseCode, ServerMessage,
     TranscriptElement,

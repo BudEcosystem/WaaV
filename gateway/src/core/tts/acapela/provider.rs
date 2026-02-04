@@ -4,7 +4,7 @@
 //! using HTTP streaming for real-time audio synthesis.
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -114,7 +114,10 @@ impl TTSRequestBuilder for AcapelaRequestBuilder {
         );
 
         // Build and return the request with query parameters
-        client.get(self.command_url()).headers(headers).query(&params)
+        client
+            .get(self.command_url())
+            .headers(headers)
+            .query(&params)
     }
 
     fn get_config(&self) -> &TTSConfig {
@@ -330,9 +333,10 @@ impl AcapelaTts {
             )));
         }
 
-        let account_info: AcapelaAccountInfo = response.json().await.map_err(|e| {
-            TTSError::InternalError(format!("Failed to parse account info: {}", e))
-        })?;
+        let account_info: AcapelaAccountInfo = response
+            .json()
+            .await
+            .map_err(|e| TTSError::InternalError(format!("Failed to parse account info: {}", e)))?;
 
         Ok(account_info)
     }
@@ -475,7 +479,11 @@ impl BaseTTS for AcapelaTts {
         };
 
         // Execute request through generic provider
-        match self.provider.generic_speak(request_builder, text, flush).await {
+        match self
+            .provider
+            .generic_speak(request_builder, text, flush)
+            .await
+        {
             Ok(()) => Ok(()),
             Err(TTSError::AuthenticationFailed(_)) => {
                 // Token might have expired, retry with fresh token
@@ -529,10 +537,7 @@ mod tests {
 
         let tts = tts.unwrap();
         assert_eq!(tts.acapela_config().voice_id, "alice");
-        assert_eq!(
-            tts.acapela_config().credentials.email,
-            "user@example.com"
-        );
+        assert_eq!(tts.acapela_config().credentials.email, "user@example.com");
         assert!(!tts.is_ready());
     }
 
@@ -585,8 +590,7 @@ mod tests {
         };
 
         let acapela_config = AcapelaTtsConfig::from_base(&config).unwrap();
-        let builder =
-            AcapelaRequestBuilder::new(acapela_config, config, "test-token".to_string());
+        let builder = AcapelaRequestBuilder::new(acapela_config, config, "test-token".to_string());
 
         // Test that command URL is correct
         assert!(builder.command_url().contains("acapela-cloud.com"));
@@ -604,11 +608,13 @@ mod tests {
         };
 
         let acapela_config = AcapelaTtsConfig::from_base(&config).unwrap();
-        let builder =
-            AcapelaRequestBuilder::new(acapela_config, config, "test-token".to_string());
+        let builder = AcapelaRequestBuilder::new(acapela_config, config, "test-token".to_string());
 
         assert_eq!(builder.acapela_config().voice_id, "lily");
-        assert_eq!(builder.acapela_config().audio_format, AcapelaAudioFormat::Ogg);
+        assert_eq!(
+            builder.acapela_config().audio_format,
+            AcapelaAudioFormat::Ogg
+        );
         assert_eq!(builder.acapela_config().sample_rate, 24000);
     }
 
@@ -619,18 +625,15 @@ mod tests {
         let config = TTSConfig {
             api_key: "user@example.com:password".to_string(),
             voice_id: Some("alice".to_string()),
-            pronunciations: vec![
-                Pronunciation {
-                    word: "Acapela".to_string(),
-                    pronunciation: "ah-kah-peh-lah".to_string(),
-                },
-            ],
+            pronunciations: vec![Pronunciation {
+                word: "Acapela".to_string(),
+                pronunciation: "ah-kah-peh-lah".to_string(),
+            }],
             ..Default::default()
         };
 
         let acapela_config = AcapelaTtsConfig::from_base(&config).unwrap();
-        let builder =
-            AcapelaRequestBuilder::new(acapela_config, config, "test-token".to_string());
+        let builder = AcapelaRequestBuilder::new(acapela_config, config, "test-token".to_string());
 
         assert!(builder.get_pronunciation_replacer().is_some());
     }

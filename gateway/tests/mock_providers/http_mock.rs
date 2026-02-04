@@ -4,11 +4,11 @@
 
 use super::{ChaosConfig, LatencyProfile, MockStats};
 use axum::{
+    Router,
     body::Body,
     extract::State,
     http::{Response, StatusCode},
     routing::post,
-    Router,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -133,13 +133,19 @@ async fn stats_handler(State(state): State<Arc<HttpMockState>>) -> Response<Body
 }
 
 /// Start HTTP mock server
-pub async fn start_http_mock(port: u16, state: HttpMockState) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn start_http_mock(
+    port: u16,
+    state: HttpMockState,
+) -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(state);
 
     let app = Router::new()
         // ElevenLabs-like endpoints (use {param} syntax for Axum 0.7+)
         .route("/v1/text-to-speech/{voice_id}", post(tts_handler.clone()))
-        .route("/v1/text-to-speech/{voice_id}/stream", post(tts_handler.clone()))
+        .route(
+            "/v1/text-to-speech/{voice_id}/stream",
+            post(tts_handler.clone()),
+        )
         .route("/v1/voices", axum::routing::get(voices_handler.clone()))
         // OpenAI-like endpoints
         .route("/v1/audio/speech", post(tts_handler.clone()))

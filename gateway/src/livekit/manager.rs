@@ -100,7 +100,9 @@ impl LiveKitManager {
     where
         F: Fn(Vec<u8>) + Send + Sync + 'static,
     {
-        warn!("set_audio_callback is deprecated. Audio flows through LiveKitClient event handlers via audio_sender channel.");
+        warn!(
+            "set_audio_callback is deprecated. Audio flows through LiveKitClient event handlers via audio_sender channel."
+        );
         Ok(())
     }
 
@@ -264,7 +266,9 @@ impl Drop for LiveKitManager {
         // We can't lock the mutex in drop (could deadlock), but we can try_lock
         if let Ok(client_guard) = self.client.try_lock() {
             if client_guard.is_some() {
-                warn!("LiveKitManager dropped with active client - call disconnect() explicitly for clean shutdown");
+                warn!(
+                    "LiveKitManager dropped with active client - call disconnect() explicitly for clean shutdown"
+                );
             }
         } else {
             // Mutex is locked, meaning client is being used elsewhere

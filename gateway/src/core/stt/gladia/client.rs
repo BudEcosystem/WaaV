@@ -4,8 +4,8 @@
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, trace, warn};
@@ -24,9 +24,8 @@ use super::messages::{
 // Type Aliases
 // =============================================================================
 
-type WsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
 
 // =============================================================================
@@ -121,14 +120,10 @@ impl GladiaSTT {
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(match status.as_u16() {
-                401 => STTError::AuthenticationFailed(format!(
-                    "Invalid API key: {}",
-                    error_text
-                )),
-                400 | 422 => STTError::ConfigurationError(format!(
-                    "Invalid request: {}",
-                    error_text
-                )),
+                401 => STTError::AuthenticationFailed(format!("Invalid API key: {}", error_text)),
+                400 | 422 => {
+                    STTError::ConfigurationError(format!("Invalid request: {}", error_text))
+                }
                 _ => STTError::ConnectionFailed(format!(
                     "Session init failed ({}): {}",
                     status, error_text
@@ -150,10 +145,7 @@ impl GladiaSTT {
     }
 
     /// Spawn the WebSocket message receiver task
-    fn spawn_receiver_task(
-        &self,
-        mut ws_stream: futures_util::stream::SplitStream<WsStream>,
-    ) {
+    fn spawn_receiver_task(&self, mut ws_stream: futures_util::stream::SplitStream<WsStream>) {
         let on_result = self.on_result.clone();
         let on_error = self.on_error.clone();
         let state = self.state.clone();
@@ -245,7 +237,7 @@ impl BaseSTT for GladiaSTT {
         }
 
         let gladia_config = GladiaSTTConfig::from_base(&config)?;
-        
+
         Ok(Self {
             gladia_config,
             base_config: Some(config),
@@ -282,9 +274,9 @@ impl BaseSTT for GladiaSTT {
 
         // Step 2: Connect to WebSocket
         debug!("Connecting to WebSocket: {}", init_response.url);
-        let (ws_stream, _) = connect_async(&init_response.url)
-            .await
-            .map_err(|e| STTError::ConnectionFailed(format!("WebSocket connection failed: {}", e)))?;
+        let (ws_stream, _) = connect_async(&init_response.url).await.map_err(|e| {
+            STTError::ConnectionFailed(format!("WebSocket connection failed: {}", e))
+        })?;
 
         // Split the stream
         let (sink, stream) = ws_stream.split();
@@ -299,10 +291,7 @@ impl BaseSTT for GladiaSTT {
         *self.state.write().await = STTConnectionState::Connected;
         self.is_ready.store(true, Ordering::SeqCst);
 
-        info!(
-            "Connected to Gladia STT (session: {})",
-            init_response.id
-        );
+        info!("Connected to Gladia STT (session: {})", init_response.id);
         Ok(())
     }
 
@@ -384,13 +373,13 @@ impl BaseSTT for GladiaSTT {
         let new_gladia_config = GladiaSTTConfig::from_base(&config)?;
         self.gladia_config = new_gladia_config;
         self.base_config = Some(config);
-        
+
         // If connected, we need to reconnect with the new config
         if self.is_ready() {
             self.disconnect().await?;
             self.connect().await?;
         }
-        
+
         Ok(())
     }
 

@@ -4,15 +4,20 @@
 //! These tests verify that the server can start correctly under various conditions.
 
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use axum::{body::Body, http::Request, Router};
+use axum::{Router, body::Body, http::Request};
 use tokio::time::timeout;
 use tower::util::ServiceExt;
 
-use waav_gateway::{config::{DAGTimeoutsConfig, PluginConfig, AuthApiSecret}, routes, state::AppState, ServerConfig};
+use waav_gateway::{
+    ServerConfig,
+    config::{AuthApiSecret, DAGTimeoutsConfig, PluginConfig},
+    routes,
+    state::AppState,
+};
 
 /// Helper function to create a minimal test configuration
 fn create_minimal_config(port: u16) -> ServerConfig {
@@ -65,6 +70,9 @@ fn create_minimal_config(port: u16) -> ServerConfig {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+        ws_processing_timeout_secs: 10,
+        realtime_processing_timeout_secs: 30,
+        sip_max_participants: 3,
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     }
@@ -203,10 +211,7 @@ async fn test_cors_configurations() {
     let mut config = create_minimal_config(port);
     config.cors_allowed_origins = Some("*".to_string());
     let app_state = AppState::new(config).await;
-    assert_eq!(
-        app_state.config.cors_allowed_origins,
-        Some("*".to_string())
-    );
+    assert_eq!(app_state.config.cors_allowed_origins, Some("*".to_string()));
 
     // Test with specific origins
     let mut config2 = create_minimal_config(port + 1);
@@ -249,7 +254,10 @@ async fn test_auth_configurations() {
     // Test with auth enabled (but no service URL - will fail validation)
     let mut config2 = create_minimal_config(port + 1);
     config2.auth_required = true;
-    config2.auth_api_secrets = vec![AuthApiSecret { id: "test_id".to_string(), secret: "test_secret".to_string() }];
+    config2.auth_api_secrets = vec![AuthApiSecret {
+        id: "test_id".to_string(),
+        secret: "test_secret".to_string(),
+    }];
     let app_state2 = AppState::new(config2).await;
     assert!(app_state2.config.auth_required);
 }

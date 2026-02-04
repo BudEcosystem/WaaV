@@ -37,20 +37,17 @@ use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{
-        http::Request,
-        protocol::Message,
-    },
+    tungstenite::{http::Request, protocol::Message},
 };
 use tracing::{debug, error, info, warn};
 
-use crate::core::stt::base::{
-    BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
-};
 use super::config::{DashScopeSttConfig, TurnDetectionMode};
 use super::messages::{
-    QwenSessionUpdate, QwenAudioBufferAppend, QwenSessionFinish, QwenServerMessage,
-    ParaformerRunTask, ParaformerFinishTask, ParaformerResponse,
+    ParaformerFinishTask, ParaformerResponse, ParaformerRunTask, QwenAudioBufferAppend,
+    QwenServerMessage, QwenSessionFinish, QwenSessionUpdate,
+};
+use crate::core::stt::base::{
+    BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
 
 // =============================================================================
@@ -242,9 +239,8 @@ impl DashScopeStt {
             Ok(msg) => {
                 if msg.is_error() {
                     if let Some(err) = &msg.error {
-                        let _ = error_tx.try_send(STTError::AudioProcessingError(
-                            err.message.clone(),
-                        ));
+                        let _ =
+                            error_tx.try_send(STTError::AudioProcessingError(err.message.clone()));
                     }
                 } else if msg.is_transcription_completed() {
                     if let Some(transcript) = msg.get_transcript() {
@@ -273,9 +269,10 @@ impl DashScopeStt {
             Ok(msg) => {
                 if msg.is_task_failed() {
                     if let Some((code, message)) = msg.get_error() {
-                        let _ = error_tx.try_send(STTError::AudioProcessingError(
-                            format!("[{}] {}", code, message),
-                        ));
+                        let _ = error_tx.try_send(STTError::AudioProcessingError(format!(
+                            "[{}] {}",
+                            code, message
+                        )));
                     }
                 } else if msg.is_result_generated() {
                     if let Some(transcript) = msg.get_transcript() {
@@ -330,9 +327,7 @@ impl BaseSTT for DashScopeStt {
                 )));
             }
             Err(_) => {
-                return Err(STTError::ConnectionFailed(
-                    "Connection timeout".to_string(),
-                ));
+                return Err(STTError::ConnectionFailed("Connection timeout".to_string()));
             }
         };
 
@@ -357,14 +352,18 @@ impl BaseSTT for DashScopeStt {
             write
                 .send(Message::Text(session_update.into()))
                 .await
-                .map_err(|e| STTError::ConnectionFailed(format!("Failed to send session update: {}", e)))?;
+                .map_err(|e| {
+                    STTError::ConnectionFailed(format!("Failed to send session update: {}", e))
+                })?;
             None
         } else {
             let (run_task_json, task_id) = self.create_paraformer_run_task();
             write
                 .send(Message::Text(run_task_json.into()))
                 .await
-                .map_err(|e| STTError::ConnectionFailed(format!("Failed to send run-task: {}", e)))?;
+                .map_err(|e| {
+                    STTError::ConnectionFailed(format!("Failed to send run-task: {}", e))
+                })?;
             Some(task_id)
         };
 
@@ -403,9 +402,19 @@ impl BaseSTT for DashScopeStt {
 
                 // Send finish message
                 let finish_msg = if is_qwen {
-                    Message::Text(QwenSessionFinish::new().to_json().unwrap_or_default().into())
+                    Message::Text(
+                        QwenSessionFinish::new()
+                            .to_json()
+                            .unwrap_or_default()
+                            .into(),
+                    )
                 } else if let Some(tid) = &task_id_clone {
-                    Message::Text(ParaformerFinishTask::new(tid).to_json().unwrap_or_default().into())
+                    Message::Text(
+                        ParaformerFinishTask::new(tid)
+                            .to_json()
+                            .unwrap_or_default()
+                            .into(),
+                    )
                 } else {
                     return write;
                 };
@@ -419,9 +428,17 @@ impl BaseSTT for DashScopeStt {
                     match msg_result {
                         Ok(Message::Text(text)) => {
                             if is_qwen {
-                                Self::handle_qwen_response(&text, &result_tx_clone, &error_tx_clone);
+                                Self::handle_qwen_response(
+                                    &text,
+                                    &result_tx_clone,
+                                    &error_tx_clone,
+                                );
                             } else {
-                                Self::handle_paraformer_response(&text, &result_tx_clone, &error_tx_clone);
+                                Self::handle_paraformer_response(
+                                    &text,
+                                    &result_tx_clone,
+                                    &error_tx_clone,
+                                );
                             }
                         }
                         Ok(Message::Close(_)) => {
@@ -435,7 +452,8 @@ impl BaseSTT for DashScopeStt {
                         }
                         Err(e) => {
                             error!("WebSocket error: {}", e);
-                            let _ = error_tx_clone.try_send(STTError::ConnectionFailed(e.to_string()));
+                            let _ =
+                                error_tx_clone.try_send(STTError::ConnectionFailed(e.to_string()));
                             break;
                         }
                         _ => {}
@@ -538,10 +556,9 @@ impl BaseSTT for DashScopeStt {
         }
 
         if let Some(sender) = &self.ws_sender {
-            sender
-                .send(audio)
-                .await
-                .map_err(|_| STTError::ProviderError("Failed to send audio to channel".to_string()))?;
+            sender.send(audio).await.map_err(|_| {
+                STTError::ProviderError("Failed to send audio to channel".to_string())
+            })?;
         }
 
         Ok(())

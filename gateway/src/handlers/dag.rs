@@ -2,12 +2,7 @@
 //!
 //! Provides REST API endpoints for DAG template management and validation.
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 #[cfg(feature = "dag-routing")]
@@ -16,16 +11,11 @@ use tracing::{debug, warn};
 use crate::state::AppState;
 
 #[cfg(feature = "dag-routing")]
-use crate::dag::{
-    DAGDefinition, DAGCompiler,
-    global_templates,
-};
+use crate::dag::{DAGCompiler, DAGDefinition, global_templates};
 
 /// List available DAG templates
 #[cfg(feature = "dag-routing")]
-pub async fn list_templates(
-    State(_state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn list_templates(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
     let templates = global_templates();
     let template_names = templates.names();
     let template_list: Vec<TemplateInfo> = template_names
@@ -34,7 +24,10 @@ pub async fn list_templates(
             let template = templates.get(&name);
             TemplateInfo {
                 name: name.clone(),
-                version: template.as_ref().map(|t| t.version.clone()).unwrap_or_default(),
+                version: template
+                    .as_ref()
+                    .map(|t| t.version.clone())
+                    .unwrap_or_default(),
                 description: template.map(|t| t.name.clone()),
             }
         })
@@ -49,15 +42,13 @@ pub async fn list_templates(
 
 /// List available DAG templates (stub when feature disabled)
 #[cfg(not(feature = "dag-routing"))]
-pub async fn list_templates(
-    State(_state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn list_templates(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,
         Json(serde_json::json!({
             "error": "DAG routing is not enabled",
             "message": "Build with --features dag-routing to enable DAG support"
-        }))
+        })),
     )
 }
 
@@ -82,7 +73,7 @@ pub async fn validate_dag(
                     warnings: vec![],
                     node_count: 0,
                     edge_count: 0,
-                })
+                }),
             );
         }
     };
@@ -93,30 +84,26 @@ pub async fn validate_dag(
     // Compile (validates) the DAG
     let compiler = DAGCompiler::new();
     match compiler.compile(dag_def) {
-        Ok(_compiled) => {
-            (
-                StatusCode::OK,
-                Json(ValidateDAGResponse {
-                    valid: true,
-                    errors: vec![],
-                    warnings: vec![],
-                    node_count,
-                    edge_count,
-                })
-            )
-        }
-        Err(e) => {
-            (
-                StatusCode::OK,
-                Json(ValidateDAGResponse {
-                    valid: false,
-                    errors: vec![e.to_string()],
-                    warnings: vec![],
-                    node_count,
-                    edge_count,
-                })
-            )
-        }
+        Ok(_compiled) => (
+            StatusCode::OK,
+            Json(ValidateDAGResponse {
+                valid: true,
+                errors: vec![],
+                warnings: vec![],
+                node_count,
+                edge_count,
+            }),
+        ),
+        Err(e) => (
+            StatusCode::OK,
+            Json(ValidateDAGResponse {
+                valid: false,
+                errors: vec![e.to_string()],
+                warnings: vec![],
+                node_count,
+                edge_count,
+            }),
+        ),
     }
 }
 
@@ -131,7 +118,7 @@ pub async fn validate_dag(
         Json(serde_json::json!({
             "error": "DAG routing is not enabled",
             "message": "Build with --features dag-routing to enable DAG support"
-        }))
+        })),
     )
 }
 
@@ -144,24 +131,20 @@ pub async fn get_template(
     let templates = global_templates();
 
     match templates.get(&template_name) {
-        Some(template) => {
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "name": template_name,
-                    "template": template
-                }))
-            )
-        }
-        None => {
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": "Template not found",
-                    "name": template_name
-                }))
-            )
-        }
+        Some(template) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "name": template_name,
+                "template": template
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "Template not found",
+                "name": template_name
+            })),
+        ),
     }
 }
 
@@ -176,19 +159,21 @@ pub async fn get_template(
         Json(serde_json::json!({
             "error": "DAG routing is not enabled",
             "message": "Build with --features dag-routing to enable DAG support"
-        }))
+        })),
     )
 }
 
 // Request/Response types
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ListTemplatesResponse {
     pub templates: Vec<TemplateInfo>,
     pub count: usize,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct TemplateInfo {
     pub name: String,
     pub version: String,
@@ -196,11 +181,13 @@ pub struct TemplateInfo {
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ValidateDAGRequest {
     pub dag: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ValidateDAGResponse {
     pub valid: bool,
     pub errors: Vec<String>,

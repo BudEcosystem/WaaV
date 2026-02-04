@@ -16,15 +16,15 @@
 //! - Encoding: PCM 16-bit
 
 use super::config::{
-    chunk_text, NectecTtsConfig, NectecVoice, Vaja9Request, Vaja9Response, API_KEY_HEADER,
-    DEFAULT_SAMPLE_RATE, LIB_HEADER, LIB_VALUE, MAX_TEXT_LENGTH,
+    API_KEY_HEADER, DEFAULT_SAMPLE_RATE, LIB_HEADER, LIB_VALUE, MAX_TEXT_LENGTH, NectecTtsConfig,
+    NectecVoice, Vaja9Request, Vaja9Response, chunk_text,
 };
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
 };
 use reqwest::Client;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
@@ -151,9 +151,9 @@ impl NectecTts {
             return Err(TTSError::ProviderError(error_msg.to_string()));
         }
 
-        let audio_url = api_response.audio_url().ok_or_else(|| {
-            TTSError::ProviderError("No audio URL in response".to_string())
-        })?;
+        let audio_url = api_response
+            .audio_url()
+            .ok_or_else(|| TTSError::ProviderError("No audio URL in response".to_string()))?;
 
         debug!("NECTEC TTS: Got audio URL: {}", audio_url);
 
@@ -198,10 +198,7 @@ impl NectecTts {
             .map_err(|e| TTSError::ProviderError(format!("Failed to read audio data: {e}")))?
             .to_vec();
 
-        info!(
-            "NECTEC TTS: Downloaded {} bytes of audio",
-            audio_data.len()
-        );
+        info!("NECTEC TTS: Downloaded {} bytes of audio", audio_data.len());
 
         Ok(audio_data)
     }
@@ -232,8 +229,8 @@ impl Default for NectecTts {
 #[async_trait::async_trait]
 impl BaseTTS for NectecTts {
     fn new(config: TTSConfig) -> TTSResult<Self> {
-        let nectec_config = NectecTtsConfig::from_base(&config)
-            .map_err(|e| TTSError::InvalidConfiguration(e))?;
+        let nectec_config =
+            NectecTtsConfig::from_base(&config).map_err(|e| TTSError::InvalidConfiguration(e))?;
 
         let timeout_secs = nectec_config.request_timeout_secs;
         let http_client = Client::builder()
@@ -449,7 +446,10 @@ mod tests {
     }
 
     impl AudioCallback for MockAudioCallback {
-        fn on_audio(&self, _audio_data: AudioData) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        fn on_audio(
+            &self,
+            _audio_data: AudioData,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             self.audio_count.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {})
         }

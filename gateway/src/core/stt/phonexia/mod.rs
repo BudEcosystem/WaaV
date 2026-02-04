@@ -111,18 +111,18 @@ pub const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 60;
 /// List of commonly supported Phonexia languages
 pub const SUPPORTED_LANGUAGES: &[&str] = &[
     // Eastern European
-    "cs",    // Czech
-    "sk",    // Slovak
-    "pl",    // Polish
-    "hu",    // Hungarian
-    "ro",    // Romanian
-    "bg",    // Bulgarian
-    "sr",    // Serbian
-    "hr",    // Croatian
-    "sl",    // Slovenian
-    "uk",    // Ukrainian
-    "ru",    // Russian
-    "be",    // Belarusian
+    "cs", // Czech
+    "sk", // Slovak
+    "pl", // Polish
+    "hu", // Hungarian
+    "ro", // Romanian
+    "bg", // Bulgarian
+    "sr", // Serbian
+    "hr", // Croatian
+    "sl", // Slovenian
+    "uk", // Ukrainian
+    "ru", // Russian
+    "be", // Belarusian
     // Western European
     "en-US", // English (US)
     "en-GB", // English (UK)
@@ -137,17 +137,17 @@ pub const SUPPORTED_LANGUAGES: &[&str] = &[
     "no",    // Norwegian
     "fi",    // Finnish
     // Middle Eastern
-    "ar",    // Arabic
-    "tr",    // Turkish
-    "fa",    // Persian
-    "he",    // Hebrew
+    "ar", // Arabic
+    "tr", // Turkish
+    "fa", // Persian
+    "he", // Hebrew
     // Asian
-    "zh",    // Chinese (Mandarin)
-    "ja",    // Japanese
-    "ko",    // Korean
-    "th",    // Thai
-    "vi",    // Vietnamese
-    "id",    // Indonesian
+    "zh", // Chinese (Mandarin)
+    "ja", // Japanese
+    "ko", // Korean
+    "th", // Thai
+    "vi", // Vietnamese
+    "id", // Indonesian
 ];
 
 // =============================================================================

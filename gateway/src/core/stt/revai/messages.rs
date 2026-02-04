@@ -68,7 +68,9 @@ impl RevAICloseCode {
         match self {
             Self::Normal => "Normal closure",
             Self::Unauthorized => "Invalid or missing access token",
-            Self::BadRequest => "Invalid content_type, metadata too long, or invalid custom vocabulary",
+            Self::BadRequest => {
+                "Invalid content_type, metadata too long, or invalid custom vocabulary"
+            }
             Self::InsufficientCredits => "Insufficient credits (requires 10 minute hold)",
             Self::ServerShuttingDown => "Server shutting down, retry connection",
             Self::NoInstanceAvailable => "No streaming instances available, retry connection",
@@ -199,10 +201,7 @@ impl PartialTranscript {
             return 0.0;
         }
 
-        let sum: f64 = text_elements
-            .iter()
-            .filter_map(|e| e.confidence)
-            .sum();
+        let sum: f64 = text_elements.iter().filter_map(|e| e.confidence).sum();
 
         sum / text_elements.len() as f64
     }
@@ -262,10 +261,7 @@ impl FinalTranscript {
             return 0.0;
         }
 
-        let sum: f64 = text_elements
-            .iter()
-            .filter_map(|e| e.confidence)
-            .sum();
+        let sum: f64 = text_elements.iter().filter_map(|e| e.confidence).sum();
 
         sum / text_elements.len() as f64
     }
@@ -364,7 +360,10 @@ mod tests {
     #[test]
     fn test_close_code_from_code() {
         assert_eq!(RevAICloseCode::from_code(1000), RevAICloseCode::Normal);
-        assert_eq!(RevAICloseCode::from_code(4001), RevAICloseCode::Unauthorized);
+        assert_eq!(
+            RevAICloseCode::from_code(4001),
+            RevAICloseCode::Unauthorized
+        );
         assert_eq!(RevAICloseCode::from_code(4002), RevAICloseCode::BadRequest);
         assert_eq!(
             RevAICloseCode::from_code(4003),
@@ -582,7 +581,11 @@ mod tests {
     fn test_close_code_description() {
         assert!(!RevAICloseCode::Normal.description().is_empty());
         assert!(RevAICloseCode::Unauthorized.description().contains("token"));
-        assert!(RevAICloseCode::InsufficientCredits.description().contains("credit"));
+        assert!(
+            RevAICloseCode::InsufficientCredits
+                .description()
+                .contains("credit")
+        );
     }
 
     #[test]

@@ -18,10 +18,10 @@
 //! let dag = global_templates().get("voice-bot")?;
 //! ```
 
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use dashmap::DashMap;
 use tracing::{debug, info, warn};
 
 use super::definition::DAGDefinition;
@@ -269,24 +269,22 @@ impl DAGTemplateRegistry {
 
     /// Load a template from a YAML string
     pub fn load_from_yaml(&self, name: &str, yaml: &str) -> Result<(), TemplateError> {
-        let template: DAGDefinition = serde_yaml::from_str(yaml).map_err(|e| {
-            TemplateError::ParseError {
+        let template: DAGDefinition =
+            serde_yaml::from_str(yaml).map_err(|e| TemplateError::ParseError {
                 name: name.to_string(),
                 error: e.to_string(),
-            }
-        })?;
+            })?;
         self.register(name.to_string(), template);
         Ok(())
     }
 
     /// Load a template from a JSON string
     pub fn load_from_json(&self, name: &str, json: &str) -> Result<(), TemplateError> {
-        let template: DAGDefinition = serde_json::from_str(json).map_err(|e| {
-            TemplateError::ParseError {
+        let template: DAGDefinition =
+            serde_json::from_str(json).map_err(|e| TemplateError::ParseError {
                 name: name.to_string(),
                 error: e.to_string(),
-            }
-        })?;
+            })?;
         self.register(name.to_string(), template);
         Ok(())
     }

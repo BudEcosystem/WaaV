@@ -5,8 +5,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info};
@@ -20,9 +20,8 @@ use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
 
-type WsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Speechmatics STT WebSocket client
 pub struct SpeechmaticsSTT {
@@ -94,7 +93,8 @@ impl SpeechmaticsSTT {
                     Some(Ok(Message::Text(text))) => {
                         // Parse and handle the message inline
                         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                            let message_type = value.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                            let message_type =
+                                value.get("message").and_then(|v| v.as_str()).unwrap_or("");
 
                             match message_type {
                                 "RecognitionStarted" => {
@@ -102,10 +102,14 @@ impl SpeechmaticsSTT {
                                     is_session_started.store(true, Ordering::SeqCst);
                                 }
                                 "AddPartialTranscript" => {
-                                    if let Ok(msg) = serde_json::from_str::<AddPartialTranscriptMessage>(&text) {
+                                    if let Ok(msg) =
+                                        serde_json::from_str::<AddPartialTranscriptMessage>(&text)
+                                    {
                                         let transcript = msg.transcript();
                                         if !transcript.is_empty() {
-                                            if let Some(callback) = result_callback.read().await.as_ref() {
+                                            if let Some(callback) =
+                                                result_callback.read().await.as_ref()
+                                            {
                                                 let result = STTResult::new(
                                                     transcript.to_string(),
                                                     false,
@@ -118,17 +122,25 @@ impl SpeechmaticsSTT {
                                     }
                                 }
                                 "AddTranscript" => {
-                                    if let Ok(msg) = serde_json::from_str::<AddTranscriptMessage>(&text) {
+                                    if let Ok(msg) =
+                                        serde_json::from_str::<AddTranscriptMessage>(&text)
+                                    {
                                         let transcript = msg.transcript();
                                         if !transcript.is_empty() {
                                             let words: Vec<_> = msg.words().collect();
                                             let confidence = if !words.is_empty() {
-                                                words.iter().map(|w| w.confidence() as f32).sum::<f32>() / words.len() as f32
+                                                words
+                                                    .iter()
+                                                    .map(|w| w.confidence() as f32)
+                                                    .sum::<f32>()
+                                                    / words.len() as f32
                                             } else {
                                                 0.9
                                             };
 
-                                            if let Some(callback) = result_callback.read().await.as_ref() {
+                                            if let Some(callback) =
+                                                result_callback.read().await.as_ref()
+                                            {
                                                 let result = STTResult::new(
                                                     transcript.to_string(),
                                                     true,
@@ -153,8 +165,10 @@ impl SpeechmaticsSTT {
                                 "Error" => {
                                     if let Ok(msg) = serde_json::from_str::<ErrorMessage>(&text) {
                                         error!("Speechmatics error: {}", msg);
-                                        if let Some(callback) = error_callback.read().await.as_ref() {
-                                            callback(STTError::ProviderError(msg.to_string())).await;
+                                        if let Some(callback) = error_callback.read().await.as_ref()
+                                        {
+                                            callback(STTError::ProviderError(msg.to_string()))
+                                                .await;
                                         }
                                     }
                                 }
@@ -268,9 +282,9 @@ impl BaseSTT for SpeechmaticsSTT {
         {
             let mut ws_guard = self.ws.write().await;
             if let Some(ws) = ws_guard.as_mut() {
-                ws.send(Message::Text(json.into()))
-                    .await
-                    .map_err(|e| STTError::ConnectionFailed(format!("Failed to send start: {}", e)))?;
+                ws.send(Message::Text(json.into())).await.map_err(|e| {
+                    STTError::ConnectionFailed(format!("Failed to send start: {}", e))
+                })?;
             }
         }
 

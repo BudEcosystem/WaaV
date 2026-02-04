@@ -188,9 +188,11 @@ impl ReverieAudioFormat {
     /// Get the sample rate for this format
     pub fn sample_rate(&self) -> u32 {
         match self {
-            Self::Pcm16kInt16 | Self::Pcm16kUint8 | Self::Opus16k | Self::Ulaw16k | Self::OggOpus => {
-                16000
-            }
+            Self::Pcm16kInt16
+            | Self::Pcm16kUint8
+            | Self::Opus16k
+            | Self::Ulaw16k
+            | Self::OggOpus => 16000,
             Self::Pcm8kInt16 | Self::Pcm8kUint8 | Self::Opus8k | Self::Ulaw8k => 8000,
         }
     }
@@ -410,7 +412,8 @@ impl ReverieSTTConfig {
 
     /// Get the effective sample rate
     pub fn effective_sample_rate(&self) -> u32 {
-        self.sample_rate.unwrap_or_else(|| self.format.sample_rate())
+        self.sample_rate
+            .unwrap_or_else(|| self.format.sample_rate())
     }
 
     /// Build the WebSocket URL with query parameters

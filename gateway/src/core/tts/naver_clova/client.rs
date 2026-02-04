@@ -8,13 +8,13 @@
 //! CLOVA Voice uses a REST API with form-encoded requests and binary audio response.
 //! Each `speak()` call sends an HTTP POST request and receives audio data.
 
-use super::config::{NaverClovaTtsConfig, NaverClovaTtsFormat, MAX_TEXT_LENGTH};
+use super::config::{MAX_TEXT_LENGTH, NaverClovaTtsConfig, NaverClovaTtsFormat};
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
 };
 use reqwest::Client;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -340,7 +340,10 @@ mod tests {
     }
 
     impl AudioCallback for MockAudioCallback {
-        fn on_audio(&self, _audio_data: AudioData) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        fn on_audio(
+            &self,
+            _audio_data: AudioData,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             self.audio_count.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {})
         }

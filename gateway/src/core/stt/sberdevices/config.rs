@@ -237,7 +237,7 @@ impl SberSTTConfig {
         // Check if already Base64 encoded or needs encoding
         let client_credentials = if config.api_key.contains(':') {
             // Raw format - encode to Base64
-            use base64::{engine::general_purpose::STANDARD, Engine};
+            use base64::{Engine, engine::general_purpose::STANDARD};
             STANDARD.encode(config.api_key.as_bytes())
         } else {
             // Assume already encoded
@@ -418,7 +418,10 @@ mod tests {
             "SALUTE_SPEECH_B2B".parse::<SberScope>().unwrap(),
             SberScope::B2B
         );
-        assert_eq!("SBER_SPEECH".parse::<SberScope>().unwrap(), SberScope::Legacy);
+        assert_eq!(
+            "SBER_SPEECH".parse::<SberScope>().unwrap(),
+            SberScope::Legacy
+        );
     }
 
     #[test]
@@ -443,9 +446,8 @@ mod tests {
         let config = SberSTTConfig::from_base(&base).unwrap();
 
         // Should be Base64 encoded
-        use base64::{engine::general_purpose::STANDARD, Engine};
-        let expected =
-            STANDARD.encode("test_client_id:test_client_secret".as_bytes());
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let expected = STANDARD.encode("test_client_id:test_client_secret".as_bytes());
         assert_eq!(config.client_credentials, expected);
         assert_eq!(config.language, SberSTTLanguage::Russian);
         assert_eq!(config.audio_format, SberSTTAudioFormat::Pcm16);
@@ -455,7 +457,7 @@ mod tests {
 
     #[test]
     fn test_config_from_base_encoded_credentials() {
-        use base64::{engine::general_purpose::STANDARD, Engine};
+        use base64::{Engine, engine::general_purpose::STANDARD};
         let encoded = STANDARD.encode("client:secret".as_bytes());
 
         let base = STTConfig {
@@ -490,10 +492,10 @@ mod tests {
         // Test SberDevices defaults when fields are empty
         let base = STTConfig {
             api_key: "test:secret".to_string(),
-            language: String::new(),  // Empty to test SberDevices default (Russian)
-            encoding: String::new(),  // Empty to test SberDevices default (Pcm16)
-            model: String::new(),     // Empty to test SberDevices default (Personal scope)
-            sample_rate: 0,           // Zero to test SberDevices default (16000)
+            language: String::new(), // Empty to test SberDevices default (Russian)
+            encoding: String::new(), // Empty to test SberDevices default (Pcm16)
+            model: String::new(),    // Empty to test SberDevices default (Personal scope)
+            sample_rate: 0,          // Zero to test SberDevices default (16000)
             ..Default::default()
         };
 

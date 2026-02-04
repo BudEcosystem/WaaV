@@ -576,7 +576,10 @@ impl PluginRegistry {
         plugin_id: &str,
         _config: serde_json::Value,
     ) -> Result<Box<dyn crate::dag::nodes::AudioProcessor>, String> {
-        Err(format!("Audio processor '{}' not found - audio processor plugins are not yet implemented", plugin_id))
+        Err(format!(
+            "Audio processor '{}' not found - audio processor plugins are not yet implemented",
+            plugin_id
+        ))
     }
 }
 

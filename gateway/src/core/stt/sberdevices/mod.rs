@@ -56,10 +56,18 @@ mod messages;
 // Re-export public types
 pub use client::SberDevicesSTT;
 pub use config::{
-    SberSTTAudioFormat, SberSTTConfig, SberSTTLanguage, SberScope,
     // Constants
-    DEFAULT_SAMPLE_RATE, MAX_SYNC_AUDIO_DURATION_SECS, MAX_SYNC_AUDIO_SIZE, OAUTH_ENDPOINT,
-    STT_RECOGNIZE_ENDPOINT, TOKEN_REFRESH_THRESHOLD_SECS, TOKEN_VALIDITY_SECS,
+    DEFAULT_SAMPLE_RATE,
+    MAX_SYNC_AUDIO_DURATION_SECS,
+    MAX_SYNC_AUDIO_SIZE,
+    OAUTH_ENDPOINT,
+    STT_RECOGNIZE_ENDPOINT,
+    SberSTTAudioFormat,
+    SberSTTConfig,
+    SberSTTLanguage,
+    SberScope,
+    TOKEN_REFRESH_THRESHOLD_SECS,
+    TOKEN_VALIDITY_SECS,
 };
 pub use messages::{
     OAuthTokenRequest, OAuthTokenResponse, SberApiError, SberRecognitionResponse, SberStatusCode,

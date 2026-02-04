@@ -211,7 +211,10 @@ impl ModelManager {
             // Index 1: probability of turn completion
             // Bounds check: need at least 2 elements
             if data.len() < 2 {
-                warn!("Expected 2 elements for binary classification, got {}", data.len());
+                warn!(
+                    "Expected 2 elements for binary classification, got {}",
+                    data.len()
+                );
                 return Ok(0.3);
             }
             let end_logit = data[1];
@@ -269,7 +272,9 @@ impl ModelManager {
             if data.len() < required_len {
                 warn!(
                     "Data too short: have {} elements, need {} for position {}",
-                    data.len(), required_len, seq_len - 1
+                    data.len(),
+                    required_len,
+                    seq_len - 1
                 );
                 return Ok(0.3); // Conservative fallback
             }

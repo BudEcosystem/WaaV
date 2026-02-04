@@ -6,17 +6,21 @@
 //! - Switch pattern matching
 //! - Wait-free SPSC audio buffers (rtrb)
 
+mod buffer;
 mod condition;
 mod switch;
-mod buffer;
 
-pub use condition::{EdgeCondition, CompiledEdge};
+pub use buffer::{
+    EdgeBuffer, EdgeBufferPair, RtrbAudioBuffer, RtrbAudioConsumer, RtrbAudioProducer,
+};
+pub use condition::{CompiledEdge, EdgeCondition};
 pub use switch::SwitchMatcher;
-pub use buffer::{EdgeBuffer, EdgeBufferPair, RtrbAudioBuffer, RtrbAudioProducer, RtrbAudioConsumer};
 
 /// Prelude for convenient imports
 pub mod prelude {
-    pub use super::condition::{EdgeCondition, CompiledEdge};
+    pub use super::buffer::{
+        EdgeBuffer, EdgeBufferPair, RtrbAudioBuffer, RtrbAudioConsumer, RtrbAudioProducer,
+    };
+    pub use super::condition::{CompiledEdge, EdgeCondition};
     pub use super::switch::SwitchMatcher;
-    pub use super::buffer::{EdgeBuffer, EdgeBufferPair, RtrbAudioBuffer, RtrbAudioProducer, RtrbAudioConsumer};
 }

@@ -672,9 +672,7 @@ impl HuaweiCloudSttConfig {
 
     /// Get list of supported languages.
     pub fn supported_languages() -> Vec<&'static str> {
-        vec![
-            "zh-CN", "zh-HK", "zh-SC", "zh-MN", "mn", "bo", "ug",
-        ]
+        vec!["zh-CN", "zh-HK", "zh-SC", "zh-MN", "mn", "bo", "ug"]
     }
 
     /// Get list of supported models.
@@ -706,8 +704,8 @@ impl HuaweiCloudSttConfig {
         // Parse region from model string suffix (e.g., "chinese_16k_general@cn-north-4")
         let (model_str, region) = if config.model.contains('@') {
             let model_parts: Vec<&str> = config.model.splitn(2, '@').collect();
-            let region = HuaweiCloudRegion::from_str(model_parts[1])
-                .unwrap_or(HuaweiCloudRegion::default());
+            let region =
+                HuaweiCloudRegion::from_str(model_parts[1]).unwrap_or(HuaweiCloudRegion::default());
             (model_parts[0], region)
         } else {
             (config.model.as_str(), HuaweiCloudRegion::default())
@@ -875,7 +873,10 @@ mod tests {
     fn test_model_sample_rate() {
         assert_eq!(HuaweiCloudSttModel::Chinese16kGeneral.sample_rate(), 16000);
         assert_eq!(HuaweiCloudSttModel::Chinese8kGeneral.sample_rate(), 8000);
-        assert_eq!(HuaweiCloudSttModel::Cantonese16kGeneral.sample_rate(), 16000);
+        assert_eq!(
+            HuaweiCloudSttModel::Cantonese16kGeneral.sample_rate(),
+            16000
+        );
     }
 
     #[test]

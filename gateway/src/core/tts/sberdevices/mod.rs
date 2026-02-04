@@ -71,10 +71,17 @@ mod config;
 mod provider;
 
 pub use config::{
-    SberTtsAudioFormat, SberTtsConfig, SberTtsScope, SberTtsVoice,
     // Constants
-    DEFAULT_SAMPLE_RATE, MAX_TEXT_LENGTH, OAUTH_ENDPOINT, SBER_TTS_SYNTHESIZE_URL,
-    TOKEN_REFRESH_THRESHOLD_SECS, TOKEN_VALIDITY_SECS,
+    DEFAULT_SAMPLE_RATE,
+    MAX_TEXT_LENGTH,
+    OAUTH_ENDPOINT,
+    SBER_TTS_SYNTHESIZE_URL,
+    SberTtsAudioFormat,
+    SberTtsConfig,
+    SberTtsScope,
+    SberTtsVoice,
+    TOKEN_REFRESH_THRESHOLD_SECS,
+    TOKEN_VALIDITY_SECS,
 };
 pub use provider::SberDevicesTts;
 

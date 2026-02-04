@@ -222,11 +222,11 @@ impl DeepgramSTT {
         url.push_str("&channels=");
         url.push_str(&config.base.channels.to_string());
         url.push_str("&punctuate=");
-        url.push_str(&config.base.punctuation.to_string());
+        url.push_str(if config.base.punctuation { "true" } else { "false" });
         url.push_str("&interim_results=");
-        url.push_str(&config.interim_results.to_string());
+        url.push_str(if config.interim_results { "true" } else { "false" });
         url.push_str("&smart_format=");
-        url.push_str(&config.smart_format.to_string());
+        url.push_str(if config.smart_format { "true" } else { "false" });
         url.push_str("&encoding=");
         url.push_str(&config.base.encoding);
 
@@ -280,10 +280,13 @@ impl DeepgramSTT {
         }
 
         // Add utterance end timeout
-        if let Some(utterance_end_ms) = config.utterance_end_ms {
-            url.push_str("&utterance_end_ms=");
-            url.push_str(&utterance_end_ms.to_string());
-        }
+        // NOTE: utterance_end_ms is not a valid Deepgram WebSocket API parameter.
+        // Deepgram uses 'endpointing' for end-of-speech detection timing instead.
+        // Keeping the config field for potential future use or documentation.
+        // if let Some(utterance_end_ms) = config.utterance_end_ms {
+        //     url.push_str("&utterance_end_ms=");
+        //     url.push_str(&utterance_end_ms.to_string());
+        // }
 
         Ok(url)
     }
@@ -375,6 +378,7 @@ impl DeepgramSTT {
     /// Start the WebSocket connection task (optimized for minimal latency)
     async fn start_connection(&mut self, config: DeepgramSTTConfig) -> Result<(), STTError> {
         let ws_url = self.build_websocket_url(&config)?;
+        info!("Deepgram STT WebSocket URL: {}", ws_url);
 
         // Create channels for communication (bounded for backpressure)
         let (ws_tx, mut ws_rx) = mpsc::channel::<Bytes>(32);
@@ -413,7 +417,7 @@ impl DeepgramSTT {
                 .header("Connection", "upgrade")
                 .header("Sec-WebSocket-Key", generate_key())
                 .header("Sec-WebSocket-Version", "13")
-                .header("Authorization", format!("token {api_key}"))
+                .header("Authorization", format!("Token {api_key}"))
                 .body(())
             {
                 Ok(request) => request,
@@ -523,10 +527,75 @@ impl DeepgramSTT {
 
                     // Handle shutdown signal
                     _ = &mut shutdown_rx => {
-                        info!("Received shutdown signal");
+                        info!("Received shutdown signal, sending CloseStream to Deepgram");
+                        // CRITICAL: Send CloseStream message to signal end of audio
+                        // This tells Deepgram to finalize any pending transcripts and send speech_final
+                        let close_stream_message = Message::Text(r#"{"type":"CloseStream"}"#.into());
+                        if let Err(e) = ws_sink.send(close_stream_message).await {
+                            warn!("Failed to send CloseStream message: {}", e);
+                            break;
+                        }
+                        debug!("Sent CloseStream message to Deepgram, waiting for final results");
+
+                        // CRITICAL: Continue receiving messages after CloseStream to capture speech_final
+                        // Don't just sleep - actively receive and process any final results
+                        let close_timeout = tokio::time::Instant::now() + Duration::from_millis(1000);
+                        let mut received_speech_final = false;
+
+                        while tokio::time::Instant::now() < close_timeout {
+                            tokio::select! {
+                                biased; // Prefer receiving messages over timeout
+
+                                message = tokio::time::timeout(Duration::from_millis(200), ws_stream.next()) => {
+                                    match message {
+                                        Ok(Some(Ok(msg))) => {
+                                            // Check if this is a speech_final result before processing
+                                            if let Message::Text(ref text) = msg {
+                                                if text.contains("\"speech_final\":true") || text.contains("\"speech_final\": true") {
+                                                    info!("Received speech_final after CloseStream");
+                                                    received_speech_final = true;
+                                                }
+                                            }
+
+                                            if let Err(e) = Self::handle_websocket_message(msg, &result_tx) {
+                                                warn!("Error handling message after CloseStream: {}", e);
+                                            }
+
+                                            // If we got speech_final, we can exit sooner
+                                            if received_speech_final {
+                                                debug!("Got speech_final, exiting early");
+                                                break;
+                                            }
+                                        }
+                                        Ok(Some(Err(e))) => {
+                                            debug!("WebSocket error after CloseStream: {}", e);
+                                            break;
+                                        }
+                                        Ok(None) => {
+                                            info!("WebSocket stream ended after CloseStream");
+                                            break;
+                                        }
+                                        Err(_) => {
+                                            // 200ms timeout - continue waiting
+                                            debug!("Still waiting for final results after CloseStream...");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if !received_speech_final {
+                            debug!("CloseStream timeout reached without receiving speech_final");
+                        }
+
                         break;
                     }
                 }
+            }
+
+            // Send graceful close frame before disconnecting
+            if let Err(e) = ws_sink.close().await {
+                debug!("Error closing WebSocket sink: {}", e);
             }
 
             info!("Deepgram WebSocket connection closed");
@@ -675,10 +744,15 @@ impl BaseSTT for DeepgramSTT {
             let _ = shutdown_tx.send(());
         }
 
-        // Wait for connection task to finish
+        // Wait for connection task to finish (this now includes waiting for speech_final)
         if let Some(handle) = self.connection_handle.take() {
             let _ = timeout(Duration::from_secs(5), handle).await;
         }
+
+        // CRITICAL: Give result forwarding task time to process any pending results
+        // The connection task may have enqueued final results that need to be forwarded
+        // to the callback before we abort the forwarding task
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Clean up result forwarding task
         if let Some(handle) = self.result_forward_handle.take() {
@@ -692,12 +766,13 @@ impl BaseSTT for DeepgramSTT {
             let _ = handle.await;
         }
 
-        // Clean up channels and callbacks
+        // Clean up channels but PRESERVE callbacks
+        // Callbacks should persist across reconnections so they work when we reconnect
         self.ws_sender = None;
         self.result_tx = None;
         self.error_tx = None;
-        *self.result_callback.lock().await = None;
-        *self.error_callback.lock().await = None;
+        // NOTE: Do NOT clear result_callback and error_callback here
+        // They need to be preserved for reconnection to work correctly
 
         // Update state
         self.state = ConnectionState::Disconnected;
@@ -969,7 +1044,10 @@ mod tests {
 
         // Verify all advanced parameters are included
         assert!(url.contains("diarize=true"), "Missing diarize param");
-        assert!(url.contains("filler_words=true"), "Missing filler_words param");
+        assert!(
+            url.contains("filler_words=true"),
+            "Missing filler_words param"
+        );
         assert!(
             url.contains("profanity_filter=true"),
             "Missing profanity_filter param"
@@ -977,10 +1055,11 @@ mod tests {
         assert!(url.contains("vad_events=true"), "Missing vad_events param");
         assert!(url.contains("redact=pci"), "Missing redact=pci param");
         assert!(url.contains("redact=ssn"), "Missing redact=ssn param");
-        assert!(
-            url.contains("utterance_end_ms=750"),
-            "Missing utterance_end_ms param"
-        );
+        // Note: utterance_end_ms is not a valid Deepgram API parameter and is now disabled
+        // assert!(
+        //     url.contains("utterance_end_ms=750"),
+        //     "Missing utterance_end_ms param"
+        // );
     }
 
     #[tokio::test]

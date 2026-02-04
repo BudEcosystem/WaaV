@@ -189,7 +189,12 @@ impl UserBotLatencyObserver {
             }
             if self
                 .min_ns
-                .compare_exchange_weak(current_min, latency_ns, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange_weak(
+                    current_min,
+                    latency_ns,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
                 .is_ok()
             {
                 break;
@@ -203,7 +208,12 @@ impl UserBotLatencyObserver {
             }
             if self
                 .max_ns
-                .compare_exchange_weak(current_max, latency_ns, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange_weak(
+                    current_max,
+                    latency_ns,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
                 .is_ok()
             {
                 break;

@@ -1,15 +1,15 @@
 //! HTTP endpoint adapter
 
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::time::Duration;
-use async_trait::async_trait;
 use tracing::debug;
 
 use super::EndpointAdapter;
 use crate::dag::context::DAGContext;
 use crate::dag::definition::HttpMethod;
-use crate::dag::nodes::DAGData;
 use crate::dag::error::{DAGError, DAGResult};
+use crate::dag::nodes::DAGData;
 
 /// HTTP endpoint adapter
 pub struct HttpAdapter {
@@ -80,7 +80,8 @@ impl EndpointAdapter for HttpAdapter {
             "HTTP request"
         );
 
-        let mut request = self.client
+        let mut request = self
+            .client
             .request(self.method.clone().into(), &self.url)
             .timeout(self.timeout)
             .header("Content-Type", "application/json")
@@ -98,10 +99,13 @@ impl EndpointAdapter for HttpAdapter {
 
         request = request.json(&payload);
 
-        let response = request.send().await.map_err(|e| DAGError::HttpEndpointError {
-            url: self.url.clone(),
-            error: e.to_string(),
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| DAGError::HttpEndpointError {
+                url: self.url.clone(),
+                error: e.to_string(),
+            })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -112,10 +116,14 @@ impl EndpointAdapter for HttpAdapter {
             });
         }
 
-        let json: serde_json::Value = response.json().await.map_err(|e| DAGError::HttpEndpointError {
-            url: self.url.clone(),
-            error: format!("Failed to parse response: {}", e),
-        })?;
+        let json: serde_json::Value =
+            response
+                .json()
+                .await
+                .map_err(|e| DAGError::HttpEndpointError {
+                    url: self.url.clone(),
+                    error: format!("Failed to parse response: {}", e),
+                })?;
 
         Ok(DAGData::Json(json))
     }

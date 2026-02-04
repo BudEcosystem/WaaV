@@ -143,7 +143,8 @@ impl TinkoffTtsConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.api_key.is_empty() {
             return Err(
-                "Tinkoff API key is required. Set TINKOFF_API_KEY environment variable.".to_string(),
+                "Tinkoff API key is required. Set TINKOFF_API_KEY environment variable."
+                    .to_string(),
             );
         }
 
@@ -318,9 +319,18 @@ mod tests {
 
     #[test]
     fn test_tinkoff_voice_from_str() {
-        assert_eq!(TinkoffVoice::from_str("alyona").unwrap(), TinkoffVoice::Alyona);
-        assert_eq!(TinkoffVoice::from_str("ALYONA").unwrap(), TinkoffVoice::Alyona);
-        assert_eq!(TinkoffVoice::from_str("dorofeev").unwrap(), TinkoffVoice::Dorofeev);
+        assert_eq!(
+            TinkoffVoice::from_str("alyona").unwrap(),
+            TinkoffVoice::Alyona
+        );
+        assert_eq!(
+            TinkoffVoice::from_str("ALYONA").unwrap(),
+            TinkoffVoice::Alyona
+        );
+        assert_eq!(
+            TinkoffVoice::from_str("dorofeev").unwrap(),
+            TinkoffVoice::Dorofeev
+        );
         assert!(TinkoffVoice::from_str("invalid").is_err());
     }
 

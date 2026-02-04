@@ -164,10 +164,10 @@ mod messages;
 
 // Configuration types
 pub use config::{
-    HuaweiCloudAsrMode, HuaweiCloudAudioFormat, HuaweiCloudRegion, HuaweiCloudSttConfig,
-    HuaweiCloudSttModel, HuaweiIamDomain, HuaweiIamError, HuaweiIamProject, HuaweiIamToken,
-    HuaweiIamTokenResponse, HuaweiIamUser, DEFAULT_AUDIO_FORMAT, DEFAULT_MODEL,
-    DEFAULT_SAMPLE_RATE, MAX_CONTINUOUS_DURATION_SECS, MAX_FRAME_INTERVAL_SECS,
+    DEFAULT_AUDIO_FORMAT, DEFAULT_MODEL, DEFAULT_SAMPLE_RATE, HuaweiCloudAsrMode,
+    HuaweiCloudAudioFormat, HuaweiCloudRegion, HuaweiCloudSttConfig, HuaweiCloudSttModel,
+    HuaweiIamDomain, HuaweiIamError, HuaweiIamProject, HuaweiIamToken, HuaweiIamTokenResponse,
+    HuaweiIamUser, MAX_CONTINUOUS_DURATION_SECS, MAX_FRAME_INTERVAL_SECS,
     MAX_SHORT_AUDIO_DURATION_SECS, MAX_STREAMING_DURATION_SECS, REALTIME_ASR_CONTINUOUS_PATH,
     REALTIME_ASR_STREAMING_PATH, RECOMMENDED_CHUNK_DURATION_MS, SHORT_ASR_PATH,
     SIS_CHINA_ENDPOINT_FORMAT, SIS_INTL_ENDPOINT_FORMAT, TOKEN_VALIDITY_SECS, WS_TIMEOUT_SECS,
@@ -175,9 +175,9 @@ pub use config::{
 
 // Message types
 pub use messages::{
-    HuaweiAsrResult, HuaweiCancelFrame, HuaweiEndFrame, HuaweiRealtimeResponse,
-    HuaweiResponseType, HuaweiShortAsrConfig, HuaweiShortAsrRequest, HuaweiShortAsrResponse,
-    HuaweiSisErrorCode, HuaweiStartConfig, HuaweiStartFrame, HuaweiWordInfo, HuaweiWsCommand,
+    HuaweiAsrResult, HuaweiCancelFrame, HuaweiEndFrame, HuaweiRealtimeResponse, HuaweiResponseType,
+    HuaweiShortAsrConfig, HuaweiShortAsrRequest, HuaweiShortAsrResponse, HuaweiSisErrorCode,
+    HuaweiStartConfig, HuaweiStartFrame, HuaweiWordInfo, HuaweiWsCommand,
 };
 
 // Auth types
@@ -285,7 +285,11 @@ mod tests {
         assert!(cn_region.is_china_region());
 
         let intl_region = HuaweiCloudRegion::ApSoutheast3;
-        assert!(intl_region.sis_endpoint().contains("sis-ext.ap-southeast-3"));
+        assert!(
+            intl_region
+                .sis_endpoint()
+                .contains("sis-ext.ap-southeast-3")
+        );
         assert!(!intl_region.is_china_region());
     }
 
@@ -313,7 +317,10 @@ mod tests {
     fn test_model_sample_rate() {
         assert_eq!(HuaweiCloudSttModel::Chinese16kGeneral.sample_rate(), 16000);
         assert_eq!(HuaweiCloudSttModel::Chinese8kGeneral.sample_rate(), 8000);
-        assert_eq!(HuaweiCloudSttModel::Cantonese16kGeneral.sample_rate(), 16000);
+        assert_eq!(
+            HuaweiCloudSttModel::Cantonese16kGeneral.sample_rate(),
+            16000
+        );
     }
 
     #[test]
@@ -452,7 +459,10 @@ mod tests {
 
     #[test]
     fn test_error_code_handling() {
-        assert_eq!(HuaweiSisErrorCode::from_code(0), HuaweiSisErrorCode::Success);
+        assert_eq!(
+            HuaweiSisErrorCode::from_code(0),
+            HuaweiSisErrorCode::Success
+        );
         assert_eq!(
             HuaweiSisErrorCode::from_code(1),
             HuaweiSisErrorCode::AuthenticationFailed
@@ -475,7 +485,9 @@ mod tests {
         let config = create_test_config();
         let mut stt = HuaweiCloudStt::new(config).unwrap();
 
-        let result = stt.send_audio(bytes::Bytes::from_static(&[0u8; 1024])).await;
+        let result = stt
+            .send_audio(bytes::Bytes::from_static(&[0u8; 1024]))
+            .await;
         assert!(result.is_err());
     }
 

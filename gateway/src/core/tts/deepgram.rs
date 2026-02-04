@@ -57,11 +57,22 @@ impl TTSRequestBuilder for DeepgramRequestBuilder {
             url.push_str(&params.join("&"));
         }
 
+        // Determine Accept header based on encoding format
+        let accept_header = match encoding {
+            "linear16" | "pcm" => "audio/pcm",
+            "mp3" => "audio/mpeg",
+            "mulaw" | "ulaw" | "alaw" => "audio/basic",
+            "opus" => "audio/opus",
+            "flac" => "audio/flac",
+            _ => "audio/pcm", // Default fallback
+        };
+
         // Build the request with Deepgram-specific headers and body
         client
             .post(url)
             .header("Authorization", format!("Token {}", self.config.api_key))
             .header("Content-Type", "application/json")
+            .header("Accept", accept_header)
             .json(&json!({
                 "text": text
             }))

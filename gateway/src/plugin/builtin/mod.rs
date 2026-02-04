@@ -24,17 +24,18 @@
 use crate::core::realtime::{BaseRealtime, HumeEVI, OpenAIRealtime, RealtimeConfig, RealtimeError};
 use crate::core::stt::{
     AmiVoiceSTT, AssemblyAISTT, AwsTranscribeSTT, AzureSTT, BaiduStt, BaseSTT, BhashiniStt,
-    CartesiaSTT, DashScopeStt, DeepgramSTT, ElevenLabsSTT, FptStt, GladiaSTT, GnaniSTT, GoogleSTT, GroqSTT,
-    HuaweiCloudStt, IbmWatsonSTT, IFlytekStt, NaverClovaStt, NectecStt, OpenAISTT, PhonexiaSTT, ProsaStt, RevAISTT,
-    ReverieSTT, SarvamSTT, SberDevicesSTT, SpeechmaticsSTT, STTConfig, STTError, TencentStt,
-    TinkoffStt, ViettelStt, YandexSTT,
+    CartesiaSTT, DashScopeStt, DeepgramSTT, ElevenLabsSTT, FptStt, GladiaSTT, GnaniSTT, GoogleSTT,
+    GroqSTT, HuaweiCloudStt, IFlytekStt, IbmWatsonSTT, NaverClovaStt, NectecStt, OpenAISTT,
+    PhonexiaSTT, ProsaStt, RevAISTT, ReverieSTT, STTConfig, STTError, SarvamSTT, SberDevicesSTT,
+    SpeechmaticsSTT, TencentStt, TinkoffStt, ViettelStt, YandexSTT,
 };
 use crate::core::tts::{
     AcapelaTts, AwsPollyTTS, AzureTTS, BaiduTts, BaseTTS, BhashiniTts, CartesiaTTS, CereprocTts,
     DashScopeTts, DeepgramTTS, ElevenLabsTTS, FptTts, GnaniTTS, GoogleTTS, HuaweiCloudTts, HumeTTS,
-    IbmWatsonTTS, IFlytekTts, LmntTts, MurfTts, NaverClovaTts, NectecTts, OpenAITTS, PlayHtTts,
+    IFlytekTts, IbmWatsonTTS, LmntTts, MurfTts, NaverClovaTts, NectecTts, OpenAITTS, PlayHtTts,
     ProsaTts, ResembleTts, ReverieTts, SberDevicesTts, SmallestTts, SpeechifyTts, SpeechmaticsTts,
-    TTSConfig, TencentTts, TinkoffTts, UnrealSpeechTts, ViettelTts, WellSaidTts, YandexTts, ZaloTts,
+    TTSConfig, TencentTts, TinkoffTts, UnrealSpeechTts, ViettelTts, WellSaidTts, YandexTts,
+    ZaloTts,
 };
 use crate::plugin::metadata::ProviderMetadata;
 use crate::plugin::registry::PluginConstructor;
@@ -158,12 +159,7 @@ fn sarvam_stt_metadata() -> ProviderMetadata {
     ProviderMetadata::stt("sarvam", "Sarvam.ai Saarika STT")
         .with_description("Indian language streaming STT with Saarika model")
         .with_alias("sarvam-ai")
-        .with_features([
-            "streaming",
-            "vad-signals",
-            "indic-languages",
-            "code-mixing",
-        ])
+        .with_features(["streaming", "vad-signals", "indic-languages", "code-mixing"])
         .with_languages([
             "hi-IN", "bn-IN", "ta-IN", "te-IN", "gu-IN", "kn-IN", "ml-IN", "mr-IN", "od-IN",
             "pa-IN", "en-IN",
@@ -544,11 +540,7 @@ fn fpt_ai_stt_metadata() -> ProviderMetadata {
         .with_alias("fpt_ai-stt")
         .with_alias("fpt-stt")
         .with_alias("fpt")
-        .with_features([
-            "rest-api",
-            "vietnamese-optimized",
-            "http-file-upload",
-        ])
+        .with_features(["rest-api", "vietnamese-optimized", "http-file-upload"])
         .with_languages(["vi"])
 }
 
@@ -774,7 +766,12 @@ fn speechify_tts_metadata() -> ProviderMetadata {
             "loudness-normalization",
             "text-normalization",
         ])
-        .with_models(["simba-english", "simba-turbo", "simba-multilingual", "simba-base"])
+        .with_models([
+            "simba-english",
+            "simba-turbo",
+            "simba-multilingual",
+            "simba-base",
+        ])
         .with_languages([
             "en-US", "en-GB", "es-ES", "es-MX", "fr-FR", "de-DE", "it-IT", "pt-BR", "pt-PT",
             "nl-NL", "pl-PL", "ru-RU", "tr-TR", "ja-JP", "ko-KR", "zh-CN", "zh-TW", "ar-SA",
@@ -878,9 +875,7 @@ fn yandex_tts_metadata() -> ProviderMetadata {
 
 fn smallest_tts_metadata() -> ProviderMetadata {
     ProviderMetadata::tts("smallest", "Smallest.ai Waves TTS")
-        .with_description(
-            "Ultra-low latency TTS (~100ms) with voice cloning and 16+ languages",
-        )
+        .with_description("Ultra-low latency TTS (~100ms) with voice cloning and 16+ languages")
         .with_alias("smallest-ai")
         .with_features([
             "streaming",
@@ -899,9 +894,7 @@ fn smallest_tts_metadata() -> ProviderMetadata {
 
 fn tinkoff_tts_metadata() -> ProviderMetadata {
     ProviderMetadata::tts("tinkoff", "Tinkoff VoiceKit TTS")
-        .with_description(
-            "Russian TTS via gRPC with JWT authentication and SSML support",
-        )
+        .with_description("Russian TTS via gRPC with JWT authentication and SSML support")
         .with_alias("tinkoff-voicekit")
         .with_features([
             "streaming",

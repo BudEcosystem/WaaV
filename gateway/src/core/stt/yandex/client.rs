@@ -5,9 +5,9 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
-use std::sync::atomic::{AtomicBool, Ordering};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
@@ -142,9 +142,7 @@ impl YandexSTT {
 
             // Parse response
             let sync_response: YandexSyncResponse = serde_json::from_str(&response_text)
-                .map_err(|e| {
-                    STTError::ProviderError(format!("Failed to parse response: {}", e))
-                })?;
+                .map_err(|e| STTError::ProviderError(format!("Failed to parse response: {}", e)))?;
 
             if let Some(error) = sync_response.error {
                 return Err(STTError::ProviderError(error.display_message()));
@@ -212,10 +210,7 @@ impl YandexSTT {
                     continue;
                 }
 
-                debug!(
-                    "Processing {} bytes of accumulated audio",
-                    audio_data.len()
-                );
+                debug!("Processing {} bytes of accumulated audio", audio_data.len());
                 last_process_time = std::time::Instant::now();
 
                 // Build request
@@ -250,10 +245,9 @@ impl YandexSTT {
                                     if let Some(transcript) = sync_response.result {
                                         if !transcript.is_empty() {
                                             let stt_result = STTResult::new(
-                                                transcript,
-                                                true,  // is_final
-                                                true,  // is_speech_final
-                                                0.95,  // confidence (Yandex doesn't return this for sync)
+                                                transcript, true, // is_final
+                                                true, // is_speech_final
+                                                0.95, // confidence (Yandex doesn't return this for sync)
                                             );
 
                                             if let Some(callback) =

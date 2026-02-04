@@ -9,16 +9,16 @@
 //! - Agent/Assistant attachment
 //! - System prompts and context injection
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn, instrument};
+use tracing::{debug, info, instrument, warn};
 
-use super::{DAGNode, DAGData, NodeCapability};
+use super::{DAGData, DAGNode, NodeCapability};
 use crate::dag::context::DAGContext;
 use crate::dag::error::{DAGError, DAGResult};
 
@@ -206,9 +206,7 @@ pub struct FunctionDefinition {
 pub enum ResponseFormat {
     Text,
     JsonObject,
-    JsonSchema {
-        json_schema: serde_json::Value,
-    },
+    JsonSchema { json_schema: serde_json::Value },
 }
 
 /// OpenAI-compatible chat completion request
@@ -467,7 +465,11 @@ impl ConversationHistory {
         // Trim history to max_messages (keep system message if present)
         while self.messages.len() > self.max_messages {
             // Find first non-system message to remove
-            if let Some(idx) = self.messages.iter().position(|m| m.role != MessageRole::System) {
+            if let Some(idx) = self
+                .messages
+                .iter()
+                .position(|m| m.role != MessageRole::System)
+            {
                 self.messages.remove(idx);
             } else {
                 break;
@@ -660,11 +662,14 @@ impl LlmEndpointNode {
         }
 
         // Send request
-        let response = http_request.send().await.map_err(|e| DAGError::LlmEndpointError {
-            provider: self.config.base_url.clone(),
-            model: self.config.model.clone(),
-            error: format!("Request failed: {}", e),
-        })?;
+        let response = http_request
+            .send()
+            .await
+            .map_err(|e| DAGError::LlmEndpointError {
+                provider: self.config.base_url.clone(),
+                model: self.config.model.clone(),
+                error: format!("Request failed: {}", e),
+            })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -678,11 +683,14 @@ impl LlmEndpointNode {
 
         // Parse response
         let completion: ChatCompletionResponse =
-            response.json().await.map_err(|e| DAGError::LlmEndpointError {
-                provider: self.config.base_url.clone(),
-                model: self.config.model.clone(),
-                error: format!("Failed to parse response: {}", e),
-            })?;
+            response
+                .json()
+                .await
+                .map_err(|e| DAGError::LlmEndpointError {
+                    provider: self.config.base_url.clone(),
+                    model: self.config.model.clone(),
+                    error: format!("Failed to parse response: {}", e),
+                })?;
 
         // Extract assistant message
         let assistant_message = completion
@@ -781,11 +789,14 @@ impl LlmEndpointNode {
         }
 
         // Send request
-        let response = http_request.send().await.map_err(|e| DAGError::LlmEndpointError {
-            provider: self.config.base_url.clone(),
-            model: self.config.model.clone(),
-            error: format!("Request failed: {}", e),
-        })?;
+        let response = http_request
+            .send()
+            .await
+            .map_err(|e| DAGError::LlmEndpointError {
+                provider: self.config.base_url.clone(),
+                model: self.config.model.clone(),
+                error: format!("Request failed: {}", e),
+            })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -881,7 +892,12 @@ impl LlmEndpointNode {
                                         let entry = tool_call_builders
                                             .entry(tc_delta.index)
                                             .or_insert_with(|| {
-                                                (String::new(), String::new(), String::new(), String::new())
+                                                (
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                )
                                             });
 
                                         if let Some(id) = &tc_delta.id {
@@ -1146,7 +1162,10 @@ mod tests {
         };
 
         let node = LlmEndpointNode::new("test", config);
-        assert_eq!(node.chat_completions_url(), "http://localhost:11434/v1/chat/completions");
+        assert_eq!(
+            node.chat_completions_url(),
+            "http://localhost:11434/v1/chat/completions"
+        );
     }
 
     #[test]

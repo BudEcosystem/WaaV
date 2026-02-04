@@ -274,6 +274,46 @@ pub async fn handle_clear_message(
     true
 }
 
+/// Handle audio end signal from client
+///
+/// This signals that the client has finished sending audio. The handler
+/// triggers STT finalization which sends a CloseStream message to the
+/// provider, causing it to finalize pending transcripts and send
+/// `speech_final=true`.
+///
+/// # Arguments
+/// * `state` - Connection state containing voice manager
+/// * `message_tx` - Channel for sending response messages
+///
+/// # Returns
+/// * `bool` - true to continue processing, false to terminate connection
+pub async fn handle_audio_end(
+    state: &Arc<RwLock<ConnectionState>>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) -> bool {
+    info!("Processing audio_end signal - finalizing STT stream");
+
+    // Get voice manager if audio is enabled
+    let voice_manager = match get_voice_manager_if_audio_enabled(state, message_tx).await {
+        Some(vm) => vm,
+        None => return true,
+    };
+
+    // Finalize the STT stream
+    if let Err(e) = voice_manager.finalize_stt().await {
+        error!("Failed to finalize STT stream: {}", e);
+        let _ = message_tx
+            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
+                message: format!("Failed to finalize STT stream: {e}"),
+            }))
+            .await;
+    } else {
+        debug!("STT stream finalized successfully");
+    }
+
+    true
+}
+
 /// Helper function to get voice manager if audio is enabled
 ///
 /// Checks if audio processing is enabled and returns the voice manager if available.

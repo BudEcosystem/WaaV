@@ -18,6 +18,7 @@ pub mod huawei_cloud;
 pub mod ibm_watson;
 pub mod iflytek;
 pub mod naver_clova;
+pub mod nectec;
 pub mod openai;
 pub mod phonexia;
 pub mod prosa_ai;
@@ -28,7 +29,6 @@ pub mod sberdevices;
 pub mod speechmatics;
 pub mod tencent;
 pub mod tinkoff;
-pub mod nectec;
 pub mod viettel_ai;
 pub mod yandex;
 
@@ -40,17 +40,16 @@ pub use base::{
 
 // Re-export Alibaba Cloud DashScope implementation
 pub use alibaba_cloud::{
-    DashScopeStt, DashScopeSttConfig, DashScopeRegion, DashScopeSttModel, DashScopeAudioFormat,
-    DashScopeLanguage, TurnDetectionMode,
-    DASHSCOPE_BEIJING_REALTIME_URL, DASHSCOPE_SINGAPORE_REALTIME_URL,
-    DASHSCOPE_BEIJING_INFERENCE_URL, DASHSCOPE_SINGAPORE_INFERENCE_URL,
-    DEFAULT_STT_MODEL as DASHSCOPE_DEFAULT_STT_MODEL,
-    DEFAULT_SAMPLE_RATE as DASHSCOPE_DEFAULT_SAMPLE_RATE,
+    DASHSCOPE_BEIJING_INFERENCE_URL, DASHSCOPE_BEIJING_REALTIME_URL,
+    DASHSCOPE_SINGAPORE_INFERENCE_URL, DASHSCOPE_SINGAPORE_REALTIME_URL,
     DEFAULT_AUDIO_FORMAT as DASHSCOPE_DEFAULT_AUDIO_FORMAT,
+    DEFAULT_SAMPLE_RATE as DASHSCOPE_DEFAULT_SAMPLE_RATE,
     DEFAULT_SILENCE_DURATION_MS as DASHSCOPE_DEFAULT_SILENCE_DURATION_MS,
-    QwenSessionUpdate, QwenAudioBufferAppend, QwenAudioBufferCommit, QwenSessionFinish,
-    QwenServerMessage, ParaformerRunTask, ParaformerFinishTask, ParaformerResponse,
-    DashScopeErrorCode,
+    DEFAULT_STT_MODEL as DASHSCOPE_DEFAULT_STT_MODEL, DashScopeAudioFormat, DashScopeErrorCode,
+    DashScopeLanguage, DashScopeRegion, DashScopeStt, DashScopeSttConfig, DashScopeSttModel,
+    ParaformerFinishTask, ParaformerResponse, ParaformerRunTask, QwenAudioBufferAppend,
+    QwenAudioBufferCommit, QwenServerMessage, QwenSessionFinish, QwenSessionUpdate,
+    TurnDetectionMode,
 };
 
 // Re-export Deepgram implementation
@@ -93,7 +92,8 @@ pub use aws_transcribe::{
 // Re-export AmiVoice implementation
 pub use amivoice::{
     AMIVOICE_HTTP_NOLOG_URL, AMIVOICE_HTTP_URL, AMIVOICE_WS_NOLOG_URL, AMIVOICE_WS_URL,
-    AmiVoiceAudioFormat, AmiVoiceEngine, AmiVoiceSTT, AmiVoiceSTTConfig, DEFAULT_ENGINE as AMIVOICE_DEFAULT_ENGINE,
+    AmiVoiceAudioFormat, AmiVoiceEngine, AmiVoiceSTT, AmiVoiceSTTConfig,
+    DEFAULT_ENGINE as AMIVOICE_DEFAULT_ENGINE,
 };
 
 // Re-export IBM Watson implementation
@@ -116,181 +116,167 @@ pub use groq::{
 pub use gnani::{
     DecodeError as GnaniDecodeError, GnaniAudioFormat, GnaniGrpcError, GnaniLanguage, GnaniSTT,
     GnaniSTTConfig, SpeechChunk as GnaniSpeechChunk, StreamingError as GnaniStreamingError,
-    StreamingRecognitionResponse as GnaniStreamingResponse, TranscriptChunk as GnaniTranscriptChunk,
+    StreamingRecognitionResponse as GnaniStreamingResponse,
+    TranscriptChunk as GnaniTranscriptChunk,
 };
 
 // Re-export Sarvam.ai implementation
 pub use sarvam::{
-    SarvamSTT, SarvamSTTConfig, SARVAM_STT_WS_URL, SUPPORTED_LANGUAGES as SarvamSupportedLanguages,
+    SARVAM_STT_WS_URL, SUPPORTED_LANGUAGES as SarvamSupportedLanguages, SarvamSTT, SarvamSTTConfig,
 };
 
 // Re-export Speechmatics implementation
 pub use speechmatics::{
-    SpeechmaticsEncoding, SpeechmaticsLanguage, SpeechmaticsOperatingPoint, SpeechmaticsRegion,
-    SpeechmaticsSTT, SpeechmaticsSTTConfig, SPEECHMATICS_WS_URL_EU, SPEECHMATICS_WS_URL_US,
+    SPEECHMATICS_WS_URL_EU, SPEECHMATICS_WS_URL_US, SpeechmaticsEncoding, SpeechmaticsLanguage,
+    SpeechmaticsOperatingPoint, SpeechmaticsRegion, SpeechmaticsSTT, SpeechmaticsSTTConfig,
 };
 
 // Re-export Gladia implementation
 pub use gladia::{
-    GladiaBitDepth, GladiaEncoding, GladiaLanguageConfig, GladiaMessagesConfig, GladiaRegion,
-    GladiaSTT, GladiaSTTConfig, GLADIA_LIVE_URL,
+    GLADIA_LIVE_URL, GladiaBitDepth, GladiaEncoding, GladiaLanguageConfig, GladiaMessagesConfig,
+    GladiaRegion, GladiaSTT, GladiaSTTConfig,
 };
 
 // Re-export Rev AI implementation
-pub use revai::{
-    RevAISampleFormat, RevAISTT, RevAISTTConfig, RevAITranscriber, REVAI_STREAM_URL,
-};
+pub use revai::{REVAI_STREAM_URL, RevAISTT, RevAISTTConfig, RevAISampleFormat, RevAITranscriber};
 
 // Re-export Phonexia implementation
 pub use phonexia::{
-    PhonexiaAuth, PhonexiaResultType, PhonexiaSTT, PhonexiaSTTConfig, WEBSOCKET_PATH as PHONEXIA_WEBSOCKET_PATH,
+    PhonexiaAuth, PhonexiaResultType, PhonexiaSTT, PhonexiaSTTConfig,
+    WEBSOCKET_PATH as PHONEXIA_WEBSOCKET_PATH,
 };
 
 // Re-export Reverie implementation
 pub use reverie::{
-    ReverieAudioFormat, ReverieLanguage, ReverieLogging, ReverieSTT, ReverieSTTConfig,
-    REVERIE_STREAM_URL,
+    REVERIE_STREAM_URL, ReverieAudioFormat, ReverieLanguage, ReverieLogging, ReverieSTT,
+    ReverieSTTConfig,
 };
 
 // Re-export Yandex implementation
 pub use yandex::{
-    YandexSTT, YandexSTTAudioFormat, YandexSTTConfig, YandexSTTLanguage, YandexSTTModel,
-    YANDEX_STT_RECOGNIZE_URL,
+    YANDEX_STT_RECOGNIZE_URL, YandexSTT, YandexSTTAudioFormat, YandexSTTConfig, YandexSTTLanguage,
+    YandexSTTModel,
 };
 
 // Re-export Tinkoff implementation
 pub use tinkoff::{
-    TinkoffAudioEncoding, TinkoffGrpcError, TinkoffStt, TinkoffSttConfig, VadConfig as TinkoffVadConfig,
-    GRPC_SERVICE_PATH as TINKOFF_GRPC_SERVICE_PATH, TINKOFF_GRPC_ENDPOINT,
+    GRPC_SERVICE_PATH as TINKOFF_GRPC_SERVICE_PATH, TINKOFF_GRPC_ENDPOINT, TinkoffAudioEncoding,
+    TinkoffGrpcError, TinkoffStt, TinkoffSttConfig, VadConfig as TinkoffVadConfig,
 };
 
 // Re-export SberDevices implementation
 pub use sberdevices::{
-    SberDevicesSTT, SberSTTConfig, SberSTTAudioFormat, SberSTTLanguage, SberScope,
     OAUTH_ENDPOINT as SBER_OAUTH_ENDPOINT, STT_RECOGNIZE_ENDPOINT as SBER_STT_ENDPOINT,
+    SberDevicesSTT, SberSTTAudioFormat, SberSTTConfig, SberSTTLanguage, SberScope,
 };
 
 // Re-export Bhashini implementation
 pub use bhashini::{
-    BhashiniStt, BhashiniSttConfig, BhashiniLanguage, BhashiniAudioFormat, BhashiniPipelineProvider,
-    LanguageFamily as BhashiniLanguageFamily,
-    BHASHINI_CONFIG_URL, BHASHINI_COMPUTE_URL, MEITY_PIPELINE_ID, AI4BHARAT_PIPELINE_ID,
+    AI4BHARAT_PIPELINE_ID, BHASHINI_COMPUTE_URL, BHASHINI_CONFIG_URL, BhashiniAudioFormat,
+    BhashiniLanguage, BhashiniPipelineProvider, BhashiniStt, BhashiniSttConfig,
+    LanguageFamily as BhashiniLanguageFamily, MEITY_PIPELINE_ID,
 };
 
 // Re-export iFlytek implementation
 pub use iflytek::{
-    IFlytekStt, IFlytekSttConfig, IFlytekLanguage, IFlytekAudioEncoding, IFlytekAsrDomain,
-    IFlytekAsrMode, IFlytekAuth, IFlytekErrorCode, DataStatus as IFlytekDataStatus,
-    IFLYTEK_IAT_ENDPOINT, IFLYTEK_IST_ENDPOINT, IFLYTEK_IAT_HOST, IFLYTEK_IST_HOST,
-    DEFAULT_SAMPLE_RATE as IFLYTEK_DEFAULT_SAMPLE_RATE,
-    DEFAULT_FRAME_SIZE as IFLYTEK_DEFAULT_FRAME_SIZE,
     DEFAULT_FRAME_INTERVAL_MS as IFLYTEK_FRAME_INTERVAL_MS,
-    MAX_SHORT_FORM_DURATION_SECS as IFLYTEK_MAX_SHORT_DURATION,
+    DEFAULT_FRAME_SIZE as IFLYTEK_DEFAULT_FRAME_SIZE,
+    DEFAULT_SAMPLE_RATE as IFLYTEK_DEFAULT_SAMPLE_RATE, DataStatus as IFlytekDataStatus,
+    IFLYTEK_IAT_ENDPOINT, IFLYTEK_IAT_HOST, IFLYTEK_IST_ENDPOINT, IFLYTEK_IST_HOST,
+    IFlytekAsrDomain, IFlytekAsrMode, IFlytekAudioEncoding, IFlytekAuth, IFlytekErrorCode,
+    IFlytekLanguage, IFlytekStt, IFlytekSttConfig,
     MAX_REALTIME_DURATION_SECS as IFLYTEK_MAX_REALTIME_DURATION,
+    MAX_SHORT_FORM_DURATION_SECS as IFLYTEK_MAX_SHORT_DURATION,
 };
 
 // Re-export Baidu implementation
 pub use baidu::{
-    BaiduStt, BaiduSttConfig, BaiduSttModel, BaiduAudioFormat, BaiduSampleRate, BaiduErrorCode,
-    BaiduStartFrame, BaiduFinishFrame, BaiduCancelFrame, BaiduRealtimeResponse,
-    BaiduShortAsrRequest, BaiduShortAsrResponse, BaiduOAuthResponse, BaiduOAuthError,
     BAIDU_OAUTH_URL, BAIDU_REALTIME_ASR_URL, BAIDU_SHORT_ASR_URL, BAIDU_SHORT_ASR_URL_HTTPS,
-    DEFAULT_MODEL as BAIDU_DEFAULT_MODEL,
+    BaiduAudioFormat, BaiduCancelFrame, BaiduErrorCode, BaiduFinishFrame, BaiduOAuthError,
+    BaiduOAuthResponse, BaiduRealtimeResponse, BaiduSampleRate, BaiduShortAsrRequest,
+    BaiduShortAsrResponse, BaiduStartFrame, BaiduStt, BaiduSttConfig, BaiduSttModel,
+    DEFAULT_AUDIO_FORMAT as BAIDU_DEFAULT_AUDIO_FORMAT, DEFAULT_MODEL as BAIDU_DEFAULT_MODEL,
     DEFAULT_SAMPLE_RATE as BAIDU_DEFAULT_SAMPLE_RATE,
-    DEFAULT_AUDIO_FORMAT as BAIDU_DEFAULT_AUDIO_FORMAT,
-    TOKEN_VALIDITY_SECS as BAIDU_TOKEN_VALIDITY_SECS,
-    RECOMMENDED_CHUNK_DURATION_MS as BAIDU_CHUNK_DURATION_MS,
-    MAX_SHORT_AUDIO_DURATION_SECS as BAIDU_MAX_SHORT_DURATION,
     MAX_REALTIME_AUDIO_DURATION_SECS as BAIDU_MAX_REALTIME_DURATION,
+    MAX_SHORT_AUDIO_DURATION_SECS as BAIDU_MAX_SHORT_DURATION,
+    RECOMMENDED_CHUNK_DURATION_MS as BAIDU_CHUNK_DURATION_MS,
+    TOKEN_VALIDITY_SECS as BAIDU_TOKEN_VALIDITY_SECS,
 };
 
 // Re-export Tencent implementation
 pub use tencent::{
-    TencentStt, TencentSttConfig, TencentEngineModel, TencentAudioFormat, TencentWordInfo,
-    TencentAsrResponse, TencentAsrResult, TencentWord, TencentAsrErrorCode, TencentSliceType,
-    TencentSignatureBuilder, SignatureError as TencentSignatureError,
-    TENCENT_ASR_WS_URL,
     DEFAULT_ENGINE_MODEL as TENCENT_DEFAULT_ENGINE_MODEL,
-    DEFAULT_VOICE_FORMAT as TENCENT_DEFAULT_VOICE_FORMAT,
     DEFAULT_SAMPLE_RATE as TENCENT_DEFAULT_SAMPLE_RATE,
+    DEFAULT_VOICE_FORMAT as TENCENT_DEFAULT_VOICE_FORMAT,
     RECOMMENDED_CHUNK_DURATION_MS as TENCENT_CHUNK_DURATION_MS,
     SIGNATURE_VALIDITY_SECS as TENCENT_SIGNATURE_VALIDITY_SECS,
+    SignatureError as TencentSignatureError, TENCENT_ASR_WS_URL, TencentAsrErrorCode,
+    TencentAsrResponse, TencentAsrResult, TencentAudioFormat, TencentEngineModel,
+    TencentSignatureBuilder, TencentSliceType, TencentStt, TencentSttConfig, TencentWord,
+    TencentWordInfo, VAD_SILENCE_TIME_MAX as TENCENT_VAD_SILENCE_MAX,
     VAD_SILENCE_TIME_MIN as TENCENT_VAD_SILENCE_MIN,
-    VAD_SILENCE_TIME_MAX as TENCENT_VAD_SILENCE_MAX,
 };
 
 // Re-export Huawei Cloud implementation
 pub use huawei_cloud::{
-    HuaweiCloudStt, HuaweiCloudSttConfig, HuaweiCloudSttModel, HuaweiCloudAudioFormat,
-    HuaweiCloudRegion, HuaweiCloudAsrMode, HuaweiTokenManager,
-    HuaweiStartFrame, HuaweiEndFrame, HuaweiCancelFrame, HuaweiRealtimeResponse,
-    HuaweiShortAsrRequest, HuaweiShortAsrResponse, HuaweiAsrResult as HuaweiAsrResultType,
-    HuaweiSisErrorCode, HuaweiResponseType, HuaweiWordInfo as HuaweiWordInfoType,
-    SIS_CHINA_ENDPOINT_FORMAT, SIS_INTL_ENDPOINT_FORMAT,
-    DEFAULT_MODEL as HUAWEI_DEFAULT_MODEL,
-    DEFAULT_SAMPLE_RATE as HUAWEI_DEFAULT_SAMPLE_RATE,
-    DEFAULT_AUDIO_FORMAT as HUAWEI_DEFAULT_AUDIO_FORMAT,
-    TOKEN_VALIDITY_SECS as HUAWEI_TOKEN_VALIDITY_SECS,
-    RECOMMENDED_CHUNK_DURATION_MS as HUAWEI_CHUNK_DURATION_MS,
+    DEFAULT_AUDIO_FORMAT as HUAWEI_DEFAULT_AUDIO_FORMAT, DEFAULT_MODEL as HUAWEI_DEFAULT_MODEL,
+    DEFAULT_SAMPLE_RATE as HUAWEI_DEFAULT_SAMPLE_RATE, HuaweiAsrResult as HuaweiAsrResultType,
+    HuaweiCancelFrame, HuaweiCloudAsrMode, HuaweiCloudAudioFormat, HuaweiCloudRegion,
+    HuaweiCloudStt, HuaweiCloudSttConfig, HuaweiCloudSttModel, HuaweiEndFrame,
+    HuaweiRealtimeResponse, HuaweiResponseType, HuaweiShortAsrRequest, HuaweiShortAsrResponse,
+    HuaweiSisErrorCode, HuaweiStartFrame, HuaweiTokenManager, HuaweiWordInfo as HuaweiWordInfoType,
+    MAX_CONTINUOUS_DURATION_SECS as HUAWEI_MAX_CONTINUOUS_DURATION,
     MAX_SHORT_AUDIO_DURATION_SECS as HUAWEI_MAX_SHORT_DURATION,
     MAX_STREAMING_DURATION_SECS as HUAWEI_MAX_STREAMING_DURATION,
-    MAX_CONTINUOUS_DURATION_SECS as HUAWEI_MAX_CONTINUOUS_DURATION,
+    RECOMMENDED_CHUNK_DURATION_MS as HUAWEI_CHUNK_DURATION_MS, SIS_CHINA_ENDPOINT_FORMAT,
+    SIS_INTL_ENDPOINT_FORMAT, TOKEN_VALIDITY_SECS as HUAWEI_TOKEN_VALIDITY_SECS,
 };
 
 // Re-export NAVER CLOVA implementation
 pub use naver_clova::{
-    NaverClovaStt, NaverClovaSttConfig, NaverClovaLanguage, NaverClovaAudioFormat,
-    NaverClovaSttResponse, NaverClovaErrorResponse,
-    NAVER_CSR_ENDPOINT,
     DEFAULT_SAMPLE_RATE as NAVER_DEFAULT_SAMPLE_RATE,
-    MIN_SAMPLE_RATE as NAVER_MIN_SAMPLE_RATE,
     MAX_AUDIO_DURATION_SECONDS as NAVER_MAX_AUDIO_DURATION,
+    MIN_SAMPLE_RATE as NAVER_MIN_SAMPLE_RATE, NAVER_CSR_ENDPOINT, NaverClovaAudioFormat,
+    NaverClovaErrorResponse, NaverClovaLanguage, NaverClovaStt, NaverClovaSttConfig,
+    NaverClovaSttResponse,
 };
 
 // Re-export FPT.AI implementation
 pub use fpt_ai::{
-    FptStt, FptSttConfig, FptSttResponse, FptSttHypothesis,
-    FPT_STT_ENDPOINT,
-    DEFAULT_REQUEST_TIMEOUT as FPT_DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_REQUEST_TIMEOUT as FPT_DEFAULT_REQUEST_TIMEOUT, FPT_STT_ENDPOINT, FptStt, FptSttConfig,
+    FptSttHypothesis, FptSttResponse, MAX_AUDIO_DURATION_MS as FPT_MAX_AUDIO_DURATION_MS,
     MIN_AUDIO_DURATION_MS as FPT_MIN_AUDIO_DURATION_MS,
-    MAX_AUDIO_DURATION_MS as FPT_MAX_AUDIO_DURATION_MS,
 };
 
 // Re-export Viettel AI implementation
 pub use viettel_ai::{
-    ViettelStt, ViettelSttConfig, ViettelSttResponse,
-    VIETTEL_STT_ENDPOINT,
-    DEFAULT_REQUEST_TIMEOUT as VIETTEL_DEFAULT_REQUEST_TIMEOUT,
-    DEFAULT_SAMPLE_RATE as VIETTEL_DEFAULT_SAMPLE_RATE,
     DEFAULT_CHANNELS as VIETTEL_DEFAULT_CHANNELS,
-    PCM_FORMAT_S16LE as VIETTEL_PCM_FORMAT,
+    DEFAULT_REQUEST_TIMEOUT as VIETTEL_DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_SAMPLE_RATE as VIETTEL_DEFAULT_SAMPLE_RATE, PCM_FORMAT_S16LE as VIETTEL_PCM_FORMAT,
+    VIETTEL_STT_ENDPOINT, ViettelStt, ViettelSttConfig, ViettelSttResponse,
 };
 
 // Re-export Prosa.ai implementation
 pub use prosa_ai::{
-    ProsaStt, ProsaSttConfig, ProsaSttModel, ProsaAudioFormat, ProsaSttResponse,
-    ProsaSttResult, ProsaSttSegment, ProsaSttWsMessage,
-    PROSA_STT_BASE_URL, PROSA_STT_WS_ENDPOINT,
-    DEFAULT_SAMPLE_RATE as PROSA_DEFAULT_SAMPLE_RATE,
-    DEFAULT_CHANNELS as PROSA_DEFAULT_CHANNELS,
-    DEFAULT_CHUNK_SIZE as PROSA_DEFAULT_CHUNK_SIZE,
+    DEFAULT_CHANNELS as PROSA_DEFAULT_CHANNELS, DEFAULT_CHUNK_SIZE as PROSA_DEFAULT_CHUNK_SIZE,
     DEFAULT_REQUEST_TIMEOUT as PROSA_DEFAULT_REQUEST_TIMEOUT,
-    MIN_AUDIO_BUFFER_SIZE as PROSA_MIN_AUDIO_BUFFER_SIZE,
-    MAX_SYNC_DURATION_SECS as PROSA_MAX_SYNC_DURATION,
-    MAX_SYNC_SIZE_BYTES as PROSA_MAX_SYNC_SIZE,
+    DEFAULT_SAMPLE_RATE as PROSA_DEFAULT_SAMPLE_RATE,
     MAX_ASYNC_DURATION_SECS as PROSA_MAX_ASYNC_DURATION,
+    MAX_SYNC_DURATION_SECS as PROSA_MAX_SYNC_DURATION, MAX_SYNC_SIZE_BYTES as PROSA_MAX_SYNC_SIZE,
+    MIN_AUDIO_BUFFER_SIZE as PROSA_MIN_AUDIO_BUFFER_SIZE, PROSA_STT_BASE_URL,
+    PROSA_STT_WS_ENDPOINT, ProsaAudioFormat, ProsaStt, ProsaSttConfig, ProsaSttModel,
+    ProsaSttResponse, ProsaSttResult, ProsaSttSegment, ProsaSttWsMessage,
 };
 
 // Re-export NECTEC AI for Thai implementation
 pub use nectec::{
-    NectecStt, NectecSttConfig, NectecSttError, NectecSttModel,
-    Partii4OutputFormat, Partii4OutputLevel, Partii4Response, Partii5Response,
-    PARTII4_ENDPOINT, PARTII5_ENDPOINT, API_KEY_HEADER as NECTEC_API_KEY_HEADER,
-    DEFAULT_SAMPLE_RATE as NECTEC_DEFAULT_SAMPLE_RATE,
-    DEFAULT_CHANNELS as NECTEC_DEFAULT_CHANNELS,
+    API_KEY_HEADER as NECTEC_API_KEY_HEADER, DEFAULT_CHANNELS as NECTEC_DEFAULT_CHANNELS,
     DEFAULT_REQUEST_TIMEOUT as NECTEC_DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_SAMPLE_RATE as NECTEC_DEFAULT_SAMPLE_RATE,
     MAX_AUDIO_DURATION_MS as NECTEC_MAX_AUDIO_DURATION_MS,
-    MAX_AUDIO_SIZE_BYTES as NECTEC_MAX_AUDIO_SIZE_BYTES,
+    MAX_AUDIO_SIZE_BYTES as NECTEC_MAX_AUDIO_SIZE_BYTES, NectecStt, NectecSttConfig,
+    NectecSttError, NectecSttModel, PARTII4_ENDPOINT, PARTII5_ENDPOINT, Partii4OutputFormat,
+    Partii4OutputLevel, Partii4Response, Partii5Response,
 };
 
 /// Supported STT providers
@@ -400,12 +386,10 @@ impl std::str::FromStr for STTProvider {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "alibaba-cloud" | "alibaba_cloud" | "alibabacloud" | "alibaba" | "dashscope" | "aliyun" | "阿里云" | "qwen-asr" => {
-                Ok(STTProvider::AlibabaCloud)
-            }
-            "baidu" | "baidu-ai" | "baidu_ai" | "baiduai" | "百度" | "百度语音" | "baidu-speech" | "baidu_speech" => {
-                Ok(STTProvider::Baidu)
-            }
+            "alibaba-cloud" | "alibaba_cloud" | "alibabacloud" | "alibaba" | "dashscope"
+            | "aliyun" | "阿里云" | "qwen-asr" => Ok(STTProvider::AlibabaCloud),
+            "baidu" | "baidu-ai" | "baidu_ai" | "baiduai" | "百度" | "百度语音"
+            | "baidu-speech" | "baidu_speech" => Ok(STTProvider::Baidu),
             "deepgram" => Ok(STTProvider::Deepgram),
             "google" => Ok(STTProvider::Google),
             "elevenlabs" => Ok(STTProvider::ElevenLabs),
@@ -432,33 +416,24 @@ impl std::str::FromStr for STTProvider {
             "tinkoff" | "tinkoff-stt" | "tinkoff_stt" | "voicekit" | "tinkoff-voicekit" => {
                 Ok(STTProvider::Tinkoff)
             }
-            "sberdevices" | "sber" | "sber-devices" | "sber_devices" | "salutespeech" | "salute-speech" | "smartspeech" => {
-                Ok(STTProvider::SberDevices)
-            }
+            "sberdevices" | "sber" | "sber-devices" | "sber_devices" | "salutespeech"
+            | "salute-speech" | "smartspeech" => Ok(STTProvider::SberDevices),
             "tencent" | "tencent-cloud" | "tencent_cloud" | "tencentcloud" | "腾讯云" | "腾讯" => {
                 Ok(STTProvider::Tencent)
             }
-            "huawei-cloud" | "huawei_cloud" | "huaweicloud" | "huawei" | "华为云" | "华为" | "sis" | "huawei-sis" => {
-                Ok(STTProvider::HuaweiCloud)
-            }
-            "naver-clova" | "naver_clova" | "naverclova" | "naver" | "clova" | "csr" | "네이버" | "클로바" => {
-                Ok(STTProvider::NaverClova)
-            }
-            "bhashini" | "ulca" | "ai4bharat" | "meity" => {
-                Ok(STTProvider::Bhashini)
-            }
+            "huawei-cloud" | "huawei_cloud" | "huaweicloud" | "huawei" | "华为云" | "华为"
+            | "sis" | "huawei-sis" => Ok(STTProvider::HuaweiCloud),
+            "naver-clova" | "naver_clova" | "naverclova" | "naver" | "clova" | "csr" | "네이버"
+            | "클로바" => Ok(STTProvider::NaverClova),
+            "bhashini" | "ulca" | "ai4bharat" | "meity" => Ok(STTProvider::Bhashini),
             "iflytek" | "ifly" | "xfyun" | "xunfei" | "科大讯飞" | "讯飞" => {
                 Ok(STTProvider::IFlytek)
             }
-            "fpt-ai" | "fpt_ai" | "fptai" | "fpt" => {
-                Ok(STTProvider::FptAi)
-            }
+            "fpt-ai" | "fpt_ai" | "fptai" | "fpt" => Ok(STTProvider::FptAi),
             "viettel-ai" | "viettel_ai" | "viettelai" | "viettel" | "vtai" => {
                 Ok(STTProvider::ViettelAi)
             }
-            "prosa-ai" | "prosa_ai" | "prosai" | "prosa" | "prosa.ai" => {
-                Ok(STTProvider::ProsaAi)
-            }
+            "prosa-ai" | "prosa_ai" | "prosai" | "prosa" | "prosa.ai" => Ok(STTProvider::ProsaAi),
             "nectec" | "aiforthai" | "ai4thai" | "partii" | "partii5" | "partii4" => {
                 Ok(STTProvider::Nectec)
             }

@@ -122,14 +122,15 @@ impl TinkoffStt {
             let client = TinkoffGrpcClient::new(channel, config_clone);
 
             // Start streaming
-            let (grpc_audio_tx, mut result_rx) = match client.start_streaming(streaming_config).await {
-                Ok(streams) => streams,
-                Err(e) => {
-                    error!("Failed to start Tinkoff streaming: {}", e);
-                    let _ = error_tx.try_send(e);
-                    return;
-                }
-            };
+            let (grpc_audio_tx, mut result_rx) =
+                match client.start_streaming(streaming_config).await {
+                    Ok(streams) => streams,
+                    Err(e) => {
+                        error!("Failed to start Tinkoff streaming: {}", e);
+                        let _ = error_tx.try_send(e);
+                        return;
+                    }
+                };
 
             info!("Connected to Tinkoff VoiceKit STT");
 
@@ -260,8 +261,8 @@ impl BaseSTT for TinkoffStt {
     where
         Self: Sized,
     {
-        let tinkoff_config = TinkoffSttConfig::from_base(config)
-            .map_err(STTError::ConfigurationError)?;
+        let tinkoff_config =
+            TinkoffSttConfig::from_base(config).map_err(STTError::ConfigurationError)?;
 
         Ok(Self {
             config: Some(tinkoff_config),
@@ -369,8 +370,8 @@ impl BaseSTT for TinkoffStt {
             self.disconnect().await?;
         }
 
-        let tinkoff_config = TinkoffSttConfig::from_base(config)
-            .map_err(STTError::ConfigurationError)?;
+        let tinkoff_config =
+            TinkoffSttConfig::from_base(config).map_err(STTError::ConfigurationError)?;
 
         self.config = Some(tinkoff_config);
         self.connect().await?;

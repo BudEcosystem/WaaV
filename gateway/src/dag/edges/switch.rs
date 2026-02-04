@@ -71,10 +71,12 @@ impl SwitchMatcher {
         let mut current = data;
 
         for segment in &self.field_segments {
-            current = current.get(segment).ok_or_else(|| DAGError::FieldExtractionError {
-                field: self.field_segments.join("."),
-                error: format!("Field '{}' not found", segment),
-            })?;
+            current = current
+                .get(segment)
+                .ok_or_else(|| DAGError::FieldExtractionError {
+                    field: self.field_segments.join("."),
+                    error: format!("Field '{}' not found", segment),
+                })?;
         }
 
         Ok(current.clone())
@@ -120,8 +122,8 @@ mod tests {
 
     #[test]
     fn test_switch_nested_field() {
-        let matcher = SwitchMatcher::new("stt_result.language")
-            .add_case("en-US", "english_handler");
+        let matcher =
+            SwitchMatcher::new("stt_result.language").add_case("en-US", "english_handler");
 
         let data = json!({
             "stt_result": {
@@ -146,8 +148,7 @@ mod tests {
 
     #[test]
     fn test_switch_no_match() {
-        let matcher = SwitchMatcher::new("language")
-            .add_case("en-US", "english_handler");
+        let matcher = SwitchMatcher::new("language").add_case("en-US", "english_handler");
 
         let data = json!({ "language": "fr-FR" });
         let result = matcher.match_value(&data).unwrap();
@@ -167,8 +168,7 @@ mod tests {
 
     #[test]
     fn test_switch_missing_field() {
-        let matcher = SwitchMatcher::new("missing_field")
-            .add_case("value", "handler");
+        let matcher = SwitchMatcher::new("missing_field").add_case("value", "handler");
 
         let data = json!({ "other_field": "value" });
         let result = matcher.match_value(&data);
@@ -177,8 +177,7 @@ mod tests {
 
     #[test]
     fn test_has_match() {
-        let matcher = SwitchMatcher::new("language")
-            .add_case("en-US", "handler");
+        let matcher = SwitchMatcher::new("language").add_case("en-US", "handler");
 
         let data1 = json!({ "language": "en-US" });
         assert!(matcher.has_match(&data1));

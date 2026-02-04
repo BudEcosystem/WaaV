@@ -4,11 +4,13 @@
 //! using HTTP streaming for real-time audio synthesis.
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use tracing::{debug, info};
 
-use super::config::{SpeechifyStreamRequest, SpeechifyTtsConfig, SpeechifyVoice, SpeechifyVoicesResponse};
 use super::SPEECHIFY_VOICES_URL;
+use super::config::{
+    SpeechifyStreamRequest, SpeechifyTtsConfig, SpeechifyVoice, SpeechifyVoicesResponse,
+};
 use crate::core::tts::base::{BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult};
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
 
@@ -201,9 +203,7 @@ impl BaseTTS for SpeechifyTts {
 
         info!(
             "Creating Speechify TTS provider: voice={}, model={}, format={}",
-            speechify_config.voice_id,
-            speechify_config.model,
-            speechify_config.audio_format
+            speechify_config.voice_id, speechify_config.model, speechify_config.audio_format
         );
 
         Ok(Self {
@@ -307,7 +307,9 @@ mod tests {
         assert!(result.is_err());
 
         if let Err(TTSError::InvalidConfiguration(msg)) = result {
-            assert!(msg.contains("API") || msg.contains("api_key") || msg.contains("SPEECHIFY_API_KEY"));
+            assert!(
+                msg.contains("API") || msg.contains("api_key") || msg.contains("SPEECHIFY_API_KEY")
+            );
         } else {
             panic!("Expected InvalidConfiguration error");
         }

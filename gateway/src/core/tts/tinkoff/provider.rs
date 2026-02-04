@@ -2,15 +2,15 @@
 //!
 //! Implements the BaseTTS trait for Tinkoff's gRPC-based Text-to-Speech service.
 
-use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::sync::Arc;
 use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, warn};
 
 use super::config::TinkoffTtsConfig;
-use super::grpc::{create_tinkoff_tts_channel, TinkoffTtsGrpcClient};
-use super::messages::{SynthesizeSpeechRequest, StreamingSynthesizeSpeechResponse};
+use super::grpc::{TinkoffTtsGrpcClient, create_tinkoff_tts_channel};
+use super::messages::{StreamingSynthesizeSpeechResponse, SynthesizeSpeechRequest};
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
 };
@@ -84,28 +84,26 @@ impl TinkoffTts {
 
         while let Some(result) = stream.next().await {
             match result {
-                Ok(data) => {
-                    match StreamingSynthesizeSpeechResponse::decode(&data) {
-                        Ok(response) => {
-                            if !response.audio_chunk.is_empty() {
-                                let audio_data = AudioData {
-                                    data: response.audio_chunk.to_vec(),
-                                    sample_rate,
-                                    format: format.clone(),
-                                    duration_ms: None,
-                                };
+                Ok(data) => match StreamingSynthesizeSpeechResponse::decode(&data) {
+                    Ok(response) => {
+                        if !response.audio_chunk.is_empty() {
+                            let audio_data = AudioData {
+                                data: response.audio_chunk.to_vec(),
+                                sample_rate,
+                                format: format.clone(),
+                                duration_ms: None,
+                            };
 
-                                let callback_guard = callback_ref.read().await;
-                                if let Some(callback) = callback_guard.as_ref() {
-                                    callback.on_audio(audio_data).await;
-                                }
+                            let callback_guard = callback_ref.read().await;
+                            if let Some(callback) = callback_guard.as_ref() {
+                                callback.on_audio(audio_data).await;
                             }
                         }
-                        Err(e) => {
-                            warn!(error = %e, "Failed to decode streaming response");
-                        }
                     }
-                }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to decode streaming response");
+                    }
+                },
                 Err(status) => {
                     let error = super::grpc::grpc_status_to_tts_error(status);
                     let callback_guard = callback_ref.read().await;
@@ -446,7 +444,10 @@ mod tests {
     }
 
     impl AudioCallback for MockAudioCallback {
-        fn on_audio(&self, _audio_data: AudioData) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        fn on_audio(
+            &self,
+            _audio_data: AudioData,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             self.audio_count.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {})
         }

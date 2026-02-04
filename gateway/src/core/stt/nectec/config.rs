@@ -442,10 +442,12 @@ mod tests {
     fn test_config_validation_empty_key() {
         let config = NectecSttConfig::default();
         assert!(config.validate().is_err());
-        assert!(config
-            .validate()
-            .unwrap_err()
-            .contains("API key is required"));
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("API key is required")
+        );
     }
 
     #[test]
@@ -456,10 +458,7 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_err());
-        assert!(config
-            .validate()
-            .unwrap_err()
-            .contains("16kHz sample rate"));
+        assert!(config.validate().unwrap_err().contains("16kHz sample rate"));
     }
 
     #[test]

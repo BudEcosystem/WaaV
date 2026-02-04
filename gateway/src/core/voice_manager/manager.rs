@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use tokio::sync::{Notify, RwLock};
 use tokio::time::Duration;
-use tracing::{debug, trace, warn};
+use tracing::debug;
 
 use crate::core::cache::store::CacheStore;
 use crate::core::{
@@ -22,7 +22,7 @@ use crate::core::{
 };
 
 #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
-use crate::core::smart_turn::{SmartTurnProcessor, SmartTurnProcessResult};
+use crate::core::smart_turn::{SmartTurnProcessResult, SmartTurnProcessor};
 
 use super::{
     callbacks::{
@@ -380,41 +380,59 @@ impl VoiceManager {
     /// # }
     /// ```
     pub async fn receive_audio(&self, audio: Bytes) -> VoiceManagerResult<()> {
-        // Process audio through Smart Turn Processor if enabled
+        // CRITICAL: Audio MUST always reach STT provider for real-time guarantees.
+        // Smart turn processing is optional - skip if lock is busy to avoid blocking.
+
+        // Process audio through Smart Turn Processor if enabled AND lock is available
         #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
         {
-            let mut smart_turn_guard = self.smart_turn_processor.write().await;
-            if let Some(ref mut processor) = *smart_turn_guard {
-                // Convert bytes to f32 samples (assuming 16-bit PCM)
-                let samples = self.bytes_to_f32_samples(&audio);
+            // Use try_write() to avoid blocking the audio hot path
+            // If another frame is being processed, skip smart turn for this frame
+            // This ensures audio forwarding is never delayed by ML inference (~20ms)
+            match self.smart_turn_processor.try_write() {
+                Ok(mut smart_turn_guard) => {
+                    if let Some(ref mut processor) = *smart_turn_guard {
+                        // Convert bytes to f32 samples (assuming 16-bit PCM)
+                        let samples = self.bytes_to_f32_samples(&audio);
 
-                // Process through smart turn detector
-                match processor.process_audio(&samples).await {
-                    Ok(result) => {
-                        // If turn was detected, call the callback
-                        if result.is_turn_complete {
-                            trace!(
-                                "Smart turn detected: prob={:.3}, silence={}ms",
-                                result.probability,
-                                result.silence_duration_ms
-                            );
+                        // Process through smart turn detector
+                        match processor.process_audio(&samples).await {
+                            Ok(result) => {
+                                // If turn was detected, call the callback
+                                if result.is_turn_complete {
+                                    debug!(
+                                        "Smart turn detected: prob={:.3}, silence={}ms",
+                                        result.probability, result.silence_duration_ms
+                                    );
 
-                            let callback_opt = self.smart_turn_callback.read().clone();
-                            if let Some(callback) = callback_opt {
-                                // Drop the lock before calling callback to avoid deadlock
-                                drop(smart_turn_guard);
-                                callback(result).await;
+                                    let callback_opt = self.smart_turn_callback.read().clone();
+                                    if let Some(callback) = callback_opt {
+                                        // Drop the lock before calling callback to avoid deadlock
+                                        drop(smart_turn_guard);
+                                        callback(result).await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!("Smart turn processing error: {}", e);
                             }
                         }
                     }
-                    Err(e) => {
-                        warn!("Smart turn processing error: {}", e);
-                    }
+                }
+                Err(_) => {
+                    // Smart turn lock is contended - ML inference is in progress on another frame.
+                    // This is expected under high load. Log at trace level to enable monitoring
+                    // without flooding logs. Audio will still be sent to STT below.
+                    // Turn detection may be slightly delayed but audio latency is preserved.
+                    tracing::trace!(
+                        "Smart turn lock contended, skipping frame. Audio forwarding continues."
+                    );
                 }
             }
         }
 
         // Send audio to STT provider (zero-copy pass-through)
+        // This ALWAYS happens regardless of smart turn processing result
         let mut stt = self.stt.write().await;
         stt.send_audio(audio)
             .await
@@ -1145,6 +1163,59 @@ impl VoiceManager {
     pub async fn get_tts_provider_info(&self) -> serde_json::Value {
         let tts = self.tts.read().await;
         tts.get_provider_info()
+    }
+
+    /// Finalize the STT stream to signal end of audio input.
+    ///
+    /// This method disconnects and immediately reconnects the STT provider,
+    /// which triggers the CloseStream message to be sent. For providers like
+    /// Deepgram, this causes them to finalize any pending transcripts and
+    /// send `speech_final=true`.
+    ///
+    /// # Returns
+    /// * `VoiceManagerResult<()>` - Success or error
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # use waav_gateway::core::voice_manager::{VoiceManager, VoiceManagerConfig};
+    /// # use waav_gateway::core::stt::STTConfig;
+    /// # use waav_gateway::core::tts::TTSConfig;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let config = VoiceManagerConfig::new(STTConfig::default(), TTSConfig::default());
+    /// # let voice_manager = VoiceManager::new(config, None)?;
+    /// // After sending all audio...
+    /// voice_manager.finalize_stt().await?;
+    /// // Wait for final transcripts to arrive
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn finalize_stt(&self) -> VoiceManagerResult<()> {
+        tracing::info!("Finalizing STT stream - sending CloseStream signal");
+
+        // Disconnect STT to trigger CloseStream message
+        // NOTE: The Deepgram implementation now waits for speech_final during disconnect,
+        // so the final transcripts should arrive before this returns
+        {
+            let mut stt = self.stt.write().await;
+            stt.disconnect()
+                .await
+                .map_err(VoiceManagerError::STTError)?;
+        }
+
+        // Small delay to ensure callbacks have processed the final results
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Reconnect STT for continued use
+        {
+            let mut stt = self.stt.write().await;
+            stt.connect()
+                .await
+                .map_err(VoiceManagerError::STTError)?;
+        }
+
+        tracing::info!("STT stream finalized and reconnected");
+        Ok(())
     }
 }
 

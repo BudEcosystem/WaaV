@@ -132,24 +132,12 @@ impl TtsRequest {
     }
 
     /// Create a minimal TTS request with default options.
-    pub fn simple(
-        app_id: &str,
-        voice: &str,
-        text: &str,
-    ) -> Self {
+    pub fn simple(app_id: &str, voice: &str, text: &str) -> Self {
         Self::new(
-            app_id,
-            voice,
-            "raw",
-            16000,
-            "UTF8",
-            50,  // Normal speed
-            50,  // Normal volume
-            50,  // Normal pitch
-            false,
-            0,
-            0,
-            text,
+            app_id, voice, "raw", 16000, "UTF8", 50, // Normal speed
+            50, // Normal volume
+            50, // Normal pitch
+            false, 0, 0, text,
         )
     }
 
@@ -224,10 +212,7 @@ impl TtsResponse {
 
     /// Check if this is the last response.
     pub fn is_last(&self) -> bool {
-        self.data
-            .as_ref()
-            .map(|d| d.is_last())
-            .unwrap_or(false)
+        self.data.as_ref().map(|d| d.is_last()).unwrap_or(false)
     }
 
     /// Decode and return the audio data.
@@ -354,7 +339,10 @@ mod tests {
 
         let response = TtsResponse::from_json(json).unwrap();
         assert!(!response.is_success());
-        assert_eq!(response.error_code(), IFlytekErrorCode::AuthorizationFailure);
+        assert_eq!(
+            response.error_code(),
+            IFlytekErrorCode::AuthorizationFailure
+        );
     }
 
     #[test]
@@ -397,17 +385,11 @@ mod tests {
     #[test]
     fn test_tts_request_business_params() {
         let request = TtsRequest::new(
-            "app_id",
-            "xiaoyan",
-            "lame",
-            8000,
-            "GBK",
-            30,  // Slow
-            80,  // Loud
-            70,  // High pitch
-            true,
-            1,   // Letter by letter
-            2,   // Read as value
+            "app_id", "xiaoyan", "lame", 8000, "GBK", 30, // Slow
+            80, // Loud
+            70, // High pitch
+            true, 1, // Letter by letter
+            2, // Read as value
             "Test",
         );
 

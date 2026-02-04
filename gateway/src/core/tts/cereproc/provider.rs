@@ -4,7 +4,7 @@
 //! using HTTP requests for audio synthesis with file URL download.
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -274,10 +274,9 @@ impl CereprocTts {
             .map_err(|e| TTSError::ConnectionFailed(format!("Failed to check credits: {}", e)))?;
 
         if response.status().is_success() {
-            let credit: super::messages::CreditResponse =
-                response.json().await.map_err(|e| {
-                    TTSError::ConnectionFailed(format!("Failed to parse credit response: {}", e))
-                })?;
+            let credit: super::messages::CreditResponse = response.json().await.map_err(|e| {
+                TTSError::ConnectionFailed(format!("Failed to parse credit response: {}", e))
+            })?;
             Ok(credit.total_available())
         } else {
             Err(TTSError::ConnectionFailed(
@@ -364,7 +363,11 @@ impl BaseTTS for CereprocTts {
         };
 
         // Execute request through generic provider
-        match self.provider.generic_speak(request_builder, text, flush).await {
+        match self
+            .provider
+            .generic_speak(request_builder, text, flush)
+            .await
+        {
             Ok(()) => Ok(()),
             Err(TTSError::AuthenticationFailed(_)) => {
                 // Token might have expired, retry with fresh token

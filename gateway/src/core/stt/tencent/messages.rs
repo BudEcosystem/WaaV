@@ -167,7 +167,10 @@ impl TencentAsrResult {
 
     /// Check if this result has word-level timestamps.
     pub fn has_word_timestamps(&self) -> bool {
-        self.word_list.as_ref().map(|w| !w.is_empty()).unwrap_or(false)
+        self.word_list
+            .as_ref()
+            .map(|w| !w.is_empty())
+            .unwrap_or(false)
     }
 
     /// Get duration in milliseconds.
@@ -483,7 +486,10 @@ mod tests {
         let response = TencentAsrResponse::from_json(json).unwrap();
 
         assert!(response.is_error());
-        assert_eq!(response.error_code(), TencentAsrErrorCode::AuthenticationFailure);
+        assert_eq!(
+            response.error_code(),
+            TencentAsrErrorCode::AuthenticationFailure
+        );
         assert!(response.get_error_message().unwrap().contains("4002"));
         assert!(response.get_transcript().is_none());
     }
@@ -649,19 +655,58 @@ mod tests {
 
     #[test]
     fn test_error_code_parsing() {
-        assert_eq!(TencentAsrErrorCode::from_code(0), TencentAsrErrorCode::Success);
-        assert_eq!(TencentAsrErrorCode::from_code(4001), TencentAsrErrorCode::InvalidParameters);
-        assert_eq!(TencentAsrErrorCode::from_code(4002), TencentAsrErrorCode::AuthenticationFailure);
-        assert_eq!(TencentAsrErrorCode::from_code(4003), TencentAsrErrorCode::ServiceNotActivated);
-        assert_eq!(TencentAsrErrorCode::from_code(4004), TencentAsrErrorCode::InsufficientQuota);
-        assert_eq!(TencentAsrErrorCode::from_code(4005), TencentAsrErrorCode::ServiceNotSupported);
-        assert_eq!(TencentAsrErrorCode::from_code(4006), TencentAsrErrorCode::AudioTooLong);
-        assert_eq!(TencentAsrErrorCode::from_code(4007), TencentAsrErrorCode::AudioDecodingFailed);
-        assert_eq!(TencentAsrErrorCode::from_code(4008), TencentAsrErrorCode::ClientUploadTimeout);
-        assert_eq!(TencentAsrErrorCode::from_code(5000), TencentAsrErrorCode::ServerError);
-        assert_eq!(TencentAsrErrorCode::from_code(5001), TencentAsrErrorCode::ServerBusy);
-        assert_eq!(TencentAsrErrorCode::from_code(5002), TencentAsrErrorCode::ServerTimeout);
-        assert_eq!(TencentAsrErrorCode::from_code(9999), TencentAsrErrorCode::Unknown(9999));
+        assert_eq!(
+            TencentAsrErrorCode::from_code(0),
+            TencentAsrErrorCode::Success
+        );
+        assert_eq!(
+            TencentAsrErrorCode::from_code(4001),
+            TencentAsrErrorCode::InvalidParameters
+        );
+        assert_eq!(
+            TencentAsrErrorCode::from_code(4002),
+            TencentAsrErrorCode::AuthenticationFailure
+        );
+        assert_eq!(
+            TencentAsrErrorCode::from_code(4003),
+            TencentAsrErrorCode::ServiceNotActivated
+        );
+        assert_eq!(
+            TencentAsrErrorCode::from_code(4004),
+            TencentAsrErrorCode::InsufficientQuota
+        );
+        assert_eq!(
+            TencentAsrErrorCode::from_code(4005),
+            TencentAsrErrorCode::ServiceNotSupported
+        );
+        assert_eq!(
+            TencentAsrErrorCode::from_code(4006),
+            TencentAsrErrorCode::AudioTooLong
+        );
+        assert_eq!(
+            TencentAsrErrorCode::from_code(4007),
+            TencentAsrErrorCode::AudioDecodingFailed
+        );
+        assert_eq!(
+            TencentAsrErrorCode::from_code(4008),
+            TencentAsrErrorCode::ClientUploadTimeout
+        );
+        assert_eq!(
+            TencentAsrErrorCode::from_code(5000),
+            TencentAsrErrorCode::ServerError
+        );
+        assert_eq!(
+            TencentAsrErrorCode::from_code(5001),
+            TencentAsrErrorCode::ServerBusy
+        );
+        assert_eq!(
+            TencentAsrErrorCode::from_code(5002),
+            TencentAsrErrorCode::ServerTimeout
+        );
+        assert_eq!(
+            TencentAsrErrorCode::from_code(9999),
+            TencentAsrErrorCode::Unknown(9999)
+        );
     }
 
     #[test]
@@ -675,7 +720,11 @@ mod tests {
     #[test]
     fn test_error_code_descriptions() {
         assert_eq!(TencentAsrErrorCode::Success.description(), "Success");
-        assert!(!TencentAsrErrorCode::InvalidParameters.description().is_empty());
+        assert!(
+            !TencentAsrErrorCode::InvalidParameters
+                .description()
+                .is_empty()
+        );
         assert!(!TencentAsrErrorCode::Unknown(1234).description().is_empty());
     }
 
@@ -711,9 +760,15 @@ mod tests {
     #[test]
     fn test_slice_type_parsing() {
         assert_eq!(TencentSliceType::from_value(0), TencentSliceType::Interim);
-        assert_eq!(TencentSliceType::from_value(1), TencentSliceType::SegmentEnd);
+        assert_eq!(
+            TencentSliceType::from_value(1),
+            TencentSliceType::SegmentEnd
+        );
         assert_eq!(TencentSliceType::from_value(2), TencentSliceType::Final);
-        assert_eq!(TencentSliceType::from_value(99), TencentSliceType::Unknown(99));
+        assert_eq!(
+            TencentSliceType::from_value(99),
+            TencentSliceType::Unknown(99)
+        );
     }
 
     #[test]

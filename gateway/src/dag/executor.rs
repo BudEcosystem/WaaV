@@ -130,7 +130,9 @@ impl DAGExecutor {
         ctx: &mut DAGContext,
     ) -> DAGResult<DAGData> {
         // Find position of start node in topo order
-        let start_pos = dag.topo_order.iter()
+        let start_pos = dag
+            .topo_order
+            .iter()
             .position(|&n| n == start)
             .ok_or(DAGError::InvalidStartNode)?;
 
@@ -170,7 +172,9 @@ impl DAGExecutor {
             let compiled_node = &dag.graph[node_idx];
 
             // Gather input from predecessors (with edge transforms applied)
-            let node_input = self.gather_inputs_with_transforms(dag, node_idx, &node_outputs, ctx).await?;
+            let node_input = self
+                .gather_inputs_with_transforms(dag, node_idx, &node_outputs, ctx)
+                .await?;
 
             // Skip if no input (conditional edge didn't match)
             if matches!(node_input, DAGData::Empty) && node_idx != start {
@@ -257,9 +261,9 @@ impl DAGExecutor {
         for node_idx in nodes_to_check {
             // Check if this node has other incoming edges besides from the router
             let incoming = dag.incoming_edges(node_idx);
-            let has_other_path = incoming.iter().any(|(source, _)| {
-                *source != router_idx && reachable_nodes.contains(source)
-            });
+            let has_other_path = incoming
+                .iter()
+                .any(|(source, _)| *source != router_idx && reachable_nodes.contains(source));
 
             if !has_other_path {
                 // This node is only reachable via the router, prune it
@@ -301,9 +305,9 @@ impl DAGExecutor {
         for (child_idx, _edge) in outgoing {
             // Check if child has other reachable incoming edges
             let incoming = dag.incoming_edges(child_idx);
-            let has_other_path = incoming.iter().any(|(source, _)| {
-                *source != node_idx && reachable_nodes.contains(source)
-            });
+            let has_other_path = incoming
+                .iter()
+                .any(|(source, _)| *source != node_idx && reachable_nodes.contains(source));
 
             if !has_other_path {
                 self.prune_subtree(dag, child_idx, target_idx, reachable_nodes);
@@ -366,7 +370,10 @@ impl DAGExecutor {
 
         if incoming.is_empty() {
             // Entry node - return stored input
-            return Ok(node_outputs.get(&node_idx).cloned().unwrap_or(DAGData::Empty));
+            return Ok(node_outputs
+                .get(&node_idx)
+                .cloned()
+                .unwrap_or(DAGData::Empty));
         }
 
         // Collect inputs from all matching incoming edges
@@ -445,7 +452,8 @@ impl DAGExecutor {
         }
 
         // Execute the transform
-        let result = engine.eval_ast_with_scope::<Dynamic>(&mut scope, transform_ast)
+        let result = engine
+            .eval_ast_with_scope::<Dynamic>(&mut scope, transform_ast)
             .map_err(|e| DAGError::TransformError {
                 edge: "edge transform".to_string(),
                 error: e.to_string(),
@@ -464,7 +472,8 @@ impl DAGExecutor {
         node_outputs: &HashMap<NodeIndex, DAGData>,
         ctx: &DAGContext,
     ) -> DAGResult<DAGData> {
-        self.gather_inputs_with_transforms(dag, node_idx, node_outputs, ctx).await
+        self.gather_inputs_with_transforms(dag, node_idx, node_outputs, ctx)
+            .await
     }
 
     /// Execute a single node
@@ -496,20 +505,24 @@ impl DAGExecutor {
         // All node executions are wrapped with timeout to prevent indefinite blocking
         let result = if node_type == "split" {
             // First execute the split node to get branch info
-            let split_result = match timeout(self.default_timeout, node.execute(input.clone(), ctx)).await {
-                Ok(result) => result?,
-                Err(_) => {
-                    warn!(
-                        node_id = %node_id,
-                        timeout_ms = %self.default_timeout.as_millis(),
-                        "Split node execution timed out"
-                    );
-                    return Err(DAGError::ExecutionTimeout(self.default_timeout.as_millis() as u64));
-                }
-            };
+            let split_result =
+                match timeout(self.default_timeout, node.execute(input.clone(), ctx)).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        warn!(
+                            node_id = %node_id,
+                            timeout_ms = %self.default_timeout.as_millis(),
+                            "Split node execution timed out"
+                        );
+                        return Err(DAGError::ExecutionTimeout(
+                            self.default_timeout.as_millis() as u64
+                        ));
+                    }
+                };
 
             // Get branches from context metadata (set by SplitNode)
-            let branches: Vec<String> = ctx.metadata
+            let branches: Vec<String> = ctx
+                .metadata
                 .get("split_branches")
                 .map(|s| s.split(',').map(String::from).collect())
                 .unwrap_or_default();
@@ -519,7 +532,12 @@ impl DAGExecutor {
                 Ok(split_result)
             } else {
                 // Execute branches in parallel (with per-branch timeout handled by execute_split_branches)
-                match timeout(self.default_timeout, self.execute_split_branches(dag, &branches, input, ctx)).await {
+                match timeout(
+                    self.default_timeout,
+                    self.execute_split_branches(dag, &branches, input, ctx),
+                )
+                .await
+                {
                     Ok(result) => result,
                     Err(_) => {
                         warn!(
@@ -527,7 +545,9 @@ impl DAGExecutor {
                             timeout_ms = %self.default_timeout.as_millis(),
                             "Split branch execution timed out"
                         );
-                        Err(DAGError::ExecutionTimeout(self.default_timeout.as_millis() as u64))
+                        Err(DAGError::ExecutionTimeout(
+                            self.default_timeout.as_millis() as u64
+                        ))
                     }
                 }
             }
@@ -541,7 +561,9 @@ impl DAGExecutor {
                         timeout_ms = %self.default_timeout.as_millis(),
                         "Node execution timed out"
                     );
-                    Err(DAGError::ExecutionTimeout(self.default_timeout.as_millis() as u64))
+                    Err(DAGError::ExecutionTimeout(
+                        self.default_timeout.as_millis() as u64
+                    ))
                 }
             }
         };
@@ -549,7 +571,8 @@ impl DAGExecutor {
         let duration = start.elapsed();
 
         // Record metrics
-        dag.metrics.record_node_execution(node_id, duration, result.is_ok());
+        dag.metrics
+            .record_node_execution(node_id, duration, result.is_ok());
 
         // Record end time
         ctx.record_node_end(node_id);
@@ -564,10 +587,7 @@ impl DAGExecutor {
                 );
 
                 // Store result in context for expression evaluation
-                ctx.set_node_result_arc(
-                    node_id.clone(),
-                    Arc::new(output.to_json()),
-                );
+                ctx.set_node_result_arc(node_id.clone(), Arc::new(output.to_json()));
             }
             Err(e) => {
                 warn!(
@@ -599,12 +619,19 @@ impl DAGExecutor {
                 // Sequential execution for single branch or disabled parallelism
                 let mut results = Vec::with_capacity(branches.len());
                 for branch_id in branches {
-                    let branch_idx = dag.get_node_index(branch_id)
+                    let branch_idx = dag
+                        .get_node_index(branch_id)
                         .ok_or_else(|| DAGError::UnknownNode(branch_id.clone()))?;
 
                     let mut branch_ctx = ctx.clone_for_branch();
                     // Use Box::pin for recursive call
-                    let result = Box::pin(self.execute_from_node(dag, branch_idx, input.clone(), &mut branch_ctx)).await?;
+                    let result = Box::pin(self.execute_from_node(
+                        dag,
+                        branch_idx,
+                        input.clone(),
+                        &mut branch_ctx,
+                    ))
+                    .await?;
                     results.push(result);
                 }
                 return Ok(DAGData::Multiple(results));
@@ -614,7 +641,8 @@ impl DAGExecutor {
             // First, resolve all branch indices upfront
             let mut branch_indices = Vec::with_capacity(branches.len());
             for branch_id in branches {
-                let branch_idx = dag.get_node_index(branch_id)
+                let branch_idx = dag
+                    .get_node_index(branch_id)
                     .ok_or_else(|| DAGError::UnknownNode(branch_id.clone()))?;
                 branch_indices.push((branch_id.clone(), branch_idx));
             }
@@ -630,8 +658,17 @@ impl DAGExecutor {
                     // Create a boxed future for each branch
                     Box::pin(async move {
                         // Use Box::pin for recursive call
-                        Box::pin(self.execute_from_node(dag, branch_idx, input_clone, &mut branch_ctx)).await
-                    }) as std::pin::Pin<Box<dyn std::future::Future<Output = DAGResult<DAGData>> + Send>>
+                        Box::pin(self.execute_from_node(
+                            dag,
+                            branch_idx,
+                            input_clone,
+                            &mut branch_ctx,
+                        ))
+                        .await
+                    })
+                        as std::pin::Pin<
+                            Box<dyn std::future::Future<Output = DAGResult<DAGData>> + Send>,
+                        >
                 })
                 .collect();
 
@@ -644,7 +681,8 @@ impl DAGExecutor {
                 match result {
                     Ok(data) => collected_results.push(data),
                     Err(e) => {
-                        let branch_id = branch_indices.get(i)
+                        let branch_id = branch_indices
+                            .get(i)
                             .map(|(id, _)| id.as_str())
                             .unwrap_or("unknown");
                         return Err(DAGError::SplitBranchError {
@@ -669,7 +707,8 @@ impl DAGExecutor {
         branches: &'a [String],
         input: DAGData,
         ctx: &'a DAGContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DAGResult<Vec<DAGData>>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DAGResult<Vec<DAGData>>> + Send + 'a>>
+    {
         Box::pin(async move {
             use futures::future::join_all;
 
@@ -677,12 +716,19 @@ impl DAGExecutor {
                 // Sequential execution
                 let mut results = Vec::with_capacity(branches.len());
                 for branch_id in branches {
-                    let branch_idx = dag.get_node_index(branch_id)
+                    let branch_idx = dag
+                        .get_node_index(branch_id)
                         .ok_or_else(|| DAGError::UnknownNode(branch_id.clone()))?;
 
                     let mut branch_ctx = ctx.clone_for_branch();
                     // Use Box::pin for recursive call
-                    let result = Box::pin(self.execute_from_node(dag, branch_idx, input.clone(), &mut branch_ctx)).await?;
+                    let result = Box::pin(self.execute_from_node(
+                        dag,
+                        branch_idx,
+                        input.clone(),
+                        &mut branch_ctx,
+                    ))
+                    .await?;
                     results.push(result);
                 }
                 return Ok(results);
@@ -692,7 +738,8 @@ impl DAGExecutor {
             // First, resolve all branch indices upfront
             let mut branch_indices = Vec::with_capacity(branches.len());
             for branch_id in branches {
-                let branch_idx = dag.get_node_index(branch_id)
+                let branch_idx = dag
+                    .get_node_index(branch_id)
                     .ok_or_else(|| DAGError::UnknownNode(branch_id.clone()))?;
                 branch_indices.push((branch_id.clone(), branch_idx));
             }
@@ -707,8 +754,17 @@ impl DAGExecutor {
 
                     // Create a boxed future for each branch
                     Box::pin(async move {
-                        Box::pin(self.execute_from_node(dag, branch_idx, input_clone, &mut branch_ctx)).await
-                    }) as std::pin::Pin<Box<dyn std::future::Future<Output = DAGResult<DAGData>> + Send>>
+                        Box::pin(self.execute_from_node(
+                            dag,
+                            branch_idx,
+                            input_clone,
+                            &mut branch_ctx,
+                        ))
+                        .await
+                    })
+                        as std::pin::Pin<
+                            Box<dyn std::future::Future<Output = DAGResult<DAGData>> + Send>,
+                        >
                 })
                 .collect();
 
@@ -721,7 +777,8 @@ impl DAGExecutor {
                 match result {
                     Ok(data) => collected_results.push(data),
                     Err(e) => {
-                        let branch_id = branch_indices.get(i)
+                        let branch_id = branch_indices
+                            .get(i)
                             .map(|(id, _)| id.clone())
                             .unwrap_or_else(|| "unknown".to_string());
                         return Err(DAGError::SplitBranchError {
@@ -798,9 +855,7 @@ fn dynamic_to_json(value: &Dynamic) -> serde_json::Value {
         return serde_json::json!(s);
     }
     if let Some(arr) = value.clone().try_cast::<Array>() {
-        let json_arr: Vec<serde_json::Value> = arr.iter()
-            .map(dynamic_to_json)
-            .collect();
+        let json_arr: Vec<serde_json::Value> = arr.iter().map(dynamic_to_json).collect();
         return serde_json::json!(json_arr);
     }
     if let Some(map) = value.clone().try_cast::<rhai::Map>() {
@@ -838,18 +893,20 @@ fn dynamic_to_dag_data(value: &Dynamic) -> DAGResult<DAGData> {
     if let Some(arr) = value.clone().try_cast::<Array>() {
         // Check if it looks like binary data (array of integers 0-255)
         if arr.iter().all(|v| {
-            v.clone().try_cast::<i64>().map(|i| (0..=255).contains(&i)).unwrap_or(false)
+            v.clone()
+                .try_cast::<i64>()
+                .map(|i| (0..=255).contains(&i))
+                .unwrap_or(false)
         }) {
-            let bytes: Vec<u8> = arr.iter()
+            let bytes: Vec<u8> = arr
+                .iter()
                 .filter_map(|v| v.clone().try_cast::<i64>().map(|i| i as u8))
                 .collect();
             return Ok(DAGData::Binary(Bytes::from(bytes)));
         }
 
         // Otherwise treat as JSON array
-        let json_arr: Vec<serde_json::Value> = arr.iter()
-            .map(dynamic_to_json)
-            .collect();
+        let json_arr: Vec<serde_json::Value> = arr.iter().map(dynamic_to_json).collect();
         return Ok(DAGData::Json(serde_json::json!(json_arr)));
     }
     if let Some(map) = value.clone().try_cast::<rhai::Map>() {
@@ -864,15 +921,20 @@ fn dynamic_to_dag_data(value: &Dynamic) -> DAGResult<DAGData> {
 mod tests {
     use super::*;
     use crate::dag::compiler::DAGCompiler;
-    use crate::dag::definition::{DAGDefinition, NodeDefinition, EdgeDefinition, NodeType, OutputDestination};
+    use crate::dag::definition::{
+        DAGDefinition, EdgeDefinition, NodeDefinition, NodeType, OutputDestination,
+    };
 
     fn create_simple_dag() -> CompiledDAG {
         let compiler = DAGCompiler::new();
         let mut dag = DAGDefinition::new("test-dag", "Test DAG");
         dag.add_node(NodeDefinition::new("input", NodeType::TextInput));
-        dag.add_node(NodeDefinition::new("output", NodeType::TextOutput {
-            destination: OutputDestination::WebSocket,
-        }));
+        dag.add_node(NodeDefinition::new(
+            "output",
+            NodeType::TextOutput {
+                destination: OutputDestination::WebSocket,
+            },
+        ));
         dag.add_edge(EdgeDefinition::new("input", "output"));
         dag.with_entry("input");
         dag.add_exit("output");
@@ -925,16 +987,20 @@ mod tests {
         def.add_node(NodeDefinition::new("input", NodeType::TextInput));
         def.add_node(NodeDefinition::new("handler_a", NodeType::Passthrough));
         def.add_node(NodeDefinition::new("handler_b", NodeType::Passthrough));
-        def.add_node(NodeDefinition::new("output", NodeType::TextOutput {
-            destination: OutputDestination::WebSocket,
-        }));
+        def.add_node(NodeDefinition::new(
+            "output",
+            NodeType::TextOutput {
+                destination: OutputDestination::WebSocket,
+            },
+        ));
         def.add_edge(EdgeDefinition::new("input", "handler_a"));
         def.add_edge(EdgeDefinition::new("input", "handler_b"));
         def.add_edge(EdgeDefinition::new("handler_a", "output"));
         def.add_edge(EdgeDefinition::new("handler_b", "output"));
         def.with_entry("input");
         def.add_exit("output");
-        def.api_key_routes.insert("tenant_a".to_string(), "handler_a".to_string());
+        def.api_key_routes
+            .insert("tenant_a".to_string(), "handler_a".to_string());
 
         let dag = compiler.compile(def).unwrap();
         let executor = DAGExecutor::new();

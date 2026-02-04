@@ -42,13 +42,13 @@ use tokio_tungstenite::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::core::tts::base::{
-    AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
-};
 use super::config::DashScopeTtsConfig;
 use super::messages::{
-    QwenTtsSessionUpdate, QwenTtsTextAppend, QwenTtsTextCommit, QwenTtsServerMessage,
-    CosyVoiceRunTask, CosyVoiceContinueTask, CosyVoiceFinishTask, CosyVoiceResponse,
+    CosyVoiceContinueTask, CosyVoiceFinishTask, CosyVoiceResponse, CosyVoiceRunTask,
+    QwenTtsServerMessage, QwenTtsSessionUpdate, QwenTtsTextAppend, QwenTtsTextCommit,
+};
+use crate::core::tts::base::{
+    AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
 };
 
 // =============================================================================
@@ -328,14 +328,18 @@ impl BaseTTS for DashScopeTts {
             write
                 .send(Message::Text(session_update.into()))
                 .await
-                .map_err(|e| TTSError::ConnectionFailed(format!("Failed to send session update: {}", e)))?;
+                .map_err(|e| {
+                    TTSError::ConnectionFailed(format!("Failed to send session update: {}", e))
+                })?;
             None
         } else {
             let (run_task_json, task_id) = self.create_cosyvoice_run_task();
             write
                 .send(Message::Text(run_task_json.into()))
                 .await
-                .map_err(|e| TTSError::ConnectionFailed(format!("Failed to send run-task: {}", e)))?;
+                .map_err(|e| {
+                    TTSError::ConnectionFailed(format!("Failed to send run-task: {}", e))
+                })?;
             Some(task_id)
         };
 
@@ -378,7 +382,11 @@ impl BaseTTS for DashScopeTts {
                     // Send text message (may be multiple JSON for Qwen)
                     for line in msg.lines() {
                         if !line.is_empty() {
-                            if write.send(Message::Text(line.to_string().into())).await.is_err() {
+                            if write
+                                .send(Message::Text(line.to_string().into()))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -389,7 +397,9 @@ impl BaseTTS for DashScopeTts {
                 if !is_qwen {
                     if let Some(tid) = &task_id_clone {
                         let finish = CosyVoiceFinishTask::new(tid);
-                        let _ = write.send(Message::Text(finish.to_json().unwrap_or_default().into())).await;
+                        let _ = write
+                            .send(Message::Text(finish.to_json().unwrap_or_default().into()))
+                            .await;
                     }
                 }
 
@@ -401,9 +411,21 @@ impl BaseTTS for DashScopeTts {
                     match msg_result {
                         Ok(Message::Text(text)) => {
                             let done = if is_qwen {
-                                Self::handle_qwen_response(&text, &audio_tx, sample_rate, &format, &bytes_counter)
+                                Self::handle_qwen_response(
+                                    &text,
+                                    &audio_tx,
+                                    sample_rate,
+                                    &format,
+                                    &bytes_counter,
+                                )
                             } else {
-                                Self::handle_cosyvoice_response(&text, &audio_tx, sample_rate, &format, &bytes_counter)
+                                Self::handle_cosyvoice_response(
+                                    &text,
+                                    &audio_tx,
+                                    sample_rate,
+                                    &format,
+                                    &bytes_counter,
+                                )
                             };
                             if done {
                                 break;
@@ -514,10 +536,9 @@ impl BaseTTS for DashScopeTts {
         }
 
         if let Some(sender) = &self.text_sender {
-            sender
-                .send(text.to_string())
-                .await
-                .map_err(|_| TTSError::InternalError("Failed to send text to channel".to_string()))?;
+            sender.send(text.to_string()).await.map_err(|_| {
+                TTSError::InternalError("Failed to send text to channel".to_string())
+            })?;
         }
 
         Ok(())

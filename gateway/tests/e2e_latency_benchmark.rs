@@ -6,19 +6,19 @@
 //! Run: cargo test --test e2e_latency_benchmark -- --nocapture
 
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use wiremock::matchers::{any, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // Realistic provider latencies (based on real-world measurements)
-const DEEPGRAM_STT_LATENCY_MS: u64 = 80;  // 50-150ms typical
+const DEEPGRAM_STT_LATENCY_MS: u64 = 80; // 50-150ms typical
 const DEEPGRAM_TTS_LATENCY_MS: u64 = 120; // 80-200ms typical
 const ELEVENLABS_TTS_LATENCY_MS: u64 = 180; // 100-300ms typical
 
@@ -82,7 +82,10 @@ async fn test_http_latency_with_mock_provider() {
 
     println!("\n=== HTTP Latency Test with Mock Provider ===");
     println!("Mock server URL: {}", mock_server.uri());
-    println!("Simulated provider latency: {}ms", ELEVENLABS_TTS_LATENCY_MS);
+    println!(
+        "Simulated provider latency: {}ms",
+        ELEVENLABS_TTS_LATENCY_MS
+    );
 
     let client = reqwest::Client::new();
     let mut stats = LatencyStats::default();
@@ -192,7 +195,10 @@ async fn test_concurrent_http_latency() {
     );
 
     // With 120ms provider latency and 50 concurrent, total should be ~120-200ms
-    assert!(total_time < 500.0, "Concurrent requests should complete quickly");
+    assert!(
+        total_time < 500.0,
+        "Concurrent requests should complete quickly"
+    );
 }
 
 /// Benchmark summary
@@ -204,9 +210,18 @@ async fn test_print_benchmark_summary() {
     println!("╠══════════════════════════════════════════════════════════════╣");
     println!("║                                                              ║");
     println!("║  Simulated Provider Latencies:                               ║");
-    println!("║    • Deepgram STT:    {:>3}ms (typical: 50-150ms)             ║", DEEPGRAM_STT_LATENCY_MS);
-    println!("║    • Deepgram TTS:    {:>3}ms (typical: 80-200ms)             ║", DEEPGRAM_TTS_LATENCY_MS);
-    println!("║    • ElevenLabs TTS:  {:>3}ms (typical: 100-300ms)            ║", ELEVENLABS_TTS_LATENCY_MS);
+    println!(
+        "║    • Deepgram STT:    {:>3}ms (typical: 50-150ms)             ║",
+        DEEPGRAM_STT_LATENCY_MS
+    );
+    println!(
+        "║    • Deepgram TTS:    {:>3}ms (typical: 80-200ms)             ║",
+        DEEPGRAM_TTS_LATENCY_MS
+    );
+    println!(
+        "║    • ElevenLabs TTS:  {:>3}ms (typical: 100-300ms)            ║",
+        ELEVENLABS_TTS_LATENCY_MS
+    );
     println!("║                                                              ║");
     println!("║  Test Coverage:                                              ║");
     println!("║    • HTTP endpoint latency                                   ║");

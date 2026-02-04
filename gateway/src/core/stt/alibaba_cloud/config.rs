@@ -27,13 +27,16 @@ use crate::core::stt::base::{STTConfig, STTError};
 pub const DASHSCOPE_BEIJING_REALTIME_URL: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime";
 
 /// DashScope Singapore (International) WebSocket endpoint for realtime API.
-pub const DASHSCOPE_SINGAPORE_REALTIME_URL: &str = "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime";
+pub const DASHSCOPE_SINGAPORE_REALTIME_URL: &str =
+    "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime";
 
 /// DashScope Beijing (China) WebSocket endpoint for inference API.
-pub const DASHSCOPE_BEIJING_INFERENCE_URL: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference";
+pub const DASHSCOPE_BEIJING_INFERENCE_URL: &str =
+    "wss://dashscope.aliyuncs.com/api-ws/v1/inference";
 
 /// DashScope Singapore (International) WebSocket endpoint for inference API.
-pub const DASHSCOPE_SINGAPORE_INFERENCE_URL: &str = "wss://dashscope-intl.aliyuncs.com/api-ws/v1/inference";
+pub const DASHSCOPE_SINGAPORE_INFERENCE_URL: &str =
+    "wss://dashscope-intl.aliyuncs.com/api-ws/v1/inference";
 
 /// Default STT model.
 pub const DEFAULT_STT_MODEL: &str = "qwen3-asr-flash-realtime";
@@ -158,7 +161,9 @@ impl DashScopeSttModel {
             "qwen3-asr-flash-realtime-2025-10-27" => Self::Qwen3AsrFlashRealtime20251027,
             "paraformer-realtime-v2" | "paraformer-v2" | "paraformer" => Self::ParaformerRealtimeV2,
             "paraformer-realtime-v1" | "paraformer-v1" => Self::ParaformerRealtimeV1,
-            "paraformer-realtime-8k-v2" | "paraformer-8k-v2" | "paraformer-8k" => Self::Paraformer8kRealtimeV2,
+            "paraformer-realtime-8k-v2" | "paraformer-8k-v2" | "paraformer-8k" => {
+                Self::Paraformer8kRealtimeV2
+            }
             "paraformer-realtime-8k-v1" | "paraformer-8k-v1" => Self::Paraformer8kRealtimeV1,
             "fun-asr-realtime" | "fun-asr" | "funasr" => Self::FunAsrRealtime,
             "fun-asr-realtime-2025-09-15" => Self::FunAsrRealtime20250915,
@@ -168,7 +173,10 @@ impl DashScopeSttModel {
 
     /// Check if this is a Qwen model (uses realtime API format).
     pub fn is_qwen_model(&self) -> bool {
-        matches!(self, Self::Qwen3AsrFlashRealtime | Self::Qwen3AsrFlashRealtime20251027)
+        matches!(
+            self,
+            Self::Qwen3AsrFlashRealtime | Self::Qwen3AsrFlashRealtime20251027
+        )
     }
 
     /// Check if this is a Paraformer model (uses inference API format).
@@ -184,7 +192,10 @@ impl DashScopeSttModel {
 
     /// Check if this is an 8kHz model (telephony).
     pub fn is_8k_model(&self) -> bool {
-        matches!(self, Self::Paraformer8kRealtimeV2 | Self::Paraformer8kRealtimeV1)
+        matches!(
+            self,
+            Self::Paraformer8kRealtimeV2 | Self::Paraformer8kRealtimeV1
+        )
     }
 }
 
@@ -256,7 +267,13 @@ impl DashScopeAudioFormat {
     pub fn supported_by_paraformer(&self) -> bool {
         matches!(
             self,
-            Self::Pcm16 | Self::Wav | Self::Mp3 | Self::Opus | Self::Speex | Self::Aac | Self::AmrNb
+            Self::Pcm16
+                | Self::Wav
+                | Self::Mp3
+                | Self::Opus
+                | Self::Speex
+                | Self::Aac
+                | Self::AmrNb
         )
     }
 }
@@ -541,8 +558,7 @@ impl DashScopeSttConfig {
         let language = DashScopeLanguage::from_str(&config.language);
 
         // Parse audio format from encoding
-        let audio_format = DashScopeAudioFormat::from_str(&config.encoding)
-            .unwrap_or_default();
+        let audio_format = DashScopeAudioFormat::from_str(&config.encoding).unwrap_or_default();
 
         // Adjust sample rate for 8k models
         let sample_rate = if model.is_8k_model() {
@@ -606,7 +622,11 @@ impl DashScopeSttConfig {
     /// Get the WebSocket URL for the configured model and region.
     pub fn get_websocket_url(&self) -> String {
         if self.model.is_qwen_model() {
-            format!("{}?model={}", self.region.realtime_url(), self.model.as_model_id())
+            format!(
+                "{}?model={}",
+                self.region.realtime_url(),
+                self.model.as_model_id()
+            )
         } else {
             self.region.inference_url().to_string()
         }
@@ -615,8 +635,8 @@ impl DashScopeSttConfig {
     /// Get list of supported languages.
     pub fn supported_languages() -> Vec<&'static str> {
         vec![
-            "zh", "yue", "sichuan", "wu", "minnan", "en", "ja", "ko", "de", "fr",
-            "ru", "es", "pt", "ar", "it", "hi", "id", "th", "vi", "tr", "uk", "ms",
+            "zh", "yue", "sichuan", "wu", "minnan", "en", "ja", "ko", "de", "fr", "ru", "es", "pt",
+            "ar", "it", "hi", "id", "th", "vi", "tr", "uk", "ms",
         ]
     }
 
@@ -643,16 +663,33 @@ mod tests {
 
     #[test]
     fn test_region_urls() {
-        assert!(DashScopeRegion::Beijing.realtime_url().contains("dashscope.aliyuncs.com"));
-        assert!(DashScopeRegion::Singapore.realtime_url().contains("dashscope-intl"));
+        assert!(
+            DashScopeRegion::Beijing
+                .realtime_url()
+                .contains("dashscope.aliyuncs.com")
+        );
+        assert!(
+            DashScopeRegion::Singapore
+                .realtime_url()
+                .contains("dashscope-intl")
+        );
     }
 
     #[test]
     fn test_region_parsing() {
-        assert_eq!(DashScopeRegion::from_str("beijing"), DashScopeRegion::Beijing);
-        assert_eq!(DashScopeRegion::from_str("singapore"), DashScopeRegion::Singapore);
+        assert_eq!(
+            DashScopeRegion::from_str("beijing"),
+            DashScopeRegion::Beijing
+        );
+        assert_eq!(
+            DashScopeRegion::from_str("singapore"),
+            DashScopeRegion::Singapore
+        );
         assert_eq!(DashScopeRegion::from_str("cn"), DashScopeRegion::Beijing);
-        assert_eq!(DashScopeRegion::from_str("intl"), DashScopeRegion::Singapore);
+        assert_eq!(
+            DashScopeRegion::from_str("intl"),
+            DashScopeRegion::Singapore
+        );
     }
 
     #[test]
@@ -693,9 +730,18 @@ mod tests {
 
     #[test]
     fn test_audio_format_parsing() {
-        assert_eq!(DashScopeAudioFormat::from_str("pcm"), Some(DashScopeAudioFormat::Pcm16));
-        assert_eq!(DashScopeAudioFormat::from_str("opus"), Some(DashScopeAudioFormat::Opus));
-        assert_eq!(DashScopeAudioFormat::from_str("wav"), Some(DashScopeAudioFormat::Wav));
+        assert_eq!(
+            DashScopeAudioFormat::from_str("pcm"),
+            Some(DashScopeAudioFormat::Pcm16)
+        );
+        assert_eq!(
+            DashScopeAudioFormat::from_str("opus"),
+            Some(DashScopeAudioFormat::Opus)
+        );
+        assert_eq!(
+            DashScopeAudioFormat::from_str("wav"),
+            Some(DashScopeAudioFormat::Wav)
+        );
         assert_eq!(DashScopeAudioFormat::from_str("unknown"), None);
     }
 
@@ -709,9 +755,18 @@ mod tests {
 
     #[test]
     fn test_language_parsing() {
-        assert_eq!(DashScopeLanguage::from_str("zh"), DashScopeLanguage::Chinese);
-        assert_eq!(DashScopeLanguage::from_str("en"), DashScopeLanguage::English);
-        assert_eq!(DashScopeLanguage::from_str("yue"), DashScopeLanguage::Cantonese);
+        assert_eq!(
+            DashScopeLanguage::from_str("zh"),
+            DashScopeLanguage::Chinese
+        );
+        assert_eq!(
+            DashScopeLanguage::from_str("en"),
+            DashScopeLanguage::English
+        );
+        assert_eq!(
+            DashScopeLanguage::from_str("yue"),
+            DashScopeLanguage::Cantonese
+        );
         assert_eq!(DashScopeLanguage::from_str("auto"), DashScopeLanguage::Auto);
     }
 

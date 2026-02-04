@@ -234,7 +234,6 @@ pub struct ElevenLabsSTTConfig {
     // =========================================================================
     // Advanced Features (Entity Detection, Diarization, PII/PHI)
     // =========================================================================
-
     /// Key terms for improved transcription accuracy.
     ///
     /// A list of domain-specific terms, product names, or specialized vocabulary
@@ -432,9 +431,7 @@ impl ElevenLabsSTTConfig {
                 // Use form_urlencoded to properly escape special characters
                 let encoded_terms: Vec<String> = terms
                     .iter()
-                    .map(|t| {
-                        form_urlencoded::byte_serialize(t.as_bytes()).collect::<String>()
-                    })
+                    .map(|t| form_urlencoded::byte_serialize(t.as_bytes()).collect::<String>())
                     .collect();
                 url.push_str("&keyterms=");
                 url.push_str(&encoded_terms.join(","));

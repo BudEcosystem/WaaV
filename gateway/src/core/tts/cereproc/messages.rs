@@ -206,7 +206,12 @@ pub struct CereprocApiError {
     pub code: String,
 
     /// Error message
-    #[serde(alias = "resultDescription", alias = "error", alias = "message", default)]
+    #[serde(
+        alias = "resultDescription",
+        alias = "error",
+        alias = "message",
+        default
+    )]
     pub message: String,
 
     /// Additional error details

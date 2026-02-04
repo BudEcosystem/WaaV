@@ -52,37 +52,72 @@ pub struct LatencyProfile {
 impl LatencyProfile {
     /// Deepgram STT WebSocket - very fast streaming
     pub fn deepgram_stt() -> Self {
-        Self { min_ms: 30, max_ms: 150, p50_ms: 50, p99_ms: 120 }
+        Self {
+            min_ms: 30,
+            max_ms: 150,
+            p50_ms: 50,
+            p99_ms: 120,
+        }
     }
 
     /// Deepgram TTS WebSocket
     pub fn deepgram_tts() -> Self {
-        Self { min_ms: 50, max_ms: 200, p50_ms: 80, p99_ms: 180 }
+        Self {
+            min_ms: 50,
+            max_ms: 200,
+            p50_ms: 80,
+            p99_ms: 180,
+        }
     }
 
     /// ElevenLabs TTS HTTP
     pub fn elevenlabs_tts() -> Self {
-        Self { min_ms: 100, max_ms: 400, p50_ms: 180, p99_ms: 350 }
+        Self {
+            min_ms: 100,
+            max_ms: 400,
+            p50_ms: 180,
+            p99_ms: 350,
+        }
     }
 
     /// Google STT gRPC streaming
     pub fn google_stt() -> Self {
-        Self { min_ms: 40, max_ms: 200, p50_ms: 60, p99_ms: 150 }
+        Self {
+            min_ms: 40,
+            max_ms: 200,
+            p50_ms: 60,
+            p99_ms: 150,
+        }
     }
 
     /// Google TTS gRPC
     pub fn google_tts() -> Self {
-        Self { min_ms: 80, max_ms: 300, p50_ms: 120, p99_ms: 250 }
+        Self {
+            min_ms: 80,
+            max_ms: 300,
+            p50_ms: 120,
+            p99_ms: 250,
+        }
     }
 
     /// OpenAI Realtime WebSocket
     pub fn openai_realtime() -> Self {
-        Self { min_ms: 100, max_ms: 500, p50_ms: 200, p99_ms: 450 }
+        Self {
+            min_ms: 100,
+            max_ms: 500,
+            p50_ms: 200,
+            p99_ms: 450,
+        }
     }
 
     /// Cartesia TTS WebSocket
     pub fn cartesia_tts() -> Self {
-        Self { min_ms: 60, max_ms: 250, p50_ms: 100, p99_ms: 220 }
+        Self {
+            min_ms: 60,
+            max_ms: 250,
+            p50_ms: 100,
+            p99_ms: 220,
+        }
     }
 
     /// Generate a random latency based on the profile
@@ -146,11 +181,11 @@ impl ChaosConfig {
     /// High chaos for stress testing
     pub fn stress() -> Self {
         Self {
-            failure_rate: 0.05,     // 5% failures
-            timeout_rate: 0.03,     // 3% timeouts
-            drop_rate: 0.02,        // 2% drops
-            rate_limit_rate: 0.05,  // 5% rate limits
-            slow_rate: 0.1,         // 10% slow responses
+            failure_rate: 0.05,    // 5% failures
+            timeout_rate: 0.03,    // 3% timeouts
+            drop_rate: 0.02,       // 2% drops
+            rate_limit_rate: 0.05, // 5% rate limits
+            slow_rate: 0.1,        // 10% slow responses
         }
     }
 
@@ -205,7 +240,8 @@ impl MockStats {
     pub fn record_success(&self, latency_ms: u64) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         self.successful_requests.fetch_add(1, Ordering::Relaxed);
-        self.total_latency_ms.fetch_add(latency_ms, Ordering::Relaxed);
+        self.total_latency_ms
+            .fetch_add(latency_ms, Ordering::Relaxed);
     }
 
     pub fn record_failure(&self) {
@@ -250,6 +286,6 @@ impl MockStats {
     }
 }
 
+pub mod grpc_mock;
 pub mod http_mock;
 pub mod websocket_mock;
-pub mod grpc_mock;

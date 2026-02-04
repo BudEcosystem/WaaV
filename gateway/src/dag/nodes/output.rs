@@ -3,11 +3,11 @@
 //! These nodes serve as exit points for data from the DAG.
 //! They route processed data to external destinations (WebSocket, LiveKit, webhooks).
 
-use std::sync::Arc;
 use async_trait::async_trait;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
-use super::{DAGNode, DAGData, NodeCapability, TTSAudioData};
+use super::{DAGData, DAGNode, NodeCapability, TTSAudioData};
 use crate::dag::context::DAGContext;
 use crate::dag::definition::OutputDestination;
 use crate::dag::error::{DAGError, DAGResult};
@@ -109,7 +109,10 @@ impl DAGNode for AudioOutputNode {
         );
 
         // Store destination info in context for executor
-        ctx.metadata.insert("output_destination".to_string(), format!("{:?}", self.destination));
+        ctx.metadata.insert(
+            "output_destination".to_string(),
+            format!("{:?}", self.destination),
+        );
 
         Ok(DAGData::TTSAudio(audio_data))
     }
@@ -210,9 +213,13 @@ impl DAGNode for TextOutputNode {
         );
 
         // Store destination info in context for executor
-        ctx.metadata.insert("output_destination".to_string(), format!("{:?}", self.destination));
+        ctx.metadata.insert(
+            "output_destination".to_string(),
+            format!("{:?}", self.destination),
+        );
         if let Some(ref msg_type) = self.message_type {
-            ctx.metadata.insert("message_type".to_string(), msg_type.clone());
+            ctx.metadata
+                .insert("message_type".to_string(), msg_type.clone());
         }
 
         Ok(DAGData::Text(text))
@@ -328,7 +335,8 @@ impl DAGNode for WebhookOutputNode {
         );
 
         // Use the pre-created pooled client for connection reuse
-        let mut request = self.client
+        let mut request = self
+            .client
             .post(&self.url)
             .timeout(std::time::Duration::from_millis(self.timeout_ms))
             .header("Content-Type", "application/json")
@@ -377,10 +385,13 @@ impl DAGNode for WebhookOutputNode {
             Ok(DAGData::Empty)
         } else {
             // Wait for response
-            let response = request.send().await.map_err(|e| DAGError::WebhookDeliveryError {
-                url: self.url.clone(),
-                error: e.to_string(),
-            })?;
+            let response = request
+                .send()
+                .await
+                .map_err(|e| DAGError::WebhookDeliveryError {
+                    url: self.url.clone(),
+                    error: e.to_string(),
+                })?;
 
             if !response.status().is_success() {
                 return Err(DAGError::WebhookDeliveryError {

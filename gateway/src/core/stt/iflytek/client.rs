@@ -193,16 +193,14 @@ impl IFlytekStt {
             Message::Text(text) => {
                 debug!("iFlytek STT received: {}", text);
 
-                let response = SttResponse::from_json(&text)
-                    .map_err(|e| STTError::ProviderError(format!("Failed to parse response: {}", e)))?;
+                let response = SttResponse::from_json(&text).map_err(|e| {
+                    STTError::ProviderError(format!("Failed to parse response: {}", e))
+                })?;
 
                 // Check for errors
                 if !response.is_success() {
                     let error_code = response.error_code();
-                    let error = STTError::ProviderError(format!(
-                        "iFlytek error: {}",
-                        error_code
-                    ));
+                    let error = STTError::ProviderError(format!("iFlytek error: {}", error_code));
 
                     // Send error through channel
                     if let Err(e) = error_tx.try_send(error.clone()) {
@@ -273,9 +271,13 @@ impl IFlytekStt {
     /// Start the WebSocket connection task.
     async fn start_connection(&mut self) -> Result<(), STTError> {
         // Build signed WebSocket URL
-        let ws_url = self.config.auth
+        let ws_url = self
+            .config
+            .auth
             .build_signed_url(self.config.host(), self.config.path())
-            .map_err(|e| STTError::ConnectionFailed(format!("Failed to build signed URL: {}", e)))?;
+            .map_err(|e| {
+                STTError::ConnectionFailed(format!("Failed to build signed URL: {}", e))
+            })?;
 
         debug!("Connecting to iFlytek: {}", ws_url);
 
@@ -309,7 +311,8 @@ impl IFlytekStt {
             let ws_stream = match timeout(WS_CONNECT_TIMEOUT, connect_async(&ws_url)).await {
                 Ok(Ok((stream, _))) => stream,
                 Ok(Err(e)) => {
-                    let err = STTError::ConnectionFailed(format!("WebSocket connection failed: {}", e));
+                    let err =
+                        STTError::ConnectionFailed(format!("WebSocket connection failed: {}", e));
                     error!("{}", err);
                     let _ = error_tx.try_send(err);
                     return;
@@ -503,12 +506,10 @@ impl IFlytekStt {
                 info!("iFlytek STT connected successfully");
                 Ok(())
             }
-            Ok(Err(_)) => {
-                Err(STTError::ConnectionFailed("Connection channel closed".to_string()))
-            }
-            Err(_) => {
-                Err(STTError::ConnectionFailed("Connection timeout".to_string()))
-            }
+            Ok(Err(_)) => Err(STTError::ConnectionFailed(
+                "Connection channel closed".to_string(),
+            )),
+            Err(_) => Err(STTError::ConnectionFailed("Connection timeout".to_string())),
         }
     }
 }

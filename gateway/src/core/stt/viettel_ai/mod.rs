@@ -33,6 +33,6 @@ mod tests;
 
 pub use client::ViettelStt;
 pub use config::{
-    ViettelSttConfig, ViettelSttResponse, DEFAULT_CHANNELS, DEFAULT_REQUEST_TIMEOUT,
-    DEFAULT_SAMPLE_RATE, PCM_FORMAT_S16LE, VIETTEL_STT_ENDPOINT,
+    DEFAULT_CHANNELS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SAMPLE_RATE, PCM_FORMAT_S16LE,
+    VIETTEL_STT_ENDPOINT, ViettelSttConfig, ViettelSttResponse,
 };

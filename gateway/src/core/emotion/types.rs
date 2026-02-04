@@ -47,6 +47,7 @@ use std::fmt;
 /// assert!(emotion.is_widely_supported());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Emotion {
     // =========================================================================
@@ -317,6 +318,7 @@ impl fmt::Display for Emotion {
 /// assert_eq!(style.to_string(), "whispered");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryStyle {
     /// Normal, default delivery
@@ -417,6 +419,7 @@ impl fmt::Display for DeliveryStyle {
 ///
 /// Providers can also accept raw numeric intensity (0.0 to 1.0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum IntensityLevel {
     /// Subtle expression (0.3)
@@ -492,6 +495,7 @@ impl IntensityLevel {
 /// assert_eq!(intensity.as_f32(), 1.0);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(untagged)]
 pub enum EmotionIntensity {
     /// Numeric intensity (0.0 to 1.0)

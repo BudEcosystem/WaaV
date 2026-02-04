@@ -2,8 +2,8 @@
 //!
 //! Edges can have conditions that determine when data flows through them.
 
-use std::sync::Arc;
 use rhai::AST;
+use std::sync::Arc;
 
 use crate::dag::context::DAGContext;
 use crate::dag::error::DAGResult;
@@ -131,8 +131,7 @@ mod tests {
 
     #[test]
     fn test_compiled_edge() {
-        let edge = CompiledEdge::new("input", "stt")
-            .with_priority(10);
+        let edge = CompiledEdge::new("input", "stt").with_priority(10);
 
         assert_eq!(edge.from, "input");
         assert_eq!(edge.to, "stt");

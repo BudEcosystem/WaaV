@@ -61,8 +61,8 @@ pub use provider::BhashiniTts;
 
 // Re-export language types from STT module
 pub use crate::core::stt::bhashini::{
-    BhashiniLanguage, BhashiniPipelineProvider, LanguageFamily,
-    BHASHINI_COMPUTE_URL, BHASHINI_CONFIG_URL, MEITY_PIPELINE_ID, AI4BHARAT_PIPELINE_ID,
+    AI4BHARAT_PIPELINE_ID, BHASHINI_COMPUTE_URL, BHASHINI_CONFIG_URL, BhashiniLanguage,
+    BhashiniPipelineProvider, LanguageFamily, MEITY_PIPELINE_ID,
 };
 
 #[cfg(test)]
@@ -110,7 +110,10 @@ mod tests {
         let config = create_test_config();
         let bhashini_config = BhashiniTtsConfig::from_base(config).unwrap();
         assert_eq!(bhashini_config.language, BhashiniLanguage::Hindi);
-        assert_eq!(bhashini_config.audio_format, BhashiniTtsAudioFormat::default());
+        assert_eq!(
+            bhashini_config.audio_format,
+            BhashiniTtsAudioFormat::default()
+        );
         assert_eq!(bhashini_config.sample_rate, 22050);
     }
 

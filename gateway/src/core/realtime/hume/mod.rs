@@ -120,7 +120,7 @@ mod config;
 pub mod messages;
 
 pub use client::HumeEVI;
-pub use config::{EVIVersion, HumeEVIConfig};
+pub use config::{EVIConfigError, EVIVersion, HumeEVIConfig};
 pub use messages::{
     AudioEncoding, AudioInput, AudioOutput, AudioSettings, EVIClientMessage, EVIServerMessage,
     HUME_EVI_DEFAULT_CHANNELS, HUME_EVI_DEFAULT_SAMPLE_RATE, HUME_EVI_MAX_SESSION_DURATION,

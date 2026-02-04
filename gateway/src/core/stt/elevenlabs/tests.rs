@@ -1274,9 +1274,7 @@ mod advanced_features_tests {
 
     #[test]
     fn test_config_validate_too_many_keyterms() {
-        let keyterms: Vec<String> = (0..=MAX_KEYTERMS)
-            .map(|i| format!("term_{}", i))
-            .collect();
+        let keyterms: Vec<String> = (0..=MAX_KEYTERMS).map(|i| format!("term_{}", i)).collect();
 
         let config = ElevenLabsSTTConfig {
             base: STTConfig {
@@ -1550,7 +1548,10 @@ mod advanced_features_tests {
 
         let result = ElevenLabsMessage::parse(json);
         assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), ElevenLabsMessage::EntitiesDetected(_)));
+        assert!(matches!(
+            result.unwrap(),
+            ElevenLabsMessage::EntitiesDetected(_)
+        ));
     }
 
     #[test]
@@ -1564,7 +1565,10 @@ mod advanced_features_tests {
 
         let result = ElevenLabsMessage::parse(json);
         assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), ElevenLabsMessage::SpeakerTurns(_)));
+        assert!(matches!(
+            result.unwrap(),
+            ElevenLabsMessage::SpeakerTurns(_)
+        ));
     }
 
     #[test]
@@ -1579,7 +1583,10 @@ mod advanced_features_tests {
 
         let result = ElevenLabsMessage::parse(json);
         assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), ElevenLabsMessage::SensitiveDataDetected(_)));
+        assert!(matches!(
+            result.unwrap(),
+            ElevenLabsMessage::SensitiveDataDetected(_)
+        ));
     }
 
     #[test]

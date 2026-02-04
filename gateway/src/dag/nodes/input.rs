@@ -4,10 +4,10 @@
 //! They receive data from external sources (WebSocket, LiveKit, etc.)
 //! and pass it into the pipeline.
 
-use std::sync::Arc;
 use async_trait::async_trait;
+use std::sync::Arc;
 
-use super::{DAGNode, DAGData, NodeCapability};
+use super::{DAGData, DAGNode, NodeCapability};
 use crate::dag::context::DAGContext;
 use crate::dag::error::DAGResult;
 

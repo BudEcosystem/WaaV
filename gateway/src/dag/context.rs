@@ -119,11 +119,7 @@ impl DAGContext {
     }
 
     /// Set a single external resource
-    pub fn set_resource<T: Any + Send + Sync>(
-        &mut self,
-        key: impl Into<String>,
-        resource: Arc<T>,
-    ) {
+    pub fn set_resource<T: Any + Send + Sync>(&mut self, key: impl Into<String>, resource: Arc<T>) {
         // We need to get mutable access to the resources
         // Since Arc is shared, we need to clone and replace
         let mut resources = (*self.external_resources).clone();
@@ -231,19 +227,24 @@ impl DAGContext {
 
     /// Get remaining time until deadline (if set)
     pub fn remaining_time(&self) -> Option<Duration> {
-        self.deadline.and_then(|d| d.checked_duration_since(Instant::now()))
+        self.deadline
+            .and_then(|d| d.checked_duration_since(Instant::now()))
     }
 
     /// Record node execution start
     pub fn record_node_start(&mut self, node_id: &str) {
-        self.timing.node_starts.insert(node_id.to_string(), Instant::now());
+        self.timing
+            .node_starts
+            .insert(node_id.to_string(), Instant::now());
     }
 
     /// Record node execution end
     pub fn record_node_end(&mut self, node_id: &str) {
         if let Some(start) = self.timing.node_starts.get(node_id) {
             let duration = start.elapsed();
-            self.timing.node_durations.insert(node_id.to_string(), duration);
+            self.timing
+                .node_durations
+                .insert(node_id.to_string(), duration);
         }
     }
 
@@ -274,8 +275,14 @@ impl std::fmt::Debug for DAGContext {
             .field("stream_id", &self.stream_id)
             .field("api_key_id", &self.api_key_id)
             .field("metadata", &self.metadata)
-            .field("node_results", &self.node_results.keys().collect::<Vec<_>>())
-            .field("external_resources", &self.external_resources.keys().collect::<Vec<_>>())
+            .field(
+                "node_results",
+                &self.node_results.keys().collect::<Vec<_>>(),
+            )
+            .field(
+                "external_resources",
+                &self.external_resources.keys().collect::<Vec<_>>(),
+            )
             .field("is_cancelled", &self.is_cancelled())
             .field("deadline", &self.deadline)
             .finish()
@@ -396,8 +403,7 @@ mod tests {
 
     #[test]
     fn test_deadline() {
-        let ctx = DAGContext::new("stream-123")
-            .with_timeout(Duration::from_millis(10));
+        let ctx = DAGContext::new("stream-123").with_timeout(Duration::from_millis(10));
 
         assert!(!ctx.is_deadline_exceeded());
         sleep(Duration::from_millis(20));
@@ -421,13 +427,21 @@ mod tests {
         let mut timing = DAGTiming::new();
 
         // Simulate node execution
-        timing.node_starts.insert("node1".to_string(), Instant::now());
+        timing
+            .node_starts
+            .insert("node1".to_string(), Instant::now());
         sleep(Duration::from_millis(10));
-        timing.node_durations.insert("node1".to_string(), Duration::from_millis(10));
+        timing
+            .node_durations
+            .insert("node1".to_string(), Duration::from_millis(10));
 
-        timing.node_starts.insert("node2".to_string(), Instant::now());
+        timing
+            .node_starts
+            .insert("node2".to_string(), Instant::now());
         sleep(Duration::from_millis(5));
-        timing.node_durations.insert("node2".to_string(), Duration::from_millis(5));
+        timing
+            .node_durations
+            .insert("node2".to_string(), Duration::from_millis(5));
 
         let (slowest_id, _) = timing.slowest_node().unwrap();
         assert_eq!(slowest_id, "node1");
@@ -435,8 +449,7 @@ mod tests {
 
     #[test]
     fn test_clone_for_branch() {
-        let mut ctx = DAGContext::new("stream-123")
-            .with_metadata("key1", "value1");
+        let mut ctx = DAGContext::new("stream-123").with_metadata("key1", "value1");
         ctx.set_node_result("node1", 42i32);
 
         let branch_ctx = ctx.clone_for_branch();

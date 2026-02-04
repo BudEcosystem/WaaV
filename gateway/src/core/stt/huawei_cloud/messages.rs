@@ -770,7 +770,10 @@ mod tests {
 
     #[test]
     fn test_error_code_parsing() {
-        assert_eq!(HuaweiSisErrorCode::from_code(0), HuaweiSisErrorCode::Success);
+        assert_eq!(
+            HuaweiSisErrorCode::from_code(0),
+            HuaweiSisErrorCode::Success
+        );
         assert_eq!(
             HuaweiSisErrorCode::from_code(1),
             HuaweiSisErrorCode::AuthenticationFailed
@@ -783,7 +786,10 @@ mod tests {
             HuaweiSisErrorCode::from_code(6),
             HuaweiSisErrorCode::RateLimitExceeded
         );
-        assert_eq!(HuaweiSisErrorCode::from_code(9999), HuaweiSisErrorCode::Unknown);
+        assert_eq!(
+            HuaweiSisErrorCode::from_code(9999),
+            HuaweiSisErrorCode::Unknown
+        );
     }
 
     #[test]

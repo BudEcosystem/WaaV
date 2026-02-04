@@ -30,7 +30,7 @@ use sha1::Sha1;
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::config::{SIGNATURE_VALIDITY_SECS, MAX_NONCE, VOICE_ID_LENGTH};
+use super::config::{MAX_NONCE, SIGNATURE_VALIDITY_SECS, VOICE_ID_LENGTH};
 
 // =============================================================================
 // Type Aliases
@@ -134,10 +134,7 @@ pub struct TencentSignatureBuilder {
 
 impl TencentSignatureBuilder {
     /// Create a new signature builder with required credentials.
-    pub fn new(
-        secret_id: impl Into<String>,
-        secret_key: impl Into<String>,
-    ) -> Self {
+    pub fn new(secret_id: impl Into<String>, secret_key: impl Into<String>) -> Self {
         let now = Self::current_timestamp();
 
         Self {
@@ -320,7 +317,10 @@ impl TencentSignatureBuilder {
         params.insert("timestamp".to_string(), self.timestamp.to_string());
         params.insert("expired".to_string(), self.expired.to_string());
         params.insert("nonce".to_string(), self.nonce.to_string());
-        params.insert("engine_model_type".to_string(), self.engine_model_type.clone());
+        params.insert(
+            "engine_model_type".to_string(),
+            self.engine_model_type.clone(),
+        );
         params.insert("voice_id".to_string(), self.voice_id.clone());
         params.insert("voice_format".to_string(), self.voice_format.to_string());
 
@@ -358,7 +358,10 @@ impl TencentSignatureBuilder {
         }
 
         if let Some(reinforce_hotword) = self.reinforce_hotword {
-            params.insert("reinforce_hotword".to_string(), reinforce_hotword.to_string());
+            params.insert(
+                "reinforce_hotword".to_string(),
+                reinforce_hotword.to_string(),
+            );
         }
 
         if let Some(max_speak_time) = self.max_speak_time {
@@ -374,7 +377,10 @@ impl TencentSignatureBuilder {
         }
 
         if let Some(filter_empty_result) = self.filter_empty_result {
-            params.insert("filter_empty_result".to_string(), filter_empty_result.to_string());
+            params.insert(
+                "filter_empty_result".to_string(),
+                filter_empty_result.to_string(),
+            );
         }
 
         params
@@ -402,10 +408,8 @@ impl TencentSignatureBuilder {
         let signature_bytes = result.into_bytes();
 
         // Base64 encode
-        let signature_base64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &signature_bytes,
-        );
+        let signature_base64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &signature_bytes);
 
         Ok(signature_base64)
     }
@@ -513,8 +517,8 @@ mod tests {
             .with_timestamp(1234567890)
             .with_nonce(9876543210)
             .with_needvad(true)
-            .with_filter_dirty(1)  // Mode: 1=filter
-            .with_filter_modal(0)  // Mode: 0=off
+            .with_filter_dirty(1) // Mode: 1=filter
+            .with_filter_modal(0) // Mode: 0=off
             .with_filter_punc(true)
             .with_word_info(2)
             .with_vad_silence_time(500)
@@ -536,8 +540,7 @@ mod tests {
 
     #[test]
     fn test_builder_word_info_clamping() {
-        let builder = TencentSignatureBuilder::new("id", "key")
-            .with_word_info(10); // Above max
+        let builder = TencentSignatureBuilder::new("id", "key").with_word_info(10); // Above max
 
         assert_eq!(builder.word_info, Some(2));
     }
@@ -601,7 +604,10 @@ mod tests {
 
         let param_string = TencentSignatureBuilder::build_param_string(&params);
 
-        assert_eq!(param_string, "a_param=value_a&b_param=value_b&c_param=value_c");
+        assert_eq!(
+            param_string,
+            "a_param=value_a&b_param=value_b&c_param=value_c"
+        );
     }
 
     #[test]
@@ -609,7 +615,7 @@ mod tests {
         let builder = TencentSignatureBuilder::new("id", "key")
             .with_voice_id("test_voice_id_ab")
             .with_needvad(true)
-            .with_filter_dirty(1)  // Mode: 1=filter
+            .with_filter_dirty(1) // Mode: 1=filter
             .with_hotword_id("vocab123");
 
         let params = builder.build_params();
@@ -683,18 +689,15 @@ mod tests {
 
     #[test]
     fn test_signature_is_base64() {
-        let builder = TencentSignatureBuilder::new("id", "key")
-            .with_voice_id("test_voice_id_ab");
+        let builder = TencentSignatureBuilder::new("id", "key").with_voice_id("test_voice_id_ab");
 
         let params = builder.build_params();
         let param_string = TencentSignatureBuilder::build_param_string(&params);
         let signature = builder.calculate_signature(&param_string).unwrap();
 
         // Should be valid base64
-        let decoded = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &signature,
-        );
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &signature);
         assert!(decoded.is_ok());
 
         // HMAC-SHA1 produces 20 bytes
@@ -783,7 +786,9 @@ mod tests {
             .with_timestamp(1609459200)
             .with_nonce(123456789);
 
-        let url = builder.build_url("wss://asr.cloud.tencent.com/asr/v2", "12345678").unwrap();
+        let url = builder
+            .build_url("wss://asr.cloud.tencent.com/asr/v2", "12345678")
+            .unwrap();
 
         assert!(url.starts_with("wss://asr.cloud.tencent.com/asr/v2/12345678?"));
         assert!(url.contains("secretid=test_id"));

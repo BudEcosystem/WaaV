@@ -79,10 +79,10 @@ pub use websocket::{
 
 // Re-export Smart Turn types for audio-based turn detection
 pub use smart_turn::{
-    MelExtractor, MelExtractorConfig,
-    SmartTurnDetector, SmartTurnDetectorBuilder, SmartTurnDetectorConfig, SmartTurnResult,
-    SMART_TURN_MAX_FRAMES, WHISPER_HOP_LENGTH, WHISPER_MAX_DURATION_SECS, WHISPER_MAX_FRAMES,
-    WHISPER_N_FFT, WHISPER_N_MELS, WHISPER_SAMPLE_RATE,
+    MelExtractor, MelExtractorConfig, SMART_TURN_MAX_FRAMES, SmartTurnDetector,
+    SmartTurnDetectorBuilder, SmartTurnDetectorConfig, SmartTurnResult, WHISPER_HOP_LENGTH,
+    WHISPER_MAX_DURATION_SECS, WHISPER_MAX_FRAMES, WHISPER_N_FFT, WHISPER_N_MELS,
+    WHISPER_SAMPLE_RATE,
 };
 
 // Re-export Turn Decision Engine types for ensemble turn detection

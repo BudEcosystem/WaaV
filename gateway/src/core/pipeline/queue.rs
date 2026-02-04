@@ -466,7 +466,6 @@ impl FramePriorityQueue {
 
         Some(removed)
     }
-
 }
 
 // =============================================================================
@@ -695,10 +694,22 @@ mod tests {
         let queue = FramePriorityQueue::new(10);
 
         // Push frames in random priority order
-        queue.push(PriorityFrame::new(Bytes::from_static(b"normal"), FramePriority::Normal));
-        queue.push(PriorityFrame::new(Bytes::from_static(b"critical"), FramePriority::Critical));
-        queue.push(PriorityFrame::new(Bytes::from_static(b"low"), FramePriority::Low));
-        queue.push(PriorityFrame::new(Bytes::from_static(b"high"), FramePriority::High));
+        queue.push(PriorityFrame::new(
+            Bytes::from_static(b"normal"),
+            FramePriority::Normal,
+        ));
+        queue.push(PriorityFrame::new(
+            Bytes::from_static(b"critical"),
+            FramePriority::Critical,
+        ));
+        queue.push(PriorityFrame::new(
+            Bytes::from_static(b"low"),
+            FramePriority::Low,
+        ));
+        queue.push(PriorityFrame::new(
+            Bytes::from_static(b"high"),
+            FramePriority::High,
+        ));
 
         // Should come out in priority order
         assert_eq!(queue.pop().unwrap().data, Bytes::from_static(b"critical"));
@@ -777,8 +788,14 @@ mod tests {
         let queue = FramePriorityQueue::new(2);
 
         // Fill with low priority frames
-        queue.push(PriorityFrame::new(Bytes::from_static(b"low1"), FramePriority::Low));
-        queue.push(PriorityFrame::new(Bytes::from_static(b"low2"), FramePriority::Low));
+        queue.push(PriorityFrame::new(
+            Bytes::from_static(b"low1"),
+            FramePriority::Low,
+        ));
+        queue.push(PriorityFrame::new(
+            Bytes::from_static(b"low2"),
+            FramePriority::Low,
+        ));
 
         // Push high priority - should evict a low priority
         queue.push(PriorityFrame::high(Bytes::from_static(b"high")));
@@ -799,7 +816,10 @@ mod tests {
         queue.push(PriorityFrame::high(Bytes::from_static(b"high2")));
 
         // Try to push low priority - should be dropped
-        let result = queue.push(PriorityFrame::new(Bytes::from_static(b"low"), FramePriority::Low));
+        let result = queue.push(PriorityFrame::new(
+            Bytes::from_static(b"low"),
+            FramePriority::Low,
+        ));
         assert!(!result);
 
         assert_eq!(queue.len(), 2);
@@ -809,7 +829,10 @@ mod tests {
     fn test_queue_push_with_evicted() {
         let queue = FramePriorityQueue::new(2);
 
-        queue.push(PriorityFrame::new(Bytes::from_static(b"low"), FramePriority::Low));
+        queue.push(PriorityFrame::new(
+            Bytes::from_static(b"low"),
+            FramePriority::Low,
+        ));
         queue.push(PriorityFrame::normal(Bytes::from_static(b"normal")));
 
         // Push high priority, should evict low
@@ -844,7 +867,10 @@ mod tests {
     fn test_queue_pop_all() {
         let queue = FramePriorityQueue::new(10);
 
-        queue.push(PriorityFrame::new(Bytes::from_static(b"low"), FramePriority::Low));
+        queue.push(PriorityFrame::new(
+            Bytes::from_static(b"low"),
+            FramePriority::Low,
+        ));
         queue.push(PriorityFrame::normal(Bytes::from_static(b"normal")));
         queue.push(PriorityFrame::high(Bytes::from_static(b"high")));
 
@@ -1075,7 +1101,10 @@ mod tests {
         let queue = FramePriorityQueue::new(2);
 
         // Fill queue with Low and High priority frames
-        queue.push(PriorityFrame::new(Bytes::from_static(b"low"), FramePriority::Low));
+        queue.push(PriorityFrame::new(
+            Bytes::from_static(b"low"),
+            FramePriority::Low,
+        ));
         queue.push(PriorityFrame::high(Bytes::from_static(b"high")));
         assert_eq!(queue.len(), 2);
 
@@ -1101,7 +1130,10 @@ mod tests {
         let queue = FramePriorityQueue::new(3);
 
         // Fill with mixed priorities
-        queue.push(PriorityFrame::new(Bytes::from_static(b"low"), FramePriority::Low));
+        queue.push(PriorityFrame::new(
+            Bytes::from_static(b"low"),
+            FramePriority::Low,
+        ));
         queue.push(PriorityFrame::normal(Bytes::from_static(b"normal")));
         queue.push(PriorityFrame::high(Bytes::from_static(b"high")));
         assert_eq!(queue.len(), 3);
@@ -1125,7 +1157,10 @@ mod tests {
         // Same regression test but for push_with_evicted
         let queue = FramePriorityQueue::new(2);
 
-        queue.push(PriorityFrame::new(Bytes::from_static(b"low"), FramePriority::Low));
+        queue.push(PriorityFrame::new(
+            Bytes::from_static(b"low"),
+            FramePriority::Low,
+        ));
         queue.push(PriorityFrame::high(Bytes::from_static(b"high")));
 
         // Push Normal - should evict Low and return it

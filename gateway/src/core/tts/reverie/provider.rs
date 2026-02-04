@@ -174,7 +174,10 @@ impl TTSRequestBuilder for ReverieRequestBuilder {
 // =============================================================================
 
 /// Computes a hash of the TTS configuration for cache keying.
-fn compute_reverie_tts_config_hash(config: &TTSConfig, reverie_config: &ReverieTtsConfig) -> String {
+fn compute_reverie_tts_config_hash(
+    config: &TTSConfig,
+    reverie_config: &ReverieTtsConfig,
+) -> String {
     let mut s = String::with_capacity(256);
 
     // Provider identifier
@@ -345,15 +348,13 @@ impl ReverieTts {
 
     /// Sets the speed.
     pub fn set_speed(&mut self, speed: f32) {
-        self.request_builder.reverie_config.speed =
-            speed.clamp(super::MIN_SPEED, super::MAX_SPEED);
+        self.request_builder.reverie_config.speed = speed.clamp(super::MIN_SPEED, super::MAX_SPEED);
         self.recompute_config_hash();
     }
 
     /// Sets the pitch.
     pub fn set_pitch(&mut self, pitch: f32) {
-        self.request_builder.reverie_config.pitch =
-            pitch.clamp(super::MIN_PITCH, super::MAX_PITCH);
+        self.request_builder.reverie_config.pitch = pitch.clamp(super::MIN_PITCH, super::MAX_PITCH);
         self.recompute_config_hash();
     }
 
@@ -612,7 +613,10 @@ mod tests {
         let builder = ReverieRequestBuilder::new(config, reverie_config);
 
         let client = reqwest::Client::new();
-        let request = builder.build_http_request(&client, "Hello").build().unwrap();
+        let request = builder
+            .build_http_request(&client, "Hello")
+            .build()
+            .unwrap();
 
         // Verify REV-API-KEY header
         let api_key_header = request.headers().get("rev-api-key").unwrap();

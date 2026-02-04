@@ -870,11 +870,8 @@ mod tests {
 
     #[test]
     fn test_speaker_info_with_name() {
-        let speaker = SpeakerInfo::with_name(
-            "speaker_1".to_string(),
-            "John Doe".to_string(),
-            Some(0.87),
-        );
+        let speaker =
+            SpeakerInfo::with_name("speaker_1".to_string(), "John Doe".to_string(), Some(0.87));
         assert_eq!(speaker.speaker_id, "speaker_1");
         assert_eq!(speaker.name, Some("John Doe".to_string()));
         assert_eq!(speaker.confidence, Some(0.87));
@@ -942,7 +939,10 @@ mod tests {
             WordTiming::new("world".to_string(), 0.6, 1.0),
         ];
         let speakers = vec![SpeakerInfo::new("speaker_0".to_string())];
-        let entities = vec![DetectedEntity::new("world".to_string(), "common_noun".to_string())];
+        let entities = vec![DetectedEntity::new(
+            "world".to_string(),
+            "common_noun".to_string(),
+        )];
         let sensitive_data = vec![SensitiveDataItem::new("pii".to_string())];
 
         let result = STTResult::with_metadata(

@@ -10,16 +10,16 @@
 //! `disconnect()` is called or when the buffer reaches the maximum duration.
 
 use super::config::{
-    NaverClovaAudioFormat, NaverClovaSttConfig, NaverClovaSttResponse,
-    MAX_AUDIO_DURATION_SECONDS, NAVER_CSR_ENDPOINT,
+    MAX_AUDIO_DURATION_SECONDS, NAVER_CSR_ENDPOINT, NaverClovaAudioFormat, NaverClovaSttConfig,
+    NaverClovaSttResponse,
 };
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
 use bytes::Bytes;
 use reqwest::Client;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
@@ -56,7 +56,11 @@ impl NaverClovaStt {
 
     /// Build the API endpoint URL with language parameter.
     fn build_endpoint_url(&self) -> String {
-        format!("{}?lang={}", NAVER_CSR_ENDPOINT, self.config.language.code())
+        format!(
+            "{}?lang={}",
+            NAVER_CSR_ENDPOINT,
+            self.config.language.code()
+        )
     }
 
     /// Transcribe the buffered audio using the REST API.
@@ -72,8 +76,7 @@ impl NaverClovaStt {
         }
 
         let buffer_len = buffer.len();
-        let duration_secs = buffer_len as f32
-            / (self.config.sample_rate as f32 * 2.0); // 2 bytes per sample for 16-bit PCM
+        let duration_secs = buffer_len as f32 / (self.config.sample_rate as f32 * 2.0); // 2 bytes per sample for 16-bit PCM
 
         info!(
             "NAVER CLOVA: Transcribing {} bytes ({:.2} seconds) of audio",
@@ -213,7 +216,9 @@ impl BaseSTT for NaverClovaStt {
         let http_client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .map_err(|e| STTError::ConfigurationError(format!("Failed to create HTTP client: {e}")))?;
+            .map_err(|e| {
+                STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+            })?;
 
         info!(
             "NAVER CLOVA STT: Initialized with language={}, sample_rate={}",
@@ -371,8 +376,8 @@ impl BaseSTT for NaverClovaStt {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::config::NaverClovaLanguage;
+    use super::*;
 
     fn make_test_config() -> STTConfig {
         STTConfig {

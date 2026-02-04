@@ -216,15 +216,13 @@ impl ZaloTtsConfig {
 
         // Parse voice from voice_id field
         let voice = match &config.voice_id {
-            Some(id) if !id.is_empty() => {
-                ZaloVoice::from_str_relaxed(id).unwrap_or_else(|| {
-                    tracing::warn!(
-                        "Unknown Zalo voice '{}', using default (Female Northern)",
-                        id
-                    );
-                    ZaloVoice::default()
-                })
-            }
+            Some(id) if !id.is_empty() => ZaloVoice::from_str_relaxed(id).unwrap_or_else(|| {
+                tracing::warn!(
+                    "Unknown Zalo voice '{}', using default (Female Northern)",
+                    id
+                );
+                ZaloVoice::default()
+            }),
             _ => ZaloVoice::default(),
         };
 
@@ -264,8 +262,7 @@ impl ZaloTtsConfig {
     /// Build URL-encoded request body.
     pub fn build_request_body(&self, text: &str) -> String {
         // URL-encode text for form submission
-        let encoded_text: String =
-            url::form_urlencoded::byte_serialize(text.as_bytes()).collect();
+        let encoded_text: String = url::form_urlencoded::byte_serialize(text.as_bytes()).collect();
 
         format!(
             "input={}&speed={}&speaker_id={}",
@@ -344,8 +341,14 @@ mod tests {
 
     #[test]
     fn test_voice_from_str_numeric() {
-        assert_eq!(ZaloVoice::from_str_relaxed("1"), Some(ZaloVoice::FemaleSouth));
-        assert_eq!(ZaloVoice::from_str_relaxed("2"), Some(ZaloVoice::FemaleNorth));
+        assert_eq!(
+            ZaloVoice::from_str_relaxed("1"),
+            Some(ZaloVoice::FemaleSouth)
+        );
+        assert_eq!(
+            ZaloVoice::from_str_relaxed("2"),
+            Some(ZaloVoice::FemaleNorth)
+        );
         assert_eq!(ZaloVoice::from_str_relaxed("3"), Some(ZaloVoice::MaleSouth));
         assert_eq!(ZaloVoice::from_str_relaxed("4"), Some(ZaloVoice::MaleNorth));
     }
@@ -372,10 +375,22 @@ mod tests {
 
     #[test]
     fn test_voice_from_str_short() {
-        assert_eq!(ZaloVoice::from_str_relaxed("fs"), Some(ZaloVoice::FemaleSouth));
-        assert_eq!(ZaloVoice::from_str_relaxed("fn"), Some(ZaloVoice::FemaleNorth));
-        assert_eq!(ZaloVoice::from_str_relaxed("ms"), Some(ZaloVoice::MaleSouth));
-        assert_eq!(ZaloVoice::from_str_relaxed("mn"), Some(ZaloVoice::MaleNorth));
+        assert_eq!(
+            ZaloVoice::from_str_relaxed("fs"),
+            Some(ZaloVoice::FemaleSouth)
+        );
+        assert_eq!(
+            ZaloVoice::from_str_relaxed("fn"),
+            Some(ZaloVoice::FemaleNorth)
+        );
+        assert_eq!(
+            ZaloVoice::from_str_relaxed("ms"),
+            Some(ZaloVoice::MaleSouth)
+        );
+        assert_eq!(
+            ZaloVoice::from_str_relaxed("mn"),
+            Some(ZaloVoice::MaleNorth)
+        );
     }
 
     #[test]
@@ -451,10 +466,7 @@ mod tests {
         };
 
         assert!(response.is_success());
-        assert_eq!(
-            response.audio_url(),
-            Some("https://example.com/audio.wav")
-        );
+        assert_eq!(response.audio_url(), Some("https://example.com/audio.wav"));
     }
 
     #[test]

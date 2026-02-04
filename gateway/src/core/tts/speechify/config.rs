@@ -479,7 +479,9 @@ impl SpeechifyTtsConfigBuilder {
     pub fn build(self) -> TTSResult<SpeechifyTtsConfig> {
         let config = SpeechifyTtsConfig {
             api_key: self.api_key.unwrap_or_default(),
-            voice_id: self.voice_id.unwrap_or_else(|| super::DEFAULT_VOICE_ID.to_string()),
+            voice_id: self
+                .voice_id
+                .unwrap_or_else(|| super::DEFAULT_VOICE_ID.to_string()),
             model: self.model.unwrap_or_default(),
             audio_format: self.audio_format.unwrap_or_default(),
             language: self.language,

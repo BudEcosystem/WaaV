@@ -150,10 +150,7 @@ impl AmiVoiceMessage {
 
     /// Check if this is an error message.
     pub fn is_error(&self) -> bool {
-        matches!(
-            self,
-            Self::SessionStartError(_) | Self::SessionEndError(_)
-        )
+        matches!(self, Self::SessionStartError(_) | Self::SessionEndError(_))
     }
 
     /// Get error message if this is an error.
@@ -213,9 +210,7 @@ impl AmiVoiceResult {
 
         // Use STTResult::new to ensure confidence clamping
         STTResult::new(
-            transcript,
-            is_final,
-            is_final, // is_speech_final matches is_final for AmiVoice
+            transcript, is_final, is_final, // is_speech_final matches is_final for AmiVoice
             confidence,
         )
     }

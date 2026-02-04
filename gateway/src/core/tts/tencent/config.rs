@@ -787,23 +787,19 @@ mod tests {
 
     #[test]
     fn test_config_speed_clamping() {
-        let config = TencentTtsConfig::new("id", "key")
-            .with_speed(0.1); // Below minimum
+        let config = TencentTtsConfig::new("id", "key").with_speed(0.1); // Below minimum
         assert_eq!(config.speed, MIN_SPEED);
 
-        let config = TencentTtsConfig::new("id", "key")
-            .with_speed(5.0); // Above maximum
+        let config = TencentTtsConfig::new("id", "key").with_speed(5.0); // Above maximum
         assert_eq!(config.speed, MAX_SPEED);
     }
 
     #[test]
     fn test_config_volume_clamping() {
-        let config = TencentTtsConfig::new("id", "key")
-            .with_volume(-1.0); // Below minimum
+        let config = TencentTtsConfig::new("id", "key").with_volume(-1.0); // Below minimum
         assert_eq!(config.volume, MIN_VOLUME);
 
-        let config = TencentTtsConfig::new("id", "key")
-            .with_volume(15.0); // Above maximum
+        let config = TencentTtsConfig::new("id", "key").with_volume(15.0); // Above maximum
         assert_eq!(config.volume, MAX_VOLUME);
     }
 

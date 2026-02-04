@@ -125,8 +125,8 @@ impl Default for VADParams {
     fn default() -> Self {
         Self {
             confidence_threshold: 0.7,
-            start_debounce_frames: 4,  // ~200ms at 20fps (50ms frames)
-            stop_debounce_frames: 16,  // ~800ms at 20fps
+            start_debounce_frames: 4, // ~200ms at 20fps (50ms frames)
+            stop_debounce_frames: 16, // ~800ms at 20fps
             min_volume: 0.6,
         }
     }
@@ -238,8 +238,8 @@ impl VADAnalyzer {
     /// # Returns
     /// * Tuple of (current_state, Option<transition_event>)
     pub fn analyze(&mut self, confidence: f32, volume: f32) -> (VADState, Option<VADTransition>) {
-        let is_voice = confidence >= self.params.confidence_threshold
-            && volume >= self.params.min_volume;
+        let is_voice =
+            confidence >= self.params.confidence_threshold && volume >= self.params.min_volume;
 
         let _old_state = self.state;
 
@@ -430,8 +430,8 @@ mod tests {
     #[test]
     fn test_vad_params_clamping() {
         let params = VADParams::default()
-            .with_confidence_threshold(1.5)  // Should clamp to 1.0
-            .with_min_volume(-0.5);          // Should clamp to 0.0
+            .with_confidence_threshold(1.5) // Should clamp to 1.0
+            .with_min_volume(-0.5); // Should clamp to 0.0
 
         assert_eq!(params.confidence_threshold, 1.0);
         assert_eq!(params.min_volume, 0.0);
@@ -461,9 +461,11 @@ mod tests {
 
     #[test]
     fn test_quiet_to_starting() {
-        let mut vad = VADAnalyzer::new(VADParams::default()
-            .with_confidence_threshold(0.5)
-            .with_min_volume(0.5));
+        let mut vad = VADAnalyzer::new(
+            VADParams::default()
+                .with_confidence_threshold(0.5)
+                .with_min_volume(0.5),
+        );
 
         // Voice detected → STARTING
         let (state, transition) = vad.analyze(0.8, 0.7);
@@ -473,10 +475,12 @@ mod tests {
 
     #[test]
     fn test_starting_to_speaking() {
-        let mut vad = VADAnalyzer::new(VADParams::default()
-            .with_confidence_threshold(0.5)
-            .with_min_volume(0.5)
-            .with_start_debounce(3));
+        let mut vad = VADAnalyzer::new(
+            VADParams::default()
+                .with_confidence_threshold(0.5)
+                .with_min_volume(0.5)
+                .with_start_debounce(3),
+        );
 
         // First voice frame → STARTING
         vad.analyze(0.8, 0.7);
@@ -494,10 +498,12 @@ mod tests {
 
     #[test]
     fn test_starting_interrupted_by_silence() {
-        let mut vad = VADAnalyzer::new(VADParams::default()
-            .with_confidence_threshold(0.5)
-            .with_min_volume(0.5)
-            .with_start_debounce(3));
+        let mut vad = VADAnalyzer::new(
+            VADParams::default()
+                .with_confidence_threshold(0.5)
+                .with_min_volume(0.5)
+                .with_start_debounce(3),
+        );
 
         // Voice detected → STARTING
         vad.analyze(0.8, 0.7);
@@ -515,10 +521,12 @@ mod tests {
 
     #[test]
     fn test_speaking_to_stopping() {
-        let mut vad = VADAnalyzer::new(VADParams::default()
-            .with_confidence_threshold(0.5)
-            .with_min_volume(0.5)
-            .with_start_debounce(1));  // Quick start for test
+        let mut vad = VADAnalyzer::new(
+            VADParams::default()
+                .with_confidence_threshold(0.5)
+                .with_min_volume(0.5)
+                .with_start_debounce(1),
+        ); // Quick start for test
 
         // Get to SPEAKING state
         vad.analyze(0.8, 0.7);
@@ -532,11 +540,13 @@ mod tests {
 
     #[test]
     fn test_stopping_to_quiet() {
-        let mut vad = VADAnalyzer::new(VADParams::default()
-            .with_confidence_threshold(0.5)
-            .with_min_volume(0.5)
-            .with_start_debounce(1)
-            .with_stop_debounce(3));
+        let mut vad = VADAnalyzer::new(
+            VADParams::default()
+                .with_confidence_threshold(0.5)
+                .with_min_volume(0.5)
+                .with_start_debounce(1)
+                .with_stop_debounce(3),
+        );
 
         // Get to SPEAKING
         vad.analyze(0.8, 0.7);
@@ -556,11 +566,13 @@ mod tests {
 
     #[test]
     fn test_stopping_interrupted_by_voice() {
-        let mut vad = VADAnalyzer::new(VADParams::default()
-            .with_confidence_threshold(0.5)
-            .with_min_volume(0.5)
-            .with_start_debounce(1)
-            .with_stop_debounce(5));
+        let mut vad = VADAnalyzer::new(
+            VADParams::default()
+                .with_confidence_threshold(0.5)
+                .with_min_volume(0.5)
+                .with_start_debounce(1)
+                .with_stop_debounce(5),
+        );
 
         // Get to SPEAKING
         vad.analyze(0.8, 0.7);
@@ -582,9 +594,11 @@ mod tests {
 
     #[test]
     fn test_confidence_below_threshold() {
-        let mut vad = VADAnalyzer::new(VADParams::default()
-            .with_confidence_threshold(0.7)
-            .with_min_volume(0.5));
+        let mut vad = VADAnalyzer::new(
+            VADParams::default()
+                .with_confidence_threshold(0.7)
+                .with_min_volume(0.5),
+        );
 
         // Confidence below threshold → stays QUIET
         let (state, transition) = vad.analyze(0.6, 0.8);
@@ -594,9 +608,11 @@ mod tests {
 
     #[test]
     fn test_volume_below_threshold() {
-        let mut vad = VADAnalyzer::new(VADParams::default()
-            .with_confidence_threshold(0.5)
-            .with_min_volume(0.7));
+        let mut vad = VADAnalyzer::new(
+            VADParams::default()
+                .with_confidence_threshold(0.5)
+                .with_min_volume(0.7),
+        );
 
         // Volume below threshold → stays QUIET
         let (state, transition) = vad.analyze(0.9, 0.5);
@@ -606,10 +622,12 @@ mod tests {
 
     #[test]
     fn test_both_thresholds_must_be_met() {
-        let mut vad = VADAnalyzer::new(VADParams::default()
-            .with_confidence_threshold(0.5)
-            .with_min_volume(0.5)
-            .with_start_debounce(1));
+        let mut vad = VADAnalyzer::new(
+            VADParams::default()
+                .with_confidence_threshold(0.5)
+                .with_min_volume(0.5)
+                .with_start_debounce(1),
+        );
 
         // High confidence, low volume → no detection
         vad.analyze(0.9, 0.3);
@@ -630,8 +648,7 @@ mod tests {
 
     #[test]
     fn test_reset_from_speaking() {
-        let mut vad = VADAnalyzer::new(VADParams::default()
-            .with_start_debounce(1));
+        let mut vad = VADAnalyzer::new(VADParams::default().with_start_debounce(1));
 
         // Get to SPEAKING
         vad.analyze(0.8, 0.8);
@@ -645,8 +662,7 @@ mod tests {
 
     #[test]
     fn test_reset_clears_counters() {
-        let mut vad = VADAnalyzer::new(VADParams::default()
-            .with_start_debounce(5));
+        let mut vad = VADAnalyzer::new(VADParams::default().with_start_debounce(5));
 
         // Partially through start debounce
         vad.analyze(0.8, 0.8);
@@ -704,9 +720,11 @@ mod tests {
 
     #[test]
     fn test_debounce_progress() {
-        let mut vad = VADAnalyzer::new(VADParams::default()
-            .with_start_debounce(5)
-            .with_stop_debounce(10));
+        let mut vad = VADAnalyzer::new(
+            VADParams::default()
+                .with_start_debounce(5)
+                .with_stop_debounce(10),
+        );
 
         // QUIET state
         assert_eq!(vad.debounce_progress(), (0, 0));
@@ -737,7 +755,10 @@ mod tests {
         let new_params = VADParams::aggressive();
         vad.set_params(new_params.clone());
 
-        assert_eq!(vad.params().confidence_threshold, new_params.confidence_threshold);
+        assert_eq!(
+            vad.params().confidence_threshold,
+            new_params.confidence_threshold
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -746,11 +767,13 @@ mod tests {
 
     #[test]
     fn test_typical_speech_sequence() {
-        let mut vad = VADAnalyzer::new(VADParams::default()
-            .with_confidence_threshold(0.5)
-            .with_min_volume(0.5)
-            .with_start_debounce(3)
-            .with_stop_debounce(5));
+        let mut vad = VADAnalyzer::new(
+            VADParams::default()
+                .with_confidence_threshold(0.5)
+                .with_min_volume(0.5)
+                .with_start_debounce(3)
+                .with_stop_debounce(5),
+        );
 
         let mut transitions = vec![];
 
@@ -799,10 +822,12 @@ mod tests {
 
     #[test]
     fn test_noisy_input() {
-        let mut vad = VADAnalyzer::new(VADParams::default()
-            .with_confidence_threshold(0.6)
-            .with_min_volume(0.5)
-            .with_start_debounce(4));
+        let mut vad = VADAnalyzer::new(
+            VADParams::default()
+                .with_confidence_threshold(0.6)
+                .with_min_volume(0.5)
+                .with_start_debounce(4),
+        );
 
         // Simulate noisy input with intermittent voice detection
         let noise_pattern = [0.7, 0.3, 0.2, 0.5, 0.4, 0.3, 0.6, 0.2];
@@ -817,9 +842,11 @@ mod tests {
 
     #[test]
     fn test_rapid_on_off_speech() {
-        let mut vad = VADAnalyzer::new(VADParams::default()
-            .with_start_debounce(2)
-            .with_stop_debounce(3));
+        let mut vad = VADAnalyzer::new(
+            VADParams::default()
+                .with_start_debounce(2)
+                .with_stop_debounce(3),
+        );
 
         let mut started_count = 0;
         let mut ended_count = 0;
@@ -854,10 +881,12 @@ mod tests {
 
     #[test]
     fn test_exact_threshold_values() {
-        let mut vad = VADAnalyzer::new(VADParams::default()
-            .with_confidence_threshold(0.7)
-            .with_min_volume(0.6)
-            .with_start_debounce(1));
+        let mut vad = VADAnalyzer::new(
+            VADParams::default()
+                .with_confidence_threshold(0.7)
+                .with_min_volume(0.6)
+                .with_start_debounce(1),
+        );
 
         // Exactly at threshold should trigger
         let (state, _) = vad.analyze(0.7, 0.6);
@@ -875,9 +904,11 @@ mod tests {
 
     #[test]
     fn test_zero_debounce() {
-        let mut vad = VADAnalyzer::new(VADParams::default()
-            .with_start_debounce(0)
-            .with_stop_debounce(0));
+        let mut vad = VADAnalyzer::new(
+            VADParams::default()
+                .with_start_debounce(0)
+                .with_stop_debounce(0),
+        );
 
         // With zero debounce, should transition immediately
         // Note: start_debounce of 0 means condition >= 0, which is always true
@@ -886,9 +917,11 @@ mod tests {
 
     #[test]
     fn test_single_frame_debounce() {
-        let mut vad = VADAnalyzer::new(VADParams::default()
-            .with_start_debounce(1)
-            .with_stop_debounce(1));
+        let mut vad = VADAnalyzer::new(
+            VADParams::default()
+                .with_start_debounce(1)
+                .with_stop_debounce(1),
+        );
 
         // Single frame should trigger start
         let (_, t) = vad.analyze(0.9, 0.9);

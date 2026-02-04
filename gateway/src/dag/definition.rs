@@ -191,9 +191,7 @@ impl DAGDefinition {
 
         if !self.nodes.is_empty() {
             // Check entry node exists
-            if !self.entry_node.is_empty()
-                && !self.nodes.iter().any(|n| n.id == self.entry_node)
-            {
+            if !self.entry_node.is_empty() && !self.nodes.iter().any(|n| n.id == self.entry_node) {
                 errors.push(format!(
                     "Entry node '{}' not found in nodes",
                     self.entry_node
@@ -378,9 +376,7 @@ pub enum NodeType {
     },
 
     /// Plugin-based audio/text processor
-    Processor {
-        plugin: String,
-    },
+    Processor { plugin: String },
 
     /// HTTP endpoint call
     HttpEndpoint {
@@ -472,9 +468,7 @@ pub enum NodeType {
     },
 
     /// Split node (broadcast to multiple branches)
-    Split {
-        branches: Vec<String>,
-    },
+    Split { branches: Vec<String> },
 
     /// Join node (aggregate from multiple branches)
     Join {
@@ -490,9 +484,7 @@ pub enum NodeType {
     },
 
     /// Conditional router
-    Router {
-        routes: Vec<RouteDefinition>,
-    },
+    Router { routes: Vec<RouteDefinition> },
 
     /// Data transformer (Rhai script)
     Transform {
@@ -514,9 +506,7 @@ pub enum OutputDestination {
     /// Send to LiveKit room
     LiveKit,
     /// Send to specific endpoint node
-    Endpoint {
-        node_id: String,
-    },
+    Endpoint { node_id: String },
     /// Broadcast to all connected clients
     Broadcast,
     /// Discard output (useful for side effects only)
@@ -718,11 +708,14 @@ mod tests {
     fn test_dag_definition_builder() {
         let mut dag = DAGDefinition::new("test-dag", "Test DAG");
         dag.add_node(NodeDefinition::new("input", NodeType::AudioInput));
-        dag.add_node(NodeDefinition::new("stt", NodeType::SttProvider {
-            provider: "deepgram".to_string(),
-            model: None,
-            language: None,
-        }));
+        dag.add_node(NodeDefinition::new(
+            "stt",
+            NodeType::SttProvider {
+                provider: "deepgram".to_string(),
+                model: None,
+                language: None,
+            },
+        ));
         dag.add_edge(EdgeDefinition::new("input", "stt"));
         dag.with_entry("input");
         dag.add_exit("stt");
@@ -750,11 +743,14 @@ mod tests {
 
     #[test]
     fn test_node_type_serialization() {
-        let node = NodeDefinition::new("stt", NodeType::SttProvider {
-            provider: "deepgram".to_string(),
-            model: Some("nova-2".to_string()),
-            language: Some("en-US".to_string()),
-        });
+        let node = NodeDefinition::new(
+            "stt",
+            NodeType::SttProvider {
+                provider: "deepgram".to_string(),
+                model: Some("nova-2".to_string()),
+                language: Some("en-US".to_string()),
+            },
+        );
 
         let json = serde_json::to_string(&node).unwrap();
         assert!(json.contains("stt_provider"));

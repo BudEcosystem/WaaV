@@ -11,17 +11,17 @@
 mod mock_providers;
 
 use mock_providers::{
-    http_mock::{spawn_http_mock, HttpMockState},
-    websocket_mock::{spawn_stt_websocket_mock, spawn_tts_websocket_mock, WebSocketMockState},
     ChaosConfig, LatencyProfile,
+    http_mock::{HttpMockState, spawn_http_mock},
+    websocket_mock::{WebSocketMockState, spawn_stt_websocket_mock, spawn_tts_websocket_mock},
 };
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Semaphore};
 
@@ -300,13 +300,23 @@ fn generate_report(summary: &BreakingPointSummary) -> String {
     let mut report = String::new();
 
     report.push_str("\n");
-    report.push_str("╔══════════════════════════════════════════════════════════════════════════╗\n");
-    report.push_str("║                    WAAV GATEWAY BREAKING POINT REPORT                    ║\n");
-    report.push_str("╠══════════════════════════════════════════════════════════════════════════╣\n\n");
+    report
+        .push_str("╔══════════════════════════════════════════════════════════════════════════╗\n");
+    report
+        .push_str("║                    WAAV GATEWAY BREAKING POINT REPORT                    ║\n");
+    report.push_str(
+        "╠══════════════════════════════════════════════════════════════════════════╣\n\n",
+    );
 
     report.push_str("HARDWARE:\n");
-    report.push_str(&format!("  CPU: {} ({} cores)\n", summary.hardware_info.cpu_model, summary.hardware_info.cpu_cores));
-    report.push_str(&format!("  RAM: {:.1} GB\n", summary.hardware_info.total_ram_gb));
+    report.push_str(&format!(
+        "  CPU: {} ({} cores)\n",
+        summary.hardware_info.cpu_model, summary.hardware_info.cpu_cores
+    ));
+    report.push_str(&format!(
+        "  RAM: {:.1} GB\n",
+        summary.hardware_info.total_ram_gb
+    ));
     report.push_str(&format!("  OS: {}\n\n", summary.hardware_info.os));
 
     report.push_str("RESULTS:\n");
@@ -327,18 +337,14 @@ fn generate_report(summary: &BreakingPointSummary) -> String {
     for iter in &summary.iterations {
         report.push_str(&format!(
             "│ {:>7} │ {:>9.0} │ {:>8.2}% │ {:>9.2} │ {:>9.2} │ {:>9} │\n",
-            iter.vus,
-            iter.rps,
-            iter.error_rate,
-            iter.p50_ms,
-            iter.p99_ms,
-            iter.timeout_requests
+            iter.vus, iter.rps, iter.error_rate, iter.p50_ms, iter.p99_ms, iter.timeout_requests
         ));
     }
 
     report.push_str("└─────────┴───────────┴───────────┴───────────┴───────────┴───────────┘\n\n");
 
-    report.push_str("╚══════════════════════════════════════════════════════════════════════════╝\n");
+    report
+        .push_str("╚══════════════════════════════════════════════════════════════════════════╝\n");
 
     report
 }
@@ -347,11 +353,7 @@ fn generate_report(summary: &BreakingPointSummary) -> String {
 // HTTP CLIENT REQUESTS
 // ============================================================================
 
-async fn make_request(
-    client: &reqwest::Client,
-    base_url: &str,
-    stats: &IterationStats,
-) {
+async fn make_request(client: &reqwest::Client, base_url: &str, stats: &IterationStats) {
     let start = Instant::now();
     let url = format!("{}/", base_url);
 
@@ -457,13 +459,11 @@ fn get_hardware_info() -> HardwareInfo {
     let total_ram_gb = std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("MemTotal"))
-                .and_then(|l| {
-                    l.split_whitespace()
-                        .nth(1)
-                        .and_then(|v| v.parse::<f32>().ok())
-                })
+            s.lines().find(|l| l.starts_with("MemTotal")).and_then(|l| {
+                l.split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse::<f32>().ok())
+            })
         })
         .map(|kb| kb / 1024.0 / 1024.0)
         .unwrap_or(0.0);
@@ -471,15 +471,13 @@ fn get_hardware_info() -> HardwareInfo {
     let os = std::fs::read_to_string("/etc/os-release")
         .ok()
         .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("PRETTY_NAME"))
-                .map(|l| {
-                    l.split('=')
-                        .nth(1)
-                        .unwrap_or("Unknown")
-                        .trim_matches('"')
-                        .to_string()
-                })
+            s.lines().find(|l| l.starts_with("PRETTY_NAME")).map(|l| {
+                l.split('=')
+                    .nth(1)
+                    .unwrap_or("Unknown")
+                    .trim_matches('"')
+                    .to_string()
+            })
         })
         .unwrap_or_else(|| "Unknown".to_string());
 
@@ -522,8 +520,10 @@ async fn test_find_breaking_point() {
     }
 
     let hardware_info = get_hardware_info();
-    println!("Hardware: {} ({} cores), {:.1} GB RAM",
-             hardware_info.cpu_model, hardware_info.cpu_cores, hardware_info.total_ram_gb);
+    println!(
+        "Hardware: {} ({} cores), {:.1} GB RAM",
+        hardware_info.cpu_model, hardware_info.cpu_cores, hardware_info.total_ram_gb
+    );
 
     let semaphore = Arc::new(Semaphore::new(100_000));
 

@@ -183,13 +183,28 @@ impl BhashiniLanguage {
     /// Get the language family.
     pub fn family(&self) -> LanguageFamily {
         match self {
-            Self::Tamil | Self::Telugu | Self::Kannada | Self::Malayalam => LanguageFamily::Dravidian,
-            Self::Hindi | Self::Bengali | Self::Marathi | Self::Gujarati | Self::Punjabi
-            | Self::Odia | Self::Urdu | Self::Nepali | Self::Sindhi | Self::Konkani
-            | Self::Maithili | Self::Bhojpuri | Self::Kashmiri | Self::Dogri => {
-                LanguageFamily::IndoAryan
+            Self::Tamil | Self::Telugu | Self::Kannada | Self::Malayalam => {
+                LanguageFamily::Dravidian
             }
-            Self::Assamese | Self::Sanskrit | Self::English | Self::Bodo | Self::Manipuri
+            Self::Hindi
+            | Self::Bengali
+            | Self::Marathi
+            | Self::Gujarati
+            | Self::Punjabi
+            | Self::Odia
+            | Self::Urdu
+            | Self::Nepali
+            | Self::Sindhi
+            | Self::Konkani
+            | Self::Maithili
+            | Self::Bhojpuri
+            | Self::Kashmiri
+            | Self::Dogri => LanguageFamily::IndoAryan,
+            Self::Assamese
+            | Self::Sanskrit
+            | Self::English
+            | Self::Bodo
+            | Self::Manipuri
             | Self::Santali => LanguageFamily::Misc,
         }
     }
@@ -624,40 +639,44 @@ mod tests {
 
     #[test]
     fn test_language_families() {
-        assert_eq!(
-            BhashiniLanguage::Tamil.family(),
-            LanguageFamily::Dravidian
-        );
-        assert_eq!(
-            BhashiniLanguage::Telugu.family(),
-            LanguageFamily::Dravidian
-        );
-        assert_eq!(
-            BhashiniLanguage::Hindi.family(),
-            LanguageFamily::IndoAryan
-        );
+        assert_eq!(BhashiniLanguage::Tamil.family(), LanguageFamily::Dravidian);
+        assert_eq!(BhashiniLanguage::Telugu.family(), LanguageFamily::Dravidian);
+        assert_eq!(BhashiniLanguage::Hindi.family(), LanguageFamily::IndoAryan);
         assert_eq!(
             BhashiniLanguage::Bengali.family(),
             LanguageFamily::IndoAryan
         );
-        assert_eq!(
-            BhashiniLanguage::English.family(),
-            LanguageFamily::Misc
-        );
+        assert_eq!(BhashiniLanguage::English.family(), LanguageFamily::Misc);
     }
 
     #[test]
     fn test_service_id_selection() {
         // Dravidian languages
-        assert!(BhashiniLanguage::Tamil.asr_service_id().contains("dravidian"));
-        assert!(BhashiniLanguage::Telugu.asr_service_id().contains("dravidian"));
+        assert!(
+            BhashiniLanguage::Tamil
+                .asr_service_id()
+                .contains("dravidian")
+        );
+        assert!(
+            BhashiniLanguage::Telugu
+                .asr_service_id()
+                .contains("dravidian")
+        );
 
         // Indo-Aryan languages
         assert!(BhashiniLanguage::Hindi.asr_service_id().contains("hi-gpu"));
-        assert!(BhashiniLanguage::Bengali.asr_service_id().contains("indo_aryan"));
+        assert!(
+            BhashiniLanguage::Bengali
+                .asr_service_id()
+                .contains("indo_aryan")
+        );
 
         // English
-        assert!(BhashiniLanguage::English.asr_service_id().contains("whisper"));
+        assert!(
+            BhashiniLanguage::English
+                .asr_service_id()
+                .contains("whisper")
+        );
     }
 
     #[test]

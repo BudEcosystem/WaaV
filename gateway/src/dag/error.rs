@@ -15,7 +15,6 @@ pub enum DAGError {
     // ─────────────────────────────────────────────────────────────────────────────
     // Compilation Errors
     // ─────────────────────────────────────────────────────────────────────────────
-
     /// DAG definition parsing failed
     #[error("Failed to parse DAG definition: {0}")]
     ParseError(String),
@@ -46,10 +45,7 @@ pub enum DAGError {
 
     /// Rhai expression compilation failed
     #[error("Failed to compile expression '{expression}': {error}")]
-    ExpressionCompilationError {
-        expression: String,
-        error: String,
-    },
+    ExpressionCompilationError { expression: String, error: String },
 
     /// Invalid switch pattern configuration
     #[error("Invalid switch pattern: {0}")]
@@ -58,17 +54,13 @@ pub enum DAGError {
     // ─────────────────────────────────────────────────────────────────────────────
     // Configuration Errors
     // ─────────────────────────────────────────────────────────────────────────────
-
     /// Required configuration field missing
     #[error("Missing required configuration: {0}")]
     MissingConfiguration(String),
 
     /// Invalid node configuration
     #[error("Invalid node configuration for '{node_id}': {error}")]
-    InvalidNodeConfig {
-        node_id: String,
-        error: String,
-    },
+    InvalidNodeConfig { node_id: String, error: String },
 
     /// Configuration validation error (used for security checks, input validation)
     #[error("Configuration error: {0}")]
@@ -85,13 +77,9 @@ pub enum DAGError {
     // ─────────────────────────────────────────────────────────────────────────────
     // Execution Errors
     // ─────────────────────────────────────────────────────────────────────────────
-
     /// Node execution failed
     #[error("Node '{node_id}' execution failed: {error}")]
-    NodeExecutionError {
-        node_id: String,
-        error: String,
-    },
+    NodeExecutionError { node_id: String, error: String },
 
     /// Condition evaluation failed
     #[error("Condition evaluation failed: {0}")]
@@ -99,10 +87,7 @@ pub enum DAGError {
 
     /// Edge transform execution failed
     #[error("Edge transform on '{edge}' failed: {error}")]
-    TransformError {
-        edge: String,
-        error: String,
-    },
+    TransformError { edge: String, error: String },
 
     /// No matching route found for current state
     #[error("No matching route found from node '{0}'")]
@@ -122,10 +107,7 @@ pub enum DAGError {
 
     /// Split branch execution failed
     #[error("Split branch '{branch_id}' failed: {error}")]
-    SplitBranchError {
-        branch_id: String,
-        error: String,
-    },
+    SplitBranchError { branch_id: String, error: String },
 
     /// DAG execution cancelled
     #[error("DAG execution was cancelled")]
@@ -138,13 +120,9 @@ pub enum DAGError {
     // ─────────────────────────────────────────────────────────────────────────────
     // Data Errors
     // ─────────────────────────────────────────────────────────────────────────────
-
     /// Unsupported data type for operation
     #[error("Unsupported data type for operation: expected {expected}, got {actual}")]
-    UnsupportedDataType {
-        expected: String,
-        actual: String,
-    },
+    UnsupportedDataType { expected: String, actual: String },
 
     /// Data serialization failed
     #[error("Data serialization failed: {0}")]
@@ -156,10 +134,7 @@ pub enum DAGError {
 
     /// Field extraction failed (for switch patterns)
     #[error("Failed to extract field '{field}' from data: {error}")]
-    FieldExtractionError {
-        field: String,
-        error: String,
-    },
+    FieldExtractionError { field: String, error: String },
 
     /// Invalid input data for node
     #[error("Node '{node_id}' received invalid input: expected {expected}, got {got}")]
@@ -172,13 +147,9 @@ pub enum DAGError {
     // ─────────────────────────────────────────────────────────────────────────────
     // Endpoint Errors
     // ─────────────────────────────────────────────────────────────────────────────
-
     /// HTTP endpoint request failed
     #[error("HTTP endpoint '{url}' request failed: {error}")]
-    HttpEndpointError {
-        url: String,
-        error: String,
-    },
+    HttpEndpointError { url: String, error: String },
 
     /// gRPC endpoint request failed
     #[error("gRPC endpoint '{service}/{method}' request failed: {error}")]
@@ -190,17 +161,11 @@ pub enum DAGError {
 
     /// WebSocket endpoint connection failed
     #[error("WebSocket endpoint '{url}' connection failed: {error}")]
-    WebSocketEndpointError {
-        url: String,
-        error: String,
-    },
+    WebSocketEndpointError { url: String, error: String },
 
     /// IPC endpoint communication failed
     #[error("IPC endpoint '{name}' communication failed: {error}")]
-    IpcEndpointError {
-        name: String,
-        error: String,
-    },
+    IpcEndpointError { name: String, error: String },
 
     /// LiveKit endpoint operation failed
     #[error("LiveKit endpoint operation failed: {0}")]
@@ -216,10 +181,7 @@ pub enum DAGError {
 
     /// Webhook delivery failed
     #[error("Webhook delivery to '{url}' failed: {error}")]
-    WebhookDeliveryError {
-        url: String,
-        error: String,
-    },
+    WebhookDeliveryError { url: String, error: String },
 
     /// Endpoint connection timeout
     #[error("Endpoint connection timeout: {0}")]
@@ -228,57 +190,36 @@ pub enum DAGError {
     // ─────────────────────────────────────────────────────────────────────────────
     // Buffer Errors
     // ─────────────────────────────────────────────────────────────────────────────
-
     /// Ring buffer full (backpressure)
     #[error("Ring buffer full for edge {from} -> {to}")]
-    BufferFull {
-        from: String,
-        to: String,
-    },
+    BufferFull { from: String, to: String },
 
     /// Ring buffer allocation failed
     #[error("Failed to allocate ring buffer of size {size}: {error}")]
-    BufferAllocationError {
-        size: usize,
-        error: String,
-    },
+    BufferAllocationError { size: usize, error: String },
 
     // ─────────────────────────────────────────────────────────────────────────────
     // Provider Errors
     // ─────────────────────────────────────────────────────────────────────────────
-
     /// STT provider error
     #[error("STT provider '{provider}' error: {error}")]
-    STTProviderError {
-        provider: String,
-        error: String,
-    },
+    STTProviderError { provider: String, error: String },
 
     /// TTS provider error
     #[error("TTS provider '{provider}' error: {error}")]
-    TTSProviderError {
-        provider: String,
-        error: String,
-    },
+    TTSProviderError { provider: String, error: String },
 
     /// Realtime provider error
     #[error("Realtime provider '{provider}' error: {error}")]
-    RealtimeProviderError {
-        provider: String,
-        error: String,
-    },
+    RealtimeProviderError { provider: String, error: String },
 
     /// Audio processor error
     #[error("Audio processor '{processor}' error: {error}")]
-    AudioProcessorError {
-        processor: String,
-        error: String,
-    },
+    AudioProcessorError { processor: String, error: String },
 
     // ─────────────────────────────────────────────────────────────────────────────
     // Internal Errors
     // ─────────────────────────────────────────────────────────────────────────────
-
     /// Internal error (should not occur in normal operation)
     #[error("Internal DAG error: {0}")]
     InternalError(String),

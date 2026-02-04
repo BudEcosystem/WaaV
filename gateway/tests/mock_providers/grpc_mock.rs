@@ -17,7 +17,11 @@ pub struct GrpcMockState {
 }
 
 impl GrpcMockState {
-    pub fn new(stt_latency: LatencyProfile, tts_latency: LatencyProfile, chaos: ChaosConfig) -> Self {
+    pub fn new(
+        stt_latency: LatencyProfile,
+        tts_latency: LatencyProfile,
+        chaos: ChaosConfig,
+    ) -> Self {
         Self {
             stt_latency,
             tts_latency,

@@ -2,8 +2,8 @@
 //!
 //! Implements the BaseTTS trait for SberDevices' REST-based Text-to-Speech service.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,9 +11,7 @@ use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use super::config::{
-    SberTtsConfig, MAX_TEXT_LENGTH, OAUTH_ENDPOINT, TOKEN_REFRESH_THRESHOLD_SECS,
-};
+use super::config::{MAX_TEXT_LENGTH, OAUTH_ENDPOINT, SberTtsConfig, TOKEN_REFRESH_THRESHOLD_SECS};
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
 };
@@ -229,7 +227,10 @@ impl SberDevicesTts {
             TTSError::AudioGenerationFailed(format!("Failed to read audio response: {}", e))
         })?;
 
-        debug!(audio_size = audio_bytes.len(), "Received audio from SberDevices TTS");
+        debug!(
+            audio_size = audio_bytes.len(),
+            "Received audio from SberDevices TTS"
+        );
         Ok(audio_bytes.to_vec())
     }
 }
@@ -591,7 +592,10 @@ mod tests {
     }
 
     impl AudioCallback for MockAudioCallback {
-        fn on_audio(&self, _audio_data: AudioData) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        fn on_audio(
+            &self,
+            _audio_data: AudioData,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             self.audio_count.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {})
         }

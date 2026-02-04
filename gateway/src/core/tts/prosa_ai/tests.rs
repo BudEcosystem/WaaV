@@ -1,7 +1,9 @@
 //! Tests for Prosa.ai TTS provider.
 
 use super::*;
-use crate::core::tts::base::{AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError};
+use crate::core::tts::base::{
+    AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError,
+};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -155,7 +157,10 @@ fn test_config_validation_success() {
 #[test]
 fn test_voice_model_ids() {
     assert_eq!(ProsaTtsVoice::DimasFormal.model_id(), "tts-dimas-formal");
-    assert_eq!(ProsaTtsVoice::DimasExpressive.model_id(), "tts-dimas-expressive");
+    assert_eq!(
+        ProsaTtsVoice::DimasExpressive.model_id(),
+        "tts-dimas-expressive"
+    );
     assert_eq!(ProsaTtsVoice::OchaFriendly.model_id(), "tts-ocha-friendly");
     assert_eq!(ProsaTtsVoice::Roger.model_id(), "tts-roger");
     assert_eq!(ProsaTtsVoice::Jennifer.model_id(), "tts-jennifer");
@@ -198,8 +203,14 @@ fn test_voice_domain() {
 
 #[test]
 fn test_voice_from_str_default() {
-    assert_eq!(ProsaTtsVoice::from_str_relaxed("dimas"), ProsaTtsVoice::DimasFormal);
-    assert_eq!(ProsaTtsVoice::from_str_relaxed("default"), ProsaTtsVoice::DimasFormal);
+    assert_eq!(
+        ProsaTtsVoice::from_str_relaxed("dimas"),
+        ProsaTtsVoice::DimasFormal
+    );
+    assert_eq!(
+        ProsaTtsVoice::from_str_relaxed("default"),
+        ProsaTtsVoice::DimasFormal
+    );
 }
 
 #[test]
@@ -224,10 +235,22 @@ fn test_voice_from_str_variations() {
 
 #[test]
 fn test_voice_from_str_english() {
-    assert_eq!(ProsaTtsVoice::from_str_relaxed("roger"), ProsaTtsVoice::Roger);
-    assert_eq!(ProsaTtsVoice::from_str_relaxed("english_male"), ProsaTtsVoice::Roger);
-    assert_eq!(ProsaTtsVoice::from_str_relaxed("jennifer"), ProsaTtsVoice::Jennifer);
-    assert_eq!(ProsaTtsVoice::from_str_relaxed("english_female"), ProsaTtsVoice::Jennifer);
+    assert_eq!(
+        ProsaTtsVoice::from_str_relaxed("roger"),
+        ProsaTtsVoice::Roger
+    );
+    assert_eq!(
+        ProsaTtsVoice::from_str_relaxed("english_male"),
+        ProsaTtsVoice::Roger
+    );
+    assert_eq!(
+        ProsaTtsVoice::from_str_relaxed("jennifer"),
+        ProsaTtsVoice::Jennifer
+    );
+    assert_eq!(
+        ProsaTtsVoice::from_str_relaxed("english_female"),
+        ProsaTtsVoice::Jennifer
+    );
 }
 
 #[test]
@@ -282,11 +305,26 @@ fn test_audio_format_sample_rate() {
 
 #[test]
 fn test_audio_format_from_str() {
-    assert_eq!(ProsaTtsAudioFormat::from_str_relaxed("opus"), ProsaTtsAudioFormat::Opus);
-    assert_eq!(ProsaTtsAudioFormat::from_str_relaxed("mp3"), ProsaTtsAudioFormat::Mp3);
-    assert_eq!(ProsaTtsAudioFormat::from_str_relaxed("wav"), ProsaTtsAudioFormat::Wav);
-    assert_eq!(ProsaTtsAudioFormat::from_str_relaxed("audio/mpeg"), ProsaTtsAudioFormat::Mp3);
-    assert_eq!(ProsaTtsAudioFormat::from_str_relaxed("unknown"), ProsaTtsAudioFormat::Opus);
+    assert_eq!(
+        ProsaTtsAudioFormat::from_str_relaxed("opus"),
+        ProsaTtsAudioFormat::Opus
+    );
+    assert_eq!(
+        ProsaTtsAudioFormat::from_str_relaxed("mp3"),
+        ProsaTtsAudioFormat::Mp3
+    );
+    assert_eq!(
+        ProsaTtsAudioFormat::from_str_relaxed("wav"),
+        ProsaTtsAudioFormat::Wav
+    );
+    assert_eq!(
+        ProsaTtsAudioFormat::from_str_relaxed("audio/mpeg"),
+        ProsaTtsAudioFormat::Mp3
+    );
+    assert_eq!(
+        ProsaTtsAudioFormat::from_str_relaxed("unknown"),
+        ProsaTtsAudioFormat::Opus
+    );
 }
 
 #[test]
@@ -532,7 +570,10 @@ fn test_set_audio_format() {
     let mut tts = ProsaTts::new(make_test_config()).unwrap();
 
     tts.set_audio_format(ProsaTtsAudioFormat::Mp3);
-    assert_eq!(tts.get_prosa_config().audio_format, ProsaTtsAudioFormat::Mp3);
+    assert_eq!(
+        tts.get_prosa_config().audio_format,
+        ProsaTtsAudioFormat::Mp3
+    );
 }
 
 #[test]

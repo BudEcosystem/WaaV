@@ -170,7 +170,12 @@ impl ReverieSpeaker {
         if self.variant <= 1 {
             format!("{}_{}", self.language, self.gender.as_suffix())
         } else {
-            format!("{}_{}_{}", self.language, self.gender.as_suffix(), self.variant)
+            format!(
+                "{}_{}_{}",
+                self.language,
+                self.gender.as_suffix(),
+                self.variant
+            )
         }
     }
 
@@ -520,7 +525,10 @@ mod tests {
 
     #[test]
     fn test_gender_from_str() {
-        assert_eq!("male".parse::<ReverieGender>().unwrap(), ReverieGender::Male);
+        assert_eq!(
+            "male".parse::<ReverieGender>().unwrap(),
+            ReverieGender::Male
+        );
         assert_eq!("m".parse::<ReverieGender>().unwrap(), ReverieGender::Male);
         assert_eq!(
             "female".parse::<ReverieGender>().unwrap(),

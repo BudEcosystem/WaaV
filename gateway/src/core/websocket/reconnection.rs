@@ -245,7 +245,10 @@ pub enum ReconnectionState {
 impl ReconnectionState {
     /// Check if in a terminal state (Failed or Disabled).
     pub fn is_terminal(&self) -> bool {
-        matches!(self, ReconnectionState::Failed | ReconnectionState::Disabled)
+        matches!(
+            self,
+            ReconnectionState::Failed | ReconnectionState::Disabled
+        )
     }
 
     /// Check if currently connected.
@@ -374,8 +377,7 @@ impl ReconnectionManager {
             let now = now_monotonic_ns();
             let connected_duration_ms = (now.saturating_sub(connected_at)) / 1_000_000;
 
-            if self.config.reset_after_ms > 0
-                && connected_duration_ms >= self.config.reset_after_ms
+            if self.config.reset_after_ms > 0 && connected_duration_ms >= self.config.reset_after_ms
             {
                 // Reset attempt count since connection was stable
                 self.attempt_count.store(0, Ordering::Release);
@@ -389,7 +391,8 @@ impl ReconnectionManager {
     pub fn reset(&self) {
         self.attempt_count.store(0, Ordering::Release);
         self.is_connected.store(false, Ordering::Release);
-        self.is_failed.store(!self.config.enabled, Ordering::Release);
+        self.is_failed
+            .store(!self.config.enabled, Ordering::Release);
         self.last_attempt_ns.store(0, Ordering::Release);
         self.connected_at_ns.store(0, Ordering::Release);
     }

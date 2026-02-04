@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -251,7 +251,9 @@ impl SarvamSTT {
         sarvam_config: SarvamSTTConfig,
     ) -> Result<(), STTError> {
         // Validate configuration
-        sarvam_config.validate().map_err(STTError::ConfigurationError)?;
+        sarvam_config
+            .validate()
+            .map_err(STTError::ConfigurationError)?;
 
         let ws_url = sarvam_config.build_websocket_url();
 
@@ -595,10 +597,9 @@ impl BaseSTT for SarvamSTT {
             let data_len = audio_data.len();
 
             // Send audio data with backpressure handling
-            ws_sender
-                .send(audio_data)
-                .await
-                .map_err(|e| STTError::NetworkError(format!("Failed to send audio to Sarvam: {e}")))?;
+            ws_sender.send(audio_data).await.map_err(|e| {
+                STTError::NetworkError(format!("Failed to send audio to Sarvam: {e}"))
+            })?;
 
             debug!("Sent {} bytes of audio to Sarvam", data_len);
         }

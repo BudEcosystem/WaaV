@@ -44,7 +44,9 @@ impl ResembleModel {
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "chatterbox" | "" => Some(ResembleModel::Chatterbox),
-            "chatterbox-turbo" | "chatterbox_turbo" | "turbo" => Some(ResembleModel::ChatterboxTurbo),
+            "chatterbox-turbo" | "chatterbox_turbo" | "turbo" => {
+                Some(ResembleModel::ChatterboxTurbo)
+            }
             "chatterbox-multilingual" | "chatterbox_multilingual" | "multilingual" => {
                 Some(ResembleModel::ChatterboxMultilingual)
             }

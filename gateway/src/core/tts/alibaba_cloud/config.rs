@@ -2,8 +2,8 @@
 //!
 //! Configuration types and constants for DashScope TTS providers.
 
-use serde::{Deserialize, Serialize};
 use crate::core::tts::base::{TTSConfig, TTSError};
+use serde::{Deserialize, Serialize};
 
 // =============================================================================
 // Constants
@@ -13,13 +13,16 @@ use crate::core::tts::base::{TTSConfig, TTSError};
 pub const DASHSCOPE_BEIJING_REALTIME_URL: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime";
 
 /// DashScope Singapore realtime endpoint.
-pub const DASHSCOPE_SINGAPORE_REALTIME_URL: &str = "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime";
+pub const DASHSCOPE_SINGAPORE_REALTIME_URL: &str =
+    "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime";
 
 /// DashScope Beijing inference endpoint.
-pub const DASHSCOPE_BEIJING_INFERENCE_URL: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference";
+pub const DASHSCOPE_BEIJING_INFERENCE_URL: &str =
+    "wss://dashscope.aliyuncs.com/api-ws/v1/inference";
 
 /// DashScope Singapore inference endpoint.
-pub const DASHSCOPE_SINGAPORE_INFERENCE_URL: &str = "wss://dashscope-intl.aliyuncs.com/api-ws/v1/inference";
+pub const DASHSCOPE_SINGAPORE_INFERENCE_URL: &str =
+    "wss://dashscope-intl.aliyuncs.com/api-ws/v1/inference";
 
 /// Default TTS model.
 pub const DEFAULT_TTS_MODEL: &str = "cosyvoice-v3-flash";
@@ -322,7 +325,9 @@ impl DashScopeTtsConfig {
         };
 
         let voice = config.voice_id.unwrap_or_else(|| DEFAULT_VOICE.to_string());
-        let sample_rate = config.sample_rate.unwrap_or_else(|| model.default_sample_rate());
+        let sample_rate = config
+            .sample_rate
+            .unwrap_or_else(|| model.default_sample_rate());
         let audio_format = config
             .audio_format
             .as_ref()
@@ -346,12 +351,32 @@ impl DashScopeTtsConfig {
     pub fn supported_voices() -> Vec<&'static str> {
         vec![
             // CosyVoice voices
-            "longxiaochun", "longxiaoxia", "longlaotie", "longshu", "longyue",
-            "longwan", "longfei", "longbella", "longjielidou", "longshuo",
-            "longjing", "longmiao", "longchen", "longhua", "longtong",
+            "longxiaochun",
+            "longxiaoxia",
+            "longlaotie",
+            "longshu",
+            "longyue",
+            "longwan",
+            "longfei",
+            "longbella",
+            "longjielidou",
+            "longshuo",
+            "longjing",
+            "longmiao",
+            "longchen",
+            "longhua",
+            "longtong",
             // Qwen TTS voices
-            "Cherry", "Serena", "Ethan", "Jennifer", "Ryan", "Neil", "Elias",
-            "Shanghai-Jada", "Beijing-Dylan", "Cantonese-Kiki",
+            "Cherry",
+            "Serena",
+            "Ethan",
+            "Jennifer",
+            "Ryan",
+            "Neil",
+            "Elias",
+            "Shanghai-Jada",
+            "Beijing-Dylan",
+            "Cantonese-Kiki",
         ]
     }
 
@@ -413,9 +438,18 @@ mod tests {
 
     #[test]
     fn test_region_parsing() {
-        assert_eq!(DashScopeRegion::from_str("singapore"), DashScopeRegion::Singapore);
-        assert_eq!(DashScopeRegion::from_str("intl"), DashScopeRegion::Singapore);
-        assert_eq!(DashScopeRegion::from_str("beijing"), DashScopeRegion::Beijing);
+        assert_eq!(
+            DashScopeRegion::from_str("singapore"),
+            DashScopeRegion::Singapore
+        );
+        assert_eq!(
+            DashScopeRegion::from_str("intl"),
+            DashScopeRegion::Singapore
+        );
+        assert_eq!(
+            DashScopeRegion::from_str("beijing"),
+            DashScopeRegion::Beijing
+        );
         assert_eq!(DashScopeRegion::from_str("china"), DashScopeRegion::Beijing);
     }
 
@@ -444,10 +478,22 @@ mod tests {
 
     #[test]
     fn test_audio_format_parsing() {
-        assert_eq!(DashScopeAudioFormat::from_str("mp3"), Some(DashScopeAudioFormat::Mp3));
-        assert_eq!(DashScopeAudioFormat::from_str("pcm"), Some(DashScopeAudioFormat::Pcm16));
-        assert_eq!(DashScopeAudioFormat::from_str("wav"), Some(DashScopeAudioFormat::Wav));
-        assert_eq!(DashScopeAudioFormat::from_str("opus"), Some(DashScopeAudioFormat::Opus));
+        assert_eq!(
+            DashScopeAudioFormat::from_str("mp3"),
+            Some(DashScopeAudioFormat::Mp3)
+        );
+        assert_eq!(
+            DashScopeAudioFormat::from_str("pcm"),
+            Some(DashScopeAudioFormat::Pcm16)
+        );
+        assert_eq!(
+            DashScopeAudioFormat::from_str("wav"),
+            Some(DashScopeAudioFormat::Wav)
+        );
+        assert_eq!(
+            DashScopeAudioFormat::from_str("opus"),
+            Some(DashScopeAudioFormat::Opus)
+        );
     }
 
     #[test]

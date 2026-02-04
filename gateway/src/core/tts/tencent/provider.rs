@@ -2,15 +2,17 @@
 //!
 //! Provides HTTP REST-based text-to-speech synthesis using Tencent Cloud API.
 
-use super::config::{TencentTtsConfig, TencentTtsResponse, MAX_TEXT_LENGTH, TTS_ACTION, TTS_VERSION};
+use super::config::{
+    MAX_TEXT_LENGTH, TTS_ACTION, TTS_VERSION, TencentTtsConfig, TencentTtsResponse,
+};
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
 };
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -177,7 +179,10 @@ impl TencentTts {
         )?;
         let secret_service = Self::hmac_sha256(&secret_date, service.as_bytes())?;
         let secret_signing = Self::hmac_sha256(&secret_service, b"tc3_request")?;
-        let signature = hex::encode(Self::hmac_sha256(&secret_signing, string_to_sign.as_bytes())?);
+        let signature = hex::encode(Self::hmac_sha256(
+            &secret_signing,
+            string_to_sign.as_bytes(),
+        )?);
 
         // Step 4: Create authorization header
         let authorization = format!(
@@ -251,7 +256,10 @@ impl TencentTts {
             .header("X-TC-Action", TTS_ACTION)
             .header("X-TC-Version", TTS_VERSION)
             .header("X-TC-Timestamp", timestamp_str)
-            .header("X-TC-Region", self.config.region.as_deref().unwrap_or("ap-guangzhou"))
+            .header(
+                "X-TC-Region",
+                self.config.region.as_deref().unwrap_or("ap-guangzhou"),
+            )
             .body(payload_str)
             .send()
             .await
@@ -284,13 +292,14 @@ impl TencentTts {
         }
 
         // Decode audio
-        let audio_base64 = tts_response.response.audio.ok_or_else(|| {
-            TTSError::ProviderError("No audio data in response".to_string())
-        })?;
+        let audio_base64 = tts_response
+            .response
+            .audio
+            .ok_or_else(|| TTSError::ProviderError("No audio data in response".to_string()))?;
 
-        let audio_data = BASE64_STANDARD.decode(&audio_base64).map_err(|e| {
-            TTSError::InternalError(format!("Failed to decode audio: {}", e))
-        })?;
+        let audio_data = BASE64_STANDARD
+            .decode(&audio_base64)
+            .map_err(|e| TTSError::InternalError(format!("Failed to decode audio: {}", e)))?;
 
         debug!("Received {} bytes of audio data", audio_data.len());
 
@@ -466,8 +475,8 @@ impl BaseTTS for TencentTts {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::config::{TencentTtsAudioFormat, TencentTtsVoice};
+    use super::*;
 
     fn create_test_config() -> TTSConfig {
         TTSConfig {

@@ -64,6 +64,9 @@ async fn create_test_state_auth_disabled() -> Arc<AppState> {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     };
@@ -225,6 +228,9 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -524,6 +530,9 @@ mod with_api_secret {
             rate_limit_burst_size: 10,
             max_websocket_connections: None,
             max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };

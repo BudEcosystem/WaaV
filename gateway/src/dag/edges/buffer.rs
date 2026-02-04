@@ -9,10 +9,10 @@
 //! - `RtrbAudioBuffer`: Wait-free SPSC buffer for raw audio bytes (uses rtrb)
 //! - `EdgeBufferPair`: Bidirectional buffer pair for request/response patterns
 
+use parking_lot::Mutex;
+use rtrb::{Consumer, Producer, RingBuffer};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use parking_lot::Mutex;
-use rtrb::{RingBuffer, Producer, Consumer};
 
 use crate::dag::error::{DAGError, DAGResult};
 use crate::dag::nodes::DAGData;
@@ -407,7 +407,8 @@ impl RtrbAudioProducer {
 
                     if first_len < to_write {
                         let remaining = to_write - first_len;
-                        second[..remaining].copy_from_slice(&data[first_len..first_len + remaining]);
+                        second[..remaining]
+                            .copy_from_slice(&data[first_len..first_len + remaining]);
                     }
 
                     chunk.commit_all();
@@ -418,7 +419,9 @@ impl RtrbAudioProducer {
         };
 
         if written > 0 {
-            self.stats.bytes_pushed.fetch_add(written as u64, Ordering::Relaxed);
+            self.stats
+                .bytes_pushed
+                .fetch_add(written as u64, Ordering::Relaxed);
         }
         written
     }
@@ -478,7 +481,9 @@ impl RtrbAudioConsumer {
             }
 
             chunk.commit_all();
-            self.stats.bytes_popped.fetch_add(to_read as u64, Ordering::Relaxed);
+            self.stats
+                .bytes_popped
+                .fetch_add(to_read as u64, Ordering::Relaxed);
             to_read
         } else {
             0
@@ -506,7 +511,9 @@ impl RtrbAudioConsumer {
             }
 
             chunk.commit_all();
-            self.stats.bytes_popped.fetch_add(size as u64, Ordering::Relaxed);
+            self.stats
+                .bytes_popped
+                .fetch_add(size as u64, Ordering::Relaxed);
             Some(output)
         } else {
             None
@@ -582,8 +589,12 @@ mod tests {
     fn test_edge_buffer_pair() {
         let pair = EdgeBufferPair::default_capacity("edge_1");
 
-        pair.forward().push(DAGData::Text("forward".into())).unwrap();
-        pair.backward().push(DAGData::Text("backward".into())).unwrap();
+        pair.forward()
+            .push(DAGData::Text("forward".into()))
+            .unwrap();
+        pair.backward()
+            .push(DAGData::Text("backward".into()))
+            .unwrap();
 
         assert_eq!(pair.forward().len(), 1);
         assert_eq!(pair.backward().len(), 1);

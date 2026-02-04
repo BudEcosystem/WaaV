@@ -106,7 +106,9 @@ impl BotSpeakingState {
 
         if !was_speaking {
             self.speaking_start_ns.store(now_ns, Ordering::Release);
-            Some(BotSpeakingStarted { timestamp_ns: now_ns })
+            Some(BotSpeakingStarted {
+                timestamp_ns: now_ns,
+            })
         } else {
             None
         }
@@ -442,8 +444,8 @@ mod tests {
 
     #[test]
     fn test_concurrent_audio_and_silence_check() {
-        use std::sync::atomic::AtomicUsize;
         use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
 
         let state = Arc::new(BotSpeakingState::new(5)); // 5ms threshold
         let silence_count = Arc::new(AtomicUsize::new(0));

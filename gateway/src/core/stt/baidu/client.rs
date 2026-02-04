@@ -43,21 +43,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
 use tokio::time::timeout;
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::protocol::Message,
-};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
 
+use super::config::{BAIDU_OAUTH_URL, BaiduOAuthResponse, BaiduSttConfig};
+use super::messages::{
+    BaiduFinishFrame, BaiduRealtimeResponse, BaiduShortAsrRequest, BaiduShortAsrResponse,
+    BaiduStartFrame,
+};
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
-};
-use super::config::{
-    BaiduOAuthResponse, BaiduSttConfig, BAIDU_OAUTH_URL,
-};
-use super::messages::{
-    BaiduFinishFrame, BaiduRealtimeResponse, BaiduShortAsrRequest,
-    BaiduShortAsrResponse, BaiduStartFrame,
 };
 
 // =============================================================================
@@ -169,12 +164,10 @@ impl TokenManager {
 
         debug!("Fetching new Baidu OAuth token...");
 
-        let response = self
-            .client
-            .post(&url)
-            .send()
-            .await
-            .map_err(|e| STTError::AuthenticationFailed(format!("OAuth request failed: {}", e)))?;
+        let response =
+            self.client.post(&url).send().await.map_err(|e| {
+                STTError::AuthenticationFailed(format!("OAuth request failed: {}", e))
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -185,17 +178,19 @@ impl TokenManager {
             )));
         }
 
-        let oauth_response: BaiduOAuthResponse = response
-            .json()
-            .await
-            .map_err(|e| STTError::AuthenticationFailed(format!("Failed to parse OAuth response: {}", e)))?;
+        let oauth_response: BaiduOAuthResponse = response.json().await.map_err(|e| {
+            STTError::AuthenticationFailed(format!("Failed to parse OAuth response: {}", e))
+        })?;
 
         // Cache the token
         let expires_at = Self::now_secs() + oauth_response.expires_in;
         *self.access_token.write().await = Some(oauth_response.access_token.clone());
         *self.expires_at.write().await = Some(expires_at);
 
-        info!("Baidu OAuth token obtained, expires in {} seconds", oauth_response.expires_in);
+        info!(
+            "Baidu OAuth token obtained, expires in {} seconds",
+            oauth_response.expires_in
+        );
 
         Ok(oauth_response.access_token)
     }
@@ -328,9 +323,7 @@ impl BaiduStt {
                 )));
             }
             Err(_) => {
-                return Err(STTError::ConnectionFailed(
-                    "Connection timeout".to_string(),
-                ));
+                return Err(STTError::ConnectionFailed("Connection timeout".to_string()));
             }
         };
 
@@ -358,14 +351,16 @@ impl BaiduStt {
             self.config.audio_format.as_str(),
         );
 
-        let start_json = start_frame
-            .to_json()
-            .map_err(|e| STTError::ConnectionFailed(format!("Failed to serialize START frame: {}", e)))?;
+        let start_json = start_frame.to_json().map_err(|e| {
+            STTError::ConnectionFailed(format!("Failed to serialize START frame: {}", e))
+        })?;
 
         write
             .send(Message::Text(start_json.into()))
             .await
-            .map_err(|e| STTError::ConnectionFailed(format!("Failed to send START frame: {}", e)))?;
+            .map_err(|e| {
+                STTError::ConnectionFailed(format!("Failed to send START frame: {}", e))
+            })?;
 
         debug!("Sent Baidu START frame");
 
@@ -384,7 +379,11 @@ impl BaiduStt {
             let send_task = tokio::spawn(async move {
                 while let Some(audio) = audio_rx.recv().await {
                     // Send binary audio data
-                    if write.send(Message::Binary(audio.to_vec().into())).await.is_err() {
+                    if write
+                        .send(Message::Binary(audio.to_vec().into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -402,7 +401,11 @@ impl BaiduStt {
                 while let Some(msg_result) = read.next().await {
                     match msg_result {
                         Ok(Message::Text(text)) => {
-                            Self::handle_realtime_response(&text, &result_tx_clone, &error_tx_clone);
+                            Self::handle_realtime_response(
+                                &text,
+                                &result_tx_clone,
+                                &error_tx_clone,
+                            );
                         }
                         Ok(Message::Close(_)) => {
                             debug!("Baidu WebSocket closed");
@@ -413,7 +416,8 @@ impl BaiduStt {
                         }
                         Err(e) => {
                             error!("Baidu WebSocket error: {}", e);
-                            let _ = error_tx_clone.try_send(STTError::ConnectionFailed(e.to_string()));
+                            let _ =
+                                error_tx_clone.try_send(STTError::ConnectionFailed(e.to_string()));
                             break;
                         }
                         _ => {}
@@ -490,7 +494,11 @@ impl BaiduStt {
 
                     debug!(
                         "Baidu transcript ({}): {}",
-                        if response.is_final() { "final" } else { "interim" },
+                        if response.is_final() {
+                            "final"
+                        } else {
+                            "interim"
+                        },
                         transcript
                     );
 
@@ -528,13 +536,17 @@ impl BaiduStt {
             request
         };
 
-        let request_json = request
-            .to_json()
-            .map_err(|e| STTError::AudioProcessingError(format!("Failed to serialize request: {}", e)))?;
+        let request_json = request.to_json().map_err(|e| {
+            STTError::AudioProcessingError(format!("Failed to serialize request: {}", e))
+        })?;
 
         let url = self.config.get_short_asr_url();
 
-        debug!("Sending short audio request to {}, {} bytes", url, audio_data.len());
+        debug!(
+            "Sending short audio request to {}, {} bytes",
+            url,
+            audio_data.len()
+        );
 
         let response = self
             .http_client
@@ -577,7 +589,9 @@ impl BaiduStt {
 
     /// Get the recommended chunk size for audio streaming.
     pub fn get_chunk_size(&self) -> usize {
-        self.config.sample_rate.chunk_size_for_duration(DEFAULT_CHUNK_DURATION_MS)
+        self.config
+            .sample_rate
+            .chunk_size_for_duration(DEFAULT_CHUNK_DURATION_MS)
     }
 
     /// Check if using real-time mode.
@@ -665,10 +679,9 @@ impl BaseSTT for BaiduStt {
         if self.config.use_realtime {
             // Real-time mode: send to WebSocket
             if let Some(sender) = &self.ws_sender {
-                sender
-                    .send(audio)
-                    .await
-                    .map_err(|_| STTError::ProviderError("Failed to send audio to channel".to_string()))?;
+                sender.send(audio).await.map_err(|_| {
+                    STTError::ProviderError("Failed to send audio to channel".to_string())
+                })?;
             }
         } else {
             // REST API mode: accumulate in buffer
@@ -959,8 +972,12 @@ mod tests {
         stt.connect().await.unwrap();
 
         // Send some audio
-        stt.send_audio(Bytes::from_static(&[1, 2, 3, 4])).await.unwrap();
-        stt.send_audio(Bytes::from_static(&[5, 6, 7, 8])).await.unwrap();
+        stt.send_audio(Bytes::from_static(&[1, 2, 3, 4]))
+            .await
+            .unwrap();
+        stt.send_audio(Bytes::from_static(&[5, 6, 7, 8]))
+            .await
+            .unwrap();
 
         // Check buffer
         let buffer = stt.audio_buffer.lock().await;

@@ -34,18 +34,14 @@
 //! }
 //! ```
 
+pub mod client;
 pub mod config;
 pub mod messages;
-pub mod client;
 
 // Re-export public types
-pub use config::{
-    ReverieAudioFormat, ReverieLanguage, ReverieLogging, ReverieSTTConfig,
-};
-pub use messages::{
-    ReverieAsrResult, ReverieCloseReason, ReverieServerMessage,
-};
 pub use client::ReverieSTT;
+pub use config::{ReverieAudioFormat, ReverieLanguage, ReverieLogging, ReverieSTTConfig};
+pub use messages::{ReverieAsrResult, ReverieCloseReason, ReverieServerMessage};
 
 // =============================================================================
 // Constants

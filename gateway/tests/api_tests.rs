@@ -5,7 +5,12 @@ use axum::{
 use serde_json::{Value, json};
 use tower::util::ServiceExt;
 
-use waav_gateway::{ServerConfig, config::{DAGTimeoutsConfig, PluginConfig}, routes, state::AppState};
+use waav_gateway::{
+    ServerConfig,
+    config::{DAGTimeoutsConfig, PluginConfig},
+    routes,
+    state::AppState,
+};
 
 #[tokio::test]
 async fn test_health_check() {
@@ -59,6 +64,9 @@ async fn test_health_check() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     };
@@ -142,6 +150,9 @@ async fn test_speak_endpoint_missing_api_key() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     };
@@ -233,6 +244,9 @@ async fn test_speak_endpoint_empty_text() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     };
@@ -331,6 +345,9 @@ async fn test_speak_endpoint_with_pronunciations() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     };
@@ -431,6 +448,9 @@ async fn test_speak_endpoint_invalid_provider() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     };

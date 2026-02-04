@@ -9,17 +9,17 @@
 mod mock_providers;
 
 use mock_providers::{
-    http_mock::{spawn_http_mock, HttpMockState},
-    websocket_mock::{spawn_stt_websocket_mock, spawn_tts_websocket_mock, WebSocketMockState},
     ChaosConfig, LatencyProfile, MockStats,
+    http_mock::{HttpMockState, spawn_http_mock},
+    websocket_mock::{WebSocketMockState, spawn_stt_websocket_mock, spawn_tts_websocket_mock},
 };
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write as IoWrite};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
@@ -52,21 +52,21 @@ impl ResultSaver {
             OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(output_dir.join("requests.jsonl"))?
+                .open(output_dir.join("requests.jsonl"))?,
         );
 
         let stage_log = BufWriter::new(
             OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(output_dir.join("stages.jsonl"))?
+                .open(output_dir.join("stages.jsonl"))?,
         );
 
         let resource_log = BufWriter::new(
             OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(output_dir.join("resources.jsonl"))?
+                .open(output_dir.join("resources.jsonl"))?,
         );
 
         println!("Results will be saved to: {:?}", output_dir);
@@ -195,7 +195,8 @@ impl LatencyHistogram {
 
         // Update aggregates
         self.total_count.fetch_add(1, Ordering::Relaxed);
-        self.total_latency_us.fetch_add(latency_us, Ordering::Relaxed);
+        self.total_latency_us
+            .fetch_add(latency_us, Ordering::Relaxed);
 
         // Update min (CAS loop for atomic min)
         let mut current_min = self.min_latency_us.load(Ordering::Relaxed);
@@ -229,18 +230,18 @@ impl LatencyHistogram {
     fn get_bucket_index(&self, latency_us: u64) -> usize {
         let latency_ms = latency_us / 1000;
         match latency_ms {
-            0 => 0,             // <1ms
-            1 => 1,             // <2ms
-            2..=4 => 2,         // <5ms
-            5..=9 => 3,         // <10ms
-            10..=19 => 4,       // <20ms
-            20..=49 => 5,       // <50ms
-            50..=99 => 6,       // <100ms
-            100..=199 => 7,     // <200ms
-            200..=499 => 8,     // <500ms
-            500..=999 => 9,     // <1s
-            1000..=1999 => 10,  // <2s
-            _ => 11,            // >2s
+            0 => 0,            // <1ms
+            1 => 1,            // <2ms
+            2..=4 => 2,        // <5ms
+            5..=9 => 3,        // <10ms
+            10..=19 => 4,      // <20ms
+            20..=49 => 5,      // <50ms
+            50..=99 => 6,      // <100ms
+            100..=199 => 7,    // <200ms
+            200..=499 => 8,    // <500ms
+            500..=999 => 9,    // <1s
+            1000..=1999 => 10, // <2s
+            _ => 11,           // >2s
         }
     }
 
@@ -256,8 +257,18 @@ impl LatencyHistogram {
 
         // Bucket upper bounds in microseconds
         let bucket_bounds_us: [u64; 12] = [
-            1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000, 500_000, 1_000_000,
-            2_000_000, u64::MAX,
+            1_000,
+            2_000,
+            5_000,
+            10_000,
+            20_000,
+            50_000,
+            100_000,
+            200_000,
+            500_000,
+            1_000_000,
+            2_000_000,
+            u64::MAX,
         ];
 
         for (idx, bound) in bucket_bounds_us.iter().enumerate() {
@@ -267,7 +278,11 @@ impl LatencyHistogram {
                 if idx == 0 {
                     return *bound / 2; // Midpoint of first bucket
                 }
-                let prev_bound = if idx > 0 { bucket_bounds_us[idx - 1] } else { 0 };
+                let prev_bound = if idx > 0 {
+                    bucket_bounds_us[idx - 1]
+                } else {
+                    0
+                };
                 return (prev_bound + *bound) / 2; // Midpoint approximation
             }
         }
@@ -298,11 +313,7 @@ impl LatencyHistogram {
 
     pub fn min_us(&self) -> u64 {
         let min = self.min_latency_us.load(Ordering::Relaxed);
-        if min == u64::MAX {
-            0
-        } else {
-            min
-        }
+        if min == u64::MAX { 0 } else { min }
     }
 
     pub fn max_us(&self) -> u64 {
@@ -327,8 +338,8 @@ impl LatencyHistogram {
     /// Get bucket distribution as string for detailed analysis
     pub fn bucket_distribution(&self) -> String {
         let labels = [
-            "<1ms", "<2ms", "<5ms", "<10ms", "<20ms", "<50ms", "<100ms", "<200ms", "<500ms",
-            "<1s", "<2s", ">2s",
+            "<1ms", "<2ms", "<5ms", "<10ms", "<20ms", "<50ms", "<100ms", "<200ms", "<500ms", "<1s",
+            "<2s", ">2s",
         ];
         let mut result = String::new();
         for (idx, label) in labels.iter().enumerate() {
@@ -348,13 +359,13 @@ impl LatencyHistogram {
 /// Per-request log entry for detailed analysis
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct RequestLogEntry {
-    pub timestamp_us: u64,       // Microseconds since benchmark start
-    pub latency_us: u64,         // Request latency in microseconds
-    pub success: bool,           // Success/failure
-    pub stage: String,           // Current load stage
-    pub concurrent: u32,         // Target concurrent VUs
-    pub request_id: u64,         // Unique request ID
-    pub error: Option<String>,   // Error message if failed
+    pub timestamp_us: u64,     // Microseconds since benchmark start
+    pub latency_us: u64,       // Request latency in microseconds
+    pub success: bool,         // Success/failure
+    pub stage: String,         // Current load stage
+    pub concurrent: u32,       // Target concurrent VUs
+    pub request_id: u64,       // Unique request ID
+    pub error: Option<String>, // Error message if failed
 }
 
 // ============================================================================
@@ -743,7 +754,9 @@ async fn make_websocket_request(
     use tokio_tungstenite::connect_async;
 
     let start = Instant::now();
-    let ws_url = base_url.replace("http://", "ws://").replace("https://", "wss://");
+    let ws_url = base_url
+        .replace("http://", "ws://")
+        .replace("https://", "wss://");
     let ws_url = format!("{}/ws", ws_url);
 
     let result = tokio::time::timeout(timeout, connect_async(&ws_url)).await;
@@ -912,9 +925,8 @@ fn generate_report(
     report.push_str(
         "║                    WAAV GATEWAY SCALE BENCHMARK REPORT                    ║\n",
     );
-    report.push_str(
-        "╠══════════════════════════════════════════════════════════════════════════╣\n",
-    );
+    report
+        .push_str("╠══════════════════════════════════════════════════════════════════════════╣\n");
     report.push_str(&format!(
         "║ Test Duration: {:.1} seconds                                              ║\n",
         total_duration.as_secs_f64()
@@ -933,9 +945,15 @@ fn generate_report(
 
     // Stage results table
     report.push_str("Stage Results:\n");
-    report.push_str("┌──────────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐\n");
-    report.push_str("│ Stage        │ VUs     │ P50     │ P90     │ P99     │ P99.9   │ RPS     │ Error % │\n");
-    report.push_str("├──────────────┼─────────┼─────────┼─────────┼─────────┼─────────┼─────────┼─────────┤\n");
+    report.push_str(
+        "┌──────────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐\n",
+    );
+    report.push_str(
+        "│ Stage        │ VUs     │ P50     │ P90     │ P99     │ P99.9   │ RPS     │ Error % │\n",
+    );
+    report.push_str(
+        "├──────────────┼─────────┼─────────┼─────────┼─────────┼─────────┼─────────┼─────────┤\n",
+    );
 
     for result in stage_results {
         report.push_str(&format!(
@@ -1002,12 +1020,11 @@ async fn test_scale_benchmark_10k_live() {
     println!("WaaV Gateway Scale Benchmark - 10,000 Requests");
     println!("{}\n", "=".repeat(70));
 
-    let base_url = std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:3001".to_string());
+    let base_url =
+        std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:3001".to_string());
 
     // Initialize continuous result saver FIRST to capture all data even on crash
-    let result_saver = Arc::new(
-        ResultSaver::new().expect("Failed to create result saver")
-    );
+    let result_saver = Arc::new(ResultSaver::new().expect("Failed to create result saver"));
     println!("Continuous logging enabled - results will survive crash");
 
     // Check if gateway is running
@@ -1137,7 +1154,8 @@ async fn test_gateway_overhead_benchmark() {
     println!("  - TTS WebSocket Mock: ws://127.0.0.1:18083");
 
     // Check gateway connection
-    let base_url = std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:3001".to_string());
+    let base_url =
+        std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:3001".to_string());
 
     let client = reqwest::Client::new();
     match client.get(format!("{}/", base_url)).send().await {
@@ -1227,7 +1245,8 @@ async fn test_e2e_realistic_benchmark() {
     println!("  - ElevenLabs-style HTTP TTS: P50=180ms, P99=350ms");
     println!("  - Deepgram-style WebSocket STT: P50=50ms, P99=120ms");
 
-    let base_url = std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:3001".to_string());
+    let base_url =
+        std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:3001".to_string());
 
     let client = reqwest::Client::new();
     match client.get(format!("{}/", base_url)).send().await {
@@ -1307,7 +1326,8 @@ async fn test_chaos_benchmark() {
     println!("  - 2% connection drop rate");
     println!("  - 10% slow response rate");
 
-    let base_url = std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:3001".to_string());
+    let base_url =
+        std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:3001".to_string());
 
     let client = reqwest::Client::new();
     match client.get(format!("{}/", base_url)).send().await {
@@ -1377,10 +1397,7 @@ async fn test_chaos_benchmark() {
         println!("✓ Gateway handling provider failures gracefully");
     }
 
-    println!(
-        "\nTotal Duration: {:.1}s",
-        total_duration.as_secs_f64()
-    );
+    println!("\nTotal Duration: {:.1}s", total_duration.as_secs_f64());
 }
 
 // ============================================================================

@@ -64,8 +64,8 @@ mod config;
 
 pub use client::NaverClovaTts;
 pub use config::{
-    NaverClovaTtsConfig, NaverClovaTtsFormat, NaverClovaVoice,
-    DEFAULT_SAMPLE_RATE, MAX_TEXT_LENGTH, NAVER_TTS_ENDPOINT,
+    DEFAULT_SAMPLE_RATE, MAX_TEXT_LENGTH, NAVER_TTS_ENDPOINT, NaverClovaTtsConfig,
+    NaverClovaTtsFormat, NaverClovaVoice,
 };
 
 #[cfg(test)]

@@ -298,9 +298,18 @@ mod tests {
 
     #[test]
     fn test_model_from_str() {
-        assert_eq!(WellSaidModel::from_str("legacy"), Some(WellSaidModel::Legacy));
-        assert_eq!(WellSaidModel::from_str("caruso"), Some(WellSaidModel::Caruso));
-        assert_eq!(WellSaidModel::from_str("CARUSO"), Some(WellSaidModel::Caruso));
+        assert_eq!(
+            WellSaidModel::from_str("legacy"),
+            Some(WellSaidModel::Legacy)
+        );
+        assert_eq!(
+            WellSaidModel::from_str("caruso"),
+            Some(WellSaidModel::Caruso)
+        );
+        assert_eq!(
+            WellSaidModel::from_str("CARUSO"),
+            Some(WellSaidModel::Caruso)
+        );
         assert_eq!(WellSaidModel::from_str(""), Some(WellSaidModel::Legacy));
         assert_eq!(WellSaidModel::from_str("invalid"), None);
     }
@@ -399,8 +408,7 @@ mod tests {
 
     #[test]
     fn test_stream_request_with_caruso() {
-        let request = WellSaidStreamRequest::new(26, "Hello")
-            .with_model(WellSaidModel::Caruso);
+        let request = WellSaidStreamRequest::new(26, "Hello").with_model(WellSaidModel::Caruso);
         let json = serde_json::to_string(&request).unwrap();
 
         assert!(json.contains("\"model\":\"caruso\""));

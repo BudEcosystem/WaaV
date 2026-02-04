@@ -8,8 +8,8 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
-use crate::core::stt::base::STTError;
 use super::config::{HuaweiCloudRegion, HuaweiIamTokenResponse, TOKEN_VALIDITY_SECS};
+use crate::core::stt::base::STTError;
 
 // =============================================================================
 // Constants
@@ -170,7 +170,9 @@ impl HuaweiTokenManager {
         let token = self.token.read().await;
 
         match (token.as_ref(), expires_at) {
-            (Some(_), Some(exp)) => Self::now_secs() < exp.saturating_sub(TOKEN_REFRESH_BUFFER_SECS),
+            (Some(_), Some(exp)) => {
+                Self::now_secs() < exp.saturating_sub(TOKEN_REFRESH_BUFFER_SECS)
+            }
             _ => false,
         }
     }
@@ -198,7 +200,8 @@ impl HuaweiTokenManager {
         }
 
         // Fetch new token
-        self.fetch_token(username, password, domain_name, region).await
+        self.fetch_token(username, password, domain_name, region)
+            .await
     }
 
     /// Fetch a new token from IAM.
@@ -212,9 +215,9 @@ impl HuaweiTokenManager {
         let url = region.iam_endpoint();
         let request = IamTokenRequest::new(username, password, domain_name, region);
 
-        let request_json = request
-            .to_json()
-            .map_err(|e| STTError::ConfigurationError(format!("Failed to serialize IAM request: {}", e)))?;
+        let request_json = request.to_json().map_err(|e| {
+            STTError::ConfigurationError(format!("Failed to serialize IAM request: {}", e))
+        })?;
 
         debug!("Fetching new Huawei Cloud IAM token from {}", url);
 
@@ -249,14 +252,15 @@ impl HuaweiTokenManager {
 
         // Parse response body to get expiration time
         let body = response.text().await.unwrap_or_default();
-        let expires_at = if let Ok(token_response) = serde_json::from_str::<HuaweiIamTokenResponse>(&body) {
-            // Parse ISO 8601 expiration time
-            parse_iso8601_timestamp(&token_response.token.expires_at)
-                .unwrap_or_else(|| Self::now_secs() + TOKEN_VALIDITY_SECS)
-        } else {
-            // Default to 24 hours if parsing fails
-            Self::now_secs() + TOKEN_VALIDITY_SECS
-        };
+        let expires_at =
+            if let Ok(token_response) = serde_json::from_str::<HuaweiIamTokenResponse>(&body) {
+                // Parse ISO 8601 expiration time
+                parse_iso8601_timestamp(&token_response.token.expires_at)
+                    .unwrap_or_else(|| Self::now_secs() + TOKEN_VALIDITY_SECS)
+            } else {
+                // Default to 24 hours if parsing fails
+                Self::now_secs() + TOKEN_VALIDITY_SECS
+            };
 
         // Cache the token
         *self.token.write().await = Some(token.clone());
@@ -287,7 +291,8 @@ impl HuaweiTokenManager {
         region: HuaweiCloudRegion,
     ) -> Result<String, STTError> {
         self.clear().await;
-        self.fetch_token(username, password, domain_name, region).await
+        self.fetch_token(username, password, domain_name, region)
+            .await
     }
 }
 

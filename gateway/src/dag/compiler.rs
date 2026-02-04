@@ -8,14 +8,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use petgraph::Direction;
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
-use petgraph::Direction;
 use rhai::Engine;
 use tracing::{debug, info};
 
-use super::definition::{DAGDefinition, NodeDefinition, EdgeDefinition, NodeType};
+use super::definition::{DAGDefinition, EdgeDefinition, NodeDefinition, NodeType};
 use super::edges::CompiledEdge;
 use super::error::{DAGError, DAGResult};
 use super::metrics::DAGMetrics;
@@ -115,9 +115,9 @@ impl DAGCompiler {
         );
 
         // Validate the definition structure
-        definition.validate_structure().map_err(|errors| {
-            DAGError::InvalidStructure(errors.join("; "))
-        })?;
+        definition
+            .validate_structure()
+            .map_err(|errors| DAGError::InvalidStructure(errors.join("; ")))?;
 
         // Build the graph
         let mut graph = DiGraph::new();
@@ -132,9 +132,11 @@ impl DAGCompiler {
 
         // Add edges to graph
         for edge_def in &definition.edges {
-            let from_idx = *node_index.get(&edge_def.from)
+            let from_idx = *node_index
+                .get(&edge_def.from)
                 .ok_or_else(|| DAGError::UnknownNode(edge_def.from.clone()))?;
-            let to_idx = *node_index.get(&edge_def.to)
+            let to_idx = *node_index
+                .get(&edge_def.to)
                 .ok_or_else(|| DAGError::UnknownNode(edge_def.to.clone()))?;
 
             let compiled_edge = self.compile_edge(edge_def)?;
@@ -148,20 +150,26 @@ impl DAGCompiler {
         })?;
 
         // Get entry and exit nodes
-        let entry = *node_index.get(&definition.entry_node)
+        let entry = *node_index
+            .get(&definition.entry_node)
             .ok_or_else(|| DAGError::EntryNodeNotFound(definition.entry_node.clone()))?;
 
-        let exits: Vec<NodeIndex> = definition.exit_nodes.iter()
-            .map(|id| node_index.get(id)
-                .ok_or_else(|| DAGError::ExitNodeNotFound(id.clone()))
-                .map(|idx| *idx))
+        let exits: Vec<NodeIndex> = definition
+            .exit_nodes
+            .iter()
+            .map(|id| {
+                node_index
+                    .get(id)
+                    .ok_or_else(|| DAGError::ExitNodeNotFound(id.clone()))
+                    .map(|idx| *idx)
+            })
             .collect::<DAGResult<Vec<_>>>()?;
 
         // Compile API key routes
-        let api_key_routes: HashMap<String, NodeIndex> = definition.api_key_routes.iter()
-            .filter_map(|(key, node_id)| {
-                node_index.get(node_id).map(|idx| (key.clone(), *idx))
-            })
+        let api_key_routes: HashMap<String, NodeIndex> = definition
+            .api_key_routes
+            .iter()
+            .filter_map(|(key, node_id)| node_index.get(node_id).map(|idx| (key.clone(), *idx)))
             .collect();
 
         info!(
@@ -189,19 +197,19 @@ impl DAGCompiler {
         debug!(node_id = %def.id, node_type = ?def.node_type, "Compiling node");
 
         let node: Arc<dyn DAGNode> = match &def.node_type {
-            NodeType::AudioInput => {
-                Arc::new(AudioInputNode::new(&def.id))
-            }
-            NodeType::TextInput => {
-                Arc::new(TextInputNode::new(&def.id))
-            }
+            NodeType::AudioInput => Arc::new(AudioInputNode::new(&def.id)),
+            NodeType::TextInput => Arc::new(TextInputNode::new(&def.id)),
             NodeType::AudioOutput { destination } => {
                 Arc::new(AudioOutputNode::new(&def.id, destination.clone()))
             }
             NodeType::TextOutput { destination } => {
                 Arc::new(TextOutputNode::new(&def.id, destination.clone()))
             }
-            NodeType::SttProvider { provider, model, language } => {
+            NodeType::SttProvider {
+                provider,
+                model,
+                language,
+            } => {
                 let mut node = STTProviderNode::new(&def.id, provider);
                 if let Some(m) = model {
                     node = node.with_model(m);
@@ -211,7 +219,11 @@ impl DAGCompiler {
                 }
                 Arc::new(node)
             }
-            NodeType::TtsProvider { provider, voice_id, model } => {
+            NodeType::TtsProvider {
+                provider,
+                voice_id,
+                model,
+            } => {
                 let mut node = TTSProviderNode::new(&def.id, provider);
                 if let Some(v) = voice_id {
                     node = node.with_voice(v);
@@ -228,13 +240,15 @@ impl DAGCompiler {
                 }
                 Arc::new(node)
             }
-            NodeType::Processor { plugin } => {
-                Arc::new(ProcessorNode::new(&def.id, plugin))
-            }
-            NodeType::HttpEndpoint { url, method, headers, timeout_ms } => {
+            NodeType::Processor { plugin } => Arc::new(ProcessorNode::new(&def.id, plugin)),
+            NodeType::HttpEndpoint {
+                url,
+                method,
+                headers,
+                timeout_ms,
+            } => {
                 // Use try_new() for SSRF protection
-                let mut node = HttpEndpointNode::try_new(&def.id, url)?
-                    .with_method(method.clone());
+                let mut node = HttpEndpointNode::try_new(&def.id, url)?.with_method(method.clone());
                 for (key, value) in headers {
                     node = node.with_header(key, value);
                 }
@@ -243,7 +257,12 @@ impl DAGCompiler {
                 }
                 Arc::new(node)
             }
-            NodeType::GrpcEndpoint { address, service, method, timeout_ms } => {
+            NodeType::GrpcEndpoint {
+                address,
+                service,
+                method,
+                timeout_ms,
+            } => {
                 let mut node = GrpcEndpointNode::new(&def.id, address, service, method);
                 if let Some(timeout) = timeout_ms {
                     node = node.with_timeout_ms(*timeout);
@@ -258,7 +277,11 @@ impl DAGCompiler {
                 }
                 Arc::new(node)
             }
-            NodeType::IpcEndpoint { shm_name, input_format, output_format } => {
+            NodeType::IpcEndpoint {
+                shm_name,
+                input_format,
+                output_format,
+            } => {
                 // Use try_new() for proper error handling with input validation
                 let mut node = IpcEndpointNode::try_new(&def.id, shm_name)?;
                 if let Some(f) = input_format {
@@ -309,7 +332,10 @@ impl DAGCompiler {
 
                 // Parse tools from JSON if provided
                 if let Some(tools_json) = tools {
-                    if let Ok(parsed_tools) = serde_json::from_value::<Vec<super::nodes::ToolDefinition>>(tools_json.clone()) {
+                    if let Ok(parsed_tools) = serde_json::from_value::<
+                        Vec<super::nodes::ToolDefinition>,
+                    >(tools_json.clone())
+                    {
                         llm_config.tools = Some(parsed_tools);
                     }
                 }
@@ -323,10 +349,13 @@ impl DAGCompiler {
                 }
                 Arc::new(node)
             }
-            NodeType::Split { branches } => {
-                Arc::new(SplitNode::new(&def.id, branches.clone()))
-            }
-            NodeType::Join { sources, strategy, selector, merge_script } => {
+            NodeType::Split { branches } => Arc::new(SplitNode::new(&def.id, branches.clone())),
+            NodeType::Join {
+                sources,
+                strategy,
+                selector,
+                merge_script,
+            } => {
                 let mut node = JoinNode::new(&def.id, sources.clone(), *strategy);
                 if let Some(s) = selector {
                     node = node.with_selector(s);
@@ -336,12 +365,12 @@ impl DAGCompiler {
                 }
                 Arc::new(node)
             }
-            NodeType::Router { routes } => {
-                Arc::new(RouterNode::from_definitions(&def.id, routes.clone(), &self.evaluator)?)
-            }
-            NodeType::Transform { script } => {
-                Arc::new(TransformNode::compiled(&def.id, script)?)
-            }
+            NodeType::Router { routes } => Arc::new(RouterNode::from_definitions(
+                &def.id,
+                routes.clone(),
+                &self.evaluator,
+            )?),
+            NodeType::Transform { script } => Arc::new(TransformNode::compiled(&def.id, script)?),
             NodeType::Passthrough => {
                 Arc::new(super::nodes::transform::PassthroughNode::new(&def.id))
             }
@@ -452,14 +481,20 @@ mod tests {
     fn create_simple_dag() -> DAGDefinition {
         let mut dag = DAGDefinition::new("test-dag", "Test DAG");
         dag.add_node(NodeDefinition::new("input", NodeType::AudioInput));
-        dag.add_node(NodeDefinition::new("stt", NodeType::SttProvider {
-            provider: "deepgram".to_string(),
-            model: None,
-            language: None,
-        }));
-        dag.add_node(NodeDefinition::new("output", NodeType::TextOutput {
-            destination: OutputDestination::WebSocket,
-        }));
+        dag.add_node(NodeDefinition::new(
+            "stt",
+            NodeType::SttProvider {
+                provider: "deepgram".to_string(),
+                model: None,
+                language: None,
+            },
+        ));
+        dag.add_node(NodeDefinition::new(
+            "output",
+            NodeType::TextOutput {
+                destination: OutputDestination::WebSocket,
+            },
+        ));
         dag.add_edge(EdgeDefinition::new("input", "stt"));
         dag.add_edge(EdgeDefinition::new("stt", "output"));
         dag.with_entry("input");
@@ -485,11 +520,13 @@ mod tests {
         let compiler = DAGCompiler::new();
         let mut dag = DAGDefinition::new("test-dag", "Test DAG");
         dag.add_node(NodeDefinition::new("input", NodeType::TextInput));
-        dag.add_node(NodeDefinition::new("output", NodeType::TextOutput {
-            destination: OutputDestination::WebSocket,
-        }));
-        dag.add_edge(EdgeDefinition::new("input", "output")
-            .with_condition("is_final == true"));
+        dag.add_node(NodeDefinition::new(
+            "output",
+            NodeType::TextOutput {
+                destination: OutputDestination::WebSocket,
+            },
+        ));
+        dag.add_edge(EdgeDefinition::new("input", "output").with_condition("is_final == true"));
         dag.with_entry("input");
         dag.add_exit("output");
 
@@ -530,7 +567,8 @@ mod tests {
     fn test_api_key_routing() {
         let compiler = DAGCompiler::new();
         let mut dag = create_simple_dag();
-        dag.api_key_routes.insert("tenant_a".to_string(), "stt".to_string());
+        dag.api_key_routes
+            .insert("tenant_a".to_string(), "stt".to_string());
 
         let compiled = compiler.compile(dag).unwrap();
 

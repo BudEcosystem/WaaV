@@ -34,8 +34,9 @@ mod tests;
 
 pub use client::ProsaTts;
 pub use config::{
-    ProsaTtsAudioFormat, ProsaTtsConfig, ProsaTtsError, ProsaTtsRequest, ProsaTtsRequestConfig,
-    ProsaTtsRequestData, ProsaTtsResponse, ProsaTtsResult, ProsaTtsVoice, DEFAULT_PITCH,
-    DEFAULT_REQUEST_TIMEOUT, DEFAULT_SAMPLE_RATE, DEFAULT_TEMPO, MAX_ASYNC_TEXT_LENGTH, MAX_PITCH,
-    MAX_SYNC_TEXT_LENGTH, MAX_TEMPO, MIN_PITCH, MIN_TEMPO, MIN_TEXT_LENGTH, PROSA_TTS_BASE_URL,
+    DEFAULT_PITCH, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SAMPLE_RATE, DEFAULT_TEMPO,
+    MAX_ASYNC_TEXT_LENGTH, MAX_PITCH, MAX_SYNC_TEXT_LENGTH, MAX_TEMPO, MIN_PITCH, MIN_TEMPO,
+    MIN_TEXT_LENGTH, PROSA_TTS_BASE_URL, ProsaTtsAudioFormat, ProsaTtsConfig, ProsaTtsError,
+    ProsaTtsRequest, ProsaTtsRequestConfig, ProsaTtsRequestData, ProsaTtsResponse, ProsaTtsResult,
+    ProsaTtsVoice,
 };

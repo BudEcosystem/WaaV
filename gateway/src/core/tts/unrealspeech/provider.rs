@@ -4,13 +4,13 @@
 //! using HTTP streaming for real-time audio synthesis.
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use tracing::{debug, info};
 
 use super::config::{UnrealSpeechStreamRequest, UnrealSpeechTtsConfig};
-use crate::core::tts::base::{BaseTTS, ConnectionState, TTSConfig, TTSResult};
 #[cfg(test)]
 use crate::core::tts::base::TTSError;
+use crate::core::tts::base::{BaseTTS, ConnectionState, TTSConfig, TTSResult};
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
 
 // =============================================================================
@@ -484,10 +484,7 @@ mod tests {
         };
 
         let tts = UnrealSpeechTts::new(config).unwrap();
-        assert_eq!(
-            tts.unrealspeech_config().voice,
-            UnrealSpeechVoice::AmAdam
-        );
+        assert_eq!(tts.unrealspeech_config().voice, UnrealSpeechVoice::AmAdam);
         assert_eq!(
             tts.unrealspeech_config().bitrate,
             UnrealSpeechBitrate::Bitrate192k

@@ -7,8 +7,8 @@ use std::fs;
 use tracing::{info, warn};
 
 use axum::{Router, middleware};
-use axum_server::tls_rustls::RustlsConfig;
 use axum_server::Handle;
+use axum_server::tls_rustls::RustlsConfig;
 use clap::{Parser, Subcommand};
 use http::{
     HeaderName, Method,

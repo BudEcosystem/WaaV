@@ -12,8 +12,8 @@ pub mod elevenlabs;
 pub mod fpt_ai;
 pub mod gnani;
 pub mod google;
-pub mod hume;
 pub mod huawei_cloud;
+pub mod hume;
 pub mod ibm_watson;
 pub mod iflytek;
 pub mod lmnt;
@@ -33,15 +33,16 @@ pub mod speechmatics;
 pub mod tencent;
 pub mod tinkoff;
 pub mod unrealspeech;
+pub mod viettel_ai;
 pub mod wellsaid;
 pub mod yandex;
-pub mod viettel_ai;
 pub mod zalo_ai;
 
 pub use acapela::{
-    AcapelaAccountInfo, AcapelaAudioFormat, AcapelaCredentials, AcapelaOutputMode,
-    AcapelaRequestBuilder, AcapelaTts, AcapelaTtsConfig, AcapelaTtsConfigBuilder, AcapelaVoice,
-    EventsData, PhonemeEvent, StreamChunk, StreamParser, Viseme, WordEvent, ACAPELA_COMMAND_URL,
+    ACAPELA_COMMAND_URL, AcapelaAccountInfo, AcapelaAudioFormat, AcapelaCredentials,
+    AcapelaOutputMode, AcapelaRequestBuilder, AcapelaTts, AcapelaTtsConfig,
+    AcapelaTtsConfigBuilder, AcapelaVoice, EventsData, PhonemeEvent, StreamChunk, StreamParser,
+    Viseme, WordEvent,
 };
 pub use aws_polly::{
     AWS_POLLY_TTS_URL, AwsPollyTTS, AwsPollyTTSConfig, PollyEngine, PollyOutputFormat, PollyVoice,
@@ -54,7 +55,7 @@ pub use base::{
 };
 pub use cartesia::{CARTESIA_TTS_URL, CartesiaTTS};
 pub use cereproc::{
-    CereprocAudioFormat, CereprocCredentials, CereprocTts, CereprocTtsConfig, CEREVOICE_SPEAK_URL,
+    CEREVOICE_SPEAK_URL, CereprocAudioFormat, CereprocCredentials, CereprocTts, CereprocTtsConfig,
 };
 pub use deepgram::{DEEPGRAM_TTS_URL, DeepgramTTS};
 pub use elevenlabs::{ELEVENLABS_TTS_URL, ElevenLabsTTS};
@@ -79,48 +80,48 @@ pub use resemble::{
     ResembleTtsConfig, ResembleVoice,
 };
 pub use reverie::{
-    ReverieGender, ReverieSpeaker, ReverieTts, ReverieTtsAudioFormat, ReverieTtsConfig,
-    REVERIE_TTS_URL,
+    REVERIE_TTS_URL, ReverieGender, ReverieSpeaker, ReverieTts, ReverieTtsAudioFormat,
+    ReverieTtsConfig,
 };
 pub use smallest::{
-    SmallestLanguage, SmallestModel, SmallestOutputFormat, SmallestRequestBuilder, SmallestTts,
-    SmallestTtsConfig, SmallestTtsRequest, SmallestVoice, SmallestVoicesResponse,
-    SmallestWsRequest, SMALLEST_ADD_VOICE_URL, SMALLEST_API_BASE_URL, SMALLEST_TTS_URL,
-    SMALLEST_TTS_WS_URL, SMALLEST_VOICES_URL_TEMPLATE,
+    SMALLEST_ADD_VOICE_URL, SMALLEST_API_BASE_URL, SMALLEST_TTS_URL, SMALLEST_TTS_WS_URL,
+    SMALLEST_VOICES_URL_TEMPLATE, SmallestLanguage, SmallestModel, SmallestOutputFormat,
+    SmallestRequestBuilder, SmallestTts, SmallestTtsConfig, SmallestTtsRequest, SmallestVoice,
+    SmallestVoicesResponse, SmallestWsRequest,
 };
 pub use speechify::{
-    SpeechifyAudioFormat, SpeechifyModel, SpeechifyRequestBuilder, SpeechifyStreamRequest,
-    SpeechifyTts, SpeechifyTtsConfig, SpeechifyVoice, SPEECHIFY_TTS_STREAM_URL,
-    SPEECHIFY_VOICES_URL,
+    SPEECHIFY_TTS_STREAM_URL, SPEECHIFY_VOICES_URL, SpeechifyAudioFormat, SpeechifyModel,
+    SpeechifyRequestBuilder, SpeechifyStreamRequest, SpeechifyTts, SpeechifyTtsConfig,
+    SpeechifyVoice,
 };
 pub use speechmatics::{
-    SpeechmaticsGenerateRequest, SpeechmaticsOutputFormat, SpeechmaticsRequestBuilder,
-    SpeechmaticsTts, SpeechmaticsTtsConfig, SpeechmaticsVoice, SPEECHMATICS_GENERATE_URL,
-    SPEECHMATICS_TTS_BASE_URL,
+    SPEECHMATICS_GENERATE_URL, SPEECHMATICS_TTS_BASE_URL, SpeechmaticsGenerateRequest,
+    SpeechmaticsOutputFormat, SpeechmaticsRequestBuilder, SpeechmaticsTts, SpeechmaticsTtsConfig,
+    SpeechmaticsVoice,
 };
 pub use unrealspeech::{
-    UnrealSpeechBitrate, UnrealSpeechCodec, UnrealSpeechRequestBuilder, UnrealSpeechStreamRequest,
-    UnrealSpeechTts, UnrealSpeechTtsConfig, UnrealSpeechVoice, UNREALSPEECH_STREAM_URL,
+    UNREALSPEECH_STREAM_URL, UnrealSpeechBitrate, UnrealSpeechCodec, UnrealSpeechRequestBuilder,
+    UnrealSpeechStreamRequest, UnrealSpeechTts, UnrealSpeechTtsConfig, UnrealSpeechVoice,
 };
 pub use wellsaid::{
-    WellSaidAvatar, WellSaidModel, WellSaidRequestBuilder, WellSaidStreamRequest, WellSaidTts,
-    WellSaidTtsConfig, WELLSAID_AVATARS_URL, WELLSAID_TTS_STREAM_URL,
+    WELLSAID_AVATARS_URL, WELLSAID_TTS_STREAM_URL, WellSaidAvatar, WellSaidModel,
+    WellSaidRequestBuilder, WellSaidStreamRequest, WellSaidTts, WellSaidTtsConfig,
 };
 pub use yandex::{
-    YandexAudioFormat, YandexEmotion, YandexTts, YandexTtsConfig, YandexVoice,
-    YANDEX_TTS_SYNTHESIZE_URL,
+    YANDEX_TTS_SYNTHESIZE_URL, YandexAudioFormat, YandexEmotion, YandexTts, YandexTtsConfig,
+    YandexVoice,
 };
 
 // Re-export SberDevices SaluteSpeech TTS implementation
 pub use sberdevices::{
-    SberDevicesTts, SberTtsAudioFormat, SberTtsConfig, SberTtsScope, SberTtsVoice,
-    SBER_TTS_SYNTHESIZE_URL,
+    SBER_TTS_SYNTHESIZE_URL, SberDevicesTts, SberTtsAudioFormat, SberTtsConfig, SberTtsScope,
+    SberTtsVoice,
 };
 
 // Re-export Tinkoff VoiceKit TTS implementation
 pub use tinkoff::{
-    TinkoffAudioEncoding, TinkoffTts, TinkoffTtsConfig, TinkoffTtsGrpcError, TinkoffVoice,
-    TINKOFF_GRPC_ENDPOINT,
+    TINKOFF_GRPC_ENDPOINT, TinkoffAudioEncoding, TinkoffTts, TinkoffTtsConfig, TinkoffTtsGrpcError,
+    TinkoffVoice,
 };
 
 // Re-export Gnani.ai implementation
@@ -128,120 +129,104 @@ pub use gnani::{GnaniGender, GnaniTTS, GnaniTTSConfig, GnaniTTSLanguage};
 
 // Re-export Bhashini ULCA TTS implementation
 pub use bhashini::{
-    BhashiniTts, BhashiniTtsAudioFormat, BhashiniTtsConfig, BhashiniTtsGender,
-    BHASHINI_COMPUTE_URL as BHASHINI_TTS_URL, DEFAULT_TTS_SAMPLE_RATE as BHASHINI_TTS_SAMPLE_RATE,
+    BHASHINI_COMPUTE_URL as BHASHINI_TTS_URL, BhashiniTts, BhashiniTtsAudioFormat,
+    BhashiniTtsConfig, BhashiniTtsGender, DEFAULT_TTS_SAMPLE_RATE as BHASHINI_TTS_SAMPLE_RATE,
 };
 
 // Re-export iFlytek TTS implementation
 pub use iflytek::{
-    IFlytekTts, IFlytekTtsConfig, IFlytekTtsEncoding, IFlytekTextEncoding, IFlytekVoice,
-    IFLYTEK_TTS_ENDPOINT, IFLYTEK_TTS_HOST, IFLYTEK_TTS_PATH,
-    DEFAULT_TTS_SAMPLE_RATE as IFLYTEK_TTS_SAMPLE_RATE,
-    DEFAULT_SPEED as IFLYTEK_DEFAULT_SPEED,
-    DEFAULT_VOLUME as IFLYTEK_DEFAULT_VOLUME,
-    DEFAULT_PITCH as IFLYTEK_DEFAULT_PITCH,
+    DEFAULT_PITCH as IFLYTEK_DEFAULT_PITCH, DEFAULT_SPEED as IFLYTEK_DEFAULT_SPEED,
+    DEFAULT_TTS_SAMPLE_RATE as IFLYTEK_TTS_SAMPLE_RATE, DEFAULT_VOLUME as IFLYTEK_DEFAULT_VOLUME,
+    IFLYTEK_TTS_ENDPOINT, IFLYTEK_TTS_HOST, IFLYTEK_TTS_PATH, IFlytekTextEncoding, IFlytekTts,
+    IFlytekTtsConfig, IFlytekTtsEncoding, IFlytekVoice,
 };
 
 // Re-export Alibaba Cloud DashScope TTS implementation
 pub use alibaba_cloud::{
-    DashScopeTts, DashScopeTtsConfig, DashScopeTtsModel as DashScopeTtsModelEnum,
-    DashScopeAudioFormat as DashScopeTtsAudioFormat, DashScopeRegion as DashScopeTtsRegion,
-    DASHSCOPE_BEIJING_REALTIME_URL as ALIBABA_TTS_BEIJING_REALTIME_URL,
-    DASHSCOPE_SINGAPORE_REALTIME_URL as ALIBABA_TTS_SINGAPORE_REALTIME_URL,
     DASHSCOPE_BEIJING_INFERENCE_URL as ALIBABA_TTS_BEIJING_INFERENCE_URL,
+    DASHSCOPE_BEIJING_REALTIME_URL as ALIBABA_TTS_BEIJING_REALTIME_URL,
     DASHSCOPE_SINGAPORE_INFERENCE_URL as ALIBABA_TTS_SINGAPORE_INFERENCE_URL,
-    DEFAULT_TTS_MODEL as ALIBABA_DEFAULT_TTS_MODEL,
+    DASHSCOPE_SINGAPORE_REALTIME_URL as ALIBABA_TTS_SINGAPORE_REALTIME_URL,
     DEFAULT_SAMPLE_RATE as ALIBABA_TTS_DEFAULT_SAMPLE_RATE,
-    DEFAULT_VOICE as ALIBABA_TTS_DEFAULT_VOICE,
+    DEFAULT_TTS_MODEL as ALIBABA_DEFAULT_TTS_MODEL, DEFAULT_VOICE as ALIBABA_TTS_DEFAULT_VOICE,
+    DashScopeAudioFormat as DashScopeTtsAudioFormat, DashScopeRegion as DashScopeTtsRegion,
+    DashScopeTts, DashScopeTtsConfig, DashScopeTtsModel as DashScopeTtsModelEnum,
 };
 
 // Re-export Baidu AI Cloud TTS implementation
 pub use baidu::{
-    BaiduTts, BaiduTtsConfig, BaiduTtsVoice, BaiduTtsAudioFormat, BaiduVoiceCategory,
-    BaiduOAuthResponse, BaiduOAuthError, BaiduTtsErrorResponse,
-    BAIDU_TTS_URL, BAIDU_TTS_URL_HTTPS, BAIDU_OAUTH_URL,
-    DEFAULT_VOICE as BAIDU_TTS_DEFAULT_VOICE,
-    DEFAULT_SPEED as BAIDU_TTS_DEFAULT_SPEED,
-    DEFAULT_PITCH as BAIDU_TTS_DEFAULT_PITCH,
-    DEFAULT_VOLUME as BAIDU_TTS_DEFAULT_VOLUME,
-    MAX_TEXT_LENGTH_GBK as BAIDU_TTS_MAX_TEXT_LENGTH,
+    BAIDU_OAUTH_URL, BAIDU_TTS_URL, BAIDU_TTS_URL_HTTPS, BaiduOAuthError, BaiduOAuthResponse,
+    BaiduTts, BaiduTtsAudioFormat, BaiduTtsConfig, BaiduTtsErrorResponse, BaiduTtsVoice,
+    BaiduVoiceCategory, DEFAULT_PITCH as BAIDU_TTS_DEFAULT_PITCH,
+    DEFAULT_SPEED as BAIDU_TTS_DEFAULT_SPEED, DEFAULT_VOICE as BAIDU_TTS_DEFAULT_VOICE,
+    DEFAULT_VOLUME as BAIDU_TTS_DEFAULT_VOLUME, MAX_TEXT_LENGTH_GBK as BAIDU_TTS_MAX_TEXT_LENGTH,
 };
 
 // Re-export Tencent Cloud TTS implementation
 pub use tencent::{
-    TencentTts, TencentTtsConfig, TencentTtsVoice, TencentTtsAudioFormat, TencentVoiceCategory,
-    TencentTtsResponse, TencentTtsSampleRate, TencentTtsSubtitle,
-    TENCENT_TTS_URL, TENCENT_TTS_INTL_URL, TTS_ACTION, TTS_VERSION,
-    DEFAULT_VOICE_TYPE as TENCENT_TTS_DEFAULT_VOICE,
-    DEFAULT_SPEED as TENCENT_TTS_DEFAULT_SPEED,
-    DEFAULT_VOLUME as TENCENT_TTS_DEFAULT_VOLUME,
-    MAX_TEXT_LENGTH as TENCENT_TTS_MAX_TEXT_LENGTH,
+    DEFAULT_SPEED as TENCENT_TTS_DEFAULT_SPEED, DEFAULT_VOICE_TYPE as TENCENT_TTS_DEFAULT_VOICE,
+    DEFAULT_VOLUME as TENCENT_TTS_DEFAULT_VOLUME, MAX_TEXT_LENGTH as TENCENT_TTS_MAX_TEXT_LENGTH,
+    TENCENT_TTS_INTL_URL, TENCENT_TTS_URL, TTS_ACTION, TTS_VERSION, TencentTts,
+    TencentTtsAudioFormat, TencentTtsConfig, TencentTtsResponse, TencentTtsSampleRate,
+    TencentTtsSubtitle, TencentTtsVoice, TencentVoiceCategory,
 };
 
 // Re-export Huawei Cloud TTS implementation
 pub use huawei_cloud::{
-    HuaweiCloudTts, HuaweiCloudTtsConfig, HuaweiTtsVoice, HuaweiTtsAudioFormat,
-    HuaweiCloudRegion as HuaweiTtsRegion, HuaweiTtsMode,
+    HuaweiCloudRegion as HuaweiTtsRegion, HuaweiCloudTts, HuaweiCloudTtsConfig,
+    HuaweiTtsAudioFormat, HuaweiTtsMode, HuaweiTtsVoice,
     MAX_TEXT_LENGTH as HUAWEI_TTS_MAX_TEXT_LENGTH,
 };
 
 // Re-export NAVER CLOVA Voice TTS implementation
 pub use naver_clova::{
-    NaverClovaTts, NaverClovaTtsConfig, NaverClovaVoice, NaverClovaTtsFormat,
-    NAVER_TTS_ENDPOINT, MAX_TEXT_LENGTH as NAVER_TTS_MAX_TEXT_LENGTH,
     DEFAULT_SAMPLE_RATE as NAVER_TTS_DEFAULT_SAMPLE_RATE,
+    MAX_TEXT_LENGTH as NAVER_TTS_MAX_TEXT_LENGTH, NAVER_TTS_ENDPOINT, NaverClovaTts,
+    NaverClovaTtsConfig, NaverClovaTtsFormat, NaverClovaVoice,
 };
 
 // Re-export Zalo AI TTS implementation
 pub use zalo_ai::{
-    ZaloTts, ZaloTtsConfig, ZaloVoice, ZaloTtsResponse, ZaloTtsData,
-    ZALO_TTS_ENDPOINT, AUDIO_SAMPLE_RATE as ZALO_TTS_SAMPLE_RATE,
-    DEFAULT_SPEED as ZALO_TTS_DEFAULT_SPEED,
-    MIN_SPEED as ZALO_TTS_MIN_SPEED, MAX_SPEED as ZALO_TTS_MAX_SPEED,
+    AUDIO_SAMPLE_RATE as ZALO_TTS_SAMPLE_RATE, DEFAULT_SPEED as ZALO_TTS_DEFAULT_SPEED,
+    MAX_SPEED as ZALO_TTS_MAX_SPEED, MIN_SPEED as ZALO_TTS_MIN_SPEED, ZALO_TTS_ENDPOINT, ZaloTts,
+    ZaloTtsConfig, ZaloTtsData, ZaloTtsResponse, ZaloVoice,
 };
 
 // Re-export FPT.AI TTS implementation
 pub use fpt_ai::{
-    FptTts, FptTtsConfig, FptVoice, FptTtsResponse, FptAudioFormat,
-    FPT_TTS_ENDPOINT, AUDIO_SAMPLE_RATE as FPT_TTS_SAMPLE_RATE,
-    DEFAULT_SPEED as FPT_TTS_DEFAULT_SPEED,
-    MIN_SPEED as FPT_TTS_MIN_SPEED, MAX_SPEED as FPT_TTS_MAX_SPEED,
-    MAX_TEXT_LENGTH as FPT_TTS_MAX_TEXT_LENGTH,
+    AUDIO_SAMPLE_RATE as FPT_TTS_SAMPLE_RATE, DEFAULT_SPEED as FPT_TTS_DEFAULT_SPEED,
+    FPT_TTS_ENDPOINT, FptAudioFormat, FptTts, FptTtsConfig, FptTtsResponse, FptVoice,
+    MAX_SPEED as FPT_TTS_MAX_SPEED, MAX_TEXT_LENGTH as FPT_TTS_MAX_TEXT_LENGTH,
+    MIN_SPEED as FPT_TTS_MIN_SPEED,
 };
 
 // Re-export Viettel AI TTS implementation
 pub use viettel_ai::{
-    ViettelTts, ViettelTtsConfig, ViettelVoice, ViettelTtsResponse,
-    VIETTEL_TTS_ENDPOINT, VIETTEL_VOICES_ENDPOINT,
-    AUDIO_SAMPLE_RATE as VIETTEL_TTS_SAMPLE_RATE,
-    DEFAULT_SPEED as VIETTEL_TTS_DEFAULT_SPEED,
-    MIN_SPEED as VIETTEL_TTS_MIN_SPEED, MAX_SPEED as VIETTEL_TTS_MAX_SPEED,
-    MAX_TEXT_LENGTH as VIETTEL_TTS_MAX_TEXT_LENGTH,
+    AUDIO_SAMPLE_RATE as VIETTEL_TTS_SAMPLE_RATE, DEFAULT_SPEED as VIETTEL_TTS_DEFAULT_SPEED,
+    MAX_SPEED as VIETTEL_TTS_MAX_SPEED, MAX_TEXT_LENGTH as VIETTEL_TTS_MAX_TEXT_LENGTH,
+    MIN_SPEED as VIETTEL_TTS_MIN_SPEED, VIETTEL_TTS_ENDPOINT, VIETTEL_VOICES_ENDPOINT, ViettelTts,
+    ViettelTtsConfig, ViettelTtsResponse, ViettelVoice,
 };
 
 // Re-export Prosa.ai TTS implementation
 pub use prosa_ai::{
-    ProsaTts, ProsaTtsConfig, ProsaTtsVoice, ProsaTtsAudioFormat, ProsaTtsResponse,
-    ProsaTtsResult, ProsaTtsError, ProsaTtsRequest, ProsaTtsRequestConfig, ProsaTtsRequestData,
-    PROSA_TTS_BASE_URL,
-    DEFAULT_SAMPLE_RATE as PROSA_TTS_SAMPLE_RATE,
-    DEFAULT_PITCH as PROSA_TTS_DEFAULT_PITCH,
+    DEFAULT_PITCH as PROSA_TTS_DEFAULT_PITCH, DEFAULT_SAMPLE_RATE as PROSA_TTS_SAMPLE_RATE,
     DEFAULT_TEMPO as PROSA_TTS_DEFAULT_TEMPO,
-    MIN_PITCH as PROSA_TTS_MIN_PITCH, MAX_PITCH as PROSA_TTS_MAX_PITCH,
-    MIN_TEMPO as PROSA_TTS_MIN_TEMPO, MAX_TEMPO as PROSA_TTS_MAX_TEMPO,
-    MAX_SYNC_TEXT_LENGTH as PROSA_TTS_MAX_SYNC_TEXT_LENGTH,
-    MAX_ASYNC_TEXT_LENGTH as PROSA_TTS_MAX_ASYNC_TEXT_LENGTH,
+    MAX_ASYNC_TEXT_LENGTH as PROSA_TTS_MAX_ASYNC_TEXT_LENGTH, MAX_PITCH as PROSA_TTS_MAX_PITCH,
+    MAX_SYNC_TEXT_LENGTH as PROSA_TTS_MAX_SYNC_TEXT_LENGTH, MAX_TEMPO as PROSA_TTS_MAX_TEMPO,
+    MIN_PITCH as PROSA_TTS_MIN_PITCH, MIN_TEMPO as PROSA_TTS_MIN_TEMPO, PROSA_TTS_BASE_URL,
+    ProsaTts, ProsaTtsAudioFormat, ProsaTtsConfig, ProsaTtsError, ProsaTtsRequest,
+    ProsaTtsRequestConfig, ProsaTtsRequestData, ProsaTtsResponse, ProsaTtsResult, ProsaTtsVoice,
 };
 
 // Re-export NECTEC AI for Thai TTS implementation
 pub use nectec::{
-    NectecTts, NectecTtsConfig, NectecTtsError, NectecVoice,
-    Vaja9Request, Vaja9Response, chunk_text as nectec_chunk_text,
-    VAJA9_ENDPOINT as NECTEC_TTS_ENDPOINT,
+    API_KEY_HEADER as NECTEC_TTS_API_KEY_HEADER,
     DEFAULT_REQUEST_TIMEOUT as NECTEC_TTS_DEFAULT_REQUEST_TIMEOUT,
     DEFAULT_SAMPLE_RATE as NECTEC_TTS_DEFAULT_SAMPLE_RATE,
-    MAX_TEXT_LENGTH as NECTEC_TTS_MAX_TEXT_LENGTH,
-    API_KEY_HEADER as NECTEC_TTS_API_KEY_HEADER,
+    MAX_TEXT_LENGTH as NECTEC_TTS_MAX_TEXT_LENGTH, NectecTts, NectecTtsConfig, NectecTtsError,
+    NectecVoice, VAJA9_ENDPOINT as NECTEC_TTS_ENDPOINT, Vaja9Request, Vaja9Response,
+    chunk_text as nectec_chunk_text,
 };
 
 use std::collections::HashMap;
@@ -308,7 +293,10 @@ pub fn get_tts_provider_urls() -> HashMap<String, String> {
     urls.insert("openai".to_string(), OPENAI_TTS_URL.to_string());
     // AWS Polly: Use us-east-1 as default region for warmup URL
     // The actual region is determined by config at runtime via AWS SDK
-    urls.insert("aws-polly".to_string(), "https://polly.us-east-1.amazonaws.com/v1/speech".to_string());
+    urls.insert(
+        "aws-polly".to_string(),
+        "https://polly.us-east-1.amazonaws.com/v1/speech".to_string(),
+    );
     urls.insert("ibm-watson".to_string(), IBM_WATSON_TTS_URL.to_string());
     urls.insert("hume".to_string(), HUME_TTS_STREAM_URL.to_string());
     urls.insert("lmnt".to_string(), LMNT_TTS_URL.to_string());
@@ -317,19 +305,34 @@ pub fn get_tts_provider_urls() -> HashMap<String, String> {
     urls.insert("wellsaid".to_string(), WELLSAID_TTS_STREAM_URL.to_string());
     urls.insert("resemble".to_string(), RESEMBLE_TTS_STREAM_URL.to_string());
     urls.insert("reverie".to_string(), REVERIE_TTS_URL.to_string());
-    urls.insert("speechify".to_string(), SPEECHIFY_TTS_STREAM_URL.to_string());
-    urls.insert("speechmatics".to_string(), SPEECHMATICS_GENERATE_URL.to_string());
-    urls.insert("unrealspeech".to_string(), UNREALSPEECH_STREAM_URL.to_string());
+    urls.insert(
+        "speechify".to_string(),
+        SPEECHIFY_TTS_STREAM_URL.to_string(),
+    );
+    urls.insert(
+        "speechmatics".to_string(),
+        SPEECHMATICS_GENERATE_URL.to_string(),
+    );
+    urls.insert(
+        "unrealspeech".to_string(),
+        UNREALSPEECH_STREAM_URL.to_string(),
+    );
     urls.insert("yandex".to_string(), YANDEX_TTS_SYNTHESIZE_URL.to_string());
     urls.insert("tinkoff".to_string(), TINKOFF_GRPC_ENDPOINT.to_string());
-    urls.insert("sberdevices".to_string(), SBER_TTS_SYNTHESIZE_URL.to_string());
+    urls.insert(
+        "sberdevices".to_string(),
+        SBER_TTS_SYNTHESIZE_URL.to_string(),
+    );
     urls.insert("bhashini".to_string(), BHASHINI_TTS_URL.to_string());
     // iFlytek uses WebSocket (wss://) - skip HTTP warmup, connection established on first use
     // urls.insert("iflytek".to_string(), IFLYTEK_TTS_ENDPOINT.to_string());
     urls.insert("tencent".to_string(), TENCENT_TTS_INTL_URL.to_string());
     // Huawei Cloud: Use a valid URL without placeholder for warmup
     // The actual project_id is set at runtime via config
-    urls.insert("huawei-cloud".to_string(), "https://sis.cn-north-4.myhuaweicloud.com/v1/tts".to_string());
+    urls.insert(
+        "huawei-cloud".to_string(),
+        "https://sis.cn-north-4.myhuaweicloud.com/v1/tts".to_string(),
+    );
     urls.insert("zalo-ai".to_string(), ZALO_TTS_ENDPOINT.to_string());
     urls.insert("fpt-ai".to_string(), FPT_TTS_ENDPOINT.to_string());
     urls.insert("viettel-ai".to_string(), VIETTEL_TTS_ENDPOINT.to_string());
@@ -534,7 +537,10 @@ mod tests {
         let urls = get_tts_provider_urls();
         assert!(urls.contains_key("aws-polly"));
         // URL uses default us-east-1 region for warmup (actual region set at runtime)
-        assert_eq!(urls.get("aws-polly").unwrap(), "https://polly.us-east-1.amazonaws.com/v1/speech");
+        assert_eq!(
+            urls.get("aws-polly").unwrap(),
+            "https://polly.us-east-1.amazonaws.com/v1/speech"
+        );
     }
 
     #[test]

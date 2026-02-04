@@ -31,13 +31,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use tracing::{debug, info};
 use xxhash_rust::xxh3::xxh3_128;
 
 use super::config::{SmallestLanguage, SmallestModel, SmallestOutputFormat, SmallestTtsConfig};
 use super::messages::{SmallestTtsRequest, SmallestVoice, SmallestVoicesResponse};
-use super::{voices_url, MAX_TEXT_LENGTH, SMALLEST_TTS_URL, SUPPORTED_SAMPLE_RATES};
+use super::{MAX_TEXT_LENGTH, SMALLEST_TTS_URL, SUPPORTED_SAMPLE_RATES, voices_url};
 use crate::core::tts::base::{
     AudioCallback, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
 };
@@ -609,7 +609,10 @@ mod tests {
         config.voice_id = None;
 
         let tts = SmallestTts::new(config).unwrap();
-        assert_eq!(tts.smallest_config().voice_id, super::super::DEFAULT_VOICE_ID);
+        assert_eq!(
+            tts.smallest_config().voice_id,
+            super::super::DEFAULT_VOICE_ID
+        );
     }
 
     // =========================================================================
@@ -820,8 +823,7 @@ mod tests {
 
     #[test]
     fn test_request_body_with_unicode() {
-        let request = SmallestTtsRequest::new("नमस्ते दुनिया", "emily")
-            .with_language("hi");
+        let request = SmallestTtsRequest::new("नमस्ते दुनिया", "emily").with_language("hi");
 
         let json = serde_json::to_string(&request).unwrap();
 

@@ -199,7 +199,10 @@ impl StartRecognitionMessage {
     }
 
     /// Create with full configuration
-    pub fn with_config(audio_format: AudioFormat, transcription_config: TranscriptionConfig) -> Self {
+    pub fn with_config(
+        audio_format: AudioFormat,
+        transcription_config: TranscriptionConfig,
+    ) -> Self {
         Self {
             message: "StartRecognition".to_string(),
             audio_format,
@@ -294,7 +297,10 @@ impl TranscriptResult {
 
     /// Get the confidence score of the best alternative
     pub fn confidence(&self) -> f64 {
-        self.alternatives.first().map(|a| a.confidence).unwrap_or(0.0)
+        self.alternatives
+            .first()
+            .map(|a| a.confidence)
+            .unwrap_or(0.0)
     }
 
     /// Check if this is a word result
@@ -399,7 +405,11 @@ pub struct ErrorMessage {
 
 impl std::fmt::Display for ErrorMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Speechmatics error [{}]: {}", self.error_type, self.reason)
+        write!(
+            f,
+            "Speechmatics error [{}]: {}",
+            self.error_type, self.reason
+        )
     }
 }
 
@@ -593,8 +603,10 @@ mod tests {
         assert_eq!(word.content, "Speechmatics");
         assert!(word.sounds_like.is_none());
 
-        let word_with_hints =
-            AdditionalVocabWord::with_sounds_like("Speechmatics", vec!["speech matics".to_string()]);
+        let word_with_hints = AdditionalVocabWord::with_sounds_like(
+            "Speechmatics",
+            vec!["speech matics".to_string()],
+        );
         assert!(word_with_hints.sounds_like.is_some());
     }
 

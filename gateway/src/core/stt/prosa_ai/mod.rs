@@ -39,8 +39,8 @@ mod tests;
 
 pub use client::ProsaStt;
 pub use config::{
-    ProsaAudioFormat, ProsaSttConfig, ProsaSttError, ProsaSttModel, ProsaSttResponse, ProsaSttResult,
-    ProsaSttSegment, ProsaSttWsMessage, DEFAULT_CHANNELS, DEFAULT_CHUNK_SIZE,
-    DEFAULT_REQUEST_TIMEOUT, DEFAULT_SAMPLE_RATE, MAX_ASYNC_DURATION_SECS, MAX_SYNC_DURATION_SECS,
-    MAX_SYNC_SIZE_BYTES, MIN_AUDIO_BUFFER_SIZE, PROSA_STT_BASE_URL, PROSA_STT_WS_ENDPOINT,
+    DEFAULT_CHANNELS, DEFAULT_CHUNK_SIZE, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SAMPLE_RATE,
+    MAX_ASYNC_DURATION_SECS, MAX_SYNC_DURATION_SECS, MAX_SYNC_SIZE_BYTES, MIN_AUDIO_BUFFER_SIZE,
+    PROSA_STT_BASE_URL, PROSA_STT_WS_ENDPOINT, ProsaAudioFormat, ProsaSttConfig, ProsaSttError,
+    ProsaSttModel, ProsaSttResponse, ProsaSttResult, ProsaSttSegment, ProsaSttWsMessage,
 };

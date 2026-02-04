@@ -18,19 +18,20 @@
 //! - PCM: Linear16 (S16LE)
 
 use super::config::{
-    ViettelSttConfig, ViettelSttResponse, MAX_AUDIO_BUFFER_SIZE, MIN_AUDIO_BUFFER_SIZE,
-    VIETTEL_STT_ENDPOINT,
+    MAX_AUDIO_BUFFER_SIZE, MIN_AUDIO_BUFFER_SIZE, VIETTEL_STT_ENDPOINT, ViettelSttConfig,
+    ViettelSttResponse,
 };
 use crate::core::stt::base::{
-    BaseSTT, STTConfig, STTConnectionState, STTError, STTErrorCallback, STTResult, STTResultCallback,
+    BaseSTT, STTConfig, STTConnectionState, STTError, STTErrorCallback, STTResult,
+    STTResultCallback,
 };
 use bytes::Bytes;
 use reqwest::{
-    multipart::{Form, Part},
     Client,
+    multipart::{Form, Part},
 };
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -81,7 +82,9 @@ impl ViettelStt {
         let part = Part::bytes(wav_data)
             .file_name("audio.wav")
             .mime_str("audio/wav")
-            .map_err(|e| STTError::ConfigurationError(format!("Failed to create form part: {e}")))?;
+            .map_err(|e| {
+                STTError::ConfigurationError(format!("Failed to create form part: {e}"))
+            })?;
 
         let form = Form::new().part("file", part);
 
@@ -117,7 +120,11 @@ impl ViettelStt {
                 .await
                 .unwrap_or_else(|_| "Unable to read error body".to_string());
 
-            error!("Viettel STT: API error (status {}): {}", status.as_u16(), body);
+            error!(
+                "Viettel STT: API error (status {}): {}",
+                status.as_u16(),
+                body
+            );
 
             return match status.as_u16() {
                 401 => Err(STTError::AuthenticationFailed(format!(
@@ -222,9 +229,9 @@ impl ViettelStt {
             if let Some(callback) = callback_guard.as_ref() {
                 let result = STTResult::new(
                     transcription.clone(),
-                    true,  // is_final
-                    true,  // is_speech_final
-                    0.96,  // confidence (Viettel claims 96% accuracy)
+                    true, // is_final
+                    true, // is_speech_final
+                    0.96, // confidence (Viettel claims 96% accuracy)
                 );
                 callback(result).await;
             }

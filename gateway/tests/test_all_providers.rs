@@ -93,10 +93,8 @@ const TTS_PROVIDERS: &[(&str, &str)] = &[
 ];
 
 /// All 2 Realtime providers
-const REALTIME_PROVIDERS: &[(&str, &str)] = &[
-    ("openai", "OPENAI_API_KEY"),
-    ("hume", "HUME_API_KEY"),
-];
+const REALTIME_PROVIDERS: &[(&str, &str)] =
+    &[("openai", "OPENAI_API_KEY"), ("hume", "HUME_API_KEY")];
 
 // ============================================================================
 // Test Result Tracking
@@ -140,7 +138,9 @@ fn get_gateway_url() -> String {
 }
 
 fn has_api_key(env_var: &str) -> bool {
-    env::var(env_var).map(|v| !v.is_empty() && !v.starts_with("your_")).unwrap_or(false)
+    env::var(env_var)
+        .map(|v| !v.is_empty() && !v.starts_with("your_"))
+        .unwrap_or(false)
 }
 
 fn generate_test_audio_wav() -> Vec<u8> {
@@ -153,8 +153,8 @@ fn generate_test_audio_wav() -> Vec<u8> {
 // ============================================================================
 
 async fn test_deepgram_stt_api() -> Result<u64, String> {
-    let api_key = env::var("DEEPGRAM_API_KEY")
-        .map_err(|_| "DEEPGRAM_API_KEY not set".to_string())?;
+    let api_key =
+        env::var("DEEPGRAM_API_KEY").map_err(|_| "DEEPGRAM_API_KEY not set".to_string())?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -184,8 +184,8 @@ async fn test_deepgram_stt_api() -> Result<u64, String> {
 }
 
 async fn test_deepgram_tts_api() -> Result<u64, String> {
-    let api_key = env::var("DEEPGRAM_API_KEY")
-        .map_err(|_| "DEEPGRAM_API_KEY not set".to_string())?;
+    let api_key =
+        env::var("DEEPGRAM_API_KEY").map_err(|_| "DEEPGRAM_API_KEY not set".to_string())?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -223,8 +223,8 @@ async fn test_deepgram_tts_api() -> Result<u64, String> {
 }
 
 async fn test_elevenlabs_stt_api() -> Result<u64, String> {
-    let api_key = env::var("ELEVENLABS_API_KEY")
-        .map_err(|_| "ELEVENLABS_API_KEY not set".to_string())?;
+    let api_key =
+        env::var("ELEVENLABS_API_KEY").map_err(|_| "ELEVENLABS_API_KEY not set".to_string())?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -263,8 +263,8 @@ async fn test_elevenlabs_stt_api() -> Result<u64, String> {
 }
 
 async fn test_elevenlabs_tts_api() -> Result<u64, String> {
-    let api_key = env::var("ELEVENLABS_API_KEY")
-        .map_err(|_| "ELEVENLABS_API_KEY not set".to_string())?;
+    let api_key =
+        env::var("ELEVENLABS_API_KEY").map_err(|_| "ELEVENLABS_API_KEY not set".to_string())?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -280,7 +280,10 @@ async fn test_elevenlabs_tts_api() -> Result<u64, String> {
     let start = Instant::now();
 
     let response = client
-        .post(format!("https://api.elevenlabs.io/v1/text-to-speech/{}", voice_id))
+        .post(format!(
+            "https://api.elevenlabs.io/v1/text-to-speech/{}",
+            voice_id
+        ))
         .header("xi-api-key", &api_key)
         .header("Content-Type", "application/json")
         .json(&payload)
@@ -304,8 +307,7 @@ async fn test_elevenlabs_tts_api() -> Result<u64, String> {
 }
 
 async fn test_openai_stt_api() -> Result<u64, String> {
-    let api_key = env::var("OPENAI_API_KEY")
-        .map_err(|_| "OPENAI_API_KEY not set".to_string())?;
+    let api_key = env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY not set".to_string())?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -344,8 +346,7 @@ async fn test_openai_stt_api() -> Result<u64, String> {
 }
 
 async fn test_openai_tts_api() -> Result<u64, String> {
-    let api_key = env::var("OPENAI_API_KEY")
-        .map_err(|_| "OPENAI_API_KEY not set".to_string())?;
+    let api_key = env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY not set".to_string())?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -385,8 +386,8 @@ async fn test_openai_tts_api() -> Result<u64, String> {
 }
 
 async fn test_cartesia_tts_api() -> Result<u64, String> {
-    let api_key = env::var("CARTESIA_API_KEY")
-        .map_err(|_| "CARTESIA_API_KEY not set".to_string())?;
+    let api_key =
+        env::var("CARTESIA_API_KEY").map_err(|_| "CARTESIA_API_KEY not set".to_string())?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -492,7 +493,10 @@ async fn test_azure_tts_api() -> Result<u64, String> {
         ))
         .header("Ocp-Apim-Subscription-Key", &api_key)
         .header("Content-Type", "application/ssml+xml")
-        .header("X-Microsoft-OutputFormat", "audio-16khz-32kbitrate-mono-mp3")
+        .header(
+            "X-Microsoft-OutputFormat",
+            "audio-16khz-32kbitrate-mono-mp3",
+        )
         .body(ssml)
         .send()
         .await
@@ -729,48 +733,90 @@ fn print_test_summary(results: &[TestResult]) {
 
     // Print STT Results
     println!("\n--- STT PROVIDERS ({}) ---", stt_results.len());
-    println!("{:<20} {:>10} {:>12} {}", "Provider", "Status", "Latency", "Error");
+    println!(
+        "{:<20} {:>10} {:>12} {}",
+        "Provider", "Status", "Latency", "Error"
+    );
     println!("{}", "-".repeat(70));
     for result in &stt_results {
-        let latency_str = result.latency_ms
+        let latency_str = result
+            .latency_ms
             .map(|l| format!("{}ms", l))
             .unwrap_or_else(|| "-".to_string());
-        let error_str = result.error_message
+        let error_str = result
+            .error_message
             .as_ref()
-            .map(|e| if e.len() > 30 { format!("{}...", &e[..30]) } else { e.clone() })
+            .map(|e| {
+                if e.len() > 30 {
+                    format!("{}...", &e[..30])
+                } else {
+                    e.clone()
+                }
+            })
             .unwrap_or_default();
-        println!("{:<20} {:>10} {:>12} {}", result.provider, result.status, latency_str, error_str);
+        println!(
+            "{:<20} {:>10} {:>12} {}",
+            result.provider, result.status, latency_str, error_str
+        );
     }
 
     // Print TTS Results
     println!("\n--- TTS PROVIDERS ({}) ---", tts_results.len());
-    println!("{:<20} {:>10} {:>12} {}", "Provider", "Status", "Latency", "Error");
+    println!(
+        "{:<20} {:>10} {:>12} {}",
+        "Provider", "Status", "Latency", "Error"
+    );
     println!("{}", "-".repeat(70));
     for result in &tts_results {
-        let latency_str = result.latency_ms
+        let latency_str = result
+            .latency_ms
             .map(|l| format!("{}ms", l))
             .unwrap_or_else(|| "-".to_string());
-        let error_str = result.error_message
+        let error_str = result
+            .error_message
             .as_ref()
-            .map(|e| if e.len() > 30 { format!("{}...", &e[..30]) } else { e.clone() })
+            .map(|e| {
+                if e.len() > 30 {
+                    format!("{}...", &e[..30])
+                } else {
+                    e.clone()
+                }
+            })
             .unwrap_or_default();
-        println!("{:<20} {:>10} {:>12} {}", result.provider, result.status, latency_str, error_str);
+        println!(
+            "{:<20} {:>10} {:>12} {}",
+            result.provider, result.status, latency_str, error_str
+        );
     }
 
     // Print Realtime Results
     if !realtime_results.is_empty() {
         println!("\n--- REALTIME PROVIDERS ({}) ---", realtime_results.len());
-        println!("{:<20} {:>10} {:>12} {}", "Provider", "Status", "Latency", "Error");
+        println!(
+            "{:<20} {:>10} {:>12} {}",
+            "Provider", "Status", "Latency", "Error"
+        );
         println!("{}", "-".repeat(70));
         for result in &realtime_results {
-            let latency_str = result.latency_ms
+            let latency_str = result
+                .latency_ms
                 .map(|l| format!("{}ms", l))
                 .unwrap_or_else(|| "-".to_string());
-            let error_str = result.error_message
+            let error_str = result
+                .error_message
                 .as_ref()
-                .map(|e| if e.len() > 30 { format!("{}...", &e[..30]) } else { e.clone() })
+                .map(|e| {
+                    if e.len() > 30 {
+                        format!("{}...", &e[..30])
+                    } else {
+                        e.clone()
+                    }
+                })
                 .unwrap_or_default();
-            println!("{:<20} {:>10} {:>12} {}", result.provider, result.status, latency_str, error_str);
+            println!(
+                "{:<20} {:>10} {:>12} {}",
+                result.provider, result.status, latency_str, error_str
+            );
         }
     }
 
@@ -803,7 +849,10 @@ async fn test_all_providers() {
             println!("✓ Gateway is running at {}", gateway_url);
         }
         _ => {
-            println!("✗ Gateway is not running at {}. Start it first!", gateway_url);
+            println!(
+                "✗ Gateway is not running at {}. Start it first!",
+                gateway_url
+            );
             println!("  Run: cargo run --release");
             return;
         }
@@ -830,13 +879,20 @@ async fn test_all_providers() {
     }
 
     // Test Realtime providers (simplified - check if key exists)
-    println!("\nTesting {} Realtime providers...", REALTIME_PROVIDERS.len());
+    println!(
+        "\nTesting {} Realtime providers...",
+        REALTIME_PROVIDERS.len()
+    );
     for (provider, env_var) in REALTIME_PROVIDERS {
         let api_key_configured = has_api_key(env_var);
         let result = TestResult {
             provider: provider.to_string(),
             provider_type: "Realtime".to_string(),
-            status: if api_key_configured { TestStatus::Skipped } else { TestStatus::ApiKeyMissing },
+            status: if api_key_configured {
+                TestStatus::Skipped
+            } else {
+                TestStatus::ApiKeyMissing
+            },
             latency_ms: None,
             error_message: if api_key_configured {
                 Some("WebSocket test not implemented".to_string())
@@ -906,6 +962,7 @@ async fn test_provider_availability() {
 }
 
 #[tokio::test]
+#[ignore] // Requires running gateway at localhost:3001
 async fn test_gateway_health() {
     let gateway_url = get_gateway_url();
 
@@ -914,10 +971,7 @@ async fn test_gateway_health() {
         .build()
         .unwrap();
 
-    let response = client
-        .get(format!("{}/", gateway_url))
-        .send()
-        .await;
+    let response = client.get(format!("{}/", gateway_url)).send().await;
 
     match response {
         Ok(resp) => {

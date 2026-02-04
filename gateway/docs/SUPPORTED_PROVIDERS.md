@@ -67,6 +67,7 @@ WaaV Gateway provides unified access to 70+ cloud-based Speech-to-Text (STT), Te
 
 ### China & East Asia Providers
 
+
 | Provider | Protocol | Languages | Key Features | Env Variable |
 |----------|----------|-----------|--------------|--------------|
 | **iFlytek** | WebSocket | 18+ | HMAC-SHA256 auth, Chinese dialects | `IFLYTEK_APPID` |

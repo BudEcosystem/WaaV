@@ -11,6 +11,29 @@ publish = false
 
 [features]
 default = []
+
+# =============================================================================
+# SIMD Control Features
+# =============================================================================
+# These features control SIMD behavior for testing and specific deployment scenarios.
+# Note: SIMD is always enabled via pulp with automatic CPU detection.
+# These flags are primarily for CI/testing purposes.
+
+# simd-native: Use -C target-cpu=native for maximum performance on the build machine
+# Useful for local development and benchmarking. Not recommended for distribution.
+simd-native = []
+
+# simd-portable: Use portable baseline (AVX2/NEON) for cross-platform distribution
+# This is the default behavior set in .cargo/config.toml
+simd-portable = []
+
+# simd-scalar-only: Force scalar fallback for testing and comparison benchmarks
+# Useful for verifying SIMD correctness and measuring speedup
+simd-scalar-only = []
+
+# =============================================================================
+# Core Features
+# =============================================================================
 turn-detect = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 plugins-dynamic = ["dep:libloading", "dep:abi_stable", "dep:waav-plugin-api"]  # Dynamic plugin loading with FFI-safe types
 noise-filter = [
@@ -195,6 +218,10 @@ dirs = { version = "5.0", optional = true }  # Cache directory for model storage
 # Smart Turn additional dependencies
 num = { version = "0.4", optional = true }  # Complex number support for FFT
 
+# SIMD optimizations - portable SIMD with runtime CPU feature detection
+# Used for high-performance audio processing (PCM conversion, mel spectrogram, FFT)
+pulp = "0.18"
+
 [dev-dependencies]
 tower = { version = "0.5.2", features = ["util"] }
 tempfile = "3.8"
@@ -206,6 +233,10 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 
 [[bench]]
 name = "gateway_benchmarks"
+harness = false
+
+[[bench]]
+name = "simd_benchmarks"
 harness = false
 
 # =============================================================================

@@ -89,6 +89,6 @@ mod tests;
 
 pub use client::FptStt;
 pub use config::{
-    FptSttConfig, FptSttResponse, FptSttHypothesis, FPT_STT_ENDPOINT,
-    DEFAULT_REQUEST_TIMEOUT, MIN_AUDIO_DURATION_MS, MAX_AUDIO_DURATION_MS,
+    DEFAULT_REQUEST_TIMEOUT, FPT_STT_ENDPOINT, FptSttConfig, FptSttHypothesis, FptSttResponse,
+    MAX_AUDIO_DURATION_MS, MIN_AUDIO_DURATION_MS,
 };

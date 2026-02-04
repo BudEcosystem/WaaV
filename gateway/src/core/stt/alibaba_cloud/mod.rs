@@ -73,29 +73,26 @@
 //! - Beijing (China): `dashscope.aliyuncs.com`
 //! - Singapore (International): `dashscope-intl.aliyuncs.com`
 
+pub mod client;
 pub mod config;
 pub mod messages;
-pub mod client;
 
 // Re-export main types
+pub use client::DashScopeStt;
 pub use config::{
-    DashScopeSttConfig, DashScopeRegion, DashScopeSttModel, DashScopeAudioFormat,
-    DashScopeLanguage, TurnDetectionMode,
-    DASHSCOPE_BEIJING_REALTIME_URL, DASHSCOPE_SINGAPORE_REALTIME_URL,
-    DASHSCOPE_BEIJING_INFERENCE_URL, DASHSCOPE_SINGAPORE_INFERENCE_URL,
-    DEFAULT_STT_MODEL, DEFAULT_SAMPLE_RATE, DEFAULT_AUDIO_FORMAT, DEFAULT_SILENCE_DURATION_MS,
+    DASHSCOPE_BEIJING_INFERENCE_URL, DASHSCOPE_BEIJING_REALTIME_URL,
+    DASHSCOPE_SINGAPORE_INFERENCE_URL, DASHSCOPE_SINGAPORE_REALTIME_URL, DEFAULT_AUDIO_FORMAT,
+    DEFAULT_SAMPLE_RATE, DEFAULT_SILENCE_DURATION_MS, DEFAULT_STT_MODEL, DashScopeAudioFormat,
+    DashScopeLanguage, DashScopeRegion, DashScopeSttConfig, DashScopeSttModel, TurnDetectionMode,
 };
 pub use messages::{
-    QwenSessionUpdate, QwenAudioBufferAppend, QwenAudioBufferCommit, QwenSessionFinish,
-    QwenServerMessage, QwenSessionConfig, QwenAudioTranscriptionConfig, QwenTurnDetection,
-    QwenSessionInfo, QwenError, QwenEmotion,
-    ParaformerRunTask, ParaformerFinishTask, ParaformerResponse,
-    ParaformerHeader, ParaformerPayload, ParaformerParameters,
-    ParaformerResponseHeader, ParaformerResponsePayload, ParaformerOutput,
-    ParaformerSentence, ParaformerWord, ParaformerUsage,
-    DashScopeErrorCode,
+    DashScopeErrorCode, ParaformerFinishTask, ParaformerHeader, ParaformerOutput,
+    ParaformerParameters, ParaformerPayload, ParaformerResponse, ParaformerResponseHeader,
+    ParaformerResponsePayload, ParaformerRunTask, ParaformerSentence, ParaformerUsage,
+    ParaformerWord, QwenAudioBufferAppend, QwenAudioBufferCommit, QwenAudioTranscriptionConfig,
+    QwenEmotion, QwenError, QwenServerMessage, QwenSessionConfig, QwenSessionFinish,
+    QwenSessionInfo, QwenSessionUpdate, QwenTurnDetection,
 };
-pub use client::DashScopeStt;
 
 #[cfg(test)]
 mod tests {
@@ -180,10 +177,26 @@ mod tests {
 
     #[test]
     fn test_region_endpoints() {
-        assert!(DashScopeRegion::Beijing.realtime_url().contains("dashscope.aliyuncs.com"));
-        assert!(DashScopeRegion::Singapore.realtime_url().contains("dashscope-intl"));
-        assert!(DashScopeRegion::Beijing.inference_url().contains("inference"));
-        assert!(DashScopeRegion::Singapore.inference_url().contains("inference"));
+        assert!(
+            DashScopeRegion::Beijing
+                .realtime_url()
+                .contains("dashscope.aliyuncs.com")
+        );
+        assert!(
+            DashScopeRegion::Singapore
+                .realtime_url()
+                .contains("dashscope-intl")
+        );
+        assert!(
+            DashScopeRegion::Beijing
+                .inference_url()
+                .contains("inference")
+        );
+        assert!(
+            DashScopeRegion::Singapore
+                .inference_url()
+                .contains("inference")
+        );
     }
 
     #[test]
@@ -209,14 +222,7 @@ mod tests {
 
     #[test]
     fn test_paraformer_run_task() {
-        let msg = ParaformerRunTask::new(
-            "paraformer-realtime-v2",
-            "pcm",
-            16000,
-            "zh",
-            true,
-            true,
-        );
+        let msg = ParaformerRunTask::new("paraformer-realtime-v2", "pcm", 16000, "zh", true, true);
         let json = msg.to_json().unwrap();
 
         assert!(json.contains("run-task"));
@@ -264,9 +270,18 @@ mod tests {
 
     #[test]
     fn test_error_code_parsing() {
-        assert_eq!(DashScopeErrorCode::from_str("200"), DashScopeErrorCode::Success);
-        assert_eq!(DashScopeErrorCode::from_str("401"), DashScopeErrorCode::Unauthorized);
-        assert_eq!(DashScopeErrorCode::from_str("429"), DashScopeErrorCode::RateLimitExceeded);
+        assert_eq!(
+            DashScopeErrorCode::from_str("200"),
+            DashScopeErrorCode::Success
+        );
+        assert_eq!(
+            DashScopeErrorCode::from_str("401"),
+            DashScopeErrorCode::Unauthorized
+        );
+        assert_eq!(
+            DashScopeErrorCode::from_str("429"),
+            DashScopeErrorCode::RateLimitExceeded
+        );
     }
 
     #[tokio::test]
@@ -274,7 +289,9 @@ mod tests {
         let config = create_test_config();
         let mut stt = DashScopeStt::new(config).unwrap();
 
-        let result = stt.send_audio(bytes::Bytes::from_static(&[0u8; 1024])).await;
+        let result = stt
+            .send_audio(bytes::Bytes::from_static(&[0u8; 1024]))
+            .await;
         assert!(matches!(result, Err(STTError::ConnectionFailed(_))));
     }
 
@@ -289,8 +306,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_callback_registration() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         struct TestCallback {
             result_received: AtomicBool,
@@ -306,21 +323,25 @@ mod tests {
         });
 
         let result_callback = callback.clone();
-        let result = stt.on_result(Arc::new(move |_result| {
-            let cb = result_callback.clone();
-            Box::pin(async move {
-                cb.result_received.store(true, Ordering::Relaxed);
-            })
-        })).await;
+        let result = stt
+            .on_result(Arc::new(move |_result| {
+                let cb = result_callback.clone();
+                Box::pin(async move {
+                    cb.result_received.store(true, Ordering::Relaxed);
+                })
+            }))
+            .await;
         assert!(result.is_ok());
 
         let error_callback = callback.clone();
-        let result = stt.on_error(Arc::new(move |_error| {
-            let cb = error_callback.clone();
-            Box::pin(async move {
-                cb.error_received.store(true, Ordering::Relaxed);
-            })
-        })).await;
+        let result = stt
+            .on_error(Arc::new(move |_error| {
+                let cb = error_callback.clone();
+                Box::pin(async move {
+                    cb.error_received.store(true, Ordering::Relaxed);
+                })
+            }))
+            .await;
         assert!(result.is_ok());
     }
 
@@ -359,20 +380,50 @@ mod tests {
 
     #[test]
     fn test_audio_format_parsing() {
-        assert_eq!(DashScopeAudioFormat::from_str("pcm"), Some(DashScopeAudioFormat::Pcm16));
-        assert_eq!(DashScopeAudioFormat::from_str("linear16"), Some(DashScopeAudioFormat::Pcm16));
-        assert_eq!(DashScopeAudioFormat::from_str("opus"), Some(DashScopeAudioFormat::Opus));
-        assert_eq!(DashScopeAudioFormat::from_str("wav"), Some(DashScopeAudioFormat::Wav));
-        assert_eq!(DashScopeAudioFormat::from_str("mp3"), Some(DashScopeAudioFormat::Mp3));
+        assert_eq!(
+            DashScopeAudioFormat::from_str("pcm"),
+            Some(DashScopeAudioFormat::Pcm16)
+        );
+        assert_eq!(
+            DashScopeAudioFormat::from_str("linear16"),
+            Some(DashScopeAudioFormat::Pcm16)
+        );
+        assert_eq!(
+            DashScopeAudioFormat::from_str("opus"),
+            Some(DashScopeAudioFormat::Opus)
+        );
+        assert_eq!(
+            DashScopeAudioFormat::from_str("wav"),
+            Some(DashScopeAudioFormat::Wav)
+        );
+        assert_eq!(
+            DashScopeAudioFormat::from_str("mp3"),
+            Some(DashScopeAudioFormat::Mp3)
+        );
     }
 
     #[test]
     fn test_language_parsing() {
-        assert_eq!(DashScopeLanguage::from_str("zh"), DashScopeLanguage::Chinese);
-        assert_eq!(DashScopeLanguage::from_str("zh_cn"), DashScopeLanguage::Chinese);
-        assert_eq!(DashScopeLanguage::from_str("en"), DashScopeLanguage::English);
-        assert_eq!(DashScopeLanguage::from_str("yue"), DashScopeLanguage::Cantonese);
-        assert_eq!(DashScopeLanguage::from_str("cantonese"), DashScopeLanguage::Cantonese);
+        assert_eq!(
+            DashScopeLanguage::from_str("zh"),
+            DashScopeLanguage::Chinese
+        );
+        assert_eq!(
+            DashScopeLanguage::from_str("zh_cn"),
+            DashScopeLanguage::Chinese
+        );
+        assert_eq!(
+            DashScopeLanguage::from_str("en"),
+            DashScopeLanguage::English
+        );
+        assert_eq!(
+            DashScopeLanguage::from_str("yue"),
+            DashScopeLanguage::Cantonese
+        );
+        assert_eq!(
+            DashScopeLanguage::from_str("cantonese"),
+            DashScopeLanguage::Cantonese
+        );
         assert_eq!(DashScopeLanguage::from_str("auto"), DashScopeLanguage::Auto);
     }
 

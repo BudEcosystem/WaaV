@@ -674,7 +674,9 @@ impl AcapelaTtsConfigBuilder {
                 email: self.email.unwrap_or_default(),
                 password: self.password.unwrap_or_default(),
             },
-            voice_id: self.voice_id.unwrap_or_else(|| super::DEFAULT_VOICE_ID.to_string()),
+            voice_id: self
+                .voice_id
+                .unwrap_or_else(|| super::DEFAULT_VOICE_ID.to_string()),
             audio_format: self.audio_format.unwrap_or_default(),
             output_mode: self.output_mode.unwrap_or_default(),
             sample_rate: self.sample_rate.unwrap_or(super::DEFAULT_SAMPLE_RATE),
@@ -712,11 +714,26 @@ mod tests {
 
     #[test]
     fn test_audio_format_from_str() {
-        assert_eq!("mp3".parse::<AcapelaAudioFormat>().unwrap(), AcapelaAudioFormat::Mp3);
-        assert_eq!("wav".parse::<AcapelaAudioFormat>().unwrap(), AcapelaAudioFormat::Wav);
-        assert_eq!("linear16".parse::<AcapelaAudioFormat>().unwrap(), AcapelaAudioFormat::S16le);
-        assert_eq!("pcm".parse::<AcapelaAudioFormat>().unwrap(), AcapelaAudioFormat::S16le);
-        assert_eq!("mulaw".parse::<AcapelaAudioFormat>().unwrap(), AcapelaAudioFormat::Mulaw);
+        assert_eq!(
+            "mp3".parse::<AcapelaAudioFormat>().unwrap(),
+            AcapelaAudioFormat::Mp3
+        );
+        assert_eq!(
+            "wav".parse::<AcapelaAudioFormat>().unwrap(),
+            AcapelaAudioFormat::Wav
+        );
+        assert_eq!(
+            "linear16".parse::<AcapelaAudioFormat>().unwrap(),
+            AcapelaAudioFormat::S16le
+        );
+        assert_eq!(
+            "pcm".parse::<AcapelaAudioFormat>().unwrap(),
+            AcapelaAudioFormat::S16le
+        );
+        assert_eq!(
+            "mulaw".parse::<AcapelaAudioFormat>().unwrap(),
+            AcapelaAudioFormat::Mulaw
+        );
 
         // Test invalid format
         assert!("invalid".parse::<AcapelaAudioFormat>().is_err());
@@ -750,9 +767,18 @@ mod tests {
 
     #[test]
     fn test_output_mode_from_str() {
-        assert_eq!("stream".parse::<AcapelaOutputMode>().unwrap(), AcapelaOutputMode::Stream);
-        assert_eq!("file".parse::<AcapelaOutputMode>().unwrap(), AcapelaOutputMode::File);
-        assert_eq!("events".parse::<AcapelaOutputMode>().unwrap(), AcapelaOutputMode::Events);
+        assert_eq!(
+            "stream".parse::<AcapelaOutputMode>().unwrap(),
+            AcapelaOutputMode::Stream
+        );
+        assert_eq!(
+            "file".parse::<AcapelaOutputMode>().unwrap(),
+            AcapelaOutputMode::File
+        );
+        assert_eq!(
+            "events".parse::<AcapelaOutputMode>().unwrap(),
+            AcapelaOutputMode::Events
+        );
     }
 
     #[test]
@@ -938,7 +964,10 @@ mod tests {
         assert!(config.word_positions);
         assert!(config.mouth_positions);
         assert!(!config.mark_positions);
-        assert_eq!(config.dictionaries, Some("custom.dic,extra.dic".to_string()));
+        assert_eq!(
+            config.dictionaries,
+            Some("custom.dic,extra.dic".to_string())
+        );
         assert_eq!(config.application, Some("my-app".to_string()));
     }
 

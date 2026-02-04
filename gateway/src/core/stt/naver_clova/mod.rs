@@ -69,9 +69,9 @@ mod config;
 
 pub use client::NaverClovaStt;
 pub use config::{
+    DEFAULT_SAMPLE_RATE, MAX_AUDIO_DURATION_SECONDS, MIN_SAMPLE_RATE, NAVER_CSR_ENDPOINT,
     NaverClovaAudioFormat, NaverClovaErrorResponse, NaverClovaLanguage, NaverClovaSttConfig,
-    NaverClovaSttResponse, DEFAULT_SAMPLE_RATE, MAX_AUDIO_DURATION_SECONDS, MIN_SAMPLE_RATE,
-    NAVER_CSR_ENDPOINT,
+    NaverClovaSttResponse,
 };
 
 #[cfg(test)]

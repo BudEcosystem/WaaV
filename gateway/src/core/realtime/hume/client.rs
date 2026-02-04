@@ -110,7 +110,7 @@ impl HumeEVI {
     pub fn from_hume_config(config: HumeEVIConfig) -> RealtimeResult<Self> {
         config
             .validate()
-            .map_err(RealtimeError::InvalidConfiguration)?;
+            .map_err(|e| RealtimeError::InvalidConfiguration(e.to_string()))?;
 
         Ok(Self {
             config,

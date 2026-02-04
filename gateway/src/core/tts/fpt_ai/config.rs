@@ -266,10 +266,7 @@ impl FptTtsConfig {
         // Parse voice from voice_id field
         let voice = match &config.voice_id {
             Some(id) if !id.is_empty() => FptVoice::from_str_relaxed(id).unwrap_or_else(|| {
-                tracing::warn!(
-                    "Unknown FPT.AI voice '{}', using default (Ban Mai)",
-                    id
-                );
+                tracing::warn!("Unknown FPT.AI voice '{}', using default (Ban Mai)", id);
                 FptVoice::default()
             }),
             _ => FptVoice::default(),
@@ -417,23 +414,41 @@ mod tests {
         assert_eq!(FptVoice::from_str_relaxed("lannhi"), Some(FptVoice::LanNhi));
         assert_eq!(FptVoice::from_str_relaxed("leminh"), Some(FptVoice::LeMinh));
         assert_eq!(FptVoice::from_str_relaxed("myan"), Some(FptVoice::MyAn));
-        assert_eq!(FptVoice::from_str_relaxed("thuminh"), Some(FptVoice::ThuMinh));
+        assert_eq!(
+            FptVoice::from_str_relaxed("thuminh"),
+            Some(FptVoice::ThuMinh)
+        );
         assert_eq!(FptVoice::from_str_relaxed("giahuy"), Some(FptVoice::GiaHuy));
-        assert_eq!(FptVoice::from_str_relaxed("linhsan"), Some(FptVoice::LinhSan));
+        assert_eq!(
+            FptVoice::from_str_relaxed("linhsan"),
+            Some(FptVoice::LinhSan)
+        );
     }
 
     #[test]
     fn test_voice_from_str_underscores() {
-        assert_eq!(FptVoice::from_str_relaxed("ban_mai"), Some(FptVoice::BanMai));
-        assert_eq!(FptVoice::from_str_relaxed("lan_nhi"), Some(FptVoice::LanNhi));
-        assert_eq!(FptVoice::from_str_relaxed("le_minh"), Some(FptVoice::LeMinh));
+        assert_eq!(
+            FptVoice::from_str_relaxed("ban_mai"),
+            Some(FptVoice::BanMai)
+        );
+        assert_eq!(
+            FptVoice::from_str_relaxed("lan_nhi"),
+            Some(FptVoice::LanNhi)
+        );
+        assert_eq!(
+            FptVoice::from_str_relaxed("le_minh"),
+            Some(FptVoice::LeMinh)
+        );
     }
 
     #[test]
     fn test_voice_from_str_case_insensitive() {
         assert_eq!(FptVoice::from_str_relaxed("BANMAI"), Some(FptVoice::BanMai));
         assert_eq!(FptVoice::from_str_relaxed("BanMai"), Some(FptVoice::BanMai));
-        assert_eq!(FptVoice::from_str_relaxed("Ban Mai"), Some(FptVoice::BanMai));
+        assert_eq!(
+            FptVoice::from_str_relaxed("Ban Mai"),
+            Some(FptVoice::BanMai)
+        );
     }
 
     #[test]
@@ -444,7 +459,10 @@ mod tests {
 
     #[test]
     fn test_voice_from_str_default() {
-        assert_eq!(FptVoice::from_str_relaxed("default"), Some(FptVoice::BanMai));
+        assert_eq!(
+            FptVoice::from_str_relaxed("default"),
+            Some(FptVoice::BanMai)
+        );
         assert_eq!(FptVoice::from_str_relaxed("female"), Some(FptVoice::BanMai));
     }
 
@@ -504,10 +522,22 @@ mod tests {
 
     #[test]
     fn test_audio_format_from_str() {
-        assert_eq!(FptAudioFormat::from_str_relaxed("mp3"), Some(FptAudioFormat::Mp3));
-        assert_eq!(FptAudioFormat::from_str_relaxed("wav"), Some(FptAudioFormat::Wav));
-        assert_eq!(FptAudioFormat::from_str_relaxed("audio/mpeg"), Some(FptAudioFormat::Mp3));
-        assert_eq!(FptAudioFormat::from_str_relaxed("audio/wav"), Some(FptAudioFormat::Wav));
+        assert_eq!(
+            FptAudioFormat::from_str_relaxed("mp3"),
+            Some(FptAudioFormat::Mp3)
+        );
+        assert_eq!(
+            FptAudioFormat::from_str_relaxed("wav"),
+            Some(FptAudioFormat::Wav)
+        );
+        assert_eq!(
+            FptAudioFormat::from_str_relaxed("audio/mpeg"),
+            Some(FptAudioFormat::Mp3)
+        );
+        assert_eq!(
+            FptAudioFormat::from_str_relaxed("audio/wav"),
+            Some(FptAudioFormat::Wav)
+        );
         assert_eq!(FptAudioFormat::from_str_relaxed("invalid"), None);
     }
 

@@ -205,19 +205,28 @@ impl SpeechmaticsTtsConfig {
 
     /// Get the generate URL for the configured voice
     pub fn generate_url(&self) -> String {
-        format!("{}/{}", super::SPEECHMATICS_GENERATE_URL, self.voice.as_str())
+        format!(
+            "{}/{}",
+            super::SPEECHMATICS_GENERATE_URL,
+            self.voice.as_str()
+        )
     }
 
     /// Get the full URL with query parameters
     pub fn full_url(&self) -> String {
-        format!("{}?output_format={}", self.generate_url(), self.output_format.as_str())
+        format!(
+            "{}?output_format={}",
+            self.generate_url(),
+            self.output_format.as_str()
+        )
     }
 
     /// Validate the configuration
     pub fn validate(&self) -> TTSResult<()> {
         if self.api_key.is_empty() {
             return Err(TTSError::InvalidConfiguration(
-                "Speechmatics API key is required. Set SPEECHMATICS_API_KEY environment variable.".to_string(),
+                "Speechmatics API key is required. Set SPEECHMATICS_API_KEY environment variable."
+                    .to_string(),
             ));
         }
         Ok(())
@@ -234,7 +243,8 @@ impl SpeechmaticsTtsConfig {
 
         if api_key.is_empty() {
             return Err(TTSError::InvalidConfiguration(
-                "Speechmatics API key is required. Set SPEECHMATICS_API_KEY environment variable.".to_string(),
+                "Speechmatics API key is required. Set SPEECHMATICS_API_KEY environment variable."
+                    .to_string(),
             ));
         }
 
@@ -329,10 +339,22 @@ mod tests {
 
     #[test]
     fn test_voice_from_str() {
-        assert_eq!(SpeechmaticsVoice::from_str("sarah").unwrap(), SpeechmaticsVoice::Sarah);
-        assert_eq!(SpeechmaticsVoice::from_str("THEO").unwrap(), SpeechmaticsVoice::Theo);
-        assert_eq!(SpeechmaticsVoice::from_str("Megan").unwrap(), SpeechmaticsVoice::Megan);
-        assert_eq!(SpeechmaticsVoice::from_str("JACK").unwrap(), SpeechmaticsVoice::Jack);
+        assert_eq!(
+            SpeechmaticsVoice::from_str("sarah").unwrap(),
+            SpeechmaticsVoice::Sarah
+        );
+        assert_eq!(
+            SpeechmaticsVoice::from_str("THEO").unwrap(),
+            SpeechmaticsVoice::Theo
+        );
+        assert_eq!(
+            SpeechmaticsVoice::from_str("Megan").unwrap(),
+            SpeechmaticsVoice::Megan
+        );
+        assert_eq!(
+            SpeechmaticsVoice::from_str("JACK").unwrap(),
+            SpeechmaticsVoice::Jack
+        );
         assert!(SpeechmaticsVoice::from_str("invalid").is_err());
     }
 
@@ -375,17 +397,35 @@ mod tests {
 
     #[test]
     fn test_output_format_from_str() {
-        assert_eq!(SpeechmaticsOutputFormat::from_str("wav_16000").unwrap(), SpeechmaticsOutputFormat::Wav16000);
-        assert_eq!(SpeechmaticsOutputFormat::from_str("wav").unwrap(), SpeechmaticsOutputFormat::Wav16000);
-        assert_eq!(SpeechmaticsOutputFormat::from_str("pcm_16000").unwrap(), SpeechmaticsOutputFormat::Pcm16000);
-        assert_eq!(SpeechmaticsOutputFormat::from_str("pcm").unwrap(), SpeechmaticsOutputFormat::Pcm16000);
-        assert_eq!(SpeechmaticsOutputFormat::from_str("raw").unwrap(), SpeechmaticsOutputFormat::Pcm16000);
+        assert_eq!(
+            SpeechmaticsOutputFormat::from_str("wav_16000").unwrap(),
+            SpeechmaticsOutputFormat::Wav16000
+        );
+        assert_eq!(
+            SpeechmaticsOutputFormat::from_str("wav").unwrap(),
+            SpeechmaticsOutputFormat::Wav16000
+        );
+        assert_eq!(
+            SpeechmaticsOutputFormat::from_str("pcm_16000").unwrap(),
+            SpeechmaticsOutputFormat::Pcm16000
+        );
+        assert_eq!(
+            SpeechmaticsOutputFormat::from_str("pcm").unwrap(),
+            SpeechmaticsOutputFormat::Pcm16000
+        );
+        assert_eq!(
+            SpeechmaticsOutputFormat::from_str("raw").unwrap(),
+            SpeechmaticsOutputFormat::Pcm16000
+        );
         assert!(SpeechmaticsOutputFormat::from_str("invalid").is_err());
     }
 
     #[test]
     fn test_output_format_default() {
-        assert_eq!(SpeechmaticsOutputFormat::default(), SpeechmaticsOutputFormat::Wav16000);
+        assert_eq!(
+            SpeechmaticsOutputFormat::default(),
+            SpeechmaticsOutputFormat::Wav16000
+        );
     }
 
     #[test]
@@ -420,8 +460,7 @@ mod tests {
 
     #[test]
     fn test_config_generate_url() {
-        let config = SpeechmaticsTtsConfig::new("test-key")
-            .with_voice(SpeechmaticsVoice::Theo);
+        let config = SpeechmaticsTtsConfig::new("test-key").with_voice(SpeechmaticsVoice::Theo);
 
         let url = config.generate_url();
         assert!(url.contains("speechmatics.com"));

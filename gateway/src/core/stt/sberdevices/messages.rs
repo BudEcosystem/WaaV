@@ -120,9 +120,10 @@ impl SberApiError {
             Self {
                 http_status,
                 error_code: err.error.or(err.code),
-                message: err.error_description.or(err.message).unwrap_or_else(|| {
-                    format!("HTTP {} error", http_status)
-                }),
+                message: err
+                    .error_description
+                    .or(err.message)
+                    .unwrap_or_else(|| format!("HTTP {} error", http_status)),
             }
         } else {
             Self {

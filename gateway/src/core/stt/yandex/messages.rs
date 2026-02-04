@@ -77,7 +77,10 @@ impl StreamingRecognitionResult {
 
     /// Get the best confidence score
     pub fn best_confidence(&self) -> f32 {
-        self.alternatives.first().and_then(|a| a.confidence).unwrap_or(0.0)
+        self.alternatives
+            .first()
+            .and_then(|a| a.confidence)
+            .unwrap_or(0.0)
     }
 
     /// Check if this is a final result

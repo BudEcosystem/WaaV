@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rhai::{Engine, AST, Scope, Dynamic};
+use rhai::{AST, Dynamic, Engine, Scope};
 use tracing::debug;
 
 use super::context::DAGContext;
@@ -19,10 +19,7 @@ use super::error::{DAGError, DAGResult};
 #[derive(Debug, Clone)]
 pub enum CompiledCondition {
     /// Rhai AST for expression evaluation
-    Expression {
-        ast: Arc<AST>,
-        source: String,
-    },
+    Expression { ast: Arc<AST>, source: String },
     /// Simple field-based switch
     Switch {
         field_segments: Vec<String>,
@@ -104,9 +101,11 @@ impl ConditionEvaluator {
             CompiledCondition::Expression { ast, source } => {
                 self.evaluate_expression(ast, source, data, ctx)
             }
-            CompiledCondition::Switch { field_segments, cases, default } => {
-                self.evaluate_switch(field_segments, cases, default, data)
-            }
+            CompiledCondition::Switch {
+                field_segments,
+                cases,
+                default,
+            } => self.evaluate_switch(field_segments, cases, default, data),
             CompiledCondition::ApiKey { patterns, default } => {
                 self.evaluate_api_key(patterns, default, ctx)
             }
@@ -122,7 +121,11 @@ impl ConditionEvaluator {
         ctx: &DAGContext,
     ) -> DAGResult<Option<String>> {
         match condition {
-            CompiledCondition::Switch { field_segments, cases, default } => {
+            CompiledCondition::Switch {
+                field_segments,
+                cases,
+                default,
+            } => {
                 let value = extract_field(data, field_segments)?;
                 let value_str = json_value_to_string(&value);
 
@@ -192,10 +195,13 @@ impl ConditionEvaluator {
         }
 
         // Evaluate the expression
-        let result: Dynamic = self.engine.eval_ast_with_scope(&mut scope, ast).map_err(|e| {
-            debug!(source = %source, error = %e, "Expression evaluation failed");
-            DAGError::ConditionError(format!("Expression '{}' failed: {}", source, e))
-        })?;
+        let result: Dynamic = self
+            .engine
+            .eval_ast_with_scope(&mut scope, ast)
+            .map_err(|e| {
+                debug!(source = %source, error = %e, "Expression evaluation failed");
+                DAGError::ConditionError(format!("Expression '{}' failed: {}", source, e))
+            })?;
 
         // Convert result to bool
         result.as_bool().map_err(|_| {
@@ -293,10 +299,12 @@ fn extract_field(data: &serde_json::Value, segments: &[String]) -> DAGResult<ser
     let mut current = data;
 
     for segment in segments {
-        current = current.get(segment).ok_or_else(|| DAGError::FieldExtractionError {
-            field: segments.join("."),
-            error: format!("Field '{}' not found", segment),
-        })?;
+        current = current
+            .get(segment)
+            .ok_or_else(|| DAGError::FieldExtractionError {
+                field: segments.join("."),
+                error: format!("Field '{}' not found", segment),
+            })?;
     }
 
     Ok(current.clone())

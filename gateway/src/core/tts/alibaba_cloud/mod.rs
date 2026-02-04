@@ -147,10 +147,10 @@ mod provider;
 
 // Configuration types
 pub use config::{
-    DashScopeAudioFormat, DashScopeRegion, DashScopeTtsConfig, DashScopeTtsModel,
     DASHSCOPE_BEIJING_INFERENCE_URL, DASHSCOPE_BEIJING_REALTIME_URL,
-    DASHSCOPE_SINGAPORE_INFERENCE_URL, DASHSCOPE_SINGAPORE_REALTIME_URL,
-    DEFAULT_AUDIO_FORMAT, DEFAULT_SAMPLE_RATE, DEFAULT_TTS_MODEL, DEFAULT_VOICE,
+    DASHSCOPE_SINGAPORE_INFERENCE_URL, DASHSCOPE_SINGAPORE_REALTIME_URL, DEFAULT_AUDIO_FORMAT,
+    DEFAULT_SAMPLE_RATE, DEFAULT_TTS_MODEL, DEFAULT_VOICE, DashScopeAudioFormat, DashScopeRegion,
+    DashScopeTtsConfig, DashScopeTtsModel,
 };
 
 // Message types
@@ -240,10 +240,26 @@ mod tests {
 
     #[test]
     fn test_region_endpoints() {
-        assert!(DashScopeRegion::Beijing.realtime_url().contains("dashscope.aliyuncs.com"));
-        assert!(DashScopeRegion::Singapore.realtime_url().contains("dashscope-intl"));
-        assert!(DashScopeRegion::Beijing.inference_url().contains("inference"));
-        assert!(DashScopeRegion::Singapore.inference_url().contains("inference"));
+        assert!(
+            DashScopeRegion::Beijing
+                .realtime_url()
+                .contains("dashscope.aliyuncs.com")
+        );
+        assert!(
+            DashScopeRegion::Singapore
+                .realtime_url()
+                .contains("dashscope-intl")
+        );
+        assert!(
+            DashScopeRegion::Beijing
+                .inference_url()
+                .contains("inference")
+        );
+        assert!(
+            DashScopeRegion::Singapore
+                .inference_url()
+                .contains("inference")
+        );
     }
 
     #[test]
@@ -324,10 +340,22 @@ mod tests {
 
     #[test]
     fn test_audio_format_parsing() {
-        assert_eq!(DashScopeAudioFormat::from_str("mp3"), Some(DashScopeAudioFormat::Mp3));
-        assert_eq!(DashScopeAudioFormat::from_str("pcm"), Some(DashScopeAudioFormat::Pcm16));
-        assert_eq!(DashScopeAudioFormat::from_str("wav"), Some(DashScopeAudioFormat::Wav));
-        assert_eq!(DashScopeAudioFormat::from_str("opus"), Some(DashScopeAudioFormat::Opus));
+        assert_eq!(
+            DashScopeAudioFormat::from_str("mp3"),
+            Some(DashScopeAudioFormat::Mp3)
+        );
+        assert_eq!(
+            DashScopeAudioFormat::from_str("pcm"),
+            Some(DashScopeAudioFormat::Pcm16)
+        );
+        assert_eq!(
+            DashScopeAudioFormat::from_str("wav"),
+            Some(DashScopeAudioFormat::Wav)
+        );
+        assert_eq!(
+            DashScopeAudioFormat::from_str("opus"),
+            Some(DashScopeAudioFormat::Opus)
+        );
     }
 
     #[test]

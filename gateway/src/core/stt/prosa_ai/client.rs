@@ -4,21 +4,21 @@
 //! Speech-to-Text service.
 
 use super::config::{
-    ProsaAudioFormat, ProsaSttAudioConfig, ProsaSttConfig, ProsaSttModel, ProsaSttRequest,
-    ProsaSttRequestConfig, ProsaSttRequestData, ProsaSttResponse, ProsaSttStreamConfig,
-    ProsaSttWsMessage, MIN_AUDIO_BUFFER_SIZE, PROSA_STT_BASE_URL, PROSA_STT_WS_ENDPOINT,
+    MIN_AUDIO_BUFFER_SIZE, PROSA_STT_BASE_URL, PROSA_STT_WS_ENDPOINT, ProsaAudioFormat,
+    ProsaSttAudioConfig, ProsaSttConfig, ProsaSttModel, ProsaSttRequest, ProsaSttRequestConfig,
+    ProsaSttRequestData, ProsaSttResponse, ProsaSttStreamConfig, ProsaSttWsMessage,
 };
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info};
@@ -59,9 +59,7 @@ pub struct ProsaStt {
 
 /// Type alias for WebSocket sink.
 type WsSink = futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Message,
 >;
 
@@ -75,7 +73,9 @@ impl ProsaStt {
                 prosa_config.request_timeout_secs,
             ))
             .build()
-            .map_err(|e| STTError::ConnectionFailed(format!("Failed to create HTTP client: {}", e)))?;
+            .map_err(|e| {
+                STTError::ConnectionFailed(format!("Failed to create HTTP client: {}", e))
+            })?;
 
         Ok(Self {
             config: prosa_config,
@@ -161,7 +161,11 @@ impl ProsaStt {
             .await
             .map_err(|e| STTError::ProviderError(format!("Failed to read response: {}", e)))?;
 
-        debug!("Received response: status={}, body_len={}", status, body.len());
+        debug!(
+            "Received response: status={}, body_len={}",
+            status,
+            body.len()
+        );
 
         if !status.is_success() {
             return Err(self.parse_error_response(status.as_u16(), &body));
@@ -187,9 +191,9 @@ impl ProsaStt {
             return self.poll_job_result(&prosa_response.job_id).await;
         }
 
-        prosa_response.transcription().ok_or_else(|| {
-            STTError::ProviderError("No transcription in response".to_string())
-        })
+        prosa_response
+            .transcription()
+            .ok_or_else(|| STTError::ProviderError("No transcription in response".to_string()))
     }
 
     /// Poll for job result (async mode).
@@ -237,9 +241,7 @@ impl ProsaStt {
             tokio::time::sleep(poll_interval).await;
         }
 
-        Err(STTError::ProviderError(
-            "Job polling timeout".to_string(),
-        ))
+        Err(STTError::ProviderError("Job polling timeout".to_string()))
     }
 
     /// Parse error response.
@@ -252,9 +254,7 @@ impl ProsaStt {
                         STTError::AuthenticationFailed(err.message)
                     }
                     "forbidden" => STTError::AuthenticationFailed("Access forbidden".to_string()),
-                    "quota_insufficient" | "quota_empty" => {
-                        STTError::ProviderError(err.message)
-                    }
+                    "quota_insufficient" | "quota_empty" => STTError::ProviderError(err.message),
                     _ => STTError::ProviderError(err.message),
                 };
             }
@@ -282,13 +282,19 @@ impl ProsaStt {
             ));
         }
 
-        let url = format!("{}?x-api-key={}", PROSA_STT_WS_ENDPOINT, self.config.api_key);
+        let url = format!(
+            "{}?x-api-key={}",
+            PROSA_STT_WS_ENDPOINT, self.config.api_key
+        );
 
-        debug!("Connecting to Prosa.ai WebSocket: {}", PROSA_STT_WS_ENDPOINT);
+        debug!(
+            "Connecting to Prosa.ai WebSocket: {}",
+            PROSA_STT_WS_ENDPOINT
+        );
 
-        let (ws_stream, _) = connect_async(&url)
-            .await
-            .map_err(|e| STTError::ConnectionFailed(format!("WebSocket connection failed: {}", e)))?;
+        let (ws_stream, _) = connect_async(&url).await.map_err(|e| {
+            STTError::ConnectionFailed(format!("WebSocket connection failed: {}", e))
+        })?;
 
         let (write, mut read) = ws_stream.split();
 
@@ -310,15 +316,18 @@ impl ProsaStt {
             }),
         };
 
-        let config_json = serde_json::to_string(&config)
-            .map_err(|e| STTError::ConnectionFailed(format!("Failed to serialize config: {}", e)))?;
+        let config_json = serde_json::to_string(&config).map_err(|e| {
+            STTError::ConnectionFailed(format!("Failed to serialize config: {}", e))
+        })?;
 
         {
             let mut sink = self.ws_sink.write().await;
             if let Some(ref mut ws) = *sink {
                 ws.send(Message::Text(config_json.into()))
                     .await
-                    .map_err(|e| STTError::ConnectionFailed(format!("Failed to send config: {}", e)))?;
+                    .map_err(|e| {
+                        STTError::ConnectionFailed(format!("Failed to send config: {}", e))
+                    })?;
             }
         }
 
@@ -345,9 +354,9 @@ impl ProsaStt {
                                     if let Some(ref cb) = *callback {
                                         let result = STTResult::new(
                                             transcript.clone(),
-                                            false,  // is_final
-                                            false,  // is_speech_final
-                                            0.0,    // confidence (not provided by partial)
+                                            false, // is_final
+                                            false, // is_speech_final
+                                            0.0,   // confidence (not provided by partial)
                                         );
                                         cb(result).await;
                                     }
@@ -365,9 +374,9 @@ impl ProsaStt {
                                     if let Some(ref cb) = *callback {
                                         let result = STTResult::new(
                                             transcript.clone(),
-                                            true,   // is_final
-                                            true,   // is_speech_final (end of segment)
-                                            1.0,    // confidence (Prosa doesn't provide, assume high)
+                                            true, // is_final
+                                            true, // is_speech_final (end of segment)
+                                            1.0,  // confidence (Prosa doesn't provide, assume high)
                                         );
                                         cb(result).await;
                                     }
@@ -375,7 +384,10 @@ impl ProsaStt {
                                 ProsaSttWsMessage::Status { status } => {
                                     debug!("Status update: {}", status);
                                 }
-                                ProsaSttWsMessage::Metadata { duration, quota_used } => {
+                                ProsaSttWsMessage::Metadata {
+                                    duration,
+                                    quota_used,
+                                } => {
                                     debug!(
                                         "Session metadata: duration={:?}, quota_used={:?}",
                                         duration, quota_used
@@ -429,11 +441,9 @@ impl ProsaStt {
     async fn end_audio_stream(&self) -> Result<(), STTError> {
         let mut sink = self.ws_sink.write().await;
         if let Some(ref mut ws) = *sink {
-            ws.send(Message::Binary(Bytes::new()))
-                .await
-                .map_err(|e| {
-                    STTError::ProviderError(format!("Failed to send end signal: {}", e))
-                })?;
+            ws.send(Message::Binary(Bytes::new())).await.map_err(|e| {
+                STTError::ProviderError(format!("Failed to send end signal: {}", e))
+            })?;
         }
         Ok(())
     }

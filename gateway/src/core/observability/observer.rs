@@ -212,8 +212,11 @@ impl ObserverRegistry {
     ) {
         let observers = self.observers.read();
         for entry in observers.iter() {
-            entry.observer
-                .on_connection_state_change(provider, old_state.clone(), new_state.clone());
+            entry.observer.on_connection_state_change(
+                provider,
+                old_state.clone(),
+                new_state.clone(),
+            );
         }
     }
 

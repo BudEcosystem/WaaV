@@ -16,15 +16,13 @@
 //! cargo test test_gnani_stt_factory_creation
 //! ```
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::pin::Pin;
-use std::future::Future;
 use tokio::sync::Mutex;
 
-use waav_gateway::core::stt::{
-    BaseSTT, STTConfig, STTError, create_stt_provider,
-};
+use waav_gateway::core::stt::{BaseSTT, STTConfig, STTError, create_stt_provider};
 use waav_gateway::core::tts::{
     AudioCallback, AudioData, BaseTTS, TTSConfig, TTSError, create_tts_provider,
 };
@@ -120,11 +118,16 @@ fn test_gnani_stt_factory_creation() {
     };
 
     let result = create_stt_provider("gnani", config);
-    assert!(result.is_ok(), "Gnani STT provider should be created successfully");
+    assert!(
+        result.is_ok(),
+        "Gnani STT provider should be created successfully"
+    );
 
     let provider = result.unwrap();
-    assert!(provider.get_provider_info().contains("Gnani"),
-        "Provider info should mention Gnani");
+    assert!(
+        provider.get_provider_info().contains("Gnani"),
+        "Provider info should mention Gnani"
+    );
 }
 
 /// Test that Gnani aliases work for STT factory.
@@ -145,7 +148,11 @@ fn test_gnani_stt_factory_aliases() {
         };
 
         let result = create_stt_provider(alias, config);
-        assert!(result.is_ok(), "Gnani STT should be created with alias: {}", alias);
+        assert!(
+            result.is_ok(),
+            "Gnani STT should be created with alias: {}",
+            alias
+        );
     }
 }
 
@@ -194,7 +201,10 @@ fn test_gnani_tts_factory_creation() {
     };
 
     let result = create_tts_provider("gnani", config);
-    assert!(result.is_ok(), "Gnani TTS provider should be created successfully");
+    assert!(
+        result.is_ok(),
+        "Gnani TTS provider should be created successfully"
+    );
 }
 
 /// Test that Gnani aliases work for TTS factory.
@@ -219,7 +229,11 @@ fn test_gnani_tts_factory_aliases() {
         };
 
         let result = create_tts_provider(alias, config);
-        assert!(result.is_ok(), "Gnani TTS should be created with alias: {}", alias);
+        assert!(
+            result.is_ok(),
+            "Gnani TTS should be created with alias: {}",
+            alias
+        );
     }
 }
 
@@ -242,7 +256,10 @@ fn test_gnani_stt_not_ready_before_connect() {
     };
 
     let provider = create_stt_provider("gnani", config).unwrap();
-    assert!(!provider.is_ready(), "Provider should not be ready before connect");
+    assert!(
+        !provider.is_ready(),
+        "Provider should not be ready before connect"
+    );
 }
 
 /// Test STT provider info contains expected details.
@@ -263,8 +280,10 @@ fn test_gnani_stt_provider_info_content() {
     let info = provider.get_provider_info();
 
     assert!(info.contains("Gnani"), "Should contain 'Gnani'");
-    assert!(info.contains("gRPC") || info.contains("streaming"),
-        "Should mention gRPC or streaming capability");
+    assert!(
+        info.contains("gRPC") || info.contains("streaming"),
+        "Should mention gRPC or streaming capability"
+    );
 }
 
 /// Test that send_audio fails when not connected.
@@ -289,7 +308,10 @@ async fn test_gnani_stt_send_audio_fails_not_connected() {
 
     match result {
         Err(STTError::ConnectionFailed(msg)) => {
-            assert!(msg.contains("Not connected"), "Error should mention not connected");
+            assert!(
+                msg.contains("Not connected"),
+                "Error should mention not connected"
+            );
         }
         Err(other) => panic!("Expected ConnectionFailed error, got: {:?}", other),
         Ok(_) => panic!("Expected error, got success"),
@@ -314,7 +336,10 @@ async fn test_gnani_stt_disconnect_not_connected() {
 
     // Disconnect when not connected should not error
     let result = provider.disconnect().await;
-    assert!(result.is_ok(), "Disconnect when not connected should succeed");
+    assert!(
+        result.is_ok(),
+        "Disconnect when not connected should succeed"
+    );
 }
 
 // ============================================================================
@@ -376,9 +401,20 @@ async fn test_gnani_tts_speak_fails_not_connected() {
 #[test]
 fn test_gnani_stt_all_languages() {
     let languages = [
-        "hi-IN", "kn-IN", "ta-IN", "te-IN", "gu-IN", "mr-IN",
-        "bn-IN", "ml-IN", "pa-guru-IN", "ur-IN",
-        "en-IN", "en-GB", "en-US", "en-SG",
+        "hi-IN",
+        "kn-IN",
+        "ta-IN",
+        "te-IN",
+        "gu-IN",
+        "mr-IN",
+        "bn-IN",
+        "ml-IN",
+        "pa-guru-IN",
+        "ur-IN",
+        "en-IN",
+        "en-GB",
+        "en-US",
+        "en-SG",
     ];
 
     for lang in languages {
@@ -394,7 +430,11 @@ fn test_gnani_stt_all_languages() {
         };
 
         let result = create_stt_provider("gnani", config);
-        assert!(result.is_ok(), "Gnani STT should support language: {}", lang);
+        assert!(
+            result.is_ok(),
+            "Gnani STT should support language: {}",
+            lang
+        );
     }
 }
 
@@ -421,7 +461,11 @@ fn test_gnani_tts_all_languages() {
         };
 
         let result = create_tts_provider("gnani", config);
-        assert!(result.is_ok(), "Gnani TTS should be creatable for language context: {}", lang);
+        assert!(
+            result.is_ok(),
+            "Gnani TTS should be creatable for language context: {}",
+            lang
+        );
     }
 }
 
@@ -447,7 +491,11 @@ fn test_gnani_stt_audio_encodings() {
         };
 
         let result = create_stt_provider("gnani", config);
-        assert!(result.is_ok(), "Gnani STT should support encoding: {}", encoding);
+        assert!(
+            result.is_ok(),
+            "Gnani STT should support encoding: {}",
+            encoding
+        );
     }
 }
 
@@ -469,7 +517,11 @@ fn test_gnani_stt_sample_rates() {
         };
 
         let result = create_stt_provider("gnani", config);
-        assert!(result.is_ok(), "Gnani STT should be creatable with sample rate: {}", rate);
+        assert!(
+            result.is_ok(),
+            "Gnani STT should be creatable with sample rate: {}",
+            rate
+        );
     }
 }
 
@@ -485,13 +537,28 @@ fn test_gnani_registered_in_plugin_registry() {
     let registry = global_registry();
 
     // Check STT registration
-    assert!(registry.has_stt_provider("gnani"), "Gnani STT should be registered");
-    assert!(registry.has_stt_provider("gnani-ai"), "gnani-ai alias should work");
-    assert!(registry.has_stt_provider("vachana"), "vachana alias should work");
+    assert!(
+        registry.has_stt_provider("gnani"),
+        "Gnani STT should be registered"
+    );
+    assert!(
+        registry.has_stt_provider("gnani-ai"),
+        "gnani-ai alias should work"
+    );
+    assert!(
+        registry.has_stt_provider("vachana"),
+        "vachana alias should work"
+    );
 
     // Check TTS registration
-    assert!(registry.has_tts_provider("gnani"), "Gnani TTS should be registered");
-    assert!(registry.has_tts_provider("gnani-ai"), "gnani-ai TTS alias should work");
+    assert!(
+        registry.has_tts_provider("gnani"),
+        "Gnani TTS should be registered"
+    );
+    assert!(
+        registry.has_tts_provider("gnani-ai"),
+        "gnani-ai TTS alias should work"
+    );
 }
 
 /// Test Gnani metadata is available.
@@ -522,12 +589,16 @@ fn test_gnani_in_provider_lists() {
     let registry = global_registry();
 
     let stt_providers = registry.get_stt_provider_names();
-    assert!(stt_providers.contains(&"gnani".to_string()),
-        "Gnani should be in STT provider list");
+    assert!(
+        stt_providers.contains(&"gnani".to_string()),
+        "Gnani should be in STT provider list"
+    );
 
     let tts_providers = registry.get_tts_provider_names();
-    assert!(tts_providers.contains(&"gnani".to_string()),
-        "Gnani should be in TTS provider list");
+    assert!(
+        tts_providers.contains(&"gnani".to_string()),
+        "Gnani should be in TTS provider list"
+    );
 }
 
 // ============================================================================
@@ -553,8 +624,10 @@ fn test_invalid_provider_error() {
 
     match result {
         Err(STTError::ConfigurationError(msg)) => {
-            assert!(msg.contains("Unknown") || msg.contains("provider"),
-                "Error should mention unknown provider");
+            assert!(
+                msg.contains("Unknown") || msg.contains("provider"),
+                "Error should mention unknown provider"
+            );
         }
         Err(other) => panic!("Expected ConfigurationError, got: {:?}", other),
         Ok(_) => panic!("Expected error, got success"),
@@ -580,8 +653,7 @@ async fn test_gnani_stt_callback_registration() {
     let mut provider = create_stt_provider("gnani", config).unwrap();
 
     let callback: STTResultCallback = Arc::new(|_result: STTResult| {
-        Box::pin(async move {})
-            as Pin<Box<dyn Future<Output = ()> + Send>>
+        Box::pin(async move {}) as Pin<Box<dyn Future<Output = ()> + Send>>
     });
 
     let result = provider.on_result(callback).await;
@@ -609,7 +681,10 @@ fn test_gnani_stt_empty_api_key() {
     // Provider creation might succeed, but connect should fail
     let result = create_stt_provider("gnani", config);
     // Empty API key is allowed at creation time - validation happens at connect
-    assert!(result.is_ok(), "Provider creation with empty key should work (validation at connect)");
+    assert!(
+        result.is_ok(),
+        "Provider creation with empty key should work (validation at connect)"
+    );
 }
 
 /// Test provider config retrieval.
@@ -644,18 +719,21 @@ fn test_gnani_stt_config_retrieval() {
 /// Test multiple provider instances can be created.
 #[test]
 fn test_gnani_multiple_instances() {
-    let configs: Vec<_> = (0..5).map(|i| STTConfig {
-        provider: "gnani".to_string(),
-        api_key: format!("mock-token-{}", i),
-        language: "hi-IN".to_string(),
-        sample_rate: 16000,
-        channels: 1,
-        punctuation: true,
-        encoding: "pcm16".to_string(),
-        model: "default".to_string(),
-    }).collect();
+    let configs: Vec<_> = (0..5)
+        .map(|i| STTConfig {
+            provider: "gnani".to_string(),
+            api_key: format!("mock-token-{}", i),
+            language: "hi-IN".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "pcm16".to_string(),
+            model: "default".to_string(),
+        })
+        .collect();
 
-    let providers: Vec<_> = configs.into_iter()
+    let providers: Vec<_> = configs
+        .into_iter()
         .map(|cfg| create_stt_provider("gnani", cfg))
         .collect();
 
@@ -667,21 +745,23 @@ fn test_gnani_multiple_instances() {
 /// Test concurrent provider creation.
 #[tokio::test]
 async fn test_gnani_concurrent_creation() {
-    let handles: Vec<_> = (0..10).map(|i| {
-        tokio::spawn(async move {
-            let config = STTConfig {
-                provider: "gnani".to_string(),
-                api_key: format!("mock-token-{}", i),
-                language: "hi-IN".to_string(),
-                sample_rate: 16000,
-                channels: 1,
-                punctuation: true,
-                encoding: "pcm16".to_string(),
-                model: "default".to_string(),
-            };
-            create_stt_provider("gnani", config)
+    let handles: Vec<_> = (0..10)
+        .map(|i| {
+            tokio::spawn(async move {
+                let config = STTConfig {
+                    provider: "gnani".to_string(),
+                    api_key: format!("mock-token-{}", i),
+                    language: "hi-IN".to_string(),
+                    sample_rate: 16000,
+                    channels: 1,
+                    punctuation: true,
+                    encoding: "pcm16".to_string(),
+                    model: "default".to_string(),
+                };
+                create_stt_provider("gnani", config)
+            })
         })
-    }).collect();
+        .collect();
 
     for handle in handles {
         let result = handle.await.unwrap();

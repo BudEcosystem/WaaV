@@ -7,12 +7,26 @@
 jobs = 4  # Limit to 4 parallel jobs (adjust based on RAM: jobs = RAM_GB / 4)
 
 # =============================================================================
-# Linux: Reduce linker memory usage (LLD-compatible flags)
+# Linux x86_64: SIMD optimizations + linker memory management
 # =============================================================================
+# Target x86-64-v3 (AVX2 baseline) for optimal SIMD performance
+# This covers ~95% of modern CPUs (Intel Haswell+ 2013, AMD Zen+ 2018)
+# pulp will still use AVX-512 at runtime when available
 [target.x86_64-unknown-linux-gnu]
 rustflags = [
+    # Portable AVX2 baseline (x86-64-v3 microarchitecture level)
+    "-C", "target-cpu=x86-64-v3",
     # Reduce debug info compression level (saves memory during linking)
     "-C", "debuginfo=1",
+]
+
+# =============================================================================
+# ARM Linux: Optimized for AWS Graviton2/3 servers
+# =============================================================================
+[target.aarch64-unknown-linux-gnu]
+rustflags = [
+    # Neoverse N1 is the baseline for Graviton2, also works well on Graviton3
+    "-C", "target-cpu=neoverse-n1",
 ]
 
 # =============================================================================
@@ -22,14 +36,27 @@ rustflags = [
 rustflags = ["-C", "target-feature=+crt-static"]
 
 # =============================================================================
-# macOS: ObjC linking required for WebRTC
+# macOS Intel: ObjC linking + x86-64-v3 baseline
 # =============================================================================
 [target.x86_64-apple-darwin]
-rustflags = ["-C", "link-arg=-ObjC"]
+rustflags = [
+    "-C", "link-arg=-ObjC",
+    "-C", "target-cpu=x86-64-v3",
+]
 
+# =============================================================================
+# macOS Apple Silicon: Optimized for M1+ chips
+# =============================================================================
 [target.aarch64-apple-darwin]
-rustflags = ["-C", "link-arg=-ObjC"]
+rustflags = [
+    "-C", "link-arg=-ObjC",
+    # Apple M1 baseline covers M1, M1 Pro, M1 Max, M2, M3, etc.
+    "-C", "target-cpu=apple-m1",
+]
 
+# =============================================================================
+# iOS: ObjC linking required
+# =============================================================================
 [target.aarch64-apple-ios]
 rustflags = ["-C", "link-arg=-ObjC"]
 

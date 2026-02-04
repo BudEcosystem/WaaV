@@ -113,10 +113,10 @@ pub mod provider;
 
 // Re-export primary types
 pub use config::{
-    BaiduOAuthError, BaiduOAuthResponse, BaiduTtsAudioFormat, BaiduTtsConfig,
-    BaiduTtsErrorResponse, BaiduTtsVoice, BaiduVoiceCategory, BAIDU_OAUTH_URL, BAIDU_TTS_URL,
-    BAIDU_TTS_URL_HTTPS, DEFAULT_AUDIO_FORMAT, DEFAULT_PITCH, DEFAULT_SPEED, DEFAULT_VOICE,
-    DEFAULT_VOLUME, MAX_TEXT_LENGTH_GBK,
+    BAIDU_OAUTH_URL, BAIDU_TTS_URL, BAIDU_TTS_URL_HTTPS, BaiduOAuthError, BaiduOAuthResponse,
+    BaiduTtsAudioFormat, BaiduTtsConfig, BaiduTtsErrorResponse, BaiduTtsVoice, BaiduVoiceCategory,
+    DEFAULT_AUDIO_FORMAT, DEFAULT_PITCH, DEFAULT_SPEED, DEFAULT_VOICE, DEFAULT_VOLUME,
+    MAX_TEXT_LENGTH_GBK,
 };
 pub use provider::BaiduTts;
 
@@ -207,7 +207,11 @@ mod tests {
             };
 
             let tts = BaiduTts::new(config);
-            assert!(tts.is_ok(), "Failed to create provider with format: {}", format);
+            assert!(
+                tts.is_ok(),
+                "Failed to create provider with format: {}",
+                format
+            );
         }
     }
 

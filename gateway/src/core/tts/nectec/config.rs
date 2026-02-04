@@ -268,10 +268,16 @@ impl fmt::Display for NectecTtsError {
             NectecTtsError::InvalidApiKey => write!(f, "Invalid or missing NECTEC API key"),
             NectecTtsError::RateLimitExceeded => write!(f, "NECTEC rate limit exceeded"),
             NectecTtsError::TextTooLong(len) => {
-                write!(f, "Text too long ({} chars), max is {} chars", len, MAX_TEXT_LENGTH)
+                write!(
+                    f,
+                    "Text too long ({} chars), max is {} chars",
+                    len, MAX_TEXT_LENGTH
+                )
             }
             NectecTtsError::EmptyText => write!(f, "Text is empty"),
-            NectecTtsError::AudioDownloadFailed(msg) => write!(f, "Failed to download audio: {}", msg),
+            NectecTtsError::AudioDownloadFailed(msg) => {
+                write!(f, "Failed to download audio: {}", msg)
+            }
             NectecTtsError::ServerError(msg) => write!(f, "NECTEC server error: {}", msg),
             NectecTtsError::Unknown(msg) => write!(f, "NECTEC error: {}", msg),
         }
@@ -349,12 +355,24 @@ mod tests {
 
     #[test]
     fn test_voice_from_str() {
-        assert_eq!(NectecVoice::from_str_relaxed("male"), Some(NectecVoice::Male));
-        assert_eq!(NectecVoice::from_str_relaxed("female"), Some(NectecVoice::Female));
+        assert_eq!(
+            NectecVoice::from_str_relaxed("male"),
+            Some(NectecVoice::Male)
+        );
+        assert_eq!(
+            NectecVoice::from_str_relaxed("female"),
+            Some(NectecVoice::Female)
+        );
         assert_eq!(NectecVoice::from_str_relaxed("0"), Some(NectecVoice::Male));
-        assert_eq!(NectecVoice::from_str_relaxed("1"), Some(NectecVoice::Female));
+        assert_eq!(
+            NectecVoice::from_str_relaxed("1"),
+            Some(NectecVoice::Female)
+        );
         assert_eq!(NectecVoice::from_str_relaxed("m"), Some(NectecVoice::Male));
-        assert_eq!(NectecVoice::from_str_relaxed("f"), Some(NectecVoice::Female));
+        assert_eq!(
+            NectecVoice::from_str_relaxed("f"),
+            Some(NectecVoice::Female)
+        );
         assert_eq!(NectecVoice::from_str_relaxed("invalid"), None);
     }
 
@@ -368,7 +386,12 @@ mod tests {
     fn test_config_validation_empty_key() {
         let config = NectecTtsConfig::default();
         assert!(config.validate().is_err());
-        assert!(config.validate().unwrap_err().contains("API key is required"));
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("API key is required")
+        );
     }
 
     #[test]
@@ -417,7 +440,10 @@ mod tests {
             wav_url: Some("https://api.aiforthai.in.th/temp/audio.wav".to_string()),
             error: None,
         };
-        assert_eq!(response.audio_url(), Some("https://api.aiforthai.in.th/temp/audio.wav"));
+        assert_eq!(
+            response.audio_url(),
+            Some("https://api.aiforthai.in.th/temp/audio.wav")
+        );
         assert!(!response.has_error());
 
         let error_response = Vaja9Response {

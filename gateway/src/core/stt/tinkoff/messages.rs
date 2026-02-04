@@ -319,7 +319,11 @@ impl StreamingRecognizeResponse {
 
     /// Get the best transcript from the first result
     pub fn best_transcript(&self) -> Option<&str> {
-        self.results.first()?.alternatives.first().map(|a| a.transcript.as_str())
+        self.results
+            .first()?
+            .alternatives
+            .first()
+            .map(|a| a.transcript.as_str())
     }
 
     /// Check if any result is final

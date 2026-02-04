@@ -17,14 +17,15 @@
 //! - Channels: Mono
 //! - Encoding: Linear16 (PCM 16-bit)
 
-use super::config::{FptSttConfig, FptSttResponse, FPT_STT_ENDPOINT};
+use super::config::{FPT_STT_ENDPOINT, FptSttConfig, FptSttResponse};
 use crate::core::stt::base::{
-    BaseSTT, STTConfig, STTConnectionState, STTError, STTErrorCallback, STTResult, STTResultCallback,
+    BaseSTT, STTConfig, STTConnectionState, STTError, STTErrorCallback, STTResult,
+    STTResultCallback,
 };
 use bytes::Bytes;
 use reqwest::Client;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -70,10 +71,7 @@ impl FptStt {
             return Ok(String::new());
         }
 
-        debug!(
-            "FPT STT: Processing {} bytes of audio",
-            audio_data.len()
-        );
+        debug!("FPT STT: Processing {} bytes of audio", audio_data.len());
 
         // Build WAV header for raw PCM data
         let wav_data = self.wrap_in_wav(&audio_data);
@@ -104,9 +102,7 @@ impl FptStt {
                     "Invalid API key: {body}"
                 ))),
                 429 => Err(STTError::ProviderError(format!("Rate limited: {body}"))),
-                400 => Err(STTError::ConfigurationError(format!(
-                    "Bad request: {body}"
-                ))),
+                400 => Err(STTError::ConfigurationError(format!("Bad request: {body}"))),
                 _ => Err(STTError::ProviderError(format!(
                     "API error (status {}): {}",
                     status.as_u16(),
@@ -204,9 +200,9 @@ impl FptStt {
             if let Some(callback) = callback_guard.as_ref() {
                 let result = STTResult::new(
                     transcription.clone(),
-                    true,  // is_final
-                    true,  // is_speech_final
-                    0.9,   // confidence (FPT doesn't provide this)
+                    true, // is_final
+                    true, // is_speech_final
+                    0.9,  // confidence (FPT doesn't provide this)
                 );
                 callback(result).await;
             }

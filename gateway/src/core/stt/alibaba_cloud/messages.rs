@@ -608,7 +608,10 @@ impl ParaformerResponse {
         if self.is_task_failed() {
             Some((
                 self.header.error_code.as_deref().unwrap_or("unknown"),
-                self.header.error_message.as_deref().unwrap_or("Unknown error"),
+                self.header
+                    .error_message
+                    .as_deref()
+                    .unwrap_or("Unknown error"),
             ))
         } else {
             None
@@ -777,14 +780,7 @@ mod tests {
     // Paraformer format tests
     #[test]
     fn test_paraformer_run_task() {
-        let msg = ParaformerRunTask::new(
-            "paraformer-realtime-v2",
-            "pcm",
-            16000,
-            "zh",
-            true,
-            true,
-        );
+        let msg = ParaformerRunTask::new("paraformer-realtime-v2", "pcm", 16000, "zh", true, true);
         let json = msg.to_json().unwrap();
 
         assert!(json.contains("run-task"));
@@ -920,15 +916,33 @@ mod tests {
     // Error code tests
     #[test]
     fn test_error_code_parsing() {
-        assert_eq!(DashScopeErrorCode::from_str("200"), DashScopeErrorCode::Success);
-        assert_eq!(DashScopeErrorCode::from_str("401"), DashScopeErrorCode::Unauthorized);
-        assert_eq!(DashScopeErrorCode::from_str("429"), DashScopeErrorCode::RateLimitExceeded);
-        assert_eq!(DashScopeErrorCode::from_str("unknown"), DashScopeErrorCode::Unknown);
+        assert_eq!(
+            DashScopeErrorCode::from_str("200"),
+            DashScopeErrorCode::Success
+        );
+        assert_eq!(
+            DashScopeErrorCode::from_str("401"),
+            DashScopeErrorCode::Unauthorized
+        );
+        assert_eq!(
+            DashScopeErrorCode::from_str("429"),
+            DashScopeErrorCode::RateLimitExceeded
+        );
+        assert_eq!(
+            DashScopeErrorCode::from_str("unknown"),
+            DashScopeErrorCode::Unknown
+        );
     }
 
     #[test]
     fn test_error_code_description() {
-        assert_eq!(DashScopeErrorCode::Unauthorized.description(), "Unauthorized - invalid API key");
-        assert_eq!(DashScopeErrorCode::RateLimitExceeded.description(), "Rate limit exceeded");
+        assert_eq!(
+            DashScopeErrorCode::Unauthorized.description(),
+            "Unauthorized - invalid API key"
+        );
+        assert_eq!(
+            DashScopeErrorCode::RateLimitExceeded.description(),
+            "Rate limit exceeded"
+        );
     }
 }

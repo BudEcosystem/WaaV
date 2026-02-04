@@ -2,7 +2,7 @@
 //!
 //! Message structures for both REST API and WebSocket protocol.
 
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -188,9 +188,11 @@ impl BaiduRealtimeResponse {
     /// Get the error message.
     pub fn get_error(&self) -> Option<String> {
         if self.is_error() {
-            Some(self.err_msg.clone().unwrap_or_else(|| {
-                format!("Error code: {}", self.err_no)
-            }))
+            Some(
+                self.err_msg
+                    .clone()
+                    .unwrap_or_else(|| format!("Error code: {}", self.err_no)),
+            )
         } else {
             None
         }
@@ -300,7 +302,9 @@ impl BaiduShortAsrResponse {
 
     /// Get the first recognition result.
     pub fn get_transcript(&self) -> Option<&str> {
-        self.result.as_ref().and_then(|r| r.first().map(|s| s.as_str()))
+        self.result
+            .as_ref()
+            .and_then(|r| r.first().map(|s| s.as_str()))
     }
 
     /// Get all recognition results.
@@ -432,14 +436,7 @@ mod tests {
 
     #[test]
     fn test_start_frame_serialization() {
-        let frame = BaiduStartFrame::new(
-            "app123",
-            "key456",
-            1537,
-            "user789",
-            16000,
-            "pcm",
-        );
+        let frame = BaiduStartFrame::new("app123", "key456", 1537, "user789", 16000, "pcm");
 
         let json = frame.to_json().unwrap();
         assert!(json.contains("\"type\":\"START\""));
@@ -515,14 +512,8 @@ mod tests {
     #[test]
     fn test_short_asr_request() {
         let audio_data = vec![0u8; 100];
-        let request = BaiduShortAsrRequest::new(
-            "pcm",
-            16000,
-            "user123",
-            "token456",
-            1537,
-            &audio_data,
-        );
+        let request =
+            BaiduShortAsrRequest::new("pcm", 16000, "user123", "token456", 1537, &audio_data);
 
         assert_eq!(request.format, "pcm");
         assert_eq!(request.rate, 16000);
@@ -549,8 +540,14 @@ mod tests {
     #[test]
     fn test_error_code_parsing() {
         assert_eq!(BaiduErrorCode::from_code(0), BaiduErrorCode::Success);
-        assert_eq!(BaiduErrorCode::from_code(3301), BaiduErrorCode::AuthenticationError);
-        assert_eq!(BaiduErrorCode::from_code(3302), BaiduErrorCode::TokenInvalid);
+        assert_eq!(
+            BaiduErrorCode::from_code(3301),
+            BaiduErrorCode::AuthenticationError
+        );
+        assert_eq!(
+            BaiduErrorCode::from_code(3302),
+            BaiduErrorCode::TokenInvalid
+        );
         assert_eq!(BaiduErrorCode::from_code(9999), BaiduErrorCode::Unknown);
     }
 

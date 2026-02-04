@@ -13,7 +13,7 @@ use crate::plugin::global_registry;
 use crate::state::AppState;
 
 use super::{
-    audio_handler::{handle_clear_message, handle_speak_message},
+    audio_handler::{handle_audio_end, handle_clear_message, handle_speak_message},
     command_handler::{handle_send_message, handle_sip_transfer},
     config_handler::handle_config_message,
     messages::{IncomingMessage, MessageRoute, OutgoingMessage},
@@ -134,6 +134,7 @@ pub async fn handle_incoming_message(
             message_type,
             payload,
         } => handle_custom_message(message_type, payload, state, message_tx, app_state).await,
+        IncomingMessage::AudioEnd => handle_audio_end(state, message_tx).await,
     }
 }
 

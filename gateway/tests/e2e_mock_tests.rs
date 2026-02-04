@@ -7,14 +7,19 @@
 use std::net::TcpListener;
 use std::time::Duration;
 
-use axum::{body::Body, http::Request, Router};
-use serde_json::{json, Value};
+use axum::{Router, body::Body, http::Request};
+use serde_json::{Value, json};
 use tokio::time::timeout;
 use tower::util::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use waav_gateway::{config::{DAGTimeoutsConfig, PluginConfig}, routes, state::AppState, ServerConfig};
+use waav_gateway::{
+    ServerConfig,
+    config::{DAGTimeoutsConfig, PluginConfig},
+    routes,
+    state::AppState,
+};
 
 /// Helper function to create a minimal test configuration
 fn create_test_config(port: u16) -> ServerConfig {
@@ -67,6 +72,9 @@ fn create_test_config(port: u16) -> ServerConfig {
         rate_limit_burst_size: 100,
         max_websocket_connections: None,
         max_connections_per_ip: 1000,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     }

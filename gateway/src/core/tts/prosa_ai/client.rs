@@ -14,17 +14,17 @@
 //! Output is available in opus (default), mp3, or wav format at 48kHz.
 
 use super::config::{
+    DEFAULT_SAMPLE_RATE, MAX_PITCH, MAX_TEMPO, MIN_PITCH, MIN_TEMPO, PROSA_TTS_BASE_URL,
     ProsaTtsAudioFormat, ProsaTtsConfig, ProsaTtsRequest, ProsaTtsRequestConfig,
-    ProsaTtsRequestData, ProsaTtsResponse, ProsaTtsVoice, DEFAULT_SAMPLE_RATE, MAX_PITCH,
-    MAX_TEMPO, MIN_PITCH, MIN_TEMPO, PROSA_TTS_BASE_URL,
+    ProsaTtsRequestData, ProsaTtsResponse, ProsaTtsVoice,
 };
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use reqwest::Client;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
@@ -101,7 +101,11 @@ impl ProsaTts {
         debug!("Prosa TTS: Received response (status: {})", status.as_u16());
 
         if !status.is_success() {
-            error!("Prosa TTS: API error (status {}): {}", status.as_u16(), body);
+            error!(
+                "Prosa TTS: API error (status {}): {}",
+                status.as_u16(),
+                body
+            );
             return Err(self.parse_error_response(status.as_u16(), &body));
         }
 
@@ -151,7 +155,11 @@ impl ProsaTts {
         let poll_interval = std::time::Duration::from_secs(1);
 
         for attempt in 0..max_attempts {
-            debug!("Prosa TTS: Polling job {} (attempt {})", job_id, attempt + 1);
+            debug!(
+                "Prosa TTS: Polling job {} (attempt {})",
+                job_id,
+                attempt + 1
+            );
 
             let response = self
                 .http_client
@@ -177,9 +185,9 @@ impl ProsaTts {
             if prosa_response.is_complete() {
                 // Get audio data
                 if let Some(data) = prosa_response.audio_data() {
-                    return BASE64
-                        .decode(data)
-                        .map_err(|e| TTSError::ProviderError(format!("Failed to decode audio: {e}")));
+                    return BASE64.decode(data).map_err(|e| {
+                        TTSError::ProviderError(format!("Failed to decode audio: {e}"))
+                    });
                 } else if let Some(url) = prosa_response.audio_url() {
                     return self.download_audio(url).await;
                 }

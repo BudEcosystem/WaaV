@@ -38,11 +38,11 @@ use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
 
+use super::config::{IFLYTEK_TTS_HOST, IFLYTEK_TTS_PATH, IFlytekTtsConfig};
+use super::messages::{TtsRequest, TtsResponse};
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
 };
-use super::config::{IFlytekTtsConfig, IFLYTEK_TTS_HOST, IFLYTEK_TTS_PATH};
-use super::messages::{TtsRequest, TtsResponse};
 
 // =============================================================================
 // Constants
@@ -149,8 +149,9 @@ impl IFlytekTts {
             Message::Text(text) => {
                 debug!("iFlytek TTS received: {}", text);
 
-                let response = TtsResponse::from_json(&text)
-                    .map_err(|e| TTSError::ProviderError(format!("Failed to parse response: {}", e)))?;
+                let response = TtsResponse::from_json(&text).map_err(|e| {
+                    TTSError::ProviderError(format!("Failed to parse response: {}", e))
+                })?;
 
                 // Check for errors
                 if !response.is_success() {
@@ -176,7 +177,9 @@ impl IFlytekTts {
                                 if let Err(e) = audio_tx.try_send(audio_data) {
                                     match e {
                                         mpsc::error::TrySendError::Full(_) => {
-                                            warn!("iFlytek TTS audio channel full - dropping chunk");
+                                            warn!(
+                                                "iFlytek TTS audio channel full - dropping chunk"
+                                            );
                                         }
                                         mpsc::error::TrySendError::Closed(_) => {
                                             warn!("iFlytek TTS audio channel closed");
@@ -213,9 +216,13 @@ impl IFlytekTts {
     /// Start the WebSocket connection task.
     async fn start_connection(&mut self) -> TTSResult<()> {
         // Build signed WebSocket URL
-        let ws_url = self.config.auth
+        let ws_url = self
+            .config
+            .auth
             .build_signed_url(IFLYTEK_TTS_HOST, IFLYTEK_TTS_PATH)
-            .map_err(|e| TTSError::ConnectionFailed(format!("Failed to build signed URL: {}", e)))?;
+            .map_err(|e| {
+                TTSError::ConnectionFailed(format!("Failed to build signed URL: {}", e))
+            })?;
 
         debug!("Connecting to iFlytek TTS: {}", ws_url);
 
@@ -381,12 +388,10 @@ impl IFlytekTts {
                 info!("iFlytek TTS connected successfully");
                 Ok(())
             }
-            Ok(Err(_)) => {
-                Err(TTSError::ConnectionFailed("Connection channel closed".to_string()))
-            }
-            Err(_) => {
-                Err(TTSError::ConnectionFailed("Connection timeout".to_string()))
-            }
+            Ok(Err(_)) => Err(TTSError::ConnectionFailed(
+                "Connection channel closed".to_string(),
+            )),
+            Err(_) => Err(TTSError::ConnectionFailed("Connection timeout".to_string())),
         }
     }
 }
@@ -508,17 +513,19 @@ impl BaseTTS for IFlytekTts {
     }
 
     fn on_audio(&mut self, callback: Arc<dyn AudioCallback>) -> TTSResult<()> {
-        let mut guard = self.audio_callback.try_lock().map_err(|_| {
-            TTSError::InternalError("Failed to acquire callback lock".to_string())
-        })?;
+        let mut guard = self
+            .audio_callback
+            .try_lock()
+            .map_err(|_| TTSError::InternalError("Failed to acquire callback lock".to_string()))?;
         *guard = Some(callback);
         Ok(())
     }
 
     fn remove_audio_callback(&mut self) -> TTSResult<()> {
-        let mut guard = self.audio_callback.try_lock().map_err(|_| {
-            TTSError::InternalError("Failed to acquire callback lock".to_string())
-        })?;
+        let mut guard = self
+            .audio_callback
+            .try_lock()
+            .map_err(|_| TTSError::InternalError("Failed to acquire callback lock".to_string()))?;
         *guard = None;
         Ok(())
     }
@@ -684,12 +691,7 @@ mod tests {
         let (audio_tx, mut audio_rx) = mpsc::channel(128);
 
         let message = Message::Text(json.to_string().into());
-        let result = IFlytekTts::handle_websocket_message(
-            message,
-            &audio_tx,
-            16000,
-            "audio/pcm",
-        );
+        let result = IFlytekTts::handle_websocket_message(message, &audio_tx, 16000, "audio/pcm");
         assert!(result.is_ok());
         assert!(!result.unwrap()); // Not final
 
@@ -717,12 +719,7 @@ mod tests {
         let (audio_tx, _) = mpsc::channel(128);
 
         let message = Message::Text(json.to_string().into());
-        let result = IFlytekTts::handle_websocket_message(
-            message,
-            &audio_tx,
-            16000,
-            "audio/pcm",
-        );
+        let result = IFlytekTts::handle_websocket_message(message, &audio_tx, 16000, "audio/pcm");
         assert!(result.is_ok());
         assert!(result.unwrap()); // Final
     }
@@ -738,12 +735,7 @@ mod tests {
         let (audio_tx, _) = mpsc::channel(128);
 
         let message = Message::Text(json.to_string().into());
-        let result = IFlytekTts::handle_websocket_message(
-            message,
-            &audio_tx,
-            16000,
-            "audio/pcm",
-        );
+        let result = IFlytekTts::handle_websocket_message(message, &audio_tx, 16000, "audio/pcm");
         assert!(result.is_err());
     }
 
@@ -752,12 +744,7 @@ mod tests {
         let (audio_tx, _) = mpsc::channel(128);
 
         let message = Message::Close(None);
-        let result = IFlytekTts::handle_websocket_message(
-            message,
-            &audio_tx,
-            16000,
-            "audio/pcm",
-        );
+        let result = IFlytekTts::handle_websocket_message(message, &audio_tx, 16000, "audio/pcm");
         assert!(result.is_ok());
         assert!(result.unwrap()); // Close is final
     }
@@ -767,12 +754,7 @@ mod tests {
         let (audio_tx, _) = mpsc::channel(128);
 
         let message = Message::Ping(vec![].into());
-        let result = IFlytekTts::handle_websocket_message(
-            message,
-            &audio_tx,
-            16000,
-            "audio/pcm",
-        );
+        let result = IFlytekTts::handle_websocket_message(message, &audio_tx, 16000, "audio/pcm");
         assert!(result.is_ok());
         assert!(!result.unwrap()); // Ping is not final
     }
@@ -782,12 +764,7 @@ mod tests {
         let (audio_tx, _) = mpsc::channel(128);
 
         let message = Message::Pong(vec![].into());
-        let result = IFlytekTts::handle_websocket_message(
-            message,
-            &audio_tx,
-            16000,
-            "audio/pcm",
-        );
+        let result = IFlytekTts::handle_websocket_message(message, &audio_tx, 16000, "audio/pcm");
         assert!(result.is_ok());
         assert!(!result.unwrap()); // Pong is not final
     }
@@ -795,8 +772,8 @@ mod tests {
     // Callback tests
     #[test]
     fn test_on_audio_callback() {
-        use std::pin::Pin;
         use std::future::Future;
+        use std::pin::Pin;
         use std::sync::atomic::AtomicUsize;
 
         let config = create_test_config();
@@ -807,7 +784,10 @@ mod tests {
         }
 
         impl AudioCallback for TestCallback {
-            fn on_audio(&self, _audio_data: AudioData) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            fn on_audio(
+                &self,
+                _audio_data: AudioData,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
                 self.count.fetch_add(1, Ordering::Relaxed);
                 Box::pin(async {})
             }

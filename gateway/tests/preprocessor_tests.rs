@@ -187,10 +187,8 @@ fn test_speech_pattern_generation() {
     assert_eq!(speech.len(), audio_fixtures::SECOND);
 
     // Should have varying amplitude (not constant)
-    let first_quarter_rms =
-        audio_fixtures::calculate_rms(&speech[..audio_fixtures::SECOND / 4]);
-    let last_quarter_rms =
-        audio_fixtures::calculate_rms(&speech[3 * audio_fixtures::SECOND / 4..]);
+    let first_quarter_rms = audio_fixtures::calculate_rms(&speech[..audio_fixtures::SECOND / 4]);
+    let last_quarter_rms = audio_fixtures::calculate_rms(&speech[3 * audio_fixtures::SECOND / 4..]);
 
     // Both should have some energy
     assert!(
@@ -258,7 +256,10 @@ fn test_deterministic_generation() {
 
     let speech1 = audio_fixtures::generate_speech_pattern(1000);
     let speech2 = audio_fixtures::generate_speech_pattern(1000);
-    assert_eq!(speech1, speech2, "Speech generation should be deterministic");
+    assert_eq!(
+        speech1, speech2,
+        "Speech generation should be deterministic"
+    );
 }
 
 // =============================================================================
@@ -530,7 +531,10 @@ fn test_full_audio_pipeline_simulation() {
     println!("  Original samples: {}", noisy_speech.len());
     println!("  Bytes transmitted: {}", audio_bytes.len());
     println!("  Received samples: {}", received_samples.len());
-    println!("  RMS preserved: {:.2} -> {:.2}", original_rms, received_rms);
+    println!(
+        "  RMS preserved: {:.2} -> {:.2}",
+        original_rms, received_rms
+    );
 }
 
 #[test]

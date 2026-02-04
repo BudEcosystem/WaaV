@@ -28,13 +28,13 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use super::super::base::{
-    BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
-    SpeakerInfo, WordTiming,
+    BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback, SpeakerInfo,
+    WordTiming,
 };
 use super::config::{FlushStrategy, OpenAISTTConfig, ResponseFormat};
 use super::messages::{
-    DiarizedTranscriptionResponse, OpenAIErrorResponse, TranscriptionResponse,
-    TranscriptionResult, VerboseTranscriptionResponse, wav,
+    DiarizedTranscriptionResponse, OpenAIErrorResponse, TranscriptionResponse, TranscriptionResult,
+    VerboseTranscriptionResponse, wav,
 };
 
 // =============================================================================
@@ -490,8 +490,8 @@ impl OpenAISTT {
             ResponseFormat::DiarizedJson => {
                 let response: DiarizedTranscriptionResponse = serde_json::from_str(response_text)
                     .map_err(|e| {
-                        STTError::ProviderError(format!("Failed to parse diarized response: {e}"))
-                    })?;
+                    STTError::ProviderError(format!("Failed to parse diarized response: {e}"))
+                })?;
                 Ok(TranscriptionResult::Diarized(response))
             }
             ResponseFormat::Text | ResponseFormat::Srt | ResponseFormat::Vtt => {
@@ -507,8 +507,8 @@ impl OpenAISTT {
     fn create_enriched_result(transcription_result: &TranscriptionResult) -> STTResult {
         let mut result = STTResult::new(
             transcription_result.text().to_string(),
-            true,  // Final result (Whisper doesn't do interim)
-            true,  // Speech final
+            true, // Final result (Whisper doesn't do interim)
+            true, // Speech final
             transcription_result.confidence(),
         );
 

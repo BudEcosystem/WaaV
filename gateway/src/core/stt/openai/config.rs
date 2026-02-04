@@ -797,8 +797,7 @@ mod tests {
 
     #[test]
     fn test_diarization_config_with_speakers() {
-        let config =
-            DiarizationConfig::with_speakers(vec!["Alice".to_string(), "Bob".to_string()]);
+        let config = DiarizationConfig::with_speakers(vec!["Alice".to_string(), "Bob".to_string()]);
         assert_eq!(config.known_speaker_names.len(), 2);
         assert_eq!(config.known_speaker_names[0], "Alice");
         assert_eq!(config.known_speaker_names[1], "Bob");

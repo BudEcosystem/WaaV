@@ -48,8 +48,33 @@ impl TurnDetectorConfig {
             // Use the cache_path from config and add turn_detect subdirectory
             cache_path.join("turn_detect")
         } else {
-            anyhow::bail!("No cache directory specified");
+            // Auto-generate default cache directory
+            // Use dirs crate if available (smart-turn or silero-vad features)
+            #[cfg(any(feature = "smart-turn", feature = "silero-vad"))]
+            let base_cache = dirs::cache_dir();
+
+            #[cfg(not(any(feature = "smart-turn", feature = "silero-vad")))]
+            let base_cache: Option<PathBuf> = {
+                // Fallback: try XDG_CACHE_HOME, then ~/.cache, then /tmp
+                std::env::var("XDG_CACHE_HOME")
+                    .ok()
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        std::env::var("HOME")
+                            .ok()
+                            .map(|h| PathBuf::from(h).join(".cache"))
+                    })
+            };
+
+            base_cache
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join("waav-gateway")
+                .join("turn_detect")
         };
+
+        // Ensure the directory exists
+        std::fs::create_dir_all(&cache_dir)?;
+
         Ok(cache_dir)
     }
 }

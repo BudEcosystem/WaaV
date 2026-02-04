@@ -96,10 +96,7 @@ impl IFlytekErrorCode {
 
     /// Check if this is a retryable error.
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::ReadTimeout | Self::RequestExpired
-        )
+        matches!(self, Self::ReadTimeout | Self::RequestExpired)
     }
 
     /// Get a human-readable description.
@@ -307,12 +304,7 @@ impl SttRequest {
     }
 
     /// Create a last frame request.
-    pub fn last_frame(
-        app_id: &str,
-        audio_format: &str,
-        encoding: &str,
-        audio_data: &[u8],
-    ) -> Self {
+    pub fn last_frame(app_id: &str, audio_format: &str, encoding: &str, audio_data: &[u8]) -> Self {
         Self {
             common: SttRequestCommon {
                 app_id: app_id.to_string(),
@@ -463,10 +455,7 @@ impl SttResponse {
 
     /// Check if this is the final response.
     pub fn is_final(&self) -> bool {
-        self.data
-            .as_ref()
-            .map(|d| d.status == 2)
-            .unwrap_or(false)
+        self.data.as_ref().map(|d| d.status == 2).unwrap_or(false)
     }
 
     /// Get the transcript from the response.
@@ -547,7 +536,11 @@ mod tests {
     #[test]
     fn test_error_code_description() {
         assert!(IFlytekErrorCode::Success.description().contains("Success"));
-        assert!(IFlytekErrorCode::AuthorizationFailure.description().contains("authorization"));
+        assert!(
+            IFlytekErrorCode::AuthorizationFailure
+                .description()
+                .contains("authorization")
+        );
     }
 
     #[test]
@@ -600,24 +593,16 @@ mod tests {
 
     #[test]
     fn test_continue_frame_request() {
-        let request = SttRequest::continue_frame(
-            "test_app_id",
-            "audio/L16;rate=16000",
-            "raw",
-            &[0u8; 100],
-        );
+        let request =
+            SttRequest::continue_frame("test_app_id", "audio/L16;rate=16000", "raw", &[0u8; 100]);
 
         assert_eq!(request.data.status, 1);
     }
 
     #[test]
     fn test_last_frame_request() {
-        let request = SttRequest::last_frame(
-            "test_app_id",
-            "audio/L16;rate=16000",
-            "raw",
-            &[0u8; 100],
-        );
+        let request =
+            SttRequest::last_frame("test_app_id", "audio/L16;rate=16000", "raw", &[0u8; 100]);
 
         assert_eq!(request.data.status, 2);
     }
@@ -712,7 +697,10 @@ mod tests {
 
         let response = SttResponse::from_json(json).unwrap();
         assert!(!response.is_success());
-        assert_eq!(response.error_code(), IFlytekErrorCode::AuthorizationFailure);
+        assert_eq!(
+            response.error_code(),
+            IFlytekErrorCode::AuthorizationFailure
+        );
     }
 
     #[test]
@@ -743,15 +731,24 @@ mod tests {
             ws: vec![
                 SttWordSegment {
                     bg: 0,
-                    cw: vec![SttWord { w: "Hello".to_string(), sc: Some(0.9) }],
+                    cw: vec![SttWord {
+                        w: "Hello".to_string(),
+                        sc: Some(0.9),
+                    }],
                 },
                 SttWordSegment {
                     bg: 1,
-                    cw: vec![SttWord { w: " ".to_string(), sc: None }],
+                    cw: vec![SttWord {
+                        w: " ".to_string(),
+                        sc: None,
+                    }],
                 },
                 SttWordSegment {
                     bg: 2,
-                    cw: vec![SttWord { w: "World".to_string(), sc: Some(0.95) }],
+                    cw: vec![SttWord {
+                        w: "World".to_string(),
+                        sc: Some(0.95),
+                    }],
                 },
             ],
             sn: 1,
@@ -769,11 +766,17 @@ mod tests {
             ws: vec![
                 SttWordSegment {
                     bg: 0,
-                    cw: vec![SttWord { w: "A".to_string(), sc: Some(0.8) }],
+                    cw: vec![SttWord {
+                        w: "A".to_string(),
+                        sc: Some(0.8),
+                    }],
                 },
                 SttWordSegment {
                     bg: 1,
-                    cw: vec![SttWord { w: "B".to_string(), sc: Some(1.0) }],
+                    cw: vec![SttWord {
+                        w: "B".to_string(),
+                        sc: Some(1.0),
+                    }],
                 },
             ],
             sn: 1,
@@ -790,7 +793,10 @@ mod tests {
         let result = SttResultData {
             ws: vec![SttWordSegment {
                 bg: 0,
-                cw: vec![SttWord { w: "Test".to_string(), sc: None }],
+                cw: vec![SttWord {
+                    w: "Test".to_string(),
+                    sc: None,
+                }],
             }],
             sn: 1,
             ls: false,

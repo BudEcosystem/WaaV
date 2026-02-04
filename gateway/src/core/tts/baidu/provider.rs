@@ -29,14 +29,14 @@
 
 use async_trait::async_trait;
 use reqwest::Client;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use super::config::{
-    BaiduOAuthError, BaiduOAuthResponse, BaiduTtsConfig, BaiduTtsErrorResponse, BAIDU_OAUTH_URL,
+    BAIDU_OAUTH_URL, BaiduOAuthError, BaiduOAuthResponse, BaiduTtsConfig, BaiduTtsErrorResponse,
     MAX_TEXT_LENGTH_GBK,
 };
 use crate::core::tts::base::{
@@ -146,8 +146,9 @@ impl TokenManager {
             )));
         }
 
-        let oauth_response: BaiduOAuthResponse = serde_json::from_str(&body)
-            .map_err(|e| TTSError::InternalError(format!("Failed to parse OAuth response: {}", e)))?;
+        let oauth_response: BaiduOAuthResponse = serde_json::from_str(&body).map_err(|e| {
+            TTSError::InternalError(format!("Failed to parse OAuth response: {}", e))
+        })?;
 
         // Calculate expiration time
         let expires_at = Instant::now() + Duration::from_secs(oauth_response.expires_in);
@@ -271,10 +272,7 @@ impl BaiduTts {
     /// Check if text exceeds maximum length in GBK bytes.
     fn check_text_length(text: &str) -> bool {
         // Approximate GBK length: Chinese chars ~2 bytes, ASCII ~1 byte
-        let approx_gbk_len: usize = text
-            .chars()
-            .map(|c| if c.is_ascii() { 1 } else { 2 })
-            .sum();
+        let approx_gbk_len: usize = text.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
         approx_gbk_len <= MAX_TEXT_LENGTH_GBK
     }
 
@@ -350,13 +348,13 @@ impl BaiduTts {
 
         // Check if response is JSON (error) or audio
         if content_type.contains("application/json") {
-            let body = response
-                .text()
-                .await
-                .map_err(|e| TTSError::NetworkError(format!("Failed to read error response: {}", e)))?;
+            let body = response.text().await.map_err(|e| {
+                TTSError::NetworkError(format!("Failed to read error response: {}", e))
+            })?;
 
-            let error: BaiduTtsErrorResponse = serde_json::from_str(&body)
-                .map_err(|e| TTSError::InternalError(format!("Failed to parse error response: {}", e)))?;
+            let error: BaiduTtsErrorResponse = serde_json::from_str(&body).map_err(|e| {
+                TTSError::InternalError(format!("Failed to parse error response: {}", e))
+            })?;
 
             // Handle specific error codes
             return match error.err_no {

@@ -12,15 +12,13 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+use super::config::{BHASHINI_CONFIG_URL, BhashiniTtsConfig};
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
 };
-use super::config::{BhashiniTtsConfig, BHASHINI_CONFIG_URL};
 
 // Re-use message types from STT module since Bhashini uses same pipeline architecture
-use crate::core::stt::bhashini::{
-    PipelineConfigRequest, PipelineConfigResponse,
-};
+use crate::core::stt::bhashini::{PipelineConfigRequest, PipelineConfigResponse};
 
 /// Provider information.
 const PROVIDER_INFO: &str = "Bhashini ULCA TTS v1.0 (MeitY Government of India)";
@@ -199,7 +197,9 @@ impl BhashiniTts {
             .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
             .user_agent(USER_AGENT)
             .build()
-            .map_err(|e| TTSError::ConnectionFailed(format!("Failed to create HTTP client: {}", e)))?;
+            .map_err(|e| {
+                TTSError::ConnectionFailed(format!("Failed to create HTTP client: {}", e))
+            })?;
 
         Ok(Self {
             base_config: config,
@@ -232,7 +232,9 @@ impl BhashiniTts {
             .json(&request)
             .send()
             .await
-            .map_err(|e| TTSError::NetworkError(format!("Pipeline config request failed: {}", e)))?;
+            .map_err(|e| {
+                TTSError::NetworkError(format!("Pipeline config request failed: {}", e))
+            })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -304,9 +306,9 @@ impl BhashiniTts {
     async fn synthesize(&self, text: &str) -> TTSResult<Vec<u8>> {
         let pipeline_config = {
             let guard = self.pipeline_config.lock().await;
-            guard.clone().ok_or_else(|| {
-                TTSError::ProviderNotReady("Pipeline not configured".to_string())
-            })?
+            guard
+                .clone()
+                .ok_or_else(|| TTSError::ProviderNotReady("Pipeline not configured".to_string()))?
         };
 
         debug!("Synthesizing text with Bhashini TTS: {} chars", text.len());
@@ -340,7 +342,10 @@ impl BhashiniTts {
                 warn!("Retrying Bhashini TTS request (attempt {})", attempt + 1);
             }
 
-            match self.execute_compute_request(&pipeline_config, &request).await {
+            match self
+                .execute_compute_request(&pipeline_config, &request)
+                .await
+            {
                 Ok(audio_data) => {
                     info!(
                         "Bhashini TTS synthesis complete: {} bytes, language: {}",
@@ -355,9 +360,8 @@ impl BhashiniTts {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            TTSError::ProviderError("Max retries exceeded".to_string())
-        }))
+        Err(last_error
+            .unwrap_or_else(|| TTSError::ProviderError("Max retries exceeded".to_string())))
     }
 
     /// Execute a single compute request.
@@ -369,7 +373,10 @@ impl BhashiniTts {
         let response = self
             .client
             .post(&pipeline_config.callback_url)
-            .header(&pipeline_config.auth_header_name, &pipeline_config.auth_header_value)
+            .header(
+                &pipeline_config.auth_header_name,
+                &pipeline_config.auth_header_value,
+            )
             .header("Content-Type", "application/json")
             .json(request)
             .send()
@@ -517,17 +524,19 @@ impl BaseTTS for BhashiniTts {
     }
 
     fn on_audio(&mut self, callback: Arc<dyn AudioCallback>) -> TTSResult<()> {
-        let mut guard = self.audio_callback.try_lock().map_err(|_| {
-            TTSError::InternalError("Failed to acquire callback lock".to_string())
-        })?;
+        let mut guard = self
+            .audio_callback
+            .try_lock()
+            .map_err(|_| TTSError::InternalError("Failed to acquire callback lock".to_string()))?;
         *guard = Some(callback);
         Ok(())
     }
 
     fn remove_audio_callback(&mut self) -> TTSResult<()> {
-        let mut guard = self.audio_callback.try_lock().map_err(|_| {
-            TTSError::InternalError("Failed to acquire callback lock".to_string())
-        })?;
+        let mut guard = self
+            .audio_callback
+            .try_lock()
+            .map_err(|_| TTSError::InternalError("Failed to acquire callback lock".to_string()))?;
         *guard = None;
         Ok(())
     }

@@ -24,7 +24,9 @@ use tonic::{Request, Status, Streaming};
 use tracing::{debug, info, warn};
 
 use super::config::TinkoffSttConfig;
-use super::messages::{StreamingRecognizeRequest, StreamingRecognizeResponse, StreamingRecognitionConfig};
+use super::messages::{
+    StreamingRecognitionConfig, StreamingRecognizeRequest, StreamingRecognizeResponse,
+};
 use super::{GRPC_SERVICE_PATH, TINKOFF_GRPC_ENDPOINT};
 use crate::core::stt::base::STTError;
 
@@ -109,7 +111,8 @@ impl TinkoffGrpcClient {
     > {
         // Create channels for communication
         let (audio_tx, audio_rx) = mpsc::channel::<Bytes>(100);
-        let (result_tx, result_rx) = mpsc::channel::<Result<StreamingRecognizeResponse, STTError>>(100);
+        let (result_tx, result_rx) =
+            mpsc::channel::<Result<StreamingRecognizeResponse, STTError>>(100);
 
         // Create the request stream
         let request_stream = AudioChunkStream::new(audio_rx, streaming_config);
@@ -159,9 +162,9 @@ where
     let mut grpc = tonic::client::Grpc::new(channel);
 
     // Ensure we're ready
-    grpc.ready().await.map_err(|e| {
-        Status::unavailable(format!("Service not ready: {}", e))
-    })?;
+    grpc.ready()
+        .await
+        .map_err(|e| Status::unavailable(format!("Service not ready: {}", e)))?;
 
     // Create the codec
     let codec = TinkoffCodec::default();
@@ -170,9 +173,7 @@ where
     let path = PathAndQuery::from_static(GRPC_SERVICE_PATH);
 
     // Make the bidirectional streaming call
-    let response = grpc
-        .streaming(request, path, codec)
-        .await?;
+    let response = grpc.streaming(request, path, codec).await?;
 
     Ok(response.into_inner())
 }
@@ -394,7 +395,10 @@ impl TinkoffGrpcError {
 
     /// Check if this is a retriable error
     pub fn is_retriable(&self) -> bool {
-        matches!(self, Self::Unavailable | Self::Internal | Self::ResourceExhausted)
+        matches!(
+            self,
+            Self::Unavailable | Self::Internal | Self::ResourceExhausted
+        )
     }
 }
 
@@ -412,11 +416,23 @@ mod tests {
     fn test_tinkoff_grpc_error_from_code() {
         assert_eq!(TinkoffGrpcError::from_code(0), TinkoffGrpcError::Ok);
         assert_eq!(TinkoffGrpcError::from_code(1), TinkoffGrpcError::Cancelled);
-        assert_eq!(TinkoffGrpcError::from_code(7), TinkoffGrpcError::PermissionDenied);
+        assert_eq!(
+            TinkoffGrpcError::from_code(7),
+            TinkoffGrpcError::PermissionDenied
+        );
         assert_eq!(TinkoffGrpcError::from_code(13), TinkoffGrpcError::Internal);
-        assert_eq!(TinkoffGrpcError::from_code(14), TinkoffGrpcError::Unavailable);
-        assert_eq!(TinkoffGrpcError::from_code(16), TinkoffGrpcError::Unauthenticated);
-        assert_eq!(TinkoffGrpcError::from_code(99), TinkoffGrpcError::Unknown(99));
+        assert_eq!(
+            TinkoffGrpcError::from_code(14),
+            TinkoffGrpcError::Unavailable
+        );
+        assert_eq!(
+            TinkoffGrpcError::from_code(16),
+            TinkoffGrpcError::Unauthenticated
+        );
+        assert_eq!(
+            TinkoffGrpcError::from_code(99),
+            TinkoffGrpcError::Unknown(99)
+        );
     }
 
     #[test]

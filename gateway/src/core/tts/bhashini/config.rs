@@ -6,7 +6,7 @@ use crate::core::tts::base::{TTSConfig, TTSError};
 
 // Re-use language and pipeline types from STT module
 pub use crate::core::stt::bhashini::{
-    BhashiniLanguage, BhashiniPipelineProvider, LanguageFamily, BHASHINI_CONFIG_URL,
+    BHASHINI_CONFIG_URL, BhashiniLanguage, BhashiniPipelineProvider, LanguageFamily,
 };
 
 /// Default sample rate for TTS output (22.05 kHz).
@@ -320,14 +320,24 @@ mod tests {
     fn test_gender() {
         assert_eq!(BhashiniTtsGender::Male.as_str(), "male");
         assert_eq!(BhashiniTtsGender::Female.as_str(), "female");
-        assert_eq!(BhashiniTtsGender::from_str("male"), Some(BhashiniTtsGender::Male));
-        assert_eq!(BhashiniTtsGender::from_str("f"), Some(BhashiniTtsGender::Female));
+        assert_eq!(
+            BhashiniTtsGender::from_str("male"),
+            Some(BhashiniTtsGender::Male)
+        );
+        assert_eq!(
+            BhashiniTtsGender::from_str("f"),
+            Some(BhashiniTtsGender::Female)
+        );
     }
 
     #[test]
     fn test_tts_service_id() {
         assert!(BhashiniLanguage::Hindi.tts_service_id().contains("hi"));
-        assert!(BhashiniLanguage::Tamil.tts_service_id().contains("dravidian"));
+        assert!(
+            BhashiniLanguage::Tamil
+                .tts_service_id()
+                .contains("dravidian")
+        );
     }
 
     #[test]

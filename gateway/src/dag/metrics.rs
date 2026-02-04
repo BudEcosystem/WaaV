@@ -3,10 +3,10 @@
 //! This module provides metrics collection for DAG execution including
 //! latency histograms, throughput counters, and error tracking.
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use parking_lot::RwLock;
 
 /// Metrics collector for DAG execution
 ///
@@ -82,7 +82,8 @@ impl DAGMetrics {
     /// Record execution latency
     fn record_latency(&self, duration: Duration) {
         let us = duration.as_micros() as u64;
-        self.total_execution_time_us.fetch_add(us, Ordering::Relaxed);
+        self.total_execution_time_us
+            .fetch_add(us, Ordering::Relaxed);
 
         // Update histogram bucket
         let bucket = match us {
@@ -101,7 +102,9 @@ impl DAGMetrics {
     /// Record node execution
     pub fn record_node_execution(&self, node_id: &str, duration: Duration, success: bool) {
         let mut metrics = self.node_metrics.write();
-        let node = metrics.entry(node_id.to_string()).or_insert_with(NodeMetrics::new);
+        let node = metrics
+            .entry(node_id.to_string())
+            .or_insert_with(NodeMetrics::new);
         node.record(duration, success);
     }
 
@@ -164,7 +167,8 @@ impl DAGMetrics {
 
     /// Get latency percentiles
     pub fn latency_percentiles(&self) -> LatencyPercentiles {
-        let buckets: Vec<u64> = self.latency_histogram
+        let buckets: Vec<u64> = self
+            .latency_histogram
             .iter()
             .map(|a| a.load(Ordering::Relaxed))
             .collect();
@@ -182,14 +186,14 @@ impl DAGMetrics {
         let mut p999 = Duration::ZERO;
 
         let bucket_bounds = [
-            Duration::from_micros(1000),   // <1ms
-            Duration::from_micros(5000),   // <5ms
-            Duration::from_micros(10000),  // <10ms
-            Duration::from_micros(50000),  // <50ms
-            Duration::from_micros(100000), // <100ms
-            Duration::from_micros(500000), // <500ms
+            Duration::from_micros(1000),    // <1ms
+            Duration::from_micros(5000),    // <5ms
+            Duration::from_micros(10000),   // <10ms
+            Duration::from_micros(50000),   // <50ms
+            Duration::from_micros(100000),  // <100ms
+            Duration::from_micros(500000),  // <500ms
             Duration::from_micros(1000000), // <1s
-            Duration::from_secs(10),       // >1s (use 10s as max)
+            Duration::from_secs(10),        // >1s (use 10s as max)
         ];
 
         for (i, &count) in buckets.iter().enumerate() {
@@ -210,7 +214,12 @@ impl DAGMetrics {
             }
         }
 
-        LatencyPercentiles { p50, p90, p99, p999 }
+        LatencyPercentiles {
+            p50,
+            p90,
+            p99,
+            p999,
+        }
     }
 
     /// Get node metrics for a specific node
@@ -476,10 +485,10 @@ mod tests {
         let metrics = DAGMetrics::new();
 
         // Record various latencies
-        metrics.record_success(Duration::from_micros(500));   // <1ms bucket
-        metrics.record_success(Duration::from_millis(3));     // <5ms bucket
-        metrics.record_success(Duration::from_millis(50));    // <50ms bucket
-        metrics.record_success(Duration::from_millis(500));   // <500ms bucket
+        metrics.record_success(Duration::from_micros(500)); // <1ms bucket
+        metrics.record_success(Duration::from_millis(3)); // <5ms bucket
+        metrics.record_success(Duration::from_millis(50)); // <50ms bucket
+        metrics.record_success(Duration::from_millis(500)); // <500ms bucket
 
         let percentiles = metrics.latency_percentiles();
         // With 4 entries, p50 should be around the 2nd bucket

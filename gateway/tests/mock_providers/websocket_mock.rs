@@ -5,9 +5,9 @@
 use super::{ChaosConfig, LatencyProfile, MockStats};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
@@ -22,7 +22,11 @@ pub struct WebSocketMockState {
 }
 
 impl WebSocketMockState {
-    pub fn new(stt_latency: LatencyProfile, tts_latency: LatencyProfile, chaos: ChaosConfig) -> Self {
+    pub fn new(
+        stt_latency: LatencyProfile,
+        tts_latency: LatencyProfile,
+        chaos: ChaosConfig,
+    ) -> Self {
         Self {
             stt_latency,
             tts_latency,
@@ -85,7 +89,9 @@ async fn handle_stt_connection(
         "channels": 1,
         "models": ["nova-2"],
     });
-    write.send(Message::Text(metadata.to_string().into())).await?;
+    write
+        .send(Message::Text(metadata.to_string().into()))
+        .await?;
 
     let mut audio_chunk_count = 0u64;
 
@@ -146,7 +152,9 @@ async fn handle_stt_connection(
                 let latency_ms = start.elapsed().as_millis() as u64;
                 state.stats.record_success(latency_ms);
 
-                write.send(Message::Text(transcript.to_string().into())).await?;
+                write
+                    .send(Message::Text(transcript.to_string().into()))
+                    .await?;
             }
             Ok(Message::Text(text)) => {
                 // Handle control messages
@@ -226,7 +234,9 @@ async fn handle_tts_connection(
 
                     // Send completion
                     let complete = json!({"type": "Flushed"});
-                    write.send(Message::Text(complete.to_string().into())).await?;
+                    write
+                        .send(Message::Text(complete.to_string().into()))
+                        .await?;
 
                     let latency_ms = start.elapsed().as_millis() as u64;
                     state.stats.record_success(latency_ms);
@@ -249,7 +259,10 @@ async fn handle_tts_connection(
 }
 
 /// Start WebSocket mock server for STT
-pub async fn start_stt_websocket_mock(port: u16, state: Arc<WebSocketMockState>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn start_stt_websocket_mock(
+    port: u16,
+    state: Arc<WebSocketMockState>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     println!("STT WebSocket Mock Server listening on port {}", port);
 
@@ -265,7 +278,10 @@ pub async fn start_stt_websocket_mock(port: u16, state: Arc<WebSocketMockState>)
 }
 
 /// Start WebSocket mock server for TTS
-pub async fn start_tts_websocket_mock(port: u16, state: Arc<WebSocketMockState>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn start_tts_websocket_mock(
+    port: u16,
+    state: Arc<WebSocketMockState>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     println!("TTS WebSocket Mock Server listening on port {}", port);
 
@@ -281,7 +297,10 @@ pub async fn start_tts_websocket_mock(port: u16, state: Arc<WebSocketMockState>)
 }
 
 /// Spawn STT WebSocket mock in background
-pub fn spawn_stt_websocket_mock(port: u16, state: Arc<WebSocketMockState>) -> tokio::task::JoinHandle<()> {
+pub fn spawn_stt_websocket_mock(
+    port: u16,
+    state: Arc<WebSocketMockState>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = start_stt_websocket_mock(port, state).await {
             eprintln!("STT WebSocket Mock error: {}", e);
@@ -290,7 +309,10 @@ pub fn spawn_stt_websocket_mock(port: u16, state: Arc<WebSocketMockState>) -> to
 }
 
 /// Spawn TTS WebSocket mock in background
-pub fn spawn_tts_websocket_mock(port: u16, state: Arc<WebSocketMockState>) -> tokio::task::JoinHandle<()> {
+pub fn spawn_tts_websocket_mock(
+    port: u16,
+    state: Arc<WebSocketMockState>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = start_tts_websocket_mock(port, state).await {
             eprintln!("TTS WebSocket Mock error: {}", e);

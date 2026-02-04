@@ -4,13 +4,13 @@
 //! using HTTP streaming for real-time audio synthesis.
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use tracing::{debug, info};
 
 use super::config::{SpeechmaticsGenerateRequest, SpeechmaticsTtsConfig};
-use crate::core::tts::base::{BaseTTS, ConnectionState, TTSConfig, TTSResult};
 #[cfg(test)]
 use crate::core::tts::base::TTSError;
+use crate::core::tts::base::{BaseTTS, ConnectionState, TTSConfig, TTSResult};
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
 
 // =============================================================================
@@ -79,9 +79,7 @@ impl TTSRequestBuilder for SpeechmaticsRequestBuilder {
 
         debug!(
             "Speechmatics TTS request: voice={}, output_format={}, url={}",
-            self.config.voice,
-            self.config.output_format,
-            url
+            self.config.voice, self.config.output_format, url
         );
 
         // Build and return the request
@@ -454,7 +452,7 @@ mod tests {
 
         let tts = SpeechmaticsTts::new(config).unwrap();
         let url = tts.streaming_url();
-        
+
         assert!(url.contains("preview.tts.speechmatics.com"));
         assert!(url.contains("/generate/sarah"));
         assert!(url.contains("output_format=wav_16000"));
@@ -462,7 +460,10 @@ mod tests {
 
     #[test]
     fn test_config_with_all_formats() {
-        for format in &[SpeechmaticsOutputFormat::Wav16000, SpeechmaticsOutputFormat::Pcm16000] {
+        for format in &[
+            SpeechmaticsOutputFormat::Wav16000,
+            SpeechmaticsOutputFormat::Pcm16000,
+        ] {
             let config = TTSConfig {
                 api_key: "test-key".to_string(),
                 audio_format: Some(format.as_str().to_string()),
@@ -476,9 +477,21 @@ mod tests {
 
     #[test]
     fn test_voice_description() {
-        assert_eq!(SpeechmaticsVoice::Sarah.description(), "Female UK English voice");
-        assert_eq!(SpeechmaticsVoice::Theo.description(), "Male UK English voice");
-        assert_eq!(SpeechmaticsVoice::Megan.description(), "Female US English voice");
-        assert_eq!(SpeechmaticsVoice::Jack.description(), "Male US English voice");
+        assert_eq!(
+            SpeechmaticsVoice::Sarah.description(),
+            "Female UK English voice"
+        );
+        assert_eq!(
+            SpeechmaticsVoice::Theo.description(),
+            "Male UK English voice"
+        );
+        assert_eq!(
+            SpeechmaticsVoice::Megan.description(),
+            "Female US English voice"
+        );
+        assert_eq!(
+            SpeechmaticsVoice::Jack.description(),
+            "Male US English voice"
+        );
     }
 }

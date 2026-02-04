@@ -95,37 +95,30 @@ mod signature;
 // Re-export main types
 pub use client::TencentStt;
 pub use config::{
-    TencentSttConfig,
-    TencentEngineModel,
-    TencentAudioFormat,
-    TencentWordInfo,
-    TencentNumeralMode,
-    TencentFilterDirtyMode,
-    TencentFilterModalMode,
-    // Constants
-    TENCENT_ASR_WS_URL,
     DEFAULT_ENGINE_MODEL,
-    DEFAULT_VOICE_FORMAT,
     DEFAULT_SAMPLE_RATE,
+    DEFAULT_VOICE_FORMAT,
+    MAX_HOTWORD_LIST_SIZE,
+    MAX_SPEAK_TIME_MAX,
+    MAX_SPEAK_TIME_MIN,
     RECOMMENDED_CHUNK_DURATION_MS,
     SIGNATURE_VALIDITY_SECS,
-    VAD_SILENCE_TIME_MIN,
+    // Constants
+    TENCENT_ASR_WS_URL,
+    TencentAudioFormat,
+    TencentEngineModel,
+    TencentFilterDirtyMode,
+    TencentFilterModalMode,
+    TencentNumeralMode,
+    TencentSttConfig,
+    TencentWordInfo,
     VAD_SILENCE_TIME_MAX,
-    MAX_SPEAK_TIME_MIN,
-    MAX_SPEAK_TIME_MAX,
-    MAX_HOTWORD_LIST_SIZE,
+    VAD_SILENCE_TIME_MIN,
 };
 pub use messages::{
-    TencentAsrResponse,
-    TencentAsrResult,
-    TencentWord,
-    TencentAsrErrorCode,
-    TencentSliceType,
+    TencentAsrErrorCode, TencentAsrResponse, TencentAsrResult, TencentSliceType, TencentWord,
 };
-pub use signature::{
-    TencentSignatureBuilder,
-    SignatureError,
-};
+pub use signature::{SignatureError, TencentSignatureBuilder};
 
 #[cfg(test)]
 mod tests {
@@ -240,7 +233,9 @@ mod tests {
 
     #[test]
     fn test_error_code_roundtrip() {
-        let codes = [0, 4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008, 5000, 5001, 5002];
+        let codes = [
+            0, 4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008, 5000, 5001, 5002,
+        ];
         for code in codes {
             let error = TencentAsrErrorCode::from_code(code);
             assert_eq!(error.code(), code);

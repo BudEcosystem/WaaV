@@ -101,13 +101,19 @@ impl IFlytekAuth {
         let api_secret = parts[2].trim().to_string();
 
         if app_id.is_empty() {
-            return Err(AuthError::InvalidApiSecret("APPID cannot be empty".to_string()));
+            return Err(AuthError::InvalidApiSecret(
+                "APPID cannot be empty".to_string(),
+            ));
         }
         if api_key.is_empty() {
-            return Err(AuthError::InvalidApiSecret("API Key cannot be empty".to_string()));
+            return Err(AuthError::InvalidApiSecret(
+                "API Key cannot be empty".to_string(),
+            ));
         }
         if api_secret.is_empty() {
-            return Err(AuthError::InvalidApiSecret("API Secret cannot be empty".to_string()));
+            return Err(AuthError::InvalidApiSecret(
+                "API Secret cannot be empty".to_string(),
+            ));
         }
 
         Ok(Self {
@@ -175,9 +181,7 @@ impl IFlytekAuth {
     /// ```
     #[inline]
     fn build_signature_origin(&self, host: &str, date: &str, path: &str) -> String {
-        format!(
-            "host: {host}\ndate: {date}\nGET {path} HTTP/1.1"
-        )
+        format!("host: {host}\ndate: {date}\nGET {path} HTTP/1.1")
     }
 
     /// Sign a string using HMAC-SHA256.
@@ -269,13 +273,19 @@ impl IFlytekAuth {
     /// Validate that credentials are properly formatted.
     pub fn validate(&self) -> Result<(), AuthError> {
         if self.app_id.is_empty() {
-            return Err(AuthError::InvalidApiSecret("APPID cannot be empty".to_string()));
+            return Err(AuthError::InvalidApiSecret(
+                "APPID cannot be empty".to_string(),
+            ));
         }
         if self.api_key.is_empty() {
-            return Err(AuthError::InvalidApiSecret("API Key cannot be empty".to_string()));
+            return Err(AuthError::InvalidApiSecret(
+                "API Key cannot be empty".to_string(),
+            ));
         }
         if self.api_secret.is_empty() {
-            return Err(AuthError::InvalidApiSecret("API Secret cannot be empty".to_string()));
+            return Err(AuthError::InvalidApiSecret(
+                "API Secret cannot be empty".to_string(),
+            ));
         }
         Ok(())
     }
@@ -362,7 +372,11 @@ mod tests {
         assert_eq!(parts.len(), 6, "Date should have 6 parts: {}", date);
 
         // Day should end with comma
-        assert!(parts[0].ends_with(','), "Day should end with comma: {}", date);
+        assert!(
+            parts[0].ends_with(','),
+            "Day should end with comma: {}",
+            date
+        );
     }
 
     #[test]
@@ -408,7 +422,9 @@ mod tests {
         assert_eq!(sig1, sig2);
 
         // Different input should produce different output
-        let sig3 = auth.hmac_sha256_sign("different_data", TEST_API_SECRET).unwrap();
+        let sig3 = auth
+            .hmac_sha256_sign("different_data", TEST_API_SECRET)
+            .unwrap();
         assert_ne!(sig1, sig3);
     }
 
@@ -519,11 +535,8 @@ mod tests {
         let auth = create_test_auth();
         let date_with_special = "Wed, 20 Nov 2024 03:14:25 GMT";
 
-        let result = auth.build_signed_url_with_date(
-            "iat-api-sg.xf-yun.com",
-            "/v2/iat",
-            date_with_special,
-        );
+        let result =
+            auth.build_signed_url_with_date("iat-api-sg.xf-yun.com", "/v2/iat", date_with_special);
         assert!(result.is_ok());
 
         let url = result.unwrap();

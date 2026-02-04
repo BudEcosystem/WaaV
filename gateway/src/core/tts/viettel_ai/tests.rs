@@ -1,11 +1,13 @@
 //! Tests for Viettel AI TTS provider.
 
 use super::*;
-use crate::core::tts::base::{AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError};
+use crate::core::tts::base::{
+    AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError,
+};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn make_test_config() -> TTSConfig {
     TTSConfig {
@@ -74,14 +76,30 @@ fn test_voice_default() {
 #[test]
 fn test_voice_ids() {
     assert_eq!(ViettelVoice::DoanNgocLe.voice_id(), "doanngocle");
-    assert!(ViettelVoice::NorthernFemale1.voice_id().contains("ngochuyen"));
+    assert!(
+        ViettelVoice::NorthernFemale1
+            .voice_id()
+            .contains("ngochuyen")
+    );
     assert!(ViettelVoice::NorthernFemale2.voice_id().contains("thuthao"));
-    assert!(ViettelVoice::NorthernFemale3.voice_id().contains("phuongtrang"));
+    assert!(
+        ViettelVoice::NorthernFemale3
+            .voice_id()
+            .contains("phuongtrang")
+    );
     assert!(ViettelVoice::NorthernMale1.voice_id().contains("xuankien"));
     assert!(ViettelVoice::NorthernMale2.voice_id().contains("quang"));
-    assert!(ViettelVoice::SouthernFemale1.voice_id().contains("thuphuong"));
+    assert!(
+        ViettelVoice::SouthernFemale1
+            .voice_id()
+            .contains("thuphuong")
+    );
     assert!(ViettelVoice::SouthernFemale2.voice_id().contains("minhly"));
-    assert!(ViettelVoice::SouthernFemale3.voice_id().contains("huonggiang"));
+    assert!(
+        ViettelVoice::SouthernFemale3
+            .voice_id()
+            .contains("huonggiang")
+    );
     assert!(ViettelVoice::SouthernMale.voice_id().contains("trongphuc"));
     assert!(ViettelVoice::CentralFemale.voice_id().contains("maiphuong"));
     assert!(ViettelVoice::CentralMale.voice_id().contains("thanhtung"));
@@ -89,48 +107,118 @@ fn test_voice_ids() {
 
 #[test]
 fn test_voice_display_names() {
-    assert!(ViettelVoice::DoanNgocLe.display_name().contains("Doan Ngoc Le"));
-    assert!(ViettelVoice::NorthernFemale1.display_name().contains("Ngoc Huyen"));
-    assert!(ViettelVoice::SouthernMale.display_name().contains("Trong Phuc"));
-    assert!(ViettelVoice::CentralFemale.display_name().contains("Mai Phuong"));
+    assert!(
+        ViettelVoice::DoanNgocLe
+            .display_name()
+            .contains("Doan Ngoc Le")
+    );
+    assert!(
+        ViettelVoice::NorthernFemale1
+            .display_name()
+            .contains("Ngoc Huyen")
+    );
+    assert!(
+        ViettelVoice::SouthernMale
+            .display_name()
+            .contains("Trong Phuc")
+    );
+    assert!(
+        ViettelVoice::CentralFemale
+            .display_name()
+            .contains("Mai Phuong")
+    );
 }
 
 #[test]
 fn test_voice_from_str_default() {
-    assert_eq!(ViettelVoice::from_str_relaxed("doanngocle"), ViettelVoice::DoanNgocLe);
-    assert_eq!(ViettelVoice::from_str_relaxed("default"), ViettelVoice::DoanNgocLe);
-    assert_eq!(ViettelVoice::from_str_relaxed("female"), ViettelVoice::DoanNgocLe);
-    assert_eq!(ViettelVoice::from_str_relaxed("0"), ViettelVoice::DoanNgocLe);
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("doanngocle"),
+        ViettelVoice::DoanNgocLe
+    );
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("default"),
+        ViettelVoice::DoanNgocLe
+    );
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("female"),
+        ViettelVoice::DoanNgocLe
+    );
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("0"),
+        ViettelVoice::DoanNgocLe
+    );
 }
 
 #[test]
 fn test_voice_from_str_underscores() {
-    assert_eq!(ViettelVoice::from_str_relaxed("doan_ngoc_le"), ViettelVoice::DoanNgocLe);
-    assert_eq!(ViettelVoice::from_str_relaxed("ngoc_huyen"), ViettelVoice::NorthernFemale1);
-    assert_eq!(ViettelVoice::from_str_relaxed("thu_thao"), ViettelVoice::NorthernFemale2);
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("doan_ngoc_le"),
+        ViettelVoice::DoanNgocLe
+    );
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("ngoc_huyen"),
+        ViettelVoice::NorthernFemale1
+    );
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("thu_thao"),
+        ViettelVoice::NorthernFemale2
+    );
 }
 
 #[test]
 fn test_voice_from_str_northern() {
-    assert_eq!(ViettelVoice::from_str_relaxed("ngochuyen"), ViettelVoice::NorthernFemale1);
-    assert_eq!(ViettelVoice::from_str_relaxed("thuthao"), ViettelVoice::NorthernFemale2);
-    assert_eq!(ViettelVoice::from_str_relaxed("phuongtrang"), ViettelVoice::NorthernFemale3);
-    assert_eq!(ViettelVoice::from_str_relaxed("xuankien"), ViettelVoice::NorthernMale1);
-    assert_eq!(ViettelVoice::from_str_relaxed("quang"), ViettelVoice::NorthernMale2);
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("ngochuyen"),
+        ViettelVoice::NorthernFemale1
+    );
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("thuthao"),
+        ViettelVoice::NorthernFemale2
+    );
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("phuongtrang"),
+        ViettelVoice::NorthernFemale3
+    );
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("xuankien"),
+        ViettelVoice::NorthernMale1
+    );
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("quang"),
+        ViettelVoice::NorthernMale2
+    );
 }
 
 #[test]
 fn test_voice_from_str_southern() {
-    assert_eq!(ViettelVoice::from_str_relaxed("thuphuong"), ViettelVoice::SouthernFemale1);
-    assert_eq!(ViettelVoice::from_str_relaxed("minhly"), ViettelVoice::SouthernFemale2);
-    assert_eq!(ViettelVoice::from_str_relaxed("huonggiang"), ViettelVoice::SouthernFemale3);
-    assert_eq!(ViettelVoice::from_str_relaxed("trongphuc"), ViettelVoice::SouthernMale);
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("thuphuong"),
+        ViettelVoice::SouthernFemale1
+    );
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("minhly"),
+        ViettelVoice::SouthernFemale2
+    );
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("huonggiang"),
+        ViettelVoice::SouthernFemale3
+    );
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("trongphuc"),
+        ViettelVoice::SouthernMale
+    );
 }
 
 #[test]
 fn test_voice_from_str_central() {
-    assert_eq!(ViettelVoice::from_str_relaxed("maiphuong"), ViettelVoice::CentralFemale);
-    assert_eq!(ViettelVoice::from_str_relaxed("thanhtung"), ViettelVoice::CentralMale);
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("maiphuong"),
+        ViettelVoice::CentralFemale
+    );
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("thanhtung"),
+        ViettelVoice::CentralMale
+    );
 }
 
 #[test]

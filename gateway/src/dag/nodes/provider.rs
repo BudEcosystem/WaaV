@@ -3,25 +3,25 @@
 //! These nodes wrap speech recognition and synthesis providers for DAG pipelines.
 //! They use channel-based bridging to convert callback-based providers to async/await.
 
+use async_trait::async_trait;
+use bytes::Bytes;
+use parking_lot::Mutex;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use async_trait::async_trait;
-use bytes::Bytes;
-use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace, warn};
 
-use super::{DAGNode, DAGData, NodeCapability, STTResultData, TTSAudioData};
+use super::{DAGData, DAGNode, NodeCapability, STTResultData, TTSAudioData};
+use crate::core::realtime::{
+    AudioOutputCallback, RealtimeAudioData, RealtimeConfig, RealtimeError, RealtimeErrorCallback,
+    TranscriptCallback, TranscriptResult,
+};
+use crate::core::stt::{STTError, STTErrorCallback, STTResult, STTResultCallback};
+use crate::core::tts::{AudioCallback, AudioData, TTSError};
 use crate::dag::context::DAGContext;
 use crate::dag::error::{DAGError, DAGResult};
-use crate::core::stt::{STTResult, STTResultCallback, STTErrorCallback, STTError};
-use crate::core::tts::{AudioCallback, AudioData, TTSError};
-use crate::core::realtime::{
-    RealtimeConfig, RealtimeError, RealtimeAudioData,
-    TranscriptCallback, AudioOutputCallback, RealtimeErrorCallback, TranscriptResult,
-};
 
 /// Callback bridge for TTS provider to DAG node
 ///
@@ -527,17 +527,16 @@ impl DAGNode for TTSProviderNode {
         let text = match &input {
             DAGData::Text(t) => t.clone(),
             DAGData::STTResult(r) => r.transcript.clone(),
-            DAGData::Json(j) => {
-                j.get("text")
-                    .or_else(|| j.get("content"))
-                    .or_else(|| j.get("message"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .ok_or_else(|| DAGError::UnsupportedDataType {
-                        expected: "text".to_string(),
-                        actual: "json without text field".to_string(),
-                    })?
-            }
+            DAGData::Json(j) => j
+                .get("text")
+                .or_else(|| j.get("content"))
+                .or_else(|| j.get("message"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .ok_or_else(|| DAGError::UnsupportedDataType {
+                    expected: "text".to_string(),
+                    actual: "json without text field".to_string(),
+                })?,
             DAGData::Empty => return Ok(DAGData::Empty),
             other => {
                 return Err(DAGError::UnsupportedDataType {
@@ -762,14 +761,9 @@ impl DAGNode for TTSProviderNode {
         }
 
         // Combine all audio chunks into a single buffer
-        let total_duration: u32 = audio_chunks.iter()
-            .filter_map(|c| c.duration_ms)
-            .sum();
+        let total_duration: u32 = audio_chunks.iter().filter_map(|c| c.duration_ms).sum();
 
-        let combined_data: Vec<u8> = audio_chunks
-            .into_iter()
-            .flat_map(|c| c.data)
-            .collect();
+        let combined_data: Vec<u8> = audio_chunks.into_iter().flat_map(|c| c.data).collect();
 
         if combined_data.is_empty() {
             warn!(
@@ -791,7 +785,11 @@ impl DAGNode for TTSProviderNode {
             data: Bytes::from(combined_data),
             sample_rate,
             format,
-            duration_ms: if total_duration > 0 { Some(total_duration as u64) } else { None },
+            duration_ms: if total_duration > 0 {
+                Some(total_duration as u64)
+            } else {
+                None
+            },
             is_final: true,
         }))
     }
@@ -927,7 +925,9 @@ impl DAGNode for RealtimeProviderNode {
             let tx = transcript_sender.clone();
             Box::pin(async move {
                 if tx.send(result).await.is_err() {
-                    trace!("Realtime transcript callback: channel closed, likely node execution completed");
+                    trace!(
+                        "Realtime transcript callback: channel closed, likely node execution completed"
+                    );
                 }
             }) as Pin<Box<dyn Future<Output = ()> + Send>>
         });
@@ -938,7 +938,9 @@ impl DAGNode for RealtimeProviderNode {
             let tx = audio_sender.clone();
             Box::pin(async move {
                 if tx.send(audio).await.is_err() {
-                    trace!("Realtime audio callback: channel closed, likely node execution completed");
+                    trace!(
+                        "Realtime audio callback: channel closed, likely node execution completed"
+                    );
                 }
             }) as Pin<Box<dyn Future<Output = ()> + Send>>
         });
@@ -949,7 +951,9 @@ impl DAGNode for RealtimeProviderNode {
             let tx = error_sender.clone();
             Box::pin(async move {
                 if tx.send(error).await.is_err() {
-                    trace!("Realtime error callback: channel closed, likely node execution completed");
+                    trace!(
+                        "Realtime error callback: channel closed, likely node execution completed"
+                    );
                 }
             }) as Pin<Box<dyn Future<Output = ()> + Send>>
         });

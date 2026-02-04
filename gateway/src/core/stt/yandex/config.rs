@@ -508,17 +508,25 @@ mod tests {
         assert!(params.iter().any(|(k, v)| *k == "lang" && v == "ru-RU"));
         assert!(params.iter().any(|(k, v)| *k == "topic" && v == "general"));
         assert!(params.iter().any(|(k, v)| *k == "format" && v == "lpcm"));
-        assert!(params
-            .iter()
-            .any(|(k, v)| *k == "sampleRateHertz" && v == "16000"));
-        assert!(params
-            .iter()
-            .any(|(k, v)| *k == "folderId" && v == "folder123"));
-        assert!(params
-            .iter()
-            .any(|(k, v)| *k == "profanityFilter" && v == "true"));
-        assert!(params
-            .iter()
-            .any(|(k, v)| *k == "maxAlternatives" && v == "3"));
+        assert!(
+            params
+                .iter()
+                .any(|(k, v)| *k == "sampleRateHertz" && v == "16000")
+        );
+        assert!(
+            params
+                .iter()
+                .any(|(k, v)| *k == "folderId" && v == "folder123")
+        );
+        assert!(
+            params
+                .iter()
+                .any(|(k, v)| *k == "profanityFilter" && v == "true")
+        );
+        assert!(
+            params
+                .iter()
+                .any(|(k, v)| *k == "maxAlternatives" && v == "3")
+        );
     }
 }

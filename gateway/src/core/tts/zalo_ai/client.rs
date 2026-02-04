@@ -17,13 +17,13 @@
 //! - Channels: Mono
 //! - Sample Width: 16-bit
 
-use super::config::{ZaloTtsConfig, ZaloTtsResponse, AUDIO_SAMPLE_RATE, ZALO_TTS_ENDPOINT};
+use super::config::{AUDIO_SAMPLE_RATE, ZALO_TTS_ENDPOINT, ZaloTtsConfig, ZaloTtsResponse};
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
 };
 use reqwest::Client;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
@@ -127,15 +127,17 @@ impl ZaloTts {
                     retry_after_secs: Some(1),
                     message: error_msg,
                 }),
-                500 => Err(TTSError::ProviderError(format!("Server error: {error_msg}"))),
+                500 => Err(TTSError::ProviderError(format!(
+                    "Server error: {error_msg}"
+                ))),
                 _ => Err(TTSError::ProviderError(error_msg)),
             };
         }
 
         // Get audio URL
-        let audio_url = api_response.audio_url().ok_or_else(|| {
-            TTSError::ProviderError("No audio URL in response".to_string())
-        })?;
+        let audio_url = api_response
+            .audio_url()
+            .ok_or_else(|| TTSError::ProviderError("No audio URL in response".to_string()))?;
 
         debug!("Zalo TTS: Downloading audio from {}", audio_url);
 
@@ -177,10 +179,7 @@ impl ZaloTts {
 
     /// Set the speech speed.
     pub fn set_speed(&mut self, speed: f32) {
-        self.config.speed = speed.clamp(
-            super::config::MIN_SPEED,
-            super::config::MAX_SPEED,
-        );
+        self.config.speed = speed.clamp(super::config::MIN_SPEED, super::config::MAX_SPEED);
     }
 }
 
@@ -417,7 +416,10 @@ mod tests {
     }
 
     impl AudioCallback for MockAudioCallback {
-        fn on_audio(&self, _audio_data: AudioData) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        fn on_audio(
+            &self,
+            _audio_data: AudioData,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             self.audio_count.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {})
         }

@@ -24,9 +24,9 @@ use std::f32::consts::PI;
 pub const SAMPLE_RATE: u32 = 16000;
 
 /// Duration constants (in samples at 16kHz)
-pub const MS_100: usize = 1600;   // 100ms at 16kHz
-pub const MS_500: usize = 8000;   // 500ms at 16kHz
-pub const SECOND: usize = 16000;  // 1 second at 16kHz
+pub const MS_100: usize = 1600; // 100ms at 16kHz
+pub const MS_500: usize = 8000; // 500ms at 16kHz
+pub const SECOND: usize = 16000; // 1 second at 16kHz
 
 /// Sample rate constant
 pub const SAMPLE_RATE_USIZE: usize = 16000;
@@ -114,7 +114,8 @@ pub fn generate_chirp(
             let t = i as f32 / SAMPLE_RATE as f32;
             // Linear chirp
             let freq = start_freq + (end_freq - start_freq) * t / duration_secs;
-            let phase = 2.0 * PI * (start_freq * t + 0.5 * (end_freq - start_freq) * t * t / duration_secs);
+            let phase =
+                2.0 * PI * (start_freq * t + 0.5 * (end_freq - start_freq) * t * t / duration_secs);
             let sample = phase.sin() * max_amplitude;
             sample as i16
         })
@@ -128,7 +129,12 @@ pub fn generate_chirp_bytes(
     end_freq: f32,
     amplitude: f32,
 ) -> Vec<u8> {
-    samples_to_bytes(&generate_chirp(duration_samples, start_freq, end_freq, amplitude))
+    samples_to_bytes(&generate_chirp(
+        duration_samples,
+        start_freq,
+        end_freq,
+        amplitude,
+    ))
 }
 
 /// Generate speech-like pattern with variable amplitude envelope
@@ -223,10 +229,7 @@ pub fn generate_noisy_speech_bytes(duration_samples: usize, snr_db: f32) -> Vec<
 
 /// Convert i16 samples to little-endian bytes
 pub fn samples_to_bytes(samples: &[i16]) -> Vec<u8> {
-    samples
-        .iter()
-        .flat_map(|s| s.to_le_bytes())
-        .collect()
+    samples.iter().flat_map(|s| s.to_le_bytes()).collect()
 }
 
 /// Convert bytes to i16 samples
@@ -365,7 +368,10 @@ mod tests {
         assert_eq!(speech.len(), SECOND * 2);
 
         // Should have some silence segments
-        let silence_count = speech.windows(100).filter(|w| w.iter().all(|&s| s == 0)).count();
+        let silence_count = speech
+            .windows(100)
+            .filter(|w| w.iter().all(|&s| s == 0))
+            .count();
         assert!(silence_count > 0);
     }
 

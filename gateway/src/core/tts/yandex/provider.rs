@@ -4,7 +4,7 @@
 //! using HTTP POST requests for speech synthesis.
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use tracing::{debug, info};
 
 use super::config::YandexTtsConfig;
@@ -472,10 +472,7 @@ mod tests {
         };
 
         let yandex_config = YandexTtsConfig::from_base(&config).unwrap();
-        assert_eq!(
-            yandex_config.auth_header_value(),
-            "Api-Key AQVN1234567890"
-        );
+        assert_eq!(yandex_config.auth_header_value(), "Api-Key AQVN1234567890");
     }
 
     #[test]
@@ -492,11 +489,19 @@ mod tests {
         let params = yandex_config.build_form_params("Hello world");
 
         // Check required parameters
-        assert!(params.iter().any(|(k, v)| *k == "text" && v == "Hello world"));
+        assert!(
+            params
+                .iter()
+                .any(|(k, v)| *k == "text" && v == "Hello world")
+        );
         assert!(params.iter().any(|(k, v)| *k == "voice" && v == "john"));
         assert!(params.iter().any(|(k, v)| *k == "format" && v == "mp3"));
         assert!(params.iter().any(|(k, v)| *k == "lang" && v == "en-US"));
         assert!(params.iter().any(|(k, v)| *k == "speed" && v == "1.5"));
-        assert!(params.iter().any(|(k, v)| *k == "folderId" && v == "b1g12345"));
+        assert!(
+            params
+                .iter()
+                .any(|(k, v)| *k == "folderId" && v == "b1g12345")
+        );
     }
 }

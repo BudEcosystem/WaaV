@@ -29,13 +29,13 @@ pub mod speaking;
 
 pub use latency::{LatencyMetrics, UserBotLatencyObserver};
 pub use observer::{ObserverRegistry, VoiceObserver};
-pub use speaking::{BotSpeakingStarted, BotSpeakingStopped, BotSpeakingState};
+pub use speaking::{BotSpeakingStarted, BotSpeakingState, BotSpeakingStopped};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Test that the module exports are correct
     #[test]
@@ -55,19 +55,11 @@ mod tests {
         }
 
         impl VoiceObserver for CountingObserver {
-            fn on_stt_result(
-                &self,
-                _result: &crate::core::stt::STTResult,
-                _latency_ns: u64,
-            ) {
+            fn on_stt_result(&self, _result: &crate::core::stt::STTResult, _latency_ns: u64) {
                 self.stt_count.fetch_add(1, Ordering::Relaxed);
             }
 
-            fn on_tts_chunk(
-                &self,
-                _chunk: &crate::core::tts::AudioData,
-                _ttfb_ns: Option<u64>,
-            ) {
+            fn on_tts_chunk(&self, _chunk: &crate::core::tts::AudioData, _ttfb_ns: Option<u64>) {
                 self.tts_count.fetch_add(1, Ordering::Relaxed);
             }
         }

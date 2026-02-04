@@ -395,7 +395,12 @@ impl GladiaSTTConfig {
             "en".to_string()
         } else {
             // Extract base language code (e.g., "en-US" -> "en")
-            config.language.split('-').next().unwrap_or("en").to_string()
+            config
+                .language
+                .split('-')
+                .next()
+                .unwrap_or("en")
+                .to_string()
         };
 
         Ok(Self {
@@ -824,10 +829,7 @@ mod tests {
         assert_eq!(config.endpointing, 0.1);
         assert!(config.pre_processing.audio_enhancer);
         assert!(config.realtime_processing.words_accurate_timestamps);
-        assert_eq!(
-            config.realtime_processing.custom_vocabulary,
-            vec!["custom"]
-        );
+        assert_eq!(config.realtime_processing.custom_vocabulary, vec!["custom"]);
         assert!(config.realtime_processing.translation);
         assert_eq!(
             config.realtime_processing.translation_target_languages,

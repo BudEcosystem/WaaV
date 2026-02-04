@@ -138,9 +138,9 @@ mod messages;
 
 // Configuration types
 pub use config::{
+    BAIDU_OAUTH_URL, BAIDU_REALTIME_ASR_URL, BAIDU_SHORT_ASR_URL, BAIDU_SHORT_ASR_URL_HTTPS,
     BaiduAudioFormat, BaiduOAuthError, BaiduOAuthResponse, BaiduSampleRate, BaiduSttConfig,
-    BaiduSttModel, BAIDU_OAUTH_URL, BAIDU_REALTIME_ASR_URL, BAIDU_SHORT_ASR_URL,
-    BAIDU_SHORT_ASR_URL_HTTPS, DEFAULT_AUDIO_FORMAT, DEFAULT_MODEL, DEFAULT_SAMPLE_RATE,
+    BaiduSttModel, DEFAULT_AUDIO_FORMAT, DEFAULT_MODEL, DEFAULT_SAMPLE_RATE,
     MAX_FRAME_INTERVAL_SECS, MAX_REALTIME_AUDIO_DURATION_SECS, MAX_SHORT_AUDIO_DURATION_SECS,
     RECOMMENDED_CHUNK_DURATION_MS, TOKEN_VALIDITY_SECS,
 };
@@ -241,7 +241,10 @@ mod tests {
         assert_eq!(BaiduSttModel::from_str("mandarin"), BaiduSttModel::Mandarin);
         assert_eq!(BaiduSttModel::from_str("1537"), BaiduSttModel::Mandarin);
         assert_eq!(BaiduSttModel::from_str("english"), BaiduSttModel::English);
-        assert_eq!(BaiduSttModel::from_str("cantonese"), BaiduSttModel::Cantonese);
+        assert_eq!(
+            BaiduSttModel::from_str("cantonese"),
+            BaiduSttModel::Cantonese
+        );
     }
 
     #[test]
@@ -254,10 +257,22 @@ mod tests {
 
     #[test]
     fn test_audio_format_parsing() {
-        assert_eq!(BaiduAudioFormat::from_str("pcm"), Some(BaiduAudioFormat::Pcm));
-        assert_eq!(BaiduAudioFormat::from_str("wav"), Some(BaiduAudioFormat::Wav));
-        assert_eq!(BaiduAudioFormat::from_str("amr"), Some(BaiduAudioFormat::Amr));
-        assert_eq!(BaiduAudioFormat::from_str("m4a"), Some(BaiduAudioFormat::M4a));
+        assert_eq!(
+            BaiduAudioFormat::from_str("pcm"),
+            Some(BaiduAudioFormat::Pcm)
+        );
+        assert_eq!(
+            BaiduAudioFormat::from_str("wav"),
+            Some(BaiduAudioFormat::Wav)
+        );
+        assert_eq!(
+            BaiduAudioFormat::from_str("amr"),
+            Some(BaiduAudioFormat::Amr)
+        );
+        assert_eq!(
+            BaiduAudioFormat::from_str("m4a"),
+            Some(BaiduAudioFormat::M4a)
+        );
     }
 
     #[test]
@@ -269,14 +284,7 @@ mod tests {
 
     #[test]
     fn test_start_frame_serialization() {
-        let frame = BaiduStartFrame::new(
-            "app123",
-            "key456",
-            1537,
-            "user789",
-            16000,
-            "pcm",
-        );
+        let frame = BaiduStartFrame::new("app123", "key456", 1537, "user789", 16000, "pcm");
 
         let json = frame.to_json().unwrap();
         assert!(json.contains("\"type\":\"START\""));
@@ -348,14 +356,8 @@ mod tests {
     #[test]
     fn test_short_asr_request() {
         let audio_data = vec![0u8; 100];
-        let request = BaiduShortAsrRequest::new(
-            "pcm",
-            16000,
-            "user123",
-            "token456",
-            1537,
-            &audio_data,
-        );
+        let request =
+            BaiduShortAsrRequest::new("pcm", 16000, "user123", "token456", 1537, &audio_data);
 
         assert_eq!(request.format, "pcm");
         assert_eq!(request.rate, 16000);
@@ -382,8 +384,14 @@ mod tests {
     #[test]
     fn test_error_code_parsing() {
         assert_eq!(BaiduErrorCode::from_code(0), BaiduErrorCode::Success);
-        assert_eq!(BaiduErrorCode::from_code(3301), BaiduErrorCode::AuthenticationError);
-        assert_eq!(BaiduErrorCode::from_code(3302), BaiduErrorCode::TokenInvalid);
+        assert_eq!(
+            BaiduErrorCode::from_code(3301),
+            BaiduErrorCode::AuthenticationError
+        );
+        assert_eq!(
+            BaiduErrorCode::from_code(3302),
+            BaiduErrorCode::TokenInvalid
+        );
         assert_eq!(BaiduErrorCode::from_code(9999), BaiduErrorCode::Unknown);
     }
 
@@ -464,7 +472,9 @@ mod tests {
         let config = create_test_config();
         let mut stt = BaiduStt::new(config).unwrap();
 
-        let result = stt.send_audio(bytes::Bytes::from_static(&[0u8; 1024])).await;
+        let result = stt
+            .send_audio(bytes::Bytes::from_static(&[0u8; 1024]))
+            .await;
         assert!(result.is_err());
     }
 }

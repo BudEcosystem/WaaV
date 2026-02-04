@@ -248,7 +248,12 @@ mod tests {
         let mut config = SarvamSTTConfig::default();
         config.language_code = "fr-FR".to_string();
         assert!(config.validate().is_err());
-        assert!(config.validate().unwrap_err().contains("Unsupported language"));
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("Unsupported language")
+        );
     }
 
     #[test]

@@ -3,16 +3,16 @@
 //! These nodes handle communication with external services via HTTP, gRPC,
 //! WebSocket, IPC, and LiveKit.
 
-use std::sync::Arc;
-use std::collections::HashMap;
-use std::time::Duration;
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes};
 use futures_util::{SinkExt, StreamExt};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 
-use super::{DAGNode, DAGData, NodeCapability};
+use super::{DAGData, DAGNode, NodeCapability};
 use crate::dag::context::{DAGContext, resource_keys};
 use crate::dag::definition::HttpMethod;
 use crate::dag::error::{DAGError, DAGResult};
@@ -31,9 +31,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 /// Returns the validated URL or an error if validation fails.
 pub fn validate_url_for_ssrf(url: &str) -> DAGResult<()> {
     // Parse URL
-    let parsed = url::Url::parse(url).map_err(|e| {
-        DAGError::ConfigError(format!("Invalid URL '{}': {}", url, e))
-    })?;
+    let parsed = url::Url::parse(url)
+        .map_err(|e| DAGError::ConfigError(format!("Invalid URL '{}': {}", url, e)))?;
 
     // Check scheme
     let scheme = parsed.scheme().to_lowercase();
@@ -45,9 +44,9 @@ pub fn validate_url_for_ssrf(url: &str) -> DAGResult<()> {
     }
 
     // Get host
-    let host = parsed.host_str().ok_or_else(|| {
-        DAGError::ConfigError(format!("URL '{}' has no host", url))
-    })?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| DAGError::ConfigError(format!("URL '{}' has no host", url)))?;
 
     // Check for blocked hostnames (case-insensitive)
     let host_lower = host.to_lowercase();
@@ -216,7 +215,11 @@ impl tonic::codec::Encoder for GenericBytesEncoder {
     type Item = Bytes;
     type Error = tonic::Status;
 
-    fn encode(&mut self, item: Self::Item, dst: &mut tonic::codec::EncodeBuf<'_>) -> Result<(), Self::Error> {
+    fn encode(
+        &mut self,
+        item: Self::Item,
+        dst: &mut tonic::codec::EncodeBuf<'_>,
+    ) -> Result<(), Self::Error> {
         dst.put(item);
         Ok(())
     }
@@ -229,7 +232,10 @@ impl tonic::codec::Decoder for GenericBytesDecoder {
     type Item = Bytes;
     type Error = tonic::Status;
 
-    fn decode(&mut self, src: &mut tonic::codec::DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+    fn decode(
+        &mut self,
+        src: &mut tonic::codec::DecodeBuf<'_>,
+    ) -> Result<Option<Self::Item>, Self::Error> {
         let remaining = src.remaining();
         if remaining == 0 {
             return Ok(None);
@@ -362,7 +368,8 @@ impl DAGNode for HttpEndpointNode {
         );
 
         // Use the pre-created pooled client for connection reuse
-        let mut request = self.client
+        let mut request = self
+            .client
             .request(self.method.clone().into(), &self.url)
             .timeout(Duration::from_millis(self.timeout_ms))
             .header("Content-Type", "application/json")
@@ -380,10 +387,13 @@ impl DAGNode for HttpEndpointNode {
 
         request = request.json(&payload);
 
-        let response = request.send().await.map_err(|e| DAGError::HttpEndpointError {
-            url: self.url.clone(),
-            error: e.to_string(),
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| DAGError::HttpEndpointError {
+                url: self.url.clone(),
+                error: e.to_string(),
+            })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -394,10 +404,14 @@ impl DAGNode for HttpEndpointNode {
             });
         }
 
-        let json: serde_json::Value = response.json().await.map_err(|e| DAGError::HttpEndpointError {
-            url: self.url.clone(),
-            error: format!("Failed to parse response: {}", e),
-        })?;
+        let json: serde_json::Value =
+            response
+                .json()
+                .await
+                .map_err(|e| DAGError::HttpEndpointError {
+                    url: self.url.clone(),
+                    error: format!("Failed to parse response: {}", e),
+                })?;
 
         Ok(DAGData::Json(json))
     }
@@ -481,7 +495,8 @@ impl GrpcEndpointNode {
         }
 
         // Try to extract domain from address
-        let addr = self.address
+        let addr = self
+            .address
             .trim_start_matches("https://")
             .trim_start_matches("http://");
 
@@ -569,20 +584,20 @@ impl DAGNode for GrpcEndpointNode {
 
         // Parse the path into PathAndQuery using tonic's re-exported http crate
         // to avoid version conflicts (tonic 0.11 uses http 0.2, project uses http 1.x)
-        let path_and_query: tonic::codegen::http::uri::PathAndQuery = path.parse().map_err(|e| {
-            DAGError::GrpcEndpointError {
+        let path_and_query: tonic::codegen::http::uri::PathAndQuery =
+            path.parse().map_err(|e| DAGError::GrpcEndpointError {
                 service: self.service.clone(),
                 method: self.method.clone(),
                 error: format!("Invalid service/method path '{}': {}", path, e),
-            }
-        })?;
+            })?;
 
         // Determine if TLS is needed based on address
-        let use_tls = self.address.starts_with("https://") ||
-                      (!self.address.starts_with("http://") && !self.address.contains("localhost"));
+        let use_tls = self.address.starts_with("https://")
+            || (!self.address.starts_with("http://") && !self.address.contains("localhost"));
 
         // Normalize the address for tonic
-        let address = if self.address.starts_with("http://") || self.address.starts_with("https://") {
+        let address = if self.address.starts_with("http://") || self.address.starts_with("https://")
+        {
             self.address.clone()
         } else if use_tls {
             format!("https://{}", self.address)
@@ -670,9 +685,9 @@ impl DAGNode for GrpcEndpointNode {
         // Add stream ID to metadata
         request.metadata_mut().insert(
             "x-stream-id",
-            ctx.stream_id.parse().unwrap_or_else(|_| {
-                tonic::metadata::MetadataValue::from_static("unknown")
-            }),
+            ctx.stream_id
+                .parse()
+                .unwrap_or_else(|_| tonic::metadata::MetadataValue::from_static("unknown")),
         );
 
         // Add API key if available
@@ -694,11 +709,14 @@ impl DAGNode for GrpcEndpointNode {
         );
 
         // Make the unary gRPC call using generic bytes codec
-        client.ready().await.map_err(|e| DAGError::GrpcEndpointError {
-            service: self.service.clone(),
-            method: self.method.clone(),
-            error: format!("gRPC client not ready: {}", e),
-        })?;
+        client
+            .ready()
+            .await
+            .map_err(|e| DAGError::GrpcEndpointError {
+                service: self.service.clone(),
+                method: self.method.clone(),
+                error: format!("gRPC client not ready: {}", e),
+            })?;
 
         let response = client
             .unary(request, path_and_query, GenericBytesCodec)
@@ -839,10 +857,11 @@ impl DAGNode for WebSocketEndpointNode {
         // tungstenite 0.28 uses Utf8Bytes for text and Bytes for binary
         let message = match &input {
             DAGData::Json(json) => {
-                let text = serde_json::to_string(json).map_err(|e| DAGError::WebSocketEndpointError {
-                    url: self.url.clone(),
-                    error: format!("Failed to serialize JSON: {}", e),
-                })?;
+                let text =
+                    serde_json::to_string(json).map_err(|e| DAGError::WebSocketEndpointError {
+                        url: self.url.clone(),
+                        error: format!("Failed to serialize JSON: {}", e),
+                    })?;
                 tokio_tungstenite::tungstenite::Message::Text(text.into())
             }
             DAGData::Text(text) => {
@@ -851,21 +870,23 @@ impl DAGNode for WebSocketEndpointNode {
             DAGData::Binary(bytes) => {
                 tokio_tungstenite::tungstenite::Message::Binary(bytes.clone())
             }
-            DAGData::Audio(bytes) => {
-                tokio_tungstenite::tungstenite::Message::Binary(bytes.clone())
-            }
+            DAGData::Audio(bytes) => tokio_tungstenite::tungstenite::Message::Binary(bytes.clone()),
             other => {
                 let json = other.to_json();
-                let text = serde_json::to_string(&json).map_err(|e| DAGError::WebSocketEndpointError {
-                    url: self.url.clone(),
-                    error: format!("Failed to serialize input: {}", e),
-                })?;
+                let text =
+                    serde_json::to_string(&json).map_err(|e| DAGError::WebSocketEndpointError {
+                        url: self.url.clone(),
+                        error: format!("Failed to serialize input: {}", e),
+                    })?;
                 tokio_tungstenite::tungstenite::Message::Text(text.into())
             }
         };
 
         // Build the WebSocket request with custom headers
-        let mut request = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(&self.url)
+        let mut request =
+            tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+                &self.url,
+            )
             .map_err(|e| DAGError::WebSocketEndpointError {
                 url: self.url.clone(),
                 error: format!("Invalid WebSocket URL: {}", e),
@@ -882,16 +903,25 @@ impl DAGNode for WebSocketEndpointNode {
         }
 
         // Add stream ID header
-        if let Ok(val) = ctx.stream_id.parse::<tokio_tungstenite::tungstenite::http::HeaderValue>() {
-            if let Ok(name) = "X-Stream-ID".parse::<tokio_tungstenite::tungstenite::http::HeaderName>() {
+        if let Ok(val) = ctx
+            .stream_id
+            .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
+        {
+            if let Ok(name) =
+                "X-Stream-ID".parse::<tokio_tungstenite::tungstenite::http::HeaderName>()
+            {
                 request.headers_mut().insert(name, val);
             }
         }
 
         // Add authorization header if API key available
         if let Some(api_key) = &ctx.api_key {
-            if let Ok(val) = format!("Bearer {}", api_key).parse::<tokio_tungstenite::tungstenite::http::HeaderValue>() {
-                if let Ok(name) = "Authorization".parse::<tokio_tungstenite::tungstenite::http::HeaderName>() {
+            if let Ok(val) = format!("Bearer {}", api_key)
+                .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
+            {
+                if let Ok(name) =
+                    "Authorization".parse::<tokio_tungstenite::tungstenite::http::HeaderName>()
+                {
                     request.headers_mut().insert(name, val);
                 }
             }
@@ -905,19 +935,17 @@ impl DAGNode for WebSocketEndpointNode {
 
         // Connect with timeout
         let timeout = Duration::from_millis(self.timeout_ms);
-        let connect_result = tokio::time::timeout(
-            timeout,
-            tokio_tungstenite::connect_async(request),
-        )
-        .await
-        .map_err(|_| DAGError::WebSocketEndpointError {
-            url: self.url.clone(),
-            error: format!("Connection timed out after {}ms", self.timeout_ms),
-        })?
-        .map_err(|e| DAGError::WebSocketEndpointError {
-            url: self.url.clone(),
-            error: format!("Failed to connect: {}", e),
-        })?;
+        let connect_result =
+            tokio::time::timeout(timeout, tokio_tungstenite::connect_async(request))
+                .await
+                .map_err(|_| DAGError::WebSocketEndpointError {
+                    url: self.url.clone(),
+                    error: format!("Connection timed out after {}ms", self.timeout_ms),
+                })?
+                .map_err(|e| DAGError::WebSocketEndpointError {
+                    url: self.url.clone(),
+                    error: format!("Failed to connect: {}", e),
+                })?;
 
         let (ws_stream, _response) = connect_result;
         let (mut write, mut read) = ws_stream.split();
@@ -928,10 +956,13 @@ impl DAGNode for WebSocketEndpointNode {
         );
 
         // Send the message
-        write.send(message).await.map_err(|e| DAGError::WebSocketEndpointError {
-            url: self.url.clone(),
-            error: format!("Failed to send message: {}", e),
-        })?;
+        write
+            .send(message)
+            .await
+            .map_err(|e| DAGError::WebSocketEndpointError {
+                url: self.url.clone(),
+                error: format!("Failed to send message: {}", e),
+            })?;
 
         // Wait for response with timeout
         let response = tokio::time::timeout(timeout, read.next())
@@ -950,7 +981,9 @@ impl DAGNode for WebSocketEndpointNode {
             })?;
 
         // Close the connection gracefully
-        let _ = write.send(tokio_tungstenite::tungstenite::Message::Close(None)).await;
+        let _ = write
+            .send(tokio_tungstenite::tungstenite::Message::Close(None))
+            .await;
 
         info!(
             node_id = %self.id,
@@ -984,9 +1017,9 @@ impl DAGNode for WebSocketEndpointNode {
                     error: "Server closed connection".to_string(),
                 })
             }
-            tokio_tungstenite::tungstenite::Message::Ping(_) |
-            tokio_tungstenite::tungstenite::Message::Pong(_) |
-            tokio_tungstenite::tungstenite::Message::Frame(_) => {
+            tokio_tungstenite::tungstenite::Message::Ping(_)
+            | tokio_tungstenite::tungstenite::Message::Pong(_)
+            | tokio_tungstenite::tungstenite::Message::Frame(_) => {
                 // Unexpected control frame as response
                 Err(DAGError::WebSocketEndpointError {
                     url: self.url.clone(),
@@ -1042,7 +1075,10 @@ fn sanitize_ipc_socket_name(name: &str) -> DAGResult<String> {
     }
 
     // Validate characters (only alphanumeric, underscore, hyphen allowed)
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         return Err(DAGError::ConfigError(format!(
             "Invalid IPC socket name '{}': only alphanumeric, underscore, and hyphen allowed",
             name
@@ -1052,7 +1088,7 @@ fn sanitize_ipc_socket_name(name: &str) -> DAGResult<String> {
     // Check not empty
     if name.is_empty() {
         return Err(DAGError::ConfigError(
-            "IPC socket name cannot be empty".to_string()
+            "IPC socket name cannot be empty".to_string(),
         ));
     }
 
@@ -1207,14 +1243,12 @@ impl DAGNode for IpcEndpointNode {
                     bytes.clone()
                 }
             }
-            DAGData::Json(json) => {
-                serde_json::to_vec(json)
-                    .map_err(|e| DAGError::IpcEndpointError {
-                        name: self.shm_name.clone(),
-                        error: format!("Failed to serialize JSON: {}", e),
-                    })?
-                    .into()
-            }
+            DAGData::Json(json) => serde_json::to_vec(json)
+                .map_err(|e| DAGError::IpcEndpointError {
+                    name: self.shm_name.clone(),
+                    error: format!("Failed to serialize JSON: {}", e),
+                })?
+                .into(),
             DAGData::Text(text) => {
                 if self.input_format.as_deref() == Some("json") {
                     let json = serde_json::json!({
@@ -1267,14 +1301,20 @@ impl DAGNode for IpcEndpointNode {
 
         // Send length-prefixed message (4-byte big-endian length + data)
         let len_bytes = (send_data.len() as u32).to_be_bytes();
-        stream.write_all(&len_bytes).await.map_err(|e| DAGError::IpcEndpointError {
-            name: self.shm_name.clone(),
-            error: format!("Failed to send length prefix: {}", e),
-        })?;
-        stream.write_all(&send_data).await.map_err(|e| DAGError::IpcEndpointError {
-            name: self.shm_name.clone(),
-            error: format!("Failed to send data: {}", e),
-        })?;
+        stream
+            .write_all(&len_bytes)
+            .await
+            .map_err(|e| DAGError::IpcEndpointError {
+                name: self.shm_name.clone(),
+                error: format!("Failed to send length prefix: {}", e),
+            })?;
+        stream
+            .write_all(&send_data)
+            .await
+            .map_err(|e| DAGError::IpcEndpointError {
+                name: self.shm_name.clone(),
+                error: format!("Failed to send data: {}", e),
+            })?;
 
         // Read length-prefixed response with timeout
         let mut len_buf = [0u8; 4];
@@ -1332,15 +1372,13 @@ impl DAGNode for IpcEndpointNode {
                     Ok(DAGData::Binary(Bytes::from(response_buf)))
                 }
             }
-            Some("text") => {
-                match String::from_utf8(response_buf) {
-                    Ok(text) => Ok(DAGData::Text(text)),
-                    Err(e) => Err(DAGError::IpcEndpointError {
-                        name: self.shm_name.clone(),
-                        error: format!("Invalid UTF-8 response: {}", e),
-                    }),
-                }
-            }
+            Some("text") => match String::from_utf8(response_buf) {
+                Ok(text) => Ok(DAGData::Text(text)),
+                Err(e) => Err(DAGError::IpcEndpointError {
+                    name: self.shm_name.clone(),
+                    error: format!("Invalid UTF-8 response: {}", e),
+                }),
+            },
             Some(other) => {
                 warn!(
                     node_id = %self.id,
@@ -1496,10 +1534,13 @@ impl DAGNode for LiveKitEndpointNode {
 
                 let client = livekit_client.read().await;
                 // Send as agent message by default
-                client.send_message(&text, "agent", None, false).await.map_err(|e| {
-                    error!(node_id = %self.id, error = %e, "Failed to send message to LiveKit");
-                    DAGError::LiveKitEndpointError(format!("Failed to send message: {}", e))
-                })?;
+                client
+                    .send_message(&text, "agent", None, false)
+                    .await
+                    .map_err(|e| {
+                        error!(node_id = %self.id, error = %e, "Failed to send message to LiveKit");
+                        DAGError::LiveKitEndpointError(format!("Failed to send message: {}", e))
+                    })?;
 
                 debug!(node_id = %self.id, "Text message sent to LiveKit successfully");
                 Ok(DAGData::Empty)
@@ -1517,10 +1558,16 @@ impl DAGNode for LiveKitEndpointNode {
                 })?;
 
                 let client = livekit_client.read().await;
-                client.send_message(&text, "agent", Some("data"), false).await.map_err(|e| {
-                    error!(node_id = %self.id, error = %e, "Failed to send JSON to LiveKit");
-                    DAGError::LiveKitEndpointError(format!("Failed to send JSON message: {}", e))
-                })?;
+                client
+                    .send_message(&text, "agent", Some("data"), false)
+                    .await
+                    .map_err(|e| {
+                        error!(node_id = %self.id, error = %e, "Failed to send JSON to LiveKit");
+                        DAGError::LiveKitEndpointError(format!(
+                            "Failed to send JSON message: {}",
+                            e
+                        ))
+                    })?;
 
                 debug!(node_id = %self.id, "JSON message sent to LiveKit successfully");
                 Ok(DAGData::Empty)
@@ -1577,9 +1624,15 @@ impl DAGNode for LiveKitEndpointNode {
                     // Send as data message
                     let text = String::from_utf8_lossy(&bytes).to_string();
                     let client = livekit_client.read().await;
-                    client.send_message(&text, "agent", Some("data"), false).await.map_err(|e| {
-                        DAGError::LiveKitEndpointError(format!("Failed to send binary data: {}", e))
-                    })?;
+                    client
+                        .send_message(&text, "agent", Some("data"), false)
+                        .await
+                        .map_err(|e| {
+                            DAGError::LiveKitEndpointError(format!(
+                                "Failed to send binary data: {}",
+                                e
+                            ))
+                        })?;
 
                     Ok(DAGData::Empty)
                 }

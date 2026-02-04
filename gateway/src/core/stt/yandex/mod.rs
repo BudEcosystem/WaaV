@@ -68,7 +68,7 @@ pub mod config;
 pub mod messages;
 
 // Re-export main types
-pub use client::{YandexSTT, YANDEX_STT_RECOGNIZE_URL};
+pub use client::{YANDEX_STT_RECOGNIZE_URL, YandexSTT};
 pub use config::{YandexSTTAudioFormat, YandexSTTConfig, YandexSTTLanguage, YandexSTTModel};
 pub use messages::{
     RecognitionAlternative, StreamingRecognitionResult, YandexSTTApiError, YandexSTTStatusCode,

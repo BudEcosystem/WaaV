@@ -543,10 +543,16 @@ impl SpeechmaticsSTTConfig {
         };
 
         // Parse language
-        let language = config.language.parse().unwrap_or(SpeechmaticsLanguage::English);
+        let language = config
+            .language
+            .parse()
+            .unwrap_or(SpeechmaticsLanguage::English);
 
         // Parse encoding
-        let encoding = config.encoding.parse().unwrap_or(SpeechmaticsEncoding::PcmS16le);
+        let encoding = config
+            .encoding
+            .parse()
+            .unwrap_or(SpeechmaticsEncoding::PcmS16le);
 
         Ok(Self {
             api_key,

@@ -33,20 +33,20 @@
 //! }
 //! ```
 
+pub mod client;
 pub mod config;
 pub mod messages;
-pub mod client;
 
 // Re-export public types
+pub use client::GladiaSTT;
 pub use config::{
     GladiaBitDepth, GladiaEncoding, GladiaLanguageConfig, GladiaMessagesConfig,
     GladiaPreProcessing, GladiaRealtimeProcessing, GladiaRegion, GladiaSTTConfig,
 };
 pub use messages::{
-    AudioChunkMessage, GladiaError, InitSessionRequest, InitSessionResponse,
-    StopRecordingMessage, TranscriptData, TranscriptMessage, UtteranceData, WordData,
+    AudioChunkMessage, GladiaError, InitSessionRequest, InitSessionResponse, StopRecordingMessage,
+    TranscriptData, TranscriptMessage, UtteranceData, WordData,
 };
-pub use client::GladiaSTT;
 
 // =============================================================================
 // Constants

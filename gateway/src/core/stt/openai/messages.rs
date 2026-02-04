@@ -352,11 +352,9 @@ impl TranscriptionResult {
     /// If no log probabilities are available, returns 1.0 (full confidence).
     pub fn confidence(&self) -> f32 {
         match self {
-            Self::Verbose(r) if !r.segments.is_empty() => {
-                Self::calculate_confidence_from_logprobs(
-                    r.segments.iter().filter_map(|seg| seg.avg_logprob),
-                )
-            }
+            Self::Verbose(r) if !r.segments.is_empty() => Self::calculate_confidence_from_logprobs(
+                r.segments.iter().filter_map(|seg| seg.avg_logprob),
+            ),
             Self::Diarized(r) if !r.segments.is_empty() => {
                 Self::calculate_confidence_from_logprobs(
                     r.segments.iter().filter_map(|seg| seg.avg_logprob),
@@ -368,9 +366,8 @@ impl TranscriptionResult {
 
     /// Helper function to calculate confidence from log probabilities.
     fn calculate_confidence_from_logprobs(logprobs: impl Iterator<Item = f64>) -> f32 {
-        let (sum, count) = logprobs.fold((0.0, 0), |(sum, count), logprob| {
-            (sum + logprob, count + 1)
-        });
+        let (sum, count) =
+            logprobs.fold((0.0, 0), |(sum, count), logprob| (sum + logprob, count + 1));
 
         if count > 0 {
             // Convert log probability to linear probability
@@ -649,7 +646,10 @@ mod tests {
         }"#;
 
         let response: DiarizedTranscriptionResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.text, "Hello from speaker one. Hi from speaker two.");
+        assert_eq!(
+            response.text,
+            "Hello from speaker one. Hi from speaker two."
+        );
         assert_eq!(response.language, Some("en".to_string()));
         assert_eq!(response.duration, Some(5.0));
         assert_eq!(response.speakers.len(), 2);
@@ -869,21 +869,19 @@ mod tests {
             language: None,
             duration: None,
             speakers: vec![],
-            segments: vec![
-                DiarizedSegment {
-                    id: 0,
-                    start: 0.0,
-                    end: 1.0,
-                    text: "Test".to_string(),
-                    speaker: None,
-                    avg_logprob: Some(-0.2), // Should map to ~0.8 confidence
-                    no_speech_prob: None,
-                    tokens: vec![],
-                    temperature: None,
-                    compression_ratio: None,
-                    seek: None,
-                },
-            ],
+            segments: vec![DiarizedSegment {
+                id: 0,
+                start: 0.0,
+                end: 1.0,
+                text: "Test".to_string(),
+                speaker: None,
+                avg_logprob: Some(-0.2), // Should map to ~0.8 confidence
+                no_speech_prob: None,
+                tokens: vec![],
+                temperature: None,
+                compression_ratio: None,
+                seek: None,
+            }],
             words: vec![],
         });
 

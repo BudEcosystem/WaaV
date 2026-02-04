@@ -20,18 +20,18 @@
 //! - Max File Size: 1 MB
 
 use super::config::{
-    NectecSttConfig, NectecSttModel, Partii4Response, Partii5Response, API_KEY_HEADER, LIB_HEADER,
-    LIB_VALUE, MAX_AUDIO_SIZE_BYTES,
+    API_KEY_HEADER, LIB_HEADER, LIB_VALUE, MAX_AUDIO_SIZE_BYTES, NectecSttConfig, NectecSttModel,
+    Partii4Response, Partii5Response,
 };
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTConnectionState, STTError, STTErrorCallback, STTResult,
     STTResultCallback,
 };
 use bytes::Bytes;
-use reqwest::multipart::{Form, Part};
 use reqwest::Client;
-use std::sync::atomic::{AtomicBool, Ordering};
+use reqwest::multipart::{Form, Part};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -68,10 +68,7 @@ pub struct NectecStt {
 impl NectecStt {
     /// Process buffered audio and get transcription using Partii5.
     async fn process_partii5(&self, wav_data: Vec<u8>) -> Result<String, STTError> {
-        debug!(
-            "NECTEC STT: Sending {} bytes to Partii5",
-            wav_data.len()
-        );
+        debug!("NECTEC STT: Sending {} bytes to Partii5", wav_data.len());
 
         let part = Part::bytes(wav_data)
             .file_name("audio.wav")
@@ -98,16 +95,18 @@ impl NectecStt {
                 .await
                 .unwrap_or_else(|_| "Unable to read error body".to_string());
 
-            error!("NECTEC STT: API error (status {}): {}", status.as_u16(), body);
+            error!(
+                "NECTEC STT: API error (status {}): {}",
+                status.as_u16(),
+                body
+            );
 
             return match status.as_u16() {
                 401 => Err(STTError::AuthenticationFailed(format!(
                     "Invalid API key: {body}"
                 ))),
                 429 => Err(STTError::ProviderError(format!("Rate limited: {body}"))),
-                400 => Err(STTError::ConfigurationError(format!(
-                    "Bad request: {body}"
-                ))),
+                400 => Err(STTError::ConfigurationError(format!("Bad request: {body}"))),
                 _ => Err(STTError::ProviderError(format!(
                     "API error (status {}): {}",
                     status.as_u16(),
@@ -142,10 +141,7 @@ impl NectecStt {
 
     /// Process buffered audio and get transcription using Partii4.
     async fn process_partii4(&self, wav_data: Vec<u8>) -> Result<String, STTError> {
-        debug!(
-            "NECTEC STT: Sending {} bytes to Partii4",
-            wav_data.len()
-        );
+        debug!("NECTEC STT: Sending {} bytes to Partii4", wav_data.len());
 
         let part = Part::bytes(wav_data)
             .file_name("audio.wav")
@@ -154,7 +150,10 @@ impl NectecStt {
 
         let form = Form::new()
             .part("wavfile", part)
-            .text("outputlevel", self.config.output_level.as_param().to_string())
+            .text(
+                "outputlevel",
+                self.config.output_level.as_param().to_string(),
+            )
             .text(
                 "outputformat",
                 self.config.output_format.as_param().to_string(),
@@ -179,16 +178,18 @@ impl NectecStt {
                 .await
                 .unwrap_or_else(|_| "Unable to read error body".to_string());
 
-            error!("NECTEC STT: API error (status {}): {}", status.as_u16(), body);
+            error!(
+                "NECTEC STT: API error (status {}): {}",
+                status.as_u16(),
+                body
+            );
 
             return match status.as_u16() {
                 401 => Err(STTError::AuthenticationFailed(format!(
                     "Invalid API key: {body}"
                 ))),
                 429 => Err(STTError::ProviderError(format!("Rate limited: {body}"))),
-                400 => Err(STTError::ConfigurationError(format!(
-                    "Bad request: {body}"
-                ))),
+                400 => Err(STTError::ConfigurationError(format!("Bad request: {body}"))),
                 _ => Err(STTError::ProviderError(format!(
                     "API error (status {}): {}",
                     status.as_u16(),
@@ -591,7 +592,8 @@ mod tests {
         assert_eq!(&wav_data[36..40], b"data");
 
         // Check data size
-        let data_size = u32::from_le_bytes([wav_data[40], wav_data[41], wav_data[42], wav_data[43]]);
+        let data_size =
+            u32::from_le_bytes([wav_data[40], wav_data[41], wav_data[42], wav_data[43]]);
         assert_eq!(data_size as usize, pcm_data.len());
     }
 

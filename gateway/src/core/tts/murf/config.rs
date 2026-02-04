@@ -914,7 +914,10 @@ mod tests {
     fn test_channel_type() {
         assert_eq!(MurfChannelType::Mono.as_str(), "MONO");
         assert_eq!(MurfChannelType::Stereo.as_str(), "STEREO");
-        assert_eq!(MurfChannelType::from_str("mono"), Some(MurfChannelType::Mono));
+        assert_eq!(
+            MurfChannelType::from_str("mono"),
+            Some(MurfChannelType::Mono)
+        );
     }
 
     #[test]

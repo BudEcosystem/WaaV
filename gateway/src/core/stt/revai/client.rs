@@ -4,12 +4,12 @@
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{client::IntoClientRequest, Message},
+    tungstenite::{Message, client::IntoClientRequest},
 };
 use tracing::{debug, error, info, trace, warn};
 
@@ -17,16 +17,18 @@ use crate::core::stt::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback, STTStats,
 };
 
+use super::EOS_MESSAGE;
 use super::config::RevAISTTConfig;
 use super::messages::{RevAICloseCode, ServerMessage};
-use super::EOS_MESSAGE;
 
 // =============================================================================
 // Type Aliases
 // =============================================================================
 
-type WebSocketSink =
-    futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>;
+type WebSocketSink = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    Message,
+>;
 
 // =============================================================================
 // Rev AI STT Client
@@ -107,12 +109,8 @@ impl RevAISTT {
                     trace!(text = %text, ts = %partial.ts, "Rev AI: Partial transcript");
 
                     if let Some(ref callback) = *result_callback.read().await {
-                        let result = STTResult::new(
-                            text,
-                            false,
-                            false,
-                            partial.average_confidence() as f32,
-                        );
+                        let result =
+                            STTResult::new(text, false, false, partial.average_confidence() as f32);
                         callback(result).await;
                     }
                 }
@@ -230,9 +228,9 @@ impl BaseSTT for RevAISTT {
             .map_err(|e| STTError::ConnectionFailed(format!("Failed to create request: {}", e)))?;
 
         // Connect to WebSocket
-        let (ws_stream, response) = connect_async(request)
-            .await
-            .map_err(|e| STTError::ConnectionFailed(format!("WebSocket connection failed: {}", e)))?;
+        let (ws_stream, response) = connect_async(request).await.map_err(|e| {
+            STTError::ConnectionFailed(format!("WebSocket connection failed: {}", e))
+        })?;
 
         debug!(status = ?response.status(), "Rev AI: WebSocket connection established");
 
@@ -324,7 +322,10 @@ impl BaseSTT for RevAISTT {
             let mut sink = ws_sink.write().await;
 
             // Send EOS text message
-            if let Err(e) = sink.send(Message::Text(EOS_MESSAGE.to_string().into())).await {
+            if let Err(e) = sink
+                .send(Message::Text(EOS_MESSAGE.to_string().into()))
+                .await
+            {
                 warn!(error = %e, "Rev AI: Failed to send EOS message");
             }
 

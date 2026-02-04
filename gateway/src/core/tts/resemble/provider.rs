@@ -4,11 +4,11 @@
 //! using HTTP streaming for real-time audio synthesis.
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use tracing::{debug, info};
 
-use super::config::{ResembleStreamRequest, ResembleTtsConfig, ResembleVoicesResponse};
 use super::RESEMBLE_TTS_STREAM_URL;
+use super::config::{ResembleStreamRequest, ResembleTtsConfig, ResembleVoicesResponse};
 use crate::core::tts::base::{BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult};
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
 
@@ -307,9 +307,7 @@ mod tests {
 
         if let Err(TTSError::InvalidConfiguration(msg)) = result {
             assert!(
-                msg.contains("API")
-                    || msg.contains("api_key")
-                    || msg.contains("RESEMBLE_API_KEY")
+                msg.contains("API") || msg.contains("api_key") || msg.contains("RESEMBLE_API_KEY")
             );
         } else {
             panic!("Expected InvalidConfiguration error");
@@ -361,7 +359,10 @@ mod tests {
         let resemble_config = ResembleTtsConfig::from_base(&config).unwrap();
         let builder = ResembleRequestBuilder::new(resemble_config, config);
 
-        assert_eq!(builder.resemble_config().model, ResembleModel::ChatterboxTurbo);
+        assert_eq!(
+            builder.resemble_config().model,
+            ResembleModel::ChatterboxTurbo
+        );
     }
 
     #[test]

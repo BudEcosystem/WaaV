@@ -32,8 +32,8 @@ use std::sync::Arc;
 
 use abi_stable::library::{LibraryError, RootModule};
 use waav_plugin_api::{
-    FFIConfig, PluginCapabilityType, PluginManifest, PluginModule_Ref,
-    RealtimeProvider, STTProvider, TTSProvider,
+    FFIConfig, PluginCapabilityType, PluginManifest, PluginModule_Ref, RealtimeProvider,
+    STTProvider, TTSProvider,
 };
 
 use super::metadata::ProviderMetadata;
@@ -282,7 +282,10 @@ impl DynamicPluginLoader {
     }
 
     /// Check if a plugin is compatible with the current gateway version
-    fn check_version_compatibility(&self, manifest: &PluginManifest) -> Result<(), PluginLoadError> {
+    fn check_version_compatibility(
+        &self,
+        manifest: &PluginManifest,
+    ) -> Result<(), PluginLoadError> {
         let version_req_str = manifest.gateway_version_req.as_str();
 
         // Empty requirement means any version is acceptable
@@ -322,13 +325,17 @@ impl DynamicPluginLoader {
                 }
                 PluginCapabilityType::TTS => {
                     // create_tts is a suffix field, returns Option<ROption>
-                    if let Some(abi_stable::std_types::ROption::RSome(create_fn)) = module.create_tts() {
+                    if let Some(abi_stable::std_types::ROption::RSome(create_fn)) =
+                        module.create_tts()
+                    {
                         self.register_tts_factory(manifest, create_fn, registry);
                     }
                 }
                 PluginCapabilityType::Realtime => {
                     // create_realtime is a suffix field, returns Option<ROption>
-                    if let Some(abi_stable::std_types::ROption::RSome(create_fn)) = module.create_realtime() {
+                    if let Some(abi_stable::std_types::ROption::RSome(create_fn)) =
+                        module.create_realtime()
+                    {
                         self.register_realtime_factory(manifest, create_fn, registry);
                     }
                 }
@@ -347,7 +354,12 @@ impl DynamicPluginLoader {
     fn register_stt_factory(
         &self,
         manifest: &PluginManifest,
-        create_fn: extern "C" fn(*const FFIConfig) -> abi_stable::std_types::RResult<STTProvider, abi_stable::std_types::RString>,
+        create_fn: extern "C" fn(
+            *const FFIConfig,
+        ) -> abi_stable::std_types::RResult<
+            STTProvider,
+            abi_stable::std_types::RString,
+        >,
         registry: &PluginRegistry,
     ) {
         let plugin_id = manifest.id.to_string();
@@ -356,8 +368,7 @@ impl DynamicPluginLoader {
         // Create factory function that wraps the FFI call
         let factory: STTFactoryFn = Arc::new(move |config: STTConfig| {
             // Convert config to JSON
-            let config_json = serde_json::to_string(&config)
-                .unwrap_or_else(|_| "{}".to_string());
+            let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
             let ffi_config = FFIConfig::from_json(config_json);
 
             // Call the plugin's factory
@@ -377,7 +388,7 @@ impl DynamicPluginLoader {
 
         // Create metadata
         let metadata = ProviderMetadata::stt(&plugin_id, &plugin_name)
-            .with_feature("streaming")  // Assume streaming capability
+            .with_feature("streaming") // Assume streaming capability
             .with_description(manifest.description.to_string());
 
         registry.register_stt(&plugin_id, factory, metadata);
@@ -392,15 +403,19 @@ impl DynamicPluginLoader {
     fn register_tts_factory(
         &self,
         manifest: &PluginManifest,
-        create_fn: extern "C" fn(*const FFIConfig) -> abi_stable::std_types::RResult<TTSProvider, abi_stable::std_types::RString>,
+        create_fn: extern "C" fn(
+            *const FFIConfig,
+        ) -> abi_stable::std_types::RResult<
+            TTSProvider,
+            abi_stable::std_types::RString,
+        >,
         registry: &PluginRegistry,
     ) {
         let plugin_id = manifest.id.to_string();
         let plugin_name = manifest.name.to_string();
 
         let factory: TTSFactoryFn = Arc::new(move |config: TTSConfig| {
-            let config_json = serde_json::to_string(&config)
-                .unwrap_or_else(|_| "{}".to_string());
+            let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
             let ffi_config = FFIConfig::from_json(config_json);
 
             let result = create_fn(&ffi_config as *const _);
@@ -432,24 +447,28 @@ impl DynamicPluginLoader {
     fn register_realtime_factory(
         &self,
         manifest: &PluginManifest,
-        create_fn: extern "C" fn(*const FFIConfig) -> abi_stable::std_types::RResult<RealtimeProvider, abi_stable::std_types::RString>,
+        create_fn: extern "C" fn(
+            *const FFIConfig,
+        ) -> abi_stable::std_types::RResult<
+            RealtimeProvider,
+            abi_stable::std_types::RString,
+        >,
         registry: &PluginRegistry,
     ) {
         let plugin_id = manifest.id.to_string();
         let plugin_name = manifest.name.to_string();
 
         let factory: RealtimeFactoryFn = Arc::new(move |config: RealtimeConfig| {
-            let config_json = serde_json::to_string(&config)
-                .unwrap_or_else(|_| "{}".to_string());
+            let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
             let ffi_config = FFIConfig::from_json(config_json);
 
             let result = create_fn(&ffi_config as *const _);
 
             match result {
-                abi_stable::std_types::RResult::ROk(provider) => {
-                    Ok(Box::new(super::ffi_adapters::FFIRealtimeAdapter::new(provider))
-                        as Box<dyn crate::core::realtime::BaseRealtime>)
-                }
+                abi_stable::std_types::RResult::ROk(provider) => Ok(Box::new(
+                    super::ffi_adapters::FFIRealtimeAdapter::new(provider),
+                )
+                    as Box<dyn crate::core::realtime::BaseRealtime>),
                 abi_stable::std_types::RResult::RErr(e) => {
                     Err(RealtimeError::InvalidConfiguration(e.to_string()))
                 }
@@ -578,10 +597,7 @@ mod tests {
                 loader.extract_plugin_name(Path::new("libwaav_plugin_my_stt.so")),
                 Some("my_stt".to_string())
             );
-            assert_eq!(
-                loader.extract_plugin_name(Path::new("libother.so")),
-                None
-            );
+            assert_eq!(loader.extract_plugin_name(Path::new("libother.so")), None);
             assert_eq!(
                 loader.extract_plugin_name(Path::new("waav_plugin_test.dll")),
                 None
@@ -594,18 +610,16 @@ mod tests {
         let loader = DynamicPluginLoader::new();
 
         // Valid version requirements
-        let manifest = PluginManifest::new("test", "Test", "1.0.0")
-            .with_gateway_version(">=1.0.0");
+        let manifest = PluginManifest::new("test", "Test", "1.0.0").with_gateway_version(">=1.0.0");
         assert!(loader.check_version_compatibility(&manifest).is_ok());
 
         // Empty version requirement (always valid)
-        let manifest = PluginManifest::new("test", "Test", "1.0.0")
-            .with_gateway_version("");
+        let manifest = PluginManifest::new("test", "Test", "1.0.0").with_gateway_version("");
         assert!(loader.check_version_compatibility(&manifest).is_ok());
 
         // Invalid version requirement syntax
-        let manifest = PluginManifest::new("test", "Test", "1.0.0")
-            .with_gateway_version("not-a-version");
+        let manifest =
+            PluginManifest::new("test", "Test", "1.0.0").with_gateway_version("not-a-version");
         assert!(loader.check_version_compatibility(&manifest).is_err());
     }
 

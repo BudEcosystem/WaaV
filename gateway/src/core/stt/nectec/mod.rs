@@ -51,10 +51,10 @@ pub mod config;
 
 pub use client::NectecStt;
 pub use config::{
-    NectecSttConfig, NectecSttError, NectecSttModel, Partii4OutputFormat, Partii4OutputLevel,
-    Partii4Response, Partii5Response, API_KEY_HEADER, DEFAULT_CHANNELS, DEFAULT_REQUEST_TIMEOUT,
-    DEFAULT_SAMPLE_RATE, LIB_HEADER, LIB_VALUE, MAX_AUDIO_DURATION_MS, MAX_AUDIO_SIZE_BYTES,
-    MIN_AUDIO_DURATION_MS, PARTII4_ENDPOINT, PARTII5_ENDPOINT,
+    API_KEY_HEADER, DEFAULT_CHANNELS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SAMPLE_RATE, LIB_HEADER,
+    LIB_VALUE, MAX_AUDIO_DURATION_MS, MAX_AUDIO_SIZE_BYTES, MIN_AUDIO_DURATION_MS, NectecSttConfig,
+    NectecSttError, NectecSttModel, PARTII4_ENDPOINT, PARTII5_ENDPOINT, Partii4OutputFormat,
+    Partii4OutputLevel, Partii4Response, Partii5Response,
 };
 
 #[cfg(test)]

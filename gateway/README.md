@@ -682,6 +682,38 @@ For complete plugin development documentation, see [docs/plugins.md](docs/plugin
 4. Add tests for new features
 5. Ensure `cargo fmt` and `cargo clippy` pass
 
+## Changelog
+
+### 2026-02-04 — Deepgram STT CloseStream Fix & E2E Pipeline Improvements
+
+**Critical Bug Fix: Deepgram speech_final not received after CloseStream**
+
+- **Fixed**: After sending `CloseStream` to Deepgram, the gateway now actively receives WebSocket messages for up to 1 second to capture the `speech_final` response. Previously, the code only slept and broke out of the event loop, losing any final transcripts Deepgram returned.
+- **Fixed**: STT callbacks are now preserved across disconnect/reconnect cycles. Previously, `disconnect()` cleared `result_callback` and `error_callback`, causing reconnected streams to silently drop results.
+- **Fixed**: Added a 100ms drain delay before aborting the result forwarding task during disconnect, ensuring pending results in the channel are processed before cleanup.
+
+**End-to-End Pipeline**
+
+- Added `audio_end` WebSocket message type for clients to signal end of audio transmission, triggering STT stream finalization and `CloseStream`.
+- Added `finalize_stt()` method to `VoiceManager` for explicit STT stream finalization with automatic reconnection.
+- Reduced `speech_final_hard_timeout` from 5000ms to 2500ms and `stt_speech_final_wait` from 2000ms to 1800ms for faster fallback response.
+
+**Noise Filter**
+
+- Adjusted DeepFilterNet high-SNR thresholds (`RMS: 0.1 → 0.15`, `Peak: 0.3 → 0.4`) to apply full noise processing to more audio samples, improving transcription accuracy for noisy inputs.
+
+**Live Testing Infrastructure**
+
+- Added comprehensive E2E test suite (`full_e2e_test.py`) with 5 test cases: TTS-generated speech, questions, CMU Arctic recordings, Harvard Sentences, and noisy (10dB SNR) audio.
+- Added reusable WebSocket test client (`waav_test_client.py`) with latency instrumentation at every pipeline stage.
+- Test results: **5/5 passing** (100%), avg E2E latency 3.4s (dominated by cloud TTS synthesis).
+
+**Provider Improvements**
+
+- Enhanced configuration and error handling across 70+ STT/TTS providers.
+- Improved DAG pipeline compiler, executor, and node implementations.
+- Added Smart Turn detection infrastructure (Silero VAD + ML turn detection).
+
 ## Support
 
 For issues, questions, or contributions, please visit the [GitHub repository](https://github.com/waav-gatewayai/waav-gateway).

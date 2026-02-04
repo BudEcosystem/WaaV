@@ -17,8 +17,8 @@
 //! - Sample Rate: 16000 Hz or 8000 Hz
 //! - Encoding: PCM, MP3, Speex, Speex-WB
 
-use crate::core::tts::base::{TTSConfig, TTSError};
 use crate::core::stt::iflytek::IFlytekAuth;
+use crate::core::tts::base::{TTSConfig, TTSError};
 
 // =============================================================================
 // Constants
@@ -380,10 +380,7 @@ impl IFlytekTtsConfig {
 
     /// Get list of available voices.
     pub fn available_voices() -> Vec<&'static str> {
-        IFlytekVoice::all()
-            .iter()
-            .map(|v| v.as_code())
-            .collect()
+        IFlytekVoice::all().iter().map(|v| v.as_code()).collect()
     }
 }
 
@@ -506,11 +503,7 @@ mod tests {
     #[test]
     fn test_config_validation_invalid_sample_rate() {
         let mut config = IFlytekTtsConfig::default();
-        config.auth = IFlytekAuth::new(
-            "app".to_string(),
-            "key".to_string(),
-            "secret".to_string(),
-        );
+        config.auth = IFlytekAuth::new("app".to_string(), "key".to_string(), "secret".to_string());
         config.sample_rate = 44100;
         assert!(config.validate().is_err());
     }
@@ -518,11 +511,7 @@ mod tests {
     #[test]
     fn test_config_validation_invalid_speed() {
         let mut config = IFlytekTtsConfig::default();
-        config.auth = IFlytekAuth::new(
-            "app".to_string(),
-            "key".to_string(),
-            "secret".to_string(),
-        );
+        config.auth = IFlytekAuth::new("app".to_string(), "key".to_string(), "secret".to_string());
         config.speed = 150;
         assert!(config.validate().is_err());
     }

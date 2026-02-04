@@ -107,9 +107,7 @@ impl ReverieAsrResult {
 
     /// Get the best available text (display_text or text)
     pub fn best_text(&self) -> Option<&str> {
-        self.display_text
-            .as_deref()
-            .or(self.text.as_deref())
+        self.display_text.as_deref().or(self.text.as_deref())
     }
 
     /// Check if this is a final result that should close the connection

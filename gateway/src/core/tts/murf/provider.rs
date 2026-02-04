@@ -4,11 +4,11 @@
 //! using HTTP streaming for real-time audio synthesis.
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use tracing::{debug, info};
 
-use super::config::{MurfStreamRequest, MurfTtsConfig, MurfVoice};
 use super::MURF_VOICES_URL;
+use super::config::{MurfStreamRequest, MurfTtsConfig, MurfVoice};
 use crate::core::tts::base::{BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult};
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
 
@@ -69,7 +69,8 @@ impl TTSRequestBuilder for MurfRequestBuilder {
         // Murf uses 'api-key' header (NOT Authorization: Bearer)
         headers.insert(
             "api-key",
-            HeaderValue::from_str(&self.config.api_key).unwrap_or_else(|_| HeaderValue::from_static("")),
+            HeaderValue::from_str(&self.config.api_key)
+                .unwrap_or_else(|_| HeaderValue::from_static("")),
         );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
@@ -200,10 +201,7 @@ impl BaseTTS for MurfTts {
 
         info!(
             "Creating Murf TTS provider: voice={}, model={}, format={}, region={}",
-            murf_config.voice_id,
-            murf_config.model,
-            murf_config.format,
-            murf_config.region
+            murf_config.voice_id, murf_config.model, murf_config.format, murf_config.region
         );
 
         Ok(Self {

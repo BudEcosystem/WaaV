@@ -10,15 +10,15 @@
 mod mock_providers;
 
 use mock_providers::{
+    ChaosConfig, LatencyProfile, MockStats,
     http_mock::{HttpMockState, spawn_http_mock},
     websocket_mock::{WebSocketMockState, spawn_stt_websocket_mock, spawn_tts_websocket_mock},
-    ChaosConfig, LatencyProfile, MockStats,
 };
 
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Barrier;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -44,7 +44,8 @@ impl LoadTestStats {
 
     fn record(&self, latency_ms: u64, success: bool) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
-        self.total_latency_ms.fetch_add(latency_ms, Ordering::Relaxed);
+        self.total_latency_ms
+            .fetch_add(latency_ms, Ordering::Relaxed);
 
         if success {
             self.successful_requests.fetch_add(1, Ordering::Relaxed);
@@ -117,10 +118,8 @@ async fn test_http_tts_load_with_mock() {
     println!("╠══════════════════════════════════════════════════════════════╣");
 
     // Start mock HTTP server (ElevenLabs-style)
-    let mock_state = HttpMockState::new(
-        LatencyProfile::elevenlabs_tts(),
-        ChaosConfig::production(),
-    );
+    let mock_state =
+        HttpMockState::new(LatencyProfile::elevenlabs_tts(), ChaosConfig::production());
     let _mock_handle = spawn_http_mock(18765, mock_state);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -334,12 +333,15 @@ async fn test_http_with_chaos() {
     let failed = stats.failed_requests.load(Ordering::Relaxed);
     let failure_rate = failed as f64 / total as f64 * 100.0;
 
-    println!("║  Actual failure rate: {:.2}%% (expected ~15-20%%)              ║", failure_rate);
+    println!(
+        "║  Actual failure rate: {:.2}%% (expected ~15-20%%)              ║",
+        failure_rate
+    );
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
     // With chaos, expect some failures
     assert!(total == 200, "Should have 200 total requests");
-    assert!(failure_rate > 5.0, "Chaos should cause >5% failures");
+    assert!(failure_rate >= 5.0, "Chaos should cause >=5% failures");
     assert!(failure_rate < 50.0, "Chaos shouldn't cause >50% failures");
 }
 
@@ -411,15 +413,32 @@ async fn test_gateway_overhead_measurement() {
 
     println!("║                                                              ║");
     println!("║  Results (Gateway Overhead Only):                            ║");
-    println!("║  Total: {}, Success: {} ({:.2}%)                         ║", total, success, (success as f64 / total as f64) * 100.0);
-    println!("║  Avg Gateway Latency: {}ms                                   ║", avg);
-    println!("║  Min Gateway Latency: {}ms                                   ║", if min == u64::MAX { 0 } else { min });
-    println!("║  Max Gateway Latency: {}ms                                   ║", max);
+    println!(
+        "║  Total: {}, Success: {} ({:.2}%)                         ║",
+        total,
+        success,
+        (success as f64 / total as f64) * 100.0
+    );
+    println!(
+        "║  Avg Gateway Latency: {}ms                                   ║",
+        avg
+    );
+    println!(
+        "║  Min Gateway Latency: {}ms                                   ║",
+        if min == u64::MAX { 0 } else { min }
+    );
+    println!(
+        "║  Max Gateway Latency: {}ms                                   ║",
+        max
+    );
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
     // Gateway overhead should be <10ms for most requests
     assert!(total == 1000, "Should have 1000 total requests");
-    assert!(success as f64 / total as f64 > 0.99, "Should have >99% success");
+    assert!(
+        success as f64 / total as f64 > 0.99,
+        "Should have >99% success"
+    );
     assert!(avg < 50, "Average gateway overhead should be <50ms");
 }
 
@@ -502,7 +521,10 @@ async fn test_websocket_high_concurrency() {
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
     assert!(total == 500, "Should have 500 total messages");
-    assert!(success_rate > 90.0, "Should have >90% success rate under high concurrency");
+    assert!(
+        success_rate > 90.0,
+        "Should have >90% success rate under high concurrency"
+    );
 }
 
 /// Summary test

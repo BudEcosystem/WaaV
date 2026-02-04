@@ -47,21 +47,18 @@ use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::{
     connect_async_with_config,
-    tungstenite::{
-        http::Request,
-        protocol::Message,
-    },
+    tungstenite::{http::Request, protocol::Message},
 };
 use tracing::{debug, error, info, warn};
 
-use crate::core::stt::base::{
-    BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
-};
 use super::auth::HuaweiTokenManager;
 use super::config::{HuaweiCloudAsrMode, HuaweiCloudSttConfig};
 use super::messages::{
     HuaweiEndFrame, HuaweiRealtimeResponse, HuaweiShortAsrRequest, HuaweiShortAsrResponse,
     HuaweiStartFrame,
+};
+use crate::core::stt::base::{
+    BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
 
 // =============================================================================
@@ -259,9 +256,7 @@ impl HuaweiCloudStt {
                 )));
             }
             Err(_) => {
-                return Err(STTError::ConnectionFailed(
-                    "Connection timeout".to_string(),
-                ));
+                return Err(STTError::ConnectionFailed("Connection timeout".to_string()));
             }
         };
 
@@ -289,14 +284,16 @@ impl HuaweiCloudStt {
             self.config.need_word_info,
         );
 
-        let start_json = start_frame
-            .to_json()
-            .map_err(|e| STTError::ConnectionFailed(format!("Failed to serialize START frame: {}", e)))?;
+        let start_json = start_frame.to_json().map_err(|e| {
+            STTError::ConnectionFailed(format!("Failed to serialize START frame: {}", e))
+        })?;
 
         write
             .send(Message::Text(start_json.into()))
             .await
-            .map_err(|e| STTError::ConnectionFailed(format!("Failed to send START frame: {}", e)))?;
+            .map_err(|e| {
+                STTError::ConnectionFailed(format!("Failed to send START frame: {}", e))
+            })?;
 
         debug!("Sent Huawei Cloud START frame");
 
@@ -316,7 +313,11 @@ impl HuaweiCloudStt {
             let send_task = tokio::spawn(async move {
                 while let Some(audio) = audio_rx.recv().await {
                     // Send binary audio data
-                    if write.send(Message::Binary(audio.to_vec().into())).await.is_err() {
+                    if write
+                        .send(Message::Binary(audio.to_vec().into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -350,7 +351,8 @@ impl HuaweiCloudStt {
                         }
                         Err(e) => {
                             error!("Huawei Cloud WebSocket error: {}", e);
-                            let _ = error_tx_clone.try_send(STTError::ConnectionFailed(e.to_string()));
+                            let _ =
+                                error_tx_clone.try_send(STTError::ConnectionFailed(e.to_string()));
                             break;
                         }
                         _ => {}
@@ -447,7 +449,11 @@ impl HuaweiCloudStt {
 
                     debug!(
                         "Huawei Cloud transcript ({}): {}",
-                        if response.is_final() { "final" } else { "interim" },
+                        if response.is_final() {
+                            "final"
+                        } else {
+                            "interim"
+                        },
                         transcript
                     );
 
@@ -455,7 +461,10 @@ impl HuaweiCloudStt {
                 }
             }
             Err(e) => {
-                warn!("Failed to parse Huawei Cloud response: {} - raw: {}", e, text);
+                warn!(
+                    "Failed to parse Huawei Cloud response: {} - raw: {}",
+                    e, text
+                );
             }
         }
     }
@@ -476,13 +485,17 @@ impl HuaweiCloudStt {
             self.config.need_word_info,
         );
 
-        let request_json = request
-            .to_json()
-            .map_err(|e| STTError::AudioProcessingError(format!("Failed to serialize request: {}", e)))?;
+        let request_json = request.to_json().map_err(|e| {
+            STTError::AudioProcessingError(format!("Failed to serialize request: {}", e))
+        })?;
 
         let url = self.config.get_short_asr_url();
 
-        debug!("Sending short audio request to {}, {} bytes", url, audio_data.len());
+        debug!(
+            "Sending short audio request to {}, {} bytes",
+            url,
+            audio_data.len()
+        );
 
         let response = self
             .http_client
@@ -633,10 +646,9 @@ impl BaseSTT for HuaweiCloudStt {
             HuaweiCloudAsrMode::Streaming | HuaweiCloudAsrMode::Continuous => {
                 // WebSocket mode: send to channel
                 if let Some(sender) = &self.ws_sender {
-                    sender
-                        .send(audio)
-                        .await
-                        .map_err(|_| STTError::ProviderError("Failed to send audio to channel".to_string()))?;
+                    sender.send(audio).await.map_err(|_| {
+                        STTError::ProviderError("Failed to send audio to channel".to_string())
+                    })?;
                 }
             }
         }

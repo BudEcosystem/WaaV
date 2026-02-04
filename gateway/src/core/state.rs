@@ -73,7 +73,7 @@ impl CoreState {
                 Arc::new(
                     CacheStore::from_config(fallback_cfg)
                         .await
-                        .expect("fallback in-memory cache must succeed")
+                        .expect("fallback in-memory cache must succeed"),
                 )
             }
         };

@@ -73,19 +73,11 @@
 //! ```
 
 #[cfg(feature = "dag-routing")]
-pub mod definition;
-#[cfg(feature = "dag-routing")]
 pub mod compiler;
-#[cfg(feature = "dag-routing")]
-pub mod executor;
 #[cfg(feature = "dag-routing")]
 pub mod context;
 #[cfg(feature = "dag-routing")]
-pub mod routing;
-#[cfg(feature = "dag-routing")]
-pub mod metrics;
-#[cfg(feature = "dag-routing")]
-pub mod nodes;
+pub mod definition;
 #[cfg(feature = "dag-routing")]
 pub mod edges;
 #[cfg(feature = "dag-routing")]
@@ -93,37 +85,46 @@ pub mod endpoints;
 #[cfg(feature = "dag-routing")]
 pub mod error;
 #[cfg(feature = "dag-routing")]
+pub mod executor;
+#[cfg(feature = "dag-routing")]
+pub mod metrics;
+#[cfg(feature = "dag-routing")]
+pub mod nodes;
+#[cfg(feature = "dag-routing")]
+pub mod routing;
+#[cfg(feature = "dag-routing")]
 pub mod templates;
 
 // Re-export commonly used types for convenience
 #[cfg(feature = "dag-routing")]
-pub use definition::{DAGDefinition, NodeDefinition, EdgeDefinition, NodeType};
-#[cfg(feature = "dag-routing")]
-pub use compiler::{DAGCompiler, CompiledDAG};
-#[cfg(feature = "dag-routing")]
-pub use executor::DAGExecutor;
+pub use compiler::{CompiledDAG, DAGCompiler};
 #[cfg(feature = "dag-routing")]
 pub use context::DAGContext;
 #[cfg(feature = "dag-routing")]
+pub use definition::{DAGDefinition, EdgeDefinition, NodeDefinition, NodeType};
+#[cfg(feature = "dag-routing")]
 pub use error::DAGError;
 #[cfg(feature = "dag-routing")]
-pub use templates::{global_templates, initialize_templates, DAGTemplateRegistry, TemplatesConfig, TemplateError};
+pub use executor::DAGExecutor;
+#[cfg(feature = "dag-routing")]
+pub use templates::{
+    DAGTemplateRegistry, TemplateError, TemplatesConfig, global_templates, initialize_templates,
+};
 
 /// Prelude module for convenient imports
 #[cfg(feature = "dag-routing")]
 pub mod prelude {
-    pub use super::definition::{
-        DAGDefinition, NodeDefinition, EdgeDefinition, NodeType,
-        OutputDestination, HttpMethod, JoinStrategy, SwitchPattern,
-        RouteDefinition, DAGConfig,
-    };
-    pub use super::compiler::{DAGCompiler, CompiledDAG};
-    pub use super::executor::DAGExecutor;
+    pub use super::compiler::{CompiledDAG, DAGCompiler};
     pub use super::context::{DAGContext, DAGTiming};
-    pub use super::error::{DAGError, DAGResult};
-    pub use super::nodes::prelude::*;
+    pub use super::definition::{
+        DAGConfig, DAGDefinition, EdgeDefinition, HttpMethod, JoinStrategy, NodeDefinition,
+        NodeType, OutputDestination, RouteDefinition, SwitchPattern,
+    };
     pub use super::edges::prelude::*;
     pub use super::endpoints::prelude::*;
+    pub use super::error::{DAGError, DAGResult};
+    pub use super::executor::DAGExecutor;
+    pub use super::nodes::prelude::*;
 }
 
 #[cfg(test)]

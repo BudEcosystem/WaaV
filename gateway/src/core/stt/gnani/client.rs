@@ -15,9 +15,9 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::{RwLock, mpsc};
 use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
@@ -26,7 +26,7 @@ use crate::core::stt::base::{
 };
 
 use super::config::GnaniSTTConfig;
-use super::grpc::{create_gnani_channel, GnaniGrpcClient};
+use super::grpc::{GnaniGrpcClient, create_gnani_channel};
 
 /// Gnani Speech-to-Text client
 ///

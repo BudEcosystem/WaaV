@@ -255,9 +255,9 @@ impl AmiVoiceEngine {
             | Self::HybridJapaneseNameInput
             | Self::HybridJapaneseAddressInput => "ja",
 
-            Self::E2EChineseGeneral
-            | Self::E2EBatchChineseGeneral
-            | Self::HybridChineseGeneral => "zh",
+            Self::E2EChineseGeneral | Self::E2EBatchChineseGeneral | Self::HybridChineseGeneral => {
+                "zh"
+            }
 
             Self::HybridEnglishGeneral => "en",
             Self::HybridKoreanGeneral => "ko",
@@ -783,7 +783,10 @@ mod tests {
             AmiVoiceEngine::HybridEnglishGeneral.primary_language(),
             "en"
         );
-        assert_eq!(AmiVoiceEngine::HybridChineseGeneral.primary_language(), "zh");
+        assert_eq!(
+            AmiVoiceEngine::HybridChineseGeneral.primary_language(),
+            "zh"
+        );
         assert_eq!(AmiVoiceEngine::HybridKoreanGeneral.primary_language(), "ko");
         assert_eq!(AmiVoiceEngine::E2EMultilingual.primary_language(), "multi");
     }
@@ -795,8 +798,10 @@ mod tests {
 
         // Check that the default engine is in the list
         let default_engine = AmiVoiceEngine::default();
-        assert!(engines
-            .iter()
-            .any(|(id, _)| id == default_engine.engine_id()));
+        assert!(
+            engines
+                .iter()
+                .any(|(id, _)| id == default_engine.engine_id())
+        );
     }
 }

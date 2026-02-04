@@ -23,10 +23,7 @@ use crate::{
 
 #[cfg(feature = "dag-routing")]
 use crate::dag::{
-    compiler::DAGCompiler,
-    context::DAGContext,
-    definition::DAGDefinition,
-    executor::DAGExecutor,
+    compiler::DAGCompiler, context::DAGContext, definition::DAGDefinition, executor::DAGExecutor,
     global_templates,
 };
 
@@ -217,14 +214,7 @@ pub async fn handle_config_message(
     // Initialize DAG routing if configured
     #[cfg(feature = "dag-routing")]
     let dag_enabled = if let Some(dag_config) = dag_ws_config {
-        match initialize_dag_routing(
-            &dag_config,
-            &stream_id,
-            state,
-            message_tx,
-        )
-        .await
-        {
+        match initialize_dag_routing(&dag_config, &stream_id, state, message_tx).await {
             Ok(true) => {
                 info!("DAG routing initialized for stream {}", stream_id);
                 true
@@ -248,10 +238,13 @@ pub async fn handle_config_message(
     #[cfg(not(feature = "dag-routing"))]
     let dag_enabled = {
         if dag_ws_config.is_some() {
-            warn!("DAG routing requested but feature not enabled. Build with --features dag-routing");
+            warn!(
+                "DAG routing requested but feature not enabled. Build with --features dag-routing"
+            );
             let _ = message_tx
                 .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                    message: "DAG routing is not enabled. Build with --features dag-routing".to_string(),
+                    message: "DAG routing is not enabled. Build with --features dag-routing"
+                        .to_string(),
                 }))
                 .await;
         }
@@ -1200,8 +1193,7 @@ async fn initialize_dag_routing(
     // Get DAG definition from template or inline
     let dag_definition: DAGDefinition = if let Some(ref def) = dag_config.definition {
         // Parse inline definition
-        serde_json::from_value(def.clone())
-            .map_err(|e| format!("Invalid DAG definition: {}", e))?
+        serde_json::from_value(def.clone()).map_err(|e| format!("Invalid DAG definition: {}", e))?
     } else if let Some(ref template_name) = dag_config.template {
         // Load from template registry
         let templates = global_templates();

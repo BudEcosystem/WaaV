@@ -194,7 +194,10 @@ impl TTSRequestBuilder for CartesiaRequestBuilder {
         if let Some(ref emotion_config) = self.config.emotion_config {
             if let Some(ref emotion) = emotion_config.emotion {
                 // Convert emotion enum to string for Cartesia API
-                generation_config.insert("emotion".to_string(), json!(emotion.to_string().to_lowercase()));
+                generation_config.insert(
+                    "emotion".to_string(),
+                    json!(emotion.to_string().to_lowercase()),
+                );
             }
         }
 
@@ -218,7 +221,10 @@ impl TTSRequestBuilder for CartesiaRequestBuilder {
             self.cartesia_config.voice_id(),
             self.cartesia_config.output_format.container,
             self.config.speaking_rate,
-            self.config.emotion_config.as_ref().and_then(|e| e.emotion.as_ref())
+            self.config
+                .emotion_config
+                .as_ref()
+                .and_then(|e| e.emotion.as_ref())
         );
 
         // Build the HTTP request with all required headers
@@ -1209,7 +1215,10 @@ mod tests {
         assert!(body_json.get("generation_config").is_some());
         // Use approximate comparison for floating point
         let speed = body_json["generation_config"]["speed"].as_f64().unwrap();
-        assert!((speed - 1.2).abs() < 0.001, "speed should be approximately 1.2");
+        assert!(
+            (speed - 1.2).abs() < 0.001,
+            "speed should be approximately 1.2"
+        );
         assert_eq!(body_json["generation_config"]["emotion"], "happy");
     }
 

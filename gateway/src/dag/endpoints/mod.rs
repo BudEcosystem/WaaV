@@ -13,20 +13,16 @@ mod webhook;
 pub use http::HttpAdapter;
 pub use webhook::WebhookAdapter;
 
-use std::time::Duration;
 use async_trait::async_trait;
+use std::time::Duration;
 
 use crate::dag::context::DAGContext;
-use crate::dag::nodes::DAGData;
 use crate::dag::error::DAGResult;
+use crate::dag::nodes::DAGData;
 
 /// Prelude for convenient imports
 pub mod prelude {
-    pub use super::{
-        EndpointAdapter,
-        HttpAdapter,
-        WebhookAdapter,
-    };
+    pub use super::{EndpointAdapter, HttpAdapter, WebhookAdapter};
 }
 
 /// Trait for endpoint adapters

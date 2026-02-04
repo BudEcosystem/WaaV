@@ -249,75 +249,68 @@ impl LiveKitClient {
             match Self::convert_audio_to_frame_ref(&audio_data, config.sample_rate, config.channels)
             {
                 Ok(audio_frame) => {
-                    // Try up to 3 times with the current frame before queuing
-                    let mut retry_count = 0;
-                    const MAX_RETRIES: usize = 3;
+                    // CRITICAL: No retries with sleep in audio hot path!
+                    // Real-time audio requires < 10ms latency per frame.
+                    // On capture failure, immediately queue and continue.
+                    match source.capture_frame(&audio_frame).await {
+                        Ok(()) => {
+                            debug!("Successfully sent audio frame directly");
 
-                    loop {
-                        match source.capture_frame(&audio_frame).await {
-                            Ok(()) => {
-                                debug!("Successfully sent audio frame directly");
-
-                                // Try to drain any queued audio now that we have capacity
-                                let queued_data: Vec<Vec<u8>> = {
-                                    let mut queue = audio_queue.lock().await;
-                                    if !queue.is_empty() && queue.len() <= 5 {
-                                        // Drain a few items to reduce latency
-                                        let drain_count = queue.len().min(5);
-                                        queue.drain(..drain_count).collect()
-                                    } else {
-                                        Vec::new()
-                                    }
-                                };
-
-                                // Process drained items without holding locks
-                                for data in queued_data {
-                                    if let Ok(frame) = Self::convert_audio_to_frame_ref(
-                                        &data,
-                                        config.sample_rate,
-                                        config.channels,
-                                    ) {
-                                        let _ = source.capture_frame(&frame).await;
-                                    }
-                                }
-
-                                return Ok(());
-                            }
-                            Err(e) if retry_count < MAX_RETRIES => {
-                                retry_count += 1;
-                                debug!(
-                                    "Retry {}/{} for frame capture after error: {:?}",
-                                    retry_count, MAX_RETRIES, e
-                                );
-                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Failed to capture frame after {} retries: {:?}, queuing",
-                                    MAX_RETRIES, e
-                                );
-                                // Apply bounded queue with backpressure - drop oldest if queue is too large
+                            // Opportunistically drain queued audio now that we have capacity
+                            // Limit drain count to avoid blocking the hot path
+                            let queued_data: Vec<Vec<u8>> = {
                                 let mut queue = audio_queue.lock().await;
-                                if queue.len() >= super::MAX_AUDIO_QUEUE_SIZE {
-                                    // Drop the oldest audio frame to prevent unbounded latency
-                                    match queue.pop_front() {
-                                        Some(_dropped) => {
-                                            warn!(
-                                                "Audio queue full, dropping oldest frame to prevent latency spike"
-                                            );
-                                        }
-                                        None => warn!(
-                                            "Audio queue full but nothing to drop; queue state may be inconsistent"
-                                        ),
+                                if !queue.is_empty() {
+                                    // Drain up to 5 items to reduce latency without blocking
+                                    let drain_count = queue.len().min(5);
+                                    queue.drain(..drain_count).collect()
+                                } else {
+                                    Vec::new()
+                                }
+                            };
+
+                            // Process drained items without holding locks
+                            for data in queued_data {
+                                if let Ok(frame) = Self::convert_audio_to_frame_ref(
+                                    &data,
+                                    config.sample_rate,
+                                    config.channels,
+                                ) {
+                                    // Best effort - don't re-queue on failure to avoid loops
+                                    if let Err(e) = source.capture_frame(&frame).await {
+                                        debug!("Failed to send drained frame, skipping: {:?}", e);
                                     }
                                 }
-                                queue.push_back(audio_data);
-                                debug!(
-                                    "Queued audio data for later processing, queue size: {}",
-                                    queue.len()
-                                );
-                                return Ok(());
                             }
+
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            // Immediate queue on failure - NO RETRIES, NO SLEEP
+                            // This is critical for real-time audio latency guarantees
+                            debug!(
+                                "Capture frame failed, immediately queueing: {:?}",
+                                e
+                            );
+
+                            // Apply bounded queue with backpressure - drop oldest if queue is too large
+                            let mut queue = audio_queue.lock().await;
+                            let queue_len = queue.len();
+                            if queue_len >= super::MAX_AUDIO_QUEUE_SIZE {
+                                // Drop the oldest audio frame to prevent unbounded latency
+                                if queue.pop_front().is_some() {
+                                    warn!(
+                                        "Audio queue full ({}), dropping oldest frame to prevent latency spike",
+                                        queue_len
+                                    );
+                                }
+                            }
+                            queue.push_back(audio_data);
+                            debug!(
+                                "Queued audio data for later processing, queue size: {}",
+                                queue.len()
+                            );
+                            return Ok(());
                         }
                     }
                 }
@@ -380,12 +373,27 @@ impl LiveKitClient {
             )));
         }
 
-        // Zero-copy conversion using bytemuck for aligned data
+        // Zero-copy conversion for aligned data
         // Fall back to manual conversion for unaligned data
         let samples: Vec<i16> = if (audio_data.as_ptr() as usize).is_multiple_of(2) {
             // Data is aligned, use zero-copy reinterpretation
             unsafe {
-                // SAFETY: We've verified the length is even and the data is aligned
+                // SAFETY: We've verified:
+                // 1. The pointer is aligned to i16 (2 bytes) - checked above
+                // 2. The length is even - checked at function start
+                // 3. num_samples * 2 <= audio_data.len() - verified by num_samples = len / 2
+                // 4. The data is valid for the lifetime of the slice - audio_data is borrowed
+                debug_assert!(
+                    (audio_data.as_ptr() as usize) % std::mem::align_of::<i16>() == 0,
+                    "Pointer not aligned to i16 boundary"
+                );
+                debug_assert!(
+                    num_samples * std::mem::size_of::<i16>() <= audio_data.len(),
+                    "num_samples {} would read beyond buffer length {}",
+                    num_samples,
+                    audio_data.len()
+                );
+
                 let ptr = audio_data.as_ptr() as *const i16;
                 let slice = std::slice::from_raw_parts(ptr, num_samples);
                 slice.to_vec()

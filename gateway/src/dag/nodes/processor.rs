@@ -2,14 +2,14 @@
 //!
 //! These nodes wrap plugin-based audio and text processors for use in DAG pipelines.
 
-use std::sync::Arc;
 use async_trait::async_trait;
-use tracing::{debug, warn, info};
+use std::sync::Arc;
+use tracing::{debug, info, warn};
 
-use super::{DAGNode, DAGData, NodeCapability};
+use super::{DAGData, DAGNode, NodeCapability};
 use crate::dag::context::DAGContext;
 use crate::dag::error::{DAGError, DAGResult};
-use crate::plugin::{global_registry, capabilities::AudioFormat};
+use crate::plugin::{capabilities::AudioFormat, global_registry};
 
 /// Plugin-based processor node
 ///

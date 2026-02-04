@@ -176,7 +176,7 @@ impl CereprocCredentials {
 
     /// Get the Basic auth header value (base64 encoded)
     pub fn basic_auth_value(&self) -> String {
-        use base64::{engine::general_purpose::STANDARD, Engine};
+        use base64::{Engine, engine::general_purpose::STANDARD};
         let credentials = format!("{}:{}", self.email, self.password);
         format!("Basic {}", STANDARD.encode(credentials.as_bytes()))
     }
@@ -536,9 +536,9 @@ mod tests {
     fn test_config_defaults() {
         let base = TTSConfig {
             api_key: "user@example.com:password123".to_string(),
-            voice_id: None,          // Explicitly None to test Cereproc default
-            audio_format: None,       // Explicitly None to test Cereproc default
-            sample_rate: None,        // Explicitly None to test Cereproc default
+            voice_id: None,     // Explicitly None to test Cereproc default
+            audio_format: None, // Explicitly None to test Cereproc default
+            sample_rate: None,  // Explicitly None to test Cereproc default
             ..Default::default()
         };
 
@@ -565,10 +565,16 @@ mod tests {
         let params = config.build_query_params();
 
         assert!(params.iter().any(|(k, v)| *k == "voice" && v == "Jess"));
-        assert!(params.iter().any(|(k, v)| *k == "audioFormat" && v == "ogg"));
-        assert!(params
-            .iter()
-            .any(|(k, v)| *k == "sampleRate" && v == "16000"));
+        assert!(
+            params
+                .iter()
+                .any(|(k, v)| *k == "audioFormat" && v == "ogg")
+        );
+        assert!(
+            params
+                .iter()
+                .any(|(k, v)| *k == "sampleRate" && v == "16000")
+        );
     }
 
     #[test]
@@ -612,7 +618,10 @@ mod tests {
         config.emotion = Some(CereprocEmotion::Happy);
 
         let wrapped = config.wrap_with_emotion("Hello");
-        assert_eq!(wrapped, "<doc><emotion name=\"happy\">Hello</emotion></doc>");
+        assert_eq!(
+            wrapped,
+            "<doc><emotion name=\"happy\">Hello</emotion></doc>"
+        );
     }
 
     #[test]

@@ -89,6 +89,6 @@ pub mod config;
 
 pub use client::ZaloTts;
 pub use config::{
-    ZaloTtsConfig, ZaloTtsData, ZaloTtsResponse, ZaloVoice, AUDIO_CHANNELS, AUDIO_SAMPLE_RATE,
-    AUDIO_SAMPLE_WIDTH, DEFAULT_SPEED, MAX_SPEED, MIN_SPEED, ZALO_TTS_ENDPOINT,
+    AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AUDIO_SAMPLE_WIDTH, DEFAULT_SPEED, MAX_SPEED, MIN_SPEED,
+    ZALO_TTS_ENDPOINT, ZaloTtsConfig, ZaloTtsData, ZaloTtsResponse, ZaloVoice,
 };

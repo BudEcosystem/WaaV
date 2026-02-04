@@ -86,16 +86,28 @@ mod messages;
 pub use auth::{AuthError, IFlytekAuth, MAX_CLOCK_SKEW_SECS};
 pub use client::IFlytekStt;
 pub use config::{
-    IFlytekAsrDomain, IFlytekAsrMode, IFlytekAudioEncoding, IFlytekLanguage, IFlytekSttConfig,
     // Constants
-    DEFAULT_FRAME_INTERVAL_MS, DEFAULT_FRAME_SIZE, DEFAULT_SAMPLE_RATE, DEFAULT_VAD_EOS_MS,
-    IFLYTEK_IAT_ENDPOINT, IFLYTEK_IAT_HOST, IFLYTEK_IAT_PATH,
-    IFLYTEK_IST_ENDPOINT, IFLYTEK_IST_HOST, IFLYTEK_IST_PATH,
-    MAX_REALTIME_DURATION_SECS, MAX_SHORT_FORM_DURATION_SECS,
+    DEFAULT_FRAME_INTERVAL_MS,
+    DEFAULT_FRAME_SIZE,
+    DEFAULT_SAMPLE_RATE,
+    DEFAULT_VAD_EOS_MS,
+    IFLYTEK_IAT_ENDPOINT,
+    IFLYTEK_IAT_HOST,
+    IFLYTEK_IAT_PATH,
+    IFLYTEK_IST_ENDPOINT,
+    IFLYTEK_IST_HOST,
+    IFLYTEK_IST_PATH,
+    IFlytekAsrDomain,
+    IFlytekAsrMode,
+    IFlytekAudioEncoding,
+    IFlytekLanguage,
+    IFlytekSttConfig,
+    MAX_REALTIME_DURATION_SECS,
+    MAX_SHORT_FORM_DURATION_SECS,
 };
 pub use messages::{
-    DataStatus, IFlytekErrorCode, SttRequest, SttRequestBusiness, SttRequestCommon,
-    SttRequestData, SttResponse, SttResponseData, SttResultData, SttWord, SttWordSegment,
+    DataStatus, IFlytekErrorCode, SttRequest, SttRequestBusiness, SttRequestCommon, SttRequestData,
+    SttResponse, SttResponseData, SttResultData, SttWord, SttWordSegment,
 };
 
 #[cfg(test)]

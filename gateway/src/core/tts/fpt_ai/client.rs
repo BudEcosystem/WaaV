@@ -15,15 +15,15 @@
 //! Output is MP3 or WAV format depending on configuration.
 
 use super::config::{
-    FptAudioFormat, FptTtsConfig, FptTtsResponse, FptVoice, AUDIO_SAMPLE_RATE, FPT_TTS_ENDPOINT,
+    AUDIO_SAMPLE_RATE, FPT_TTS_ENDPOINT, FptAudioFormat, FptTtsConfig, FptTtsResponse, FptVoice,
     MAX_SPEED, MIN_SPEED,
 };
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
 };
 use reqwest::Client;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -149,9 +149,9 @@ impl FptTts {
         }
 
         // Get audio URL
-        let audio_url = api_response.audio_url().ok_or_else(|| {
-            TTSError::ProviderError("No audio URL in response".to_string())
-        })?;
+        let audio_url = api_response
+            .audio_url()
+            .ok_or_else(|| TTSError::ProviderError("No audio URL in response".to_string()))?;
 
         debug!(
             "FPT TTS: Got async URL, request_id={}, downloading from {}",
@@ -514,7 +514,10 @@ mod tests {
     }
 
     impl AudioCallback for MockAudioCallback {
-        fn on_audio(&self, _audio_data: AudioData) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        fn on_audio(
+            &self,
+            _audio_data: AudioData,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             self.audio_count.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {})
         }

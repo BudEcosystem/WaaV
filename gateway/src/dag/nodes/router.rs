@@ -5,12 +5,12 @@
 //! - Join: Aggregate results from multiple branches
 //! - Router: Conditional routing based on expressions
 
-use std::sync::Arc;
 use async_trait::async_trait;
-use rhai::{Dynamic, Array, Scope};
-use tracing::{debug, warn, info};
+use rhai::{Array, Dynamic, Scope};
+use std::sync::Arc;
+use tracing::{debug, info, warn};
 
-use super::{DAGNode, DAGData, NodeCapability};
+use super::{DAGData, DAGNode, NodeCapability};
 use crate::dag::context::DAGContext;
 use crate::dag::definition::{JoinStrategy, RouteDefinition};
 use crate::dag::error::{DAGError, DAGResult};
@@ -85,10 +85,8 @@ impl DAGNode for SplitNode {
         );
 
         // Store branch info in context for executor to handle parallel execution
-        ctx.metadata.insert(
-            "split_branches".to_string(),
-            self.branches.join(","),
-        );
+        ctx.metadata
+            .insert("split_branches".to_string(), self.branches.join(","));
 
         // Return input - actual splitting is handled by executor
         Ok(input)
@@ -273,7 +271,7 @@ impl JoinNode {
         // to prevent infinite loops or excessive resource usage
         engine.set_allow_looping(true);
         engine.set_max_operations(1_000); // Lower limit when looping is enabled
-        engine.set_max_call_levels(16);   // Limit recursion depth
+        engine.set_max_call_levels(16); // Limit recursion depth
 
         // Register max_by_field function for selecting best result by numeric field
         engine.register_fn("max_by_field", |arr: Array, field: &str| -> Dynamic {
@@ -332,10 +330,14 @@ impl JoinNode {
         );
 
         // Compile and evaluate the selector expression
-        let result = engine.eval_with_scope::<Dynamic>(&mut scope, selector)
-            .map_err(|e| DAGError::ConditionError(format!(
-                "Selector expression '{}' failed: {}", selector, e
-            )))?;
+        let result = engine
+            .eval_with_scope::<Dynamic>(&mut scope, selector)
+            .map_err(|e| {
+                DAGError::ConditionError(format!(
+                    "Selector expression '{}' failed: {}",
+                    selector, e
+                ))
+            })?;
 
         // Interpret the result
         if let Some(idx) = result.clone().try_cast::<i64>() {
@@ -343,7 +345,9 @@ impl JoinNode {
             let idx = idx as usize;
             if idx >= results.len() {
                 return Err(DAGError::ConditionError(format!(
-                    "Selector returned invalid index {} for {} results", idx, results.len()
+                    "Selector returned invalid index {} for {} results",
+                    idx,
+                    results.len()
                 )));
             }
             // Safe access using swap_remove for O(1) performance
@@ -397,7 +401,7 @@ impl JoinNode {
         // to prevent infinite loops or excessive resource usage
         engine.set_allow_looping(true);
         engine.set_max_operations(1_000); // Lower limit when looping is enabled
-        engine.set_max_call_levels(16);   // Limit recursion depth
+        engine.set_max_call_levels(16); // Limit recursion depth
 
         // Create scope with results array
         let mut scope = Scope::new();
@@ -426,16 +430,16 @@ impl JoinNode {
         );
 
         // Compile and evaluate the merge script
-        let ast = engine.compile(script)
+        let ast = engine
+            .compile(script)
             .map_err(|e| DAGError::ExpressionCompilationError {
                 expression: script.to_string(),
                 error: e.to_string(),
             })?;
 
-        let result = engine.eval_ast_with_scope::<Dynamic>(&mut scope, &ast)
-            .map_err(|e| DAGError::ConditionError(format!(
-                "Merge script failed: {}", e
-            )))?;
+        let result = engine
+            .eval_ast_with_scope::<Dynamic>(&mut scope, &ast)
+            .map_err(|e| DAGError::ConditionError(format!("Merge script failed: {}", e)))?;
 
         // Convert result to DAGData
         if let Some(s) = result.clone().try_cast::<String>() {
@@ -451,9 +455,7 @@ impl JoinNode {
             return Ok(DAGData::Json(serde_json::json!(b)));
         }
         if let Some(arr) = result.clone().try_cast::<Array>() {
-            let json_arr: Vec<serde_json::Value> = arr.iter()
-                .map(|d| dynamic_to_json(d))
-                .collect();
+            let json_arr: Vec<serde_json::Value> = arr.iter().map(|d| dynamic_to_json(d)).collect();
             return Ok(DAGData::Json(serde_json::json!(json_arr)));
         }
         if let Some(map) = result.clone().try_cast::<rhai::Map>() {
@@ -512,9 +514,7 @@ fn dynamic_to_json(value: &Dynamic) -> serde_json::Value {
         return serde_json::json!(s);
     }
     if let Some(arr) = value.clone().try_cast::<Array>() {
-        let json_arr: Vec<serde_json::Value> = arr.iter()
-            .map(dynamic_to_json)
-            .collect();
+        let json_arr: Vec<serde_json::Value> = arr.iter().map(dynamic_to_json).collect();
         return serde_json::json!(json_arr);
     }
     if let Some(map) = value.clone().try_cast::<rhai::Map>() {
@@ -712,7 +712,8 @@ impl DAGNode for RouterNode {
                 target = %target_id,
                 "Route matched"
             );
-            ctx.metadata.insert("router_target".to_string(), target_id.to_string());
+            ctx.metadata
+                .insert("router_target".to_string(), target_id.to_string());
         } else {
             warn!(
                 node_id = %self.id,
@@ -772,10 +773,7 @@ mod tests {
         let node = JoinNode::all("join", vec!["a".into(), "b".into()]);
         let mut ctx = DAGContext::new("test");
 
-        let input = DAGData::Multiple(vec![
-            DAGData::Text("a".into()),
-            DAGData::Text("b".into()),
-        ]);
+        let input = DAGData::Multiple(vec![DAGData::Text("a".into()), DAGData::Text("b".into())]);
 
         let output = node.execute(input, &mut ctx).await.unwrap();
         assert!(matches!(output, DAGData::Multiple(_)));
@@ -783,8 +781,7 @@ mod tests {
 
     #[test]
     fn test_router_node() {
-        let node = RouterNode::new("router")
-            .with_default("default_handler");
+        let node = RouterNode::new("router").with_default("default_handler");
 
         assert_eq!(node.id(), "router");
         assert_eq!(node.routes().len(), 1);
@@ -792,13 +789,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_router_default_route() {
-        let node = RouterNode::new("router")
-            .with_default("default_handler");
+        let node = RouterNode::new("router").with_default("default_handler");
 
         let mut ctx = DAGContext::new("test");
         let input = DAGData::Text("test".into());
 
         let output = node.execute(input, &mut ctx).await.unwrap();
-        assert_eq!(ctx.metadata.get("router_target"), Some(&"default_handler".to_string()));
+        assert_eq!(
+            ctx.metadata.get("router_target"),
+            Some(&"default_handler".to_string())
+        );
     }
 }

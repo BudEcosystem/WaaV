@@ -52,10 +52,10 @@ mod messages;
 mod provider;
 
 pub use config::{TinkoffAudioEncoding, TinkoffTtsConfig, TinkoffVoice};
-pub use grpc::{create_tinkoff_tts_channel, generate_jwt_token, TinkoffTtsGrpcError};
+pub use grpc::{TinkoffTtsGrpcError, create_tinkoff_tts_channel, generate_jwt_token};
 pub use messages::{
-    AudioConfig, DecodeError, SynthesisInput, SynthesizeSpeechRequest, SynthesizeSpeechResponse,
-    StreamingSynthesizeSpeechResponse, VoiceSelectionParams,
+    AudioConfig, DecodeError, StreamingSynthesizeSpeechResponse, SynthesisInput,
+    SynthesizeSpeechRequest, SynthesizeSpeechResponse, VoiceSelectionParams,
 };
 pub use provider::TinkoffTts;
 

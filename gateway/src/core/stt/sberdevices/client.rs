@@ -5,15 +5,15 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
-use std::sync::atomic::{AtomicBool, Ordering};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::config::{
-    SberSTTConfig, MAX_SYNC_AUDIO_SIZE, OAUTH_ENDPOINT, STT_RECOGNIZE_ENDPOINT,
+    MAX_SYNC_AUDIO_SIZE, OAUTH_ENDPOINT, STT_RECOGNIZE_ENDPOINT, SberSTTConfig,
     TOKEN_REFRESH_THRESHOLD_SECS,
 };
 use super::messages::{
@@ -318,10 +318,7 @@ impl SberDevicesSTT {
                     continue;
                 }
 
-                debug!(
-                    "Processing {} bytes of accumulated audio",
-                    audio_data.len()
-                );
+                debug!("Processing {} bytes of accumulated audio", audio_data.len());
                 last_process_time = std::time::Instant::now();
 
                 // Get access token
@@ -364,9 +361,9 @@ impl SberDevicesSTT {
                                     let transcript = recognition_response.get_all_transcripts();
                                     if !transcript.is_empty() {
                                         let stt_result = STTResult::new(
-                                            transcript, true,  // is_final
-                                            true,  // is_speech_final
-                                            0.95,  // confidence (Sber doesn't return this)
+                                            transcript, true, // is_final
+                                            true, // is_speech_final
+                                            0.95, // confidence (Sber doesn't return this)
                                         );
 
                                         if let Some(callback) =
@@ -710,7 +707,7 @@ mod tests {
         let stt = SberDevicesSTT::new(config).unwrap();
 
         // Verify the credentials are Base64 encoded
-        use base64::{engine::general_purpose::STANDARD, Engine};
+        use base64::{Engine, engine::general_purpose::STANDARD};
         let expected = STANDARD.encode("client_id:client_secret".as_bytes());
         assert_eq!(stt.sber_config.client_credentials, expected);
     }

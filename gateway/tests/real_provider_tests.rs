@@ -237,7 +237,10 @@ async fn test_elevenlabs_tts_real() {
 
             if status.is_success() {
                 let audio_bytes = resp.bytes().await.unwrap();
-                println!("ElevenLabs TTS returned {} bytes of audio", audio_bytes.len());
+                println!(
+                    "ElevenLabs TTS returned {} bytes of audio",
+                    audio_bytes.len()
+                );
                 assert!(audio_bytes.len() > 1000, "TTS audio too short");
             } else {
                 let body = resp.text().await.unwrap_or_default();
@@ -598,7 +601,10 @@ async fn test_azure_tts_real() {
         ))
         .header("Ocp-Apim-Subscription-Key", &api_key)
         .header("Content-Type", "application/ssml+xml")
-        .header("X-Microsoft-OutputFormat", "audio-16khz-32kbitrate-mono-mp3")
+        .header(
+            "X-Microsoft-OutputFormat",
+            "audio-16khz-32kbitrate-mono-mp3",
+        )
         .body(ssml)
         .send()
         .await;
@@ -689,7 +695,8 @@ async fn test_gateway_with_real_deepgram() {
     let _api_key = require_env("DEEPGRAM_API_KEY");
 
     // This test requires the gateway to be running with Deepgram configured
-    let gateway_url = env::var("GATEWAY_URL").unwrap_or_else(|_| "http://localhost:3001".to_string());
+    let gateway_url =
+        env::var("GATEWAY_URL").unwrap_or_else(|_| "http://localhost:3001".to_string());
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -743,7 +750,8 @@ async fn test_gateway_with_real_deepgram() {
 async fn test_gateway_voices_with_real_elevenlabs() {
     let _api_key = require_env("ELEVENLABS_API_KEY");
 
-    let gateway_url = env::var("GATEWAY_URL").unwrap_or_else(|_| "http://localhost:3001".to_string());
+    let gateway_url =
+        env::var("GATEWAY_URL").unwrap_or_else(|_| "http://localhost:3001".to_string());
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))

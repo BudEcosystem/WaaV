@@ -2,12 +2,12 @@
 //!
 //! This node uses Rhai scripts to transform data between nodes.
 
-use std::sync::Arc;
 use async_trait::async_trait;
-use rhai::{Engine, AST, Scope, Dynamic};
+use rhai::{AST, Dynamic, Engine, Scope};
+use std::sync::Arc;
 use tracing::debug;
 
-use super::{DAGNode, DAGData, NodeCapability};
+use super::{DAGData, DAGNode, NodeCapability};
 use crate::dag::context::DAGContext;
 use crate::dag::error::{DAGError, DAGResult};
 use crate::dag::routing::create_rhai_engine;
@@ -181,9 +181,12 @@ impl DAGNode for TransformNode {
         }
 
         // Execute the transform script
-        let result: Dynamic = self.engine.eval_ast_with_scope(&mut scope, &ast).map_err(|e| {
-            DAGError::node_error(&self.id, format!("Transform script failed: {}", e))
-        })?;
+        let result: Dynamic = self
+            .engine
+            .eval_ast_with_scope(&mut scope, &ast)
+            .map_err(|e| {
+                DAGError::node_error(&self.id, format!("Transform script failed: {}", e))
+            })?;
 
         // Convert result to DAGData
         let output = dynamic_to_dag_data(result);
@@ -217,10 +220,8 @@ fn dynamic_to_dag_data(value: Dynamic) -> DAGData {
         DAGData::Json(serde_json::json!(f))
     } else if value.is::<rhai::Array>() {
         let arr = value.cast::<rhai::Array>();
-        let json_arr: Vec<serde_json::Value> = arr
-            .into_iter()
-            .map(|v| dynamic_to_json(&v))
-            .collect();
+        let json_arr: Vec<serde_json::Value> =
+            arr.into_iter().map(|v| dynamic_to_json(&v)).collect();
         DAGData::Json(serde_json::Value::Array(json_arr))
     } else if value.is::<rhai::Map>() {
         let map = value.cast::<rhai::Map>();
@@ -318,10 +319,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transform_text() {
-        let node = TransformNode::compiled(
-            "transform",
-            r#"input.to_upper()"#
-        ).unwrap();
+        let node = TransformNode::compiled("transform", r#"input.to_upper()"#).unwrap();
 
         let mut ctx = DAGContext::new("test");
         let input = DAGData::Text("hello".to_string());
@@ -336,10 +334,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_transform_stt_result() {
-        let node = TransformNode::compiled(
-            "transform",
-            r#"if is_final { transcript } else { "" }"#
-        ).unwrap();
+        let node =
+            TransformNode::compiled("transform", r#"if is_final { transcript } else { "" }"#)
+                .unwrap();
 
         let mut ctx = DAGContext::new("test");
         let input = DAGData::STTResult(super::super::STTResultData {
@@ -358,10 +355,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_transform_returns_object() {
-        let node = TransformNode::compiled(
-            "transform",
-            r#"#{ text: input, processed: true }"#
-        ).unwrap();
+        let node =
+            TransformNode::compiled("transform", r#"#{ text: input, processed: true }"#).unwrap();
 
         let mut ctx = DAGContext::new("test");
         let input = DAGData::Text("test".to_string());

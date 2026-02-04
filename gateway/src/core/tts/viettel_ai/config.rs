@@ -167,10 +167,9 @@ impl ViettelVoice {
     /// Get the gender for the voice.
     pub fn gender(&self) -> &'static str {
         match self {
-            Self::NorthernMale1
-            | Self::NorthernMale2
-            | Self::SouthernMale
-            | Self::CentralMale => "male",
+            Self::NorthernMale1 | Self::NorthernMale2 | Self::SouthernMale | Self::CentralMale => {
+                "male"
+            }
             Self::Custom(_) => "unknown",
             _ => "female",
         }
@@ -190,7 +189,9 @@ impl ViettelVoice {
             "doanngocle" | "doan_ngoc_le" | "default" | "female" | "0" => Self::DoanNgocLe,
 
             // Northern voices
-            "hn_female_ngochuyen_news_48k-fhg" | "ngochuyen" | "ngoc_huyen" => Self::NorthernFemale1,
+            "hn_female_ngochuyen_news_48k-fhg" | "ngochuyen" | "ngoc_huyen" => {
+                Self::NorthernFemale1
+            }
             "hn_female_thuthao_news_48k-fhg" | "thuthao" | "thu_thao" => Self::NorthernFemale2,
             "hn_female_phuongtrang_news_48k-fhg" | "phuongtrang" | "phuong_trang" => {
                 Self::NorthernFemale3
@@ -199,7 +200,9 @@ impl ViettelVoice {
             "hn_male_quang_news_48k-fhg" | "quang" => Self::NorthernMale2,
 
             // Southern voices
-            "sg_female_thuphuong_news_48k-fhg" | "thuphuong" | "thu_phuong" => Self::SouthernFemale1,
+            "sg_female_thuphuong_news_48k-fhg" | "thuphuong" | "thu_phuong" => {
+                Self::SouthernFemale1
+            }
             "sg_female_minhly_news_48k-fhg" | "minhly" | "minh_ly" => Self::SouthernFemale2,
             "sg_female_huonggiang_news_48k-fhg" | "huonggiang" | "huong_giang" => {
                 Self::SouthernFemale3
@@ -423,22 +426,43 @@ mod tests {
     #[test]
     fn test_voice_ids() {
         assert_eq!(ViettelVoice::DoanNgocLe.voice_id(), "doanngocle");
-        assert!(ViettelVoice::NorthernFemale1.voice_id().contains("hn_female"));
+        assert!(
+            ViettelVoice::NorthernFemale1
+                .voice_id()
+                .contains("hn_female")
+        );
         assert!(ViettelVoice::SouthernMale.voice_id().contains("sg_male"));
     }
 
     #[test]
     fn test_voice_display_names() {
-        assert!(ViettelVoice::DoanNgocLe.display_name().contains("Doan Ngoc Le"));
+        assert!(
+            ViettelVoice::DoanNgocLe
+                .display_name()
+                .contains("Doan Ngoc Le")
+        );
         assert!(ViettelVoice::NorthernMale1.display_name().contains("Male"));
-        assert!(ViettelVoice::SouthernFemale1.display_name().contains("Female"));
+        assert!(
+            ViettelVoice::SouthernFemale1
+                .display_name()
+                .contains("Female")
+        );
     }
 
     #[test]
     fn test_voice_from_str_default() {
-        assert_eq!(ViettelVoice::from_str_relaxed("doanngocle"), ViettelVoice::DoanNgocLe);
-        assert_eq!(ViettelVoice::from_str_relaxed("default"), ViettelVoice::DoanNgocLe);
-        assert_eq!(ViettelVoice::from_str_relaxed("female"), ViettelVoice::DoanNgocLe);
+        assert_eq!(
+            ViettelVoice::from_str_relaxed("doanngocle"),
+            ViettelVoice::DoanNgocLe
+        );
+        assert_eq!(
+            ViettelVoice::from_str_relaxed("default"),
+            ViettelVoice::DoanNgocLe
+        );
+        assert_eq!(
+            ViettelVoice::from_str_relaxed("female"),
+            ViettelVoice::DoanNgocLe
+        );
     }
 
     #[test]

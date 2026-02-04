@@ -56,9 +56,9 @@ pub mod config;
 
 pub use client::NectecTts;
 pub use config::{
-    chunk_text, NectecTtsConfig, NectecTtsError, NectecVoice, Vaja9Request, Vaja9Response,
     API_KEY_HEADER, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SAMPLE_RATE, LIB_HEADER, LIB_VALUE,
-    MAX_TEXT_LENGTH, VAJA9_ENDPOINT,
+    MAX_TEXT_LENGTH, NectecTtsConfig, NectecTtsError, NectecVoice, VAJA9_ENDPOINT, Vaja9Request,
+    Vaja9Response, chunk_text,
 };
 
 #[cfg(test)]
@@ -166,10 +166,19 @@ mod tests {
 
     #[test]
     fn test_voice_selection() {
-        assert_eq!(NectecVoice::from_str_relaxed("male"), Some(NectecVoice::Male));
-        assert_eq!(NectecVoice::from_str_relaxed("female"), Some(NectecVoice::Female));
+        assert_eq!(
+            NectecVoice::from_str_relaxed("male"),
+            Some(NectecVoice::Male)
+        );
+        assert_eq!(
+            NectecVoice::from_str_relaxed("female"),
+            Some(NectecVoice::Female)
+        );
         assert_eq!(NectecVoice::from_str_relaxed("0"), Some(NectecVoice::Male));
-        assert_eq!(NectecVoice::from_str_relaxed("1"), Some(NectecVoice::Female));
+        assert_eq!(
+            NectecVoice::from_str_relaxed("1"),
+            Some(NectecVoice::Female)
+        );
     }
 
     #[test]
@@ -184,6 +193,11 @@ mod tests {
         let info = tts.get_provider_info();
 
         assert_eq!(info["provider"], "nectec");
-        assert!(info["supported_languages"].as_array().unwrap().contains(&serde_json::json!("th")));
+        assert!(
+            info["supported_languages"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("th"))
+        );
     }
 }

@@ -684,7 +684,10 @@ mod tests {
 
     #[test]
     fn test_phonexia_close_code() {
-        assert_eq!(PhonexiaCloseCode::from_code(1000), PhonexiaCloseCode::Normal);
+        assert_eq!(
+            PhonexiaCloseCode::from_code(1000),
+            PhonexiaCloseCode::Normal
+        );
         assert_eq!(
             PhonexiaCloseCode::from_code(4001),
             PhonexiaCloseCode::Unauthorized

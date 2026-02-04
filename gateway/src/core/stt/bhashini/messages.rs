@@ -177,9 +177,12 @@ impl PipelineConfigResponse {
 
     /// Get the inference API key.
     pub fn inference_api_key(&self) -> Option<(&str, &str)> {
-        self.pipeline_inference_api_end_point
-            .as_ref()
-            .map(|e| (e.inference_api_key.name.as_str(), e.inference_api_key.value.as_str()))
+        self.pipeline_inference_api_end_point.as_ref().map(|e| {
+            (
+                e.inference_api_key.name.as_str(),
+                e.inference_api_key.value.as_str(),
+            )
+        })
     }
 
     /// Get the service ID for ASR task.
@@ -451,7 +454,12 @@ pub mod wav {
         bits_per_sample: u16,
         num_channels: u16,
     ) -> Vec<u8> {
-        let header = create_wav_header(sample_rate, bits_per_sample, num_channels, pcm_data.len() as u32);
+        let header = create_wav_header(
+            sample_rate,
+            bits_per_sample,
+            num_channels,
+            pcm_data.len() as u32,
+        );
         let mut wav = header;
         wav.extend_from_slice(pcm_data);
         wav
@@ -471,8 +479,14 @@ mod tests {
         let request = PipelineConfigRequest::new_asr("hi", "test-pipeline-id");
         assert_eq!(request.pipeline_tasks.len(), 1);
         assert_eq!(request.pipeline_tasks[0].task_type, "asr");
-        assert_eq!(request.pipeline_tasks[0].config.language.source_language, "hi");
-        assert_eq!(request.pipeline_request_config.pipeline_id, "test-pipeline-id");
+        assert_eq!(
+            request.pipeline_tasks[0].config.language.source_language,
+            "hi"
+        );
+        assert_eq!(
+            request.pipeline_request_config.pipeline_id,
+            "test-pipeline-id"
+        );
     }
 
     #[test]
@@ -494,7 +508,10 @@ mod tests {
             "dGVzdAo=".to_string(),
         );
         assert_eq!(request.pipeline_tasks.len(), 1);
-        assert_eq!(request.pipeline_tasks[0].config.service_id, "ai4bharat/conformer-hi-gpu--t4");
+        assert_eq!(
+            request.pipeline_tasks[0].config.service_id,
+            "ai4bharat/conformer-hi-gpu--t4"
+        );
         assert!(request.input_data.audio.is_some());
     }
 
@@ -539,8 +556,14 @@ mod tests {
 
         let response: PipelineConfigResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.callback_url(), Some("https://example.com/compute"));
-        assert_eq!(response.inference_api_key(), Some(("Authorization", "test-key-123")));
-        assert_eq!(response.asr_service_id(), Some("ai4bharat/conformer-hi-gpu--t4"));
+        assert_eq!(
+            response.inference_api_key(),
+            Some(("Authorization", "test-key-123"))
+        );
+        assert_eq!(
+            response.asr_service_id(),
+            Some("ai4bharat/conformer-hi-gpu--t4")
+        );
     }
 
     #[test]

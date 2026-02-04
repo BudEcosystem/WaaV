@@ -4,11 +4,11 @@
 //! using HTTP streaming for real-time audio synthesis.
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue};
 use tracing::{debug, info};
 
-use super::config::{WellSaidAvatar, WellSaidStreamRequest, WellSaidTtsConfig};
 use super::WELLSAID_AVATARS_URL;
+use super::config::{WellSaidAvatar, WellSaidStreamRequest, WellSaidTtsConfig};
 use crate::core::tts::base::{BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult};
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
 
@@ -292,9 +292,7 @@ mod tests {
 
         if let Err(TTSError::InvalidConfiguration(msg)) = result {
             assert!(
-                msg.contains("API")
-                    || msg.contains("api_key")
-                    || msg.contains("WELLSAID_API_KEY")
+                msg.contains("API") || msg.contains("api_key") || msg.contains("WELLSAID_API_KEY")
             );
         } else {
             panic!("Expected InvalidConfiguration error");

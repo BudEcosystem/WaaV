@@ -145,7 +145,10 @@ mod tests {
             HuaweiTtsVoice::XiaoYan.as_property(),
             "chinese_xiaoyan_common"
         );
-        assert_eq!(HuaweiTtsVoice::XiaoYu.as_property(), "chinese_xiaoyu_common");
+        assert_eq!(
+            HuaweiTtsVoice::XiaoYu.as_property(),
+            "chinese_xiaoyu_common"
+        );
         assert!(!HuaweiTtsVoice::XiaoYan.is_premium());
         assert!(HuaweiTtsVoice::HuaXiaoXia.is_premium());
     }
@@ -202,9 +205,11 @@ mod tests {
     fn test_supported_voices() {
         let voices = HuaweiCloudTtsConfig::supported_voices();
         assert!(!voices.is_empty());
-        assert!(voices
-            .iter()
-            .any(|(_, prop, _)| *prop == "chinese_xiaoyan_common"));
+        assert!(
+            voices
+                .iter()
+                .any(|(_, prop, _)| *prop == "chinese_xiaoyan_common")
+        );
     }
 
     #[test]

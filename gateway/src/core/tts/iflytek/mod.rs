@@ -72,22 +72,24 @@ pub mod provider;
 
 // Re-export main types
 pub use config::{
-    IFlytekTtsConfig, IFlytekTtsEncoding, IFlytekTextEncoding, IFlytekVoice,
-    IFLYTEK_TTS_ENDPOINT, IFLYTEK_TTS_HOST, IFLYTEK_TTS_PATH,
-    DEFAULT_TTS_SAMPLE_RATE, DEFAULT_SPEED, DEFAULT_VOLUME, DEFAULT_PITCH,
+    DEFAULT_PITCH, DEFAULT_SPEED, DEFAULT_TTS_SAMPLE_RATE, DEFAULT_VOLUME, IFLYTEK_TTS_ENDPOINT,
+    IFLYTEK_TTS_HOST, IFLYTEK_TTS_PATH, IFlytekTextEncoding, IFlytekTtsConfig, IFlytekTtsEncoding,
+    IFlytekVoice,
 };
 pub use messages::{
-    TtsRequest, TtsRequestBusiness, TtsRequestCommon, TtsRequestData,
-    TtsResponse, TtsResponseData, IFlytekErrorCode,
+    IFlytekErrorCode, TtsRequest, TtsRequestBusiness, TtsRequestCommon, TtsRequestData,
+    TtsResponse, TtsResponseData,
 };
 pub use provider::IFlytekTts;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::tts::base::{AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError};
-    use std::pin::Pin;
+    use crate::core::tts::base::{
+        AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError,
+    };
     use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -220,7 +222,10 @@ mod tests {
         }
 
         impl AudioCallback for TestCallback {
-            fn on_audio(&self, _audio_data: AudioData) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            fn on_audio(
+                &self,
+                _audio_data: AudioData,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
                 self.audio_received.store(true, Ordering::Relaxed);
                 Box::pin(async {})
             }
@@ -273,17 +278,38 @@ mod tests {
     #[test]
     fn test_encoding_parsing() {
         // Raw/PCM
-        assert_eq!(IFlytekTtsEncoding::from_str("raw"), Some(IFlytekTtsEncoding::Raw));
-        assert_eq!(IFlytekTtsEncoding::from_str("pcm"), Some(IFlytekTtsEncoding::Raw));
-        assert_eq!(IFlytekTtsEncoding::from_str("linear16"), Some(IFlytekTtsEncoding::Raw));
+        assert_eq!(
+            IFlytekTtsEncoding::from_str("raw"),
+            Some(IFlytekTtsEncoding::Raw)
+        );
+        assert_eq!(
+            IFlytekTtsEncoding::from_str("pcm"),
+            Some(IFlytekTtsEncoding::Raw)
+        );
+        assert_eq!(
+            IFlytekTtsEncoding::from_str("linear16"),
+            Some(IFlytekTtsEncoding::Raw)
+        );
 
         // MP3
-        assert_eq!(IFlytekTtsEncoding::from_str("lame"), Some(IFlytekTtsEncoding::Lame));
-        assert_eq!(IFlytekTtsEncoding::from_str("mp3"), Some(IFlytekTtsEncoding::Lame));
+        assert_eq!(
+            IFlytekTtsEncoding::from_str("lame"),
+            Some(IFlytekTtsEncoding::Lame)
+        );
+        assert_eq!(
+            IFlytekTtsEncoding::from_str("mp3"),
+            Some(IFlytekTtsEncoding::Lame)
+        );
 
         // Speex
-        assert_eq!(IFlytekTtsEncoding::from_str("speex"), Some(IFlytekTtsEncoding::Speex));
-        assert_eq!(IFlytekTtsEncoding::from_str("speex-wb"), Some(IFlytekTtsEncoding::SpeexWb));
+        assert_eq!(
+            IFlytekTtsEncoding::from_str("speex"),
+            Some(IFlytekTtsEncoding::Speex)
+        );
+        assert_eq!(
+            IFlytekTtsEncoding::from_str("speex-wb"),
+            Some(IFlytekTtsEncoding::SpeexWb)
+        );
 
         // Unknown
         assert_eq!(IFlytekTtsEncoding::from_str("unknown"), None);
@@ -318,7 +344,10 @@ mod tests {
     #[test]
     fn test_error_code_parsing() {
         assert_eq!(IFlytekErrorCode::from_code(0), IFlytekErrorCode::Success);
-        assert_eq!(IFlytekErrorCode::from_code(10005), IFlytekErrorCode::AuthorizationFailure);
+        assert_eq!(
+            IFlytekErrorCode::from_code(10005),
+            IFlytekErrorCode::AuthorizationFailure
+        );
         // Unknown codes should return Unknown variant
         let unknown = IFlytekErrorCode::from_code(99999);
         assert!(matches!(unknown, IFlytekErrorCode::Unknown(_)));

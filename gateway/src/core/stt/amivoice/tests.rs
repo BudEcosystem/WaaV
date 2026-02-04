@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::core::stt::base::{BaseSTT, STTConfig, STTError, STTResult};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
 // =============================================================================
@@ -152,13 +152,21 @@ fn test_engine_ids() {
 
 #[test]
 fn test_engine_display_names() {
-    assert!(!AmiVoiceEngine::HybridJapaneseGeneral.display_name().is_empty());
-    assert!(AmiVoiceEngine::HybridJapaneseMedical
-        .display_name()
-        .contains("Medical"));
-    assert!(AmiVoiceEngine::E2EJapaneseGeneral
-        .display_name()
-        .contains("E2E"));
+    assert!(
+        !AmiVoiceEngine::HybridJapaneseGeneral
+            .display_name()
+            .is_empty()
+    );
+    assert!(
+        AmiVoiceEngine::HybridJapaneseMedical
+            .display_name()
+            .contains("Medical")
+    );
+    assert!(
+        AmiVoiceEngine::E2EJapaneseGeneral
+            .display_name()
+            .contains("E2E")
+    );
 }
 
 #[test]
@@ -190,8 +198,14 @@ fn test_engine_primary_language() {
         AmiVoiceEngine::HybridJapaneseGeneral.primary_language(),
         "ja"
     );
-    assert_eq!(AmiVoiceEngine::HybridEnglishGeneral.primary_language(), "en");
-    assert_eq!(AmiVoiceEngine::HybridChineseGeneral.primary_language(), "zh");
+    assert_eq!(
+        AmiVoiceEngine::HybridEnglishGeneral.primary_language(),
+        "en"
+    );
+    assert_eq!(
+        AmiVoiceEngine::HybridChineseGeneral.primary_language(),
+        "zh"
+    );
     assert_eq!(AmiVoiceEngine::HybridKoreanGeneral.primary_language(), "ko");
     assert_eq!(AmiVoiceEngine::E2EMultilingual.primary_language(), "multi");
 }
@@ -449,7 +463,8 @@ fn test_parse_processing_start() {
 
 #[test]
 fn test_parse_interim_result() {
-    let json = r#"{"results":[{"text":"テスト","tokens":[]}],"text":"テスト","code":"0","message":""}"#;
+    let json =
+        r#"{"results":[{"text":"テスト","tokens":[]}],"text":"テスト","code":"0","message":""}"#;
     let msg = AmiVoiceMessage::parse(&format!("U {}", json)).unwrap();
 
     match msg {

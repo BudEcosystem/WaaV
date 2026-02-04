@@ -1,14 +1,14 @@
 //! Webhook endpoint adapter (fire-and-forget)
 
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::time::Duration;
-use async_trait::async_trait;
 use tracing::{debug, warn};
 
 use super::EndpointAdapter;
 use crate::dag::context::DAGContext;
-use crate::dag::nodes::DAGData;
 use crate::dag::error::{DAGError, DAGResult};
+use crate::dag::nodes::DAGData;
 
 /// Webhook endpoint adapter
 ///
@@ -84,7 +84,8 @@ impl EndpointAdapter for WebhookAdapter {
             "Webhook send"
         );
 
-        let mut request = self.client
+        let mut request = self
+            .client
             .post(&self.url)
             .timeout(self.timeout)
             .header("Content-Type", "application/json")
@@ -133,10 +134,13 @@ impl EndpointAdapter for WebhookAdapter {
             Ok(DAGData::Empty)
         } else {
             // Wait for response
-            let response = request.send().await.map_err(|e| DAGError::WebhookDeliveryError {
-                url: self.url.clone(),
-                error: e.to_string(),
-            })?;
+            let response = request
+                .send()
+                .await
+                .map_err(|e| DAGError::WebhookDeliveryError {
+                    url: self.url.clone(),
+                    error: e.to_string(),
+                })?;
 
             if !response.status().is_success() {
                 return Err(DAGError::WebhookDeliveryError {
@@ -187,8 +191,7 @@ mod tests {
 
     #[test]
     fn test_webhook_wait_mode() {
-        let adapter = WebhookAdapter::new("test", "https://hooks.example.com")
-            .wait_for_response();
+        let adapter = WebhookAdapter::new("test", "https://hooks.example.com").wait_for_response();
 
         assert!(!adapter.is_fire_and_forget());
     }

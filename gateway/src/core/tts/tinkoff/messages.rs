@@ -458,12 +458,8 @@ mod tests {
 
     #[test]
     fn test_synthesize_request_encode() {
-        let request = SynthesizeSpeechRequest::new(
-            "Привет",
-            "alyona",
-            TinkoffAudioEncoding::Linear16,
-            24000,
-        );
+        let request =
+            SynthesizeSpeechRequest::new("Привет", "alyona", TinkoffAudioEncoding::Linear16, 24000);
         let encoded = request.encode();
         assert!(!encoded.is_empty());
         assert!(encoded.contains(&0x0a)); // input

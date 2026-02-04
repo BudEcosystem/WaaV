@@ -7,7 +7,11 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use waav_gateway::{
-    ServerConfig, config::{DAGTimeoutsConfig, PluginConfig}, middleware::auth::auth_middleware, routes, state::AppState,
+    ServerConfig,
+    config::{DAGTimeoutsConfig, PluginConfig},
+    middleware::auth::auth_middleware,
+    routes,
+    state::AppState,
 };
 
 #[tokio::test]
@@ -62,6 +66,9 @@ async fn test_websocket_voice_config() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     };
@@ -254,6 +261,9 @@ async fn test_websocket_invalid_message() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     };
@@ -378,6 +388,9 @@ async fn test_websocket_sip_transfer_without_livekit_config() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     };
@@ -505,6 +518,9 @@ async fn test_websocket_sip_transfer_invalid_phone_number() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     };
@@ -632,6 +648,9 @@ async fn test_websocket_sip_transfer_empty_phone_number() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     };

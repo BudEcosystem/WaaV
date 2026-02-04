@@ -183,9 +183,9 @@ where
     let mut grpc = tonic::client::Grpc::new(channel);
 
     // Ensure we're ready
-    grpc.ready().await.map_err(|e| {
-        Status::unavailable(format!("Service not ready: {}", e))
-    })?;
+    grpc.ready()
+        .await
+        .map_err(|e| Status::unavailable(format!("Service not ready: {}", e)))?;
 
     // Create the codec
     let codec = GnaniCodec::default();
@@ -194,9 +194,7 @@ where
     let path = PathAndQuery::from_static(GRPC_SERVICE_PATH);
 
     // Make the bidirectional streaming call
-    let response = grpc
-        .streaming(request, path, codec)
-        .await?;
+    let response = grpc.streaming(request, path, codec).await?;
 
     Ok(response.into_inner())
 }

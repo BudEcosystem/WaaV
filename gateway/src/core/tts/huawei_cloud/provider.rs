@@ -18,15 +18,13 @@
 
 use async_trait::async_trait;
 use reqwest::Client;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use super::config::{
-    HuaweiCloudTtsConfig, HuaweiTtsRequest, HuaweiTtsResponse, MAX_TEXT_LENGTH,
-};
+use super::config::{HuaweiCloudTtsConfig, HuaweiTtsRequest, HuaweiTtsResponse, MAX_TEXT_LENGTH};
 use crate::core::stt::huawei_cloud::HuaweiTokenManager;
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
@@ -250,9 +248,9 @@ impl HuaweiCloudTts {
         }
 
         // Get audio data
-        let audio_data = tts_response.get_audio_data().ok_or_else(|| {
-            TTSError::ProviderError("No audio data in response".to_string())
-        })?;
+        let audio_data = tts_response
+            .get_audio_data()
+            .ok_or_else(|| TTSError::ProviderError("No audio data in response".to_string()))?;
 
         debug!("Received {} bytes of audio data", audio_data.len());
 

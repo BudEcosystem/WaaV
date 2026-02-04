@@ -3,7 +3,7 @@
 //! This module defines the WebSocket message types for DashScope TTS providers.
 //! Supports both Qwen3-TTS (OpenAI-like protocol) and CosyVoice (inference protocol).
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

@@ -335,13 +335,15 @@ impl SberTtsConfig {
             .unwrap_or_else(|_| base.api_key.clone());
 
         if api_key.is_empty() {
-            return Err("SberDevices requires client credentials (client_id:client_secret)".to_string());
+            return Err(
+                "SberDevices requires client credentials (client_id:client_secret)".to_string(),
+            );
         }
 
         // Check if already Base64 encoded or needs encoding
         let client_credentials = if api_key.contains(':') {
             // Raw format - encode to Base64
-            use base64::{engine::general_purpose::STANDARD, Engine};
+            use base64::{Engine, engine::general_purpose::STANDARD};
             STANDARD.encode(api_key.as_bytes())
         } else {
             // Assume already encoded
@@ -447,7 +449,10 @@ mod tests {
     fn test_voice_from_str() {
         assert_eq!(SberTtsVoice::from_str("Nec").unwrap(), SberTtsVoice::Nec);
         assert_eq!(SberTtsVoice::from_str("nec").unwrap(), SberTtsVoice::Nec);
-        assert_eq!(SberTtsVoice::from_str("Natalia").unwrap(), SberTtsVoice::Nec);
+        assert_eq!(
+            SberTtsVoice::from_str("Natalia").unwrap(),
+            SberTtsVoice::Nec
+        );
         assert_eq!(SberTtsVoice::from_str("Bys").unwrap(), SberTtsVoice::Bys);
         assert_eq!(SberTtsVoice::from_str("Boris").unwrap(), SberTtsVoice::Bys);
         assert_eq!(SberTtsVoice::from_str("May").unwrap(), SberTtsVoice::May);
@@ -460,8 +465,14 @@ mod tests {
 
     #[test]
     fn test_voice_with_sample_rate_suffix() {
-        assert_eq!(SberTtsVoice::from_str("Nec_24000").unwrap(), SberTtsVoice::Nec);
-        assert_eq!(SberTtsVoice::from_str("Bys_8000").unwrap(), SberTtsVoice::Bys);
+        assert_eq!(
+            SberTtsVoice::from_str("Nec_24000").unwrap(),
+            SberTtsVoice::Nec
+        );
+        assert_eq!(
+            SberTtsVoice::from_str("Bys_8000").unwrap(),
+            SberTtsVoice::Bys
+        );
     }
 
     #[test]
@@ -526,11 +537,26 @@ mod tests {
 
     #[test]
     fn test_audio_format_from_str() {
-        assert_eq!(SberTtsAudioFormat::from_str("wav").unwrap(), SberTtsAudioFormat::Wav);
-        assert_eq!(SberTtsAudioFormat::from_str("pcm").unwrap(), SberTtsAudioFormat::Wav);
-        assert_eq!(SberTtsAudioFormat::from_str("opus").unwrap(), SberTtsAudioFormat::Opus);
-        assert_eq!(SberTtsAudioFormat::from_str("mp3").unwrap(), SberTtsAudioFormat::Mp3);
-        assert_eq!(SberTtsAudioFormat::from_str("mpeg").unwrap(), SberTtsAudioFormat::Mp3);
+        assert_eq!(
+            SberTtsAudioFormat::from_str("wav").unwrap(),
+            SberTtsAudioFormat::Wav
+        );
+        assert_eq!(
+            SberTtsAudioFormat::from_str("pcm").unwrap(),
+            SberTtsAudioFormat::Wav
+        );
+        assert_eq!(
+            SberTtsAudioFormat::from_str("opus").unwrap(),
+            SberTtsAudioFormat::Opus
+        );
+        assert_eq!(
+            SberTtsAudioFormat::from_str("mp3").unwrap(),
+            SberTtsAudioFormat::Mp3
+        );
+        assert_eq!(
+            SberTtsAudioFormat::from_str("mpeg").unwrap(),
+            SberTtsAudioFormat::Mp3
+        );
     }
 
     #[test]
@@ -555,11 +581,26 @@ mod tests {
 
     #[test]
     fn test_scope_from_str() {
-        assert_eq!(SberTtsScope::from_str("SALUTE_SPEECH_PERS").unwrap(), SberTtsScope::Personal);
-        assert_eq!(SberTtsScope::from_str("PERS").unwrap(), SberTtsScope::Personal);
-        assert_eq!(SberTtsScope::from_str("SALUTE_SPEECH_CORP").unwrap(), SberTtsScope::Corporate);
-        assert_eq!(SberTtsScope::from_str("SALUTE_SPEECH_B2B").unwrap(), SberTtsScope::B2B);
-        assert_eq!(SberTtsScope::from_str("SBER_SPEECH").unwrap(), SberTtsScope::Legacy);
+        assert_eq!(
+            SberTtsScope::from_str("SALUTE_SPEECH_PERS").unwrap(),
+            SberTtsScope::Personal
+        );
+        assert_eq!(
+            SberTtsScope::from_str("PERS").unwrap(),
+            SberTtsScope::Personal
+        );
+        assert_eq!(
+            SberTtsScope::from_str("SALUTE_SPEECH_CORP").unwrap(),
+            SberTtsScope::Corporate
+        );
+        assert_eq!(
+            SberTtsScope::from_str("SALUTE_SPEECH_B2B").unwrap(),
+            SberTtsScope::B2B
+        );
+        assert_eq!(
+            SberTtsScope::from_str("SBER_SPEECH").unwrap(),
+            SberTtsScope::Legacy
+        );
     }
 
     #[test]
@@ -583,7 +624,7 @@ mod tests {
         let config = SberTtsConfig::from_base(base).unwrap();
 
         // Should be Base64 encoded
-        use base64::{engine::general_purpose::STANDARD, Engine};
+        use base64::{Engine, engine::general_purpose::STANDARD};
         let expected = STANDARD.encode("test_client:test_secret".as_bytes());
         assert_eq!(config.client_credentials, expected);
         assert_eq!(config.voice, SberTtsVoice::Nec);
@@ -593,7 +634,7 @@ mod tests {
 
     #[test]
     fn test_config_from_base_with_encoded_credentials() {
-        use base64::{engine::general_purpose::STANDARD, Engine};
+        use base64::{Engine, engine::general_purpose::STANDARD};
         let encoded = STANDARD.encode("client:secret".as_bytes());
 
         let base = TTSConfig {
@@ -627,7 +668,7 @@ mod tests {
     fn test_config_invalid_sample_rate() {
         let base = TTSConfig {
             api_key: "test:secret".to_string(),
-            voice_id: None, // Use default SberDevices voice
+            voice_id: None,           // Use default SberDevices voice
             sample_rate: Some(16000), // Invalid - only 8000 or 24000
             ..Default::default()
         };

@@ -4,8 +4,8 @@
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, trace, warn};
@@ -15,17 +15,16 @@ use crate::core::stt::base::{
     STTResultCallback, STTStats,
 };
 
+use super::EOF_MARKER;
 use super::config::ReverieSTTConfig;
 use super::messages::ReverieServerMessage;
-use super::EOF_MARKER;
 
 // =============================================================================
 // Type Aliases
 // =============================================================================
 
-type WsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
 
 // =============================================================================
@@ -77,10 +76,7 @@ impl ReverieSTT {
     }
 
     /// Spawn the WebSocket message receiver task
-    fn spawn_receiver_task(
-        &self,
-        mut ws_stream: futures_util::stream::SplitStream<WsStream>,
-    ) {
+    fn spawn_receiver_task(&self, mut ws_stream: futures_util::stream::SplitStream<WsStream>) {
         let on_result = self.on_result.clone();
         let on_error = self.on_error.clone();
         let state = self.state.clone();
@@ -98,7 +94,8 @@ impl ReverieSTT {
                         let server_msg = ReverieServerMessage::from_json(&text);
 
                         match server_msg {
-                            ReverieServerMessage::Partial(result) | ReverieServerMessage::Final(result) => {
+                            ReverieServerMessage::Partial(result)
+                            | ReverieServerMessage::Final(result) => {
                                 // Store session ID if present
                                 if let Some(id) = &result.id {
                                     *session_id.write().await = Some(id.clone());
@@ -186,8 +183,8 @@ impl BaseSTT for ReverieSTT {
             ));
         }
 
-        let reverie_config = ReverieSTTConfig::from_base(&config)
-            .map_err(STTError::ConfigurationError)?;
+        let reverie_config =
+            ReverieSTTConfig::from_base(&config).map_err(STTError::ConfigurationError)?;
 
         Ok(Self {
             reverie_config,
@@ -218,24 +215,28 @@ impl BaseSTT for ReverieSTT {
 
         // Build WebSocket URL with all params
         let url = self.reverie_config.build_websocket_url();
-        debug!("WebSocket URL: {}", url.replace(&self.reverie_config.api_key, "[REDACTED]"));
+        debug!(
+            "WebSocket URL: {}",
+            url.replace(&self.reverie_config.api_key, "[REDACTED]")
+        );
 
         // Connect to WebSocket
-        let (ws_stream, response) = connect_async(&url)
-            .await
-            .map_err(|e| {
-                // Check for specific error types
-                let error_str = e.to_string();
-                if error_str.contains("401") || error_str.contains("Unauthorized") {
-                    STTError::AuthenticationFailed(format!("Invalid API credentials: {}", e))
-                } else if error_str.contains("400") || error_str.contains("Bad Request") {
-                    STTError::ConfigurationError(format!("Invalid configuration: {}", e))
-                } else {
-                    STTError::ConnectionFailed(format!("WebSocket connection failed: {}", e))
-                }
-            })?;
+        let (ws_stream, response) = connect_async(&url).await.map_err(|e| {
+            // Check for specific error types
+            let error_str = e.to_string();
+            if error_str.contains("401") || error_str.contains("Unauthorized") {
+                STTError::AuthenticationFailed(format!("Invalid API credentials: {}", e))
+            } else if error_str.contains("400") || error_str.contains("Bad Request") {
+                STTError::ConfigurationError(format!("Invalid configuration: {}", e))
+            } else {
+                STTError::ConnectionFailed(format!("WebSocket connection failed: {}", e))
+            }
+        })?;
 
-        debug!("WebSocket connected, response status: {:?}", response.status());
+        debug!(
+            "WebSocket connected, response status: {:?}",
+            response.status()
+        );
 
         // Split the stream
         let (sink, stream) = ws_stream.split();
@@ -252,8 +253,7 @@ impl BaseSTT for ReverieSTT {
 
         info!(
             "Connected to Reverie STT (lang: {}, domain: {})",
-            self.reverie_config.language,
-            self.reverie_config.domain
+            self.reverie_config.language, self.reverie_config.domain
         );
         Ok(())
     }
@@ -330,8 +330,8 @@ impl BaseSTT for ReverieSTT {
 
     async fn update_config(&mut self, config: STTConfig) -> Result<(), STTError> {
         // Update the reverie config
-        let new_reverie_config = ReverieSTTConfig::from_base(&config)
-            .map_err(STTError::ConfigurationError)?;
+        let new_reverie_config =
+            ReverieSTTConfig::from_base(&config).map_err(STTError::ConfigurationError)?;
         self.reverie_config = new_reverie_config;
         self.base_config = Some(config);
 

@@ -481,18 +481,22 @@ impl YandexTtsConfig {
             .unwrap_or(super::DEFAULT_SPEED);
 
         // Extract emotion from emotion_config
-        let emotion = config.emotion_config.as_ref().and_then(|ec| {
-            ec.emotion.as_ref().and_then(|e| {
-                match e.to_string().to_lowercase().as_str() {
-                    "happy" | "cheerful" | "good" | "joyful" => Some(YandexEmotion::Good),
-                    "angry" | "evil" | "irritated" | "frustrated" => Some(YandexEmotion::Evil),
-                    "formal" | "strict" | "professional" => Some(YandexEmotion::Strict),
-                    "friendly" | "warm" | "kind" => Some(YandexEmotion::Friendly),
-                    "whisper" | "quiet" => Some(YandexEmotion::Whisper),
-                    _ => None,
-                }
+        let emotion = config
+            .emotion_config
+            .as_ref()
+            .and_then(|ec| {
+                ec.emotion
+                    .as_ref()
+                    .and_then(|e| match e.to_string().to_lowercase().as_str() {
+                        "happy" | "cheerful" | "good" | "joyful" => Some(YandexEmotion::Good),
+                        "angry" | "evil" | "irritated" | "frustrated" => Some(YandexEmotion::Evil),
+                        "formal" | "strict" | "professional" => Some(YandexEmotion::Strict),
+                        "friendly" | "warm" | "kind" => Some(YandexEmotion::Friendly),
+                        "whisper" | "quiet" => Some(YandexEmotion::Whisper),
+                        _ => None,
+                    })
             })
-        }).unwrap_or_default();
+            .unwrap_or_default();
 
         // Default language based on voice
         let language = voice.default_language().parse().unwrap_or_default();

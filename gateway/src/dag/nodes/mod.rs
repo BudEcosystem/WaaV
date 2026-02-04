@@ -4,27 +4,29 @@
 //! Each node type represents a different processing unit that can transform,
 //! route, or output data.
 
+mod endpoint;
 mod input;
+mod llm;
 mod output;
 mod processor;
 mod provider;
-mod endpoint;
 mod router;
-mod llm;
 pub mod transform;
 
+pub use endpoint::{
+    GrpcEndpointNode, HttpEndpointNode, IpcEndpointNode, LiveKitEndpointNode, WebSocketEndpointNode,
+};
 pub use input::{AudioInputNode, TextInputNode};
+pub use llm::{ChatMessage, LlmEndpointConfig, LlmEndpointNode, ResponseFormat, ToolDefinition};
 pub use output::{AudioOutputNode, TextOutputNode, WebhookOutputNode};
 pub use processor::ProcessorNode;
-pub use provider::{STTProviderNode, TTSProviderNode, RealtimeProviderNode};
-pub use endpoint::{HttpEndpointNode, GrpcEndpointNode, WebSocketEndpointNode, IpcEndpointNode, LiveKitEndpointNode};
-pub use llm::{LlmEndpointNode, LlmEndpointConfig, ChatMessage, ToolDefinition, ResponseFormat};
-pub use router::{SplitNode, JoinNode, RouterNode};
-pub use transform::{TransformNode, PassthroughNode};
+pub use provider::{RealtimeProviderNode, STTProviderNode, TTSProviderNode};
+pub use router::{JoinNode, RouterNode, SplitNode};
+pub use transform::{PassthroughNode, TransformNode};
 
-use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::sync::Arc;
 
 use super::context::DAGContext;
 use super::error::DAGResult;
@@ -32,17 +34,12 @@ use super::error::DAGResult;
 /// Prelude for convenient imports
 pub mod prelude {
     pub use super::{
-        DAGNode, DAGData, NodeCapability,
-        AudioInputNode, TextInputNode,
-        AudioOutputNode, TextOutputNode, WebhookOutputNode,
-        ProcessorNode,
-        STTProviderNode, TTSProviderNode, RealtimeProviderNode,
-        HttpEndpointNode, GrpcEndpointNode, WebSocketEndpointNode,
-        IpcEndpointNode, LiveKitEndpointNode,
-        LlmEndpointNode, LlmEndpointConfig, ChatMessage, ToolDefinition, ResponseFormat,
-        SplitNode, JoinNode, RouterNode,
-        TransformNode, PassthroughNode,
-        STTResultData, TTSAudioData, WordTiming,
+        AudioInputNode, AudioOutputNode, ChatMessage, DAGData, DAGNode, GrpcEndpointNode,
+        HttpEndpointNode, IpcEndpointNode, JoinNode, LiveKitEndpointNode, LlmEndpointConfig,
+        LlmEndpointNode, NodeCapability, PassthroughNode, ProcessorNode, RealtimeProviderNode,
+        ResponseFormat, RouterNode, STTProviderNode, STTResultData, SplitNode, TTSAudioData,
+        TTSProviderNode, TextInputNode, TextOutputNode, ToolDefinition, TransformNode,
+        WebSocketEndpointNode, WebhookOutputNode, WordTiming,
     };
 }
 
@@ -328,12 +325,8 @@ pub trait DAGNode: Send + Sync {
     fn accepts_input(&self, data: &DAGData) -> bool {
         let caps = self.capabilities();
         match data {
-            DAGData::Audio(_) | DAGData::TTSAudio(_) => {
-                caps.contains(&NodeCapability::AudioInput)
-            }
-            DAGData::Text(_) | DAGData::STTResult(_) => {
-                caps.contains(&NodeCapability::TextInput)
-            }
+            DAGData::Audio(_) | DAGData::TTSAudio(_) => caps.contains(&NodeCapability::AudioInput),
+            DAGData::Text(_) | DAGData::STTResult(_) => caps.contains(&NodeCapability::TextInput),
             DAGData::Json(_) => caps.contains(&NodeCapability::JsonInput),
             DAGData::Binary(_) | DAGData::Multiple(_) | DAGData::Empty => true,
         }

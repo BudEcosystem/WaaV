@@ -149,7 +149,9 @@ impl TencentEngineModel {
             "16k_en" | "english" | "en" | "en-us" => Self::English16k,
             "16k_ca" | "cantonese_legacy" => Self::Cantonese16k,
             "16k_yue" | "cantonese" | "yue" | "zh-yue" => Self::CantoneseYue16k,
-            "16k_zh-tw" | "zh-tw" | "traditional" | "traditional_chinese" => Self::TraditionalChinese16k,
+            "16k_zh-tw" | "zh-tw" | "traditional" | "traditional_chinese" => {
+                Self::TraditionalChinese16k
+            }
             "16k_ar" | "arabic" | "ar" => Self::Arabic16k,
             "16k_ja" | "japanese" | "ja" | "ja-jp" => Self::Japanese16k,
             "16k_ko" | "korean" | "ko" | "ko-kr" => Self::Korean16k,
@@ -172,8 +174,11 @@ impl TencentEngineModel {
     /// Get the language code for this model.
     pub fn language_code(&self) -> &'static str {
         match self {
-            Self::Mandarin8k | Self::MandarinShort8k | Self::Mandarin16k |
-            Self::MandarinLarge16k | Self::MandarinVideo16k => "zh",
+            Self::Mandarin8k
+            | Self::MandarinShort8k
+            | Self::Mandarin16k
+            | Self::MandarinLarge16k
+            | Self::MandarinVideo16k => "zh",
             Self::English8k | Self::English16k => "en",
             Self::Cantonese16k | Self::CantoneseYue16k => "yue",
             Self::TraditionalChinese16k => "zh-TW",
@@ -728,7 +733,9 @@ impl TencentSttConfig {
 
     /// Get list of supported languages.
     pub fn supported_languages() -> Vec<&'static str> {
-        vec!["zh", "zh-TW", "en", "yue", "ar", "ja", "ko", "th", "vi", "id", "ms"]
+        vec![
+            "zh", "zh-TW", "en", "yue", "ar", "ja", "ko", "th", "vi", "id", "ms",
+        ]
     }
 
     /// Get list of supported models.
@@ -761,8 +768,8 @@ impl TencentSttConfig {
         }
 
         let engine_model = TencentEngineModel::from_str(&config.model);
-        let voice_format = TencentAudioFormat::from_str(&config.encoding)
-            .unwrap_or(TencentAudioFormat::Speex);
+        let voice_format =
+            TencentAudioFormat::from_str(&config.encoding).unwrap_or(TencentAudioFormat::Speex);
 
         let tencent_config = Self {
             secret_id,
@@ -793,34 +800,94 @@ mod tests {
 
     #[test]
     fn test_engine_model_parsing_mandarin() {
-        assert_eq!(TencentEngineModel::from_str("16k_zh"), TencentEngineModel::Mandarin16k);
-        assert_eq!(TencentEngineModel::from_str("mandarin"), TencentEngineModel::Mandarin16k);
-        assert_eq!(TencentEngineModel::from_str("zh"), TencentEngineModel::Mandarin16k);
-        assert_eq!(TencentEngineModel::from_str("chinese"), TencentEngineModel::Mandarin16k);
+        assert_eq!(
+            TencentEngineModel::from_str("16k_zh"),
+            TencentEngineModel::Mandarin16k
+        );
+        assert_eq!(
+            TencentEngineModel::from_str("mandarin"),
+            TencentEngineModel::Mandarin16k
+        );
+        assert_eq!(
+            TencentEngineModel::from_str("zh"),
+            TencentEngineModel::Mandarin16k
+        );
+        assert_eq!(
+            TencentEngineModel::from_str("chinese"),
+            TencentEngineModel::Mandarin16k
+        );
     }
 
     #[test]
     fn test_engine_model_parsing_8k() {
-        assert_eq!(TencentEngineModel::from_str("8k_zh"), TencentEngineModel::Mandarin8k);
-        assert_eq!(TencentEngineModel::from_str("8k_zh_s"), TencentEngineModel::MandarinShort8k);
+        assert_eq!(
+            TencentEngineModel::from_str("8k_zh"),
+            TencentEngineModel::Mandarin8k
+        );
+        assert_eq!(
+            TencentEngineModel::from_str("8k_zh_s"),
+            TencentEngineModel::MandarinShort8k
+        );
     }
 
     #[test]
     fn test_engine_model_parsing_languages() {
-        assert_eq!(TencentEngineModel::from_str("16k_en"), TencentEngineModel::English16k);
-        assert_eq!(TencentEngineModel::from_str("english"), TencentEngineModel::English16k);
-        assert_eq!(TencentEngineModel::from_str("8k_en"), TencentEngineModel::English8k);
-        assert_eq!(TencentEngineModel::from_str("16k_ca"), TencentEngineModel::Cantonese16k);
-        assert_eq!(TencentEngineModel::from_str("cantonese"), TencentEngineModel::CantoneseYue16k); // Maps to standard 16k_yue
-        assert_eq!(TencentEngineModel::from_str("16k_yue"), TencentEngineModel::CantoneseYue16k);
-        assert_eq!(TencentEngineModel::from_str("16k_zh-tw"), TencentEngineModel::TraditionalChinese16k);
-        assert_eq!(TencentEngineModel::from_str("16k_ar"), TencentEngineModel::Arabic16k);
-        assert_eq!(TencentEngineModel::from_str("16k_ja"), TencentEngineModel::Japanese16k);
-        assert_eq!(TencentEngineModel::from_str("16k_ko"), TencentEngineModel::Korean16k);
-        assert_eq!(TencentEngineModel::from_str("16k_th"), TencentEngineModel::Thai16k);
-        assert_eq!(TencentEngineModel::from_str("16k_vi"), TencentEngineModel::Vietnamese16k);
-        assert_eq!(TencentEngineModel::from_str("16k_id"), TencentEngineModel::Indonesian16k);
-        assert_eq!(TencentEngineModel::from_str("16k_ms"), TencentEngineModel::Malay16k);
+        assert_eq!(
+            TencentEngineModel::from_str("16k_en"),
+            TencentEngineModel::English16k
+        );
+        assert_eq!(
+            TencentEngineModel::from_str("english"),
+            TencentEngineModel::English16k
+        );
+        assert_eq!(
+            TencentEngineModel::from_str("8k_en"),
+            TencentEngineModel::English8k
+        );
+        assert_eq!(
+            TencentEngineModel::from_str("16k_ca"),
+            TencentEngineModel::Cantonese16k
+        );
+        assert_eq!(
+            TencentEngineModel::from_str("cantonese"),
+            TencentEngineModel::CantoneseYue16k
+        ); // Maps to standard 16k_yue
+        assert_eq!(
+            TencentEngineModel::from_str("16k_yue"),
+            TencentEngineModel::CantoneseYue16k
+        );
+        assert_eq!(
+            TencentEngineModel::from_str("16k_zh-tw"),
+            TencentEngineModel::TraditionalChinese16k
+        );
+        assert_eq!(
+            TencentEngineModel::from_str("16k_ar"),
+            TencentEngineModel::Arabic16k
+        );
+        assert_eq!(
+            TencentEngineModel::from_str("16k_ja"),
+            TencentEngineModel::Japanese16k
+        );
+        assert_eq!(
+            TencentEngineModel::from_str("16k_ko"),
+            TencentEngineModel::Korean16k
+        );
+        assert_eq!(
+            TencentEngineModel::from_str("16k_th"),
+            TencentEngineModel::Thai16k
+        );
+        assert_eq!(
+            TencentEngineModel::from_str("16k_vi"),
+            TencentEngineModel::Vietnamese16k
+        );
+        assert_eq!(
+            TencentEngineModel::from_str("16k_id"),
+            TencentEngineModel::Indonesian16k
+        );
+        assert_eq!(
+            TencentEngineModel::from_str("16k_ms"),
+            TencentEngineModel::Malay16k
+        );
     }
 
     #[test]
@@ -861,12 +928,18 @@ mod tests {
 
     #[test]
     fn test_engine_model_default() {
-        assert_eq!(TencentEngineModel::default(), TencentEngineModel::Mandarin16k);
+        assert_eq!(
+            TencentEngineModel::default(),
+            TencentEngineModel::Mandarin16k
+        );
     }
 
     #[test]
     fn test_engine_model_unknown_defaults_to_mandarin() {
-        assert_eq!(TencentEngineModel::from_str("unknown_model"), TencentEngineModel::Mandarin16k);
+        assert_eq!(
+            TencentEngineModel::from_str("unknown_model"),
+            TencentEngineModel::Mandarin16k
+        );
     }
 
     // =========================================================================
@@ -887,23 +960,59 @@ mod tests {
 
     #[test]
     fn test_audio_format_parsing() {
-        assert_eq!(TencentAudioFormat::from_str("pcm"), Some(TencentAudioFormat::Pcm));
-        assert_eq!(TencentAudioFormat::from_str("linear16"), Some(TencentAudioFormat::Pcm));
-        assert_eq!(TencentAudioFormat::from_str("speex"), Some(TencentAudioFormat::Speex));
-        assert_eq!(TencentAudioFormat::from_str("silk"), Some(TencentAudioFormat::Silk));
-        assert_eq!(TencentAudioFormat::from_str("mp3"), Some(TencentAudioFormat::Mp3));
-        assert_eq!(TencentAudioFormat::from_str("opus"), Some(TencentAudioFormat::Opus));
-        assert_eq!(TencentAudioFormat::from_str("wav"), Some(TencentAudioFormat::Wav));
-        assert_eq!(TencentAudioFormat::from_str("m4a"), Some(TencentAudioFormat::M4a));
-        assert_eq!(TencentAudioFormat::from_str("aac"), Some(TencentAudioFormat::Aac));
+        assert_eq!(
+            TencentAudioFormat::from_str("pcm"),
+            Some(TencentAudioFormat::Pcm)
+        );
+        assert_eq!(
+            TencentAudioFormat::from_str("linear16"),
+            Some(TencentAudioFormat::Pcm)
+        );
+        assert_eq!(
+            TencentAudioFormat::from_str("speex"),
+            Some(TencentAudioFormat::Speex)
+        );
+        assert_eq!(
+            TencentAudioFormat::from_str("silk"),
+            Some(TencentAudioFormat::Silk)
+        );
+        assert_eq!(
+            TencentAudioFormat::from_str("mp3"),
+            Some(TencentAudioFormat::Mp3)
+        );
+        assert_eq!(
+            TencentAudioFormat::from_str("opus"),
+            Some(TencentAudioFormat::Opus)
+        );
+        assert_eq!(
+            TencentAudioFormat::from_str("wav"),
+            Some(TencentAudioFormat::Wav)
+        );
+        assert_eq!(
+            TencentAudioFormat::from_str("m4a"),
+            Some(TencentAudioFormat::M4a)
+        );
+        assert_eq!(
+            TencentAudioFormat::from_str("aac"),
+            Some(TencentAudioFormat::Aac)
+        );
         assert_eq!(TencentAudioFormat::from_str("invalid"), None);
     }
 
     #[test]
     fn test_audio_format_from_value() {
-        assert_eq!(TencentAudioFormat::from_value(1), Some(TencentAudioFormat::Pcm));
-        assert_eq!(TencentAudioFormat::from_value(4), Some(TencentAudioFormat::Speex));
-        assert_eq!(TencentAudioFormat::from_value(10), Some(TencentAudioFormat::Opus));
+        assert_eq!(
+            TencentAudioFormat::from_value(1),
+            Some(TencentAudioFormat::Pcm)
+        );
+        assert_eq!(
+            TencentAudioFormat::from_value(4),
+            Some(TencentAudioFormat::Speex)
+        );
+        assert_eq!(
+            TencentAudioFormat::from_value(10),
+            Some(TencentAudioFormat::Opus)
+        );
         assert_eq!(TencentAudioFormat::from_value(99), None);
     }
 
@@ -987,12 +1096,10 @@ mod tests {
 
     #[test]
     fn test_config_vad_silence_time_clamping() {
-        let config = TencentSttConfig::new("id", "key", "app")
-            .with_vad_silence_time(100); // Below minimum
+        let config = TencentSttConfig::new("id", "key", "app").with_vad_silence_time(100); // Below minimum
         assert_eq!(config.vad_silence_time, Some(VAD_SILENCE_TIME_MIN));
 
-        let config = TencentSttConfig::new("id", "key", "app")
-            .with_vad_silence_time(5000); // Above maximum
+        let config = TencentSttConfig::new("id", "key", "app").with_vad_silence_time(5000); // Above maximum
         assert_eq!(config.vad_silence_time, Some(VAD_SILENCE_TIME_MAX));
     }
 

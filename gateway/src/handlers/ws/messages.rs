@@ -168,6 +168,24 @@ pub enum IncomingMessage {
         #[cfg_attr(feature = "openapi", schema(value_type = Object))]
         payload: serde_json::Value,
     },
+    /// Signal end of audio input stream.
+    ///
+    /// This message tells the STT provider that audio transmission is complete
+    /// and it should finalize any pending transcripts. This is important for
+    /// getting `speech_final=true` from providers like Deepgram that need
+    /// an explicit stream closure signal.
+    ///
+    /// # Behavior
+    /// 1. Sends CloseStream message to STT provider
+    /// 2. Waits briefly for final results
+    /// 3. Provider sends final transcript with `speech_final=true`
+    ///
+    /// # Example
+    /// ```json
+    /// {"type": "audio_end"}
+    /// ```
+    #[serde(rename = "audio_end")]
+    AudioEnd,
 }
 
 /// Unified message structure for all incoming messages from various sources
@@ -434,6 +452,7 @@ impl IncomingMessage {
                 }
             }
             IncomingMessage::Clear => {}
+            IncomingMessage::AudioEnd => {}
             IncomingMessage::Custom {
                 message_type,
                 payload,

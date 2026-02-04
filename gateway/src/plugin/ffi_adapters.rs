@@ -22,10 +22,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::sync::{Arc, Mutex};
 use waav_plugin_api::{
-    ErrorCallbackFn, FFISTTResult, FFIAudioData, FFITranscriptResult, FFIRealtimeAudio,
-    RealtimeAudioCallbackFn, RealtimeProvider, RealtimeTranscriptCallbackFn,
+    CompleteCallbackFn, ErrorCallbackFn, FFIAudioData, FFIRealtimeAudio, FFISTTResult,
+    FFITranscriptResult, RealtimeAudioCallbackFn, RealtimeProvider, RealtimeTranscriptCallbackFn,
     STTProvider, STTResultCallbackFn, TTSAudioCallbackFn, TTSProvider,
-    CompleteCallbackFn,
 };
 
 // =============================================================================
@@ -57,7 +56,9 @@ impl TypeErasedCallback {
         unsafe fn drop_typed<T>(ptr: *mut ()) {
             if !ptr.is_null() {
                 // SAFETY: ptr was created from Box::into_raw(Box<T>), so this is safe
-                unsafe { let _ = Box::from_raw(ptr as *mut T); }
+                unsafe {
+                    let _ = Box::from_raw(ptr as *mut T);
+                }
             }
         }
 
@@ -76,7 +77,9 @@ impl TypeErasedCallback {
 impl Drop for TypeErasedCallback {
     fn drop(&mut self) {
         // SAFETY: drop_fn was created with the correct type in new<T>()
-        unsafe { (self.drop_fn)(self.ptr); }
+        unsafe {
+            (self.drop_fn)(self.ptr);
+        }
     }
 }
 
@@ -121,12 +124,14 @@ impl CallbackStorage {
 }
 
 use crate::core::realtime::{
-    BaseRealtime, ConnectionState as RealtimeConnectionState, RealtimeAudioData, RealtimeConfig,
-    RealtimeError, RealtimeResult, TranscriptResult, TranscriptRole,
-    TranscriptCallback, AudioOutputCallback, RealtimeErrorCallback,
-    FunctionCallCallback, SpeechEventCallback, ResponseDoneCallback, ReconnectionCallback,
+    AudioOutputCallback, BaseRealtime, ConnectionState as RealtimeConnectionState,
+    FunctionCallCallback, RealtimeAudioData, RealtimeConfig, RealtimeError, RealtimeErrorCallback,
+    RealtimeResult, ReconnectionCallback, ResponseDoneCallback, SpeechEventCallback,
+    TranscriptCallback, TranscriptResult, TranscriptRole,
 };
-use crate::core::stt::{BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback};
+use crate::core::stt::{
+    BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
+};
 use crate::core::tts::{
     AudioCallback, AudioData, BaseTTS, ConnectionState as TTSConnectionState, TTSConfig, TTSError,
     TTSResult as TTSOpResult,
@@ -173,13 +178,18 @@ impl BaseSTT for FFISTTAdapter {
 
     async fn connect(&mut self) -> Result<(), STTError> {
         let result = {
-            let mut provider = self.provider.lock().unwrap();
+            let mut provider = self.provider.lock().map_err(|_| {
+                STTError::ConnectionFailed("STT provider unavailable (lock poisoned)".into())
+            })?;
             provider.connect()
         };
 
         match result {
             abi_stable::std_types::RResult::ROk(()) => {
-                *self.connected.lock().unwrap() = true;
+                let mut connected = self.connected.lock().map_err(|_| {
+                    STTError::ConnectionFailed("State tracking unavailable (lock poisoned)".into())
+                })?;
+                *connected = true;
                 Ok(())
             }
             abi_stable::std_types::RResult::RErr(e) => {
@@ -190,29 +200,37 @@ impl BaseSTT for FFISTTAdapter {
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
         let result = {
-            let mut provider = self.provider.lock().unwrap();
+            let mut provider = self.provider.lock().map_err(|_| {
+                STTError::ProviderError("STT provider unavailable (lock poisoned)".into())
+            })?;
             provider.disconnect()
         };
 
         match result {
             abi_stable::std_types::RResult::ROk(()) => {
-                *self.connected.lock().unwrap() = false;
+                let mut connected = self.connected.lock().map_err(|_| {
+                    STTError::ProviderError("State tracking unavailable (lock poisoned)".into())
+                })?;
+                *connected = false;
                 Ok(())
             }
-            abi_stable::std_types::RResult::RErr(e) => {
-                Err(STTError::ProviderError(e.to_string()))
-            }
+            abi_stable::std_types::RResult::RErr(e) => Err(STTError::ProviderError(e.to_string())),
         }
     }
 
     fn is_ready(&self) -> bool {
-        let provider = self.provider.lock().unwrap();
-        provider.is_ready()
+        // Return false if lock is poisoned (conservative, safe default)
+        self.provider
+            .lock()
+            .map(|provider| provider.is_ready())
+            .unwrap_or(false)
     }
 
     async fn send_audio(&mut self, audio_data: Bytes) -> Result<(), STTError> {
         let result = {
-            let mut provider = self.provider.lock().unwrap();
+            let mut provider = self.provider.lock().map_err(|_| {
+                STTError::AudioProcessingError("STT provider unavailable (lock poisoned)".into())
+            })?;
             provider.send_audio(&audio_data)
         };
 
@@ -226,7 +244,13 @@ impl BaseSTT for FFISTTAdapter {
 
     async fn on_result(&mut self, callback: STTResultCallback) -> Result<(), STTError> {
         // Store callback with type-safe cleanup
-        let user_data = self.callback_storage.lock().unwrap().store(callback);
+        let user_data = self
+            .callback_storage
+            .lock()
+            .map_err(|_| {
+                STTError::ProviderError("Callback storage unavailable (lock poisoned)".into())
+            })?
+            .store(callback);
 
         extern "C" fn stt_result_callback(result: *const FFISTTResult, user_data: *mut ()) {
             if result.is_null() || user_data.is_null() {
@@ -252,7 +276,9 @@ impl BaseSTT for FFISTTAdapter {
             func: stt_result_callback,
         };
 
-        let mut provider = self.provider.lock().unwrap();
+        let mut provider = self.provider.lock().map_err(|_| {
+            STTError::ProviderError("STT provider unavailable (lock poisoned)".into())
+        })?;
         // Get the vtable function and call it with handle reference
         let set_callback = provider.vtable.set_result_callback;
         set_callback(&mut provider.handle, callback_fn, user_data);
@@ -262,7 +288,13 @@ impl BaseSTT for FFISTTAdapter {
 
     async fn on_error(&mut self, callback: STTErrorCallback) -> Result<(), STTError> {
         // Store callback with type-safe cleanup
-        let user_data = self.callback_storage.lock().unwrap().store(callback);
+        let user_data = self
+            .callback_storage
+            .lock()
+            .map_err(|_| {
+                STTError::ProviderError("Callback storage unavailable (lock poisoned)".into())
+            })?
+            .store(callback);
 
         extern "C" fn stt_error_callback(
             error_code: u32,
@@ -295,7 +327,9 @@ impl BaseSTT for FFISTTAdapter {
             func: stt_error_callback,
         };
 
-        let mut provider = self.provider.lock().unwrap();
+        let mut provider = self.provider.lock().map_err(|_| {
+            STTError::ProviderError("STT provider unavailable (lock poisoned)".into())
+        })?;
         let set_callback = provider.vtable.set_error_callback;
         set_callback(&mut provider.handle, callback_fn, user_data);
 
@@ -307,7 +341,10 @@ impl BaseSTT for FFISTTAdapter {
     }
 
     async fn update_config(&mut self, config: STTConfig) -> Result<(), STTError> {
-        *self.config.lock().unwrap() = Some(config);
+        let mut cfg = self.config.lock().map_err(|_| {
+            STTError::ConfigurationError("Config storage unavailable (lock poisoned)".into())
+        })?;
+        *cfg = Some(config);
         Ok(())
     }
 
@@ -355,13 +392,18 @@ impl BaseTTS for FFITTSAdapter {
 
     async fn connect(&mut self) -> TTSOpResult<()> {
         let result = {
-            let mut provider = self.provider.lock().unwrap();
+            let mut provider = self.provider.lock().map_err(|_| {
+                TTSError::ConnectionFailed("TTS provider unavailable (lock poisoned)".into())
+            })?;
             provider.connect()
         };
 
         match result {
             abi_stable::std_types::RResult::ROk(()) => {
-                *self.connected.lock().unwrap() = true;
+                let mut connected = self.connected.lock().map_err(|_| {
+                    TTSError::ConnectionFailed("State tracking unavailable (lock poisoned)".into())
+                })?;
+                *connected = true;
                 Ok(())
             }
             abi_stable::std_types::RResult::RErr(e) => {
@@ -372,38 +414,52 @@ impl BaseTTS for FFITTSAdapter {
 
     async fn disconnect(&mut self) -> TTSOpResult<()> {
         let result = {
-            let mut provider = self.provider.lock().unwrap();
+            let mut provider = self.provider.lock().map_err(|_| {
+                TTSError::ProviderError("TTS provider unavailable (lock poisoned)".into())
+            })?;
             provider.disconnect()
         };
 
         match result {
             abi_stable::std_types::RResult::ROk(()) => {
-                *self.connected.lock().unwrap() = false;
+                let mut connected = self.connected.lock().map_err(|_| {
+                    TTSError::ProviderError("State tracking unavailable (lock poisoned)".into())
+                })?;
+                *connected = false;
                 Ok(())
             }
-            abi_stable::std_types::RResult::RErr(e) => {
-                Err(TTSError::ProviderError(e.to_string()))
-            }
+            abi_stable::std_types::RResult::RErr(e) => Err(TTSError::ProviderError(e.to_string())),
         }
     }
 
     fn is_ready(&self) -> bool {
-        let provider = self.provider.lock().unwrap();
-        provider.is_ready()
+        // Return false if lock is poisoned (conservative, safe default)
+        self.provider
+            .lock()
+            .map(|provider| provider.is_ready())
+            .unwrap_or(false)
     }
 
     fn get_connection_state(&self) -> TTSConnectionState {
-        if *self.connected.lock().unwrap() {
-            TTSConnectionState::Connected
-        } else {
-            TTSConnectionState::Disconnected
-        }
+        // Return Disconnected if lock is poisoned (conservative, safe default)
+        self.connected
+            .lock()
+            .map(|connected| {
+                if *connected {
+                    TTSConnectionState::Connected
+                } else {
+                    TTSConnectionState::Disconnected
+                }
+            })
+            .unwrap_or(TTSConnectionState::Disconnected)
     }
 
     async fn speak(&mut self, text: &str, flush: bool) -> TTSOpResult<()> {
         let text_rstring: abi_stable::std_types::RString = text.into();
         let result = {
-            let mut provider = self.provider.lock().unwrap();
+            let mut provider = self.provider.lock().map_err(|_| {
+                TTSError::AudioGenerationFailed("TTS provider unavailable (lock poisoned)".into())
+            })?;
             provider.speak(&text_rstring, flush)
         };
 
@@ -417,35 +473,41 @@ impl BaseTTS for FFITTSAdapter {
 
     async fn clear(&mut self) -> TTSOpResult<()> {
         let result = {
-            let mut provider = self.provider.lock().unwrap();
+            let mut provider = self.provider.lock().map_err(|_| {
+                TTSError::ProviderError("TTS provider unavailable (lock poisoned)".into())
+            })?;
             provider.clear()
         };
 
         match result {
             abi_stable::std_types::RResult::ROk(()) => Ok(()),
-            abi_stable::std_types::RResult::RErr(e) => {
-                Err(TTSError::ProviderError(e.to_string()))
-            }
+            abi_stable::std_types::RResult::RErr(e) => Err(TTSError::ProviderError(e.to_string())),
         }
     }
 
     async fn flush(&self) -> TTSOpResult<()> {
         let result = {
-            let mut provider = self.provider.lock().unwrap();
+            let mut provider = self.provider.lock().map_err(|_| {
+                TTSError::ProviderError("TTS provider unavailable (lock poisoned)".into())
+            })?;
             provider.flush()
         };
 
         match result {
             abi_stable::std_types::RResult::ROk(()) => Ok(()),
-            abi_stable::std_types::RResult::RErr(e) => {
-                Err(TTSError::ProviderError(e.to_string()))
-            }
+            abi_stable::std_types::RResult::RErr(e) => Err(TTSError::ProviderError(e.to_string())),
         }
     }
 
     fn on_audio(&mut self, callback: Arc<dyn AudioCallback>) -> TTSOpResult<()> {
         // Store callback with type-safe cleanup
-        let user_data = self.callback_storage.lock().unwrap().store(callback);
+        let user_data = self
+            .callback_storage
+            .lock()
+            .map_err(|_| {
+                TTSError::InternalError("Callback storage unavailable (lock poisoned)".into())
+            })?
+            .store(callback);
 
         extern "C" fn tts_audio_callback(audio: *const FFIAudioData, user_data: *mut ()) {
             if audio.is_null() || user_data.is_null() {
@@ -512,7 +574,9 @@ impl BaseTTS for FFITTSAdapter {
             func: tts_complete_callback,
         };
 
-        let mut provider = self.provider.lock().unwrap();
+        let mut provider = self.provider.lock().map_err(|_| {
+            TTSError::InternalError("TTS provider unavailable (lock poisoned)".into())
+        })?;
         // Get function pointers before borrowing handle
         let set_audio = provider.vtable.set_audio_callback;
         let set_error = provider.vtable.set_error_callback;
@@ -527,8 +591,17 @@ impl BaseTTS for FFITTSAdapter {
 
     fn get_provider_info(&self) -> serde_json::Value {
         let info = {
-            let provider = self.provider.lock().unwrap();
-            provider.get_provider_info()
+            // Return default info if lock is poisoned
+            match self.provider.lock() {
+                Ok(provider) => provider.get_provider_info(),
+                Err(_) => {
+                    return serde_json::json!({
+                        "provider": "dynamic-plugin-tts",
+                        "type": "ffi",
+                        "error": "provider unavailable"
+                    });
+                }
+            }
         };
 
         serde_json::from_str(info.as_str()).unwrap_or_else(|_| {
@@ -581,13 +654,22 @@ impl BaseRealtime for FFIRealtimeAdapter {
 
     async fn connect(&mut self) -> RealtimeResult<()> {
         let result = {
-            let mut provider = self.provider.lock().unwrap();
+            let mut provider = self.provider.lock().map_err(|_| {
+                RealtimeError::ConnectionFailed(
+                    "Realtime provider unavailable (lock poisoned)".into(),
+                )
+            })?;
             provider.connect()
         };
 
         match result {
             abi_stable::std_types::RResult::ROk(()) => {
-                *self.connected.lock().unwrap() = true;
+                let mut connected = self.connected.lock().map_err(|_| {
+                    RealtimeError::ConnectionFailed(
+                        "State tracking unavailable (lock poisoned)".into(),
+                    )
+                })?;
+                *connected = true;
                 Ok(())
             }
             abi_stable::std_types::RResult::RErr(e) => {
@@ -598,13 +680,20 @@ impl BaseRealtime for FFIRealtimeAdapter {
 
     async fn disconnect(&mut self) -> RealtimeResult<()> {
         let result = {
-            let mut provider = self.provider.lock().unwrap();
+            let mut provider = self.provider.lock().map_err(|_| {
+                RealtimeError::ProviderError("Realtime provider unavailable (lock poisoned)".into())
+            })?;
             provider.disconnect()
         };
 
         match result {
             abi_stable::std_types::RResult::ROk(()) => {
-                *self.connected.lock().unwrap() = false;
+                let mut connected = self.connected.lock().map_err(|_| {
+                    RealtimeError::ProviderError(
+                        "State tracking unavailable (lock poisoned)".into(),
+                    )
+                })?;
+                *connected = false;
                 Ok(())
             }
             abi_stable::std_types::RResult::RErr(e) => {
@@ -614,21 +703,32 @@ impl BaseRealtime for FFIRealtimeAdapter {
     }
 
     fn is_ready(&self) -> bool {
-        let provider = self.provider.lock().unwrap();
-        provider.is_ready()
+        // Return false if lock is poisoned (conservative, safe default)
+        self.provider
+            .lock()
+            .map(|provider| provider.is_ready())
+            .unwrap_or(false)
     }
 
     fn get_connection_state(&self) -> RealtimeConnectionState {
-        if *self.connected.lock().unwrap() {
-            RealtimeConnectionState::Connected
-        } else {
-            RealtimeConnectionState::Disconnected
-        }
+        // Return Disconnected if lock is poisoned (conservative, safe default)
+        self.connected
+            .lock()
+            .map(|connected| {
+                if *connected {
+                    RealtimeConnectionState::Connected
+                } else {
+                    RealtimeConnectionState::Disconnected
+                }
+            })
+            .unwrap_or(RealtimeConnectionState::Disconnected)
     }
 
     async fn send_audio(&mut self, audio_data: Bytes) -> RealtimeResult<()> {
         let result = {
-            let mut provider = self.provider.lock().unwrap();
+            let mut provider = self.provider.lock().map_err(|_| {
+                RealtimeError::ProviderError("Realtime provider unavailable (lock poisoned)".into())
+            })?;
             provider.send_audio(&audio_data)
         };
 
@@ -643,7 +743,9 @@ impl BaseRealtime for FFIRealtimeAdapter {
     async fn send_text(&mut self, text: &str) -> RealtimeResult<()> {
         let text_rstring: abi_stable::std_types::RString = text.into();
         let result = {
-            let mut provider = self.provider.lock().unwrap();
+            let mut provider = self.provider.lock().map_err(|_| {
+                RealtimeError::ProviderError("Realtime provider unavailable (lock poisoned)".into())
+            })?;
             provider.send_text(&text_rstring)
         };
 
@@ -657,7 +759,9 @@ impl BaseRealtime for FFIRealtimeAdapter {
 
     async fn create_response(&mut self) -> RealtimeResult<()> {
         let result = {
-            let mut provider = self.provider.lock().unwrap();
+            let mut provider = self.provider.lock().map_err(|_| {
+                RealtimeError::ProviderError("Realtime provider unavailable (lock poisoned)".into())
+            })?;
             provider.create_response()
         };
 
@@ -671,7 +775,9 @@ impl BaseRealtime for FFIRealtimeAdapter {
 
     async fn cancel_response(&mut self) -> RealtimeResult<()> {
         let result = {
-            let mut provider = self.provider.lock().unwrap();
+            let mut provider = self.provider.lock().map_err(|_| {
+                RealtimeError::ProviderError("Realtime provider unavailable (lock poisoned)".into())
+            })?;
             provider.cancel_response()
         };
 
@@ -693,7 +799,13 @@ impl BaseRealtime for FFIRealtimeAdapter {
 
     fn on_transcript(&mut self, callback: TranscriptCallback) -> RealtimeResult<()> {
         // Store callback with type-safe cleanup
-        let user_data = self.callback_storage.lock().unwrap().store(callback);
+        let user_data = self
+            .callback_storage
+            .lock()
+            .map_err(|_| {
+                RealtimeError::ProviderError("Callback storage unavailable (lock poisoned)".into())
+            })?
+            .store(callback);
 
         extern "C" fn realtime_transcript_callback(
             result: *const FFITranscriptResult,
@@ -728,7 +840,9 @@ impl BaseRealtime for FFIRealtimeAdapter {
             func: realtime_transcript_callback,
         };
 
-        let mut provider = self.provider.lock().unwrap();
+        let mut provider = self.provider.lock().map_err(|_| {
+            RealtimeError::ProviderError("Realtime provider unavailable (lock poisoned)".into())
+        })?;
         let set_callback = provider.vtable.set_transcript_callback;
         set_callback(&mut provider.handle, callback_fn, user_data);
 
@@ -737,7 +851,13 @@ impl BaseRealtime for FFIRealtimeAdapter {
 
     fn on_audio(&mut self, callback: AudioOutputCallback) -> RealtimeResult<()> {
         // Store callback with type-safe cleanup
-        let user_data = self.callback_storage.lock().unwrap().store(callback);
+        let user_data = self
+            .callback_storage
+            .lock()
+            .map_err(|_| {
+                RealtimeError::ProviderError("Callback storage unavailable (lock poisoned)".into())
+            })?
+            .store(callback);
 
         extern "C" fn realtime_audio_callback(audio: *const FFIRealtimeAudio, user_data: *mut ()) {
             if audio.is_null() || user_data.is_null() {
@@ -763,7 +883,9 @@ impl BaseRealtime for FFIRealtimeAdapter {
             func: realtime_audio_callback,
         };
 
-        let mut provider = self.provider.lock().unwrap();
+        let mut provider = self.provider.lock().map_err(|_| {
+            RealtimeError::ProviderError("Realtime provider unavailable (lock poisoned)".into())
+        })?;
         let set_callback = provider.vtable.set_audio_callback;
         set_callback(&mut provider.handle, callback_fn, user_data);
 
@@ -772,7 +894,13 @@ impl BaseRealtime for FFIRealtimeAdapter {
 
     fn on_error(&mut self, callback: RealtimeErrorCallback) -> RealtimeResult<()> {
         // Store callback with type-safe cleanup
-        let user_data = self.callback_storage.lock().unwrap().store(callback);
+        let user_data = self
+            .callback_storage
+            .lock()
+            .map_err(|_| {
+                RealtimeError::ProviderError("Callback storage unavailable (lock poisoned)".into())
+            })?
+            .store(callback);
 
         extern "C" fn realtime_error_callback(
             error_code: u32,
@@ -802,7 +930,9 @@ impl BaseRealtime for FFIRealtimeAdapter {
             func: realtime_error_callback,
         };
 
-        let mut provider = self.provider.lock().unwrap();
+        let mut provider = self.provider.lock().map_err(|_| {
+            RealtimeError::ProviderError("Realtime provider unavailable (lock poisoned)".into())
+        })?;
         let set_callback = provider.vtable.set_error_callback;
         set_callback(&mut provider.handle, callback_fn, user_data);
 
@@ -830,11 +960,18 @@ impl BaseRealtime for FFIRealtimeAdapter {
     }
 
     async fn update_session(&mut self, config: RealtimeConfig) -> RealtimeResult<()> {
-        *self.config.lock().unwrap() = Some(config);
+        let mut cfg = self.config.lock().map_err(|_| {
+            RealtimeError::InvalidConfiguration("Config storage unavailable (lock poisoned)".into())
+        })?;
+        *cfg = Some(config);
         Ok(())
     }
 
-    async fn submit_function_result(&mut self, _call_id: &str, _result: &str) -> RealtimeResult<()> {
+    async fn submit_function_result(
+        &mut self,
+        _call_id: &str,
+        _result: &str,
+    ) -> RealtimeResult<()> {
         // FFI plugins don't support function results yet
         Err(RealtimeError::ProviderError(
             "Function results not supported by FFI plugins".into(),
@@ -843,8 +980,17 @@ impl BaseRealtime for FFIRealtimeAdapter {
 
     fn get_provider_info(&self) -> serde_json::Value {
         let info = {
-            let provider = self.provider.lock().unwrap();
-            provider.get_provider_info()
+            // Return default info if lock is poisoned
+            match self.provider.lock() {
+                Ok(provider) => provider.get_provider_info(),
+                Err(_) => {
+                    return serde_json::json!({
+                        "provider": "dynamic-plugin-realtime",
+                        "type": "ffi",
+                        "error": "provider unavailable"
+                    });
+                }
+            }
         };
 
         serde_json::from_str(info.as_str()).unwrap_or_else(|_| {

@@ -18,8 +18,8 @@
 //! - Channels: Mono
 //! - Encoding: PCM, MP3 (Mandarin/English only), Speex
 
-use crate::core::stt::base::{STTConfig, STTError};
 use super::auth::IFlytekAuth;
+use crate::core::stt::base::{STTConfig, STTError};
 
 // =============================================================================
 // Constants
@@ -392,8 +392,8 @@ impl IFlytekSttConfig {
             .map_err(|e| STTError::AuthenticationFailed(e.to_string()))?;
 
         // Parse language
-        let language = IFlytekLanguage::from_code(&config.language)
-            .unwrap_or(IFlytekLanguage::default());
+        let language =
+            IFlytekLanguage::from_code(&config.language).unwrap_or(IFlytekLanguage::default());
 
         // Parse encoding
         let encoding = IFlytekAudioEncoding::from_str(&config.encoding)
@@ -532,8 +532,14 @@ mod tests {
 
     #[test]
     fn test_language_default_accent() {
-        assert_eq!(IFlytekLanguage::ChineseMandarin.default_accent(), "mandarin");
-        assert_eq!(IFlytekLanguage::ChineseCantonese.default_accent(), "cantonese");
+        assert_eq!(
+            IFlytekLanguage::ChineseMandarin.default_accent(),
+            "mandarin"
+        );
+        assert_eq!(
+            IFlytekLanguage::ChineseCantonese.default_accent(),
+            "cantonese"
+        );
         assert_eq!(IFlytekLanguage::English.default_accent(), "mandarin");
     }
 
@@ -572,7 +578,10 @@ mod tests {
 
     #[test]
     fn test_encoding_mime_types() {
-        assert_eq!(IFlytekAudioEncoding::Raw.mime_type(), "audio/L16;rate=16000");
+        assert_eq!(
+            IFlytekAudioEncoding::Raw.mime_type(),
+            "audio/L16;rate=16000"
+        );
         assert_eq!(IFlytekAudioEncoding::Mp3.mime_type(), "audio/mpeg");
     }
 
@@ -646,11 +655,7 @@ mod tests {
     #[test]
     fn test_config_validation_invalid_sample_rate() {
         let mut config = IFlytekSttConfig::default();
-        config.auth = IFlytekAuth::new(
-            "app".to_string(),
-            "key".to_string(),
-            "secret".to_string(),
-        );
+        config.auth = IFlytekAuth::new("app".to_string(), "key".to_string(), "secret".to_string());
         config.sample_rate = 44100;
         assert!(config.validate().is_err());
     }
@@ -658,11 +663,7 @@ mod tests {
     #[test]
     fn test_config_validation_mp3_non_chinese() {
         let mut config = IFlytekSttConfig::default();
-        config.auth = IFlytekAuth::new(
-            "app".to_string(),
-            "key".to_string(),
-            "secret".to_string(),
-        );
+        config.auth = IFlytekAuth::new("app".to_string(), "key".to_string(), "secret".to_string());
         config.language = IFlytekLanguage::Japanese;
         config.encoding = IFlytekAudioEncoding::Mp3;
         assert!(config.validate().is_err());

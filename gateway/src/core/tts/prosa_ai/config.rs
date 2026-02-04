@@ -144,10 +144,7 @@ impl ProsaTtsVoice {
     /// Get the gender for the voice.
     pub fn gender(&self) -> &'static str {
         match self {
-            Self::DimasFormal
-            | Self::DimasExpressive
-            | Self::Abimana
-            | Self::Roger => "male",
+            Self::DimasFormal | Self::DimasExpressive | Self::Abimana | Self::Roger => "male",
             Self::Custom(_) => "unknown",
             _ => "female",
         }
@@ -428,7 +425,11 @@ impl ProsaTtsConfig {
             return Err(TTSError::InvalidConfiguration(format!(
                 "Text exceeds maximum length of {} characters for {} mode, got {}",
                 max_length,
-                if self.wait { "synchronous" } else { "asynchronous" },
+                if self.wait {
+                    "synchronous"
+                } else {
+                    "asynchronous"
+                },
                 char_count
             )));
         }
@@ -665,8 +666,14 @@ mod tests {
 
     #[test]
     fn test_voice_from_str_default() {
-        assert_eq!(ProsaTtsVoice::from_str_relaxed("dimas"), ProsaTtsVoice::DimasFormal);
-        assert_eq!(ProsaTtsVoice::from_str_relaxed("default"), ProsaTtsVoice::DimasFormal);
+        assert_eq!(
+            ProsaTtsVoice::from_str_relaxed("dimas"),
+            ProsaTtsVoice::DimasFormal
+        );
+        assert_eq!(
+            ProsaTtsVoice::from_str_relaxed("default"),
+            ProsaTtsVoice::DimasFormal
+        );
     }
 
     #[test]
@@ -687,9 +694,18 @@ mod tests {
 
     #[test]
     fn test_voice_from_str_english() {
-        assert_eq!(ProsaTtsVoice::from_str_relaxed("roger"), ProsaTtsVoice::Roger);
-        assert_eq!(ProsaTtsVoice::from_str_relaxed("english_male"), ProsaTtsVoice::Roger);
-        assert_eq!(ProsaTtsVoice::from_str_relaxed("jennifer"), ProsaTtsVoice::Jennifer);
+        assert_eq!(
+            ProsaTtsVoice::from_str_relaxed("roger"),
+            ProsaTtsVoice::Roger
+        );
+        assert_eq!(
+            ProsaTtsVoice::from_str_relaxed("english_male"),
+            ProsaTtsVoice::Roger
+        );
+        assert_eq!(
+            ProsaTtsVoice::from_str_relaxed("jennifer"),
+            ProsaTtsVoice::Jennifer
+        );
     }
 
     #[test]
@@ -725,10 +741,22 @@ mod tests {
 
     #[test]
     fn test_audio_format_from_str() {
-        assert_eq!(ProsaTtsAudioFormat::from_str_relaxed("opus"), ProsaTtsAudioFormat::Opus);
-        assert_eq!(ProsaTtsAudioFormat::from_str_relaxed("mp3"), ProsaTtsAudioFormat::Mp3);
-        assert_eq!(ProsaTtsAudioFormat::from_str_relaxed("wav"), ProsaTtsAudioFormat::Wav);
-        assert_eq!(ProsaTtsAudioFormat::from_str_relaxed("unknown"), ProsaTtsAudioFormat::Opus);
+        assert_eq!(
+            ProsaTtsAudioFormat::from_str_relaxed("opus"),
+            ProsaTtsAudioFormat::Opus
+        );
+        assert_eq!(
+            ProsaTtsAudioFormat::from_str_relaxed("mp3"),
+            ProsaTtsAudioFormat::Mp3
+        );
+        assert_eq!(
+            ProsaTtsAudioFormat::from_str_relaxed("wav"),
+            ProsaTtsAudioFormat::Wav
+        );
+        assert_eq!(
+            ProsaTtsAudioFormat::from_str_relaxed("unknown"),
+            ProsaTtsAudioFormat::Opus
+        );
     }
 
     #[test]

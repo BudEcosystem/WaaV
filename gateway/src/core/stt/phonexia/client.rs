@@ -4,12 +4,12 @@
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
+    tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
 };
 use tracing::{debug, error, info, trace, warn};
 
@@ -17,18 +17,16 @@ use crate::core::stt::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback, STTStats,
 };
 
+use super::SESSION_ID_HEADER;
 use super::config::{PhonexiaAuth, PhonexiaSTTConfig};
 use super::messages::{PhonexiaCloseCode, PhonexiaErrorCode, ServerMessage};
-use super::SESSION_ID_HEADER;
 
 // =============================================================================
 // Type Aliases
 // =============================================================================
 
 type WebSocketSink = futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Message,
 >;
 
@@ -259,8 +257,9 @@ impl BaseSTT for PhonexiaSTT {
             PhonexiaAuth::Token { token } => {
                 request.headers_mut().insert(
                     SESSION_ID_HEADER,
-                    HeaderValue::from_str(token)
-                        .map_err(|e| STTError::AuthenticationFailed(format!("Invalid token: {}", e)))?,
+                    HeaderValue::from_str(token).map_err(|e| {
+                        STTError::AuthenticationFailed(format!("Invalid token: {}", e))
+                    })?,
                 );
             }
             PhonexiaAuth::Basic { username, password } => {
@@ -271,8 +270,9 @@ impl BaseSTT for PhonexiaSTT {
                 );
                 request.headers_mut().insert(
                     "Authorization",
-                    HeaderValue::from_str(&format!("Basic {}", encoded))
-                        .map_err(|e| STTError::AuthenticationFailed(format!("Invalid credentials: {}", e)))?,
+                    HeaderValue::from_str(&format!("Basic {}", encoded)).map_err(|e| {
+                        STTError::AuthenticationFailed(format!("Invalid credentials: {}", e))
+                    })?,
                 );
             }
             PhonexiaAuth::None => {
@@ -281,9 +281,9 @@ impl BaseSTT for PhonexiaSTT {
         }
 
         // Connect to WebSocket
-        let (ws_stream, response) = connect_async(request)
-            .await
-            .map_err(|e| STTError::ConnectionFailed(format!("WebSocket connection failed: {}", e)))?;
+        let (ws_stream, response) = connect_async(request).await.map_err(|e| {
+            STTError::ConnectionFailed(format!("WebSocket connection failed: {}", e))
+        })?;
 
         debug!(status = ?response.status(), "Phonexia: WebSocket connection established");
 
@@ -343,7 +343,10 @@ impl BaseSTT for PhonexiaSTT {
                             )
                             .await;
                         } else {
-                            warn!(len = data.len(), "Phonexia: Received non-UTF8 binary message");
+                            warn!(
+                                len = data.len(),
+                                "Phonexia: Received non-UTF8 binary message"
+                            );
                         }
                     }
                     Ok(Message::Frame(_)) => {

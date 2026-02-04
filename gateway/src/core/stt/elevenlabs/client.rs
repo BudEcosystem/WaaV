@@ -342,10 +342,7 @@ impl ElevenLabsSTT {
                         ElevenLabsMessage::SpeakerTurns(speaker_msg) => {
                             // Log speaker turns for now
                             // In future, this could be stored and attached to the STTResult
-                            debug!(
-                                "Received {} speaker turns",
-                                speaker_msg.turns.len()
-                            );
+                            debug!("Received {} speaker turns", speaker_msg.turns.len());
                             for turn in &speaker_msg.turns {
                                 debug!(
                                     "  Speaker {}: {:.2}s - {:.2}s, confidence: {:?}",

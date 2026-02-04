@@ -179,7 +179,8 @@ impl ProviderMetrics {
 
     /// Record total processing time (internal use by RequestTimer).
     fn record_processing_time(&self, duration_ns: u64) {
-        self.processing_sum_ns.fetch_add(duration_ns, Ordering::Relaxed);
+        self.processing_sum_ns
+            .fetch_add(duration_ns, Ordering::Relaxed);
         self.processing_count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -276,7 +277,8 @@ impl<'a> RequestTimer<'a> {
 
     /// Get TTFB if first byte was recorded (milliseconds).
     pub fn ttfb_ms(&self) -> Option<u64> {
-        self.first_byte_time.map(|t| (t - self.start_time).as_millis() as u64)
+        self.first_byte_time
+            .map(|t| (t - self.start_time).as_millis() as u64)
     }
 
     /// Finish timing and record metrics.
