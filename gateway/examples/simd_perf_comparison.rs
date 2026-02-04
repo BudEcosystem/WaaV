@@ -609,12 +609,12 @@ fn compare_accuracy(a: &[f32], b: &[f32]) -> (bool, f32, f64) {
     let max_diff = a
         .iter()
         .zip(b.iter())
-        .map(|(x, y)| (x - y).abs())
+        .map(|(x, y)| (*x - *y).abs())
         .fold(0.0f32, |acc, d| acc.max(d));
     let match_count = a
         .iter()
         .zip(b.iter())
-        .filter(|(x, y)| (x - y).abs() < EPSILON)
+        .filter(|(x, y)| (*x - *y).abs() < EPSILON)
         .count();
     let match_pct = 100.0 * match_count as f64 / a.len() as f64;
     (max_diff < EPSILON, max_diff, match_pct)
