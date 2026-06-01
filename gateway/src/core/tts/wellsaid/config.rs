@@ -241,6 +241,19 @@ impl WellSaidTtsConfig {
         Ok(wellsaid_config)
     }
 
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// WellSaid's config only carries voice (`speaker_id`) and model selection; it has no struct
+    /// field for any standardized prosody/voice feature. The Caruso model's AI Director (pitch,
+    /// tempo, loudness) is not represented as config state here, so there is nothing to map. Every
+    /// [`TtsFeatures`](crate::core::tts::standard::TtsFeatures) field (speed, pitch, volume,
+    /// stability, similarity_boost, style, use_speaker_boost, emotion, instructions, ssml, language,
+    /// word_timestamps, streaming, seed, sample_rate) is a capability gap and is skipped — this is a
+    /// pure `from_base` passthrough (speaker_id/model already flow through the flat base config).
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        Self::from_base(&std.base)
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> TTSResult<()> {
         if self.api_key.is_empty() {
@@ -288,6 +301,38 @@ impl Default for WellSaidTtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (TTS): WellSaid's config only holds voice/model selection (no prosody/voice
+    // feature fields), so `from_standard` is a pure `from_base` passthrough. Standardized features
+    // (here speed) are capability gaps and must be ignored, while speaker_id/model still flow
+    // through from the flat base config.
+    #[test]
+    fn from_standard_passthrough_ignores_capability_gaps() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "wellsaid".into(),
+                api_key: "test-key".into(),
+                voice_id: Some("26".into()),
+                model: "caruso".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),   // capability gap: no prosody field, must be ignored
+                pitch: Some(70.0),  // capability gap: AI Director not stored, must be ignored
+                ssml: Some(true),   // capability gap: must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = WellSaidTtsConfig::from_standard(&std).unwrap();
+        // Identical to a pure from_base of the same flat config (voice + model only).
+        let base_cfg = WellSaidTtsConfig::from_base(&std.base).unwrap();
+        assert_eq!(cfg.speaker_id, base_cfg.speaker_id);
+        assert_eq!(cfg.speaker_id, 26); // from voice_id
+        assert_eq!(cfg.model, WellSaidModel::Caruso); // from base.model
+        assert_eq!(cfg.api_key, "test-key");
+    }
 
     #[test]
     fn test_model_enum() {

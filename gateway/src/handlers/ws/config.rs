@@ -51,6 +51,11 @@ pub fn default_allow_interruption() -> Option<bool> {
     Some(true)
 }
 
+/// Default STT audio encoding (`linear16`, i.e. 16-bit PCM) when a client omits `encoding`.
+pub fn default_stt_encoding() -> String {
+    "linear16".to_string()
+}
+
 /// STT configuration for WebSocket messages (with optional API key)
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -70,10 +75,13 @@ pub struct STTWebSocketConfig {
     /// Enable punctuation in results
     #[cfg_attr(feature = "openapi", schema(example = true))]
     pub punctuation: bool,
-    /// Encoding of the audio
+    /// Encoding of the audio. Optional — defaults to `linear16` (16-bit PCM) when omitted.
+    #[serde(default = "default_stt_encoding")]
     #[cfg_attr(feature = "openapi", schema(example = "linear16"))]
     pub encoding: String,
-    /// Model to use for transcription
+    /// Model to use for transcription. Optional — defaults to empty, letting the provider pick its
+    /// own default model (each provider maps an empty model to its recommended default).
+    #[serde(default)]
     #[cfg_attr(feature = "openapi", schema(example = "nova-2"))]
     pub model: String,
     /// Optional API key for this provider (overrides server config)
@@ -347,4 +355,43 @@ pub fn compute_tts_config_hash(tts_config: &TTSConfig) -> String {
         s.push_str(&format!("{rate:.3}"));
     }
     format!("{:032x}", xxh3_128(s.as_bytes()))
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn stt_config_defaults_encoding_and_model_when_omitted() {
+        // A client that omits `encoding`/`model` must no longer be hard-rejected with
+        // "missing field …" — both now fall back to sensible defaults.
+        let json = serde_json::json!({
+            "provider": "deepgram",
+            "language": "en-US",
+            "sample_rate": 16000,
+            "channels": 1,
+            "punctuation": true
+        });
+        let cfg: STTWebSocketConfig =
+            serde_json::from_value(json).expect("stt_config should deserialize without encoding/model");
+        assert_eq!(cfg.encoding, "linear16");
+        assert_eq!(cfg.model, "");
+        assert_eq!(cfg.provider, "deepgram");
+    }
+
+    #[test]
+    fn stt_config_explicit_encoding_and_model_are_honored() {
+        let json = serde_json::json!({
+            "provider": "elevenlabs",
+            "language": "en",
+            "sample_rate": 16000,
+            "channels": 1,
+            "punctuation": true,
+            "encoding": "mulaw",
+            "model": "scribe_v2_realtime"
+        });
+        let cfg: STTWebSocketConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.encoding, "mulaw");
+        assert_eq!(cfg.model, "scribe_v2_realtime");
+    }
 }

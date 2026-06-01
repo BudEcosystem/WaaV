@@ -347,6 +347,38 @@ impl DashScopeTtsConfig {
         })
     }
 
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// CosyVoice/Qwen expose prosody knobs directly, so `speed` maps to `rate`, `pitch` to
+    /// `pitch`, and `volume` (a 0..=100 level here) is taken from the 0-100 `volume` feature;
+    /// `sample_rate` overrides the output rate. The non-standard `region` is read from the
+    /// `extras` passthrough. DashScope has no SSML / emotion / instructions / stability /
+    /// language / timestamp surface, so those features are skipped.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(speed) = f.speed {
+            cfg.rate = speed;
+        }
+        if let Some(pitch) = f.pitch {
+            cfg.pitch = pitch;
+        }
+        if let Some(volume) = f.volume {
+            cfg.volume = volume.clamp(0.0, 100.0) as u8;
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.sample_rate = rate;
+        }
+
+        // Provider-specific passthrough.
+        if let Some(region) = std.extras.0.get("region").and_then(|v| v.as_str()) {
+            cfg.region = DashScopeRegion::from_str(region);
+        }
+
+        Ok(cfg)
+    }
+
     /// Get list of supported voices.
     pub fn supported_voices() -> Vec<&'static str> {
         vec![
@@ -398,6 +430,38 @@ impl DashScopeTtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized prosody features (speed/pitch/volume) and output sample rate
+    // reach DashScope's real fields, and the non-standard region flows through the extras
+    // passthrough — previously unreachable through the flat factory.
+    #[test]
+    fn from_standard_maps_prosody_rate_and_region() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("region".into(), serde_json::json!("singapore"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "alibaba-cloud".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.25),
+                pitch: Some(0.9),
+                volume: Some(80.0),
+                sample_rate: Some(24000),
+                ssml: Some(true), // capability gap: DashScope has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = DashScopeTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.rate, 1.25);
+        assert_eq!(cfg.pitch, 0.9);
+        assert_eq!(cfg.volume, 80);
+        assert_eq!(cfg.sample_rate, 24000);
+        assert_eq!(cfg.region, DashScopeRegion::Singapore); // extras passthrough
+    }
 
     #[test]
     fn test_config_default() {

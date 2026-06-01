@@ -224,6 +224,73 @@ impl AzureSTT {
         )
     }
 
+    /// A fresh 32-hex-char request id (GUID without dashes), as Azure's USP protocol expects.
+    fn new_request_id() -> String {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
+
+    /// Current UTC time formatted as ISO-8601 (Azure `X-Timestamp`). Built from `time`
+    /// accessors so it needs no extra crate feature.
+    fn iso8601_now() -> String {
+        let n = time::OffsetDateTime::now_utc();
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            n.year(),
+            n.month() as u8,
+            n.day(),
+            n.hour(),
+            n.minute(),
+            n.second(),
+            n.millisecond()
+        )
+    }
+
+    /// Build an Azure USP **text** message: a CRLF header block (`Path`, `X-RequestId`,
+    /// `X-Timestamp`, `Content-Type`) + a blank line + the body. Sent as a WebSocket Text frame.
+    fn usp_text_message(
+        path: &str,
+        request_id: &str,
+        timestamp: &str,
+        content_type: &str,
+        body: &str,
+    ) -> String {
+        format!(
+            "Path: {path}\r\nX-RequestId: {request_id}\r\nX-Timestamp: {timestamp}\r\nContent-Type: {content_type}\r\n\r\n{body}"
+        )
+    }
+
+    /// Build an Azure USP **binary** (audio) message: a 2-byte big-endian header length, the
+    /// CRLF header block, then the raw audio payload. Sending unframed binary (the previous
+    /// behaviour) is silently ignored by Azure — this is the protocol the service requires.
+    fn usp_audio_frame(
+        request_id: &str,
+        timestamp: &str,
+        content_type: &str,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let header = format!(
+            "Path: audio\r\nX-RequestId: {request_id}\r\nX-Timestamp: {timestamp}\r\nContent-Type: {content_type}\r\n"
+        );
+        let hb = header.as_bytes();
+        let mut out = Vec::with_capacity(2 + hb.len() + payload.len());
+        out.extend_from_slice(&(hb.len() as u16).to_be_bytes());
+        out.extend_from_slice(hb);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// The `speech.config` JSON body Azure requires once after the handshake (system context).
+    fn speech_config_body() -> String {
+        serde_json::json!({
+            "context": {
+                "system": { "name": "WaaV-Gateway", "version": "1.0.0" },
+                "os": { "platform": "Linux", "name": "WaaV", "version": "1.0" },
+                "device": { "manufacturer": "WaaV", "model": "Gateway", "version": "1.0" }
+            }
+        })
+        .to_string()
+    }
+
     /// Handle incoming WebSocket messages from Azure.
     ///
     /// This method parses Azure messages and routes them appropriately:
@@ -425,6 +492,27 @@ impl AzureSTT {
 
             let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
+            // Azure USP protocol: send the mandatory `speech.config` message immediately after
+            // the handshake, then frame every audio chunk with the USP binary header. Without
+            // this the service ignores the audio and never starts a recognition turn (the
+            // provider was BROKEN — see BRUTAL_REVIEW.md "Azure STT").
+            let request_id = Self::new_request_id();
+            let speech_config = Self::usp_text_message(
+                "speech.config",
+                &request_id,
+                &Self::iso8601_now(),
+                "application/json",
+                &Self::speech_config_body(),
+            );
+            if let Err(e) = ws_sink.send(Message::Text(speech_config.into())).await {
+                let stt_error = STTError::NetworkError(format!(
+                    "Failed to send Azure speech.config: {e}"
+                ));
+                error!("{}", stt_error);
+                let _ = error_tx.try_send(stt_error);
+                return;
+            }
+
             // Keep-alive mechanism: Azure connections may timeout during silence
             // Send silence frames every 5 seconds if no audio was sent
             let mut keepalive_timer = interval(Duration::from_secs(1));
@@ -438,8 +526,15 @@ impl AzureSTT {
 
                     // Handle outgoing audio data
                     Some(audio_data) = ws_rx.recv() => {
-                        // Azure expects raw PCM audio as binary messages
-                        let message = Message::Binary(audio_data);
+                        // Frame the PCM payload with the Azure USP binary header (2-byte length
+                        // + CRLF headers), NOT raw binary.
+                        let framed = Self::usp_audio_frame(
+                            &request_id,
+                            &Self::iso8601_now(),
+                            &content_type,
+                            &audio_data,
+                        );
+                        let message = Message::Binary(framed.into());
                         if let Err(e) = ws_sink.send(message).await {
                             let stt_error = STTError::NetworkError(format!(
                                 "Failed to send audio to Azure: {e}"
@@ -497,7 +592,14 @@ impl AzureSTT {
                             // Send a small buffer of silence (32 samples at 16kHz = 2ms)
                             // This is minimal overhead but keeps the connection alive
                             let silence_frame = vec![0u8; 64]; // 32 16-bit samples
-                            let message = Message::Binary(silence_frame.into());
+                            // Keepalive audio must also be USP-framed, not raw.
+                            let framed = Self::usp_audio_frame(
+                                &request_id,
+                                &Self::iso8601_now(),
+                                &content_type,
+                                &silence_frame,
+                            );
+                            let message = Message::Binary(framed.into());
                             if let Err(e) = ws_sink.send(message).await {
                                 let stt_error = STTError::NetworkError(format!(
                                     "Failed to send keep-alive: {e}"
@@ -886,6 +988,46 @@ impl AzureSTT {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Azure USP framing — converts the provider from BROKEN (unframed binary, no speech.config)
+    // to the documented Universal Speech Protocol. Byte-exact acceptance is gated on the live
+    // CI smoke test; these assert the framing STRUCTURE the protocol requires.
+    #[test]
+    fn usp_audio_frame_has_2byte_header_len_then_header_then_payload() {
+        let payload = [1u8, 2, 3, 4];
+        let frame = AzureSTT::usp_audio_frame("rid", "2024-01-01T00:00:00.000Z", "audio/x-wav", &payload);
+        // First 2 bytes = big-endian header length.
+        let hdr_len = u16::from_be_bytes([frame[0], frame[1]]) as usize;
+        let header = std::str::from_utf8(&frame[2..2 + hdr_len]).unwrap();
+        assert!(header.starts_with("Path: audio\r\n"));
+        assert!(header.contains("X-RequestId: rid\r\n"));
+        assert!(header.contains("X-Timestamp: 2024-01-01T00:00:00.000Z\r\n"));
+        assert!(header.contains("Content-Type: audio/x-wav\r\n"));
+        // Payload is appended verbatim after the header block.
+        assert_eq!(&frame[2 + hdr_len..], &payload);
+    }
+
+    #[test]
+    fn usp_text_message_has_headers_blank_line_then_body() {
+        let body = AzureSTT::speech_config_body();
+        let msg = AzureSTT::usp_text_message(
+            "speech.config", "rid", "2024-01-01T00:00:00.000Z", "application/json", &body,
+        );
+        assert!(msg.starts_with("Path: speech.config\r\n"));
+        assert!(msg.contains("Content-Type: application/json\r\n\r\n"));
+        // Body is valid JSON with the required `context` block.
+        let json_part = msg.split("\r\n\r\n").nth(1).unwrap();
+        let v: serde_json::Value = serde_json::from_str(json_part).unwrap();
+        assert!(v["context"]["system"]["name"].is_string());
+    }
+
+    #[test]
+    fn iso8601_now_is_well_formed() {
+        let ts = AzureSTT::iso8601_now();
+        // YYYY-MM-DDTHH:MM:SS.mmmZ
+        assert_eq!(ts.len(), 24);
+        assert!(ts.ends_with('Z') && ts.contains('T'));
+    }
 
     #[test]
     fn test_azure_stt_creation() {

@@ -580,10 +580,48 @@ impl OpenAISTTConfig {
         }
     }
 
+    /// Build from the standardized config (W1 keystone). OpenAI models its advanced features on
+    /// the `response_format` (diarization needs `DiarizedJson`, word timestamps need a JSON format
+    /// with word granularity) and the free-form `prompt` (the documented spelling/vocabulary hint),
+    /// so this maps the standardized features whose meaning matches an existing OpenAI field:
+    /// diarization, word timestamps and keyterms. Features OpenAI cannot express (interim_results,
+    /// smart_format, profanity_filter, redaction, vad_events, entity/language detection) are
+    /// capability gaps and stay at default.
+    pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone());
+        if let Some(true) = f.diarization {
+            cfg.response_format = ResponseFormat::DiarizedJson;
+        }
+        if let Some(w) = f.word_timestamps {
+            cfg.timestamp_granularities = if w {
+                vec![TimestampGranularity::Word]
+            } else {
+                Vec::new()
+            };
+        }
+        if let Some(k) = &f.keyterms {
+            if !k.is_empty() {
+                cfg.prompt = Some(k.join(", "));
+            }
+        }
+        cfg
+    }
+
     /// Get the API endpoint URL.
+    ///
+    /// Honors the standard `OPENAI_BASE_URL` override (as the OpenAI SDKs do), so the provider
+    /// also works against OpenAI-compatible endpoints (Azure OpenAI, Groq, vLLM, a local
+    /// transcription server, or a proxy) — and enables credential-free contract/e2e testing.
     #[inline]
-    pub fn api_url(&self) -> &'static str {
-        "https://api.openai.com/v1/audio/transcriptions"
+    pub fn api_url(&self) -> String {
+        if let Ok(base) = std::env::var("OPENAI_BASE_URL") {
+            let base = base.trim().trim_end_matches('/');
+            if !base.is_empty() {
+                return format!("{base}/v1/audio/transcriptions");
+            }
+        }
+        "https://api.openai.com/v1/audio/transcriptions".to_string()
     }
 
     /// Validate the configuration.
@@ -643,6 +681,30 @@ impl OpenAISTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features unlock OpenAI's response-format-driven feature
+    // surface (diarization + word timestamps) — previously unreachable via the flat factory.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "openai".into(),
+                api_key: "test-key".into(),
+                model: "gpt-4o-transcribe".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "OpenAI".into()]),
+                ..Default::default()
+            },
+            ..StandardSTTConfig::from_base(STTConfig::default())
+        };
+        let cfg = OpenAISTTConfig::from_standard(&std);
+        assert_eq!(cfg.response_format, ResponseFormat::DiarizedJson);
+        assert_eq!(cfg.prompt.as_deref(), Some("WaaV, OpenAI"));
+    }
 
     #[test]
     fn test_openai_stt_model_as_str() {

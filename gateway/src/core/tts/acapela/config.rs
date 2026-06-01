@@ -440,6 +440,54 @@ impl AcapelaTtsConfig {
         })
     }
 
+    /// Build from the standardized config (W1 keystone). Maps the TTS features Acapela can express
+    /// to real query parameters: [`TtsFeatures::speed`] (a `1.0`-normal multiplier) becomes the
+    /// integer `speed` (where `100` is normal, clamped to `MIN_SPEED..=MAX_SPEED`),
+    /// [`TtsFeatures::volume`] becomes the integer `volume` level (clamped to
+    /// `MIN_VOLUME..=MAX_VOLUME`), [`TtsFeatures::sample_rate`] overrides the output `sample_rate`
+    /// (clamped to `MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE`), and [`TtsFeatures::word_timestamps`]
+    /// enables word position events (`word_positions`). The non-standard `bitrate`, `dictionaries`
+    /// and `application` knobs are read from the `extras` passthrough. Acapela has no field for
+    /// pitch, ElevenLabs-style voice settings, emotion, instructions, SSML, language, streaming or
+    /// seed, so those features are skipped.
+    ///
+    /// [`TtsFeatures::speed`]: crate::core::tts::standard::TtsFeatures::speed
+    /// [`TtsFeatures::volume`]: crate::core::tts::standard::TtsFeatures::volume
+    /// [`TtsFeatures::sample_rate`]: crate::core::tts::standard::TtsFeatures::sample_rate
+    /// [`TtsFeatures::word_timestamps`]: crate::core::tts::standard::TtsFeatures::word_timestamps
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+
+        if let Some(speed) = f.speed {
+            // Standardized speed is a 1.0-is-normal multiplier; Acapela uses 100-is-normal.
+            cfg.speed =
+                ((speed * 100.0).round() as u32).clamp(super::MIN_SPEED, super::MAX_SPEED);
+        }
+        if let Some(volume) = f.volume {
+            cfg.volume = (volume.round() as u32).clamp(super::MIN_VOLUME, super::MAX_VOLUME);
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.sample_rate = rate.clamp(super::MIN_SAMPLE_RATE, super::MAX_SAMPLE_RATE);
+        }
+        if let Some(true) = f.word_timestamps {
+            cfg.word_positions = true;
+        }
+
+        // Provider-specific passthrough.
+        if let Some(bitrate) = std.extras.0.get("bitrate").and_then(|v| v.as_u64()) {
+            cfg.bitrate = Some(bitrate as u32);
+        }
+        if let Some(dico) = std.extras.0.get("dictionaries").and_then(|v| v.as_str()) {
+            cfg.dictionaries = Some(dico.to_string());
+        }
+        if let Some(app) = std.extras.0.get("application").and_then(|v| v.as_str()) {
+            cfg.application = Some(app.to_string());
+        }
+
+        Ok(cfg)
+    }
+
     /// Validate text length
     pub fn validate_text(&self, text: &str) -> TTSResult<()> {
         let max_len = match self.output_mode {
@@ -703,6 +751,43 @@ impl AcapelaTtsConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features Acapela can express (speed, volume, output sample
+    // rate, word-timing events) reach their real query-parameter fields, and the non-standard
+    // bitrate / dictionaries / application knobs flow through the extras passthrough.
+    #[test]
+    fn from_standard_maps_speed_volume_rate_and_word_positions() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("bitrate".into(), serde_json::json!(128));
+        extras.insert("dictionaries".into(), serde_json::json!("custom.dic"));
+        extras.insert("application".into(), serde_json::json!("my-app"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "acapela".into(),
+                api_key: "user@example.com:password123".into(),
+                sample_rate: Some(22050),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.2),
+                volume: Some(40000.0),
+                sample_rate: Some(16000),
+                word_timestamps: Some(true),
+                ssml: Some(true), // capability gap: Acapela has no SSML field, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = AcapelaTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.speed, 120); // 1.2 multiplier -> 120 (100 = normal)
+        assert_eq!(cfg.volume, 40000);
+        assert_eq!(cfg.sample_rate, 16000);
+        assert!(cfg.word_positions);
+        assert_eq!(cfg.bitrate, Some(128)); // extras passthrough
+        assert_eq!(cfg.dictionaries, Some("custom.dic".to_string()));
+        assert_eq!(cfg.application, Some("my-app".to_string()));
+    }
 
     #[test]
     fn test_audio_format_enum() {

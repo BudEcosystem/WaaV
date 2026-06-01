@@ -441,6 +441,49 @@ impl SmallestTtsConfig {
         })
     }
 
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// Smallest exposes a speed multiplier plus the lightning-large voice knobs, so this maps
+    /// `speed` -> `speed` (reusing `from_base`'s `MIN_SPEED..=model.max_speed()` clamp so 1.0 stays
+    /// normal), the ElevenLabs-style `stability` -> `consistency` and `similarity_boost` ->
+    /// `similarity` (both direct 0-1 levels, clamped to their valid ranges), `language` -> the
+    /// `SmallestLanguage` enum (only when it parses), and `sample_rate` -> `sample_rate` (snapped to
+    /// the nearest supported rate). Smallest's non-standard `enhancement` level is read from the
+    /// `extras` passthrough. Features without a Smallest field (pitch, volume, style,
+    /// use_speaker_boost, emotion, instructions, ssml, word_timestamps, streaming, seed) are skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(speed) = f.speed {
+            // Reuse from_base's clamp: a 1.0-is-normal multiplier bounded by the model's max speed.
+            cfg.speed = speed.clamp(MIN_SPEED, cfg.model.max_speed());
+        }
+        if let Some(stability) = f.stability {
+            // Smallest voice consistency is a direct 0-1 level (lightning-large only).
+            cfg.consistency = stability.clamp(MIN_CONSISTENCY, MAX_CONSISTENCY);
+        }
+        if let Some(similarity_boost) = f.similarity_boost {
+            // Smallest voice similarity is a direct 0-1 level (lightning-large only).
+            cfg.similarity = similarity_boost.clamp(MIN_SIMILARITY, MAX_SIMILARITY);
+        }
+        if let Some(lang) = f.language.as_deref().and_then(|l| l.parse().ok()) {
+            cfg.language = lang;
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.sample_rate = super::nearest_sample_rate(rate);
+        }
+
+        // Provider-specific passthrough.
+        if let Some(enhancement) = std.extras.0.get("enhancement").and_then(|v| v.as_u64()) {
+            cfg.enhancement = (enhancement as u8).clamp(MIN_ENHANCEMENT, MAX_ENHANCEMENT);
+        }
+
+        Ok(cfg)
+    }
+
     /// Validates the configuration.
     pub fn validate(&self) -> Result<(), TTSError> {
         if self.api_key.is_empty() {
@@ -566,6 +609,38 @@ mod tests {
             request_pool_size: Some(4),
             emotion_config: None,
         }
+    }
+
+    // W1 keystone (TTS): the standardized features Smallest can express — the speed multiplier,
+    // the lightning-large voice knobs (stability -> consistency, similarity_boost -> similarity),
+    // the synthesis language, and the output sample rate — reach the config fields, and the open
+    // extras passthrough carries the provider-specific enhancement level.
+    #[test]
+    fn from_standard_maps_speed_voice_knobs_language_and_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("enhancement".into(), serde_json::json!(2));
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                speed: Some(1.5),
+                stability: Some(0.8),
+                similarity_boost: Some(0.7),
+                language: Some("hi".into()),
+                sample_rate: Some(16000),
+                ssml: Some(true), // capability gap: Smallest has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = SmallestTtsConfig::from_standard(&std).unwrap();
+        // Lightning model max speed is 2.0, so 1.5 passes through the clamp unchanged.
+        assert!((cfg.speed - 1.5).abs() < 0.001);
+        assert!((cfg.consistency - 0.8).abs() < 0.001); // stability -> consistency
+        assert!((cfg.similarity - 0.7).abs() < 0.001); // similarity_boost -> similarity
+        assert_eq!(cfg.language, SmallestLanguage::Hindi);
+        assert_eq!(cfg.sample_rate, 16000);
+        assert_eq!(cfg.enhancement, 2); // from extras passthrough
     }
 
     // =========================================================================

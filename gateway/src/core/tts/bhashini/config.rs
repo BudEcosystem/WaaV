@@ -202,6 +202,50 @@ impl BhashiniTtsConfig {
         })
     }
 
+    /// Build from the standardized TTS config. Bhashini's surface is a fixed AI4Bharat
+    /// pipeline, so only the features that match real fields are mapped: `sample_rate`
+    /// overrides the output rate and `language` re-selects the Bhashini language (when it
+    /// parses to a supported code). Provider-specific knobs (`custom_callback_url`,
+    /// `custom_service_id`) are read from the `extras` passthrough. Features with no
+    /// Bhashini field (speed, pitch, volume, stability, similarity_boost, style,
+    /// use_speaker_boost, emotion, instructions, ssml, word_timestamps, streaming, seed)
+    /// are skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(rate) = f.sample_rate {
+            cfg.sample_rate = rate;
+        }
+        if let Some(lang) = f.language.as_deref() {
+            if let Some(language) = BhashiniLanguage::from_code(lang) {
+                cfg.language = language;
+            }
+        }
+
+        // Provider-specific passthrough.
+        if let Some(url) = std
+            .extras
+            .0
+            .get("custom_callback_url")
+            .and_then(|v| v.as_str())
+        {
+            cfg.custom_callback_url = Some(url.to_string());
+        }
+        if let Some(id) = std
+            .extras
+            .0
+            .get("custom_service_id")
+            .and_then(|v| v.as_str())
+        {
+            cfg.custom_service_id = Some(id.to_string());
+        }
+
+        Ok(cfg)
+    }
+
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), TTSError> {
         if self.user_id.is_empty() {
@@ -255,6 +299,47 @@ impl BhashiniLanguage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Bhashini maps only the features that have real fields: sample_rate -> output rate,
+    // language -> Bhashini language, plus the custom_service_id / custom_callback_url
+    // extras passthrough. Prosody/style features have no Bhashini field and are skipped.
+    #[test]
+    fn from_standard_maps_sample_rate_language_and_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert(
+            "custom_service_id".into(),
+            serde_json::json!("svc-123"),
+        );
+        extras.insert(
+            "custom_callback_url".into(),
+            serde_json::json!("https://cb.example"),
+        );
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "bhashini".into(),
+                api_key: "user|key".into(),
+                voice_id: Some("hi".into()),
+                sample_rate: Some(22050),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                sample_rate: Some(16000),
+                language: Some("ta".into()),
+                speed: Some(1.5), // capability gap: Bhashini has no speed field, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = BhashiniTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.sample_rate, 16000);
+        assert_eq!(cfg.language, BhashiniLanguage::Tamil);
+        assert_eq!(cfg.custom_service_id, Some("svc-123".to_string())); // extras passthrough
+        assert_eq!(
+            cfg.custom_callback_url,
+            Some("https://cb.example".to_string())
+        );
+    }
 
     #[test]
     fn test_config_from_base_valid() {

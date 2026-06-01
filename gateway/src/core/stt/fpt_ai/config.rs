@@ -90,6 +90,20 @@ impl FptSttConfig {
         })
     }
 
+    /// Build from the standardized config (W1 keystone). FPT.AI is a simple batch decode endpoint
+    /// whose config only carries transport knobs (api_key, sample_rate, channels, request_timeout)
+    /// — it exposes no advanced-feature surface. None of the standardized
+    /// [`SttFeatures`](crate::core::stt::standard::SttFeatures) (diarization, word_timestamps,
+    /// smart_format, profanity_filter, filler_words, interim_results, vad_events, endpointing,
+    /// utterance_end, keyterms, redaction, entity_detection, language_detection) map to a real
+    /// field here, so this is a pure `from_base` passthrough: a uniform standardized entry point
+    /// with no feature mapping.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        Self::from_base(&std.base)
+    }
+
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), String> {
         if self.api_key.is_empty() {
@@ -174,6 +188,33 @@ impl FptSttResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: FPT.AI exposes no advanced-feature surface, so `from_standard` is a pure
+    // `from_base` passthrough. Even with features set, it must succeed and carry the base
+    // (api_key/sample_rate/channels) through unchanged.
+    #[test]
+    fn from_standard_passes_base_through() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "fpt_ai".into(),
+                api_key: "test_key".into(),
+                sample_rate: 8000,
+                channels: 1,
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = FptSttConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.api_key, "test_key");
+        assert_eq!(cfg.sample_rate, 8000);
+        assert_eq!(cfg.channels, 1);
+    }
 
     #[test]
     fn test_config_default() {

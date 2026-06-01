@@ -169,12 +169,21 @@ async fn test_elevenlabs_stt_real() {
 
     let audio_data = generate_test_audio_wav();
 
+    // ElevenLabs Scribe (batch) STT expects multipart/form-data with a `file` part and a required
+    // `model_id` field — sending a raw `audio/wav` body with no model_id yields HTTP 422.
+    let part = reqwest::multipart::Part::bytes(audio_data)
+        .file_name("audio.wav")
+        .mime_str("audio/wav")
+        .unwrap();
+    let form = reqwest::multipart::Form::new()
+        .text("model_id", "scribe_v1")
+        .part("file", part);
+
     // ElevenLabs STT endpoint
     let response = client
         .post("https://api.elevenlabs.io/v1/speech-to-text")
         .header("xi-api-key", &api_key)
-        .header("Content-Type", "audio/wav")
-        .body(audio_data)
+        .multipart(form)
         .send()
         .await;
 

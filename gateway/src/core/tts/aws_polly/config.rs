@@ -585,6 +585,42 @@ impl Default for AwsPollyTTSConfig {
 }
 
 impl AwsPollyTTSConfig {
+    /// Build from the standardized config (W1 keystone). Maps the TTS features Polly can express
+    /// to real fields: `ssml` toggles the input [`TextType`], `language` overrides the language
+    /// code, and `sample_rate` sets the output rate. The non-standard `region` is read from the
+    /// `provider_extras` passthrough. ElevenLabs-style voice settings, emotion, instructions,
+    /// speed/pitch/volume and word timestamps have no dedicated Polly field (Polly expresses those
+    /// via SSML prosody), so they are skipped.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
+        let f = &std.features;
+        let mut cfg = Self {
+            base: std.base.clone(),
+            ..Default::default()
+        };
+        // Map the standardized voice/model onto Polly's dedicated `voice`/`engine` fields (these
+        // are what the request builder actually reads). Previously `from_standard` left them at
+        // defaults, so the standardized path silently ignored the caller's voice and engine.
+        if let Some(v) = std.base.voice_id.as_deref().filter(|v| !v.is_empty()) {
+            cfg.voice = PollyVoice::from_str_or_default(v);
+        }
+        if !std.base.model.is_empty() {
+            cfg.engine = PollyEngine::from_str_or_default(&std.base.model);
+        }
+        if let Some(region) = std.extras.0.get("region").and_then(|v| v.as_str()) {
+            cfg.region = AwsRegion::from_str_or_default(region);
+        }
+        if let Some(true) = f.ssml {
+            cfg.text_type = TextType::Ssml;
+        }
+        if let Some(language) = &f.language {
+            cfg.language_code = Some(language.clone());
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.base.sample_rate = Some(rate);
+        }
+        cfg
+    }
+
     /// Create a new configuration with the given voice.
     pub fn with_voice(voice: PollyVoice) -> Self {
         let mut config = Self::default();
@@ -632,6 +668,35 @@ impl AwsPollyTTSConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features Polly can express (SSML input, language override,
+    // output sample rate) reach their real fields, and the non-standard region flows through the
+    // provider_extras passthrough.
+    #[test]
+    fn from_standard_maps_ssml_language_rate_and_region() {
+        use crate::core::stt::standard::ProviderExtras;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("region".into(), serde_json::json!("eu-west-1"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "aws-polly".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                ssml: Some(true),
+                language: Some("en-GB".into()),
+                sample_rate: Some(22050),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = AwsPollyTTSConfig::from_standard(&std);
+        assert_eq!(cfg.text_type, TextType::Ssml);
+        assert_eq!(cfg.language_code, Some("en-GB".to_string()));
+        assert_eq!(cfg.base.sample_rate, Some(22050));
+        assert_eq!(cfg.region, AwsRegion::EuWest1);
+    }
 
     #[test]
     fn test_polly_engine() {

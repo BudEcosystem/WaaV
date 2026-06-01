@@ -421,6 +421,27 @@ impl PhonexiaSTTConfig {
         phonexia_config.validate()?;
         Ok(phonexia_config)
     }
+
+    /// Build from the standardized config (W1 keystone — final batch). Phonexia is an
+    /// on-premises, batch-oriented engine with a narrow tunable surface, so this maps only the
+    /// two standardized features it can actually express: per-word timestamps
+    /// (`enable_timestamps`) and key terms / phrase hints (`preferred_phrases`). Features
+    /// Phonexia can't express (diarization, smart_format, profanity_filter, filler_words,
+    /// interim_results, vad/endpointing, redaction, entity/language detection) are capability
+    /// gaps and stay at their defaults.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+        if let Some(w) = f.word_timestamps {
+            cfg.enable_timestamps = w;
+        }
+        if let Some(k) = &f.keyterms {
+            cfg.preferred_phrases = k.clone();
+        }
+        Ok(cfg)
+    }
 }
 
 /// Convert PhonexiaSTTConfig to base STTConfig
@@ -446,6 +467,31 @@ impl From<PhonexiaSTTConfig> for STTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (final batch): the standardized features map onto the two fields Phonexia can
+    // express — per-word timestamps (`enable_timestamps`) and phrase hints (`preferred_phrases`).
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "phonexia".into(),
+                api_key: "https://phonexia.example.com".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(false),
+                keyterms: Some(vec!["WaaV".into(), "Phonexia".into()]),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = PhonexiaSTTConfig::from_standard(&std).unwrap();
+        assert!(!cfg.enable_timestamps); // word_timestamps
+        assert_eq!(cfg.preferred_phrases, vec!["WaaV", "Phonexia"]); // keyterms
+        // base (server URL carried through the api_key field) survived from_base.
+        assert_eq!(cfg.server_url, "https://phonexia.example.com");
+    }
 
     #[test]
     fn test_phonexia_config_new() {

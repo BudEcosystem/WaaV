@@ -336,6 +336,51 @@ impl IFlytekTtsConfig {
         })
     }
 
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// iFlytek exposes prosody as 0-100 levels (50 = normal), so this maps `speed` (a multiplier
+    /// where 1.0 = normal, scaled `speed * 50` so 1.0 -> 50 and clamped to 0-100), `pitch` and
+    /// `volume` (taken as iFlytek 0-100 levels) onto those fields, plus `sample_rate` onto the
+    /// output rate. iFlytek's
+    /// `background_sound` (not a standard feature) is read from the `extras` passthrough. Features
+    /// without an iFlytek field (stability, similarity_boost, style, use_speaker_boost, emotion,
+    /// instructions, ssml, language, word_timestamps, streaming, seed) are skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(speed) = f.speed {
+            // Map the speed multiplier (1.0 = normal) onto iFlytek's 0-100 level (50 = normal)
+            // via `speed * 50`, so 1.0 -> 50, clamped to the valid 0-100 range.
+            cfg.speed = (speed * 50.0).clamp(0.0, 100.0) as u32;
+        }
+        if let Some(pitch) = f.pitch {
+            // iFlytek pitch is a 0-100 level (50 = normal).
+            cfg.pitch = pitch.clamp(0.0, 100.0) as u32;
+        }
+        if let Some(volume) = f.volume {
+            // iFlytek volume is a 0-100 level (50 = normal).
+            cfg.volume = volume.clamp(0.0, 100.0) as u32;
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.sample_rate = rate;
+        }
+
+        // Provider-specific passthrough.
+        if let Some(bg) = std
+            .extras
+            .0
+            .get("background_sound")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.background_sound = bg;
+        }
+
+        Ok(cfg)
+    }
+
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), TTSError> {
         self.auth
@@ -404,6 +449,38 @@ mod tests {
             audio_format: Some("raw".to_string()),
             ..Default::default()
         }
+    }
+
+    // W1 keystone (TTS): the standardized prosody features iFlytek can express (speed, pitch,
+    // volume as 0-100 levels, plus output sample rate) reach the request fields, and the open
+    // extras passthrough carries the provider-specific background_sound knob.
+    #[test]
+    fn from_standard_maps_prosody_and_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("background_sound".into(), serde_json::json!(true));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "iflytek".into(),
+                api_key: create_test_api_key(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.0),
+                pitch: Some(70.0),
+                volume: Some(80.0),
+                sample_rate: Some(8000),
+                ssml: Some(true), // capability gap: iFlytek has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = IFlytekTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.speed, 50); // 1.0x multiplier -> 50 (iFlytek normal)
+        assert_eq!(cfg.pitch, 70);
+        assert_eq!(cfg.volume, 80);
+        assert_eq!(cfg.sample_rate, 8000);
+        assert!(cfg.background_sound); // from extras passthrough
     }
 
     // Voice tests

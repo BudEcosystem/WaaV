@@ -201,6 +201,10 @@ impl AzureSTTConfig {
     pub fn build_websocket_url(&self) -> String {
         let base_url = self.region.stt_websocket_base_url();
 
+        // NOTE: language (a locale like "en-US"), endpoint_id (a GUID) and auto-detect locales are
+        // constrained identifiers with no spaces/query-delimiters, so they are not percent-encoded
+        // (unlike genuinely free-text values such as Deepgram keyterms).
+
         // Start with the base path and required parameters
         let mut url = format!(
             "{}/speech/recognition/conversation/cognitiveservices/v1?language={}&format={}&profanity={}",
@@ -228,6 +232,31 @@ impl AzureSTTConfig {
         url
     }
 
+    /// Build from the standardized config (W1 keystone). Azure exposes a narrow advanced
+    /// surface, so this maps only the features it can actually express: interim (partial)
+    /// results, word-level timing, and profanity handling. Capabilities Azure has no field
+    /// for (diarization, redaction, keyterms, smart formatting) are left at their defaults.
+    pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone());
+        if let Some(i) = f.interim_results {
+            cfg.interim_results = i;
+        }
+        if let Some(w) = f.word_timestamps {
+            cfg.word_level_timing = w;
+        }
+        if let Some(p) = f.profanity_filter {
+            // Azure masks profanity with asterisks when filtering is on, and returns the
+            // raw words when it is off (it has no separate "remove" toggle in the standard set).
+            cfg.profanity = if p {
+                AzureProfanityOption::Masked
+            } else {
+                AzureProfanityOption::Raw
+            };
+        }
+        cfg
+    }
+
     /// Create a new configuration from base STTConfig.
     ///
     /// Initializes Azure-specific settings with sensible defaults.
@@ -253,6 +282,29 @@ impl AzureSTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: maps the standardized features Azure can express (interim results +
+    // word-level timing) onto its own config fields.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "azure".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                interim_results: Some(false),
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = AzureSTTConfig::from_standard(&std);
+        assert!(!cfg.interim_results); // interim_results
+        assert!(cfg.word_level_timing); // word_timestamps
+    }
 
     // Note: Core AzureRegion tests are now in crate::core::providers::azure::region.
     // Tests here focus on STT-specific configuration and re-export verification.

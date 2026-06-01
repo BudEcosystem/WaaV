@@ -288,6 +288,30 @@ impl ProsaSttConfig {
         })
     }
 
+    /// Build from the standardized config (W1 keystone). Prosa.ai exposes a small set of request
+    /// toggles, so this maps the standardized features whose meaning matches an existing Prosa
+    /// field: interim results (`include_partial`), filler words (`include_filler`) and smart
+    /// formatting (`auto_punctuation`). Features Prosa cannot express (diarization is only an
+    /// integer speaker count with no boolean toggle, plus word_timestamps, profanity_filter,
+    /// vad/endpointing, keyterms, redaction, entity/language detection) are capability gaps and
+    /// stay at their defaults.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+        if let Some(i) = f.interim_results {
+            cfg.include_partial = i;
+        }
+        if let Some(filler) = f.filler_words {
+            cfg.include_filler = filler;
+        }
+        if let Some(s) = f.smart_format {
+            cfg.auto_punctuation = s;
+        }
+        Ok(cfg)
+    }
+
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), String> {
         if self.api_key.is_empty() {
@@ -577,6 +601,29 @@ pub enum ProsaSttWsMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: maps the standardized features Prosa.ai can express (interim results +
+    // filler words) onto its own config fields.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "prosa_ai".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                interim_results: Some(false),
+                filler_words: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = ProsaSttConfig::from_standard(&std).unwrap();
+        assert!(!cfg.include_partial); // interim_results
+        assert!(cfg.include_filler); // filler_words
+    }
 
     #[test]
     fn test_config_default() {

@@ -190,7 +190,27 @@ mod config_tests {
 
     #[test]
     fn test_config_api_url() {
+        // Default (no override) and the standard OPENAI_BASE_URL override are exercised in one
+        // test so the env mutation is sequential — avoids racing the parallel test runner.
         let config = OpenAISTTConfig::default();
+
+        // SAFETY (edition 2024): set/remove_var are unsafe; this test is single-threaded over the
+        // env it touches and restores OPENAI_BASE_URL to unset before returning.
+        unsafe { std::env::remove_var("OPENAI_BASE_URL") };
+        assert_eq!(
+            config.api_url(),
+            "https://api.openai.com/v1/audio/transcriptions"
+        );
+
+        // The override lets the provider target OpenAI-compatible endpoints
+        // (Azure OpenAI / Groq / vLLM / local server / proxy); trailing slashes are normalized.
+        unsafe { std::env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:8089/") };
+        assert_eq!(
+            config.api_url(),
+            "http://127.0.0.1:8089/v1/audio/transcriptions"
+        );
+
+        unsafe { std::env::remove_var("OPENAI_BASE_URL") };
         assert_eq!(
             config.api_url(),
             "https://api.openai.com/v1/audio/transcriptions"

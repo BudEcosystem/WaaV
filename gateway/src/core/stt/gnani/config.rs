@@ -87,6 +87,29 @@ impl Default for GnaniSTTConfig {
 }
 
 impl GnaniSTTConfig {
+    /// Build from the standardized config (W1 keystone). Gnani is a thin gRPC streaming provider
+    /// whose only standardized-feature surface is interim (partial) results, so this maps that one
+    /// boolean; the remaining advanced features (diarization, word_timestamps, redaction, keyterms,
+    /// …) are capability gaps Gnani cannot express and are left at default. Gnani's non-standard
+    /// credentials (`token`, `access_key`) are read from `provider_extras` when present, overriding
+    /// the env-var defaults that `from_base` supplies.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, String> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+        if let Some(i) = f.interim_results {
+            cfg.interim_results = i;
+        }
+        if let Some(t) = std.extras.0.get("token").and_then(|v| v.as_str()) {
+            cfg.token = t.to_string();
+        }
+        if let Some(k) = std.extras.0.get("access_key").and_then(|v| v.as_str()) {
+            cfg.access_key = k.to_string();
+        }
+        Ok(cfg)
+    }
+
     /// Create GnaniSTTConfig from base STTConfig
     ///
     /// Extracts Gnani-specific credentials from environment variables if not
@@ -354,6 +377,35 @@ impl GnaniLanguage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features unlock Gnani's only mappable feature surface
+    // (interim/partial results) plus its non-standard credentials via extras — previously
+    // unreachable through the flat factory.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "gnani".into(),
+                api_key: String::new(),
+                language: "hi-IN".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                interim_results: Some(false),
+                ..Default::default()
+            },
+            extras: ProviderExtras(
+                serde_json::json!({ "access_key": "ak-123" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        };
+        let cfg = GnaniSTTConfig::from_standard(&std).unwrap();
+        assert!(!cfg.interim_results);
+        assert_eq!(cfg.access_key, "ak-123");
+    }
 
     #[test]
     fn test_gnani_language_from_str() {

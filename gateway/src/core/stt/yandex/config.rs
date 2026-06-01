@@ -297,6 +297,31 @@ impl YandexSTTConfig {
         })
     }
 
+    /// Build from the standardized config (W1 keystone). Yandex exposes a modest feature
+    /// surface, so this unlocks diarization, partials, profanity filtering and custom
+    /// vocabulary (hints) through the standardized API. Features Yandex cannot express
+    /// (word_timestamps, smart_format, redaction, entity_detection, …) are capability gaps
+    /// and left at their defaults.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+        if let Some(d) = f.diarization {
+            cfg.speaker_identification = d;
+        }
+        if let Some(i) = f.interim_results {
+            cfg.partial_results = i;
+        }
+        if let Some(p) = f.profanity_filter {
+            cfg.profanity_filter = p;
+        }
+        if let Some(v) = &f.keyterms {
+            cfg.hints = v.clone();
+        }
+        Ok(cfg)
+    }
+
     /// Get the Authorization header value
     pub fn auth_header_value(&self) -> String {
         if self.is_iam_token {
@@ -350,6 +375,29 @@ impl YandexSTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: maps the standardized features Yandex can express (diarization +
+    // custom vocabulary hints) onto its own config fields.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "yandex".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "Yandex".into()]),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = YandexSTTConfig::from_standard(&std).unwrap();
+        assert!(cfg.speaker_identification); // diarization
+        assert_eq!(cfg.hints, vec!["WaaV", "Yandex"]); // keyterms
+    }
 
     #[test]
     fn test_audio_format_from_str() {

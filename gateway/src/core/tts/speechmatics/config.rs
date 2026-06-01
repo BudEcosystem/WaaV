@@ -276,6 +276,20 @@ impl SpeechmaticsTtsConfig {
         Ok(cfg)
     }
 
+    /// Build from the standardized config (W1 keystone). Speechmatics' generate endpoint only
+    /// accepts a voice (path segment) and an `output_format` query parameter — both already
+    /// derived from the base config by [`from_base`] — and its request body carries nothing but the
+    /// text. The two supported formats are fixed at 16 kHz mono, so there is no prosody, voice
+    /// settings, emotion, instructions, SSML, language, timestamp, streaming, seed or even
+    /// adjustable sample-rate surface to map. Every standardized [`TtsFeatures`] field is therefore
+    /// a capability gap, and this is a pure `from_base` passthrough.
+    ///
+    /// [`from_base`]: Self::from_base
+    /// [`TtsFeatures`]: crate::core::tts::standard::TtsFeatures
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        Self::from_base(&std.base)
+    }
+
     /// Validate text length for synthesis
     pub fn validate_text(text: &str) -> TTSResult<()> {
         if text.len() > super::MAX_TEXT_LENGTH {
@@ -328,6 +342,47 @@ impl SpeechmaticsGenerateRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (TTS): Speechmatics exposes only voice + output_format (both from the base) and a
+    // text-only body, so `from_standard` is a pure `from_base` passthrough — every standardized
+    // feature is a capability gap and must be ignored while the base voice/format still flow through.
+    #[test]
+    fn from_standard_passes_base_through_ignoring_features() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("unsupported".into(), serde_json::json!("ignored"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "speechmatics".into(),
+                api_key: "test-api-key".into(),
+                voice_id: Some("jack".into()),
+                audio_format: Some("pcm".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                // None of these have a Speechmatics surface — all must be ignored.
+                speed: Some(1.5),
+                pitch: Some(2.0),
+                volume: Some(80.0),
+                emotion: Some("cheerful".into()),
+                instructions: Some("speak slowly".into()),
+                ssml: Some(true),
+                language: Some("en".into()),
+                sample_rate: Some(48000),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+
+        let cfg = SpeechmaticsTtsConfig::from_standard(&std).unwrap();
+        // Base-derived fields still flow through unchanged.
+        assert_eq!(cfg.api_key, "test-api-key");
+        assert_eq!(cfg.voice, SpeechmaticsVoice::Jack);
+        assert_eq!(cfg.output_format, SpeechmaticsOutputFormat::Pcm16000);
+        // Output stays fixed at 16 kHz: the sample_rate feature has no field to land in.
+        assert_eq!(cfg.output_format.sample_rate(), 16000);
+    }
 
     #[test]
     fn test_voice_as_str() {

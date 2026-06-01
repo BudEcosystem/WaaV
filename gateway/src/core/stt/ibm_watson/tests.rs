@@ -80,6 +80,8 @@ fn test_ibm_watson_stt_ibm_config_access() {
         api_key: "test_key".to_string(),
         language: "en-US".to_string(),
         sample_rate: 16000,
+        // No explicit model → selected by language (clear the Deepgram default "nova-3").
+        model: String::new(),
         ..Default::default()
     };
 
@@ -259,6 +261,8 @@ fn test_model_selection_by_language() {
     // English (US) -> EnUsMultimedia
     let config = STTConfig {
         language: "en-US".to_string(),
+        // No explicit model → selected by language (clear the Deepgram default "nova-3").
+        model: String::new(),
         ..Default::default()
     };
     let ibm_config = config::IbmWatsonSTTConfig::from_base(config, "test".to_string());
@@ -267,6 +271,8 @@ fn test_model_selection_by_language() {
     // German -> DeDeMultimedia
     let config = STTConfig {
         language: "de-DE".to_string(),
+        // No explicit model → selected by language (clear the Deepgram default "nova-3").
+        model: String::new(),
         ..Default::default()
     };
     let ibm_config = config::IbmWatsonSTTConfig::from_base(config, "test".to_string());
@@ -275,6 +281,8 @@ fn test_model_selection_by_language() {
     // Japanese -> JaJpMultimedia
     let config = STTConfig {
         language: "ja-JP".to_string(),
+        // No explicit model → selected by language (clear the Deepgram default "nova-3").
+        model: String::new(),
         ..Default::default()
     };
     let ibm_config = config::IbmWatsonSTTConfig::from_base(config, "test".to_string());
@@ -283,6 +291,8 @@ fn test_model_selection_by_language() {
     // Unknown language falls back to en-US
     let config = STTConfig {
         language: "xx-XX".to_string(),
+        // No explicit model → selected by language (clear the Deepgram default "nova-3").
+        model: String::new(),
         ..Default::default()
     };
     let ibm_config = config::IbmWatsonSTTConfig::from_base(config, "test".to_string());
@@ -294,6 +304,8 @@ fn test_encoding_selection() {
     // Linear16
     let config = STTConfig {
         encoding: "linear16".to_string(),
+        // No explicit model → selected by language (clear the Deepgram default "nova-3").
+        model: String::new(),
         ..Default::default()
     };
     let ibm_config = config::IbmWatsonSTTConfig::from_base(config, "test".to_string());
@@ -302,6 +314,8 @@ fn test_encoding_selection() {
     // Mulaw
     let config = STTConfig {
         encoding: "mulaw".to_string(),
+        // No explicit model → selected by language (clear the Deepgram default "nova-3").
+        model: String::new(),
         ..Default::default()
     };
     let ibm_config = config::IbmWatsonSTTConfig::from_base(config, "test".to_string());
@@ -310,6 +324,8 @@ fn test_encoding_selection() {
     // FLAC
     let config = STTConfig {
         encoding: "flac".to_string(),
+        // No explicit model → selected by language (clear the Deepgram default "nova-3").
+        model: String::new(),
         ..Default::default()
     };
     let ibm_config = config::IbmWatsonSTTConfig::from_base(config, "test".to_string());

@@ -79,11 +79,19 @@ impl CoreState {
         };
 
         let tts_provider_urls = get_tts_provider_urls();
+        // STARTUP/PRIVACY: by default do NOT eagerly warm up every provider URL — that made
+        // outbound connections to all ~37 external TTS endpoints (e.g. https://tsn.baidu.com)
+        // on every boot, regardless of which providers are actually configured. Connection
+        // pools establish lazily on first real use. Opt in with WAAV_EAGER_WARMUP=1.
+        let eager_warmup = std::env::var("WAAV_EAGER_WARMUP")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         for (provider, url) in tts_provider_urls {
             match ReqManager::new(4).await {
                 Ok(manager) => {
-                    // Optionally warm up connections to providers (e.g., Deepgram)
-                    let _ = manager.warmup(url.as_str(), "OPTIONS").await;
+                    if eager_warmup {
+                        let _ = manager.warmup(url.as_str(), "OPTIONS").await;
+                    }
                     tts_req_managers.insert(provider.clone(), Arc::new(manager));
                     tracing::info!(
                         "Initialized {} ReqManager with 4 concurrent connections",

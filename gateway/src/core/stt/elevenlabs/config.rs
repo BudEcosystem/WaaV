@@ -465,11 +465,51 @@ impl ElevenLabsSTTConfig {
     /// Automatically determines the audio format from the sample rate.
     pub fn from_base(base: STTConfig) -> Self {
         let audio_format = ElevenLabsAudioFormat::from_sample_rate(base.sample_rate);
-        Self {
-            base,
+        // Start from defaults (model_id = the realtime default), then honor an explicitly
+        // configured model. Previously `base.model` was dropped on the floor, so a caller who
+        // selected a specific realtime model was silently overridden to the default.
+        let mut cfg = Self {
             audio_format,
             ..Default::default()
+        };
+        if !base.model.is_empty() {
+            cfg.model_id = base.model.clone();
         }
+        cfg.base = base;
+        cfg
+    }
+
+    /// Build from the standardized config (W1 keystone). ElevenLabs exposes a rich advanced
+    /// surface (word timestamps, diarization, entity detection, key terms, PII/PHI redaction),
+    /// so this maps those features through the standardized API — previously unreachable via the
+    /// flat factory. Features ElevenLabs cannot express (smart_format, profanity_filter,
+    /// interim_results, vad_events, endpointing, language_detection) stay at provider defaults.
+    pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone());
+        if let Some(w) = f.word_timestamps {
+            cfg.include_timestamps = w;
+        }
+        if let Some(d) = f.diarization {
+            cfg.enable_diarization = Some(d);
+        }
+        if let Some(e) = f.entity_detection {
+            cfg.enable_entity_detection = Some(e);
+        }
+        if let Some(k) = &f.keyterms {
+            cfg.keyterms = Some(k.clone());
+        }
+        if let Some(r) = &f.redaction {
+            // Redaction categories map to PII detection; health-related categories also enable PHI.
+            cfg.enable_pii_detection = Some(!r.is_empty());
+            let phi = r
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case("phi") || c.to_lowercase().contains("health"));
+            if phi {
+                cfg.enable_phi_detection = Some(true);
+            }
+        }
+        cfg
     }
 
     /// Check if entity detection is enabled.
@@ -500,5 +540,40 @@ impl ElevenLabsSTTConfig {
     #[inline]
     pub fn has_sensitive_data_detection(&self) -> bool {
         self.has_pii_detection() || self.has_phi_detection()
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // W1 keystone: the standardized features unlock ElevenLabs' advanced feature surface
+    // (diarization + key terms) — previously unreachable via the flat factory.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "elevenlabs".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "ElevenLabs".into()]),
+                ..Default::default()
+            },
+            ..StandardSTTConfig::from_base(STTConfig::default())
+        };
+        let cfg = ElevenLabsSTTConfig::from_standard(&std);
+        assert_eq!(cfg.enable_diarization, Some(true));
+        assert_eq!(
+            cfg.keyterms,
+            Some(vec!["WaaV".to_string(), "ElevenLabs".to_string()])
+        );
     }
 }

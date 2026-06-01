@@ -556,6 +556,18 @@ impl BhashiniSttConfig {
         Ok(config)
     }
 
+    /// Build from the standardized config (W1 keystone). Bhashini is a batch ULCA ASR provider
+    /// whose pipeline exposes no advanced-feature knobs — none of the standardized features
+    /// (interim_results, diarization, word_timestamps, smart_format, profanity_filter,
+    /// filler_words, vad_events, endpointing, utterance_end, keyterms, redaction,
+    /// entity_detection, language_detection) maps to a real field on this config. So this is a
+    /// pure passthrough: a uniform standardized entry point that simply delegates to `from_base`.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, String> {
+        Self::from_base(std.base.clone())
+    }
+
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), String> {
         if self.user_id.is_empty() {
@@ -603,6 +615,33 @@ impl BhashiniSttConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: Bhashini maps zero standardized features (batch ULCA provider with no advanced
+    // knobs), so from_standard is a pure from_base passthrough — assert it succeeds and the base
+    // credentials (parsed from api_key) carry through unchanged.
+    #[test]
+    fn from_standard_passthrough_carries_base() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "bhashini".into(),
+                api_key: "user123|apikey456".into(),
+                language: "hi".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                // None of these can map to a real Bhashini field; they must be ignored.
+                diarization: Some(true),
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = BhashiniSttConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.user_id, "user123");
+        assert_eq!(cfg.ulca_api_key, "apikey456");
+        assert_eq!(cfg.language, BhashiniLanguage::Hindi);
+    }
 
     #[test]
     fn test_language_codes() {

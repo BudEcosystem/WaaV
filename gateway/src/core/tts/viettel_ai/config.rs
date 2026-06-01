@@ -312,6 +312,46 @@ impl ViettelTtsConfig {
         })
     }
 
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// Viettel exposes a single prosody knob (`speed`), so this maps `speed` onto it (reusing
+    /// `from_base`'s `clamp(MIN_SPEED, MAX_SPEED)` so 1.0 = normal and the value matches the flat
+    /// path). Viettel's non-standard `without_filter` and `tts_return_option` knobs are read from
+    /// the `extras` passthrough. Features without a Viettel field (pitch, volume, stability,
+    /// similarity_boost, style, use_speaker_boost, emotion, instructions, ssml, language,
+    /// word_timestamps, streaming, seed, sample_rate) are skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(speed) = f.speed {
+            // Reuse from_base's clamp so 1.0 = normal and the value matches the flat path.
+            cfg.speed = speed.clamp(MIN_SPEED, MAX_SPEED);
+        }
+
+        // Provider-specific passthrough.
+        if let Some(without_filter) = std
+            .extras
+            .0
+            .get("without_filter")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.without_filter = without_filter;
+        }
+        if let Some(opt) = std
+            .extras
+            .0
+            .get("tts_return_option")
+            .and_then(|v| v.as_u64())
+        {
+            cfg.tts_return_option = opt as u8;
+        }
+
+        Ok(cfg)
+    }
+
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), String> {
         if self.api_key.is_empty() {
@@ -422,6 +462,35 @@ impl ViettelTtsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (TTS): the standardized `speed` feature Viettel can express reaches the request
+    // `speed` field (clamped to MIN_SPEED..=MAX_SPEED), and the open extras passthrough carries the
+    // provider-specific without_filter / tts_return_option knobs.
+    #[test]
+    fn from_standard_maps_speed_and_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("without_filter".into(), serde_json::json!(true));
+        extras.insert("tts_return_option".into(), serde_json::json!(1));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "viettel_ai".into(),
+                api_key: "test_token".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                pitch: Some(70.0),  // capability gap: Viettel has no pitch, must be ignored
+                ssml: Some(true),   // capability gap: Viettel has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = ViettelTtsConfig::from_standard(&std).unwrap();
+        assert!((cfg.speed - 1.5).abs() < f32::EPSILON); // 1.5.clamp(0.5, 2.0) -> 1.5
+        assert!(cfg.without_filter); // from extras passthrough
+        assert_eq!(cfg.tts_return_option, 1);
+    }
 
     #[test]
     fn test_voice_ids() {

@@ -304,6 +304,37 @@ impl FptTtsConfig {
         })
     }
 
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// FPT.AI's only adjustable delivery knob is integer `speed` (-3..=+3), so the standardized
+    /// [`speed`] feature maps there — converted from the float multiplier the same way `from_base`
+    /// converts `speaking_rate` (1.0 → 0, 0.5 → -3, 2.0 → +3) and clamped to the API range. The
+    /// provider-specific `callback_url` is read from the open `extras` passthrough. FPT.AI exposes
+    /// no pitch / volume / stability / emotion / instructions / SSML / language / word-timestamp /
+    /// seed / sample-rate surface, so those features are skipped.
+    ///
+    /// [`speed`]: crate::core::tts::standard::TtsFeatures::speed
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(rate) = f.speed {
+            // Map the float multiplier (typically 0.5-2.0) to FPT's -3..=+3 scale,
+            // matching `from_base`'s `speaking_rate` conversion.
+            let mapped = ((rate - 1.0) * 6.0).round() as i8;
+            cfg.speed = mapped.clamp(MIN_SPEED, MAX_SPEED);
+        }
+
+        // Provider-specific passthrough.
+        if let Some(url) = std.extras.0.get("callback_url").and_then(|v| v.as_str()) {
+            cfg.callback_url = Some(url.to_string());
+        }
+
+        Ok(cfg)
+    }
+
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), String> {
         if self.api_key.is_empty() {
@@ -389,6 +420,38 @@ impl FptTtsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (TTS): the standardized `speed` feature reaches FPT's integer `speed` field
+    // (via the same `speaking_rate` conversion `from_base` uses), and the provider-specific
+    // `callback_url` flows through the open extras passthrough.
+    #[test]
+    fn from_standard_maps_speed_and_callback_url() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert(
+            "callback_url".into(),
+            serde_json::json!("https://example.com/cb"),
+        );
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "fpt_ai".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5), // 1.5 -> +3 on FPT's -3..=+3 scale
+                ssml: Some(true), // capability gap: FPT has no SSML, must be ignored
+                sample_rate: Some(48000), // capability gap: FPT rate is fixed, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+
+        let cfg = FptTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.speed, 3); // mapped feature reached the speed field
+        assert_eq!(cfg.callback_url, Some("https://example.com/cb".to_string())); // extras passthrough
+    }
 
     #[test]
     fn test_voice_ids() {

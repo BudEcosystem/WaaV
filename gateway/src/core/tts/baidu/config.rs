@@ -509,6 +509,41 @@ impl BaiduTtsConfig {
         })
     }
 
+    /// Build from the standardized TTS config. Baidu exposes three 0-15 prosody knobs, so this maps
+    /// `speed` -> `speed` (reusing `from_base`'s 0.25-4.0 -> 0-15 mapping for consistency) and the
+    /// direct 0-15 levels `pitch` -> `pitch` and `volume` -> `volume` (clamped). Baidu's non-standard
+    /// `cuid` and `use_https` knobs are read from the `extras` passthrough. Features without a Baidu
+    /// field (stability, similarity_boost, style, use_speaker_boost, emotion, instructions, ssml,
+    /// language, word_timestamps, streaming, seed, sample_rate) are skipped.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(speed) = f.speed {
+            // Reuse from_base's 0.25-4.0 -> 0-15 mapping for consistency.
+            let mapped = ((speed - 0.25) / (4.0 - 0.25) * 15.0).round() as u8;
+            cfg.speed = mapped.min(15);
+        }
+        if let Some(pitch) = f.pitch {
+            // Baidu pitch is a direct 0-15 level.
+            cfg.pitch = (pitch.round() as u8).min(15);
+        }
+        if let Some(volume) = f.volume {
+            // Baidu volume is a direct 0-15 level.
+            cfg.volume = (volume.round() as u8).min(15);
+        }
+
+        // Provider-specific passthrough.
+        if let Some(cuid) = std.extras.0.get("cuid").and_then(|v| v.as_str()) {
+            cfg.cuid = cuid.to_string();
+        }
+        if let Some(use_https) = std.extras.0.get("use_https").and_then(|v| v.as_bool()) {
+            cfg.use_https = use_https;
+        }
+
+        Ok(cfg)
+    }
+
     /// Get list of supported voices.
     pub fn supported_voices() -> Vec<(&'static str, u32, &'static str)> {
         vec![
@@ -542,6 +577,37 @@ impl BaiduTtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Maps speed -> speed (0.25-4.0 -> 0-15), pitch -> pitch and volume -> volume (direct 0-15
+    // levels), and demonstrates the extras passthrough (cuid / use_https).
+    #[test]
+    fn from_standard_maps_prosody_and_extras() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("cuid".into(), serde_json::json!("device-123"));
+        extras.insert("use_https".into(), serde_json::json!(false));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "baidu".into(),
+                api_key: "test_api_key|test_secret_key".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(4.0),
+                pitch: Some(8.0),
+                volume: Some(12.0),
+                ssml: Some(true), // capability gap: Baidu has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        let cfg = BaiduTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.speed, 15); // 4.0 -> 15
+        assert_eq!(cfg.pitch, 8);
+        assert_eq!(cfg.volume, 12);
+        assert_eq!(cfg.cuid, "device-123"); // from extras passthrough
+        assert!(!cfg.use_https);
+    }
 
     #[test]
     fn test_config_default() {

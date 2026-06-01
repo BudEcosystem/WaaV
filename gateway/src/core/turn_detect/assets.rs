@@ -185,8 +185,13 @@ async fn download_file(url: &str, path: &Path) -> Result<()> {
 }
 
 fn get_expected_hash(url: &str) -> Option<String> {
+    // Pinned SHA-256 of the livekit/turn-detector artifacts (supply-chain integrity, plan E7).
+    // Previously "expected_hash_here", so verification never matched and was warn-only — a
+    // 165 MB model was downloaded over the network and executed with NO integrity check.
     if url.contains(MODEL_FILENAME) {
-        Some("expected_hash_here".to_string())
+        Some("4e685767c3643b0363c9f826a98325683f29e9c7d550162c8e8740ba33aa31aa".to_string())
+    } else if url.contains(TOKENIZER_FILENAME) {
+        Some("c8219a662de786c94771323c3500377970f5eaa3afbeaef9390c9a51db9f7884".to_string())
     } else {
         None
     }
@@ -200,11 +205,47 @@ fn verify_hash(data: &[u8], expected: &str) -> Result<()> {
     let actual = format!("{:x}", hasher.finalize());
 
     if actual != expected {
-        warn!(
-            "Turn detector artifact hash mismatch - expected: {}, actual: {}",
-            expected, actual
+        // Fail CLOSED: an unexpected artifact may be tampered or corrupt and must not be
+        // executed. Operators intentionally adopting a newer pinned model can override with
+        // WAAV_SKIP_MODEL_HASH_CHECK=1 after verifying the source.
+        if std::env::var("WAAV_SKIP_MODEL_HASH_CHECK").is_ok() {
+            warn!(
+                "Turn detector artifact hash mismatch IGNORED (WAAV_SKIP_MODEL_HASH_CHECK) - expected: {}, actual: {}",
+                expected, actual
+            );
+            return Ok(());
+        }
+        anyhow::bail!(
+            "Turn detector artifact hash mismatch - expected: {expected}, actual: {actual}. \
+             Refusing to load a potentially-tampered model; set WAAV_SKIP_MODEL_HASH_CHECK=1 to override."
         );
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::*;
+
+    #[test]
+    fn verify_hash_rejects_mismatch_by_default() {
+        // SHA-256 of "hello" is well-known; verifying it against a wrong expected hash fails.
+        let err = verify_hash(b"hello", "deadbeef");
+        assert!(err.is_err(), "hash mismatch must fail closed");
+    }
+
+    #[test]
+    fn verify_hash_accepts_match() {
+        let expected = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"; // sha256("hello")
+        assert!(verify_hash(b"hello", expected).is_ok());
+    }
+
+    #[test]
+    fn expected_hashes_are_pinned_not_placeholder() {
+        let h = get_expected_hash("https://x/model_quantized.onnx").unwrap();
+        assert_eq!(h.len(), 64);
+        assert_ne!(h, "expected_hash_here");
+        assert!(get_expected_hash("https://x/tokenizer.json").is_some());
+    }
 }

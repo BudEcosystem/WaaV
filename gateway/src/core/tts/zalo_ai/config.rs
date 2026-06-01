@@ -243,6 +243,35 @@ impl ZaloTtsConfig {
         })
     }
 
+    /// Build from the standardized TTS config. Zalo's only prosody knob is `speed`, a
+    /// 1.0-is-normal multiplier matching the standardized feature, so `speed` -> `speed`
+    /// (reusing `from_base`'s `MIN_SPEED..=MAX_SPEED` clamp for consistency). The non-standard
+    /// `request_timeout_secs` knob is read from the `extras` passthrough. Zalo has no field for
+    /// pitch, volume, stability, similarity_boost, style, use_speaker_boost, emotion, instructions,
+    /// SSML, language, word_timestamps, streaming, seed or sample_rate, so those features are
+    /// skipped.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(speed) = f.speed {
+            // Standardized speed is a 1.0-is-normal multiplier; Zalo uses the same scale.
+            cfg.speed = speed.clamp(MIN_SPEED, MAX_SPEED);
+        }
+
+        // Provider-specific passthrough.
+        if let Some(timeout) = std
+            .extras
+            .0
+            .get("request_timeout_secs")
+            .and_then(|v| v.as_u64())
+        {
+            cfg.request_timeout_secs = timeout;
+        }
+
+        Ok(cfg)
+    }
+
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), String> {
         if self.api_key.is_empty() {
@@ -322,6 +351,35 @@ impl ZaloTtsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized `speed` feature reaches Zalo's only prosody field (reusing
+    // `from_base`'s 0.8-1.2 clamp), and the non-standard `request_timeout_secs` knob flows through
+    // the extras passthrough. Features Zalo cannot express (pitch, volume, ssml, ...) are ignored.
+    #[test]
+    fn from_standard_maps_speed_and_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("request_timeout_secs".into(), serde_json::json!(45));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "zalo_ai".into(),
+                api_key: "test_key".into(),
+                voice_id: Some("male_north".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.1),
+                pitch: Some(2.0),  // capability gap: Zalo has no pitch field, must be ignored
+                ssml: Some(true),  // capability gap: Zalo has no SSML field, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = ZaloTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.speed, 1.1); // 1.1 is within 0.8..=1.2, unchanged by the clamp
+        assert_eq!(cfg.voice, ZaloVoice::MaleNorth); // from_base passthrough
+        assert_eq!(cfg.request_timeout_secs, 45); // from extras passthrough
+    }
 
     #[test]
     fn test_voice_speaker_ids() {

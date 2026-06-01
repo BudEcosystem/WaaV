@@ -956,6 +956,8 @@ mod tests {
             api_key: "test_key".to_string(),
             language: "fr-FR".to_string(),
             sample_rate: 16000,
+            // No explicit model → model selected by language (clear the Deepgram default "nova-3").
+            model: String::new(),
             ..Default::default()
         };
 

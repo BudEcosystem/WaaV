@@ -284,6 +284,18 @@ impl SberSTTConfig {
         })
     }
 
+    /// Build from the standardized config (W1 keystone). SberDevices SaluteSpeech is a synchronous
+    /// REST recognizer (`speech:recognize`) with a minimal surface — it exposes none of the
+    /// standardized advanced knobs (interim_results, diarization, word_timestamps, smart_format,
+    /// profanity_filter, filler_words, vad/endpointing, keyterms, redaction, entity/language
+    /// detection). So `from_standard` is a uniform standardized entry point that simply delegates
+    /// to `from_base`; all of those features are capability gaps and stay at provider defaults.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        Self::from_base(&std.base)
+    }
+
     /// Get the Authorization header for OAuth token request
     pub fn oauth_auth_header(&self) -> String {
         format!("Basic {}", self.client_credentials)
@@ -302,6 +314,35 @@ impl SberSTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: SberDevices maps no standardized features (it is a minimal synchronous
+    // recognizer), so `from_standard` is a pure `from_base` passthrough — it succeeds and the
+    // base (credentials/language) carries through unchanged.
+    #[test]
+    fn from_standard_passthrough_carries_base() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "sberdevices".into(),
+                api_key: "test_client_id:test_client_secret".into(),
+                language: "ru-RU".into(),
+                ..Default::default()
+            },
+            // Advanced features are set but SberDevices cannot express them; they are ignored.
+            features: SttFeatures {
+                diarization: Some(true),
+                interim_results: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = SberSTTConfig::from_standard(&std).unwrap();
+        // Base carried through: credentials encoded and language parsed, exactly like from_base.
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let expected = STANDARD.encode("test_client_id:test_client_secret".as_bytes());
+        assert_eq!(cfg.client_credentials, expected);
+        assert_eq!(cfg.language, SberSTTLanguage::Russian);
+    }
 
     #[test]
     fn test_audio_format_from_str() {

@@ -123,7 +123,13 @@ fn default_inference_interval_frames() -> usize {
 }
 
 /// Wrapper for VAD config with serde support.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// NOTE: a manual `Default` is required. Deriving `Default` would ignore the
+/// `#[serde(default = "...")]` functions and produce field-type zeros
+/// (threshold=0.0, chunk_size=0, sample_rate=0) — an INVALID VAD config (a 0.0 threshold
+/// fires on every frame; 0 chunk_size/sample_rate are rejected by validation), which also
+/// made `SmartTurnProcessorConfig::default()` fail its own `validate()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SileroVADConfigWrapper {
     #[serde(default = "default_vad_threshold")]
     pub threshold: f32,
@@ -133,6 +139,17 @@ pub struct SileroVADConfigWrapper {
     pub sample_rate: u32,
     #[serde(default)]
     pub debug_logging: bool,
+}
+
+impl Default for SileroVADConfigWrapper {
+    fn default() -> Self {
+        Self {
+            threshold: default_vad_threshold(),
+            chunk_size: default_vad_chunk_size(),
+            sample_rate: default_vad_sample_rate(),
+            debug_logging: false,
+        }
+    }
 }
 
 fn default_vad_threshold() -> f32 {

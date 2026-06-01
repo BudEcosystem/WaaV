@@ -22,8 +22,22 @@ use crate::core::tts::base::{AudioCallback, BaseTTS, ConnectionState, TTSConfig,
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
 use crate::utils::req_manager::ReqManager;
 
-/// OpenAI TTS API endpoint
+/// OpenAI TTS API endpoint (default).
 pub const OPENAI_TTS_URL: &str = "https://api.openai.com/v1/audio/speech";
+
+/// Resolve the OpenAI TTS endpoint, honoring the standard `OPENAI_BASE_URL` override (as the
+/// OpenAI SDKs do). This lets the provider target OpenAI-compatible speech endpoints (Azure
+/// OpenAI, a proxy, or a local server) and enables credential-free contract/e2e testing.
+#[inline]
+pub fn openai_tts_url() -> String {
+    if let Ok(base) = std::env::var("OPENAI_BASE_URL") {
+        let base = base.trim().trim_end_matches('/');
+        if !base.is_empty() {
+            return format!("{base}/v1/audio/speech");
+        }
+    }
+    OPENAI_TTS_URL.to_string()
+}
 
 // =============================================================================
 // Request Builder
@@ -63,7 +77,7 @@ impl TTSRequestBuilder for OpenAIRequestBuilder {
         }
 
         client
-            .post(OPENAI_TTS_URL)
+            .post(openai_tts_url())
             .header("Authorization", format!("Bearer {}", self.config.api_key))
             .header("Content-Type", "application/json")
             .json(&body)
@@ -212,6 +226,25 @@ impl OpenAITTS {
         })
     }
 
+    /// Build from the standardized config (W1 keystone for TTS — uniform entry point).
+    ///
+    /// OpenAI's speech API exposes a narrow control surface (model, voice, format, speed), so
+    /// most advanced [`TtsFeatures`] are capability gaps and are skipped. Only `speed` maps to a
+    /// real, applied field: it folds into `speaking_rate`, which [`OpenAITTS::new`] reads and
+    /// clamps into the request builder. All other features (instructions, ElevenLabs voice
+    /// settings, pitch/volume, emotion, ssml, word_timestamps, streaming, seed, language,
+    /// sample_rate) have no corresponding OpenAI parameter and are intentionally not mapped.
+    ///
+    /// [`TtsFeatures`]: crate::core::tts::standard::TtsFeatures
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let f = &std.features;
+        let mut base = std.base.clone();
+        if let Some(speed) = f.speed {
+            base.speaking_rate = Some(speed);
+        }
+        OpenAITTS::new(base)
+    }
+
     /// Get the configured model
     pub fn model(&self) -> OpenAITTSModel {
         self.request_builder.model
@@ -246,7 +279,7 @@ impl BaseTTS for OpenAITTS {
 
     async fn connect(&mut self) -> TTSResult<()> {
         self.provider
-            .generic_connect_with_config(OPENAI_TTS_URL, &self.request_builder.config)
+            .generic_connect_with_config(&openai_tts_url(), &self.request_builder.config)
             .await
     }
 
@@ -330,6 +363,39 @@ impl BaseTTS for OpenAITTS {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (TTS): OpenAI exposes a narrow control surface, so `from_standard` maps only
+    // `speed` (→ speaking_rate → builder speed); every other feature is a capability gap. This
+    // asserts the mapped feature reaches the right field and the base config carries through.
+    #[tokio::test]
+    async fn from_standard_maps_speed() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "openai".into(),
+                api_key: "test_key".into(),
+                voice_id: Some("nova".into()),
+                model: "tts-1-hd".into(),
+                speaking_rate: Some(1.0),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                // Capability gaps below are intentionally ignored by OpenAI.
+                stability: Some(0.7),
+                instructions: Some("speak cheerfully".into()),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = OpenAITTS::from_standard(&std).unwrap();
+        // speed (1.5) folded into speaking_rate and applied to the builder.
+        assert!((tts.request_builder.speed - 1.5).abs() < 0.001);
+        // base carried through (api key, voice, model).
+        assert_eq!(tts.request_builder.config.api_key, "test_key");
+        assert_eq!(tts.voice(), OpenAIVoice::Nova);
+        assert_eq!(tts.model(), OpenAITTSModel::Tts1Hd);
+    }
 
     #[tokio::test]
     async fn test_openai_tts_creation() {

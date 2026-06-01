@@ -260,10 +260,19 @@ impl AssemblyAISTTConfig {
         let encoding = base.encoding.parse().unwrap_or_default();
 
         // Determine speech model based on language
-        let speech_model = if base.language.starts_with("en") || base.language.is_empty() {
-            AssemblyAISpeechModel::UniversalStreamingEnglish
+        // Honor an explicitly configured model; otherwise pick a sensible default by language.
+        // Previously `base.model` was ignored entirely and the model was chosen from language
+        // alone, so a caller selecting e.g. the multilingual model for English audio was overridden.
+        let speech_model = if base.model.is_empty() {
+            if base.language.starts_with("en") || base.language.is_empty() {
+                AssemblyAISpeechModel::UniversalStreamingEnglish
+            } else {
+                AssemblyAISpeechModel::UniversalStreamingMultilingual
+            }
         } else {
-            AssemblyAISpeechModel::UniversalStreamingMultilingual
+            base.model
+                .parse()
+                .unwrap_or(AssemblyAISpeechModel::UniversalStreamingEnglish)
         };
 
         Self {
@@ -272,6 +281,20 @@ impl AssemblyAISTTConfig {
             encoding,
             ..Default::default()
         }
+    }
+
+    /// Build from the standardized config (W1 keystone — the 2nd provider migrated after
+    /// Deepgram). Maps the features AssemblyAI v3 supports; features it cannot express
+    /// (diarization, keyterms) are simply left at provider defaults (graceful capability
+    /// degradation rather than a silent lie).
+    pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
+        let mut cfg = Self::from_base(std.base.clone());
+        if let Some(w) = std.features.word_timestamps {
+            cfg.include_word_timestamps = w;
+        }
+        // Capability gaps (left at provider defaults, not silently faked): AssemblyAI v3 has no
+        // diarization/keyterms here, and expresses endpointing as a confidence threshold (not ms).
+        cfg
     }
 }
 
@@ -283,6 +306,34 @@ mod tests {
     fn test_encoding_as_str() {
         assert_eq!(AssemblyAIEncoding::PcmS16le.as_str(), "pcm_s16le");
         assert_eq!(AssemblyAIEncoding::PcmMulaw.as_str(), "pcm_mulaw");
+    }
+
+    // W1 keystone (2nd provider): the standardized `word_timestamps` feature is honored.
+    #[test]
+    fn from_standard_maps_word_timestamps() {
+        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "assemblyai".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(false),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let cfg = AssemblyAISTTConfig::from_standard(&std);
+        assert!(
+            !cfg.include_word_timestamps,
+            "word_timestamps=false must reach the AssemblyAI config"
+        );
+        // And the default (unset) keeps the provider default (true).
+        let cfg2 = AssemblyAISTTConfig::from_standard(&StandardSTTConfig::from_base(
+            std.base.clone(),
+        ));
+        assert!(cfg2.include_word_timestamps);
     }
 
     #[test]
@@ -439,11 +490,30 @@ mod tests {
             language: "fr-FR".to_string(),
             sample_rate: 16000,
             encoding: "linear16".to_string(),
+            // No explicit model → model is selected by language (the default STTConfig model is
+            // Deepgram's "nova-3", which is now honored, so clear it to test the fallback).
+            model: String::new(),
             ..Default::default()
         };
 
         let config = AssemblyAISTTConfig::from_base(base);
 
+        assert_eq!(
+            config.speech_model,
+            AssemblyAISpeechModel::UniversalStreamingMultilingual
+        );
+    }
+
+    #[test]
+    fn test_from_base_honors_explicit_model() {
+        // An explicitly configured model must win over the language-based default.
+        let base = STTConfig {
+            api_key: "test_key".to_string(),
+            language: "en-US".to_string(), // English would otherwise force the English model
+            model: "universal-streaming-multilingual".to_string(),
+            ..Default::default()
+        };
+        let config = AssemblyAISTTConfig::from_base(base);
         assert_eq!(
             config.speech_model,
             AssemblyAISpeechModel::UniversalStreamingMultilingual

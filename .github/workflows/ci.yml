@@ -1,0 +1,151 @@
+name: CI
+
+# Production CI for the WaaV gateway. Closes the "no CI" gap flagged in BRUTAL_REVIEW.md.
+# Design notes:
+#  - No job depends on paid-provider credentials EXCEPT `real-provider-e2e`, which is gated
+#    on repo secrets and only runs on the main branch / manual dispatch.
+#  - Local neural components (Silero VAD, Smart-Turn, Turn-Detect) run ONNX locally, so their
+#    accuracy gate needs NO secrets — only model downloads (cached).
+#  - Feature-flag matrix is explicit because `default = []` ships VAD/turn-detect STUBS (S2).
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # ort downloads its own ONNX Runtime binaries:
+  ORT_STRATEGY: download
+
+defaults:
+  run:
+    working-directory: gateway
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt }
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (deny warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy }
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: gateway }
+      - run: cargo clippy --all-targets --features dag-routing,turn-ensemble,noise-filter,openapi -- -D warnings
+
+  build-and-unit:
+    name: build+unit (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""                                            # default build (must compile; ships VAD stubs)
+          - "dag-routing"
+          - "turn-ensemble"                               # silero-vad + smart-turn + turn-detect
+          - "noise-filter"
+          - "dag-routing,turn-ensemble,noise-filter,openapi"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: gateway, key: "${{ matrix.features }}" }
+      - name: check
+        run: cargo check ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+      - name: unit tests
+        run: cargo test --lib ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+
+  integration-mock:
+    name: integration (mock providers, no secrets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: gateway }
+      # These exercise the gateway end-to-end against the in-repo mock providers
+      # (tests/mock_providers) — protocol-level coverage for all providers without paid keys.
+      - run: cargo test --features dag-routing --test e2e_mock_tests --test load_test_with_mocks --test server_startup --test ws_tests
+
+  server-smoke:
+    name: server boot + health
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: gateway }
+      - run: cargo build --release
+      - name: boot and curl health
+        run: |
+          cp config.example.yaml config.yaml || true
+          ./target/release/waav-gateway -c config.yaml &
+          PID=$!
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:3001/ | grep -q '"status":"ok"'; then echo "healthy"; kill $PID; exit 0; fi
+            sleep 1
+          done
+          echo "server did not become healthy"; kill $PID 2>/dev/null; exit 1
+
+  neural-accuracy:
+    name: VAD/turn accuracy (local ONNX, no secrets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: gateway }
+      - name: cache ONNX models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/waav
+          key: waav-models-v1
+      # Accuracy regression gate: Silero VAD / Smart-Turn / Turn-Detect against labelled fixtures.
+      # These tests must assert precision/recall/F1 + p50/p95 latency thresholds (see PRODUCTION_PLAN.md §4).
+      - run: cargo test --features turn-ensemble --release --test smart_turn_accuracy_test --test turn_detect_test -- --nocapture
+
+  cross-compile-musl:
+    name: cross-compile (musl, rustls)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: x86_64-unknown-linux-musl }
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: gateway }
+      # Validates the rustls/no-OpenSSL cross-compilation claim (README). turn/noise features
+      # are excluded here because their native ONNX/tract deps complicate musl static linking.
+      - run: cargo check --target x86_64-unknown-linux-musl --features dag-routing
+
+  real-provider-e2e:
+    name: real-provider e2e (SECRET-GATED)
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    # Only runs where provider secrets exist. CANNOT run on forks/PRs by design.
+    env:
+      DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+      CARTESIA_API_KEY: ${{ secrets.CARTESIA_API_KEY }}
+      HUME_API_KEY: ${{ secrets.HUME_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: gateway }
+      - name: run #[ignore]d real-provider tests for providers whose secret is present
+        run: cargo test --release --test real_provider_tests -- --ignored --test-threads=1

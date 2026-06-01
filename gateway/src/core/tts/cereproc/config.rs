@@ -323,6 +323,51 @@ impl CereprocTtsConfig {
         })
     }
 
+    /// Build from the standardized TTS config (W1 keystone). CereProc expresses emotion through
+    /// custom SSML `<emotion>` tags, so [`TtsFeatures::emotion`] maps to the `emotion` field (using
+    /// the same Happy/Sad/Calm/Cross vocabulary as `from_base`), and [`TtsFeatures::sample_rate`]
+    /// overrides the output `sample_rate` (clamped to the supported range). The non-standard
+    /// `audio_3d` / `include_metadata` knobs are read from the `extras` passthrough. Features
+    /// CereProc has no field for (speed, pitch, volume, stability, similarity_boost, style,
+    /// use_speaker_boost, instructions, ssml, language, word_timestamps, streaming, seed) are
+    /// skipped.
+    ///
+    /// [`TtsFeatures::emotion`]: crate::core::tts::standard::TtsFeatures::emotion
+    /// [`TtsFeatures::sample_rate`]: crate::core::tts::standard::TtsFeatures::sample_rate
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+
+        // Emotion via CereProc's custom <emotion> SSML tags (Happy/Sad/Calm/Cross).
+        if let Some(emotion) = f.emotion.as_deref() {
+            cfg.emotion = match emotion.to_lowercase().as_str() {
+                "happy" | "excited" | "joyful" => Some(CereprocEmotion::Happy),
+                "sad" | "melancholy" | "sorrowful" => Some(CereprocEmotion::Sad),
+                "calm" | "peaceful" | "relaxed" | "neutral" => Some(CereprocEmotion::Calm),
+                "angry" | "cross" | "frustrated" | "annoyed" => Some(CereprocEmotion::Cross),
+                _ => cfg.emotion, // Unsupported emotion: keep base mapping (default voice).
+            };
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.sample_rate = rate.clamp(super::MIN_SAMPLE_RATE, super::MAX_SAMPLE_RATE);
+        }
+
+        // Provider-specific passthrough.
+        if let Some(audio_3d) = std.extras.0.get("audio_3d").and_then(|v| v.as_bool()) {
+            cfg.audio_3d = audio_3d;
+        }
+        if let Some(include_metadata) = std
+            .extras
+            .0
+            .get("include_metadata")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.include_metadata = include_metadata;
+        }
+
+        Ok(cfg)
+    }
+
     /// Build the query parameters for the speak endpoint
     pub fn build_query_params(&self) -> Vec<(&'static str, String)> {
         let mut params = vec![("voice", self.voice_id.clone())];
@@ -394,6 +439,51 @@ impl CereprocTtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (TTS): the standardized features CereProc can express (emotion via its custom
+    // <emotion> SSML tags, output sample rate) reach their real fields, and the non-standard
+    // audio_3d / include_metadata knobs flow through the extras passthrough.
+    #[test]
+    fn from_standard_maps_emotion_sample_rate_and_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("audio_3d".into(), serde_json::json!(true));
+        extras.insert("include_metadata".into(), serde_json::json!(true));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "cereproc".into(),
+                api_key: "user@example.com:password123".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                emotion: Some("cheerful".into()), // unsupported -> stays None; see "happy" below
+                sample_rate: Some(16000),
+                ssml: Some(true), // capability gap: CereProc has no ssml flag field, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = CereprocTtsConfig::from_standard(&std).unwrap();
+        assert!(cfg.emotion.is_none()); // "cheerful" is not in CereProc's vocabulary
+        assert_eq!(cfg.sample_rate, 16000);
+        assert!(cfg.audio_3d); // extras passthrough
+        assert!(cfg.include_metadata); // extras passthrough
+
+        // A supported emotion maps to the matching CereprocEmotion variant.
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                api_key: "user@example.com:password123".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                emotion: Some("happy".into()),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let cfg = CereprocTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.emotion, Some(CereprocEmotion::Happy));
+    }
 
     #[test]
     fn test_audio_format_conversion() {

@@ -386,6 +386,45 @@ impl SpeechifyTtsConfig {
         })
     }
 
+    /// Build from the standardized config (W1 keystone). Speechify is a deliberately minimal TTS
+    /// surface: the only standardized feature it can express is [`TtsFeatures::language`], which
+    /// overrides the synthesis `language` (otherwise auto-detected). The non-standard
+    /// `loudness_normalization` and `text_normalization` toggles are read from the `extras`
+    /// passthrough. Speechify exposes no speed, pitch, volume, ElevenLabs-style voice settings,
+    /// emotion, instructions, SSML, word-timestamp, streaming, seed or sample-rate knobs (sample
+    /// rate is fixed by the audio format), so all of those features are skipped.
+    ///
+    /// [`TtsFeatures::language`]: crate::core::tts::standard::TtsFeatures::language
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+
+        // Language override (from_base leaves this as None / auto-detect).
+        if let Some(language) = f.language.as_ref() {
+            cfg.language = Some(language.clone());
+        }
+
+        // Provider-specific passthrough.
+        if let Some(norm) = std
+            .extras
+            .0
+            .get("loudness_normalization")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.loudness_normalization = norm;
+        }
+        if let Some(norm) = std
+            .extras
+            .0
+            .get("text_normalization")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.text_normalization = norm;
+        }
+
+        Ok(cfg)
+    }
+
     /// Validate text length
     pub fn validate_text(text: &str) -> TTSResult<()> {
         if text.len() > super::MAX_TEXT_LENGTH {
@@ -501,6 +540,37 @@ impl SpeechifyTtsConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the one standardized feature Speechify can express (language override) reaches
+    // its real `language` field, and the non-standard loudness/text normalization toggles flow
+    // through the extras passthrough.
+    #[test]
+    fn from_standard_maps_language_and_normalization_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("loudness_normalization".into(), serde_json::json!(true));
+        extras.insert("text_normalization".into(), serde_json::json!(true));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "speechify".into(),
+                api_key: "test-key".into(),
+                voice_id: Some("henry".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                language: Some("es-ES".into()),
+                // capability gaps: Speechify has no speed/ssml fields, these must be ignored.
+                speed: Some(1.5),
+                ssml: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = SpeechifyTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.language, Some("es-ES".to_string()));
+        assert!(cfg.loudness_normalization); // extras passthrough
+        assert!(cfg.text_normalization);
+    }
 
     #[test]
     fn test_model_enum() {

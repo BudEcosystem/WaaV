@@ -445,17 +445,55 @@ impl RevAISTTConfig {
         let sample_format =
             RevAISampleFormat::from_str(&config.encoding).unwrap_or(RevAISampleFormat::S16LE);
 
+        // Honor an explicitly configured model (Rev AI calls it the "transcriber":
+        // machine / machine_v2 / human); otherwise use the default. Previously `config.model` was
+        // dropped, so the configured transcriber was silently ignored.
+        let transcriber = match config.model.as_str() {
+            "machine" => RevAITranscriber::Machine,
+            "machine_v2" => RevAITranscriber::MachineV2,
+            "human" => RevAITranscriber::Human,
+            _ => RevAITranscriber::default(),
+        };
+
         let revai_config = Self {
             api_key: config.api_key.clone(),
             language: config.language.clone(),
             sample_rate: config.sample_rate,
             channels: config.channels as u8,
             sample_format,
+            transcriber,
             ..Default::default()
         };
 
         revai_config.validate()?;
         Ok(revai_config)
+    }
+
+    /// Build from the standardized config (W1 keystone). Rev AI exposes a narrow boolean surface,
+    /// so this maps the features it can actually express: diarization (`enable_speaker_switch`,
+    /// which requires the `machine_v2` transcriber), profanity filtering (`filter_profanity`), and
+    /// filler words (`remove_disfluencies`, whose sense is inverted — keeping fillers means *not*
+    /// removing disfluencies). Features Rev AI can't express (word_timestamps, smart_format,
+    /// interim_results, vad/endpointing, keyterms, redaction, entity/language detection) are
+    /// capability gaps and stay at their defaults.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+        if let Some(d) = f.diarization {
+            cfg.enable_speaker_switch = d;
+            if d {
+                cfg.transcriber = RevAITranscriber::MachineV2;
+            }
+        }
+        if let Some(p) = f.profanity_filter {
+            cfg.filter_profanity = p;
+        }
+        if let Some(filler) = f.filler_words {
+            cfg.remove_disfluencies = !filler;
+        }
+        Ok(cfg)
     }
 }
 
@@ -485,6 +523,30 @@ impl From<RevAISTTConfig> for STTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: maps the standardized features Rev AI can express (diarization +
+    // profanity filter) onto its own config fields.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "revai".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                profanity_filter: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = RevAISTTConfig::from_standard(&std).unwrap();
+        assert!(cfg.enable_speaker_switch); // diarization
+        assert_eq!(cfg.transcriber, RevAITranscriber::MachineV2); // required by speaker switch
+        assert!(cfg.filter_profanity); // profanity_filter
+    }
 
     #[test]
     fn test_sample_format_as_str() {
@@ -531,6 +593,27 @@ mod tests {
         assert_eq!(RevAITranscriber::Machine.as_str(), "machine");
         assert_eq!(RevAITranscriber::MachineV2.as_str(), "machine_v2");
         assert_eq!(RevAITranscriber::Human.as_str(), "human");
+    }
+
+    #[test]
+    fn test_from_base_honors_transcriber_model() {
+        // The configured model selects Rev AI's transcriber; previously `config.model` was dropped.
+        let base = STTConfig {
+            api_key: "k".to_string(),
+            model: "machine_v2".to_string(),
+            ..Default::default()
+        };
+        let cfg = RevAISTTConfig::from_base(&base).unwrap();
+        assert_eq!(cfg.transcriber, RevAITranscriber::MachineV2);
+
+        // An unrecognized model falls back to the default transcriber rather than erroring.
+        let base2 = STTConfig {
+            api_key: "k".to_string(),
+            model: "nova-3".to_string(),
+            ..Default::default()
+        };
+        let cfg2 = RevAISTTConfig::from_base(&base2).unwrap();
+        assert_eq!(cfg2.transcriber, RevAITranscriber::default());
     }
 
     #[test]

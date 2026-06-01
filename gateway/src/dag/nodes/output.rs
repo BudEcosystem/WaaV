@@ -276,6 +276,29 @@ impl WebhookOutputNode {
         }
     }
 
+    /// Create a webhook output node with SSRF validation.
+    ///
+    /// SECURITY (S6): DAG definitions (including webhook URLs) are accepted inline from
+    /// authenticated WS clients, so a tenant could otherwise point a webhook at internal
+    /// services (`169.254.169.254`, loopback, RFC1918). This rejects those, matching the
+    /// `try_new` protection already on the HTTP/WebSocket endpoint nodes. The compiler MUST
+    /// use this (not `new`) for client-supplied URLs.
+    pub fn try_new(
+        id: impl Into<String>,
+        url: impl Into<String>,
+    ) -> crate::dag::error::DAGResult<Self> {
+        let url_str: String = url.into();
+        super::endpoint::validate_url_for_ssrf(&url_str)?;
+        Ok(Self {
+            id: id.into(),
+            url: url_str,
+            headers: std::collections::HashMap::new(),
+            timeout_ms: 5000,
+            fire_and_forget: true,
+            client: reqwest::Client::new(),
+        })
+    }
+
     /// Add a header to the webhook request
     pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(key.into(), value.into());
@@ -474,6 +497,19 @@ mod tests {
         assert!(node.headers().contains_key("Authorization"));
         assert_eq!(node.timeout_ms, 10000);
         assert!(!node.fire_and_forget);
+    }
+
+    // SECURITY (S6): webhook URLs come from client-supplied DAG defs; try_new must reject
+    // SSRF targets (loopback, link-local cloud metadata, RFC1918) and accept public URLs.
+    #[test]
+    fn test_webhook_try_new_blocks_ssrf() {
+        assert!(WebhookOutputNode::try_new("w", "http://169.254.169.254/latest/meta-data").is_err());
+        assert!(WebhookOutputNode::try_new("w", "http://127.0.0.1:8080/admin").is_err());
+        assert!(WebhookOutputNode::try_new("w", "http://localhost/internal").is_err());
+        assert!(WebhookOutputNode::try_new("w", "http://10.0.0.5/").is_err());
+        assert!(WebhookOutputNode::try_new("w", "http://192.168.1.1/").is_err());
+        // Public URL is allowed.
+        assert!(WebhookOutputNode::try_new("w", "https://example.com/hook").is_ok());
     }
 
     #[test]

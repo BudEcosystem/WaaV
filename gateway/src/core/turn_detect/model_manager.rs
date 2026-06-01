@@ -134,16 +134,8 @@ impl ModelManager {
             anyhow::bail!("Model has no input names defined");
         }
         let input_name_0 = &self.input_names[0];
-        let input_name_1 = if self.input_names.len() > 1 {
-            &self.input_names[1]
-        } else {
-            input_name_0
-        };
 
-        debug!(
-            "Creating input tensors for: {} and {}",
-            input_name_0, input_name_1
-        );
+        debug!("Creating input tensors for: {}", input_name_0);
 
         // Convert ndarray 0.15.6 arrays to format compatible with ort 2.0
         // ort expects ([shape...], Vec<data>) tuples for OwnedTensorArrayData
@@ -151,14 +143,21 @@ impl ModelManager {
         let input_data: Vec<i64> = input_array.iter().copied().collect();
         let input_value = Value::from_array(([input_dim.0, input_dim.1], input_data))?.into();
 
-        let mask_dim = mask_array.dim();
-        let mask_data: Vec<i64> = mask_array.iter().copied().collect();
-        let mask_value = Value::from_array(([mask_dim.0, mask_dim.1], mask_data))?.into();
-
-        let inputs: Vec<(&str, Value)> = vec![
-            (input_name_0.as_str(), input_value),
-            (input_name_1.as_str(), mask_value),
-        ];
+        // CRITICAL FIX: only pass the attention mask if the model actually declares a SECOND,
+        // distinct input. The turn-detector model has a single `input_ids` input; the previous
+        // code fell back to `input_names[0]` for the "second" input name and pushed the mask
+        // under the SAME name "input_ids" — so the all-ones mask OVERWROTE the real token ids
+        // and the model received `[1,1,1,...]` garbage, making the EOU probability meaningless
+        // (~0.0019 for any text). With this fix the model receives the real token ids.
+        let mut inputs: Vec<(&str, Value)> = vec![(input_name_0.as_str(), input_value)];
+        if self.input_names.len() > 1 {
+            let mask_dim = mask_array.dim();
+            let mask_data: Vec<i64> = mask_array.iter().copied().collect();
+            let mask_value = Value::from_array(([mask_dim.0, mask_dim.1], mask_data))?.into();
+            inputs.push((self.input_names[1].as_str(), mask_value));
+        } else {
+            let _ = &mask_array; // mask not needed for single-input models
+        }
 
         // Lock the session mutex for inference
         // Recover from poison if a previous inference panicked - inference should be resilient

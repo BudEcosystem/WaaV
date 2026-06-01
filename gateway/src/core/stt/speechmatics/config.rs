@@ -563,6 +563,29 @@ impl SpeechmaticsSTTConfig {
         })
     }
 
+    /// Build from the standardized config (W1 keystone — 3rd provider). Speechmatics has a rich
+    /// feature surface, so this unlocks diarization, entity detection, custom vocabulary and
+    /// partials through the standardized API — previously all unreachable via the flat factory.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+        if let Some(d) = f.diarization {
+            cfg.enable_diarization = d;
+        }
+        if let Some(i) = f.interim_results {
+            cfg.enable_partials = i;
+        }
+        if let Some(e) = f.entity_detection {
+            cfg.enable_entities = e;
+        }
+        if let Some(v) = &f.keyterms {
+            cfg.additional_vocab = v.clone();
+        }
+        Ok(cfg)
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), STTError> {
         if self.api_key.is_empty() {
@@ -656,6 +679,33 @@ impl SpeechmaticsSTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (3rd provider): the standardized features unlock Speechmatics' rich surface
+    // (diarization, entities, vocabulary, partials) — previously unreachable via the flat factory.
+    #[test]
+    fn from_standard_unlocks_speechmatics_features() {
+        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "speechmatics".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                entity_detection: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "Speechmatics".into()]),
+                interim_results: Some(false),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let cfg = SpeechmaticsSTTConfig::from_standard(&std).unwrap();
+        assert!(cfg.enable_diarization);
+        assert!(cfg.enable_entities);
+        assert_eq!(cfg.additional_vocab, vec!["WaaV", "Speechmatics"]);
+        assert!(!cfg.enable_partials);
+    }
 
     #[test]
     fn test_region_default() {

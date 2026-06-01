@@ -310,6 +310,18 @@ impl NaverClovaSttConfig {
         })
     }
 
+    /// Build from the standardized config (W1 keystone). NAVER CLOVA CSR is a simple batch
+    /// (REST) recognizer that returns plain text and exposes none of the standardized advanced
+    /// features (diarization, word_timestamps, smart_format, profanity_filter, filler_words,
+    /// interim_results, vad/endpointing, keyterms, redaction, entity/language detection) on its
+    /// config, so there is nothing to map: this is a uniform standardized entry point that simply
+    /// delegates to `from_base`. Every standardized feature is a capability gap and stays unset.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        Self::from_base(std.base.clone())
+    }
+
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), STTError> {
         if self.client_id.is_empty() {
@@ -360,6 +372,29 @@ impl NaverClovaSttConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: NAVER CLOVA CSR is a simple batch recognizer with no mappable advanced
+    // features, so `from_standard` is a pure `from_base` passthrough — it must succeed and carry
+    // the base credentials (parsed client_id|client_secret) through unchanged.
+    #[test]
+    fn from_standard_passthrough_carries_base() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "naver_clova".into(),
+                api_key: "client_id|client_secret".into(),
+                language: "ko-KR".into(),
+                sample_rate: 16000,
+                ..Default::default()
+            },
+            features: SttFeatures::default(),
+            extras: ProviderExtras::default(),
+        };
+        let cfg = NaverClovaSttConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.client_id, "client_id"); // base api_key carried through
+        assert_eq!(cfg.client_secret, "client_secret");
+        assert_eq!(cfg.language, NaverClovaLanguage::Korean);
+    }
 
     #[test]
     fn test_language_code() {

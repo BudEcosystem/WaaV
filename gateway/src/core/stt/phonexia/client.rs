@@ -238,6 +238,22 @@ impl BaseSTT for PhonexiaSTT {
             return Ok(());
         }
 
+        // FAIL CLOSED (BRUTAL_REVIEW.md "Phonexia" / PRODUCTION_PLAN.md W3): the real Phonexia
+        // Speech Platform 4 exposes gRPC + a REST async-job API, NOT the generic `/ws` +
+        // `X-SessionID` protocol implemented here. That protocol is unverified against any real
+        // Phonexia server, so we refuse by default rather than silently "succeed" against a
+        // fabricated wire format. Operators who have a server matching this protocol can opt in
+        // with WAAV_PHONEXIA_ALLOW_UNVERIFIED=1.
+        if std::env::var("WAAV_PHONEXIA_ALLOW_UNVERIFIED").is_err() {
+            return Err(STTError::ConfigurationError(
+                "Phonexia STT is not validated against the real Phonexia API (gRPC/REST). It is \
+                 disabled by default to avoid a fabricated-protocol connection. Set \
+                 WAAV_PHONEXIA_ALLOW_UNVERIFIED=1 only if your server matches the implemented \
+                 WebSocket protocol. Tracked by PRODUCTION_PLAN.md W3."
+                    .to_string(),
+            ));
+        }
+
         info!(
             server = %self.phonexia_config.server_url,
             "Phonexia: Connecting to server"
@@ -496,6 +512,23 @@ mod tests {
         let config = create_test_config();
         let result = PhonexiaSTT::new(config);
         assert!(result.is_ok());
+    }
+
+    // Phonexia is fail-closed by default: its WS protocol is unverified against the real
+    // Phonexia gRPC/REST API, so connect() must refuse with a clear error unless explicitly
+    // opted in. (Prevents shipping a fabricated-protocol "success".)
+    #[tokio::test]
+    async fn test_phonexia_connect_fails_closed_by_default() {
+        // SAFETY: single-threaded test; ensure the opt-in is not set.
+        unsafe {
+            std::env::remove_var("WAAV_PHONEXIA_ALLOW_UNVERIFIED");
+        }
+        let mut stt = PhonexiaSTT::new(create_test_config()).unwrap();
+        let err = stt.connect().await.expect_err("must fail closed by default");
+        assert!(
+            err.to_string().contains("not validated against the real Phonexia"),
+            "expected fail-closed message, got: {err}"
+        );
     }
 
     #[test]

@@ -490,6 +490,29 @@ impl GroqSTTConfig {
         }
     }
 
+    /// Build from the standardized config (W1 keystone — final STT batch). Groq is a batch
+    /// REST Whisper provider, so most of the streaming-oriented standardized features
+    /// (interim_results, diarization, vad_events, endpointing_ms, utterance_end_ms,
+    /// smart_format, profanity_filter, filler_words, redaction, keyterms, language/entity
+    /// detection) have no corresponding field on this provider and stay at default. The one
+    /// feature it can express is `word_timestamps`, which selects word-level timestamp
+    /// granularity (and the verbose JSON response format required to carry it).
+    pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone());
+        if let Some(true) = f.word_timestamps {
+            cfg.response_format = GroqResponseFormat::VerboseJson;
+            if !cfg
+                .timestamp_granularities
+                .contains(&TimestampGranularity::Word)
+            {
+                cfg.timestamp_granularities
+                    .push(TimestampGranularity::Word);
+            }
+        }
+        cfg
+    }
+
     /// Get the API endpoint URL.
     #[inline]
     pub fn api_url(&self) -> &str {
@@ -579,6 +602,35 @@ impl GroqSTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (final STT batch): Groq is batch-only, so `from_standard` maps just the one
+    // feature it can express — word-level timestamps — and otherwise delegates to `from_base`.
+    #[test]
+    fn from_standard_maps_word_timestamps() {
+        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "groq".into(),
+                api_key: "gsk_test".into(),
+                model: "whisper-large-v3".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let cfg = GroqSTTConfig::from_standard(&std);
+        // The one mappable feature reaches its field.
+        assert_eq!(cfg.response_format, GroqResponseFormat::VerboseJson);
+        assert!(cfg
+            .timestamp_granularities
+            .contains(&TimestampGranularity::Word));
+        // Base carried through via from_base.
+        assert_eq!(cfg.base.api_key, "gsk_test");
+        assert_eq!(cfg.model, GroqSTTModel::WhisperLargeV3);
+    }
 
     #[test]
     fn test_groq_stt_model_as_str() {

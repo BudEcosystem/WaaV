@@ -218,6 +218,45 @@ impl GoogleTTSConfig {
         }
     }
 
+    /// Builds from the standardized TTS config (W1 keystone for TTS).
+    ///
+    /// Wraps [`from_base_config`](Self::from_base_config) (reading the non-standard `project_id`
+    /// from `extras`) and maps the [`TtsFeatures`] Google can actually express: `pitch` and
+    /// `volume` (Google's `volume_gain_db`), `speed` (Google's `speaking_rate`, carried on the
+    /// base), `language` (overriding the voice-derived `language_code`), and `sample_rate`.
+    /// Features Google has no field for (`stability`/`similarity_boost`/`style`/
+    /// `use_speaker_boost`, `emotion`, `instructions`, `ssml`, `word_timestamps`, `streaming`,
+    /// `seed`) are skipped.
+    ///
+    /// [`TtsFeatures`]: crate::core::tts::standard::TtsFeatures
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
+        let f = &std.features;
+        let project_id = std
+            .extras
+            .0
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let mut cfg = Self::from_base_config(std.base.clone(), project_id);
+        if let Some(p) = f.pitch {
+            cfg.pitch = Some(p as f64);
+        }
+        if let Some(v) = f.volume {
+            cfg.volume_gain_db = Some(v as f64);
+        }
+        if let Some(s) = f.speed {
+            cfg.base.speaking_rate = Some(s);
+        }
+        if let Some(l) = &f.language {
+            cfg.language_code = l.clone();
+        }
+        if let Some(sr) = f.sample_rate {
+            cfg.base.sample_rate = Some(sr);
+        }
+        cfg
+    }
+
     /// Extracts the BCP-47 language code from a Google voice name.
     ///
     /// Google voice names follow the pattern `{lang}-{region}-{type}-{variant}`,
@@ -378,6 +417,43 @@ impl GoogleTTSConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (TTS): the standardized features unlock Google's pitch/volume/speed/language/
+    // sample-rate controls, and the non-standard `project_id` flows through `extras` — previously
+    // unreachable via the flat factory.
+    #[test]
+    fn from_standard_maps_google_features_and_extras() {
+        use crate::core::stt::standard::ProviderExtras;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("project_id".into(), serde_json::json!("my-project"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "google".into(),
+                voice_id: Some("en-US-Wavenet-D".to_string()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                pitch: Some(4.0),
+                volume: Some(-3.0),
+                speed: Some(1.5),
+                language: Some("es-ES".into()),
+                sample_rate: Some(48000),
+                // Capability gaps Google can't express — must be ignored, not invented.
+                stability: Some(0.7),
+                ssml: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = GoogleTTSConfig::from_standard(&std);
+        assert_eq!(cfg.project_id, "my-project");
+        assert_eq!(cfg.pitch, Some(4.0));
+        assert_eq!(cfg.volume_gain_db, Some(-3.0));
+        assert_eq!(cfg.base.speaking_rate, Some(1.5));
+        assert_eq!(cfg.language_code, "es-ES");
+        assert_eq!(cfg.base.sample_rate, Some(48000));
+    }
 
     // ===== GoogleAudioEncoding Tests =====
 

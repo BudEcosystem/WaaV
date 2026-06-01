@@ -784,6 +784,52 @@ impl TencentSttConfig {
         tencent_config.validate()?;
         Ok(tencent_config)
     }
+
+    /// Build from the standardized config (W1 keystone). Tencent ASR models its advanced features
+    /// as enum/bool knobs, so this maps the standardized features whose meaning matches an existing
+    /// Tencent field: word timestamps (`word_info`), profanity filtering (`filter_dirty`), filler
+    /// words (`filter_modal` — modal-particle filtering, whose sense is inverted: keeping fillers
+    /// means *not* filtering modal particles), VAD events (`needvad`), endpointing
+    /// (`vad_silence_time`) and key terms (`hotword_list`). Features Tencent can't express
+    /// (diarization, smart_format, interim_results, redaction, entity/language detection) are
+    /// capability gaps and stay at their defaults.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+        if let Some(w) = f.word_timestamps {
+            cfg.word_info = if w {
+                TencentWordInfo::Basic
+            } else {
+                TencentWordInfo::None
+            };
+        }
+        if let Some(p) = f.profanity_filter {
+            cfg.filter_dirty = if p {
+                TencentFilterDirtyMode::Filter
+            } else {
+                TencentFilterDirtyMode::Off
+            };
+        }
+        if let Some(filler) = f.filler_words {
+            cfg.filter_modal = if filler {
+                TencentFilterModalMode::Off
+            } else {
+                TencentFilterModalMode::Strict
+            };
+        }
+        if let Some(v) = f.vad_events {
+            cfg.needvad = v;
+        }
+        if let Some(ms) = f.endpointing_ms {
+            cfg.vad_silence_time = Some(ms.clamp(VAD_SILENCE_TIME_MIN, VAD_SILENCE_TIME_MAX));
+        }
+        if let Some(k) = &f.keyterms {
+            cfg.hotword_list = Some(k.iter().take(MAX_HOTWORD_LIST_SIZE).cloned().collect());
+        }
+        Ok(cfg)
+    }
 }
 
 // =============================================================================
@@ -793,6 +839,32 @@ impl TencentSttConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: maps the standardized features Tencent can express (profanity filter +
+    // key terms) onto its own config fields.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "tencent".into(),
+                api_key: "id|key|app".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                profanity_filter: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "Tencent".into()]),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = TencentSttConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.filter_dirty, TencentFilterDirtyMode::Filter); // profanity_filter
+        assert_eq!(
+            cfg.hotword_list,
+            Some(vec!["WaaV".to_string(), "Tencent".to_string()])
+        ); // keyterms
+    }
 
     // =========================================================================
     // Engine Model Tests

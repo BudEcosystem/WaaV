@@ -529,6 +529,24 @@ impl AmiVoiceSTTConfig {
         }
     }
 
+    /// Build from the standardized config (W1 keystone). AmiVoice exposes a narrow boolean
+    /// surface, so this maps only the standardized features whose meaning matches an existing
+    /// AmiVoice field: speaker diarization (`enable_diarization`) and interim/partial results
+    /// (`interim_results`). Features AmiVoice cannot express (word_timestamps, smart_format,
+    /// profanity_filter, redaction, keyterms, vad_events, language_detection, entity_detection)
+    /// are capability gaps and stay at default.
+    pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone());
+        if let Some(d) = f.diarization {
+            cfg.enable_diarization = d;
+        }
+        if let Some(i) = f.interim_results {
+            cfg.interim_results = i;
+        }
+        cfg
+    }
+
     /// Get the WebSocket URL.
     pub fn get_websocket_url(&self) -> &'static str {
         if self.no_logging {
@@ -626,6 +644,29 @@ impl AmiVoiceSTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features unlock AmiVoice's diarization + interim results
+    // surface — previously unreachable via the flat factory.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "amivoice".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                interim_results: Some(false),
+                ..Default::default()
+            },
+            ..StandardSTTConfig::from_base(STTConfig::default())
+        };
+        let cfg = AmiVoiceSTTConfig::from_standard(&std);
+        assert!(cfg.enable_diarization);
+        assert!(!cfg.interim_results);
+    }
 
     #[test]
     fn test_engine_id() {

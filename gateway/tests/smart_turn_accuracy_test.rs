@@ -279,6 +279,71 @@ async fn test_smart_turn_detector() -> Result<()> {
     Ok(())
 }
 
+/// REAL accuracy of the Rust Smart-Turn pipeline on the official labelled test set
+/// (pipecat-ai/smart-turn-data-v3-test). Extract samples to /tmp/smart_turn_eval/ with a
+/// labels.json ({"sN.wav": <endpoint_bool>}), then run with the ONNX runtime available:
+///   ORT_DYLIB_PATH=.../libonnxruntime.so cargo test --features turn-ensemble \
+///     --test smart_turn_accuracy_test real_dataset_accuracy -- --ignored --nocapture
+#[cfg(feature = "smart-turn")]
+#[ignore = "requires the downloaded labelled dataset in /tmp/smart_turn_eval + ORT_DYLIB_PATH"]
+#[tokio::test]
+async fn real_dataset_accuracy() -> Result<()> {
+    let dir = Path::new("/tmp/smart_turn_eval");
+    let labels: std::collections::HashMap<String, bool> =
+        serde_json::from_reader(BufReader::new(File::open(dir.join("labels.json"))?))?;
+
+    let mut detector = SmartTurnDetector::new(SmartTurnDetectorConfig::default()).await?;
+    let (mut tp, mut fp, mut tn, mut fn_, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+    let mut latencies = Vec::new();
+
+    let mut names: Vec<_> = labels.keys().cloned().collect();
+    names.sort();
+    for name in names {
+        let path = dir.join(&name);
+        if !path.exists() {
+            continue;
+        }
+        let audio = read_wav_16k_mono(&path)?;
+        // Fresh extractor per clip (independent samples; no state bleed).
+        let mut mel = MelExtractor::new(MelExtractorConfig::default())?;
+        mel.process(&audio)?;
+        let frames = mel.get_mel_2d_padded(800);
+        let r = detector.predict(&frames).await?;
+        latencies.push(r.inference_time_us);
+        // Use the model's CALIBRATED decision threshold (0.7) — this model's probabilities sit
+        // in ~[0.5, 0.73], so a naive 0.5 cutoff is degenerate (everything "complete").
+        let predicted_complete = r.probability > detector.config().threshold;
+        let actual_complete = labels[&name];
+        match (predicted_complete, actual_complete) {
+            (true, true) => tp += 1,
+            (true, false) => fp += 1,
+            (false, false) => tn += 1,
+            (false, true) => fn_ += 1,
+        }
+        n += 1;
+    }
+
+    assert!(n >= 20, "need a meaningful sample count, got {n}");
+    let acc = (tp + tn) as f64 / n as f64;
+    let precision = if tp + fp > 0 { tp as f64 / (tp + fp) as f64 } else { 0.0 };
+    let recall = if tp + fn_ > 0 { tp as f64 / (tp + fn_) as f64 } else { 0.0 };
+    let f1 = if precision + recall > 0.0 {
+        2.0 * precision * recall / (precision + recall)
+    } else {
+        0.0
+    };
+    latencies.sort_unstable();
+    let p50 = latencies[latencies.len() / 2];
+    println!(
+        "SMART-TURN ACCURACY on {n} labelled samples: acc={:.3} precision={:.3} recall={:.3} F1={:.3} | TP={tp} FP={fp} TN={tn} FN={fn_} | p50_latency={p50}us",
+        acc, precision, recall, f1
+    );
+
+    // Sanity gate: the model must do substantially better than chance on the official test set.
+    assert!(acc > 0.65, "accuracy {acc:.3} below 0.65 — pipeline likely broken");
+    Ok(())
+}
+
 /// Debug mel spectrogram values from Rust implementation
 #[tokio::test]
 async fn test_debug_mel_values() -> Result<()> {

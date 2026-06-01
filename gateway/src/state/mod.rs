@@ -41,6 +41,13 @@ pub struct AppState {
 
 impl AppState {
     pub async fn new(config: ServerConfig) -> Arc<Self> {
+        // Ensure a process-level rustls CryptoProvider is installed before any provider opens a
+        // TLS/WSS connection (e.g. a realtime STT socket). The gateway binary installs this in
+        // main(); doing it here too — idempotently — makes embedding AppState (tests, SDKs, custom
+        // binaries) robust against the "no process-level CryptoProvider" panic. install_default()
+        // returns Err if one is already installed, which we intentionally ignore.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         let core_state = CoreState::new(&config).await;
 
         // Initialize LiveKit room handler if API keys are available

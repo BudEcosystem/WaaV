@@ -102,6 +102,23 @@ impl Default for TinkoffSttConfig {
 }
 
 impl TinkoffSttConfig {
+    /// Build from the standardized config (W1 keystone). Tinkoff's VoiceKit gRPC surface is
+    /// narrow: of the canonical features it can only express interim/partial results, so this
+    /// maps `interim_results` and leaves the rest at provider defaults. Diarization, redaction,
+    /// keyterms, word timestamps, smart formatting, profanity filtering, entity/language
+    /// detection and explicit VAD-event toggles have no corresponding field on this provider and
+    /// are capability gaps (intentionally skipped).
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, String> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+        if let Some(i) = f.interim_results {
+            cfg.interim_results = i;
+        }
+        Ok(cfg)
+    }
+
     /// Create TinkoffSttConfig from base STTConfig
     ///
     /// Extracts Tinkoff-specific credentials from environment variables if not
@@ -265,6 +282,30 @@ pub struct VadConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: Tinkoff has a narrow surface, so the standardized config can only unlock
+    // interim results here; diarization (set below) is a documented capability gap and must stay
+    // at the provider default rather than silently mapping to an unrelated field.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "tinkoff".into(),
+                api_key: "test-api-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                interim_results: Some(false),
+                diarization: Some(true), // capability gap: no field to map to
+                ..Default::default()
+            },
+            ..StandardSTTConfig::from_base(STTConfig::default())
+        };
+        let cfg = TinkoffSttConfig::from_standard(&std).unwrap();
+        assert!(!cfg.interim_results); // mapped from the standardized feature
+        assert_eq!(cfg.api_key, "test-api-key"); // base carried through from_base
+    }
 
     #[test]
     fn test_tinkoff_encoding_from_str() {

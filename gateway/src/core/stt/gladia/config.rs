@@ -403,6 +403,10 @@ impl GladiaSTTConfig {
                 .to_string()
         };
 
+        // Gladia currently exposes a single model ("solaria-1"), so `config.model` is intentionally
+        // NOT mapped: the shared `STTConfig` default model is Deepgram-specific ("nova-3") and
+        // forwarding an arbitrary value would only risk an invalid-model rejection. Map a non-empty
+        // `config.model` onto `self.model` when Gladia adds selectable models.
         Ok(Self {
             api_key,
             encoding,
@@ -410,6 +414,35 @@ impl GladiaSTTConfig {
             language_config: GladiaLanguageConfig::new(language),
             ..Default::default()
         })
+    }
+
+    /// Build from the standardized config (W1 keystone). Gladia models its advanced features on
+    /// the nested `realtime_processing`/`messages_config`/`language_config` structs, so this maps
+    /// the standardized features whose meaning matches an existing Gladia field: interim results,
+    /// word timestamps, custom vocabulary (keyterms), named-entity recognition and automatic
+    /// language detection. Features Gladia cannot express (diarization, smart_format,
+    /// profanity_filter, redaction, vad_events) are capability gaps and stay at default.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+        if let Some(i) = f.interim_results {
+            cfg.messages_config.receive_partial_transcripts = i;
+        }
+        if let Some(w) = f.word_timestamps {
+            cfg.realtime_processing.words_accurate_timestamps = w;
+        }
+        if let Some(e) = f.entity_detection {
+            cfg.realtime_processing.named_entity_recognition = e;
+        }
+        if let Some(v) = &f.keyterms {
+            cfg.realtime_processing.custom_vocabulary = v.clone();
+        }
+        if let Some(true) = f.language_detection {
+            cfg.language_config = GladiaLanguageConfig::auto();
+        }
+        Ok(cfg)
     }
 
     /// Validate the configuration
@@ -559,6 +592,32 @@ impl GladiaSTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features unlock Gladia's nested feature surface
+    // (custom vocabulary + word timestamps) — previously unreachable via the flat factory.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "gladia".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "Gladia".into()]),
+                ..Default::default()
+            },
+            ..StandardSTTConfig::from_base(STTConfig::default())
+        };
+        let cfg = GladiaSTTConfig::from_standard(&std).unwrap();
+        assert!(cfg.realtime_processing.words_accurate_timestamps);
+        assert_eq!(
+            cfg.realtime_processing.custom_vocabulary,
+            vec!["WaaV", "Gladia"]
+        );
+    }
 
     // Region tests
     #[test]

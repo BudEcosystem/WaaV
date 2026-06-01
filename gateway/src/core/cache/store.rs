@@ -300,7 +300,7 @@ impl CacheBackend for FilesystemCacheBackend {
         // Write metadata
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default() // clock-before-epoch -> 0 instead of panicking the cache op
             .as_secs();
 
         let expires_at = ttl.or(self.default_ttl).map(|d| now + d.as_secs());
@@ -339,7 +339,7 @@ impl CacheBackend for FilesystemCacheBackend {
         if let Some(expires_at) = meta.expires_at {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default() // clock-before-epoch -> 0 instead of panicking the cache op
                 .as_secs();
 
             if now > expires_at {
@@ -373,7 +373,7 @@ impl CacheBackend for FilesystemCacheBackend {
         if let Some(expires_at) = meta.expires_at {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default() // clock-before-epoch -> 0 instead of panicking the cache op
                 .as_secs();
 
             if now > expires_at {

@@ -543,6 +543,31 @@ impl Default for AwsTranscribeSTTConfig {
 }
 
 impl AwsTranscribeSTTConfig {
+    /// Build from the standardized config (W1 keystone — 4th provider). Unlocks the diarization
+    /// AND content-redaction that the flat factory hardcoded off (BRUTAL_REVIEW.md flagged both),
+    /// plus partial-results stabilization, through the standardized API.
+    pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
+        let f = &std.features;
+        let mut cfg = Self {
+            base: std.base.clone(),
+            ..Default::default()
+        };
+        if let Some(d) = f.diarization {
+            cfg.show_speaker_label = d;
+            if d && cfg.max_speaker_labels.is_none() {
+                cfg.max_speaker_labels = Some(10); // AWS max
+            }
+        }
+        if let Some(i) = f.interim_results {
+            cfg.enable_partial_results_stabilization = i;
+        }
+        if let Some(r) = &f.redaction {
+            cfg.enable_content_redaction = true;
+            cfg.pii_entity_types = r.clone();
+        }
+        cfg
+    }
+
     /// Create a new configuration with the given language code.
     pub fn with_language(language_code: &str) -> Self {
         let mut config = Self::default();
@@ -637,6 +662,31 @@ impl AwsTranscribeSTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (4th provider): unlocks AWS diarization + content redaction — both hardcoded
+    // off by the flat factory per BRUTAL_REVIEW.md.
+    #[test]
+    fn from_standard_unlocks_aws_diarization_and_redaction() {
+        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "aws-transcribe".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                redaction: Some(vec!["NAME".into(), "PHONE".into()]),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let cfg = AwsTranscribeSTTConfig::from_standard(&std);
+        assert!(cfg.show_speaker_label);
+        assert_eq!(cfg.max_speaker_labels, Some(10));
+        assert!(cfg.enable_content_redaction);
+        assert_eq!(cfg.pii_entity_types, vec!["NAME", "PHONE"]);
+    }
 
     #[test]
     fn test_aws_region_as_str() {

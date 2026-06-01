@@ -14,7 +14,10 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use bytes::{Buf, BufMut, Bytes};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -75,19 +78,26 @@ pub fn generate_jwt_token(
     });
     let header_b64 = URL_SAFE_NO_PAD.encode(header.to_string().as_bytes());
 
-    // JWT Payload
+    // JWT Payload. iss/sub identify the calling key — the previous hardcoded
+    // "test_issuer"/"test_user" placeholders guaranteed auth rejection in production.
     let payload = serde_json::json!({
-        "iss": "test_issuer",
-        "sub": "test_user",
+        "iss": api_key,
+        "sub": api_key,
         "aud": scope,
         "exp": exp
     });
     let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
 
-    // Create signature
+    // Create signature.
     let signing_input = format!("{}.{}", header_b64, payload_b64);
 
-    let mut mac = HmacSha256::new_from_slice(secret_key.as_bytes())
+    // Tinkoff API secrets are base64-encoded; the HMAC key must be the DECODED bytes.
+    // Signing with the raw string (the previous behaviour) produced an invalid signature.
+    // Fall back to raw bytes if the secret isn't valid base64 (defensive, no regression).
+    let key_bytes = STANDARD
+        .decode(secret_key)
+        .unwrap_or_else(|_| secret_key.as_bytes().to_vec());
+    let mut mac = HmacSha256::new_from_slice(&key_bytes)
         .map_err(|e| TTSError::InvalidConfiguration(format!("Invalid secret key: {}", e)))?;
     mac.update(signing_input.as_bytes());
     let signature = mac.finalize().into_bytes();
@@ -371,6 +381,39 @@ mod tests {
         // Verify payload contains scope
         let payload_json = String::from_utf8(URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
         assert!(payload_json.contains("tinkoff.cloud.tts"));
+    }
+
+    // Regression: Tinkoff secrets are base64; the HMAC key must be the DECODED bytes, and the
+    // claims must not be the old "test_issuer"/"test_user" placeholders.
+    #[test]
+    fn test_jwt_secret_is_base64_decoded_and_claims_real() {
+        use hmac::Mac;
+        let api_key = "real-api-key";
+        let raw_bytes: &[u8] = b"super-secret-key-material-32bytes";
+        let secret_b64 = STANDARD.encode(raw_bytes);
+        let scope = "tinkoff.cloud.tts";
+
+        let token = generate_jwt_token(api_key, &secret_b64, scope).unwrap();
+        let parts: Vec<&str> = token.split('.').collect();
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+
+        // Signature must be HMAC over the DECODED key bytes.
+        let mut mac_ok = super::HmacSha256::new_from_slice(raw_bytes).unwrap();
+        mac_ok.update(signing_input.as_bytes());
+        let expected = URL_SAFE_NO_PAD.encode(mac_ok.finalize().into_bytes());
+        assert_eq!(parts[2], expected, "signature must use the base64-decoded secret");
+
+        // ...and NOT over the raw base64 string bytes (the old bug).
+        let mut mac_wrong = super::HmacSha256::new_from_slice(secret_b64.as_bytes()).unwrap();
+        mac_wrong.update(signing_input.as_bytes());
+        let wrong = URL_SAFE_NO_PAD.encode(mac_wrong.finalize().into_bytes());
+        assert_ne!(parts[2], wrong);
+
+        // Claims are no longer placeholders.
+        let payload_json = String::from_utf8(URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+        assert!(!payload_json.contains("test_issuer"));
+        assert!(!payload_json.contains("test_user"));
+        assert!(payload_json.contains(api_key));
     }
 
     #[test]

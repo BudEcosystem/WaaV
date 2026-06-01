@@ -49,7 +49,9 @@ mod config_tests {
         assert_eq!(config.encoding, CartesiaAudioEncoding::PcmS16le);
         assert!(config.min_volume.is_none());
         assert!(config.max_silence_duration_secs.is_none());
-        assert!(config.cartesia_version.is_none());
+        // Cartesia STT requires the API version on the WS handshake; it must default to a
+        // known-good value so factory-built sessions actually connect (was None = BROKEN).
+        assert_eq!(config.cartesia_version.as_deref(), Some("2025-04-16"));
     }
 
     #[test]
@@ -80,7 +82,8 @@ mod config_tests {
         assert!(url.contains("sample_rate=16000"));
         assert!(!url.contains("min_volume"));
         assert!(!url.contains("max_silence_duration_secs"));
-        assert!(!url.contains("cartesia_version"));
+        // Version is now sent by default (required by the API) — factory path connects.
+        assert!(url.contains("cartesia_version=2025-04-16"));
     }
 
     #[test]

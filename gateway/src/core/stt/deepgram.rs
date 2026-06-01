@@ -102,6 +102,30 @@ impl Default for DeepgramSTTConfig {
     }
 }
 
+impl DeepgramSTTConfig {
+    /// Build from the standardized config (W1 keystone), honoring advanced features that the
+    /// flat factory path hardcodes off. Diarization, keyterms, redaction, VAD events, filler
+    /// words and endpointing are now reachable through `StandardSTTConfig`. Unmodeled fields
+    /// (EU endpoint, PHI redaction, tag) keep their defaults.
+    pub fn from_standard(std: &super::standard::StandardSTTConfig) -> Self {
+        let f = &std.features;
+        Self {
+            base: std.base.clone(),
+            diarize: f.diarization.unwrap_or(false),
+            interim_results: f.interim_results.unwrap_or(true),
+            filler_words: f.filler_words.unwrap_or(false),
+            profanity_filter: f.profanity_filter.unwrap_or(false),
+            smart_format: f.smart_format.unwrap_or(true),
+            keywords: f.keyterms.clone().unwrap_or_default(),
+            redact: f.redaction.clone().unwrap_or_default(),
+            vad_events: f.vad_events.unwrap_or(false),
+            endpointing: f.endpointing_ms.or(Some(200)),
+            utterance_end_ms: f.utterance_end_ms.or(Some(500)),
+            ..Default::default()
+        }
+    }
+}
+
 /// Deepgram transcription response structure
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DeepgramResponse {
@@ -200,7 +224,48 @@ pub struct DeepgramSTT {
 pub const DEEPGRAM_DEFAULT_ENDPOINT: &str = "wss://api.deepgram.com";
 pub const DEEPGRAM_EU_ENDPOINT: &str = "wss://api.eu.deepgram.com";
 
+/// Percent-encode a query-string value so phrases with spaces ("John Smith") or `word:intensifier`
+/// syntax don't produce a malformed Deepgram URL (which closes the stream). Spaces become `+`,
+/// reserved characters are escaped.
+fn encode_query_value(s: &str) -> String {
+    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
 impl DeepgramSTT {
+    /// Internal: construct the provider from an already-mapped Deepgram config.
+    fn from_deepgram_config(deepgram_config: DeepgramSTTConfig) -> Self {
+        Self {
+            config: Some(deepgram_config),
+            state: ConnectionState::Disconnected,
+            state_notify: Arc::new(Notify::new()),
+            ws_sender: None,
+            shutdown_tx: None,
+            result_tx: None,
+            error_tx: None,
+            connection_handle: None,
+            result_forward_handle: None,
+            error_forward_handle: None,
+            result_callback: Arc::new(Mutex::new(None)),
+            error_callback: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// W1 keystone — construct directly from the standardized config so advanced features
+    /// (diarization, keyterms, redaction, vad_events, …) are honored END-TO-END. The flat
+    /// `BaseSTT::new` path hardcodes those off; this is the reachable standardized path.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "API key is required".to_string(),
+            ));
+        }
+        Ok(Self::from_deepgram_config(DeepgramSTTConfig::from_standard(
+            std,
+        )))
+    }
+
     /// Build the WebSocket URL with query parameters (optimized string building)
     fn build_websocket_url(&self, config: &DeepgramSTTConfig) -> Result<String, STTError> {
         let mut url = String::with_capacity(256); // Pre-allocate expected size
@@ -238,12 +303,27 @@ impl DeepgramSTT {
 
         if let Some(tag) = &config.tag {
             url.push_str("&tag=");
-            url.push_str(tag);
+            url.push_str(&encode_query_value(tag));
         }
 
         if !config.keywords.is_empty() {
-            url.push_str("&keywords=");
-            url.push_str(&config.keywords.join(","));
+            // nova-3 replaced `keywords` with model-driven `keyterm` prompting: `keywords` is
+            // silently ineffective on nova-3, and `keyterm` is invalid on nova-2/earlier. Send
+            // one `keyterm=` per term for nova-3 (phrases allowed); comma-joined `keywords=` else.
+            // Each value MUST be percent-encoded — keyterms/keywords routinely contain spaces (e.g.
+            // "John Smith") or `word:intensifier` syntax, and an unencoded space produces a
+            // malformed URL that Deepgram rejects, closing the stream.
+            if config.base.model.starts_with("nova-3") {
+                for term in &config.keywords {
+                    url.push_str("&keyterm=");
+                    url.push_str(&encode_query_value(term));
+                }
+            } else {
+                url.push_str("&keywords=");
+                let encoded: Vec<String> =
+                    config.keywords.iter().map(|k| encode_query_value(k)).collect();
+                url.push_str(&encoded.join(","));
+            }
         }
 
         // Add diarization (speaker identification)
@@ -270,7 +350,7 @@ impl DeepgramSTT {
         if !config.redact.is_empty() {
             for redact_item in &config.redact {
                 url.push_str("&redact=");
-                url.push_str(redact_item);
+                url.push_str(&encode_query_value(redact_item));
             }
         }
 
@@ -279,14 +359,19 @@ impl DeepgramSTT {
             url.push_str("&redact=phi");
         }
 
-        // Add utterance end timeout
-        // NOTE: utterance_end_ms is not a valid Deepgram WebSocket API parameter.
-        // Deepgram uses 'endpointing' for end-of-speech detection timing instead.
-        // Keeping the config field for potential future use or documentation.
-        // if let Some(utterance_end_ms) = config.utterance_end_ms {
-        //     url.push_str("&utterance_end_ms=");
-        //     url.push_str(&utterance_end_ms.to_string());
-        // }
+        // Add utterance-end timeout. `utterance_end_ms` IS a valid Deepgram streaming parameter —
+        // it makes Deepgram emit `UtteranceEnd` events after the given silence gap, which is the
+        // robust end-of-turn signal when interim results are flowing. Deepgram requires
+        // `interim_results=true` and a value of at least 1000 ms (it rejects smaller values with a
+        // 400), so we only emit it when those constraints hold. (The default config value of 500 is
+        // below Deepgram's minimum and is therefore intentionally not sent.)
+        if let Some(utterance_end_ms) = config.utterance_end_ms
+            && config.interim_results
+            && utterance_end_ms >= 1000
+        {
+            url.push_str("&utterance_end_ms=");
+            url.push_str(&utterance_end_ms.to_string());
+        }
 
         Ok(url)
     }
@@ -712,20 +797,7 @@ impl BaseSTT for DeepgramSTT {
             ..Default::default()
         };
 
-        Ok(Self {
-            config: Some(deepgram_config),
-            state: ConnectionState::Disconnected,
-            state_notify: Arc::new(Notify::new()),
-            ws_sender: None,
-            shutdown_tx: None,
-            result_tx: None,
-            error_tx: None,
-            connection_handle: None,
-            result_forward_handle: None,
-            error_forward_handle: None,
-            result_callback: Arc::new(Mutex::new(None)),
-            error_callback: Arc::new(Mutex::new(None)),
-        })
+        Ok(Self::from_deepgram_config(deepgram_config))
     }
 
     async fn connect(&mut self) -> Result<(), STTError> {
@@ -952,9 +1024,138 @@ mod tests {
         assert!(url.contains("punctuate=false"));
         assert!(url.contains("interim_results=true"));
         assert!(url.contains("smart_format=false"));
-        assert!(url.contains("keywords=hello,world"));
+        // nova-3 uses keyterm prompting (one param per term), NOT the legacy keywords= param.
+        assert!(url.contains("keyterm=hello"));
+        assert!(url.contains("keyterm=world"));
+        assert!(!url.contains("keywords="));
         assert!(url.contains("endpointing=300"));
         assert!(url.contains("tag=test-tag"));
+        // utterance_end_ms is a valid streaming param when interim_results=true and value >= 1000.
+        assert!(url.contains("utterance_end_ms=1000"));
+    }
+
+    #[tokio::test]
+    async fn test_deepgram_url_encodes_keyterms_and_gates_utterance_end() {
+        let stt = DeepgramSTT::default();
+        let base = |model: &str| STTConfig {
+            model: model.to_string(),
+            api_key: "k".to_string(),
+            ..Default::default()
+        };
+
+        // Multi-word keyterms MUST be percent-encoded (space → `+`), else the URL is malformed and
+        // Deepgram closes the stream (regression guard for the live "John Smith" failure).
+        let cfg = DeepgramSTTConfig {
+            base: base("nova-3"),
+            keywords: vec!["John Smith".to_string()],
+            ..Default::default()
+        };
+        let url = stt.build_websocket_url(&cfg).unwrap();
+        assert!(url.contains("keyterm=John+Smith"), "keyterm not encoded: {url}");
+        assert!(!url.contains("keyterm=John Smith"), "raw space leaked into URL: {url}");
+
+        // Legacy keywords on nova-2 are encoded per-term and comma-joined.
+        let cfg2 = DeepgramSTTConfig {
+            base: base("nova-2"),
+            keywords: vec!["New York".to_string(), "L.A.".to_string()],
+            ..Default::default()
+        };
+        let url2 = stt.build_websocket_url(&cfg2).unwrap();
+        assert!(url2.contains("keywords=New+York,L.A."), "keywords not encoded: {url2}");
+
+        // utterance_end_ms gating: below 1000 OR interim_results=false ⇒ NOT emitted.
+        let below = DeepgramSTTConfig {
+            base: base("nova-3"),
+            interim_results: true,
+            utterance_end_ms: Some(500),
+            ..Default::default()
+        };
+        assert!(!stt.build_websocket_url(&below).unwrap().contains("utterance_end_ms"));
+
+        let no_interim = DeepgramSTTConfig {
+            base: base("nova-3"),
+            interim_results: false,
+            utterance_end_ms: Some(2000),
+            ..Default::default()
+        };
+        assert!(
+            !stt.build_websocket_url(&no_interim)
+                .unwrap()
+                .contains("utterance_end_ms")
+        );
+
+        // interim_results=true AND value >= 1000 ⇒ emitted.
+        let ok = DeepgramSTTConfig {
+            base: base("nova-3"),
+            interim_results: true,
+            utterance_end_ms: Some(1500),
+            ..Default::default()
+        };
+        assert!(
+            stt.build_websocket_url(&ok)
+                .unwrap()
+                .contains("utterance_end_ms=1500")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deepgram_keywords_vs_keyterm_by_model() {
+        let stt = DeepgramSTT::default();
+        let mk = |model: &str| DeepgramSTTConfig {
+            base: STTConfig {
+                model: model.to_string(),
+                api_key: "k".to_string(),
+                ..Default::default()
+            },
+            keywords: vec!["foo".to_string(), "bar".to_string()],
+            ..Default::default()
+        };
+        // nova-2 (and earlier) -> legacy keyword boosting.
+        let url_n2 = stt.build_websocket_url(&mk("nova-2")).unwrap();
+        assert!(url_n2.contains("keywords=foo,bar"));
+        assert!(!url_n2.contains("keyterm="));
+        // nova-3 -> keyterm prompting.
+        let url_n3 = stt.build_websocket_url(&mk("nova-3")).unwrap();
+        assert!(url_n3.contains("keyterm=foo"));
+        assert!(url_n3.contains("keyterm=bar"));
+        assert!(!url_n3.contains("keywords="));
+    }
+
+    // W1 keystone: advanced features that the flat factory path hardcodes off are now reachable
+    // for Deepgram via StandardSTTConfig and actually reach the wire.
+    #[tokio::test]
+    async fn test_deepgram_from_standard_unlocks_advanced_features() {
+        use super::super::standard::{SttFeatures, StandardSTTConfig};
+        let stt = DeepgramSTT::default();
+        let std_cfg = StandardSTTConfig {
+            base: STTConfig {
+                model: "nova-3".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                keyterms: Some(vec!["WaaV".into()]),
+                redaction: Some(vec!["pii".into()]),
+                vad_events: Some(true),
+                profanity_filter: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let cfg = DeepgramSTTConfig::from_standard(&std_cfg);
+        // Config fields mapped from the standardized features.
+        assert!(cfg.diarize);
+        assert_eq!(cfg.keywords, vec!["WaaV".to_string()]);
+        assert_eq!(cfg.redact, vec!["pii".to_string()]);
+        assert!(cfg.vad_events);
+        assert!(cfg.profanity_filter);
+        // And they reach the actual request URL (previously impossible via the factory).
+        let url = stt.build_websocket_url(&cfg).unwrap();
+        assert!(url.contains("diarize=true"));
+        assert!(url.contains("keyterm=WaaV")); // nova-3 keyterm prompting
+        assert!(url.contains("vad_events=true"));
+        assert!(url.contains("profanity_filter=true"));
     }
 
     #[tokio::test]

@@ -7,7 +7,10 @@
 # -----------------------------------------------------------------------------
 /gateway/target/
 **/*.rs.bk
+# Cargo.lock MUST be committed for the gateway binary (reproducible builds — see PRODUCTION_PLAN.md S9/W11).
+# Ignore lockfiles only for library crates that legitimately omit them.
 Cargo.lock
+!/gateway/Cargo.lock
 *.pdb
 
 # -----------------------------------------------------------------------------

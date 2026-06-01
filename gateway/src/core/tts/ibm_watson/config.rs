@@ -643,6 +643,45 @@ impl Default for IbmWatsonTTSConfig {
 }
 
 impl IbmWatsonTTSConfig {
+    /// Build from the standardized TTS config. IBM Watson exposes prosody via SSML, so this maps
+    /// `speed` -> `rate_percentage` and `pitch` -> `pitch_percentage` (both IBM percentage deltas,
+    /// 0 = normal), plus `sample_rate` -> `base.sample_rate`. IBM's `instance_id` (not a standard
+    /// field) is read from the `extras` passthrough. Features without an IBM field (stability,
+    /// similarity_boost, style, use_speaker_boost, emotion, instructions, ssml, language,
+    /// word_timestamps, streaming, seed, volume) are skipped.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
+        let f = &std.features;
+        let instance_id = std
+            .extras
+            .0
+            .get("instance_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let mut cfg = Self {
+            base: std.base.clone(),
+            instance_id,
+            ..Default::default()
+        };
+        // Map the standardized voice onto IBM's dedicated `voice` field (what the request builder
+        // reads). Previously `from_standard` left it at the default, silently ignoring the voice.
+        if let Some(v) = std.base.voice_id.as_deref().filter(|v| !v.is_empty()) {
+            cfg.voice = IbmVoice::from_str_or_default(v);
+        }
+        if let Some(speed) = f.speed {
+            // IBM rate is an SSML percentage delta (0 = normal); a 1.0 multiplier maps to +0%.
+            cfg.rate_percentage = Some(((speed - 1.0) * 100.0) as i32);
+        }
+        if let Some(pitch) = f.pitch {
+            // IBM pitch is an SSML percentage delta (0 = normal).
+            cfg.pitch_percentage = Some(pitch as i32);
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.base.sample_rate = Some(rate);
+        }
+        cfg
+    }
+
     /// Create a new configuration with the given voice.
     pub fn with_voice(voice: IbmVoice) -> Self {
         let mut config = Self::default();
@@ -749,6 +788,34 @@ impl IbmWatsonTTSConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Maps speed -> rate_percentage and pitch -> pitch_percentage (IBM SSML prosody deltas),
+    // sample_rate -> base.sample_rate, and demonstrates the extras passthrough (instance_id).
+    #[test]
+    fn from_standard_maps_prosody_and_extras() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("instance_id".into(), serde_json::json!("inst-abc"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "ibm-watson".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                pitch: Some(25.0),
+                sample_rate: Some(16000),
+                ..Default::default()
+            },
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        let cfg = IbmWatsonTTSConfig::from_standard(&std);
+        assert_eq!(cfg.rate_percentage, Some(50)); // 1.5x -> +50%
+        assert_eq!(cfg.pitch_percentage, Some(25));
+        assert_eq!(cfg.base.sample_rate, Some(16000));
+        assert_eq!(cfg.instance_id, "inst-abc"); // from extras passthrough
+    }
 
     #[test]
     fn test_voice_names() {

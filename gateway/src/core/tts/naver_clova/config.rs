@@ -423,6 +423,53 @@ impl NaverClovaTtsConfig {
         })
     }
 
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// CLOVA Voice exposes prosody as integer deltas in -5..=5, so this maps the matching
+    /// standardized features onto those fields:
+    /// - [`TtsFeatures::speed`] -> `speed` (a 0.25..4.0 multiplier folded onto -5..=5, same
+    ///   curve as [`from_base`])
+    /// - [`TtsFeatures::pitch`] -> `pitch` (clamped to -5..=5)
+    /// - [`TtsFeatures::volume`] -> `volume` (clamped to -5..=5)
+    ///
+    /// CLOVA's `custom_endpoint` (not a standard field) is read from the `extras` passthrough.
+    /// Features without a CLOVA field — `emotion` (CLOVA's emotion is a numeric intensity, not a
+    /// free-text label), `sample_rate`, `ssml`, `stability`, `similarity_boost`, `style`,
+    /// `use_speaker_boost`, `instructions`, `language`, `word_timestamps`, `streaming`, `seed` —
+    /// are skipped.
+    ///
+    /// [`TtsFeatures::speed`]: crate::core::tts::standard::TtsFeatures::speed
+    /// [`TtsFeatures::pitch`]: crate::core::tts::standard::TtsFeatures::pitch
+    /// [`TtsFeatures::volume`]: crate::core::tts::standard::TtsFeatures::volume
+    /// [`from_base`]: Self::from_base
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(rate) = f.speed {
+            // Same 0.25..4.0 multiplier -> -5..=5 curve used by `from_base` (1.0 = 0).
+            let clamped = rate.clamp(0.25, 4.0);
+            cfg.speed = if clamped < 1.0 {
+                ((clamped - 0.25) / 0.75 * 5.0 - 5.0) as i8
+            } else {
+                ((clamped - 1.0) / 3.0 * 5.0) as i8
+            };
+        }
+        if let Some(pitch) = f.pitch {
+            cfg.pitch = (pitch as i32).clamp(-5, 5) as i8;
+        }
+        if let Some(volume) = f.volume {
+            cfg.volume = (volume as i32).clamp(-5, 5) as i8;
+        }
+
+        // Provider-specific passthrough.
+        if let Some(endpoint) = std.extras.0.get("custom_endpoint").and_then(|v| v.as_str()) {
+            cfg.custom_endpoint = Some(endpoint.to_string());
+        }
+
+        Ok(cfg)
+    }
+
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), TTSError> {
         if self.client_id.is_empty() {
@@ -524,6 +571,41 @@ impl NaverClovaTtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features reach CLOVA's integer prosody deltas
+    // (speed/pitch/volume in -5..=5), plus custom_endpoint via the open extras passthrough.
+    #[test]
+    fn from_standard_maps_prosody_and_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert(
+            "custom_endpoint".into(),
+            serde_json::json!("https://enterprise.example.com/tts"),
+        );
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "naver-clova".into(),
+                api_key: "client_id|client_secret".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(4.0),  // max multiplier -> +5
+                pitch: Some(3.0),
+                volume: Some(-2.0),
+                ssml: Some(true), // capability gap: CLOVA has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = NaverClovaTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.speed, 5); // 4.0x -> +5
+        assert_eq!(cfg.pitch, 3);
+        assert_eq!(cfg.volume, -2);
+        assert_eq!(
+            cfg.custom_endpoint,
+            Some("https://enterprise.example.com/tts".to_string())
+        ); // extras passthrough
+    }
 
     #[test]
     fn test_voice_speaker_id() {

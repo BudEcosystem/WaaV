@@ -408,6 +408,33 @@ impl ResembleTtsConfig {
         self
     }
 
+    /// Build from the standardized TTS config (W1 keystone — TTS fleet).
+    ///
+    /// Resemble exposes a narrow advanced surface, so only `sample_rate` maps to a real field.
+    /// Non-standard Resemble settings (`project_uuid`, `use_hd`) are read from the open
+    /// `extras` passthrough. Voice-tone features (stability, style, emotion, instructions, SSML,
+    /// speed/pitch/volume, word_timestamps, streaming, seed) have no matching field and are skipped.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+        if let Some(sr) = f.sample_rate {
+            cfg.sample_rate = sr;
+        }
+        if let Some(p) = std
+            .extras
+            .0
+            .get("project_uuid")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            cfg.project_uuid = Some(p.to_string());
+        }
+        if let Some(hd) = std.extras.0.get("use_hd").and_then(|v| v.as_bool()) {
+            cfg.use_hd = hd;
+        }
+        Ok(cfg)
+    }
+
     /// Create configuration from base TTSConfig
     ///
     /// Extracts Resemble-specific settings from the base TTS config.
@@ -531,6 +558,37 @@ impl Default for ResembleTtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (TTS fleet): standardized config unlocks the sample_rate override plus the
+    // Resemble-only `project_uuid` / `use_hd` via the open extras passthrough.
+    #[test]
+    fn from_standard_maps_sample_rate_and_extras() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        use crate::core::stt::standard::ProviderExtras;
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("project_uuid".into(), serde_json::json!("proj-123"));
+        extras.insert("use_hd".into(), serde_json::json!(true));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                api_key: "test-key".to_string(),
+                voice_id: Some("voice-uuid".to_string()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                sample_rate: Some(44100),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+
+        let cfg = ResembleTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.api_key, "test-key"); // base carried through
+        assert_eq!(cfg.voice_uuid, "voice-uuid"); // base carried through
+        assert_eq!(cfg.sample_rate, 44100); // mapped feature
+        assert_eq!(cfg.project_uuid, Some("proj-123".to_string())); // extras passthrough
+        assert!(cfg.use_hd); // extras passthrough
+    }
 
     #[test]
     fn test_model_enum() {

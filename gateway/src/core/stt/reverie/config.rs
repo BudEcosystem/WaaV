@@ -519,6 +519,18 @@ impl ReverieSTTConfig {
         cfg.validate()?;
         Ok(cfg)
     }
+
+    /// Build from the standardized config (W1 keystone). Reverie is a streaming Indian-language
+    /// ASR provider whose query-parameter surface exposes no advanced-feature knobs — none of the
+    /// standardized features (interim_results, diarization, word_timestamps, smart_format,
+    /// profanity_filter, filler_words, vad_events, endpointing, utterance_end, keyterms, redaction,
+    /// entity_detection, language_detection) maps to a real field on this config. So this is a pure
+    /// passthrough: a uniform standardized entry point that simply delegates to `from_base`.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, String> {
+        Self::from_base(&std.base)
+    }
 }
 
 impl Default for ReverieSTTConfig {
@@ -547,6 +559,34 @@ impl Default for ReverieSTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: Reverie maps zero standardized features (streaming ASR provider with no advanced
+    // knobs), so from_standard is a pure from_base passthrough — assert it succeeds and the base
+    // (api_key + app_id parsed from the model field) carries through unchanged.
+    #[test]
+    fn from_standard_passthrough_carries_base() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "reverie".into(),
+                api_key: "test-api-key".into(),
+                language: "hi".into(),
+                model: "test-app-id".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                // None of these can map to a real Reverie field; they must be ignored.
+                diarization: Some(true),
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = ReverieSTTConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.api_key, "test-api-key");
+        assert_eq!(cfg.app_id, "test-app-id");
+        assert_eq!(cfg.language, ReverieLanguage::Hindi);
+    }
 
     #[test]
     fn test_language_codes() {

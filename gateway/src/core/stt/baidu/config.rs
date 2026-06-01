@@ -466,6 +466,22 @@ impl BaiduSttConfig {
         baidu_config.validate()?;
         Ok(baidu_config)
     }
+
+    /// Build from the standardized config (W1 keystone). Baidu is a low-capability provider: it has
+    /// no boolean feature fields (no diarization / smart_format / profanity / interim toggles) and
+    /// no keyterm list, so those standardized features are capability gaps and stay at default. The
+    /// one knob it can honor is its custom vocabulary model id (`lm_id`, Mandarin only) — a numeric
+    /// model id rather than a keyterm `Vec`, so it is read from the `provider_extras` passthrough
+    /// (analogous to IBM's `instance_id`) instead of `SttFeatures`.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let mut cfg = Self::from_base(std.base.clone())?;
+        if let Some(lm_id) = std.extras.0.get("lm_id").and_then(|v| v.as_u64()) {
+            cfg.lm_id = Some(lm_id as u32);
+        }
+        Ok(cfg)
+    }
 }
 
 // =============================================================================
@@ -508,6 +524,29 @@ pub struct BaiduOAuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: Baidu has no boolean feature fields, so its only honorable knob is the custom
+    // vocabulary model id read from provider_extras (`lm_id`). This asserts both that extra and a
+    // base-derived field (model) reach the right config fields.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let mut extras = serde_json::Map::new();
+        extras.insert("lm_id".into(), serde_json::json!(98765));
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "baidu".into(),
+                api_key: "my_api_key|my_secret_key".into(),
+                model: "mandarin".into(),
+                ..Default::default()
+            },
+            features: SttFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+        let cfg = BaiduSttConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.lm_id, Some(98765)); // custom vocabulary model id from provider_extras
+        assert_eq!(cfg.model, BaiduSttModel::Mandarin); // base-derived field
+    }
 
     #[test]
     fn test_model_parsing() {

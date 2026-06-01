@@ -729,6 +729,27 @@ impl HuaweiCloudSttConfig {
         huawei_config.validate()?;
         Ok(huawei_config)
     }
+
+    /// Build from the standardized config (W1 keystone). Huawei Cloud SIS exposes a narrow set of
+    /// recognition knobs, so this maps the standardized features whose meaning matches an existing
+    /// Huawei field: word-level timing (`need_word_info`) and smart formatting, which Huawei
+    /// expresses as automatic punctuation (`add_punctuation`). Features Huawei can't express
+    /// (diarization, profanity_filter, interim_results, vad/endpointing, keyterms — Huawei requires
+    /// a pre-registered vocabulary table ID rather than inline terms, redaction, entity/language
+    /// detection) are capability gaps and stay at their defaults.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+        if let Some(w) = f.word_timestamps {
+            cfg.need_word_info = w;
+        }
+        if let Some(s) = f.smart_format {
+            cfg.add_punctuation = s;
+        }
+        Ok(cfg)
+    }
 }
 
 // =============================================================================
@@ -808,6 +829,31 @@ pub struct HuaweiIamError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features unlock Huawei's recognition knobs
+    // (word-level timing + smart formatting/punctuation) — previously unreachable via the flat
+    // factory.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "huawei_cloud".into(),
+                api_key: "user|pass|domain|project123".into(),
+                model: "chinese_16k_general".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(true),
+                smart_format: Some(false),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = HuaweiCloudSttConfig::from_standard(&std).unwrap();
+        assert!(cfg.need_word_info); // word_timestamps
+        assert!(!cfg.add_punctuation); // smart_format
+    }
 
     #[test]
     fn test_region_code() {

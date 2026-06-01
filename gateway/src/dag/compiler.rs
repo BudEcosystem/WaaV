@@ -343,7 +343,8 @@ impl DAGCompiler {
                 Arc::new(LlmEndpointNode::new(&def.id, llm_config))
             }
             NodeType::WebhookOutput { url, headers } => {
-                let mut node = WebhookOutputNode::new(&def.id, url);
+                // Use try_new() for SSRF protection (S6): webhook URLs are client-supplied.
+                let mut node = WebhookOutputNode::try_new(&def.id, url)?;
                 for (key, value) in headers {
                     node = node.with_header(key, value);
                 }

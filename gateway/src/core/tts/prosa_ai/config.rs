@@ -381,6 +381,48 @@ impl ProsaTtsConfig {
         })
     }
 
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// Prosa.ai exposes a narrow prosody surface, so only `speed` (→ `tempo`, clamped to
+    /// `MIN_TEMPO..=MAX_TEMPO`) and `pitch` (→ Prosa's integer `pitch` offset, rounded and clamped
+    /// to `MIN_PITCH..=MAX_PITCH`) map to real fields. Non-standard Prosa knobs (`label`, `wait`,
+    /// `as_signed_url`) are read from the open `extras` passthrough. Voice-tone features
+    /// (volume, stability, similarity_boost, style, use_speaker_boost, emotion, instructions, SSML,
+    /// language, word_timestamps, streaming, seed, sample_rate) have no matching field and are
+    /// skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(speed) = f.speed {
+            cfg.tempo = speed.clamp(MIN_TEMPO, MAX_TEMPO);
+        }
+        if let Some(pitch) = f.pitch {
+            cfg.pitch = (pitch.round() as i32).clamp(MIN_PITCH, MAX_PITCH);
+        }
+
+        // Provider-specific passthrough.
+        if let Some(label) = std
+            .extras
+            .0
+            .get("label")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            cfg.label = Some(label.to_string());
+        }
+        if let Some(wait) = std.extras.0.get("wait").and_then(|v| v.as_bool()) {
+            cfg.wait = wait;
+        }
+        if let Some(as_signed_url) = std.extras.0.get("as_signed_url").and_then(|v| v.as_bool()) {
+            cfg.as_signed_url = as_signed_url;
+        }
+
+        Ok(cfg)
+    }
+
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), String> {
         if self.api_key.is_empty() {
@@ -634,6 +676,36 @@ impl ProsaTtsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features Prosa.ai can express (speed → tempo, pitch → the
+    // integer pitch offset) reach their real fields, and the non-standard label / wait /
+    // as_signed_url knobs flow through the open extras passthrough.
+    #[test]
+    fn from_standard_maps_speed_pitch_and_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("label".into(), serde_json::json!("greeting"));
+        extras.insert("as_signed_url".into(), serde_json::json!(true));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "prosa-ai".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                pitch: Some(3.0),
+                ssml: Some(true), // capability gap: Prosa has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = ProsaTtsConfig::from_standard(&std).unwrap();
+        assert!((cfg.tempo - 1.5).abs() < f32::EPSILON);
+        assert_eq!(cfg.pitch, 3);
+        assert_eq!(cfg.label, Some("greeting".to_string())); // extras passthrough
+        assert!(cfg.as_signed_url);
+    }
 
     #[test]
     fn test_voice_model_ids() {

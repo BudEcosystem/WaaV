@@ -19,7 +19,10 @@ const SILERO_VAD_MODEL_URL: &str =
     "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx";
 
 /// Silero VAD v5 model dimensions.
-const SILERO_V5_HIDDEN_SIZE: usize = 64;
+/// Silero v5 uses a single unified recurrent `state` tensor of shape [2, 1, 128]
+/// (NOT the v4-style separate h/c tensors of [2,1,64] each, and NOT inputs named "h"/"c").
+/// Feeding v4 inputs to the v5 model fails at inference with `Invalid input name: h`.
+const SILERO_V5_STATE_SIZE: usize = 128;
 
 /// Result of VAD processing for a single chunk.
 #[derive(Debug, Clone, Copy)]
@@ -48,13 +51,8 @@ pub struct SileroVAD {
     /// Configuration
     config: SileroVADConfig,
 
-    /// LSTM hidden state (h)
-    /// Shape: [2, 1, 64] for Silero v5
-    state_h: Array3<f32>,
-
-    /// LSTM cell state (c)
-    /// Shape: [2, 1, 64] for Silero v5
-    state_c: Array3<f32>,
+    /// Unified Silero v5 recurrent state. Shape: [2, 1, 128].
+    state: Array3<f32>,
 
     /// Sample rate tensor (constant)
     /// Shape: [1]
@@ -115,8 +113,7 @@ impl SileroVAD {
         .context("Failed to create ONNX session")?;
 
         // Initialize state tensors
-        let state_h = Array3::zeros((2, 1, SILERO_V5_HIDDEN_SIZE));
-        let state_c = Array3::zeros((2, 1, SILERO_V5_HIDDEN_SIZE));
+        let state = Array3::zeros((2, 1, SILERO_V5_STATE_SIZE));
         let sample_rate_tensor = Array1::from_vec(vec![config.sample_rate as i64]);
         let input_buffer = Array2::zeros((1, config.chunk_size));
 
@@ -128,8 +125,7 @@ impl SileroVAD {
         Ok(Self {
             session,
             config,
-            state_h,
-            state_c,
+            state,
             sample_rate_tensor,
             input_buffer,
             speech_frames: 0,
@@ -291,8 +287,7 @@ impl SileroVAD {
         let elapsed = self.last_state_reset.elapsed().as_secs_f32();
         if elapsed >= self.config.state_reset_interval_secs {
             // Reset only the LSTM states, not the speech/silence tracking
-            self.state_h.fill(0.0);
-            self.state_c.fill(0.0);
+            self.state.fill(0.0);
             self.last_state_reset = Instant::now();
 
             if self.config.debug_logging {
@@ -306,9 +301,10 @@ impl SileroVAD {
 
     /// Runs ONNX inference and returns the speech probability.
     fn run_inference(&mut self) -> Result<f32> {
-        // Prepare input tensors using ort 2.0 API
-        // Silero VAD v5 expects: input, sr, h, c
-        // Must create Tensor objects from raw data (shape, data) tuples
+        // Prepare input tensors using ort 2.0 API.
+        // Silero VAD v5 expects: `input`, `state` (unified [2,1,128]), `sr`.
+        // (The v4 model used `input`, `sr`, `h`, `c`; feeding those to v5 fails with
+        //  `Invalid input name: h` — confirmed live.)
 
         // Input audio: shape [1, chunk_size]
         let input_data: Vec<f32> = self.input_buffer.iter().copied().collect();
@@ -317,35 +313,25 @@ impl SileroVAD {
             input_data.into_boxed_slice(),
         ))?;
 
-        // Sample rate: shape [1]
-        let sr_data: Vec<i64> = self.sample_rate_tensor.iter().copied().collect();
-        let sr_tensor = ort::value::Tensor::from_array(([1usize], sr_data.into_boxed_slice()))?;
+        // Sample rate: scalar i64 (shape []). v5 expects a rank-0 / single-element sr.
+        let sr_value = self.sample_rate_tensor[0];
+        let sr_tensor = ort::value::Tensor::from_array(([1usize], vec![sr_value].into_boxed_slice()))?;
 
-        // Hidden state h: shape [2, 1, 64]
-        let h_data: Vec<f32> = self.state_h.iter().copied().collect();
-        let h_tensor = ort::value::Tensor::from_array((
-            [2usize, 1usize, SILERO_V5_HIDDEN_SIZE],
-            h_data.into_boxed_slice(),
-        ))?;
-
-        // Cell state c: shape [2, 1, 64]
-        let c_data: Vec<f32> = self.state_c.iter().copied().collect();
-        let c_tensor = ort::value::Tensor::from_array((
-            [2usize, 1usize, SILERO_V5_HIDDEN_SIZE],
-            c_data.into_boxed_slice(),
+        // Unified recurrent state: shape [2, 1, 128]
+        let state_data: Vec<f32> = self.state.iter().copied().collect();
+        let state_tensor = ort::value::Tensor::from_array((
+            [2usize, 1usize, SILERO_V5_STATE_SIZE],
+            state_data.into_boxed_slice(),
         ))?;
 
         // Run inference
         let outputs = self.session.run(ort::inputs![
             "input" => input_tensor,
+            "state" => state_tensor,
             "sr" => sr_tensor,
-            "h" => h_tensor,
-            "c" => c_tensor,
         ])?;
 
-        // Extract outputs using ort 2.0 API
-        // try_extract_tensor returns (&Shape, &[T]) tuple
-        // output: probability, hn: new hidden state, cn: new cell state
+        // output: speech probability [1,1]; stateN: updated recurrent state [2,1,128].
         let probability = {
             let output_tensor = outputs
                 .get("output")
@@ -353,33 +339,17 @@ impl SileroVAD {
             let (_shape, data) = output_tensor
                 .try_extract_tensor::<f32>()
                 .context("Failed to extract output tensor")?;
-            // Probability is at index 0 (shape is [1, 1])
             data[0]
         };
 
-        // Update hidden states
-        if let Some(hn) = outputs.get("hn") {
-            let (_shape, hn_data) = hn
+        // Carry the updated state forward for the next chunk.
+        if let Some(state_n) = outputs.get("stateN") {
+            let (_shape, sn_data) = state_n
                 .try_extract_tensor::<f32>()
-                .context("Failed to extract hn tensor")?;
-            // Shape is [2, 1, 64], stored in row-major order
+                .context("Failed to extract stateN tensor")?;
             for i in 0..2 {
-                for j in 0..SILERO_V5_HIDDEN_SIZE {
-                    // Linear index: i * (1 * 64) + 0 * 64 + j = i * 64 + j
-                    self.state_h[[i, 0, j]] = hn_data[i * SILERO_V5_HIDDEN_SIZE + j];
-                }
-            }
-        }
-
-        if let Some(cn) = outputs.get("cn") {
-            let (_shape, cn_data) = cn
-                .try_extract_tensor::<f32>()
-                .context("Failed to extract cn tensor")?;
-            // Shape is [2, 1, 64], stored in row-major order
-            for i in 0..2 {
-                for j in 0..SILERO_V5_HIDDEN_SIZE {
-                    // Linear index: i * (1 * 64) + 0 * 64 + j = i * 64 + j
-                    self.state_c[[i, 0, j]] = cn_data[i * SILERO_V5_HIDDEN_SIZE + j];
+                for j in 0..SILERO_V5_STATE_SIZE {
+                    self.state[[i, 0, j]] = sn_data[i * SILERO_V5_STATE_SIZE + j];
                 }
             }
         }
@@ -450,8 +420,7 @@ impl SileroVAD {
     ///
     /// Call this when starting a new conversation or after a long pause.
     pub fn reset(&mut self) {
-        self.state_h.fill(0.0);
-        self.state_c.fill(0.0);
+        self.state.fill(0.0);
         self.speech_frames = 0;
         self.silence_frames = 0;
         self.in_speech = false;
@@ -492,6 +461,41 @@ mod tests {
 
     // Note: Most tests require the ONNX model file.
     // These are integration tests that should be run with the model available.
+
+    // Live test: confirms the Silero model actually LOADS and RUNS. The review predicted the
+    // v5 model URL (master) would fail against the v4-style h/c/sr tensor I/O. Run with the
+    // ONNX Runtime available: ORT_DYLIB_PATH=.../libonnxruntime.so cargo test --features
+    // silero-vad live_silero_loads_and_runs -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "downloads silero model + runs ONNX inference (needs ORT_DYLIB_PATH)"]
+    async fn live_silero_loads_and_runs() {
+        let mut vad = SileroVAD::new(SileroVADConfig::default())
+            .await
+            .expect("Silero VAD must load + initialize state");
+        let chunk = SileroVADConfig::default().chunk_size;
+
+        let silence = vec![0.0f32; chunk];
+        let r = vad.process(&silence).expect("process silence");
+        assert!(
+            (0.0..=1.0).contains(&r.probability),
+            "probability out of range: {}",
+            r.probability
+        );
+        eprintln!(
+            "SILERO_SILENCE prob={:.4} is_speech={} ({}us)",
+            r.probability, r.is_speech, r.inference_time_us
+        );
+
+        // A loud tone burst must produce a valid, and typically higher, speech probability —
+        // proving the recurrent state actually updates (not a degenerate constant output).
+        let tone: Vec<f32> = (0..chunk).map(|i| (i as f32 * 0.25).sin() * 0.6).collect();
+        let r2 = vad.process(&tone).expect("process tone");
+        assert!((0.0..=1.0).contains(&r2.probability));
+        eprintln!(
+            "SILERO_TONE    prob={:.4} is_speech={} ({}us)",
+            r2.probability, r2.is_speech, r2.inference_time_us
+        );
+    }
 
     #[test]
     fn test_vad_result_struct() {

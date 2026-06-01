@@ -560,6 +560,42 @@ impl HuaweiCloudTtsConfig {
         })
     }
 
+    /// Build from the standardized TTS config. Huawei SIS exposes prosody knobs directly, so this
+    /// maps `speed` -> `speed` (the same `speaking_rate`-style normalization into the -500..=500
+    /// range used by `from_base`), `pitch` -> `pitch` and `volume` -> `volume` (both clamped to the
+    /// SIS ranges), plus `sample_rate` -> `sample_rate`. Huawei's `region` (not a standard field) is
+    /// read from the `extras` passthrough, overriding the `model`-derived region. Features without a
+    /// Huawei field (stability, similarity_boost, style, use_speaker_boost, emotion, instructions,
+    /// ssml, language, word_timestamps, streaming, seed) are skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(speed) = f.speed {
+            // Map: 0.25 -> -500, 1.0 -> 0, 4.0 -> 500 (same normalization as from_base).
+            let normalized = (speed - 1.0) / (4.0 - 0.25) * 1000.0;
+            cfg.speed = (normalized.round() as i16).clamp(-500, 500);
+        }
+        if let Some(pitch) = f.pitch {
+            cfg.pitch = (pitch.round() as i16).clamp(-500, 500);
+        }
+        if let Some(volume) = f.volume {
+            cfg.volume = (volume.round() as i64).clamp(0, 100) as u8;
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.sample_rate = rate;
+        }
+
+        // Provider-specific passthrough: region override.
+        if let Some(region) = std.extras.0.get("region").and_then(|v| v.as_str()) {
+            cfg.region = HuaweiCloudRegion::from_str(region).unwrap_or(cfg.region);
+        }
+
+        Ok(cfg)
+    }
+
     /// Get the standard TTS endpoint URL.
     pub fn get_tts_url(&self) -> String {
         format!(
@@ -881,6 +917,37 @@ impl HuaweiRttsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Maps speed -> speed (normalized into SIS -500..=500), pitch -> pitch, volume -> volume,
+    // sample_rate -> sample_rate, and demonstrates the extras passthrough (region override).
+    #[test]
+    fn from_standard_maps_prosody_and_region() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("region".into(), serde_json::json!("cn-east-3"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "huawei-cloud".into(),
+                api_key: "user|pass|domain|project123".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.0),
+                pitch: Some(100.0),
+                volume: Some(80.0),
+                sample_rate: Some(8000),
+                ssml: Some(true), // capability gap: Huawei has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = HuaweiCloudTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.speed, 0); // 1.0x -> 0 (normal)
+        assert_eq!(cfg.pitch, 100);
+        assert_eq!(cfg.volume, 80);
+        assert_eq!(cfg.sample_rate, 8000);
+        assert_eq!(cfg.region, HuaweiCloudRegion::CnEast3); // from extras passthrough
+    }
 
     #[test]
     fn test_region_code() {

@@ -396,6 +396,39 @@ impl SberTtsConfig {
         })
     }
 
+    /// Build from the standardized TTS config (W1 keystone). SberDevices SaluteSpeech exposes no
+    /// prosody knobs (the voice/format/scope come from base fields), so the only standardized
+    /// feature with a real field is `sample_rate` -> `sample_rate` (re-validated to the supported
+    /// 8000/24000 Hz set, exactly as `from_base` does). The non-standard `connection_timeout_secs`
+    /// and `request_timeout_secs` knobs are read from the `extras` passthrough. Features without a
+    /// SberDevices field (speed, pitch, volume, stability, similarity_boost, style,
+    /// use_speaker_boost, emotion, instructions, ssml, language, word_timestamps, streaming, seed)
+    /// are skipped.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Result<Self, String> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(rate) = f.sample_rate {
+            if rate != 8000 && rate != 24000 {
+                return Err(format!(
+                    "Invalid sample rate: {}. SberDevices TTS only supports 8000 or 24000 Hz",
+                    rate
+                ));
+            }
+            cfg.sample_rate = rate;
+        }
+
+        // Provider-specific passthrough.
+        if let Some(secs) = std.extras.0.get("connection_timeout_secs").and_then(|v| v.as_u64()) {
+            cfg.connection_timeout_secs = secs;
+        }
+        if let Some(secs) = std.extras.0.get("request_timeout_secs").and_then(|v| v.as_u64()) {
+            cfg.request_timeout_secs = secs;
+        }
+
+        Ok(cfg)
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), String> {
         if self.client_credentials.is_empty() {
@@ -444,6 +477,37 @@ impl SberTtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the only standardized feature SberDevices can express is the output sample rate
+    // (re-validated to 8000/24000 Hz), and the non-standard timeout knobs flow through extras.
+    #[test]
+    fn from_standard_maps_sample_rate_and_extras() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("connection_timeout_secs".into(), serde_json::json!(15));
+        extras.insert("request_timeout_secs".into(), serde_json::json!(45));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "sberdevices".into(),
+                api_key: "test_client:test_secret".into(),
+                voice_id: Some("Bys".into()),
+                sample_rate: Some(24000),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                sample_rate: Some(8000),
+                speed: Some(1.2), // capability gap: SberDevices has no speed field, must be ignored
+                ssml: Some(true), // capability gap: must be ignored
+                ..Default::default()
+            },
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        let cfg = SberTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.sample_rate, 8000); // feature override re-validated to supported set
+        assert_eq!(cfg.voice, SberTtsVoice::Bys);
+        assert_eq!(cfg.connection_timeout_secs, 15); // extras passthrough
+        assert_eq!(cfg.request_timeout_secs, 45); // extras passthrough
+    }
 
     #[test]
     fn test_voice_from_str() {

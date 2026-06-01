@@ -115,9 +115,24 @@ impl ViettelSttConfig {
             sample_rate,
             format: PCM_FORMAT_S16LE.to_string(),
             channels,
-            asr_model: None,
+            // Honor an explicitly configured ASR model; previously `config.model` was dropped.
+            asr_model: (!config.model.is_empty()).then(|| config.model.clone()),
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
         })
+    }
+
+    /// Build from the standardized config (W1 keystone). Viettel AI is a simple batch decode
+    /// endpoint whose config only carries transport knobs (api_key, sample_rate, format, channels,
+    /// asr_model, timeout) — it exposes no advanced-feature surface. None of the standardized
+    /// [`SttFeatures`](crate::core::stt::standard::SttFeatures) (diarization, word_timestamps,
+    /// smart_format, profanity_filter, filler_words, interim_results, vad_events, endpointing,
+    /// utterance_end, keyterms, redaction, entity_detection, language_detection) map to a real
+    /// field here, so this is a pure `from_base` passthrough: a uniform standardized entry point
+    /// with no feature mapping.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        Self::from_base(&std.base)
     }
 
     /// Validate the configuration.
@@ -197,6 +212,33 @@ impl ViettelSttResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: Viettel AI exposes no advanced-feature surface, so `from_standard` is a pure
+    // `from_base` passthrough. Even with features set, it must succeed and carry the base
+    // (api_key/sample_rate/channels) through unchanged.
+    #[test]
+    fn from_standard_passes_base_through() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "viettel_ai".into(),
+                api_key: "test_token".into(),
+                sample_rate: 8000,
+                channels: 1,
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = ViettelSttConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.api_key, "test_token");
+        assert_eq!(cfg.sample_rate, 8000);
+        assert_eq!(cfg.channels, 1);
+    }
 
     #[test]
     fn test_config_default() {

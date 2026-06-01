@@ -388,6 +388,42 @@ impl PlayHtTtsConfig {
     ///
     /// * `base` - Base TTS configuration
     /// * `user_id` - Play.ht user ID for authentication
+    /// Build from the standardized config (TTS W1 keystone). Mirrors the flat-factory entry point
+    /// but unlocks the typed [`TtsFeatures`] surface. Play.ht's `user_id` is not a standard field,
+    /// so (like IBM Watson's `instance_id`) it is read from the `provider_extras` passthrough.
+    ///
+    /// Mapped: `speed` → speed (clamped), `style` → `style_guidance`, `language` → language,
+    /// `seed` → seed, `sample_rate` → sample_rate. Features with no real Play.ht field
+    /// (pitch, volume, stability, similarity_boost, use_speaker_boost, emotion, instructions,
+    /// ssml, word_timestamps, streaming) are skipped as capability gaps.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
+        let f = &std.features;
+        let user_id = std
+            .extras
+            .0
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let mut cfg = Self::from_base(std.base.clone(), user_id);
+        if let Some(s) = f.speed {
+            cfg.speed = s.clamp(MIN_SPEED, MAX_SPEED);
+        }
+        if let Some(s) = f.style {
+            cfg.style_guidance = Some(s);
+        }
+        if let Some(l) = &f.language {
+            cfg.language = Some(l.clone());
+        }
+        if let Some(s) = f.seed {
+            cfg.seed = Some(s as i64);
+        }
+        if let Some(r) = f.sample_rate {
+            cfg.sample_rate = r;
+        }
+        cfg
+    }
+
     pub fn from_base(base: TTSConfig, user_id: String) -> Self {
         let output_format = base
             .audio_format
@@ -675,6 +711,38 @@ impl Default for PlayHtTtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // TTS W1 keystone: standardized features unlock Play.ht's speed/style/language/seed/sample_rate
+    // surface, and the `user_id` (non-standard) flows through the provider_extras passthrough.
+    #[test]
+    fn from_standard_maps_features_and_extras() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("user_id".into(), serde_json::json!("user-123"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "playht".into(),
+                voice_id: Some("s3://test-voice/manifest.json".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.4),
+                style: Some(0.6),
+                language: Some("en".into()),
+                seed: Some(42),
+                sample_rate: Some(24000),
+                ..Default::default()
+            },
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        let cfg = PlayHtTtsConfig::from_standard(&std);
+        assert!((cfg.speed - 1.4).abs() < 0.001);
+        assert_eq!(cfg.style_guidance, Some(0.6));
+        assert_eq!(cfg.language, Some("en".to_string()));
+        assert_eq!(cfg.seed, Some(42));
+        assert_eq!(cfg.sample_rate, 24000);
+        assert_eq!(cfg.user_id, "user-123"); // from provider_extras passthrough
+    }
 
     // =========================================================================
     // PlayHtModel Tests

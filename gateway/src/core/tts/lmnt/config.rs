@@ -282,9 +282,17 @@ impl LmntTtsConfig {
         // Extract speed from speaking_rate if provided
         let speed = base.speaking_rate.unwrap_or(DEFAULT_SPEED);
 
+        // Honor an explicitly configured model; otherwise use LMNT's default. Previously the
+        // caller's `base.model` was ignored and every request used DEFAULT_MODEL ("blizzard").
+        let model = if base.model.is_empty() {
+            DEFAULT_MODEL.to_string()
+        } else {
+            base.model.clone()
+        };
+
         Self {
             base,
-            model: DEFAULT_MODEL.to_string(),
+            model,
             language: DEFAULT_LANGUAGE.to_string(),
             output_format,
             sample_rate,
@@ -294,6 +302,42 @@ impl LmntTtsConfig {
             seed: None,
             debug: false,
         }
+    }
+
+    /// Build from the standardized config (W1 keystone for TTS).
+    ///
+    /// Maps the standardized [`TtsFeatures`] whose meaning matches a real LMNT field:
+    /// `speed` → `speed`, `language` → `language`, `sample_rate` → `sample_rate`,
+    /// `seed` → `seed`, and `stability` → `top_p` (LMNT's speech-stability control). The
+    /// non-standard `debug` flag is read from `extras`. Features LMNT cannot express
+    /// (`pitch`, `volume`, `similarity_boost`, `style`, `use_speaker_boost`, `emotion`,
+    /// `instructions`, `ssml`, `word_timestamps`, `streaming`) are skipped.
+    ///
+    /// [`TtsFeatures`]: crate::core::tts::standard::TtsFeatures
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone());
+        if let Some(s) = f.speed {
+            cfg = cfg.with_speed(s);
+        }
+        if let Some(l) = &f.language {
+            cfg.language = l.clone();
+        }
+        if let Some(r) = f.sample_rate {
+            cfg.sample_rate = r;
+        }
+        if let Some(seed) = f.seed {
+            cfg = cfg.with_seed(seed as i64);
+        }
+        // LMNT's `top_p` is its speech-stability control (lower = more varied).
+        if let Some(stability) = f.stability {
+            cfg = cfg.with_top_p(stability);
+        }
+        // Non-standard LMNT flag: save output to clip library.
+        if let Some(debug) = std.extras.0.get("debug").and_then(|v| v.as_bool()) {
+            cfg.debug = debug;
+        }
+        cfg
     }
 
     /// Returns the voice ID to use for synthesis.
@@ -450,6 +494,51 @@ impl Default for LmntTtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // from_standard (W1 keystone for TTS)
+    // =========================================================================
+
+    // Maps the LMNT-expressible features (speed, language, sample_rate, seed, stability→top_p)
+    // and the non-standard `debug` flag via provider extras.
+    #[test]
+    fn from_standard_maps_features_and_extras() {
+        use crate::core::stt::standard::ProviderExtras;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("debug".into(), serde_json::json!(true));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "lmnt".to_string(),
+                api_key: "k".to_string(),
+                voice_id: Some("lily".to_string()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                language: Some("en".to_string()),
+                sample_rate: Some(16000),
+                seed: Some(12345),
+                stability: Some(0.9),
+                // Capability gaps (skipped): pitch/volume/similarity_boost/style/...
+                pitch: Some(2.0),
+                emotion: Some("cheerful".to_string()),
+                ssml: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+
+        let cfg = LmntTtsConfig::from_standard(&std);
+        assert!((cfg.speed - 1.5).abs() < 0.001);
+        assert_eq!(cfg.language, "en");
+        assert_eq!(cfg.sample_rate, 16000);
+        assert_eq!(cfg.seed, Some(12345));
+        assert!((cfg.top_p - 0.9).abs() < 0.001); // stability → top_p
+        assert!(cfg.debug); // from provider extras passthrough
+        assert_eq!(cfg.voice_id(), "lily"); // base carried through
+    }
 
     // =========================================================================
     // LmntAudioFormat Tests
@@ -659,6 +748,16 @@ mod tests {
         let config = LmntTtsConfig::from_base(base).with_model("custom-model");
 
         assert_eq!(config.model, "custom-model");
+    }
+
+    #[test]
+    fn test_config_from_base_honors_model() {
+        // An explicitly configured model must flow through `from_base` (previously it was dropped
+        // and every request used DEFAULT_MODEL).
+        let mut base = create_test_base_config();
+        base.model = "lily-turbo".to_string();
+        let config = LmntTtsConfig::from_base(base);
+        assert_eq!(config.model, "lily-turbo");
     }
 
     #[test]

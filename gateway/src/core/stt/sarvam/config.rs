@@ -101,9 +101,28 @@ impl SarvamSTTConfig {
         }
     }
 
+    /// Build from the standardized config (W1 keystone). Sarvam's Saarika streaming surface is
+    /// narrow, so this maps the one standardized feature it can actually express: explicit
+    /// voice-activity events (`vad_events` -> `vad_signals`, the speech_start/speech_end signals).
+    /// Features Sarvam cannot express (interim_results, diarization, word_timestamps, smart_format,
+    /// profanity_filter, filler_words, endpointing/utterance_end, keyterms, redaction,
+    /// entity/language detection) are capability gaps and stay at default.
+    pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base);
+        if let Some(v) = f.vad_events {
+            cfg.vad_signals = v;
+        }
+        cfg
+    }
+
     /// Build the WebSocket URL with query parameters
     pub fn build_websocket_url(&self) -> String {
         let mut url = String::with_capacity(256);
+        // NOTE: model/language_code/input_audio_codec are constrained identifiers (e.g.
+        // "saarika:v2.5", "en-IN", "pcm_s16le") — they never contain spaces or query delimiters, and
+        // the `:` in model ids is valid in a query and must stay literal, so they are NOT
+        // percent-encoded here (unlike genuinely free-text values such as Deepgram keyterms).
         url.push_str(SARVAM_STT_WS_URL);
         url.push_str("?model=");
         url.push_str(&self.model);
@@ -163,6 +182,27 @@ impl SarvamSTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized `vad_events` feature unlocks Sarvam's voice-activity
+    // signals (speech_start/speech_end), and the base (provider/api_key) carries through.
+    #[test]
+    fn from_standard_maps_vad_events() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "sarvam".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                vad_events: Some(false),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = SarvamSTTConfig::from_standard(&std);
+        assert!(!cfg.vad_signals); // vad_events -> vad_signals
+    }
 
     #[test]
     fn test_default_config() {

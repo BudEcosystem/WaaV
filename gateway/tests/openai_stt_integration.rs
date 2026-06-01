@@ -378,3 +378,144 @@ async fn test_openai_verbose_json_format() {
 
     stt.disconnect().await.expect("Failed to disconnect");
 }
+
+/// REAL live end-to-end round-trip against a local OpenAI-compatible server.
+///
+/// Unlike the `#[ignore]`d tests above, this one runs in the default suite: it stands up a real
+/// HTTP server implementing `POST /v1/audio/transcriptions`, points the WaaV OpenAI provider at
+/// it via the standard `OPENAI_BASE_URL` override, and drives the *actual* provider lifecycle
+/// (`connect` → `send_audio` → `flush`/`disconnect`). It exercises the provider's real wire path
+/// — multipart form construction, `Authorization: Bearer` header, WAV encoding, the HTTP POST,
+/// and JSON response parsing — end-to-end, with NO paid credentials. This is the credential-free
+/// equivalent of `test_openai_live_transcription`, validating that the integration is wired
+/// correctly against a server that speaks the OpenAI transcription contract.
+#[tokio::test]
+async fn test_openai_stt_local_server_roundtrip() {
+    use axum::{Router, extract::State, http::HeaderMap, routing::post};
+    use bytes::Bytes;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+    use waav_gateway::core::stt::openai::{OpenAISTTConfig, ResponseFormat};
+
+    const EXPECTED: &str = "waav local e2e transcript via openai provider";
+
+    // --- Real local server speaking the OpenAI transcription contract ---
+    #[derive(Default)]
+    struct SrvState {
+        saw_bearer: AtomicBool,
+        saw_multipart: AtomicBool,
+        hits: AtomicUsize,
+    }
+
+    async fn transcribe(
+        State(st): State<Arc<SrvState>>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::Json<serde_json::Value> {
+        st.hits.fetch_add(1, Ordering::SeqCst);
+        if headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| s.starts_with("Bearer "))
+        {
+            st.saw_bearer.store(true, Ordering::SeqCst);
+        }
+        if headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| s.contains("multipart/form-data"))
+        {
+            st.saw_multipart.store(true, Ordering::SeqCst);
+        }
+        // The body is the real multipart payload (WAV audio + form fields). We require it to be
+        // non-trivial so a broken/empty upload would be caught.
+        assert!(
+            body.len() > 1000,
+            "expected a real multipart audio upload, got {} bytes",
+            body.len()
+        );
+        axum::Json(serde_json::json!({ "text": EXPECTED }))
+    }
+
+    let state = Arc::new(SrvState::default());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local server");
+    let addr = listener.local_addr().expect("local_addr");
+    let app = Router::new()
+        .route("/v1/audio/transcriptions", post(transcribe))
+        .with_state(state.clone());
+    // Socket is already bound, so the client can connect immediately; serve() just accepts.
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    // --- Point the real WaaV OpenAI provider at our local server ---
+    // SAFETY (edition 2024): set/remove_var are unsafe. Only this test touches OPENAI_BASE_URL in
+    // the default suite (the other live tests are #[ignore]d), and it is removed below.
+    unsafe { std::env::set_var("OPENAI_BASE_URL", format!("http://{addr}")) };
+
+    let mut config = OpenAISTTConfig::from_base(STTConfig {
+        provider: "openai".to_string(),
+        api_key: "local-test-key".to_string(),
+        language: "en".to_string(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".to_string(),
+        model: "whisper-1".to_string(),
+    });
+    // Force plain JSON so the server's `{"text": ...}` body is parsed via TranscriptionResponse.
+    config.response_format = ResponseFormat::Json;
+
+    let mut stt = OpenAISTT::with_config(config).expect("create OpenAI STT");
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    stt.on_result(Arc::new(move |result| {
+        let tx = tx.clone();
+        Box::pin(async move {
+            let _ = tx.send(result);
+        })
+    }))
+    .await
+    .expect("register callback");
+
+    stt.connect().await.expect("connect");
+
+    // 0.5s of non-zero PCM so the encoded WAV upload is substantial (> 1000 bytes).
+    let mut audio = Vec::with_capacity(8000 * 2);
+    for i in 0..8000u32 {
+        let sample = (((i as f32) * 0.05).sin() * 8000.0) as i16;
+        audio.extend_from_slice(&sample.to_le_bytes());
+    }
+    stt.send_audio(Bytes::from(audio)).await.expect("send_audio");
+    stt.flush().await.expect("flush");
+
+    let received = tokio::time::timeout(tokio::time::Duration::from_secs(10), rx.recv()).await;
+
+    stt.disconnect().await.expect("disconnect");
+    // Restore global env before asserting so a failure can't leak into other tests.
+    unsafe { std::env::remove_var("OPENAI_BASE_URL") };
+
+    let result = received
+        .expect("timed out waiting for transcription result")
+        .expect("result channel closed without a result");
+
+    assert_eq!(
+        result.transcript, EXPECTED,
+        "provider should return the transcript parsed from the local OpenAI-compatible server"
+    );
+    assert!(
+        state.hits.load(Ordering::SeqCst) >= 1,
+        "the provider must have actually POSTed to the local server"
+    );
+    assert!(
+        state.saw_bearer.load(Ordering::SeqCst),
+        "the provider must send an Authorization: Bearer header"
+    );
+    assert!(
+        state.saw_multipart.load(Ordering::SeqCst),
+        "the provider must send a multipart/form-data body (OpenAI transcription contract)"
+    );
+}

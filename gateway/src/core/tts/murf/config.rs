@@ -506,6 +506,49 @@ impl MurfTtsConfig {
         Ok(murf_config)
     }
 
+    /// Build from the standardized config (W1 keystone for TTS — first TTS provider migrated).
+    /// Wraps `from_base` (the uniform entry point) and maps the [`TtsFeatures`] whose meaning
+    /// matches a real Murf field: `speed`→`rate` (-50..50), `pitch`→`pitch` (-50..50),
+    /// `emotion`→`style` (Murf's named speaking style, e.g. "Conversational"),
+    /// `language`→`multi_native_locale` (cross-language pronunciation), `sample_rate`→`sample_rate`.
+    /// The non-standard `region` (data-residency endpoint) is read from `extras`. Features Murf
+    /// cannot express (volume, stability/similarity_boost/style-exaggeration/use_speaker_boost,
+    /// instructions, ssml, word_timestamps, streaming, seed) are skipped.
+    ///
+    /// [`TtsFeatures`]: crate::core::tts::standard::TtsFeatures
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+        if let Some(speed) = f.speed {
+            cfg = cfg.with_rate(speed as i32);
+        }
+        if let Some(pitch) = f.pitch {
+            cfg = cfg.with_pitch(pitch as i32);
+        }
+        if let Some(emotion) = &f.emotion {
+            cfg = cfg.with_style(emotion.clone());
+        }
+        if let Some(language) = &f.language {
+            cfg.multi_native_locale = Some(language.clone());
+        }
+        if let Some(sample_rate) = f.sample_rate {
+            cfg.sample_rate = sample_rate;
+        }
+        if let Some(region) = std
+            .extras
+            .0
+            .get("region")
+            .and_then(|v| v.as_str())
+            .and_then(MurfRegion::from_str)
+        {
+            cfg.region = region;
+        }
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> TTSResult<()> {
         // API key is required
@@ -786,6 +829,48 @@ pub struct MurfVoice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (first TTS provider): the standardized features map onto Murf's real fields
+    // (rate, pitch, style, multi_native_locale, sample_rate) and the `region` extra — previously
+    // unreachable via the flat factory.
+    #[test]
+    fn from_standard_maps_features_and_region_extra() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("region".into(), serde_json::json!("us-east"));
+
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "murf".into(),
+                api_key: "test-key".into(),
+                voice_id: Some("en-US-natalie".into()),
+                model: "GEN2".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(10.0),
+                pitch: Some(-5.0),
+                emotion: Some("Conversational".into()),
+                language: Some("en-US".into()),
+                sample_rate: Some(44100),
+                ..Default::default()
+            },
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+
+        let cfg = MurfTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.rate, Some(10)); // speed -> rate
+        assert_eq!(cfg.pitch, Some(-5)); // pitch -> pitch
+        assert_eq!(cfg.style, Some("Conversational".to_string())); // emotion -> style
+        assert_eq!(cfg.multi_native_locale, Some("en-US".to_string())); // language -> locale
+        assert_eq!(cfg.sample_rate, 44100); // sample_rate passthrough
+        assert_eq!(cfg.region, MurfRegion::UsEast); // region from extras
+        // base carried through from_base
+        assert_eq!(cfg.api_key, "test-key");
+        assert_eq!(cfg.voice_id, "en-US-natalie");
+        assert_eq!(cfg.model, MurfModel::Gen2);
+    }
 
     #[test]
     fn test_config_defaults() {

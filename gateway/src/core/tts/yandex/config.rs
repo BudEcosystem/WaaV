@@ -514,6 +514,69 @@ impl YandexTtsConfig {
         })
     }
 
+    /// Build from the standardized TTS config (W1 keystone). Maps the features Yandex SpeechKit can
+    /// express to real fields: [`TtsFeatures::speed`] is a `1.0`-normal multiplier applied directly
+    /// to `speed` (reusing `from_base`'s `MIN_SPEED..=MAX_SPEED` clamp), [`TtsFeatures::emotion`] is
+    /// matched to a [`YandexEmotion`] using the same string mapping as `from_base`,
+    /// [`TtsFeatures::language`] overrides the [`YandexLanguage`] when it parses, and
+    /// [`TtsFeatures::sample_rate`] is normalized to Yandex's supported rates (8000/16000/48000)
+    /// using `from_base`'s bucketing. Yandex's non-standard `folder_id` and `is_iam_token` knobs are
+    /// read from the `extras` passthrough. Features without a Yandex field (pitch, volume, stability,
+    /// similarity_boost, style, use_speaker_boost, instructions, ssml, word_timestamps, streaming,
+    /// seed) are skipped.
+    ///
+    /// [`TtsFeatures::speed`]: crate::core::tts::standard::TtsFeatures::speed
+    /// [`TtsFeatures::emotion`]: crate::core::tts::standard::TtsFeatures::emotion
+    /// [`TtsFeatures::language`]: crate::core::tts::standard::TtsFeatures::language
+    /// [`TtsFeatures::sample_rate`]: crate::core::tts::standard::TtsFeatures::sample_rate
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+
+        if let Some(speed) = f.speed {
+            // Standardized speed is a 1.0-is-normal multiplier; Yandex uses the same scale.
+            cfg.speed = speed.clamp(super::MIN_SPEED, super::MAX_SPEED);
+        }
+        if let Some(ref emotion) = f.emotion {
+            // Reuse from_base's string -> YandexEmotion mapping; unknown values leave the base value.
+            match emotion.to_lowercase().as_str() {
+                "happy" | "cheerful" | "good" | "joyful" => cfg.emotion = YandexEmotion::Good,
+                "angry" | "evil" | "irritated" | "frustrated" => cfg.emotion = YandexEmotion::Evil,
+                "formal" | "strict" | "professional" => cfg.emotion = YandexEmotion::Strict,
+                "friendly" | "warm" | "kind" => cfg.emotion = YandexEmotion::Friendly,
+                "whisper" | "quiet" => cfg.emotion = YandexEmotion::Whisper,
+                _ => {}
+            }
+        }
+        if let Some(ref language) = f.language {
+            if let Ok(lang) = language.parse::<YandexLanguage>() {
+                cfg.language = lang;
+            }
+        }
+        if let Some(sr) = f.sample_rate {
+            // Reuse from_base's normalization to Yandex's supported rates.
+            cfg.sample_rate = if sr == 0 {
+                super::DEFAULT_SAMPLE_RATE
+            } else if sr <= 12000 {
+                super::MIN_SAMPLE_RATE
+            } else if sr <= 32000 {
+                16000
+            } else {
+                super::MAX_SAMPLE_RATE
+            };
+        }
+
+        // Provider-specific passthrough.
+        if let Some(folder_id) = std.extras.0.get("folder_id").and_then(|v| v.as_str()) {
+            cfg.folder_id = Some(folder_id.to_string());
+        }
+        if let Some(is_iam_token) = std.extras.0.get("is_iam_token").and_then(|v| v.as_bool()) {
+            cfg.is_iam_token = is_iam_token;
+        }
+
+        Ok(cfg)
+    }
+
     /// Build the form parameters for the synthesis request
     pub fn build_form_params(&self, text: &str) -> Vec<(&'static str, String)> {
         let mut params = vec![
@@ -575,6 +638,40 @@ impl YandexTtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features Yandex can express (speed, emotion, language, output
+    // sample rate) reach their real config fields, and the non-standard folder_id / is_iam_token
+    // knobs flow through the extras passthrough.
+    #[test]
+    fn from_standard_maps_speed_emotion_language_and_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("folder_id".into(), serde_json::json!("b1gfolder123"));
+        extras.insert("is_iam_token".into(), serde_json::json!(true));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "yandex".into(),
+                api_key: "AQVN1234567890".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                emotion: Some("cheerful".into()),
+                language: Some("en-US".into()),
+                sample_rate: Some(16000),
+                ssml: Some(true), // capability gap: Yandex config has no SSML field, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = YandexTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.speed, 1.5); // 1.5 multiplier clamped to 0.1..=3.0
+        assert_eq!(cfg.emotion, YandexEmotion::Good); // "cheerful" -> Good
+        assert_eq!(cfg.language, YandexLanguage::English); // "en-US" -> English
+        assert_eq!(cfg.sample_rate, 16000); // 16000 -> 16000 bucket
+        assert_eq!(cfg.folder_id, Some("b1gfolder123".to_string())); // extras passthrough
+        assert!(cfg.is_iam_token);
+    }
 
     #[test]
     fn test_audio_format_conversion() {

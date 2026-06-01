@@ -6,6 +6,8 @@ pub mod azure;
 pub mod baidu;
 mod base;
 pub mod bhashini;
+/// Standardized capability-rich STT config (W1 keystone, additive).
+pub mod standard;
 pub mod cartesia;
 pub mod deepgram;
 pub mod elevenlabs;

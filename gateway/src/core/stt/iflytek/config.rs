@@ -424,6 +424,26 @@ impl IFlytekSttConfig {
         })
     }
 
+    /// Build from the standardized config (W1 keystone). iFlytek exposes a narrow feature
+    /// surface, so only the features it can actually express are mapped: `smart_format` →
+    /// `convert_numbers` (spoken-number normalization) and `endpointing_ms` → `vad_eos_ms`
+    /// (end-of-speech silence timeout). Features iFlytek cannot express (diarization, redaction,
+    /// keyterms, interim_results, word_timestamps, profanity_filter, …) are capability gaps and
+    /// left at their defaults.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+        if let Some(s) = f.smart_format {
+            cfg.convert_numbers = s;
+        }
+        if let Some(ms) = f.endpointing_ms {
+            cfg.vad_eos_ms = ms;
+        }
+        Ok(cfg)
+    }
+
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), STTError> {
         self.auth
@@ -478,6 +498,30 @@ mod tests {
 
     fn create_test_api_key() -> String {
         "test_app_id|test_api_key_xxxxx|test_api_secret_xx".to_string()
+    }
+
+    // W1 keystone: maps the standardized features iFlytek can express (smart_format +
+    // endpointing) onto its own config fields. iFlytek's narrow surface means the rest
+    // (diarization, redaction, keyterms, …) are capability gaps left at defaults.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "iflytek".into(),
+                api_key: create_test_api_key(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                smart_format: Some(false),
+                endpointing_ms: Some(1500),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = IFlytekSttConfig::from_standard(&std).unwrap();
+        assert!(!cfg.convert_numbers); // smart_format
+        assert_eq!(cfg.vad_eos_ms, 1500); // endpointing_ms
     }
 
     fn create_test_base_config() -> STTConfig {

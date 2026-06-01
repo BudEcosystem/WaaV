@@ -16,7 +16,7 @@ use http::{
 };
 use tokio::net::TcpListener;
 use tower_governor::{
-    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
+    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::PeerIpKeyExtractor,
 };
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -206,18 +206,28 @@ async fn main() -> anyhow::Result<()> {
         axum::routing::get(waav_gateway::handlers::api::health_check),
     );
 
-    // Configure rate limiting (disabled when rate >= 100000 for performance testing)
-    let governor_layer = if rate_limit_rps < 100000 {
+    // Configure rate limiting.
+    // SECURITY (S7): key on the real TCP peer IP (PeerIpKeyExtractor), NOT SmartIpKeyExtractor,
+    // which trusts client-supplied X-Forwarded-For / X-Real-IP and therefore lets an attacker
+    // mint a fresh token bucket per request by rotating the header. Behind a trusted reverse
+    // proxy, set up a dedicated trusted-proxy XFF extractor (tracked in W4) — do not re-enable
+    // SmartIpKeyExtractor on an internet-facing listener.
+    // Disable ONLY via an explicit `rate_limit_requests_per_second: 0` (no silent magic-number
+    // threshold that could ship a limiter-off build by accident).
+    let governor_layer = if rate_limit_rps == 0 {
+        tracing::warn!(
+            "Rate limiting EXPLICITLY DISABLED (rate_limit_requests_per_second = 0); \
+             do not run this configuration on an internet-facing deployment"
+        );
+        None
+    } else {
         let governor_config = GovernorConfigBuilder::default()
             .per_second(rate_limit_rps as u64)
             .burst_size(rate_limit_burst)
-            .key_extractor(SmartIpKeyExtractor)
+            .key_extractor(PeerIpKeyExtractor)
             .finish()
             .expect("Failed to build rate limiter config");
         Some(GovernorLayer::new(governor_config))
-    } else {
-        println!("Rate limiting disabled (rate >= 100000/s)");
-        None
     };
 
     // Configure CORS

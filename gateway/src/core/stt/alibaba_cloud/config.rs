@@ -585,6 +585,40 @@ impl DashScopeSttConfig {
         })
     }
 
+    /// Build from the standardized config (W1 keystone). DashScope exposes a focused feature
+    /// surface, so this maps the standardized features it can actually express onto its own
+    /// fields: word-level timestamps (`word_timestamps`), filler words (`disfluency_removal`,
+    /// whose sense is inverted — keeping fillers means *not* removing disfluencies), context
+    /// biasing hotwords (`context_text`, built by joining `keyterms`), the endpointing silence
+    /// window (`silence_duration_ms`) and automatic language detection (`language = Auto`).
+    /// Features DashScope can't express (diarization, smart_format, profanity_filter,
+    /// interim_results, vad_events, utterance_end, redaction, entity_detection) are capability
+    /// gaps and stay at their defaults.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+        if let Some(w) = f.word_timestamps {
+            cfg.word_timestamps = w;
+        }
+        if let Some(filler) = f.filler_words {
+            cfg.disfluency_removal = !filler;
+        }
+        if let Some(k) = &f.keyterms {
+            if !k.is_empty() {
+                cfg.context_text = Some(k.join(" "));
+            }
+        }
+        if let Some(ms) = f.endpointing_ms {
+            cfg.silence_duration_ms = ms;
+        }
+        if let Some(true) = f.language_detection {
+            cfg.language = DashScopeLanguage::Auto;
+        }
+        Ok(cfg)
+    }
+
     /// Validate configuration.
     pub fn validate(&self) -> Result<(), STTError> {
         // Check API key
@@ -660,6 +694,29 @@ impl DashScopeSttConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: maps the standardized features DashScope can express (word timestamps +
+    // context-biasing keyterms) onto its own config fields.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "alibaba_cloud".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "DashScope".into()]),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = DashScopeSttConfig::from_standard(&std).unwrap();
+        assert!(cfg.word_timestamps); // word_timestamps
+        assert_eq!(cfg.context_text.as_deref(), Some("WaaV DashScope")); // keyterms
+    }
 
     #[test]
     fn test_region_urls() {

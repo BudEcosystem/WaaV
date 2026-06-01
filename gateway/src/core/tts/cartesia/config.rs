@@ -613,6 +613,40 @@ pub struct CartesiaTTSConfig {
 }
 
 impl CartesiaTTSConfig {
+    /// Build from the standardized config (W1 keystone for TTS — uniform entry point).
+    ///
+    /// Cartesia's request body exposes a `generation_config` (speed + emotion) and an
+    /// `output_format` (sample rate), so this maps the matching standardized features:
+    /// - [`TtsFeatures::speed`] → `base.speaking_rate` (sent as `generation_config.speed`)
+    /// - [`TtsFeatures::emotion`] → `base.emotion_config` (sent as `generation_config.emotion`)
+    /// - [`TtsFeatures::sample_rate`] → `output_format.sample_rate`
+    ///
+    /// Features Cartesia can't express (pitch, volume, ElevenLabs voice settings, instructions,
+    /// ssml, language, word_timestamps, streaming, seed) are skipped.
+    ///
+    /// [`TtsFeatures::speed`]: crate::core::tts::standard::TtsFeatures::speed
+    /// [`TtsFeatures::emotion`]: crate::core::tts::standard::TtsFeatures::emotion
+    /// [`TtsFeatures::sample_rate`]: crate::core::tts::standard::TtsFeatures::sample_rate
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
+        let f = &std.features;
+        let mut base = std.base.clone();
+        if let Some(s) = f.speed {
+            base.speaking_rate = Some(s);
+        }
+        if let Some(emotion) = f
+            .emotion
+            .as_deref()
+            .and_then(crate::core::emotion::Emotion::from_str)
+        {
+            base.emotion_config = Some(crate::core::emotion::EmotionConfig::with_emotion(emotion));
+        }
+        let mut cfg = Self::from_base(base);
+        if let Some(rate) = f.sample_rate {
+            cfg.output_format.sample_rate = rate;
+        }
+        cfg
+    }
+
     /// Creates a CartesiaTTSConfig from a base TTSConfig with default Cartesia settings.
     ///
     /// Maps base config fields to Cartesia-specific settings:
@@ -774,6 +808,60 @@ impl Default for CartesiaTTSConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // from_standard Tests
+    // =========================================================================
+
+    // W1 keystone (TTS): the standardized features Cartesia can express (speed, emotion, sample
+    // rate) reach the fields the request builder consumes (generation_config + output_format).
+    #[test]
+    fn from_standard_maps_speed_emotion_and_sample_rate() {
+        use crate::core::emotion::Emotion;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "cartesia".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                emotion: Some("cheerful".into()),
+                sample_rate: Some(44100),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+
+        let cfg = CartesiaTTSConfig::from_standard(&std);
+        assert_eq!(cfg.base.speaking_rate, Some(1.5));
+        assert_eq!(
+            cfg.base.emotion_config.and_then(|e| e.emotion),
+            Some(Emotion::Happy) // "cheerful" parses to Emotion::Happy
+        );
+        assert_eq!(cfg.output_format.sample_rate, 44100);
+    }
+
+    #[test]
+    fn from_standard_no_features_passes_base_through() {
+        use crate::core::tts::standard::StandardTTSConfig;
+
+        let std = StandardTTSConfig::from_base(TTSConfig {
+            api_key: "k".into(),
+            model: "sonic-3-2025-10-27".into(),
+            ..Default::default()
+        });
+
+        let cfg = CartesiaTTSConfig::from_standard(&std);
+        // Pure from_base passthrough: no features set, so the base is forwarded untouched
+        // (including its `TTSConfig::default()` values like `speaking_rate: Some(1.0)`).
+        assert_eq!(cfg.base.api_key, "k");
+        assert_eq!(cfg.model, "sonic-3-2025-10-27");
+        assert_eq!(cfg.base.speaking_rate, TTSConfig::default().speaking_rate);
+        assert!(cfg.base.emotion_config.is_none());
+    }
 
     // =========================================================================
     // CartesiaAudioContainer Tests

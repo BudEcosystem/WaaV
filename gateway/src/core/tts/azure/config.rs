@@ -513,6 +513,29 @@ impl AzureTTSConfig {
         }
     }
 
+    /// Build from the standardized config (TTS W1 keystone). Azure expresses speed/pitch/volume
+    /// and emotion at synthesis time via SSML (`mstts:express-as`) rather than through struct
+    /// fields, so the only directly mappable feature is `ssml` → the `use_ssml` flag. Also
+    /// demonstrates the `provider_extras` passthrough: Azure's `region` (not a standard field) is
+    /// read from extras and parsed via `AzureRegion::from_str`.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone());
+        if let Some(region) = std
+            .extras
+            .0
+            .get("region")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+        {
+            cfg.region = region;
+        }
+        if let Some(s) = f.ssml {
+            cfg.use_ssml = s;
+        }
+        cfg
+    }
+
     /// Creates an `AzureTTSConfig` with a specific region.
     ///
     /// # Arguments
@@ -697,6 +720,30 @@ impl AzureTTSConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // TTS W1 keystone: maps `ssml` → `use_ssml` and demonstrates provider_extras (region).
+    #[test]
+    fn from_standard_maps_ssml_and_region() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("region".into(), serde_json::json!("westeurope"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "azure".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                ssml: Some(false),
+                ..Default::default()
+            },
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        let cfg = AzureTTSConfig::from_standard(&std);
+        assert!(!cfg.use_ssml); // mapped from features.ssml
+        assert_eq!(cfg.region, AzureRegion::WestEurope); // from provider_extras passthrough
+        assert_eq!(cfg.base.api_key, "k"); // base carried through
+    }
 
     // =========================================================================
     // AzureAudioEncoding Tests

@@ -463,6 +463,45 @@ impl UnrealSpeechTtsConfig {
         })
     }
 
+    /// Build from the standardized config (W1 keystone). Maps the TTS features Unreal Speech can
+    /// express to its real request fields: [`TtsFeatures::speed`] becomes the `speed` offset
+    /// (`0.0` is normal, clamped to Unreal Speech's `-1.0..=1.0` range — same range
+    /// [`validate_speed`] enforces) and [`TtsFeatures::pitch`] becomes the `pitch` multiplier
+    /// (`1.0` is normal, clamped to `0.5..=1.5` per [`validate_pitch`]). The non-standard
+    /// `bitrate` knob is read from the `extras` passthrough (a numeric kbps value or a string like
+    /// `"320k"`). Unreal Speech has no field for volume, ElevenLabs-style voice settings, emotion,
+    /// instructions, SSML, language, word timestamps, streaming, seed or sample rate, so those
+    /// features are skipped.
+    ///
+    /// [`TtsFeatures::speed`]: crate::core::tts::standard::TtsFeatures::speed
+    /// [`TtsFeatures::pitch`]: crate::core::tts::standard::TtsFeatures::pitch
+    /// [`validate_speed`]: Self::validate_speed
+    /// [`validate_pitch`]: Self::validate_pitch
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+
+        if let Some(speed) = f.speed {
+            // Unreal Speech's speed is a 0.0-is-normal offset in -1.0..=1.0.
+            cfg.speed = speed.clamp(-1.0, 1.0);
+        }
+        if let Some(pitch) = f.pitch {
+            // Unreal Speech's pitch is a 1.0-is-normal multiplier in 0.5..=1.5.
+            cfg.pitch = pitch.clamp(0.5, 1.5);
+        }
+
+        // Provider-specific passthrough.
+        if let Some(bitrate) = std.extras.0.get("bitrate") {
+            if let Some(kbps) = bitrate.as_u64() {
+                cfg.bitrate = format!("{}k", kbps).parse().unwrap_or_default();
+            } else if let Some(s) = bitrate.as_str() {
+                cfg.bitrate = s.parse().unwrap_or_default();
+            }
+        }
+
+        Ok(cfg)
+    }
+
     /// Validate text length for stream endpoint
     pub fn validate_stream_text(text: &str) -> TTSResult<()> {
         if text.len() > super::MAX_STREAM_TEXT_LENGTH {
@@ -599,6 +638,36 @@ impl UnrealSpeechTtsConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features unlock Unreal Speech's speed offset and pitch
+    // multiplier — plus the bitrate knob via the open extras passthrough — previously unreachable
+    // through the flat factory (which always defaulted speed/pitch/bitrate).
+    #[test]
+    fn from_standard_maps_speed_pitch_and_bitrate_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("bitrate".into(), serde_json::json!(320));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "unrealspeech".into(),
+                api_key: "test-key".into(),
+                voice_id: Some("Dan".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(0.5),
+                pitch: Some(1.2),
+                ssml: Some(true), // capability gap: Unreal Speech has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = UnrealSpeechTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.speed, 0.5); // -1.0..=1.0 offset, passed through
+        assert_eq!(cfg.pitch, 1.2); // 0.5..=1.5 multiplier, passed through
+        assert_eq!(cfg.bitrate, UnrealSpeechBitrate::Bitrate320k); // extras passthrough
+        assert_eq!(cfg.voice, UnrealSpeechVoice::Dan); // base passthrough preserved
+    }
 
     #[test]
     fn test_voice_enum_standard() {

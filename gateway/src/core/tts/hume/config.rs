@@ -380,6 +380,51 @@ impl HumeTTSConfig {
         }
     }
 
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// Hume's differentiator is natural-language emotion control via `description`, so the
+    /// `instructions` / `emotion` features map there (clamped to `MAX_DESCRIPTION_LENGTH`).
+    /// `speed` maps to Hume's speed (clamped to `MIN_SPEED..=MAX_SPEED`) and `sample_rate`
+    /// overrides the output format rate. Provider-specific knobs (`generation_id`,
+    /// `num_generations`) are read from `extras`. Hume has no SSML / pitch / volume / stability
+    /// surface, so those features are skipped.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone());
+
+        // Natural-language acting instructions: prefer explicit `instructions`, fall back to
+        // `emotion` (Hume expresses emotion through the same free-form description field).
+        if let Some(desc) = f.instructions.as_ref().or(f.emotion.as_ref()) {
+            let desc = if desc.len() > MAX_DESCRIPTION_LENGTH {
+                desc[..MAX_DESCRIPTION_LENGTH].to_string()
+            } else {
+                desc.clone()
+            };
+            cfg.description = Some(desc);
+        }
+        if let Some(speed) = f.speed {
+            cfg.speed = Some(speed.clamp(MIN_SPEED, MAX_SPEED));
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.output_format.sample_rate = rate;
+        }
+
+        // Provider-specific passthrough.
+        if let Some(id) = std.extras.0.get("generation_id").and_then(|v| v.as_str()) {
+            cfg.generation_id = Some(id.to_string());
+        }
+        if let Some(num) = std
+            .extras
+            .0
+            .get("num_generations")
+            .and_then(|v| v.as_u64())
+        {
+            cfg.num_generations = Some(num as u8);
+        }
+
+        cfg
+    }
+
     /// Validates the configuration for API compatibility.
     pub fn validate(&self) -> Result<(), TTSError> {
         // Check API key
@@ -515,6 +560,39 @@ impl Default for HumeTTSConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features unlock Hume's natural-language emotion control
+    // (`description`), speed and output sample rate — plus generation_id / num_generations via
+    // the open extras passthrough — previously unreachable through the flat factory.
+    #[test]
+    fn from_standard_maps_instructions_speed_and_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("generation_id".into(), serde_json::json!("gen-123"));
+        extras.insert("num_generations".into(), serde_json::json!(2));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "hume".into(),
+                api_key: "k".into(),
+                sample_rate: Some(24000),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                instructions: Some("warm, friendly, inviting".into()),
+                speed: Some(1.25),
+                sample_rate: Some(48000),
+                ssml: Some(true), // capability gap: Hume has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = HumeTTSConfig::from_standard(&std);
+        assert_eq!(cfg.description, Some("warm, friendly, inviting".to_string()));
+        assert_eq!(cfg.speed, Some(1.25));
+        assert_eq!(cfg.output_format.sample_rate, 48000);
+        assert_eq!(cfg.generation_id, Some("gen-123".to_string())); // extras passthrough
+        assert_eq!(cfg.num_generations, Some(2));
+    }
 
     // =========================================================================
     // HumeAudioFormat Tests

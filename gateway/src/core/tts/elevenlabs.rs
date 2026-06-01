@@ -40,6 +40,37 @@ impl Default for VoiceSettings {
     }
 }
 
+impl VoiceSettings {
+    /// Build ElevenLabs voice settings from the standardized TTS config (W1 keystone — TTS analog
+    /// of the STT migration). ElevenLabs' voice settings map cleanly onto the canonical voice
+    /// features (`stability`, `similarity_boost`, `style`, `use_speaker_boost`, `speed`), which
+    /// were previously unreachable through the flat factory. The base's `speaking_rate` seeds
+    /// `speed` (preserving `ElevenLabsTTS::new`), then the explicit `speed` feature overrides it.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
+        let f = &std.features;
+        let mut settings = VoiceSettings {
+            speed: std.base.speaking_rate,
+            ..Default::default()
+        };
+        if let Some(s) = f.stability {
+            settings.stability = Some(s);
+        }
+        if let Some(s) = f.similarity_boost {
+            settings.similarity_boost = Some(s);
+        }
+        if let Some(s) = f.style {
+            settings.style = Some(s);
+        }
+        if let Some(b) = f.use_speaker_boost {
+            settings.use_speaker_boost = Some(b);
+        }
+        if let Some(s) = f.speed {
+            settings.speed = Some(s);
+        }
+        settings
+    }
+}
+
 pub const ELEVENLABS_TTS_URL: &str = "https://api.elevenlabs.io/v1/text-to-speech";
 
 /// ElevenLabs-specific request builder
@@ -99,10 +130,20 @@ impl TTSRequestBuilder for ElevenLabsRequestBuilder {
                     }
                 }
                 "ulaw" => "ulaw_8000".to_string(),
-                _ => {
-                    // Default to PCM for compatibility with the rest of the system
-                    let sample_rate = self.config.sample_rate.unwrap_or(24000);
-                    format!("pcm_{sample_rate}")
+                other => {
+                    // If the caller already passed a canonical ElevenLabs format string
+                    // (e.g. "mp3_44100_128", "pcm_16000", "ulaw_8000", "opus_48000_64"),
+                    // honor it verbatim instead of silently forcing PCM — otherwise a valid
+                    // explicit selection (e.g. MP3, the only output allowed on lower tiers) was
+                    // being overridden to the Pro-tier-only `pcm_*` and rejected with HTTP 403.
+                    const KNOWN_PREFIXES: [&str; 5] = ["mp3_", "pcm_", "ulaw_", "alaw_", "opus_"];
+                    if KNOWN_PREFIXES.iter().any(|p| other.starts_with(p)) {
+                        other.to_string()
+                    } else {
+                        // Unknown short alias → default to PCM for downstream-pipeline compatibility.
+                        let sample_rate = self.config.sample_rate.unwrap_or(24000);
+                        format!("pcm_{sample_rate}")
+                    }
                 }
             }
         } else {
@@ -299,6 +340,42 @@ impl BaseTTS for ElevenLabsTTS {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (TTS analog): the standardized voice features (stability, similarity_boost,
+    // style, speaker boost, speed) flow into ElevenLabs `VoiceSettings` — previously unreachable
+    // via the flat factory. The base `speaking_rate` seeds speed unless the `speed` feature wins.
+    #[test]
+    fn from_standard_maps_elevenlabs_voice_settings() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "elevenlabs".into(),
+                api_key: "k".into(),
+                speaking_rate: Some(1.25),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                stability: Some(0.7),
+                similarity_boost: Some(0.9),
+                style: Some(0.3),
+                use_speaker_boost: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let settings = VoiceSettings::from_standard(&std);
+        assert_eq!(settings.stability, Some(0.7));
+        assert_eq!(settings.similarity_boost, Some(0.9));
+        assert_eq!(settings.style, Some(0.3));
+        assert_eq!(settings.use_speaker_boost, Some(true));
+        // base.speaking_rate seeds speed when no explicit speed feature is set
+        assert_eq!(settings.speed, Some(1.25));
+
+        // the explicit speed feature overrides base.speaking_rate
+        let mut std2 = std.clone();
+        std2.features.speed = Some(2.0);
+        assert_eq!(VoiceSettings::from_standard(&std2).speed, Some(2.0));
+    }
 
     #[tokio::test]
     async fn test_elevenlabs_tts_creation() {

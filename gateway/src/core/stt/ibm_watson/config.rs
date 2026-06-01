@@ -408,31 +408,72 @@ impl Default for IbmWatsonSTTConfig {
 }
 
 impl IbmWatsonSTTConfig {
+    /// Build from the standardized config (W1 keystone — 5th provider). IBM Watson has a rich
+    /// boolean surface, so this maps 6 features at once. Also demonstrates the `provider_extras`
+    /// passthrough: IBM's `instance_id` (not a standard field) is read from extras.
+    pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
+        let f = &std.features;
+        let instance_id = std
+            .extras
+            .0
+            .get("instance_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let mut cfg = Self::from_base(std.base.clone(), instance_id);
+        if let Some(i) = f.interim_results {
+            cfg.interim_results = i;
+        }
+        if let Some(w) = f.word_timestamps {
+            cfg.word_timestamps = w;
+        }
+        if let Some(d) = f.diarization {
+            cfg.speaker_labels = d;
+        }
+        if let Some(s) = f.smart_format {
+            cfg.smart_formatting = s;
+        }
+        if let Some(p) = f.profanity_filter {
+            cfg.profanity_filter = p;
+        }
+        if let Some(r) = &f.redaction {
+            cfg.redaction = !r.is_empty();
+        }
+        cfg
+    }
+
     /// Create IBM Watson STT configuration from base STT config.
     ///
     /// # Arguments
     /// * `base` - Base STT configuration
     /// * `instance_id` - IBM Cloud service instance ID
     pub fn from_base(base: STTConfig, instance_id: String) -> Self {
-        // Determine model based on language in base config
-        let model = match base.language.as_str() {
-            "en-US" => IbmModel::EnUsMultimedia,
-            "en-GB" => IbmModel::EnGbMultimedia,
-            "en-AU" => IbmModel::EnAuMultimedia,
-            "es-ES" => IbmModel::EsEsMultimedia,
-            "es-LA" | "es-MX" => IbmModel::EsLaMultimedia,
-            "fr-FR" => IbmModel::FrFrMultimedia,
-            "fr-CA" => IbmModel::FrCaMultimedia,
-            "de-DE" => IbmModel::DeDeMultimedia,
-            "it-IT" => IbmModel::ItItMultimedia,
-            "pt-BR" => IbmModel::PtBrMultimedia,
-            "ja-JP" => IbmModel::JaJpMultimedia,
-            "ko-KR" => IbmModel::KoKrMultimedia,
-            "zh-CN" => IbmModel::ZhCnMultimedia,
-            "nl-NL" => IbmModel::NlNlMultimedia,
-            "ar-MS" | "ar" => IbmModel::ArMsMultimedia,
-            "hi-IN" | "hi" => IbmModel::HiInMultimedia,
-            _ => IbmModel::EnUsMultimedia,
+        // Honor an explicitly configured model verbatim (e.g. "en-US_Telephony",
+        // "en-US_NarrowbandModel", a custom LM) — `IbmModel::Custom` serializes as-is. Previously
+        // `base.model` was ignored and the model was derived from language alone, always selecting
+        // the *_Multimedia variant.
+        let model = if !base.model.is_empty() {
+            IbmModel::Custom(base.model.clone())
+        } else {
+            match base.language.as_str() {
+                "en-US" => IbmModel::EnUsMultimedia,
+                "en-GB" => IbmModel::EnGbMultimedia,
+                "en-AU" => IbmModel::EnAuMultimedia,
+                "es-ES" => IbmModel::EsEsMultimedia,
+                "es-LA" | "es-MX" => IbmModel::EsLaMultimedia,
+                "fr-FR" => IbmModel::FrFrMultimedia,
+                "fr-CA" => IbmModel::FrCaMultimedia,
+                "de-DE" => IbmModel::DeDeMultimedia,
+                "it-IT" => IbmModel::ItItMultimedia,
+                "pt-BR" => IbmModel::PtBrMultimedia,
+                "ja-JP" => IbmModel::JaJpMultimedia,
+                "ko-KR" => IbmModel::KoKrMultimedia,
+                "zh-CN" => IbmModel::ZhCnMultimedia,
+                "nl-NL" => IbmModel::NlNlMultimedia,
+                "ar-MS" | "ar" => IbmModel::ArMsMultimedia,
+                "hi-IN" | "hi" => IbmModel::HiInMultimedia,
+                _ => IbmModel::EnUsMultimedia,
+            }
         };
 
         // Determine encoding based on base config
@@ -546,6 +587,35 @@ impl IbmWatsonSTTConfig {
 mod tests {
     use super::*;
 
+    // W1 keystone (5th provider): maps 6 features + demonstrates provider_extras (instance_id).
+    #[test]
+    fn from_standard_maps_features_and_extras() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let mut extras = serde_json::Map::new();
+        extras.insert("instance_id".into(), serde_json::json!("inst-123"));
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "ibm-watson".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                word_timestamps: Some(true),
+                smart_format: Some(true),
+                redaction: Some(vec!["pii".into()]),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = IbmWatsonSTTConfig::from_standard(&std);
+        assert!(cfg.speaker_labels);
+        assert!(cfg.word_timestamps);
+        assert!(cfg.smart_formatting);
+        assert!(cfg.redaction);
+        assert_eq!(cfg.instance_id, "inst-123"); // from provider_extras passthrough
+    }
+
     #[test]
     fn test_region_hostnames() {
         assert_eq!(
@@ -611,6 +681,8 @@ mod tests {
             api_key: "test-api-key".to_string(),
             language: "de-DE".to_string(),
             sample_rate: 16000,
+            // No explicit model → selected by language (clear the Deepgram default "nova-3").
+            model: String::new(),
             ..Default::default()
         };
 
@@ -618,6 +690,21 @@ mod tests {
 
         assert_eq!(config.model, IbmModel::DeDeMultimedia);
         assert_eq!(config.instance_id, "test-instance-id");
+    }
+
+    #[test]
+    fn test_from_base_honors_explicit_model() {
+        // An explicitly configured model (e.g. a Telephony variant) must be honored verbatim,
+        // not overridden by the language-based default.
+        let base = STTConfig {
+            api_key: "test-api-key".to_string(),
+            language: "en-US".to_string(),
+            model: "en-US_Telephony".to_string(),
+            ..Default::default()
+        };
+        let config = IbmWatsonSTTConfig::from_base(base, "iid".to_string());
+        assert_eq!(config.model, IbmModel::Custom("en-US_Telephony".to_string()));
+        assert_eq!(config.model.as_str(), "en-US_Telephony");
     }
 
     #[test]

@@ -86,6 +86,11 @@ pub struct CartesiaSTTConfig {
     pub cartesia_version: Option<String>,
 }
 
+/// Default Cartesia API version date. REQUIRED on the STT WebSocket — without it the
+/// connection is rejected. Previously defaulted to `None`, so every factory-built Cartesia
+/// STT session failed to connect (BROKEN). Keep in sync with the TTS DEFAULT_API_VERSION.
+pub const DEFAULT_API_VERSION: &str = "2025-04-16";
+
 impl Default for CartesiaSTTConfig {
     fn default() -> Self {
         Self {
@@ -94,7 +99,7 @@ impl Default for CartesiaSTTConfig {
             encoding: CartesiaAudioEncoding::default(),
             min_volume: None,
             max_silence_duration_secs: None,
-            cartesia_version: None,
+            cartesia_version: Some(DEFAULT_API_VERSION.to_string()),
         }
     }
 }
@@ -226,9 +231,62 @@ impl CartesiaSTTConfig {
     ///
     /// Applies Cartesia-specific defaults while preserving base configuration values.
     pub fn from_base(base: STTConfig) -> Self {
+        // Cartesia currently exposes a single streaming model ("ink-whisper"), so `base.model` is
+        // intentionally NOT mapped here: the shared `STTConfig` default model is Deepgram-specific
+        // ("nova-3") and forwarding an arbitrary value would only risk an invalid-model rejection.
+        // When Cartesia adds selectable models, map a non-empty `base.model` onto `self.model`.
         Self {
             base,
             ..Default::default()
         }
+    }
+
+    /// Build from the standardized config (W1 keystone). Cartesia's `ink-whisper` streaming model
+    /// exposes a narrow VAD-oriented surface, so the only standardized feature it can actually
+    /// express is endpointing: `endpointing_ms` (silence after speech before finalizing) maps onto
+    /// `max_silence_duration_secs` (Cartesia's endpointing window, expressed in seconds — converted
+    /// from milliseconds). The other standardized features (interim_results, diarization,
+    /// word_timestamps, smart_format, profanity_filter, filler_words, vad_events, utterance_end,
+    /// keyterms, redaction, entity/language detection) have no corresponding Cartesia field and are
+    /// capability gaps that stay at their defaults.
+    pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone());
+        if let Some(ms) = f.endpointing_ms {
+            cfg.max_silence_duration_secs = Some(ms as f32 / 1000.0);
+        }
+        cfg
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // W1 keystone: Cartesia's only mappable standardized feature is endpointing
+    // (`endpointing_ms` -> `max_silence_duration_secs`, ms converted to seconds); the base
+    // (api_key) carries through unchanged.
+    #[test]
+    fn from_standard_maps_endpointing() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "cartesia".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                endpointing_ms: Some(500),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = CartesiaSTTConfig::from_standard(&std);
+        assert_eq!(cfg.max_silence_duration_secs, Some(0.5)); // endpointing_ms -> seconds
+        assert_eq!(cfg.base.api_key, "test-key"); // base carried through
     }
 }

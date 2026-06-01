@@ -247,6 +247,21 @@ impl NectecSttConfig {
         })
     }
 
+    /// Build from the standardized config (W1 keystone — FINAL batch, completes the STT migration).
+    ///
+    /// NECTEC is a simple batch Thai-only engine (Partii4/Partii5): its config exposes only the
+    /// model, audio shape, timeout, and the two Partii4 output knobs (`output_level`/`output_format`).
+    /// None of the canonical [`SttFeatures`](crate::core::stt::standard::SttFeatures) — interim_results,
+    /// diarization, word_timestamps, smart_format, profanity_filter, filler_words, vad_events,
+    /// endpointing/utterance timing, keyterms, redaction, language/entity detection — has a real field
+    /// to map onto, so this is a pure `from_base` passthrough: a uniform standardized entry point with
+    /// no feature mapping (every standardized feature is a capability gap and stays at its default).
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        Self::from_base(&std.base)
+    }
+
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), String> {
         if self.api_key.is_empty() {
@@ -377,6 +392,32 @@ impl std::error::Error for NectecSttError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (FINAL batch): NECTEC is a simple batch engine with no advanced-feature fields,
+    // so `from_standard` is a pure `from_base` passthrough — assert it succeeds and the base
+    // (api_key/model) carries through even when advanced features are requested (they're capability
+    // gaps and are intentionally dropped).
+    #[test]
+    fn from_standard_passthrough_carries_base() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "nectec".into(),
+                api_key: "test-key".into(),
+                model: "partii4".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                profanity_filter: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = NectecSttConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.api_key, "test-key");
+        assert_eq!(cfg.model, NectecSttModel::Partii4);
+    }
 
     #[test]
     fn test_default_config() {

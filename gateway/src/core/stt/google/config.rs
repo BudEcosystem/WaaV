@@ -46,6 +46,33 @@ impl Default for GoogleSTTConfig {
 }
 
 impl GoogleSTTConfig {
+    /// Build from the standardized config (W1 keystone). Google's v2 streaming config models only
+    /// a small advanced surface, so this maps the two standardized features it can express:
+    /// interim results (`interim_results`) and explicit voice-activity events (`vad_events` ->
+    /// `enable_voice_activity_events`). Google's constructor needs a non-standard `project_id`,
+    /// which is read from the `provider_extras` passthrough. Features Google cannot express here
+    /// (diarization, smart_format, profanity_filter, word_timestamps, redaction, keyterms,
+    /// language/entity detection) are capability gaps and stay at default.
+    pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
+        let f = &std.features;
+        let project_id = std
+            .extras
+            .0
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let mut cfg =
+            crate::core::stt::google::GoogleSTT::create_google_config(std.base.clone(), project_id);
+        if let Some(i) = f.interim_results {
+            cfg.interim_results = i;
+        }
+        if let Some(v) = f.vad_events {
+            cfg.enable_voice_activity_events = v;
+        }
+        cfg
+    }
+
     pub fn recognizer_path(&self) -> String {
         let recognizer = self.recognizer_id.as_deref().unwrap_or("_");
         format!(
@@ -93,5 +120,35 @@ mod optional_duration_serde {
     {
         let opt: Option<u64> = Option::deserialize(deserializer)?;
         Ok(opt.map(Duration::from_millis))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // W1 keystone: the standardized features unlock Google's interim-results and voice-activity
+    // event flags, and the non-standard `project_id` is read from the provider_extras passthrough.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let mut extras = serde_json::Map::new();
+        extras.insert("project_id".into(), serde_json::json!("proj-123"));
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "google".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                interim_results: Some(false),
+                vad_events: Some(false),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = GoogleSTTConfig::from_standard(&std);
+        assert!(!cfg.interim_results);
+        assert!(!cfg.enable_voice_activity_events);
+        assert_eq!(cfg.project_id, "proj-123"); // from provider_extras passthrough
     }
 }

@@ -123,6 +123,36 @@ impl GnaniTTSConfig {
         })
     }
 
+    /// Build from the standardized TTS config (W1 keystone). Gnani's request surface is limited to
+    /// language selection, SSML gender and the output sample rate, so this maps the standardized
+    /// features that have a real field: `language` -> `language_code` (parsed, falling back to the
+    /// `from_base` value on an unrecognized code) and `sample_rate` -> `output_sample_rate`.
+    /// Gnani has no speed/pitch/volume/stability/emotion/instructions/SSML-input knobs
+    /// (`ssml_gender` is voice gender, not the `ssml` text-mode flag), so those features are
+    /// skipped. The non-standard `voice_name` is read from the `extras` passthrough.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, String> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(language) = f.language.as_deref() {
+            if let Ok(lang) = GnaniTTSLanguage::from_str(language) {
+                cfg.language_code = lang;
+            }
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.output_sample_rate = rate;
+        }
+
+        // Provider-specific passthrough.
+        if let Some(voice_name) = std.extras.0.get("voice_name").and_then(|v| v.as_str()) {
+            cfg.voice_name = Some(voice_name.to_string());
+        }
+
+        Ok(cfg)
+    }
+
     /// Validate configuration
     pub fn validate(&self) -> Result<(), String> {
         if self.token.is_empty() {
@@ -326,6 +356,33 @@ impl GnaniTTSLanguage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (TTS): the standardized features Gnani can express (language override, output
+    // sample rate) reach their real fields, and the non-standard voice_name flows through the
+    // extras passthrough. Features Gnani has no field for (e.g. ssml text-mode) are ignored.
+    #[test]
+    fn from_standard_maps_language_and_sample_rate() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("voice_name".into(), serde_json::json!("speaker-3"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "gnani".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                language: Some("Ta-IN".into()),
+                sample_rate: Some(16000),
+                ssml: Some(true), // capability gap: Gnani has no SSML text mode, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = GnaniTTSConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.language_code, GnaniTTSLanguage::Tamil);
+        assert_eq!(cfg.output_sample_rate, 16000);
+        assert_eq!(cfg.voice_name, Some("speaker-3".to_string())); // extras passthrough
+    }
 
     #[test]
     fn test_gnani_tts_language_from_str() {

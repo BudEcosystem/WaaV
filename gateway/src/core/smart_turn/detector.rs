@@ -1000,6 +1000,37 @@ impl SmartTurnDetectorBuilder {
 mod tests {
     use super::*;
 
+    // Live test: confirms the Smart-Turn v3 model LOADS and RUNS, and that the mel layout the
+    // code produces ([1, 80, 800]) matches the model's `input_features` ([batch, 80, 800]).
+    // (Independent inspection of the real model REFUTED the review's "transposed input"
+    // prediction — the layout is correct.) Run with: ORT_DYLIB_PATH=.../libonnxruntime.so
+    // cargo test --features smart-turn live_smart_turn_loads_and_runs -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "downloads smart-turn-v3 model + runs ONNX inference (needs ORT_DYLIB_PATH)"]
+    async fn live_smart_turn_loads_and_runs() {
+        let mut det = SmartTurnDetector::new(SmartTurnDetectorConfig::default())
+            .await
+            .expect("Smart-Turn model must load");
+        // 800 frames x 80 mel bins (the model input is [1, 80, 800]).
+        let frames: Vec<Vec<f32>> = (0..800)
+            .map(|f| {
+                (0..80)
+                    .map(|m| (((f + m) as f32) * 0.01).sin() * 0.1)
+                    .collect()
+            })
+            .collect();
+        let r = det.predict(&frames).await.expect("predict must run");
+        assert!(
+            (0.0..=1.0).contains(&r.probability),
+            "probability out of range: {}",
+            r.probability
+        );
+        eprintln!(
+            "SMARTTURN prob={:.4} complete={} ({}us)",
+            r.probability, r.is_turn_complete, r.inference_time_us
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Configuration tests
     // -------------------------------------------------------------------------

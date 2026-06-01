@@ -4,6 +4,8 @@ pub mod aws_polly;
 pub mod azure;
 pub mod baidu;
 mod base;
+/// Standardized capability-rich TTS config (W1 keystone, additive).
+pub mod standard;
 pub mod bhashini;
 pub mod cartesia;
 pub mod cereproc;

@@ -141,6 +141,23 @@ impl DeepgramTTS {
         })
     }
 
+    /// Build from the standardized config (W1 keystone). Deepgram's flat `TTSConfig` is the
+    /// constructor input, so this maps the standardized features onto it before delegating to
+    /// `new`. Deepgram's `/v1/speak` REST surface is narrow: only `sample_rate` is expressible
+    /// (the request builder emits `sample_rate=` from `config.sample_rate`). Speed/pitch/volume,
+    /// emotion, instructions, SSML, voice settings, word timestamps, streaming, seed and language
+    /// have no Deepgram `/v1/speak` parameter and are skipped (capability gaps).
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let f = &std.features;
+        let mut base = std.base.clone();
+        if let Some(sr) = f.sample_rate {
+            base.sample_rate = Some(sr);
+        }
+        Self::new(base)
+    }
+
     /// Set the request manager for this instance
     pub async fn set_req_manager(&mut self, req_manager: Arc<ReqManager>) {
         self.provider.set_req_manager(req_manager).await;
@@ -250,6 +267,33 @@ mod tests {
         let tts = DeepgramTTS::new(config).unwrap();
         assert!(!tts.is_ready());
         assert_eq!(tts.get_connection_state(), ConnectionState::Disconnected);
+    }
+
+    // W1 keystone: Deepgram's narrow `/v1/speak` surface only expresses `sample_rate`; the
+    // standardized feature reaches the flat config the request builder reads. Other features are
+    // capability gaps (no Deepgram parameter) and are intentionally skipped.
+    #[tokio::test]
+    async fn from_standard_maps_sample_rate() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "deepgram".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                sample_rate: Some(48000),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = DeepgramTTS::from_standard(&std).unwrap();
+        assert_eq!(
+            tts.request_builder.config.sample_rate,
+            Some(48000)
+        );
+        // base carried through.
+        assert_eq!(tts.request_builder.config.api_key, "k");
     }
 
     #[tokio::test]

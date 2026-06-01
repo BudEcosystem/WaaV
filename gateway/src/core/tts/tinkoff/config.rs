@@ -139,6 +139,58 @@ impl TinkoffTtsConfig {
         })
     }
 
+    /// Build from the standardized TTS config. Tinkoff exposes three direct prosody knobs, so this
+    /// maps `speed` -> `speaking_rate` (both are 1.0-is-normal multipliers, clamped to the API's
+    /// 0.25-4.0 range), `pitch` -> `pitch` (direct semitone offset, clamped to -20.0..=20.0), and
+    /// `volume` -> `volume_gain_db` (direct dB gain, clamped to -96.0..=16.0). `sample_rate`
+    /// overrides the output sample rate (clamped to the API's 1000-48000 Hz range). Tinkoff's
+    /// non-standard `connection_timeout_secs` / `request_timeout_secs` knobs are read from the
+    /// `extras` passthrough. Features without a Tinkoff field (stability, similarity_boost, style,
+    /// use_speaker_boost, emotion, instructions, ssml, language, word_timestamps, streaming, seed)
+    /// are skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, String> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(speed) = f.speed {
+            // Both are 1.0-is-normal multipliers; clamp to Tinkoff's 0.25-4.0 range.
+            cfg.speaking_rate = speed.clamp(0.25, 4.0);
+        }
+        if let Some(pitch) = f.pitch {
+            // Tinkoff pitch is a direct semitone offset.
+            cfg.pitch = pitch.clamp(-20.0, 20.0);
+        }
+        if let Some(volume) = f.volume {
+            // Tinkoff volume is a direct dB gain.
+            cfg.volume_gain_db = volume.clamp(-96.0, 16.0);
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.sample_rate = rate.clamp(1000, 48000);
+        }
+
+        // Provider-specific passthrough.
+        if let Some(secs) = std
+            .extras
+            .0
+            .get("connection_timeout_secs")
+            .and_then(|v| v.as_u64())
+        {
+            cfg.connection_timeout_secs = secs;
+        }
+        if let Some(secs) = std
+            .extras
+            .0
+            .get("request_timeout_secs")
+            .and_then(|v| v.as_u64())
+        {
+            cfg.request_timeout_secs = secs;
+        }
+
+        Ok(cfg)
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), String> {
         if self.api_key.is_empty() {
@@ -316,6 +368,43 @@ impl TinkoffAudioEncoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Maps speed -> speaking_rate (1.0-is-normal multiplier), pitch -> pitch (direct semitones),
+    // volume -> volume_gain_db (direct dB), sample_rate -> sample_rate, and demonstrates the extras
+    // passthrough (connection_timeout_secs / request_timeout_secs).
+    #[test]
+    fn from_standard_maps_prosody_and_extras() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("connection_timeout_secs".into(), serde_json::json!(20));
+        extras.insert("request_timeout_secs".into(), serde_json::json!(45));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "tinkoff".into(),
+                api_key: "test".into(),
+                // The shared TTSConfig default voice_id ("aura-asteria-en") is a Deepgram voice
+                // that Tinkoff rejects; pin a valid Tinkoff voice so from_base/from_standard resolve.
+                voice_id: Some("alyona".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(2.0),
+                pitch: Some(5.0),
+                volume: Some(-6.0),
+                sample_rate: Some(48000),
+                ssml: Some(true), // capability gap: no Tinkoff SSML field here, must be ignored
+                ..Default::default()
+            },
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        let cfg = TinkoffTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.speaking_rate, 2.0); // 1.0-is-normal multiplier, passed through
+        assert_eq!(cfg.pitch, 5.0); // direct semitone offset
+        assert_eq!(cfg.volume_gain_db, -6.0); // direct dB gain
+        assert_eq!(cfg.sample_rate, 48000);
+        assert_eq!(cfg.connection_timeout_secs, 20); // from extras passthrough
+        assert_eq!(cfg.request_timeout_secs, 45);
+    }
 
     #[test]
     fn test_tinkoff_voice_from_str() {
