@@ -60,6 +60,24 @@ impl GnaniTTS {
         })
     }
 
+    /// Build from the standardized config (W1 keystone), mirroring `DeepgramTTS::from_standard`.
+    /// Gnani's expressible advanced features are `language` (-> `language_code`) and `sample_rate`
+    /// (-> `output_sample_rate`), plus the provider-specific `voice_name` extra; these are mapped
+    /// by [`GnaniTTSConfig::from_standard`] and reach the live synthesis request — previously
+    /// unreachable through the flat factory. Speed/pitch/volume/stability/emotion/instructions/
+    /// SSML-text-mode have no Gnani field and are skipped (capability gaps).
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let gnani_config =
+            GnaniTTSConfig::from_standard(std).map_err(TTSError::InvalidConfiguration)?;
+
+        Ok(Self {
+            config: Some(gnani_config),
+            ..Default::default()
+        })
+    }
+
     /// Build HTTP client
     fn build_client(config: &GnaniTTSConfig) -> TTSResult<reqwest::Client> {
         let mut builder = reqwest::Client::builder()
@@ -358,6 +376,37 @@ mod tests {
         let config = create_test_config();
         let result = GnaniTTS::create(config);
         assert!(result.is_ok());
+    }
+
+    // W1 keystone (struct-level, mirrors DeepgramTTS::from_standard): the standardized `language`
+    // and `sample_rate` features and the `voice_name` extra reach the live `GnaniTTSConfig` through
+    // the provider STRUCT's `from_standard` — the path the dispatch helper constructs.
+    #[test]
+    fn from_standard_struct_maps_language_and_sample_rate() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("voice_name".into(), serde_json::json!("speaker-3"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "gnani".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                language: Some("Ta-IN".into()),
+                sample_rate: Some(16000),
+                ssml: Some(true), // capability gap: must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let tts = GnaniTTS::from_standard(&std).unwrap();
+        let cfg = tts.config.as_ref().unwrap();
+        assert_eq!(
+            cfg.language_code,
+            crate::core::tts::gnani::GnaniTTSLanguage::Tamil
+        );
+        assert_eq!(cfg.output_sample_rate, 16000);
+        assert_eq!(cfg.voice_name, Some("speaker-3".to_string()));
     }
 
     #[test]

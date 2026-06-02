@@ -167,6 +167,38 @@ impl ZaloTts {
         Ok(audio_data)
     }
 
+    /// Build from the standardized TTS config (W1 keystone). Mirrors [`BaseTTS::new`] but maps the
+    /// standardized features via [`ZaloTtsConfig::from_standard`] (which honors `speed` and the
+    /// `request_timeout_secs` extra) before constructing the timeout-bounded HTTP client. Features
+    /// Zalo cannot express stay at provider defaults (capability gaps).
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let zalo_config = ZaloTtsConfig::from_standard(std)?;
+
+        let timeout_secs = zalo_config.request_timeout_secs;
+        let http_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| {
+                TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
+            })?;
+
+        info!(
+            "Zalo TTS: Initialized (standardized) with voice='{}', speed={}",
+            zalo_config.voice.display_name(),
+            zalo_config.speed
+        );
+
+        Ok(Self {
+            config: zalo_config,
+            http_client,
+            is_ready: AtomicBool::new(false),
+            audio_callback: Arc::new(RwLock::new(None)),
+            connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
+        })
+    }
+
     /// Get the Zalo-specific configuration.
     pub fn get_zalo_config(&self) -> &ZaloTtsConfig {
         &self.config
@@ -442,6 +474,31 @@ mod tests {
 
         let tts = result.unwrap();
         assert!(!tts.is_ready());
+    }
+
+    // W1 keystone (TTS): the struct-level `from_standard` builds a real `ZaloTts` through the
+    // standardized path, carrying the `speed` feature (Zalo's only prosody knob) onto the provider
+    // config the request builder reads. Mirrors `DeepgramTTS::from_standard`.
+    #[test]
+    fn from_standard_builds_provider_with_speed() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "zalo_ai".into(),
+                api_key: "test_key".into(),
+                voice_id: Some("male_north".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.1),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = ZaloTts::from_standard(&std).unwrap();
+        assert!((tts.config.speed - 1.1).abs() < f32::EPSILON);
+        assert_eq!(tts.config.voice, ZaloVoice::MaleNorth);
+        assert_eq!(tts.config.api_key, "test_key");
     }
 
     #[test]

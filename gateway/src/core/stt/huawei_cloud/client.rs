@@ -178,6 +178,39 @@ pub struct HuaweiCloudStt {
 }
 
 impl HuaweiCloudStt {
+    /// W1 keystone — construct directly from the standardized config so Huawei's mappable
+    /// recognition knobs (word-level timing `need_word_info`, smart formatting `add_punctuation`)
+    /// are honored END-TO-END. Mirrors `DeepgramSTT::new_standard`: the provider config is built
+    /// from `HuaweiCloudSttConfig::from_standard` (which parses+validates the pipe-separated
+    /// credential in `api_key`); features Huawei can't express stay at default.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let huawei_config = HuaweiCloudSttConfig::from_standard(std)?;
+        huawei_config.validate()?;
+
+        Ok(Self {
+            base_config: std.base.clone(),
+            config: huawei_config,
+            token_manager: Arc::new(HuaweiTokenManager::new()),
+            connected: Arc::new(AtomicBool::new(false)),
+            state_notify: Arc::new(Notify::new()),
+            ws_sender: None,
+            shutdown_tx: None,
+            connection_handle: None,
+            result_forward_handle: None,
+            error_forward_handle: None,
+            result_callback: Arc::new(Mutex::new(None)),
+            error_callback: Arc::new(Mutex::new(None)),
+            http_client: reqwest::Client::builder()
+                .timeout(HTTP_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
+            audio_buffer: Arc::new(Mutex::new(Vec::new())),
+            session_ready: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
     /// Create a new Huawei Cloud STT client.
     pub fn new(config: STTConfig) -> Result<Self, STTError> {
         let huawei_config = HuaweiCloudSttConfig::from_base(config.clone())?;

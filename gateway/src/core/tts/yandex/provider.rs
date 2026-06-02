@@ -127,6 +127,28 @@ impl YandexTts {
         })
     }
 
+    /// Build from the standardized TTS config (W1 keystone). Mirrors [`Self::create`] but derives
+    /// the Yandex config via [`YandexTtsConfig::from_standard`] (which honors speed, emotion,
+    /// language, output sample rate, and the folder_id / is_iam_token extras) and keeps the
+    /// standardized base config as `base_config`. Features without a Yandex field stay at provider
+    /// defaults (capability gaps).
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let yandex_config = YandexTtsConfig::from_standard(std)?;
+
+        info!(
+            "Creating Yandex TTS provider (standardized): voice={}, lang={}, format={}",
+            yandex_config.voice, yandex_config.language, yandex_config.audio_format
+        );
+
+        Ok(Self {
+            provider: TTSProvider::new()?,
+            yandex_config,
+            base_config: std.base.clone(),
+        })
+    }
+
     /// Create a request builder
     fn create_request_builder(&self) -> YandexRequestBuilder {
         YandexRequestBuilder::new(self.yandex_config.clone(), self.base_config.clone())
@@ -291,6 +313,33 @@ mod tests {
         let tts = tts.unwrap();
         assert_eq!(tts.yandex_config.voice.as_str(), "alena");
         assert_eq!(tts.yandex_config.audio_format, YandexAudioFormat::OggOpus);
+    }
+
+    // W1 keystone (TTS): the struct-level `from_standard` builds a real `YandexTts` through the
+    // standardized path, carrying the speed/emotion features Yandex can express onto the provider
+    // config the request builder reads. Mirrors `DeepgramTTS::from_standard`.
+    #[test]
+    fn from_standard_builds_provider_with_speed_and_emotion() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        use crate::core::tts::yandex::YandexEmotion;
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "yandex".into(),
+                api_key: "AQVN1234567890".into(),
+                voice_id: Some("alena".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                emotion: Some("cheerful".into()),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = YandexTts::from_standard(&std).unwrap();
+        assert_eq!(tts.yandex_config.speed, 1.5);
+        assert_eq!(tts.yandex_config.emotion, YandexEmotion::Good);
+        assert_eq!(tts.yandex_config.api_key, "AQVN1234567890");
     }
 
     #[test]

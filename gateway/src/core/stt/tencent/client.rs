@@ -156,12 +156,31 @@ impl TencentStt {
     /// Create a new Tencent STT client.
     pub fn new(config: STTConfig) -> Result<Self, STTError> {
         let tencent_config = TencentSttConfig::from_base(config.clone())?;
+        Self::from_tencent_config(config, tencent_config)
+    }
+
+    /// W1 keystone — construct directly from the standardized config so the advanced features
+    /// Tencent ASR can express (word timestamps, profanity/modal filtering, VAD events,
+    /// endpointing, hot words) are honored END-TO-END. The flat `BaseSTT::new` path uses
+    /// `from_base`, which hardcodes those defaults; this is the reachable standardized path.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let tencent_config = TencentSttConfig::from_standard(std)?;
+        Self::from_tencent_config(std.base.clone(), tencent_config)
+    }
+
+    /// Internal: construct the provider from an already-mapped Tencent config.
+    fn from_tencent_config(
+        base_config: STTConfig,
+        tencent_config: TencentSttConfig,
+    ) -> Result<Self, STTError> {
         tencent_config.validate()?;
 
         let voice_id = TencentSignatureBuilder::generate_voice_id();
 
         Ok(Self {
-            base_config: config,
+            base_config,
             config: tencent_config,
             connected: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
@@ -585,6 +604,47 @@ mod tests {
         };
         let result = TencentStt::new(config);
         assert!(result.is_err());
+    }
+
+    // W1 keystone: the advanced features Tencent can express (word timestamps, profanity filter,
+    // key terms -> hot words) must survive THROUGH `new_standard` into the provider's Tencent
+    // config — not just the config-level `from_standard`. The flat `new` path leaves them off.
+    #[test]
+    fn test_new_standard_unlocks_advanced_features() {
+        use super::super::config::{TencentFilterDirtyMode, TencentWordInfo};
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "tencent".into(),
+                api_key: "test_secret_id|test_secret_key|test_app_id".into(),
+                language: "zh".into(),
+                sample_rate: 16000,
+                encoding: "pcm".into(),
+                model: "16k_zh".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(true),
+                profanity_filter: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "Tencent".into()]),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let stt = TencentStt::new_standard(&std).unwrap();
+        assert_eq!(stt.config.word_info, TencentWordInfo::Basic); // word_timestamps
+        assert_eq!(stt.config.filter_dirty, TencentFilterDirtyMode::Filter); // profanity_filter
+        assert_eq!(
+            stt.config.hotword_list,
+            Some(vec!["WaaV".to_string(), "Tencent".to_string()])
+        ); // keyterms -> hotword_list
+
+        // Malformed credentials are rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            api_key: "only_one_part".into(),
+            ..Default::default()
+        });
+        assert!(TencentStt::new_standard(&bad).is_err());
     }
 
     #[test]

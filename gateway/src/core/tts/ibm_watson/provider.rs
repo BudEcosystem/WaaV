@@ -232,6 +232,16 @@ impl IbmWatsonTTS {
         })
     }
 
+    /// Build from the standardized TTS config (W1 keystone), mirroring `DeepgramTTS::from_standard`.
+    /// Delegates feature mapping to [`IbmWatsonTTSConfig::from_standard`] (speed -> `rate_percentage`,
+    /// pitch -> `pitch_percentage`, sample_rate, voice, plus the `instance_id` extras passthrough)
+    /// so advanced prosody reaches the provider config the request builder reads.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        Self::new_from_ibm_config(IbmWatsonTTSConfig::from_standard(std))
+    }
+
     /// Set the instance ID (required before connecting).
     pub fn set_instance_id(&mut self, instance_id: String) {
         self.config.instance_id = instance_id;

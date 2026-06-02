@@ -213,6 +213,25 @@ impl Default for AzureSTT {
 }
 
 impl AzureSTT {
+    /// W1 keystone — construct directly from the standardized config so the advanced features
+    /// Azure can express (interim results, word-level timing, profanity handling) are honored
+    /// END-TO-END. The flat `BaseSTT::new` path uses `from_base` (defaults only); this is the
+    /// reachable standardized path. Capabilities Azure has no field for stay at their defaults.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "Azure subscription key is required".to_string(),
+            ));
+        }
+        // `Self` implements `Drop`, so the struct-update (`..Default::default()`) move is illegal;
+        // start from the Default value and overwrite only the config.
+        let mut stt = Self::default();
+        stt.config = Some(AzureSTTConfig::from_standard(std));
+        Ok(stt)
+    }
+
     /// Build the Content-Type header value for audio format.
     ///
     /// Azure expects a specific format like:
@@ -988,6 +1007,34 @@ impl AzureSTT {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: a standardized advanced feature Azure supports (word-level timing) survives
+    // through new_standard onto the stored provider config — the flat factory path drops it.
+    #[test]
+    fn new_standard_carries_word_timestamps_to_config() {
+        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "azure".into(),
+                api_key: "subscription-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let stt = AzureSTT::new_standard(&std).unwrap();
+        assert!(stt.config.as_ref().unwrap().word_level_timing);
+
+        // Missing key is rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(AzureSTT::new_standard(&bad).is_err());
+    }
 
     // Azure USP framing — converts the provider from BROKEN (unframed binary, no speech.config)
     // to the documented Universal Speech Protocol. Byte-exact acceptance is gated on the live

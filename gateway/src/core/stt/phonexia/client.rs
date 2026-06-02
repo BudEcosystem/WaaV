@@ -80,6 +80,22 @@ impl PhonexiaSTT {
         })
     }
 
+    /// W1 keystone — construct directly from the standardized config so the advanced features
+    /// Phonexia can express (per-word timestamps, key terms / phrase hints) are honored
+    /// END-TO-END. Mirrors `DeepgramSTT::new_standard`: validate the credential, then build the
+    /// provider from the standardized->provider config mapping (`PhonexiaSTTConfig::from_standard`).
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        // Phonexia is on-premises: the server URL is carried in the api_key field.
+        if std.base.api_key.is_empty() {
+            return Err(STTError::ConfigurationError(
+                "Phonexia server URL is required (carried in the api_key field)".to_string(),
+            ));
+        }
+        Self::from_phonexia_config(crate::core::stt::phonexia::config::PhonexiaSTTConfig::from_standard(std)?)
+    }
+
     /// Get the stream ID
     pub async fn get_stream_id(&self) -> Option<String> {
         self.stream_id.read().await.clone()
@@ -551,6 +567,41 @@ mod tests {
 
         let result = PhonexiaSTT::from_phonexia_config(config);
         assert!(result.is_ok());
+    }
+
+    // W1 keystone: advanced features Phonexia can express (word_timestamps -> enable_timestamps,
+    // keyterms -> preferred_phrases) survive through the provider-struct `new_standard` method to
+    // the provider-specific config — proving the standardized path is honored end-to-end.
+    #[test]
+    fn test_phonexia_new_standard_unlocks_advanced_features() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "phonexia".into(),
+                api_key: "https://test-phonexia.example.com".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "Phonexia".into()]),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let stt = PhonexiaSTT::new_standard(&std).expect("new_standard must succeed");
+        assert!(stt.phonexia_config.enable_timestamps); // word_timestamps
+        assert_eq!(
+            stt.phonexia_config.preferred_phrases,
+            vec!["WaaV".to_string(), "Phonexia".to_string()]
+        ); // keyterms
+
+        // Missing server URL (carried in api_key) is rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            provider: "phonexia".into(),
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(PhonexiaSTT::new_standard(&bad).is_err());
     }
 
     #[test]

@@ -563,6 +563,42 @@ mod message_helper_tests {
 mod client_tests {
     use super::*;
 
+    // W1 keystone: an advanced feature set on the standardized config must survive through
+    // `new_standard` into the provider-specific config (previously dropped by the flat factory).
+    #[test]
+    fn new_standard_propagates_advanced_features() {
+        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "elevenlabs".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "ElevenLabs".into()]),
+                ..Default::default()
+            },
+            ..StandardSTTConfig::from_base(STTConfig::default())
+        };
+        let stt = ElevenLabsSTT::new_standard(&std).expect("new_standard should succeed");
+        // `ElevenLabsSTT` implements `Drop`, so borrow the config rather than move it out.
+        let cfg = stt.config.as_ref().expect("config should be set");
+        assert_eq!(cfg.enable_diarization, Some(true));
+        assert_eq!(
+            cfg.keyterms,
+            Some(vec!["WaaV".to_string(), "ElevenLabs".to_string()])
+        );
+
+        // Missing key is rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            provider: "elevenlabs".into(),
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(ElevenLabsSTT::new_standard(&bad).is_err());
+    }
+
     #[test]
     fn test_default() {
         let stt = ElevenLabsSTT::default();

@@ -574,6 +574,79 @@ impl GoogleTTS {
         })
     }
 
+    /// Builds from the standardized config (W1 keystone), mirroring `DeepgramTTS::from_standard`.
+    ///
+    /// The `project_id` is extracted from the Google Cloud credentials (`base.api_key`), exactly as
+    /// [`GoogleTTS::new`] does, rather than from `extras` — so the live auth client and request
+    /// path are identical to the flat constructor. The standardized [`TtsFeatures`] Google can
+    /// express are then mapped onto the resolved `GoogleTTSConfig`: `speed` (`speaking_rate`,
+    /// carried on the base), `sample_rate`, `pitch`, `volume` (`volume_gain_db`) and `language`
+    /// (overriding the voice-derived `language_code`) — previously unreachable through the flat
+    /// factory. Features Google has no field for (`stability`/`similarity_boost`/`style`/
+    /// `use_speaker_boost`, `emotion`, `instructions`, `ssml`, `word_timestamps`, `streaming`,
+    /// `seed`) are skipped (capability gaps).
+    ///
+    /// [`TtsFeatures`]: crate::core::tts::standard::TtsFeatures
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let f = &std.features;
+
+        // Apply base-level feature overrides up front so the credential-derived constructor and the
+        // config hash both see them.
+        let mut config = std.base.clone();
+        if let Some(s) = f.speed {
+            config.speaking_rate = Some(s);
+        }
+        if let Some(sr) = f.sample_rate {
+            config.sample_rate = Some(sr);
+        }
+
+        // Extract project_id from credentials (mirrors `new`).
+        let credential_source = CredentialSource::from_api_key(&config.api_key);
+        let project_id = credential_source.extract_project_id().ok_or_else(|| {
+            TTSError::InvalidConfiguration(
+                "Failed to extract project_id from Google Cloud credentials. \
+                 Ensure the credentials file contains a valid project_id field."
+                    .to_string(),
+            )
+        })?;
+        let auth_client = TTSGoogleAuthClient::new(credential_source)?;
+
+        // Build the Google-specific config, then apply the Google-expressible feature overrides.
+        let mut google_config = GoogleTTSConfig::from_base_config(config.clone(), project_id);
+        if let Some(p) = f.pitch {
+            google_config.pitch = Some(p as f64);
+        }
+        if let Some(v) = f.volume {
+            google_config.volume_gain_db = Some(v as f64);
+        }
+        if let Some(l) = &f.language {
+            google_config.language_code = l.clone();
+        }
+
+        let pronunciation_replacer = if !config.pronunciations.is_empty() {
+            Some(PronunciationReplacer::new(&config.pronunciations))
+        } else {
+            None
+        };
+
+        let config_hash = compute_google_tts_config_hash(&config);
+
+        Ok(Self {
+            config,
+            google_config,
+            auth_client: Arc::new(auth_client),
+            http_client: reqwest::Client::new(),
+            req_manager: Arc::new(RwLock::new(None)),
+            connected: Arc::new(AtomicBool::new(false)),
+            audio_callback: Arc::new(RwLock::new(None)),
+            config_hash,
+            cache: Arc::new(RwLock::new(None)),
+            pronunciation_replacer,
+        })
+    }
+
     /// Streams audio data to the registered callback in appropriately-sized chunks.
     ///
     /// This method chunks the audio data based on format and sample rate,
@@ -926,6 +999,18 @@ impl BaseTTS for GoogleTTS {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A self-contained, valid service-account credential (real 2048-bit RSA key, generated for
+    // tests only — not used against any real project) so the credential-deriving constructors
+    // (`new` / `from_standard`) can build the auth client without any network/token fetch.
+    const TEST_SERVICE_ACCOUNT_JSON: &str = r#"{
+  "type": "service_account",
+  "project_id": "creds-project-123",
+  "private_key_id": "test-key-id",
+  "client_email": "test@creds-project-123.iam.gserviceaccount.com",
+  "client_id": "1234567890",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC0dEowKy753Kjw\nP8a593MGNp91QpbTYl6VGND6bRXvkXr1h4Bb37e0OWofS/skiWI6omPU34bEuTgC\n83kfKILtWkb5URVs58QX7TO9w84eA+ePxHGoWL7Myohwrh5fWruk4f4t3rXqjlAK\ne5+yslho0ufEMB4thPDAMK7yQt3grCK6Ybe+en96aiaz4yR4xxKkI5l5KEVacF/i\n4wDszefD8n7+f9K+VhIZRTbuowRlwwn3/79BNmLNcSt5MgTQeA/Ayhl6uyrXNkTm\npj5rRum/13G0QAzPJJiYmYm/zNBR94Mvk4JM9T9kOZjEH4s1q7E/vfRoX6+qeVud\nduosFrz7AgMBAAECggEAIuXCWyJeyU9VFHEg+2HRSshRehnQlTyW0fqkn2ltLpFR\n2B3GQv42xpG75iWJgf1Xk8NHzykTJQQ0ws1XBSGOgFxPEXQO0qrXj1D+CprNR5y1\nsWXqHQZcj7ozPKdPlF01oKNbxn8layDudbiGn8ZBtrPiwlwT2fW1oVVI3+zyf7o2\n7QGbhq6ZXz9U3TAwTa+5nB8R8JNAO2xwwFKrtQLB9mtNuuYzk5mV8PV6sqKEqk+x\n4AjUYgO3BJ6jO+Cg9DfMV6WYQF8E9CvR4raOhKMFcjZQ/rAZz5QhFDLbWltxN6Qd\nnMiMshuP0rHOsUkQWr5suf8Wp4hqsb8zYgXklVHrwQKBgQDpIhzdV1RKCprUHioV\nGa1H3Z2lvrndMAZ8OgtdeagfImzICsloF3KvTpAAdkWN8cia/sjP3MKA8UzJGgF0\nb9N3XI4VsBIXcuL6Sz3hc0M2o017L0yCesNK/ffxygjwrHOZ4SUCerK4whddr7g1\n6l6DfoL6peiyT6+NSnUYKtyVMQKBgQDGJ21xKUHroiGR6vspMCh4fREKPKY4XJLu\nBrz5tIrCGmguUrBY690shtn7SQjsriTEN9EVjRc6xLfrY+tD4zvAhINwn6bTvdS5\nco6DmvKRwiyUX4VdqAEktwg2dLgLstHQKS6FGaMolRe9YWgRTwrv8BhsJzw/MxRb\ncu+Wt4gZ6wKBgQCzY9FsLC+qzaA3yoI9PEXO/+O3zxv77GGBI7TtF5jbZETqZQp3\ns1tHNB+wi1GYGM1xHs5szAVK7OJV+FHYQ9gnh6u5WoOBUaEAUfdqzKOSnnQXbtzj\npg0yXlx0zC626ywE4270CnANpSQPrhAERLS3YBjvP8zfsFt4UCvsDccwcQKBgFS0\nX/1CpLJEgVMt/qVxt6sh01nr6SYotIpZiQi5G6OzxBshL88jLE2va5kWdGEwY/kY\n3yD2ShrOIszVzqkbhtxaCRHovVjASiHoDXHGl7ClL4dReeI6Qhrevv0AUfh2PWhd\nYkx1VCCx8w76h5D2l/dPTDFXaFKf1DDvZemolN53AoGAftepQ1IBdcm23x4Z+/0X\nR8IOzZWxdgLO7llUPxrYr4xXKB/lTdwMwTezGAQSwGG8amTXH3Kh2TItg1kcEqnw\n0pv1w3pEXtsXF5+2JJZlpkDholWm4Sr371WLoibqZxur4i3s/oXc7g5sV8FK4Gc+\nQLrApvC3ECyPJuv/tZ/KPrM=\n-----END PRIVATE KEY-----\n"
+}"#;
 
     #[test]
     fn test_google_error_to_tts_authentication_failed() {
@@ -1475,6 +1560,44 @@ mod tests {
         different_config.voice_id = Some("different-voice".to_string());
         let different_hash = compute_google_tts_config_hash(&different_config);
         assert_ne!(hash, different_hash);
+    }
+
+    // W1 keystone (struct-level, mirrors DeepgramTTS::from_standard): the standardized Google
+    // features (pitch/volume/speed/language/sample_rate) reach the live `GoogleTTSConfig` through
+    // the provider STRUCT's `from_standard`, with `project_id` derived from credentials exactly as
+    // `new` does. Inline JSON service-account credentials make construction synchronous (no token
+    // fetch / network).
+    #[tokio::test]
+    async fn from_standard_struct_maps_google_features() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "google".into(),
+                api_key: TEST_SERVICE_ACCOUNT_JSON.to_string(),
+                voice_id: Some("en-US-Wavenet-D".to_string()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                pitch: Some(4.0),
+                volume: Some(-3.0),
+                speed: Some(1.5),
+                language: Some("es-ES".into()),
+                sample_rate: Some(48000),
+                // Capability gaps Google can't express — must be ignored, not invented.
+                stability: Some(0.7),
+                ssml: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = GoogleTTS::from_standard(&std).unwrap();
+        assert_eq!(tts.google_config.project_id, "creds-project-123");
+        assert_eq!(tts.google_config.pitch, Some(4.0));
+        assert_eq!(tts.google_config.volume_gain_db, Some(-3.0));
+        assert_eq!(tts.google_config.base.speaking_rate, Some(1.5));
+        assert_eq!(tts.config.speaking_rate, Some(1.5));
+        assert_eq!(tts.google_config.language_code, "es-ES");
+        assert_eq!(tts.config.sample_rate, Some(48000));
     }
 
     #[test]

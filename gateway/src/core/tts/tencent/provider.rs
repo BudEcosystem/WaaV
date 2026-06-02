@@ -61,6 +61,19 @@ impl TencentTts {
         })
     }
 
+    /// Build from the standardized TTS config (W1 keystone), mirroring `DeepgramTTS::from_standard`.
+    /// Delegates the feature mapping to the config-level [`TencentTtsConfig::from_standard`] (which
+    /// maps `speed`→`speed`, `volume`→`volume`, `word_timestamps`→`enable_subtitles`,
+    /// `emotion`→`emotion_category`, plus the `project_id`/`use_intl_endpoint`/`emotion_intensity`/
+    /// `primary_language`/`region` extras), then constructs the provider via [`Self::with_config`]
+    /// so the mapped settings are honored end-to-end through the dispatch path.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let tencent_config = TencentTtsConfig::from_standard(std)?;
+        Self::with_config(tencent_config)
+    }
+
     /// Create from Tencent-specific config.
     pub fn with_config(config: TencentTtsConfig) -> TTSResult<Self> {
         config.validate()?;
@@ -497,6 +510,36 @@ mod tests {
         let config = create_test_config();
         let result = TencentTts::new(config);
         assert!(result.is_ok());
+    }
+
+    // W1 keystone: the standardized dispatch path reaches the provider STRUCT's `from_standard`,
+    // building the real provider with mapped prosody/emotion. Tencent supports speed + volume +
+    // word_timestamps + emotion, so this asserts those reach the provider's config.
+    #[test]
+    fn from_standard_builds_provider_with_mapped_features() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "tencent".into(),
+                api_key: "secret_id|secret_key".into(),
+                voice_id: Some("0".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                volume: Some(8.0),
+                word_timestamps: Some(true),
+                emotion: Some("happy".into()),
+                ssml: Some(true), // capability gap: ignored
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = TencentTts::from_standard(&std).unwrap();
+        assert_eq!(tts.config.speed, 1.5);
+        assert_eq!(tts.config.volume, 8.0);
+        assert!(tts.config.enable_subtitles);
+        assert_eq!(tts.config.emotion_category, Some("happy".to_string()));
     }
 
     #[test]

@@ -45,6 +45,34 @@ pub struct NaverClovaStt {
 }
 
 impl NaverClovaStt {
+    /// W1 keystone — construct from the standardized config. NAVER CLOVA CSR is a batch (REST)
+    /// recognizer whose config exposes none of the standardized advanced features, so this is a
+    /// uniform standardized entry point that delegates to `from_standard` (a pure `from_base`
+    /// passthrough): the base config is carried through unchanged and every advanced feature is a
+    /// capability gap left at default.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let naver_config = NaverClovaSttConfig::from_standard(std)?;
+
+        let http_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| {
+                STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+            })?;
+
+        Ok(Self {
+            config: naver_config,
+            http_client,
+            audio_buffer: Arc::new(Mutex::new(Vec::new())),
+            is_ready: AtomicBool::new(false),
+            result_callback: Arc::new(Mutex::new(None)),
+            error_callback: Arc::new(Mutex::new(None)),
+            original_config: std.base.clone(),
+        })
+    }
+
     /// Calculate the maximum audio buffer size in bytes based on configuration.
     fn max_buffer_bytes(&self) -> usize {
         // Calculate max bytes for 60 seconds of audio
@@ -401,6 +429,29 @@ mod tests {
         let stt = result.unwrap();
         assert!(!stt.is_ready());
         assert!(stt.get_config().is_some());
+    }
+
+    // W1 keystone: NAVER CLOVA CSR exposes no mappable advanced features, so the meaningful
+    // assertion is that the base config survives through `new_standard` onto the provider config
+    // (credentials parsed, language mapped) even when advanced features are requested (they are
+    // capability gaps, intentionally dropped) — proving the standardized path is wired.
+    #[test]
+    fn test_naver_clova_new_standard_carries_base() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: make_test_config(),
+            // Advanced features the provider cannot express; must not break the standardized path.
+            features: SttFeatures {
+                diarization: Some(true),
+                interim_results: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let stt = NaverClovaStt::new_standard(&std).unwrap();
+        assert_eq!(stt.config.client_id, "test_client_id"); // base api_key survived
+        assert_eq!(stt.config.client_secret, "test_client_secret");
+        assert_eq!(stt.config.language, NaverClovaLanguage::Korean); // base language survived
     }
 
     #[test]

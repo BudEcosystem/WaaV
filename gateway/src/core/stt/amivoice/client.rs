@@ -671,6 +671,25 @@ impl AmiVoiceSTT {
     pub fn get_amivoice_config(&self) -> Option<&AmiVoiceSTTConfig> {
         self.config.as_ref()
     }
+
+    /// W1 keystone — construct directly from the standardized config so the advanced features
+    /// AmiVoice can express (speaker diarization, interim/partial results) are honored
+    /// END-TO-END. The flat `BaseSTT::new` path maps only the base config; this is the reachable
+    /// standardized path.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "AmiVoice APPKEY is required".to_string(),
+            ));
+        }
+        // `AmiVoiceSTT` implements `Drop`, so build the default then set the config field
+        // (struct-update with `..Default::default()` would move out of a Drop type).
+        let mut stt = Self::default();
+        stt.config = Some(AmiVoiceSTTConfig::from_standard(std));
+        Ok(stt)
+    }
 }
 
 impl Drop for AmiVoiceSTT {

@@ -72,6 +72,34 @@ impl Default for TinkoffStt {
 }
 
 impl TinkoffStt {
+    /// W1 keystone — construct directly from the standardized config so the advanced features
+    /// Tinkoff can express (interim/partial results) are honored END-TO-END. The flat
+    /// `BaseSTT::new` path resets those to provider defaults; this is the reachable
+    /// standardized path. Mirrors `DeepgramSTT::new_standard`.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "API key is required".to_string(),
+            ));
+        }
+        let tinkoff_config =
+            TinkoffSttConfig::from_standard(std).map_err(STTError::ConfigurationError)?;
+        Ok(Self {
+            config: Some(tinkoff_config),
+            state: ConnectionState::Disconnected,
+            state_notify: Arc::new(Notify::new()),
+            audio_sender: None,
+            shutdown_tx: None,
+            connection_handle: None,
+            result_forward_handle: None,
+            error_forward_handle: None,
+            result_callback: Arc::new(RwLock::new(None)),
+            error_callback: Arc::new(RwLock::new(None)),
+        })
+    }
+
     /// Create streaming recognition config from provider config
     fn create_streaming_config(config: &TinkoffSttConfig) -> StreamingRecognitionConfig {
         StreamingRecognitionConfig {
@@ -406,6 +434,43 @@ mod tests {
             encoding: "linear16".to_string(),
             model: "default".to_string(),
         }
+    }
+
+    // W1 keystone: an advanced feature Tinkoff supports (interim/partial results) must survive
+    // through `new_standard` into the provider-specific config, instead of being reset to the
+    // provider default by the flat path. RED until `new_standard` maps it.
+    #[test]
+    fn test_tinkoff_new_standard_unlocks_advanced_features() {
+        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "tinkoff".into(),
+                api_key: "test-api-key".into(),
+                language: "ru-RU".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                interim_results: Some(false),
+                ..Default::default()
+            },
+            ..StandardSTTConfig::from_base(STTConfig::default())
+        };
+        let stt = TinkoffStt::new_standard(&std).unwrap();
+        let cfg = stt.config.as_ref().expect("config present");
+        // interim_results survived from the standardized feature (provider default is true).
+        assert!(!cfg.interim_results);
+        assert_eq!(cfg.api_key, "test-api-key");
+    }
+
+    #[test]
+    fn test_tinkoff_new_standard_requires_api_key() {
+        use crate::core::stt::standard::StandardSTTConfig;
+        let std = StandardSTTConfig::from_base(STTConfig {
+            provider: "tinkoff".into(),
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(TinkoffStt::new_standard(&std).is_err());
     }
 
     #[test]

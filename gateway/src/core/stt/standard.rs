@@ -119,6 +119,79 @@ pub fn create_stt_standard(
 ) -> Result<Box<dyn super::base::BaseSTT>, super::base::STTError> {
     match provider.to_lowercase().as_str() {
         "deepgram" => Ok(Box::new(super::deepgram::DeepgramSTT::new_standard(&config)?)),
+        "alibaba-cloud" | "alibaba_cloud" => Ok(Box::new(
+            super::alibaba_cloud::DashScopeStt::new_standard(&config)?,
+        )),
+        "amivoice" => Ok(Box::new(super::amivoice::AmiVoiceSTT::new_standard(&config)?)),
+        "assemblyai" => Ok(Box::new(super::assemblyai::AssemblyAISTT::new_standard(
+            &config,
+        )?)),
+        "aws-transcribe" | "aws_transcribe" => Ok(Box::new(
+            super::aws_transcribe::AwsTranscribeSTT::new_standard(&config)?,
+        )),
+        "azure" => Ok(Box::new(super::azure::AzureSTT::new_standard(&config)?)),
+        "baidu" => Ok(Box::new(super::baidu::BaiduStt::new_standard(&config)?)),
+        "bhashini" => Ok(Box::new(super::bhashini::BhashiniStt::new_standard(
+            &config,
+        )?)),
+        "cartesia" => Ok(Box::new(super::cartesia::CartesiaSTT::new_standard(
+            &config,
+        )?)),
+        "elevenlabs" => Ok(Box::new(super::elevenlabs::ElevenLabsSTT::new_standard(
+            &config,
+        )?)),
+        "fpt-ai" | "fpt_ai" | "fptai" | "fpt" => {
+            Ok(Box::new(super::fpt_ai::FptStt::new_standard(&config)?))
+        }
+        "gladia" => Ok(Box::new(super::gladia::GladiaSTT::new_standard(&config)?)),
+        "gnani" => Ok(Box::new(super::gnani::GnaniSTT::new_standard(&config)?)),
+        "google" => Ok(Box::new(super::google::GoogleSTT::new_standard(&config)?)),
+        "groq" => Ok(Box::new(super::groq::GroqSTT::new_standard(&config)?)),
+        "huawei-cloud" | "huawei_cloud" | "huaweicloud" | "huawei" | "sis" | "huawei-sis" => Ok(
+            Box::new(super::huawei_cloud::HuaweiCloudStt::new_standard(&config)?),
+        ),
+        "ibm-watson" | "ibm_watson" | "watson" | "ibm" => Ok(Box::new(
+            super::ibm_watson::IbmWatsonSTT::new_standard(&config)?,
+        )),
+        "iflytek" | "ifly" | "xfyun" | "xunfei" | "科大讯飞" | "讯飞" => {
+            Ok(Box::new(super::iflytek::IFlytekStt::new_standard(&config)?))
+        }
+        "naver-clova" | "naver_clova" | "naverclova" | "naver" | "clova" | "csr" | "네이버" => Ok(
+            Box::new(super::naver_clova::NaverClovaStt::new_standard(&config)?),
+        ),
+        "nectec" | "aiforthai" | "ai4thai" | "partii" | "partii5" | "partii4" => {
+            Ok(Box::new(super::nectec::NectecStt::new_standard(&config)?))
+        }
+        "openai" => Ok(Box::new(super::openai::OpenAISTT::new_standard(&config)?)),
+        "phonexia" | "phonexia-stt" | "phonexia_stt" => Ok(Box::new(
+            super::phonexia::PhonexiaSTT::new_standard(&config)?,
+        )),
+        "prosa-ai" | "prosa_ai" | "prosai" | "prosa" | "prosa.ai" => {
+            Ok(Box::new(super::prosa_ai::ProsaStt::new_standard(&config)?))
+        }
+        "revai" | "rev-ai" | "rev_ai" | "rev.ai" => {
+            Ok(Box::new(super::revai::RevAISTT::new_standard(&config)?))
+        }
+        "reverie" | "reverie-ai" | "reverie_ai" | "reverie-stt" | "reverieinc" => Ok(Box::new(
+            super::reverie::ReverieSTT::new_standard(&config)?,
+        )),
+        "sarvam" => Ok(Box::new(super::sarvam::SarvamSTT::new_standard(&config)?)),
+        "sberdevices" | "sber_devices" | "sber" | "salutespeech" | "salute_speech" => Ok(Box::new(
+            super::sberdevices::SberDevicesSTT::new_standard(&config)?,
+        )),
+        "speechmatics" => Ok(Box::new(super::speechmatics::SpeechmaticsSTT::new_standard(
+            &config,
+        )?)),
+        "tencent" | "tencent-cloud" | "tencent_cloud" | "tencentcloud" | "腾讯" | "腾讯云" => {
+            Ok(Box::new(super::tencent::TencentStt::new_standard(&config)?))
+        }
+        "tinkoff" => Ok(Box::new(super::tinkoff::TinkoffStt::new_standard(&config)?)),
+        "viettel-ai" | "viettel_ai" | "viettelai" | "viettel" => Ok(Box::new(
+            super::viettel_ai::ViettelStt::new_standard(&config)?,
+        )),
+        "yandex" | "yandex-speechkit" | "yandex_speechkit" | "speechkit" => {
+            Ok(Box::new(super::yandex::YandexSTT::new_standard(&config)?))
+        }
         // Not-yet-migrated providers use the flat path; advanced features stay at provider
         // defaults until they gain `from_standard` (tracked by W2).
         _ => super::create_stt_provider(provider, config.base),

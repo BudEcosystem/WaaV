@@ -53,6 +53,45 @@ pub struct FptTts {
 }
 
 impl FptTts {
+    /// Build an `FptTts` from an already-resolved provider config (shared by `new` and
+    /// `from_standard`).
+    fn from_fpt_config(fpt_config: FptTtsConfig) -> TTSResult<Self> {
+        let timeout_secs = fpt_config.request_timeout_secs;
+        let http_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| {
+                TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
+            })?;
+
+        info!(
+            "FPT TTS: Initialized with voice='{}', speed={}, format={}",
+            fpt_config.voice.display_name(),
+            fpt_config.speed,
+            fpt_config.format.as_str()
+        );
+
+        Ok(Self {
+            config: fpt_config,
+            http_client,
+            is_ready: AtomicBool::new(false),
+            audio_callback: Arc::new(RwLock::new(None)),
+            connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
+        })
+    }
+
+    /// Build from the standardized config (W1 keystone), mirroring `DeepgramTTS::from_standard`.
+    /// FPT.AI's only adjustable delivery knob is integer `speed`; the standardized `speed` feature
+    /// and the provider-specific `callback_url` extra are mapped by [`FptTtsConfig::from_standard`]
+    /// and reach the live synthesis headers. Pitch/volume/stability/emotion/instructions/SSML/
+    /// language/word-timestamp/seed/sample-rate have no FPT.AI parameter and are skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let fpt_config = FptTtsConfig::from_standard(std)?;
+        Self::from_fpt_config(fpt_config)
+    }
+
     /// Synthesize text and return audio data.
     async fn synthesize(&self, text: &str) -> TTSResult<Vec<u8>> {
         if text.is_empty() {
@@ -273,29 +312,7 @@ impl Default for FptTts {
 impl BaseTTS for FptTts {
     fn new(config: TTSConfig) -> TTSResult<Self> {
         let fpt_config = FptTtsConfig::from_base(config)?;
-
-        let timeout_secs = fpt_config.request_timeout_secs;
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| {
-                TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
-            })?;
-
-        info!(
-            "FPT TTS: Initialized with voice='{}', speed={}, format={}",
-            fpt_config.voice.display_name(),
-            fpt_config.speed,
-            fpt_config.format.as_str()
-        );
-
-        Ok(Self {
-            config: fpt_config,
-            http_client,
-            is_ready: AtomicBool::new(false),
-            audio_callback: Arc::new(RwLock::new(None)),
-            connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
-        })
+        Self::from_fpt_config(fpt_config)
     }
 
     async fn connect(&mut self) -> TTSResult<()> {
@@ -530,6 +547,39 @@ mod tests {
             self.complete_count.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {})
         }
+    }
+
+    // W1 keystone (struct-level, mirrors DeepgramTTS::from_standard): the standardized `speed`
+    // feature and `callback_url` extra reach the live `FptTts` config through the provider STRUCT's
+    // `from_standard` — the path the dispatch helper constructs.
+    #[test]
+    fn from_standard_struct_maps_speed_and_callback_url() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert(
+            "callback_url".into(),
+            serde_json::json!("https://example.com/cb"),
+        );
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "fpt-ai".into(),
+                api_key: "k".into(),
+                voice_id: Some("banmai".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5), // -> +3 on FPT's -3..=+3 scale
+                ssml: Some(true), // capability gap: must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let tts = FptTts::from_standard(&std).unwrap();
+        assert_eq!(tts.config.speed, 3);
+        assert_eq!(
+            tts.config.callback_url,
+            Some("https://example.com/cb".to_string())
+        );
     }
 
     #[test]

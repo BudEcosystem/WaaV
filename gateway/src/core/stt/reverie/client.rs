@@ -75,6 +75,24 @@ impl ReverieSTT {
         })
     }
 
+    /// W1 keystone — construct directly from the standardized config. Reverie exposes no
+    /// advanced-feature query knobs, so this is a uniform standardized entry point that delegates
+    /// to `ReverieSTTConfig::from_standard` (a `from_base` passthrough) and then `with_config`.
+    /// Mirrors `DeepgramSTT::new_standard`: validate the api_key, then build from the
+    /// standardized->provider config mapping.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "API key is required".to_string(),
+            ));
+        }
+        let cfg = crate::core::stt::reverie::config::ReverieSTTConfig::from_standard(std)
+            .map_err(STTError::ConfigurationError)?;
+        Self::with_config(cfg)
+    }
+
     /// Spawn the WebSocket message receiver task
     fn spawn_receiver_task(&self, mut ws_stream: futures_util::stream::SplitStream<WsStream>) {
         let on_result = self.on_result.clone();
@@ -400,6 +418,40 @@ mod tests {
         let stt = stt.unwrap();
         assert!(!stt.is_ready());
         assert_eq!(stt.get_provider_info(), "Reverie STT (Indian Languages)");
+    }
+
+    // W1 keystone: Reverie maps zero standardized feature knobs, so `new_standard` is a pure
+    // passthrough of the base config — assert the base (api_key + app_id from the model field +
+    // language) survives through the provider-struct method to the provider-specific config.
+    #[test]
+    fn test_reverie_new_standard_carries_base() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: create_test_base_config(),
+            features: SttFeatures {
+                // None of these can map to a real Reverie field; they must be ignored.
+                diarization: Some(true),
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let stt = ReverieSTT::new_standard(&std).expect("new_standard must succeed");
+        assert_eq!(stt.reverie_config.api_key, "test-api-key");
+        assert_eq!(stt.reverie_config.app_id, "test-app-id"); // parsed from model field
+        assert_eq!(
+            stt.reverie_config.language,
+            super::super::config::ReverieLanguage::Hindi
+        );
+
+        // Missing api_key is rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            provider: "reverie".into(),
+            api_key: String::new(),
+            model: "test-app-id".into(),
+            ..Default::default()
+        });
+        assert!(ReverieSTT::new_standard(&bad).is_err());
     }
 
     #[test]

@@ -533,6 +533,12 @@ impl AzureTTSConfig {
         if let Some(s) = f.ssml {
             cfg.use_ssml = s;
         }
+        // Fold the standardized speaking speed into the base rate so the SSML <prosody rate> path
+        // (build_ssml_for_text) actually applies it — previously features.speed was silently
+        // dropped for Azure while ElevenLabs/OpenAI/Google/Cartesia honored it. (Review S4.)
+        if let Some(speed) = f.speed {
+            cfg.base.speaking_rate = Some(speed);
+        }
         cfg
     }
 

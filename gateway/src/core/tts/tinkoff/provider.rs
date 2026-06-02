@@ -37,6 +37,26 @@ impl Default for TinkoffTts {
 }
 
 impl TinkoffTts {
+    /// Build from the standardized TTS config (W1 keystone), mirroring `DeepgramTTS::from_standard`.
+    /// Delegates the feature mapping to the config-level [`TinkoffTtsConfig::from_standard`] (which
+    /// maps `speed`→`speaking_rate`, `pitch`→`pitch`, `volume`→`volume_gain_db`, `sample_rate`, and
+    /// the `connection_timeout_secs`/`request_timeout_secs` extras), then constructs the provider so
+    /// the mapped prosody is honored end-to-end through the dispatch path.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let tinkoff_config =
+            TinkoffTtsConfig::from_standard(std).map_err(TTSError::InvalidConfiguration)?;
+
+        Ok(Self {
+            config: Some(tinkoff_config),
+            state: ConnectionState::Disconnected,
+            state_notify: Arc::new(Notify::new()),
+            client: None,
+            audio_callback: Arc::new(RwLock::new(None)),
+        })
+    }
+
     /// Create synthesis request from text
     fn create_synthesis_request(&self, text: &str) -> Result<SynthesizeSpeechRequest, TTSError> {
         let config = self.config.as_ref().ok_or_else(|| {
@@ -319,6 +339,37 @@ mod tests {
             sample_rate: Some(24000),
             ..Default::default()
         }
+    }
+
+    // W1 keystone: the standardized dispatch path reaches the provider STRUCT's `from_standard`,
+    // building the real provider with mapped prosody. Tinkoff supports speed/pitch/volume/
+    // sample_rate, so this asserts those reach the provider's config.
+    #[test]
+    fn from_standard_builds_provider_with_mapped_prosody() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "tinkoff".into(),
+                api_key: "test-api-key".into(),
+                voice_id: Some("alyona".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(2.0),
+                pitch: Some(5.0),
+                volume: Some(-6.0),
+                sample_rate: Some(48000),
+                ssml: Some(true), // capability gap: ignored
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = TinkoffTts::from_standard(&std).unwrap();
+        let cfg = tts.config.as_ref().unwrap();
+        assert_eq!(cfg.speaking_rate, 2.0);
+        assert_eq!(cfg.pitch, 5.0);
+        assert_eq!(cfg.volume_gain_db, -6.0);
+        assert_eq!(cfg.sample_rate, 48000);
     }
 
     #[test]

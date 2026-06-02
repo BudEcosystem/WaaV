@@ -155,6 +155,22 @@ impl OpenAISTT {
     ///
     /// # Returns
     /// * `Result<Self, STTError>` - New instance or error
+    /// W1 keystone — construct directly from the standardized config so the advanced features
+    /// OpenAI can express (diarization → DiarizedJson response format, word_timestamps → word
+    /// timestamp granularity, keyterms → prompt) are honored END-TO-END. The flat `BaseSTT::new`
+    /// path can only see the base config; this is the reachable standardized path. Features OpenAI's
+    /// API lacks remain capability gaps at default.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "API key is required".to_string(),
+            ));
+        }
+        Self::with_config(OpenAISTTConfig::from_standard(std))
+    }
+
     pub fn with_config(config: OpenAISTTConfig) -> Result<Self, STTError> {
         // Validate configuration
         config.validate().map_err(STTError::ConfigurationError)?;

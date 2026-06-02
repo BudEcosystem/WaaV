@@ -141,6 +141,34 @@ impl SpeechmaticsTts {
         SpeechmaticsRequestBuilder::new(self.speechmatics_config.clone(), self.base_config.clone())
     }
 
+    /// Build from the standardized config (W1 keystone for TTS), mirroring
+    /// `DeepgramTTS::from_standard`. Delegates feature mapping to the config-level
+    /// [`SpeechmaticsTtsConfig::from_standard`]. Speechmatics' generate endpoint only accepts a
+    /// voice (path segment) and an `output_format` query parameter — both derived from the base
+    /// config — and its body carries nothing but text, so every standardized [`TtsFeatures`] field
+    /// (prosody, voice settings, emotion, instructions, SSML, language, timestamps, streaming,
+    /// seed, sample_rate) is a capability gap that is intentionally skipped. The matching flat base
+    /// config is kept for the generic provider's connect layer.
+    ///
+    /// [`SpeechmaticsTtsConfig::from_standard`]: super::config::SpeechmaticsTtsConfig::from_standard
+    /// [`TtsFeatures`]: crate::core::tts::standard::TtsFeatures
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let speechmatics_config = SpeechmaticsTtsConfig::from_standard(std)?;
+
+        info!(
+            "Creating Speechmatics TTS provider: voice={}, output_format={}",
+            speechmatics_config.voice, speechmatics_config.output_format
+        );
+
+        Ok(Self {
+            provider: TTSProvider::new()?,
+            speechmatics_config,
+            base_config: std.base.clone(),
+        })
+    }
+
     /// Get the Speechmatics-specific configuration
     pub fn speechmatics_config(&self) -> &SpeechmaticsTtsConfig {
         &self.speechmatics_config
@@ -241,6 +269,40 @@ impl BaseTTS for SpeechmaticsTts {
 mod tests {
     use super::*;
     use crate::core::tts::speechmatics::{SpeechmaticsOutputFormat, SpeechmaticsVoice};
+
+    // W1 keystone: the standardized dispatch path reaches the provider STRUCT's `from_standard`,
+    // building the real provider. Speechmatics exposes only voice + output_format (both from the
+    // base), so this asserts those base-derived settings land in the provider's config while the
+    // unsupported features are ignored.
+    #[test]
+    fn from_standard_builds_provider_from_base() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "speechmatics".into(),
+                api_key: "test-api-key".into(),
+                voice_id: Some("jack".into()),
+                audio_format: Some("pcm".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                // Capability gaps for Speechmatics — must be ignored.
+                speed: Some(1.5),
+                sample_rate: Some(48000),
+                ssml: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let tts = SpeechmaticsTts::from_standard(&std).unwrap();
+        assert_eq!(tts.speechmatics_config().voice, SpeechmaticsVoice::Jack);
+        assert_eq!(
+            tts.speechmatics_config().output_format,
+            SpeechmaticsOutputFormat::Pcm16000
+        );
+        // Output stays fixed at 16 kHz: the sample_rate feature has no field to land in.
+        assert_eq!(tts.speechmatics_config().output_format.sample_rate(), 16000);
+    }
 
     #[test]
     fn test_speechmatics_tts_creation() {

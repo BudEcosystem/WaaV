@@ -644,6 +644,39 @@ mod client_tests {
         assert_eq!(config.temperature, Some(0.3));
         assert_eq!(config.base.language, "fr");
     }
+
+    // W1 keystone: standardized advanced features OpenAI can express (diarization → DiarizedJson,
+    // keyterms → prompt) survive through `new_standard` onto the provider config — proving the
+    // standardized path doesn't drop them.
+    #[tokio::test]
+    async fn test_openai_new_standard_unlocks_features() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "openai".into(),
+                api_key: "sk-test-key".into(),
+                model: "gpt-4o-transcribe".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "OpenAI".into()]),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let stt = OpenAISTT::new_standard(&std).unwrap();
+        let config = stt.config.as_ref().unwrap();
+        assert_eq!(config.response_format, ResponseFormat::DiarizedJson); // diarization survived
+        assert_eq!(config.prompt.as_deref(), Some("WaaV, OpenAI")); // keyterms survived
+
+        // Missing key is rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(OpenAISTT::new_standard(&bad).is_err());
+    }
 }
 
 // =============================================================================

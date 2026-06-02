@@ -439,6 +439,16 @@ impl HumeTTS {
         })
     }
 
+    /// Build from the standardized TTS config (W1 keystone), mirroring `DeepgramTTS::from_standard`.
+    /// Delegates feature mapping to [`HumeTTSConfig::from_standard`] (instructions/emotion ->
+    /// `description`, speed, sample_rate, plus the `generation_id`/`num_generations` extras
+    /// passthrough) so Hume's natural-language emotion control reaches the provider config.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        Self::with_config(HumeTTSConfig::from_standard(std))
+    }
+
     /// Sets the request manager for connection pooling.
     pub async fn set_req_manager(&mut self, req_manager: Arc<ReqManager>) {
         self.provider.set_req_manager(req_manager).await;
@@ -672,6 +682,28 @@ mod tests {
     // =========================================================================
     // HumeRequestBuilder Tests
     // =========================================================================
+
+    // W1 keystone: the provider struct's `from_standard` maps Hume's natural-language emotion
+    // control (instructions/emotion -> description) and speed through onto the provider config.
+    #[test]
+    fn from_standard_maps_instructions_and_speed_to_provider() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                instructions: Some("warm, friendly, inviting".to_string()),
+                speed: Some(1.3),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = HumeTTS::from_standard(&std).unwrap();
+        assert_eq!(
+            tts.hume_config().description.as_deref(),
+            Some("warm, friendly, inviting")
+        );
+        assert_eq!(tts.hume_config().speed, Some(1.3));
+    }
 
     #[test]
     fn test_hume_request_builder_new() {

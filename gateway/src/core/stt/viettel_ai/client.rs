@@ -59,6 +59,40 @@ pub struct ViettelStt {
 }
 
 impl ViettelStt {
+    /// W1 keystone — construct directly from the standardized config. Viettel AI is a simple
+    /// batch decode endpoint that exposes no advanced-feature surface, so `from_standard` is a
+    /// pure `from_base` passthrough: this gives a uniform standardized entry point that carries
+    /// the base config through unchanged. Mirrors `DeepgramSTT::new_standard`.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "Viettel AI API token is required".to_string(),
+            ));
+        }
+        let viettel_config = ViettelSttConfig::from_standard(std)?;
+
+        let timeout_secs = viettel_config.request_timeout_secs;
+        let http_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| {
+                STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+            })?;
+
+        Ok(Self {
+            config: viettel_config,
+            base_config: Some(std.base.clone()),
+            http_client,
+            is_ready: AtomicBool::new(false),
+            connection_state: Arc::new(RwLock::new(STTConnectionState::Disconnected)),
+            audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_AUDIO_BUFFER_SIZE))),
+            result_callback: Arc::new(RwLock::new(None)),
+            error_callback: Arc::new(RwLock::new(None)),
+        })
+    }
+
     /// Process buffered audio and get transcription.
     async fn process_audio(&self, audio_data: Vec<u8>) -> Result<String, STTError> {
         if audio_data.len() < MIN_AUDIO_BUFFER_SIZE {
@@ -459,6 +493,46 @@ mod tests {
         fn get_result_count(&self) -> usize {
             self.result_count.load(Ordering::SeqCst)
         }
+    }
+
+    // W1 keystone: Viettel AI exposes no advanced-feature surface, so `new_standard` is a pure
+    // passthrough — even with features set, the standardized path must build the provider and
+    // carry the base config (api_key/sample_rate/channels) through into the provider-specific
+    // config unchanged. (Advanced features are documented capability gaps left at default.)
+    #[test]
+    fn test_viettel_new_standard_passes_base_through() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "viettel-ai".into(),
+                api_key: "test_token".into(),
+                sample_rate: 8000,
+                channels: 1,
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let stt = ViettelStt::new_standard(&std).unwrap();
+        let cfg = stt.get_viettel_config();
+        assert_eq!(cfg.api_key, "test_token");
+        assert_eq!(cfg.sample_rate, 8000);
+        assert_eq!(cfg.channels, 1);
+    }
+
+    #[test]
+    fn test_viettel_new_standard_requires_api_key() {
+        use crate::core::stt::standard::StandardSTTConfig;
+        let std = StandardSTTConfig::from_base(STTConfig {
+            provider: "viettel-ai".into(),
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(ViettelStt::new_standard(&std).is_err());
     }
 
     #[test]

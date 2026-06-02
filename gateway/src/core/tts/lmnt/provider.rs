@@ -391,6 +391,17 @@ impl LmntTts {
     ///
     /// let tts = LmntTts::with_config(config)?;
     /// ```
+    /// Build from the standardized config (W1 keystone for TTS), mirroring
+    /// `DeepgramTTS::from_standard`. Delegates to the config-level
+    /// [`LmntTtsConfig::from_standard`] (which maps `speed`, `language`, `sample_rate`, `seed`,
+    /// `stability`→`top_p`, and the non-standard `debug` extra) then constructs through
+    /// `with_config` so the mapped LMNT settings are honored end-to-end through the dispatch path.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        Self::with_config(LmntTtsConfig::from_standard(std))
+    }
+
     pub fn with_config(lmnt_config: LmntTtsConfig) -> TTSResult<Self> {
         // Validate configuration
         if let Err(e) = lmnt_config.validate() {
@@ -903,6 +914,42 @@ mod tests {
 
         assert!(!tts.is_ready());
         assert_eq!(tts.get_connection_state(), ConnectionState::Disconnected);
+    }
+
+    // W1 keystone: the struct-level `from_standard` (the dispatch entry point, mirroring
+    // `DeepgramTTS::from_standard`) must carry the standardized advanced features onto the live
+    // provider's LMNT config — not just the config-level helper. Asserts stability→top_p plus
+    // speed/language/seed reach `lmnt_config()`.
+    #[test]
+    fn from_standard_reaches_provider_config() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "lmnt".to_string(),
+                api_key: "k".to_string(),
+                voice_id: Some("lily".to_string()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                language: Some("en".to_string()),
+                sample_rate: Some(16000),
+                seed: Some(12345),
+                stability: Some(0.9),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+
+        let tts = LmntTts::from_standard(&std).unwrap();
+        let cfg = tts.lmnt_config();
+        assert!((cfg.speed - 1.5).abs() < 0.001);
+        assert_eq!(cfg.language, "en");
+        assert_eq!(cfg.sample_rate, 16000);
+        assert_eq!(cfg.seed, Some(12345));
+        assert!((cfg.top_p - 0.9).abs() < 0.001); // stability → top_p
+        assert_eq!(cfg.voice_id(), "lily"); // base carried through
     }
 
     #[test]

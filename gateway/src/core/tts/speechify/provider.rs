@@ -189,6 +189,25 @@ impl SpeechifyTts {
     pub fn streaming_url(&self) -> &str {
         super::SPEECHIFY_TTS_STREAM_URL
     }
+
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// Mirrors `DeepgramTTS::from_standard`: maps the standardized features onto Speechify's
+    /// provider config via [`SpeechifyTtsConfig::from_standard`] (language + the normalization
+    /// extras), then constructs the provider mirroring [`BaseTTS::new`]. Speechify is a minimal
+    /// surface, so speed/pitch/volume/voice-settings/emotion/instructions/ssml/seed/sample_rate
+    /// are capability gaps and stay at their defaults — never fabricated.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let speechify_config = SpeechifyTtsConfig::from_standard(std)?;
+
+        Ok(Self {
+            provider: TTSProvider::new()?,
+            speechify_config,
+            base_config: std.base.clone(),
+        })
+    }
 }
 
 #[async_trait]
@@ -282,6 +301,30 @@ impl BaseTTS for SpeechifyTts {
 mod tests {
     use super::*;
     use crate::core::tts::speechify::SpeechifyModel;
+
+    // The provider struct's `from_standard` (mirroring `DeepgramTTS::from_standard`) maps a
+    // standardized advanced feature (language override) all the way onto the provider config the
+    // request builder reads — proving the standardized dispatch path reaches the struct, not just
+    // the config-level method.
+    #[test]
+    fn from_standard_maps_language_onto_provider_config() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "speechify".to_string(),
+                api_key: "test-api-key".to_string(),
+                voice_id: Some("george".to_string()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                language: Some("es-ES".to_string()),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = SpeechifyTts::from_standard(&std).unwrap();
+        assert_eq!(tts.speechify_config().language.as_deref(), Some("es-ES"));
+    }
 
     #[test]
     fn test_speechify_tts_creation() {

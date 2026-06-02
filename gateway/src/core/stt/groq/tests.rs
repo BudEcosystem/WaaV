@@ -950,6 +950,41 @@ mod client_tests {
         assert_eq!(stored_config.base.api_key, "new_key");
         assert_eq!(stored_config.model, GroqSTTModel::WhisperLargeV3);
     }
+
+    // W1 keystone: Groq's one mappable feature (word-level timestamps) must survive through
+    // `new_standard` into the provider-specific config — previously dropped by the flat factory.
+    #[test]
+    fn new_standard_unlocks_word_timestamps() {
+        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "groq".into(),
+                api_key: "gsk_test".into(),
+                model: "whisper-large-v3".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let stt = GroqSTT::new_standard(&std).expect("new_standard should succeed");
+        let cfg = stt.config.as_ref().expect("config should be set");
+        assert_eq!(cfg.response_format, GroqResponseFormat::VerboseJson);
+        assert!(cfg
+            .timestamp_granularities
+            .contains(&super::super::config::TimestampGranularity::Word));
+        assert_eq!(cfg.base.api_key, "gsk_test");
+
+        // Empty api_key is rejected through the standardized path too (parity with Deepgram).
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            provider: "groq".into(),
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(GroqSTT::new_standard(&bad).is_err());
+    }
 }
 
 // =============================================================================

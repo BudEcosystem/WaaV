@@ -36,6 +36,34 @@ pub struct NaverClovaTts {
 }
 
 impl NaverClovaTts {
+    /// Build from the standardized config (W1 keystone for TTS), mirroring
+    /// `DeepgramTTS::from_standard`. Delegates to the config-level
+    /// [`NaverClovaTtsConfig::from_standard`] (which maps `speed`/`pitch`/`volume` onto CLOVA's
+    /// -5..=5 integer prosody deltas and reads the non-standard `custom_endpoint` extra) so the
+    /// mapped prosody is honored end-to-end through the dispatch path, then assembles the REST
+    /// client exactly like [`BaseTTS::new`].
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let naver_config = NaverClovaTtsConfig::from_standard(std)?;
+
+        let timeout_secs = naver_config.request_timeout_secs;
+        let http_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| {
+                TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
+            })?;
+
+        Ok(Self {
+            config: naver_config,
+            http_client,
+            is_ready: AtomicBool::new(false),
+            audio_callback: Arc::new(RwLock::new(None)),
+            connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
+        })
+    }
+
     /// Synthesize text and return audio data.
     async fn synthesize(&self, text: &str) -> TTSResult<Vec<u8>> {
         if text.is_empty() {
@@ -366,6 +394,46 @@ mod tests {
 
         let tts = result.unwrap();
         assert!(!tts.is_ready());
+    }
+
+    // W1 keystone: the struct-level `from_standard` (the dispatch entry point, mirroring
+    // `DeepgramTTS::from_standard`) must carry the standardized advanced features onto the live
+    // client's CLOVA config — not just the config-level helper. Asserts speed/pitch/volume reach
+    // the integer prosody deltas plus the `custom_endpoint` extra.
+    #[test]
+    fn from_standard_reaches_provider_config() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert(
+            "custom_endpoint".into(),
+            serde_json::json!("https://enterprise.example.com/tts"),
+        );
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "naver-clova".into(),
+                api_key: "client_id|client_secret".into(),
+                voice_id: Some("clara".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(4.0), // max multiplier -> +5
+                pitch: Some(3.0),
+                volume: Some(-2.0),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+
+        let tts = NaverClovaTts::from_standard(&std).unwrap();
+        assert_eq!(tts.config.speed, 5); // 4.0x -> +5
+        assert_eq!(tts.config.pitch, 3);
+        assert_eq!(tts.config.volume, -2);
+        assert_eq!(tts.config.voice.speaker_id(), "clara"); // base carried through
+        assert_eq!(
+            tts.config.custom_endpoint,
+            Some("https://enterprise.example.com/tts".to_string())
+        );
     }
 
     #[test]

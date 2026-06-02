@@ -716,6 +716,33 @@ fn test_client_set_engine() {
     assert_eq!(config.engine, AmiVoiceEngine::HybridJapaneseMedical);
 }
 
+// W1 keystone: a standardized advanced feature AmiVoice supports (speaker diarization +
+// interim results) survives through `new_standard` into the provider config.
+#[test]
+fn test_new_standard_unlocks_diarization_and_interim() {
+    use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+    let std = StandardSTTConfig {
+        base: make_test_config(),
+        features: SttFeatures {
+            diarization: Some(true),
+            interim_results: Some(false),
+            ..Default::default()
+        },
+        extras: Default::default(),
+    };
+    let stt = AmiVoiceSTT::new_standard(&std).unwrap();
+    let cfg = stt.get_amivoice_config().unwrap();
+    assert!(cfg.enable_diarization);
+    assert!(!cfg.interim_results);
+
+    // Missing APPKEY is rejected through the standardized path too.
+    let bad = StandardSTTConfig::from_base(STTConfig {
+        api_key: String::new(),
+        ..make_test_config()
+    });
+    assert!(AmiVoiceSTT::new_standard(&bad).is_err());
+}
+
 #[test]
 fn test_client_set_interim_results() {
     let mut stt = AmiVoiceSTT::new(make_test_config()).unwrap();

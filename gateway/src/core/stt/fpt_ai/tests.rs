@@ -64,6 +64,42 @@ fn test_new_empty_api_key() {
     }
 }
 
+// W1 keystone: FPT.AI exposes no advanced-feature surface, so `new_standard` is a uniform
+// standardized entry point that carries the base transport config (api_key/sample_rate/channels)
+// through to the provider-specific config unchanged — even when advanced features are requested.
+#[test]
+fn new_standard_carries_base_through() {
+    use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+    let std = StandardSTTConfig {
+        base: STTConfig {
+            provider: "fpt_ai".into(),
+            api_key: "test_key".into(),
+            sample_rate: 8000,
+            channels: 1,
+            ..Default::default()
+        },
+        features: SttFeatures {
+            diarization: Some(true),
+            word_timestamps: Some(true),
+            ..Default::default()
+        },
+        extras: ProviderExtras::default(),
+    };
+    let stt = FptStt::new_standard(&std).expect("new_standard should succeed");
+    let cfg = stt.get_fpt_config();
+    assert_eq!(cfg.api_key, "test_key");
+    assert_eq!(cfg.sample_rate, 8000);
+    assert_eq!(cfg.channels, 1);
+
+    // Missing key is rejected through the standardized path too.
+    let bad = StandardSTTConfig::from_base(STTConfig {
+        provider: "fpt_ai".into(),
+        api_key: String::new(),
+        ..Default::default()
+    });
+    assert!(FptStt::new_standard(&bad).is_err());
+}
+
 #[test]
 fn test_provider_info() {
     let stt = FptStt::new(make_test_config()).unwrap();

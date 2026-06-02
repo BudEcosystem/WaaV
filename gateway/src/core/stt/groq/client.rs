@@ -282,6 +282,22 @@ impl GroqSTT {
     ///
     /// # Returns
     /// * `Result<Self, STTError>` - New instance or error
+    /// W1 keystone — construct directly from the standardized config so Groq's one mappable
+    /// feature (word-level timestamps, which selects the verbose-JSON response format) is honored
+    /// END-TO-END. Groq is a batch REST Whisper provider, so the streaming-oriented standardized
+    /// features have no field here and stay at default. Mirrors `DeepgramSTT::new_standard`:
+    /// the api_key is checked first, then the provider is built from `GroqSTTConfig::from_standard`.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "API key is required for Groq STT".to_string(),
+            ));
+        }
+        Self::with_config(GroqSTTConfig::from_standard(std))
+    }
+
     pub fn with_config(config: GroqSTTConfig) -> Result<Self, STTError> {
         // Validate configuration
         config.validate().map_err(STTError::ConfigurationError)?;

@@ -389,12 +389,19 @@ async fn initialize_voice_manager(
         }
     };
 
-    // Create full configs with API keys
-    let stt_config = stt_ws_config.to_stt_config(stt_api_key);
-    let tts_config = tts_ws_config.to_tts_config(tts_api_key);
+    // Build standardized configs (W1 keystone): they carry the flat base PLUS advanced
+    // features/extras the client supplied, so the VoiceManager builds providers via
+    // `create_stt_standard`/`create_tts_standard` → `from_standard` instead of dropping features
+    // on the flat factory path. The flat `stt_config`/`tts_config` are still derived (== the
+    // standardized bases) for cache hashing and other flat consumers below.
+    let standard_stt = stt_ws_config.to_standard_stt(stt_api_key);
+    let standard_tts = tts_ws_config.to_standard_tts(tts_api_key);
+    // Flat TTS view kept for cache hashing (the standardized configs are moved into the manager).
+    let tts_config = standard_tts.base.clone();
 
-    // Create voice manager configuration with default speech final settings
-    let voice_config = VoiceManagerConfig::new(stt_config.clone(), tts_config.clone());
+    // Create voice manager configuration with default speech final settings, routed through the
+    // standardized keystone path.
+    let voice_config = VoiceManagerConfig::from_standard(standard_stt, standard_tts);
 
     let turn_detector = app_state.core_state.get_turn_detector();
 
@@ -886,6 +893,8 @@ async fn initialize_livekit_client(
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        features: Default::default(),
+        extras: Default::default(),
     };
 
     let tts_config_for_livekit = tts_config.unwrap_or(&default_tts_config);

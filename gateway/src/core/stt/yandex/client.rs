@@ -94,6 +94,36 @@ impl YandexSTT {
         })
     }
 
+    /// W1 keystone — construct directly from the standardized config so the advanced features
+    /// Yandex can express (diarization, partials, profanity filtering, custom-vocabulary hints)
+    /// are honored END-TO-END. The flat `BaseSTT::new` path resets those to provider defaults;
+    /// this is the reachable standardized path. Mirrors `DeepgramSTT::new_standard`.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "Yandex API key is required".to_string(),
+            ));
+        }
+        let yandex_config = YandexSTTConfig::from_standard(std)?;
+
+        Ok(Self {
+            config: std.base.clone(),
+            yandex_config,
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .map_err(|e| STTError::ConnectionFailed(e.to_string()))?,
+            connected: AtomicBool::new(false),
+            result_callback: Arc::new(RwLock::new(None)),
+            error_callback: Arc::new(RwLock::new(None)),
+            audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_SYNC_AUDIO_SIZE))),
+            processing_task: Arc::new(RwLock::new(None)),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
     /// Recognize audio using synchronous API
     async fn recognize_sync(&self, audio_data: &[u8]) -> Result<String, STTError> {
         // Build headers
@@ -436,6 +466,41 @@ mod tests {
             encoding: "lpcm".to_string(),
             model: "general".to_string(),
         }
+    }
+
+    // W1 keystone: advanced features Yandex supports (diarization -> speaker_identification,
+    // keyterms -> hints) must survive through `new_standard` into the provider-specific config,
+    // instead of being reset to the provider default by the flat path. RED until `new_standard`
+    // maps them.
+    #[test]
+    fn test_yandex_new_standard_unlocks_advanced_features() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "yandex".into(),
+                api_key: "test-api-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "Yandex".into()]),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let stt = YandexSTT::new_standard(&std).unwrap();
+        assert!(stt.yandex_config.speaker_identification); // diarization
+        assert_eq!(stt.yandex_config.hints, vec!["WaaV", "Yandex"]); // keyterms
+    }
+
+    #[test]
+    fn test_yandex_new_standard_requires_api_key() {
+        use crate::core::stt::standard::StandardSTTConfig;
+        let std = StandardSTTConfig::from_base(STTConfig {
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(YandexSTT::new_standard(&std).is_err());
     }
 
     #[test]

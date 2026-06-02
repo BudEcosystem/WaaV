@@ -294,6 +294,28 @@ impl AzureTTS {
         })
     }
 
+    /// Build the provider from the standardized config (W1 keystone), mirroring
+    /// `DeepgramTTS::from_standard`. Delegates feature mapping to
+    /// [`AzureTTSConfig::from_standard`] (the `ssml` → `use_ssml` flag plus the `region` extra) so
+    /// the standardized SSML toggle reaches the request builder — which decides whether to emit
+    /// `mstts:express-as` SSML — through the standardized dispatch instead of being dropped at the
+    /// flat boundary. (Speed/pitch/volume/emotion are Azure SSML-time controls without struct
+    /// fields, so they stay at default here, matching the config-level mapping.)
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let config = std.base.clone();
+        let azure_config = AzureTTSConfig::from_standard(std);
+        let request_builder = AzureRequestBuilder::new(config.clone(), azure_config.clone());
+        let config_hash = compute_azure_tts_config_hash(&config, &azure_config);
+
+        Ok(Self {
+            provider: TTSProvider::new()?,
+            request_builder,
+            config_hash,
+        })
+    }
+
     /// Sets the request manager for this instance.
     ///
     /// This allows sharing a request manager across multiple provider instances
@@ -779,6 +801,30 @@ mod tests {
 
         assert!(!tts.is_ready());
         assert_eq!(tts.get_connection_state(), ConnectionState::Disconnected);
+    }
+
+    // W1 keystone: a StandardTTSConfig advanced feature Azure supports (the `ssml` → `use_ssml`
+    // toggle, plus the non-standard `region` extra) reaches the provider's resolved
+    // `azure_config` through the provider struct's `from_standard`, mirroring
+    // `DeepgramTTS::from_standard`.
+    #[test]
+    fn from_standard_reaches_provider_config() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("region".into(), serde_json::json!("westeurope"));
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                // from_base defaults use_ssml to true; flip it to prove the feature is honored.
+                ssml: Some(false),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let tts = AzureTTS::from_standard(&std).unwrap();
+        assert!(!tts.azure_config().use_ssml);
+        assert_eq!(tts.azure_config().region, AzureRegion::WestEurope);
+        assert_eq!(tts.azure_config().base.api_key, "test-subscription-key");
     }
 
     #[test]

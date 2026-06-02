@@ -366,6 +366,30 @@ impl AcapelaTts {
         &self.acapela_config
     }
 
+    /// Build the provider from the standardized config (W1 keystone), mirroring
+    /// `DeepgramTTS::from_standard`. Delegates the feature mapping to
+    /// [`AcapelaTtsConfig::from_standard`] (speed/volume/sample_rate/word_timestamps + the
+    /// `bitrate`/`dictionaries`/`application` extras) so advanced features reach the live request
+    /// builder through the standardized dispatch instead of being dropped at the flat boundary.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let acapela_config = AcapelaTtsConfig::from_standard(std)?;
+
+        info!(
+            "Creating Acapela Cloud TTS provider (standardized): voice={}, format={}, sample_rate={}",
+            acapela_config.voice_id, acapela_config.audio_format, acapela_config.sample_rate
+        );
+
+        Ok(Self {
+            provider: TTSProvider::new()?,
+            acapela_config,
+            base_config: std.base.clone(),
+            token_cache: Arc::new(RwLock::new(None)),
+            auth_client: reqwest::Client::new(),
+        })
+    }
+
     /// Get the command endpoint URL being used
     pub fn command_url(&self) -> &str {
         super::ACAPELA_COMMAND_URL
@@ -522,6 +546,38 @@ impl BaseTTS for AcapelaTts {
 mod tests {
     use super::*;
     use crate::core::tts::acapela::AcapelaAudioFormat;
+
+    // W1 keystone: a StandardTTSConfig advanced feature Acapela supports (speed/volume/
+    // sample_rate/word_timestamps) reaches the provider's `acapela_config` through the provider
+    // struct's `from_standard`, mirroring `DeepgramTTS::from_standard`.
+    #[test]
+    fn from_standard_reaches_provider_config() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "acapela".into(),
+                api_key: "user@example.com:password".into(),
+                voice_id: Some("alice".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                volume: Some(40000.0),
+                sample_rate: Some(16000),
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = AcapelaTts::from_standard(&std).unwrap();
+        // 1.5 multiplier -> 150 on Acapela's 100-is-normal scale.
+        assert_eq!(tts.acapela_config().speed, 150);
+        assert_eq!(tts.acapela_config().volume, 40000);
+        assert_eq!(tts.acapela_config().sample_rate, 16000);
+        assert!(tts.acapela_config().word_positions);
+        // base carried through.
+        assert_eq!(tts.base_config.api_key, "user@example.com:password");
+    }
 
     #[test]
     fn test_acapela_tts_creation() {

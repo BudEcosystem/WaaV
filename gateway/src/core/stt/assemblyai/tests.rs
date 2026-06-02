@@ -369,6 +369,36 @@ mod client_tests {
         }
     }
 
+    // W1 keystone: a standardized advanced feature AssemblyAI supports (word-level timestamps)
+    // survives through `new_standard` into the provider config.
+    #[test]
+    fn test_new_standard_unlocks_word_timestamps() {
+        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                language: "en".to_string(),
+                sample_rate: 16000,
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(false),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let stt = AssemblyAISTT::new_standard(&std).unwrap();
+        assert!(!stt.config.as_ref().unwrap().include_word_timestamps);
+
+        // Missing key is rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            api_key: String::new(),
+            sample_rate: 16000,
+            ..Default::default()
+        });
+        assert!(AssemblyAISTT::new_standard(&bad).is_err());
+    }
+
     #[test]
     fn test_new_rejects_sample_rate_below_minimum() {
         let config = STTConfig {

@@ -283,10 +283,30 @@ impl BaiduStt {
     /// Create a new Baidu STT client.
     pub fn new(config: STTConfig) -> Result<Self, STTError> {
         let baidu_config = BaiduSttConfig::from_base(config.clone())?;
+        Self::from_baidu_config(config, baidu_config)
+    }
+
+    /// W1 keystone — construct directly from the standardized config so the knobs Baidu can honor
+    /// (its custom-vocabulary model id `lm_id`, read from `provider_extras`) are carried END-TO-END.
+    /// The flat `BaseSTT::new` path uses `from_base` and drops the extras; this is the reachable
+    /// standardized path. Baidu has no boolean feature fields, so those features stay at default.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let baidu_config = BaiduSttConfig::from_standard(std)?;
+        Self::from_baidu_config(std.base.clone(), baidu_config)
+    }
+
+    /// Internal: assemble the client from an already-mapped Baidu config (shared by `new` and
+    /// `new_standard`).
+    fn from_baidu_config(
+        base_config: STTConfig,
+        baidu_config: BaiduSttConfig,
+    ) -> Result<Self, STTError> {
         baidu_config.validate()?;
 
         Ok(Self {
-            base_config: config,
+            base_config,
             config: baidu_config,
             token_manager: Arc::new(TokenManager::new()),
             connected: Arc::new(AtomicBool::new(false)),
@@ -764,6 +784,27 @@ mod tests {
         let config = create_test_config();
         let result = BaiduStt::new(config);
         assert!(result.is_ok());
+    }
+
+    // W1 keystone: Baidu's one honorable knob (custom-vocabulary `lm_id` from provider_extras)
+    // survives through new_standard onto the stored provider config; the flat factory path drops it.
+    #[test]
+    fn new_standard_carries_lm_id_to_config() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+        let mut extras = serde_json::Map::new();
+        extras.insert("lm_id".into(), serde_json::json!(98765));
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "baidu".into(),
+                api_key: "my_api_key|my_secret_key".into(),
+                model: "mandarin".into(),
+                ..create_test_config()
+            },
+            features: Default::default(),
+            extras: ProviderExtras(extras),
+        };
+        let stt = BaiduStt::new_standard(&std).unwrap();
+        assert_eq!(stt.config.lm_id, Some(98765));
     }
 
     #[test]

@@ -260,6 +260,19 @@ impl AwsPollyTTS {
         })
     }
 
+    /// Build the provider from the standardized config (W1 keystone), mirroring
+    /// `DeepgramTTS::from_standard`. Delegates the feature mapping to
+    /// [`AwsPollyTTSConfig::from_standard`] (SSML input type, language override, output
+    /// sample_rate + voice/engine and the `region` extra) so advanced features reach the live
+    /// SynthesizeSpeech request through the standardized dispatch instead of being dropped at the
+    /// flat boundary.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let polly_config = AwsPollyTTSConfig::from_standard(std);
+        Self::new_from_polly_config(polly_config)
+    }
+
     /// Create a new Amazon Polly TTS instance from AwsPollyTTSConfig.
     ///
     /// Use this when you want full control over Polly-specific settings.
@@ -669,6 +682,35 @@ mod tests {
         assert_eq!(tts.voice(), PollyVoice::Joanna);
         assert_eq!(tts.engine(), PollyEngine::Neural);
         assert_eq!(tts.output_format(), PollyOutputFormat::Pcm);
+    }
+
+    // W1 keystone: a StandardTTSConfig advanced feature Polly supports (SSML input type, language
+    // override, output sample_rate) reaches the provider's resolved `polly_config` through the
+    // provider struct's `from_standard`, mirroring `DeepgramTTS::from_standard`.
+    #[tokio::test]
+    async fn from_standard_reaches_provider_config() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "aws-polly".into(),
+                voice_id: Some("Matthew".into()),
+                model: "neural".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                ssml: Some(true),
+                language: Some("en-GB".into()),
+                sample_rate: Some(16000), // valid for the default PCM output format
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = AwsPollyTTS::from_standard(&std).unwrap();
+        assert_eq!(tts.polly_config().text_type, TextType::Ssml);
+        assert_eq!(tts.polly_config().language_code, Some("en-GB".to_string()));
+        assert_eq!(tts.polly_config().base.sample_rate, Some(16000));
+        assert_eq!(tts.voice(), PollyVoice::Matthew);
+        assert_eq!(tts.engine(), PollyEngine::Neural);
     }
 
     #[tokio::test]

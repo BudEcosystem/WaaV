@@ -162,7 +162,22 @@ impl SberDevicesSTT {
     /// Create a new SberDevices STT provider from STTConfig
     pub fn create(config: STTConfig) -> Result<Self, STTError> {
         let sber_config = SberSTTConfig::from_base(&config)?;
+        Self::from_sber_config(config, sber_config)
+    }
 
+    /// W1 keystone — construct directly from the standardized config so it is honored END-TO-END.
+    /// SberDevices SaluteSpeech is a minimal synchronous REST recognizer that exposes none of the
+    /// standardized advanced knobs, so `from_standard` is a pure `from_base` passthrough (capability
+    /// gaps stay at provider defaults); this keeps the standardized dispatch path reachable.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let sber_config = SberSTTConfig::from_standard(std)?;
+        Self::from_sber_config(std.base.clone(), sber_config)
+    }
+
+    /// Internal: construct the provider from an already-mapped SberDevices config.
+    fn from_sber_config(config: STTConfig, sber_config: SberSTTConfig) -> Result<Self, STTError> {
         info!(
             "Creating SberDevices STT provider: language={}, format={:?}",
             sber_config.language.as_code(),
@@ -582,6 +597,47 @@ mod tests {
         let config = create_test_config();
         let stt = SberDevicesSTT::new(config);
         assert!(stt.is_ok());
+    }
+
+    // W1 keystone: the standardized config must build the provider THROUGH `new_standard`, with
+    // the base (credentials/language/scope and the punctuation knob Sber supports) surviving into
+    // the provider's `sber_config`. Advanced streaming features are a capability gap (Sber is a
+    // minimal sync recognizer) and stay at default — they are set here but must be ignored.
+    #[test]
+    fn test_new_standard_carries_base_features() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "sberdevices".into(),
+                api_key: "test_client:test_secret".into(),
+                language: "ru-RU".into(),
+                punctuation: true,
+                model: "SALUTE_SPEECH_PERS".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                interim_results: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let stt = SberDevicesSTT::new_standard(&std).unwrap();
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let expected = STANDARD.encode("test_client:test_secret".as_bytes());
+        use super::super::config::{SberSTTLanguage, SberScope};
+        assert_eq!(stt.sber_config.client_credentials, expected);
+        assert_eq!(stt.sber_config.language, SberSTTLanguage::Russian);
+        assert_eq!(stt.sber_config.scope, SberScope::Personal);
+        assert!(stt.sber_config.enable_punctuation); // base punctuation survived new_standard
+
+        // Empty credentials are rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            provider: "sberdevices".into(),
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(SberDevicesSTT::new_standard(&bad).is_err());
     }
 
     #[test]

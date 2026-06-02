@@ -56,7 +56,7 @@ use std::time::Duration;
 use aws_config::BehaviorVersion;
 use aws_sdk_transcribestreaming::Client as TranscribeClient;
 use aws_sdk_transcribestreaming::types::{
-    AudioEvent, AudioStream, LanguageCode, MediaEncoding as AwsMediaEncoding,
+    AudioEvent, AudioStream, ContentRedactionType, LanguageCode, MediaEncoding as AwsMediaEncoding,
     PartialResultsStability as AwsPartialResultsStability, TranscriptResultStream,
 };
 use aws_smithy_types::Blob;
@@ -206,6 +206,31 @@ impl AwsTranscribeSTT {
         })
     }
 
+    /// W1 keystone — construct directly from the standardized config so the advanced features
+    /// Amazon Transcribe can express (speaker diarization, content/PII redaction, partial-results
+    /// stabilization) are honored END-TO-END. The flat `BaseSTT::new` path hardcodes diarization
+    /// and redaction off; this is the reachable standardized path.
+    ///
+    /// Amazon Transcribe authenticates with AWS credentials (env / credentials file / IAM role),
+    /// NOT an `api_key`, so this does not require `base.api_key` — credentials and region are
+    /// resolved from the environment exactly as the flat `BaseSTT::new` path does.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let mut aws_config = AwsTranscribeSTTConfig::from_standard(std);
+        // Resolve credentials/region from the environment (parity with `BaseSTT::new`).
+        aws_config.region = AwsRegion::from_str_or_default(
+            std::env::var("AWS_REGION")
+                .unwrap_or_else(|_| "us-east-1".to_string())
+                .as_str(),
+        );
+        aws_config.aws_access_key_id = std::env::var("AWS_ACCESS_KEY_ID").ok();
+        aws_config.aws_secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+        aws_config.aws_session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+        aws_config.media_encoding = MediaEncoding::from_str_or_default(&std.base.encoding);
+        Self::new_with_config(aws_config)
+    }
+
     /// Get the current session ID.
     pub async fn get_session_id(&self) -> Option<String> {
         self.session_id.read().await.clone()
@@ -297,6 +322,12 @@ impl AwsTranscribeSTT {
         let vocabulary_filter_name = config.vocabulary_filter_name.clone();
         let session_id = config.session_id.clone();
         let identify_language = config.identify_language;
+        // Content/PII redaction (Review S1): previously set on the config by from_standard but never
+        // forwarded to the request builder, so redaction was silently a no-op (a compliance-grade
+        // failure). Forward it here. Per the AWS SDK, ContentRedactionType=Pii with no
+        // PiiEntityTypes redacts ALL PII; an explicit non-empty list narrows it.
+        let enable_content_redaction = config.enable_content_redaction;
+        let pii_entity_types = config.pii_entity_types.clone();
 
         let is_connected = self.is_connected.clone();
         let session_id_storage = self.session_id.clone();
@@ -360,6 +391,13 @@ impl AwsTranscribeSTT {
 
             if show_speaker_label {
                 request = request.show_speaker_label(true);
+            }
+
+            if enable_content_redaction {
+                request = request.content_redaction_type(ContentRedactionType::Pii);
+                if !pii_entity_types.is_empty() {
+                    request = request.pii_entity_types(pii_entity_types.join(","));
+                }
             }
 
             if let Some(vocab) = vocabulary_name {
@@ -810,6 +848,38 @@ mod tests {
         let stt = AwsTranscribeSTT::new(config).unwrap();
         assert!(!stt.is_ready());
         assert_eq!(stt.get_provider_info(), "Amazon Transcribe Streaming");
+    }
+
+    // W1 keystone: standardized advanced features Amazon Transcribe supports (speaker
+    // diarization + content/PII redaction) survive through `new_standard` into the provider
+    // config — both were hardcoded off on the flat path.
+    #[test]
+    fn test_new_standard_unlocks_diarization_and_redaction() {
+        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "aws-transcribe".to_string(),
+                api_key: String::new(), // AWS uses credentials, not api_key
+                language: "en-US".to_string(),
+                sample_rate: 16000,
+                channels: 1,
+                punctuation: true,
+                encoding: "pcm".to_string(),
+                model: String::new(),
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                redaction: Some(vec!["NAME".into(), "PHONE".into()]),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let stt = AwsTranscribeSTT::new_standard(&std).unwrap();
+        let cfg = stt.config.as_ref().unwrap();
+        assert!(cfg.show_speaker_label);
+        assert_eq!(cfg.max_speaker_labels, Some(10));
+        assert!(cfg.enable_content_redaction);
+        assert_eq!(cfg.pii_entity_types, vec!["NAME", "PHONE"]);
     }
 
     #[tokio::test]

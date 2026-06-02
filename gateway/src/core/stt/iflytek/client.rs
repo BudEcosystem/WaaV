@@ -183,6 +183,41 @@ impl IFlytekStt {
         Self::create_internal(config)
     }
 
+    /// Internal: construct the provider from an already-mapped iFlytek config.
+    fn from_iflytek_config(base_config: STTConfig, iflytek_config: IFlytekSttConfig) -> Self {
+        Self {
+            base_config,
+            config: iflytek_config,
+            connected: AtomicBool::new(false),
+            state_notify: Arc::new(Notify::new()),
+            ws_sender: None,
+            shutdown_tx: None,
+            connection_handle: None,
+            result_forward_handle: None,
+            error_forward_handle: None,
+            result_callback: Arc::new(Mutex::new(None)),
+            error_callback: Arc::new(Mutex::new(None)),
+            frame_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// W1 keystone — construct directly from the standardized config so the advanced features
+    /// iFlytek can express (smart_format → convert_numbers, endpointing_ms → vad_eos_ms) are
+    /// honored END-TO-END. The flat `BaseSTT::new` path can only see the base config; this is the
+    /// reachable standardized path. Features iFlytek's API lacks remain capability gaps at default.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "API key is required".to_string(),
+            ));
+        }
+        let iflytek_config = IFlytekSttConfig::from_standard(std)?;
+        iflytek_config.validate()?;
+        Ok(Self::from_iflytek_config(std.base.clone(), iflytek_config))
+    }
+
     /// Handle incoming WebSocket message.
     fn handle_websocket_message(
         message: Message,
@@ -709,6 +744,37 @@ mod tests {
         let stt = result.unwrap();
         assert!(!stt.is_ready());
         assert_eq!(stt.get_provider_info(), PROVIDER_INFO);
+    }
+
+    // W1 keystone: a standardized advanced feature iFlytek can express (endpointing_ms →
+    // vad_eos_ms, smart_format → convert_numbers) survives through `new_standard` onto the
+    // provider's own config — proving the standardized path doesn't drop it.
+    #[test]
+    fn test_iflytek_new_standard_unlocks_features() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "iflytek".into(),
+                api_key: create_test_api_key(),
+                ..create_test_config()
+            },
+            features: SttFeatures {
+                smart_format: Some(false),
+                endpointing_ms: Some(1500),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let stt = IFlytekStt::new_standard(&std).unwrap();
+        assert_eq!(stt.config.vad_eos_ms, 1500); // endpointing_ms survived to provider config
+        assert!(!stt.config.convert_numbers); // smart_format survived
+
+        // Missing key is rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(IFlytekStt::new_standard(&bad).is_err());
     }
 
     #[test]

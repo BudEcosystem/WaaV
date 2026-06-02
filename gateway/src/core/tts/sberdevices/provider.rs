@@ -94,6 +94,36 @@ impl Default for SberDevicesTts {
 }
 
 impl SberDevicesTts {
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// Mirrors `DeepgramTTS::from_standard`: maps the standardized features onto SberDevices'
+    /// provider config via [`SberTtsConfig::from_standard`] (sample_rate + the timeout extras),
+    /// then constructs the provider mirroring [`BaseTTS::new`] (HTTP client built from the
+    /// resolved timeouts). SberDevices SaluteSpeech exposes no prosody knobs, so speed/pitch/
+    /// emotion/instructions/ssml/seed/… are capability gaps and stay at their defaults.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let sber_config =
+            SberTtsConfig::from_standard(std).map_err(TTSError::InvalidConfiguration)?;
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(sber_config.connection_timeout_secs))
+            .timeout(Duration::from_secs(sber_config.request_timeout_secs))
+            .build()
+            .map_err(|e| TTSError::InternalError(format!("Failed to create HTTP client: {}", e)))?;
+
+        Ok(Self {
+            config: Some(sber_config),
+            state: ConnectionState::Disconnected,
+            state_notify: Arc::new(Notify::new()),
+            client,
+            token_manager: Arc::new(RwLock::new(TokenManager::new())),
+            audio_callback: Arc::new(RwLock::new(None)),
+            connected: AtomicBool::new(false),
+        })
+    }
+
     /// Obtain OAuth access token
     async fn obtain_token(&self) -> TTSResult<String> {
         let config = self.config.as_ref().ok_or_else(|| {
@@ -460,6 +490,25 @@ mod tests {
             sample_rate: Some(24000),
             ..Default::default()
         }
+    }
+
+    // The provider struct's `from_standard` (mirroring `DeepgramTTS::from_standard`) maps a
+    // standardized advanced feature (sample_rate) all the way onto the provider config the
+    // synthesis request reads — proving the standardized dispatch path reaches the struct, not
+    // just the config-level method.
+    #[test]
+    fn from_standard_maps_sample_rate_onto_provider_config() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                sample_rate: Some(8000),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = SberDevicesTts::from_standard(&std).unwrap();
+        assert_eq!(tts.config.as_ref().unwrap().sample_rate, 8000);
     }
 
     #[test]

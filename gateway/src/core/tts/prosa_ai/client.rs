@@ -48,6 +48,47 @@ pub struct ProsaTts {
 }
 
 impl ProsaTts {
+    /// Construct the client from an already-built Prosa config (shared by `new` and
+    /// `from_standard`).
+    fn from_prosa_config(prosa_config: ProsaTtsConfig) -> TTSResult<Self> {
+        let timeout_secs = prosa_config.request_timeout_secs;
+        let http_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| {
+                TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
+            })?;
+
+        info!(
+            "Prosa TTS: Initialized with voice='{}', format={}",
+            prosa_config.voice.display_name(),
+            prosa_config.audio_format
+        );
+
+        Ok(Self {
+            config: prosa_config,
+            http_client,
+            is_ready: AtomicBool::new(false),
+            audio_callback: Arc::new(RwLock::new(None)),
+            connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
+        })
+    }
+
+    /// Builds the client from the standardized config (W1 keystone for TTS — uniform entry point,
+    /// mirroring `DeepgramTTS::from_standard`).
+    ///
+    /// Delegates the feature mapping to [`ProsaTtsConfig::from_standard`] (speed → tempo,
+    /// pitch → integer pitch offset; the non-standard `label`/`wait`/`as_signed_url` knobs flow
+    /// through the `extras` passthrough), then builds the client. Voice-tone features (volume,
+    /// stability, similarity_boost, style, use_speaker_boost, emotion, instructions, SSML,
+    /// language, word_timestamps, streaming, seed, sample_rate) have no Prosa field and are skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let prosa_config = ProsaTtsConfig::from_standard(std)?;
+        Self::from_prosa_config(prosa_config)
+    }
+
     /// Synthesize text and return audio data.
     async fn synthesize(&self, text: &str) -> TTSResult<Vec<u8>> {
         if text.is_empty() {
@@ -309,28 +350,7 @@ impl Default for ProsaTts {
 impl BaseTTS for ProsaTts {
     fn new(config: TTSConfig) -> TTSResult<Self> {
         let prosa_config = ProsaTtsConfig::from_base(config)?;
-
-        let timeout_secs = prosa_config.request_timeout_secs;
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| {
-                TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
-            })?;
-
-        info!(
-            "Prosa TTS: Initialized with voice='{}', format={}",
-            prosa_config.voice.display_name(),
-            prosa_config.audio_format
-        );
-
-        Ok(Self {
-            config: prosa_config,
-            http_client,
-            is_ready: AtomicBool::new(false),
-            audio_callback: Arc::new(RwLock::new(None)),
-            connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
-        })
+        Self::from_prosa_config(prosa_config)
     }
 
     async fn connect(&mut self) -> TTSResult<()> {
@@ -493,6 +513,38 @@ mod tests {
             voice_id: Some("dimas".to_string()),
             ..Default::default()
         }
+    }
+
+    // W1 keystone (TTS): the standardized features Prosa can express (speed → tempo,
+    // pitch → integer pitch offset) reach the built client's config via the struct-level
+    // `from_standard`, and the non-standard `label`/`as_signed_url` knobs flow through the extras
+    // passthrough.
+    #[test]
+    fn from_standard_maps_features_to_client() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("label".into(), serde_json::json!("greeting"));
+        extras.insert("as_signed_url".into(), serde_json::json!(true));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "prosa-ai".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                pitch: Some(3.0),
+                ssml: Some(true), // capability gap: ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let tts = ProsaTts::from_standard(&std).unwrap();
+        assert!((tts.config.tempo - 1.5).abs() < f32::EPSILON);
+        assert_eq!(tts.config.pitch, 3);
+        assert_eq!(tts.config.label, Some("greeting".to_string()));
+        assert!(tts.config.as_signed_url);
+        assert_eq!(tts.config.api_key, "k");
     }
 
     #[test]

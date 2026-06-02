@@ -44,6 +44,35 @@ pub struct SpeechmaticsSTT {
 }
 
 impl SpeechmaticsSTT {
+    /// W1 keystone — construct directly from the standardized config so Speechmatics' rich feature
+    /// surface (diarization, interim partials, entity detection, custom vocabulary) is honored
+    /// END-TO-END. The flat `BaseSTT::new` path uses `from_base`, which hardcodes those off; this
+    /// is the reachable standardized path.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let speechmatics_config = SpeechmaticsSTTConfig::from_standard(std)?;
+        speechmatics_config.validate()?;
+
+        info!(
+            "Creating Speechmatics STT client (standardized): region={}, language={}, operating_point={}",
+            speechmatics_config.region,
+            speechmatics_config.language,
+            speechmatics_config.operating_point
+        );
+
+        Ok(Self {
+            config: speechmatics_config,
+            base_config: Some(std.base.clone()),
+            ws: Arc::new(RwLock::new(None)),
+            is_connected: Arc::new(AtomicBool::new(false)),
+            is_session_started: Arc::new(AtomicBool::new(false)),
+            seq_no: Arc::new(AtomicU64::new(0)),
+            result_callback: Arc::new(RwLock::new(None)),
+            error_callback: Arc::new(RwLock::new(None)),
+        })
+    }
+
     /// Build the WebSocket URL with authentication
     fn build_ws_url(&self) -> String {
         self.config.ws_url().to_string()
@@ -419,6 +448,41 @@ mod tests {
         let config = STTConfig::default();
         let result = SpeechmaticsSTT::new(config);
         assert!(result.is_err());
+    }
+
+    // W1 keystone: Speechmatics' rich advanced features (diarization, interim partials, entity
+    // detection, custom vocabulary) must survive THROUGH `new_standard` into the provider's
+    // config — not just the config-level `from_standard`. The flat `new` path leaves them off.
+    #[test]
+    fn test_new_standard_unlocks_advanced_features() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "speechmatics".into(),
+                api_key: "test-api-key".into(),
+                language: "en".into(),
+                sample_rate: 16000,
+                encoding: "pcm_s16le".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                interim_results: Some(true),
+                entity_detection: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "Speechmatics".into()]),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let stt = SpeechmaticsSTT::new_standard(&std).unwrap();
+        assert!(stt.config.enable_diarization);
+        assert!(stt.config.enable_partials);
+        assert!(stt.config.enable_entities);
+        assert_eq!(stt.config.additional_vocab, vec!["WaaV", "Speechmatics"]);
+
+        // Missing api_key is rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig::default());
+        assert!(SpeechmaticsSTT::new_standard(&bad).is_err());
     }
 
     #[test]

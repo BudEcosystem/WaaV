@@ -152,6 +152,39 @@ impl ViettelTts {
         Ok(audio_data)
     }
 
+    /// Build from the standardized TTS config (W1 keystone). Mirrors [`BaseTTS::new`] but maps the
+    /// standardized features via [`ViettelTtsConfig::from_standard`] (which honors `speed` and the
+    /// `without_filter` / `tts_return_option` extras) before constructing the timeout-bounded HTTP
+    /// client. Features Viettel cannot express stay at provider defaults (capability gaps).
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let viettel_config = ViettelTtsConfig::from_standard(std)?;
+
+        let timeout_secs = viettel_config.request_timeout_secs;
+        let http_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| {
+                TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
+            })?;
+
+        info!(
+            "Viettel TTS: Initialized (standardized) with voice='{}', speed={}",
+            viettel_config.voice.display_name(),
+            viettel_config.speed
+        );
+
+        Ok(Self {
+            config: viettel_config,
+            http_client,
+            is_ready: AtomicBool::new(false),
+            audio_callback: Arc::new(RwLock::new(None)),
+            connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
+            request_counter: AtomicU64::new(1),
+        })
+    }
+
     /// Get the Viettel-specific configuration.
     pub fn get_viettel_config(&self) -> &ViettelTtsConfig {
         &self.config
@@ -445,6 +478,31 @@ mod tests {
 
         let tts = result.unwrap();
         assert!(!tts.is_ready());
+    }
+
+    // W1 keystone (TTS): the struct-level `from_standard` builds a real `ViettelTts` through the
+    // standardized path, carrying the `speed` feature (Viettel's only prosody knob) onto the
+    // provider config the request builder reads. Mirrors `DeepgramTTS::from_standard`.
+    #[test]
+    fn from_standard_builds_provider_with_speed() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "viettel_ai".into(),
+                api_key: "test_token".into(),
+                voice_id: Some("doanngocle".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = ViettelTts::from_standard(&std).unwrap();
+        assert!((tts.config.speed - 1.5).abs() < f32::EPSILON);
+        assert_eq!(tts.config.voice, ViettelVoice::DoanNgocLe);
+        assert_eq!(tts.config.api_key, "test_token");
     }
 
     #[test]

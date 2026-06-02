@@ -368,6 +368,30 @@ impl SmallestTts {
         self.config_hash =
             compute_smallest_tts_config_hash(&self.base_config, &self.smallest_config);
     }
+
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// Mirrors `DeepgramTTS::from_standard`: maps the standardized features onto Smallest's
+    /// provider config via [`SmallestTtsConfig::from_standard`] (speed, stability -> consistency,
+    /// similarity_boost -> similarity, language, sample_rate + the enhancement extra), then
+    /// constructs the provider mirroring [`BaseTTS::new`]. Capability gaps (pitch, volume, style,
+    /// emotion, instructions, ssml, seed, …) have no Smallest field and stay at their defaults.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let smallest_config = SmallestTtsConfig::from_standard(std)?;
+        smallest_config.validate()?;
+
+        let base_config = std.base.clone();
+        let config_hash = compute_smallest_tts_config_hash(&base_config, &smallest_config);
+
+        Ok(Self {
+            provider: TTSProvider::new()?,
+            smallest_config,
+            base_config,
+            config_hash,
+        })
+    }
 }
 
 #[async_trait]
@@ -569,6 +593,25 @@ mod tests {
             request_pool_size: Some(4),
             emotion_config: None,
         }
+    }
+
+    // The provider struct's `from_standard` (mirroring `DeepgramTTS::from_standard`) maps a
+    // standardized advanced feature (speed) all the way onto the provider config the request
+    // builder reads — proving the standardized dispatch path reaches the struct, not just the
+    // config-level method.
+    #[test]
+    fn from_standard_maps_speed_onto_provider_config() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                speed: Some(1.5),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = SmallestTts::from_standard(&std).unwrap();
+        assert_eq!(tts.smallest_config().speed, 1.5);
     }
 
     // =========================================================================

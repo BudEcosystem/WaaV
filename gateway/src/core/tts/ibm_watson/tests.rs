@@ -467,6 +467,38 @@ mod provider_tests {
         assert_eq!(tts.output_format(), IbmOutputFormat::Mp3);
     }
 
+    // W1 keystone: the provider struct's `from_standard` maps prosody (speed -> rate_percentage,
+    // pitch -> pitch_percentage) and the `instance_id` extras passthrough onto the provider config
+    // the request builder reads.
+    #[tokio::test]
+    async fn from_standard_maps_prosody_to_provider() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("instance_id".into(), serde_json::json!("inst-xyz"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "ibm-watson".to_string(),
+                api_key: "test_key".to_string(),
+                voice_id: Some("en-US_MichaelV3Voice".to_string()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.25), // (1.25 - 1.0) * 100 = +25%
+                pitch: Some(-10.0),
+                sample_rate: Some(22050),
+                ..Default::default()
+            },
+            extras: crate::core::tts::standard::ProviderExtras(extras),
+        };
+        let tts = IbmWatsonTTS::from_standard(&std).unwrap();
+        let cfg = tts.ibm_config();
+        assert_eq!(cfg.rate_percentage, Some(25));
+        assert_eq!(cfg.pitch_percentage, Some(-10));
+        assert_eq!(cfg.base.sample_rate, Some(22050));
+        assert_eq!(cfg.instance_id, "inst-xyz");
+        assert_eq!(tts.voice(), IbmVoice::EnUsMichaelV3Voice);
+    }
+
     #[tokio::test]
     async fn test_provider_creation_from_ibm_config() {
         let config = IbmWatsonTTSConfig {

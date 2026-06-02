@@ -134,6 +134,38 @@ impl Default for GoogleSTT {
 }
 
 impl GoogleSTT {
+    /// W1 keystone — construct directly from the standardized config so Google's mappable
+    /// features (interim results, voice-activity events) and its non-standard `project_id`
+    /// (read from `extras`) are honored END-TO-END. Mirrors `DeepgramSTT::new_standard`: the
+    /// credential is `std.base.api_key` (a Google credential source), used to build the auth
+    /// client exactly as `BaseSTT::new` does. Features Google can't express stay at default.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "API key is required".to_string(),
+            ));
+        }
+        let google_config = GoogleSTTConfig::from_standard(std);
+        let auth_client = STTGoogleAuthClient::from_api_key(&std.base.api_key)?;
+        Ok(Self {
+            config: Some(google_config),
+            state: ConnectionState::Disconnected,
+            state_notify: Arc::new(Notify::new()),
+            audio_sender: None,
+            shutdown_tx: None,
+            result_tx: None,
+            error_tx: None,
+            connection_handle: None,
+            result_forward_handle: None,
+            error_forward_handle: None,
+            result_callback: Arc::new(RwLock::new(None)),
+            error_callback: Arc::new(RwLock::new(None)),
+            auth_client: Some(Arc::new(auth_client)),
+        })
+    }
+
     pub(super) fn create_google_config(config: STTConfig, project_id: String) -> GoogleSTTConfig {
         GoogleSTTConfig {
             base: config,

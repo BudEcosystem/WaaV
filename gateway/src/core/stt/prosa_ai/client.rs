@@ -67,7 +67,16 @@ impl ProsaStt {
     /// Create a new Prosa.ai STT client.
     pub fn new(config: STTConfig) -> Result<Self, STTError> {
         let prosa_config = ProsaSttConfig::from_base(&config)?;
+        Self::from_prosa_config(prosa_config, Some(config))
+    }
 
+    /// Internal: construct the provider from an already-mapped Prosa config (and the optional
+    /// originating base config). Centralizes HTTP-client construction so both the flat `new` and
+    /// the standardized `new_standard` paths share one builder.
+    fn from_prosa_config(
+        prosa_config: ProsaSttConfig,
+        base_config: Option<STTConfig>,
+    ) -> Result<Self, STTError> {
         let http_client = Client::builder()
             .timeout(std::time::Duration::from_secs(
                 prosa_config.request_timeout_secs,
@@ -79,7 +88,7 @@ impl ProsaStt {
 
         Ok(Self {
             config: prosa_config,
-            base_config: Some(config),
+            base_config,
             http_client,
             ws_sink: Arc::new(RwLock::new(None)),
             audio_buffer: Arc::new(RwLock::new(Vec::new())),
@@ -88,6 +97,22 @@ impl ProsaStt {
             error_callback: Arc::new(RwLock::new(None)),
             current_job_id: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// W1 keystone — construct directly from the standardized config so the advanced features
+    /// Prosa.ai can express (interim results, filler words, smart formatting) are honored
+    /// END-TO-END. Mirrors `DeepgramSTT::new_standard`: validate the api_key, then build the
+    /// provider from the standardized->provider config mapping (`ProsaSttConfig::from_standard`).
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "Prosa.ai API key is required".to_string(),
+            ));
+        }
+        let prosa_config = ProsaSttConfig::from_standard(std)?;
+        Self::from_prosa_config(prosa_config, Some(std.base.clone()))
     }
 
     /// Get the Prosa.ai specific configuration.

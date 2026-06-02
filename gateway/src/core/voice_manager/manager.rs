@@ -119,10 +119,26 @@ impl VoiceManager {
         config: VoiceManagerConfig,
         turn_detector: Option<Arc<RwLock<TurnDetector>>>,
     ) -> VoiceManagerResult<Self> {
-        let tts = create_tts_provider(&config.tts_config.provider, config.tts_config.clone())
-            .map_err(VoiceManagerError::TTSError)?;
-        let stt = create_stt_provider(&config.stt_config.provider, config.stt_config.clone())
-            .map_err(VoiceManagerError::STTError)?;
+        // Prefer the reachable W1 keystone path when a standardized config is present so advanced
+        // features (diarization, keyterms, voice settings, …) are honored END-TO-END. Fall back to
+        // the flat factory for the legacy path (and for providers not yet migrated, where
+        // `create_*_standard` itself delegates to the flat factory).
+        let tts = match &config.standard_tts {
+            Some(std_tts) => {
+                crate::core::tts::standard::create_tts_standard(&std_tts.base.provider, std_tts.clone())
+                    .map_err(VoiceManagerError::TTSError)?
+            }
+            None => create_tts_provider(&config.tts_config.provider, config.tts_config.clone())
+                .map_err(VoiceManagerError::TTSError)?,
+        };
+        let stt = match &config.standard_stt {
+            Some(std_stt) => {
+                crate::core::stt::standard::create_stt_standard(&std_stt.base.provider, std_stt.clone())
+                    .map_err(VoiceManagerError::STTError)?
+            }
+            None => create_stt_provider(&config.stt_config.provider, config.stt_config.clone())
+                .map_err(VoiceManagerError::STTError)?,
+        };
 
         // Pre-allocate string buffers with reasonable capacity
         const TEXT_BUFFER_CAPACITY: usize = 1024;

@@ -520,7 +520,9 @@ impl SmallestTtsConfig {
             )));
         }
 
-        if self.enhancement < MIN_ENHANCEMENT || self.enhancement > MAX_ENHANCEMENT {
+        // `enhancement` is a `u8` and `MIN_ENHANCEMENT == 0`, so the lower bound is
+        // guaranteed by the type; only the upper bound needs validating.
+        if self.enhancement > MAX_ENHANCEMENT {
             return Err(TTSError::InvalidConfiguration(format!(
                 "Enhancement must be between {} and {}",
                 MIN_ENHANCEMENT, MAX_ENHANCEMENT

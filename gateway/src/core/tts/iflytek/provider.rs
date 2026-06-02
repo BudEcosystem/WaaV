@@ -121,12 +121,19 @@ impl IFlytekTts {
     /// Create a new iFlytek TTS provider (internal).
     fn create_internal(config: TTSConfig) -> TTSResult<Self> {
         let iflytek_config = IFlytekTtsConfig::from_base(config.clone())?;
+        Self::create_from_iflytek_config(config, iflytek_config)
+    }
 
+    /// Create a provider from a pre-built iFlytek-specific config (shared by `from_standard`).
+    fn create_from_iflytek_config(
+        base_config: TTSConfig,
+        iflytek_config: IFlytekTtsConfig,
+    ) -> TTSResult<Self> {
         // Validate configuration
         iflytek_config.validate()?;
 
         Ok(Self {
-            base_config: config,
+            base_config,
             config: iflytek_config,
             connected: AtomicBool::new(false),
             text_sender: None,
@@ -136,6 +143,17 @@ impl IFlytekTts {
             audio_callback: Arc::new(Mutex::new(None)),
             bytes_synthesized: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
+    }
+
+    /// Build from the standardized TTS config (W1 keystone), mirroring `DeepgramTTS::from_standard`.
+    /// Delegates feature mapping to [`IFlytekTtsConfig::from_standard`] (speed/pitch/volume as
+    /// iFlytek 0-100 levels, sample_rate, plus the `background_sound` extras passthrough) so
+    /// advanced prosody reaches the provider config the WebSocket request reads.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let iflytek_config = IFlytekTtsConfig::from_standard(std)?;
+        Self::create_from_iflytek_config(std.base.clone(), iflytek_config)
     }
 
     /// Handle incoming WebSocket message.
@@ -586,6 +604,29 @@ mod tests {
 
         let tts = result.unwrap();
         assert!(!tts.is_ready());
+    }
+
+    // W1 keystone: the provider struct's `from_standard` maps prosody (speed/pitch/volume as
+    // iFlytek 0-100 levels) through onto the provider config the WebSocket request reads.
+    #[test]
+    fn from_standard_maps_prosody_to_provider_config() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                speed: Some(1.0), // 1.0 multiplier * 50 -> 50 (normal) on iFlytek's 0-100 scale
+                pitch: Some(70.0),
+                volume: Some(80.0),
+                sample_rate: Some(16000),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = IFlytekTts::from_standard(&std).unwrap();
+        assert_eq!(tts.config.speed, 50);
+        assert_eq!(tts.config.pitch, 70);
+        assert_eq!(tts.config.volume, 80);
+        assert_eq!(tts.config.sample_rate, 16000);
     }
 
     #[test]

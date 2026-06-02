@@ -297,6 +297,37 @@ impl Default for IbmWatsonSTT {
 }
 
 impl IbmWatsonSTT {
+    /// W1 keystone — construct directly from the standardized config so IBM Watson's rich feature
+    /// surface (interim results, word timestamps, speaker diarization, smart formatting, profanity
+    /// filtering, redaction) and its non-standard `instance_id` (via `extras`) are honored
+    /// END-TO-END. Mirrors `DeepgramSTT::new_standard`: the api_key is checked first, then the
+    /// provider is built from `IbmWatsonSTTConfig::from_standard`.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "IBM Watson API key is required".to_string(),
+            ));
+        }
+        Ok(Self {
+            config: Some(IbmWatsonSTTConfig::from_standard(std)),
+            state: ConnectionState::Disconnected,
+            state_notify: Arc::new(Notify::new()),
+            ws_sender: None,
+            shutdown_tx: None,
+            result_tx: None,
+            error_tx: None,
+            connection_handle: None,
+            result_forward_handle: None,
+            error_forward_handle: None,
+            result_callback: Arc::new(Mutex::new(None)),
+            error_callback: Arc::new(Mutex::new(None)),
+            iam_token: Arc::new(RwLock::new(None)),
+            connected: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
     /// Set the IBM Cloud instance ID.
     ///
     /// The instance ID is found in your IBM Cloud service credentials.

@@ -102,6 +102,14 @@ impl HuaweiCloudTts {
     /// Create a new Huawei Cloud TTS provider (internal).
     fn create_internal(config: TTSConfig) -> TTSResult<Self> {
         let huawei_config = HuaweiCloudTtsConfig::from_base(config.clone())?;
+        Self::create_from_huawei_config(config, huawei_config)
+    }
+
+    /// Create a provider from a pre-built Huawei-specific config (shared by `from_standard`).
+    fn create_from_huawei_config(
+        base_config: TTSConfig,
+        huawei_config: HuaweiCloudTtsConfig,
+    ) -> TTSResult<Self> {
         huawei_config.validate()?;
 
         // Create HTTP client with connection pooling
@@ -114,7 +122,7 @@ impl HuaweiCloudTts {
             .map_err(|e| TTSError::InternalError(format!("Failed to create HTTP client: {}", e)))?;
 
         Ok(Self {
-            base_config: config,
+            base_config,
             config: huawei_config,
             token_manager: Arc::new(HuaweiTokenManager::new()),
             client,
@@ -123,6 +131,17 @@ impl HuaweiCloudTts {
             bytes_synthesized: Arc::new(AtomicU64::new(0)),
             requests_count: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Build from the standardized TTS config (W1 keystone), mirroring `DeepgramTTS::from_standard`.
+    /// Delegates feature mapping to [`HuaweiCloudTtsConfig::from_standard`] (speed/pitch/volume,
+    /// sample_rate, plus the `region` extras passthrough) so advanced features reach the provider
+    /// config the request builder reads.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let huawei_config = HuaweiCloudTtsConfig::from_standard(std)?;
+        Self::create_from_huawei_config(std.base.clone(), huawei_config)
     }
 
     /// Get the IAM token, fetching if necessary.
@@ -470,6 +489,29 @@ mod tests {
         let config = create_test_config();
         let result = HuaweiCloudTts::new(config);
         assert!(result.is_ok());
+    }
+
+    // W1 keystone: the provider struct's `from_standard` maps prosody features through onto the
+    // Huawei-specific config the request builder reads. Asserts speed/pitch/volume reach the config.
+    #[test]
+    fn from_standard_maps_prosody_to_provider_config() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                speed: Some(1.0), // 1.0 multiplier -> 0 (normal) in Huawei's -500..=500 range
+                pitch: Some(120.0),
+                volume: Some(80.0),
+                sample_rate: Some(8000),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = HuaweiCloudTts::from_standard(&std).unwrap();
+        assert_eq!(tts.config.speed, 0);
+        assert_eq!(tts.config.pitch, 120);
+        assert_eq!(tts.config.volume, 80);
+        assert_eq!(tts.config.sample_rate, 8000);
     }
 
     #[test]

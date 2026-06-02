@@ -162,6 +162,25 @@ impl Default for ElevenLabsSTT {
 }
 
 impl ElevenLabsSTT {
+    /// W1 keystone — construct directly from the standardized config so ElevenLabs' advanced
+    /// features (word timestamps, diarization, entity detection, key terms, PII/PHI redaction)
+    /// are honored END-TO-END. The flat `BaseSTT::new` path hardcodes those off; this is the
+    /// reachable standardized path mirroring `DeepgramSTT::new_standard`.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "API key is required for ElevenLabs STT".to_string(),
+            ));
+        }
+        // `ElevenLabsSTT` implements `Drop`, so a struct-update move (`..Default::default()`)
+        // is illegal; start from the Default value and overwrite only the config.
+        let mut stt = Self::default();
+        stt.config = Some(ElevenLabsSTTConfig::from_standard(std));
+        Ok(stt)
+    }
+
     /// Build the WebSocket URL with query parameters.
     pub(crate) fn build_websocket_url(
         &self,

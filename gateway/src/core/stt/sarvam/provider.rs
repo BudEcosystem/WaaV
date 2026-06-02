@@ -145,6 +145,36 @@ pub struct SarvamSTT {
 }
 
 impl SarvamSTT {
+    /// W1 keystone — construct directly from the standardized config so the advanced features
+    /// Sarvam can express (`vad_events` -> `vad_signals`) are honored END-TO-END. The flat
+    /// `BaseSTT::new` path uses `from_base`, which hardcodes those defaults; this is the
+    /// reachable standardized path.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "SARVAM_API_KEY is required".to_string(),
+            ));
+        }
+        let sarvam_config = SarvamSTTConfig::from_standard(std);
+        Ok(Self {
+            config: Some(std.base.clone()),
+            sarvam_config: Some(sarvam_config),
+            state: ConnectionState::Disconnected,
+            state_notify: Arc::new(Notify::new()),
+            ws_sender: None,
+            shutdown_tx: None,
+            result_tx: None,
+            error_tx: None,
+            connection_handle: None,
+            result_forward_handle: None,
+            error_forward_handle: None,
+            result_callback: Arc::new(Mutex::new(None)),
+            error_callback: Arc::new(Mutex::new(None)),
+        })
+    }
+
     /// Handle incoming WebSocket messages
     fn handle_websocket_message(
         message: Message,
@@ -702,6 +732,36 @@ mod tests {
         } else {
             panic!("Expected AuthenticationFailed error");
         }
+    }
+
+    // W1 keystone: the standardized `vad_events` feature must survive THROUGH `new_standard`
+    // into the provider's Sarvam config (`vad_signals`), not just the config-level `from_standard`.
+    #[test]
+    fn test_new_standard_unlocks_vad_events() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "sarvam".into(),
+                api_key: "test_key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                vad_events: Some(false),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let stt = SarvamSTT::new_standard(&std).unwrap();
+        let sarvam_config = stt.sarvam_config.as_ref().expect("sarvam_config set");
+        assert!(!sarvam_config.vad_signals); // vad_events -> vad_signals survived new_standard
+
+        // Empty api_key is still rejected through the standardized path.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            provider: "sarvam".into(),
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(SarvamSTT::new_standard(&bad).is_err());
     }
 
     #[test]

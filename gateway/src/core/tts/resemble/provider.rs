@@ -188,6 +188,30 @@ impl ResembleTts {
     pub fn resemble_config(&self) -> &ResembleTtsConfig {
         &self.resemble_config
     }
+
+    /// Builds the provider from the standardized config (W1 keystone for TTS — uniform entry
+    /// point, mirroring `DeepgramTTS::from_standard`).
+    ///
+    /// Delegates the feature mapping to [`ResembleTtsConfig::from_standard`] (sample_rate → the
+    /// real field; the non-standard `project_uuid`/`use_hd` knobs flow through the `extras`
+    /// passthrough). Voice-tone features (stability, style, emotion, instructions, SSML,
+    /// speed/pitch/volume, word_timestamps, streaming, seed) have no Resemble field and are skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let resemble_config = ResembleTtsConfig::from_standard(std)?;
+
+        info!(
+            "Creating Resemble AI TTS provider: voice_uuid={}, model={}",
+            resemble_config.voice_uuid, resemble_config.model
+        );
+
+        Ok(Self {
+            provider: TTSProvider::new()?,
+            resemble_config,
+            base_config: std.base.clone(),
+        })
+    }
 }
 
 #[async_trait]
@@ -279,6 +303,37 @@ mod tests {
     use super::*;
     use crate::core::tts::base::Pronunciation;
     use crate::core::tts::resemble::config::ResembleModel;
+
+    // W1 keystone (TTS): the standardized `sample_rate` override reaches the built provider's
+    // Resemble config through the struct-level `from_standard`, and the non-standard
+    // `project_uuid`/`use_hd` knobs flow through the extras passthrough.
+    #[test]
+    fn from_standard_maps_features_to_provider() {
+        use crate::core::stt::standard::ProviderExtras;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("project_uuid".into(), serde_json::json!("proj-123"));
+        extras.insert("use_hd".into(), serde_json::json!(true));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                api_key: "test-key".to_string(),
+                voice_id: Some("voice-uuid".to_string()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                sample_rate: Some(44100),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let tts = ResembleTts::from_standard(&std).unwrap();
+        let cfg = tts.resemble_config();
+        assert_eq!(cfg.api_key, "test-key");
+        assert_eq!(cfg.voice_uuid, "voice-uuid");
+        assert_eq!(cfg.sample_rate, 44100);
+        assert_eq!(cfg.project_uuid, Some("proj-123".to_string()));
+        assert!(cfg.use_hd);
+    }
 
     #[test]
     fn test_resemble_tts_creation() {

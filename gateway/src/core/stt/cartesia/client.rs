@@ -161,6 +161,25 @@ pub struct CartesiaSTT {
 }
 
 impl CartesiaSTT {
+    /// W1 keystone — construct directly from the standardized config so the one advanced feature
+    /// Cartesia can express (endpointing: `endpointing_ms` -> `max_silence_duration_secs`) is
+    /// honored END-TO-END. The flat `BaseSTT::new` path uses `from_base` (defaults only); this is
+    /// the reachable standardized path. Capabilities Cartesia lacks stay at their defaults.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "API key is required for Cartesia STT".to_string(),
+            ));
+        }
+        // `Self` implements `Drop`, so the struct-update (`..Default::default()`) move is illegal;
+        // start from the Default value and overwrite only the config.
+        let mut stt = Self::default();
+        stt.config = Some(CartesiaSTTConfig::from_standard(std));
+        Ok(stt)
+    }
+
     /// Handle incoming WebSocket messages and convert to STTResult.
     ///
     /// This is optimized for the hot path:
@@ -645,6 +664,37 @@ impl Drop for CartesiaSTT {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: Cartesia's one mappable advanced feature (endpointing) survives through
+    // new_standard onto the stored provider config (ms -> seconds); the flat factory path drops it.
+    #[test]
+    fn new_standard_carries_endpointing_to_config() {
+        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "cartesia".into(),
+                api_key: "test_key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                endpointing_ms: Some(500),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let stt = CartesiaSTT::new_standard(&std).unwrap();
+        assert_eq!(
+            stt.config.as_ref().unwrap().max_silence_duration_secs,
+            Some(0.5)
+        );
+
+        // Missing key is rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(CartesiaSTT::new_standard(&bad).is_err());
+    }
     use tokio::time::Duration;
 
     #[tokio::test]

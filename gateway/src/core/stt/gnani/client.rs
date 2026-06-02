@@ -75,6 +75,23 @@ impl Default for GnaniSTT {
 }
 
 impl GnaniSTT {
+    /// W1 keystone — construct directly from the standardized config so Gnani's only mappable
+    /// feature (interim/partial results) and its non-standard credentials (`token`, `access_key`
+    /// via `extras`) are honored END-TO-END. The remaining advanced features are capability gaps
+    /// Gnani cannot express and stay at default. Mirrors `DeepgramSTT::new_standard`; credential
+    /// validation happens at `connect()` time (parity with `BaseSTT::new`), since Gnani
+    /// authenticates with mTLS token/access_key rather than an api_key.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let gnani_config =
+            GnaniSTTConfig::from_standard(std).map_err(STTError::ConfigurationError)?;
+        Ok(Self {
+            config: Some(gnani_config),
+            ..Default::default()
+        })
+    }
+
     /// Create a new Gnani STT instance
     pub fn create(config: STTConfig) -> Result<Self, STTError> {
         // Convert base config to Gnani-specific config
@@ -298,6 +315,36 @@ mod tests {
         let config = create_test_config();
         let result = GnaniSTT::create(config);
         assert!(result.is_ok());
+    }
+
+    // W1 keystone: Gnani's mappable feature (interim/partial results) plus its non-standard
+    // credentials (via extras) must survive through `new_standard` into the provider config
+    // (previously dropped by the flat factory).
+    #[test]
+    fn new_standard_propagates_interim_results_and_creds() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "gnani".into(),
+                api_key: String::new(),
+                language: "hi-IN".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                interim_results: Some(false),
+                ..Default::default()
+            },
+            extras: ProviderExtras(
+                serde_json::json!({ "access_key": "ak-123" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        };
+        let stt = GnaniSTT::new_standard(&std).expect("new_standard should succeed");
+        let cfg = stt.config.expect("config should be set");
+        assert!(!cfg.interim_results);
+        assert_eq!(cfg.access_key, "ak-123");
     }
 
     #[test]

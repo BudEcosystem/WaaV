@@ -141,7 +141,15 @@ impl BhashiniStt {
         let bhashini_config = BhashiniSttConfig::from_base(config.clone()).map_err(|e| {
             STTError::ConfigurationError(format!("Invalid Bhashini configuration: {}", e))
         })?;
+        Self::from_bhashini_config(config, bhashini_config)
+    }
 
+    /// Internal: assemble the client from an already-mapped Bhashini config (shared by
+    /// `create_internal`/`new` and `new_standard`).
+    fn from_bhashini_config(
+        base_config: STTConfig,
+        bhashini_config: BhashiniSttConfig,
+    ) -> Result<Self, STTError> {
         let client = Client::builder()
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
             .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
@@ -152,7 +160,7 @@ impl BhashiniStt {
             })?;
 
         Ok(Self {
-            base_config: config,
+            base_config,
             config: bhashini_config,
             client,
             pipeline_config: Arc::new(Mutex::new(None)),
@@ -166,6 +174,19 @@ impl BhashiniStt {
     /// Public constructor for external use.
     pub fn new(config: STTConfig) -> Result<Self, STTError> {
         Self::create_internal(config)
+    }
+
+    /// W1 keystone — construct directly from the standardized config. Bhashini is a batch ULCA
+    /// provider with no advanced-feature knobs, so `from_standard` is a pure `from_base`
+    /// passthrough; this gives the provider a uniform standardized entry point on the keystone
+    /// path (every standardized feature is a capability gap and stays at default).
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let bhashini_config = BhashiniSttConfig::from_standard(std).map_err(|e| {
+            STTError::ConfigurationError(format!("Invalid Bhashini configuration: {}", e))
+        })?;
+        Self::from_bhashini_config(std.base.clone(), bhashini_config)
     }
 
     /// Fetch pipeline configuration from Bhashini.
@@ -541,6 +562,32 @@ mod tests {
         let config = create_test_config();
         let result = BhashiniStt::new(config);
         assert!(result.is_ok());
+    }
+
+    // W1 keystone: Bhashini maps zero advanced features (batch ULCA provider), so new_standard is a
+    // pure passthrough — the base credentials parsed from api_key carry through to the stored config.
+    #[test]
+    fn new_standard_passthrough_carries_base() {
+        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "bhashini".into(),
+                api_key: "user123|apikey456".into(),
+                language: "hi".into(),
+                sample_rate: 16000,
+                ..Default::default()
+            },
+            features: SttFeatures {
+                // None of these map to a real Bhashini field; they must be ignored, not error.
+                diarization: Some(true),
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let stt = BhashiniStt::new_standard(&std).unwrap();
+        assert_eq!(stt.config.user_id, "user123");
+        assert_eq!(stt.config.ulca_api_key, "apikey456");
     }
 
     #[test]

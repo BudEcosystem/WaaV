@@ -695,3 +695,43 @@ fn test_custom_model() {
     // Custom models default to 16kHz
     assert_eq!(model.recommended_sample_rate(), 16000);
 }
+
+// W1 keystone: IBM Watson's rich feature surface (diarization, word timestamps, smart
+// formatting, redaction) and its non-standard `instance_id` (via extras) must survive through
+// `new_standard` into the provider-specific config — previously dropped by the flat factory.
+#[test]
+fn new_standard_unlocks_advanced_features_and_instance_id() {
+    use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+    let mut extras = serde_json::Map::new();
+    extras.insert("instance_id".into(), serde_json::json!("inst-123"));
+    let std = StandardSTTConfig {
+        base: STTConfig {
+            provider: "ibm-watson".into(),
+            api_key: "k".into(),
+            ..Default::default()
+        },
+        features: SttFeatures {
+            diarization: Some(true),
+            word_timestamps: Some(true),
+            smart_format: Some(true),
+            redaction: Some(vec!["pii".into()]),
+            ..Default::default()
+        },
+        extras: ProviderExtras(extras),
+    };
+    let stt = IbmWatsonSTT::new_standard(&std).expect("new_standard should succeed");
+    let cfg = stt.get_ibm_config().expect("ibm config should be set");
+    assert!(cfg.speaker_labels); // diarization
+    assert!(cfg.word_timestamps); // word_timestamps
+    assert!(cfg.smart_formatting); // smart_format
+    assert!(cfg.redaction); // redaction (non-empty)
+    assert_eq!(cfg.instance_id, "inst-123"); // from provider_extras passthrough
+
+    // Empty api_key is rejected through the standardized path too (parity with Deepgram).
+    let bad = StandardSTTConfig::from_base(STTConfig {
+        provider: "ibm-watson".into(),
+        api_key: String::new(),
+        ..Default::default()
+    });
+    assert!(IbmWatsonSTT::new_standard(&bad).is_err());
+}

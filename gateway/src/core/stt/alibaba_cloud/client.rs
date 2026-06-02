@@ -175,6 +175,37 @@ impl DashScopeStt {
         })
     }
 
+    /// W1 keystone — construct directly from the standardized config so the advanced features
+    /// DashScope can express (word timestamps, context-biasing keyterms, filler-word retention,
+    /// endpointing window, automatic language detection) are honored END-TO-END. The flat
+    /// `BaseSTT::new` path maps only the base config; this is the reachable standardized path.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "DashScope API key is required".to_string(),
+            ));
+        }
+        let dashscope_config = DashScopeSttConfig::from_standard(std)?;
+        dashscope_config.validate()?;
+
+        Ok(Self {
+            base_config: std.base.clone(),
+            config: dashscope_config,
+            connected: Arc::new(AtomicBool::new(false)),
+            state_notify: Arc::new(Notify::new()),
+            ws_sender: None,
+            shutdown_tx: None,
+            connection_handle: None,
+            result_forward_handle: None,
+            error_forward_handle: None,
+            result_callback: Arc::new(Mutex::new(None)),
+            error_callback: Arc::new(Mutex::new(None)),
+            task_id: Arc::new(Mutex::new(None)),
+        })
+    }
+
     /// Build WebSocket request with authentication headers.
     fn build_request(&self) -> Result<Request<()>, STTError> {
         let url = self.config.get_websocket_url();
@@ -635,6 +666,32 @@ mod tests {
         let config = create_test_config();
         let result = DashScopeStt::new(config);
         assert!(result.is_ok());
+    }
+
+    // W1 keystone: a standardized advanced feature DashScope supports (word timestamps +
+    // context-biasing keyterms) survives through `new_standard` into the provider config.
+    #[test]
+    fn test_new_standard_unlocks_word_timestamps_and_keyterms() {
+        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: create_test_config(),
+            features: SttFeatures {
+                word_timestamps: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "DashScope".into()]),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let stt = DashScopeStt::new_standard(&std).unwrap();
+        assert!(stt.config.word_timestamps);
+        assert_eq!(stt.config.context_text.as_deref(), Some("WaaV DashScope"));
+
+        // Missing key is rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            api_key: String::new(),
+            ..create_test_config()
+        });
+        assert!(DashScopeStt::new_standard(&bad).is_err());
     }
 
     #[test]

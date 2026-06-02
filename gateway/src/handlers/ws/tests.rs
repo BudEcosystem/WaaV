@@ -18,6 +18,8 @@ fn test_ws_config_serialization() {
         punctuation: true,
         encoding: "linear16".to_string(),
         model: "nova-3".to_string(),
+        features: Default::default(),
+        extras: Default::default(),
     };
 
     let json = serde_json::to_string(&stt_ws_config).unwrap();
@@ -41,6 +43,8 @@ fn test_ws_config_serialization() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        features: Default::default(),
+        extras: Default::default(),
     };
 
     let json = serde_json::to_string(&tts_ws_config).unwrap();
@@ -65,6 +69,8 @@ fn test_incoming_message_serialization() {
             punctuation: true,
             encoding: "linear16".to_string(),
             model: "nova-3".to_string(),
+            features: Default::default(),
+            extras: Default::default(),
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -81,6 +87,8 @@ fn test_incoming_message_serialization() {
             emotion_intensity: None,
             delivery_style: None,
             emotion_description: None,
+            features: Default::default(),
+            extras: Default::default(),
         }),
         livekit: None,
         dag_config: None,
@@ -356,6 +364,8 @@ fn test_stt_ws_config_conversion() {
         punctuation: true,
         encoding: "linear16".to_string(),
         model: "nova-3".to_string(),
+        features: Default::default(),
+        extras: Default::default(),
     };
 
     let api_key = "test_api_key".to_string();
@@ -386,6 +396,8 @@ fn test_tts_ws_config_conversion_with_all_values() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        features: Default::default(),
+        extras: Default::default(),
     };
 
     let api_key = "test_api_key".to_string();
@@ -418,6 +430,8 @@ fn test_tts_ws_config_conversion_with_defaults() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        features: Default::default(),
+        extras: Default::default(),
     };
 
     let api_key = "test_api_key".to_string();
@@ -479,6 +493,8 @@ fn test_livekit_ws_config_conversion() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        features: Default::default(),
+        extras: Default::default(),
     };
 
     let livekit_url = "wss://test-livekit.com".to_string();
@@ -521,6 +537,8 @@ fn test_livekit_config_with_empty_listen_participants() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        features: Default::default(),
+        extras: Default::default(),
     };
 
     let livekit_config = livekit_ws_config.to_livekit_config(
@@ -560,6 +578,8 @@ fn test_livekit_config_with_listen_participants() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        features: Default::default(),
+        extras: Default::default(),
     };
 
     let livekit_config = livekit_ws_config.to_livekit_config(
@@ -670,6 +690,8 @@ fn test_incoming_message_config_with_livekit() {
             punctuation: true,
             encoding: "linear16".to_string(),
             model: "nova-3".to_string(),
+            features: Default::default(),
+            extras: Default::default(),
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -686,6 +708,8 @@ fn test_incoming_message_config_with_livekit() {
             emotion_intensity: None,
             delivery_style: None,
             emotion_description: None,
+            features: Default::default(),
+            extras: Default::default(),
         }),
         livekit: Some(LiveKitWebSocketConfig {
             room_name: "test-room".to_string(),
@@ -718,6 +742,8 @@ fn test_incoming_message_config_without_livekit() {
             punctuation: true,
             encoding: "linear16".to_string(),
             model: "nova-3".to_string(),
+            features: Default::default(),
+            extras: Default::default(),
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -734,6 +760,8 @@ fn test_incoming_message_config_without_livekit() {
             emotion_intensity: None,
             delivery_style: None,
             emotion_description: None,
+            features: Default::default(),
+            extras: Default::default(),
         }),
         livekit: None,
         dag_config: None,
@@ -998,6 +1026,8 @@ fn test_tts_ws_config_conversion_mixed_values() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        features: Default::default(),
+        extras: Default::default(),
     };
 
     let api_key = "test_api_key".to_string();
@@ -1029,6 +1059,8 @@ fn test_config_message_without_livekit_routing() {
             punctuation: true,
             encoding: "linear16".to_string(),
             model: "nova-3".to_string(),
+            features: Default::default(),
+            extras: Default::default(),
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -1045,6 +1077,8 @@ fn test_config_message_without_livekit_routing() {
             emotion_intensity: None,
             delivery_style: None,
             emotion_description: None,
+            features: Default::default(),
+            extras: Default::default(),
         }),
         livekit: None, // No LiveKit configuration
         dag_config: None,
@@ -1082,6 +1116,8 @@ fn test_config_message_with_livekit_routing() {
             punctuation: true,
             encoding: "linear16".to_string(),
             model: "nova-3".to_string(),
+            features: Default::default(),
+            extras: Default::default(),
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -1098,6 +1134,8 @@ fn test_config_message_with_livekit_routing() {
             emotion_intensity: None,
             delivery_style: None,
             emotion_description: None,
+            features: Default::default(),
+            extras: Default::default(),
         }),
         livekit: Some(LiveKitWebSocketConfig {
             room_name: "test-room".to_string(),
@@ -1343,6 +1381,8 @@ fn test_config_message_audio_default() {
             punctuation: true,
             encoding: "linear16".to_string(),
             model: "nova-3".to_string(),
+            features: Default::default(),
+            extras: Default::default(),
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -1359,6 +1399,8 @@ fn test_config_message_audio_default() {
             emotion_intensity: None,
             delivery_style: None,
             emotion_description: None,
+            features: Default::default(),
+            extras: Default::default(),
         }),
         livekit: None,
         dag_config: None,

@@ -296,6 +296,21 @@ impl ReverieTts {
         })
     }
 
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// Mirrors `DeepgramTTS::from_standard`: maps the standardized features onto Reverie's
+    /// provider config via [`ReverieTtsConfig::from_standard`] (speed, pitch, sample_rate,
+    /// language + the `format` extra), then constructs the provider via [`Self::with_config`].
+    /// Capability gaps (volume, stability, emotion, instructions, ssml, seed, …) have no Reverie
+    /// field and stay at their defaults — never fabricated.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let reverie_config =
+            ReverieTtsConfig::from_standard(std).map_err(TTSError::InvalidConfiguration)?;
+        Self::with_config(reverie_config)
+    }
+
     /// Creates a new Reverie TTS provider with custom configuration.
     pub fn with_config(reverie_config: ReverieTtsConfig) -> TTSResult<Self> {
         // Validate configuration
@@ -535,6 +550,29 @@ mod tests {
             request_pool_size: Some(4),
             emotion_config: None,
         }
+    }
+
+    // =========================================================================
+    // from_standard (W1 keystone) Tests
+    // =========================================================================
+
+    // The provider struct's `from_standard` (mirroring `DeepgramTTS::from_standard`) maps a
+    // standardized advanced feature (speed -> Reverie's speed multiplier) all the way onto the
+    // provider config the request builder reads — proving the standardized dispatch path reaches
+    // the struct, not just the config-level method.
+    #[test]
+    fn from_standard_maps_speed_onto_provider_config() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                speed: Some(1.4),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = ReverieTts::from_standard(&std).unwrap();
+        assert_eq!(tts.reverie_config().speed, 1.4);
     }
 
     // =========================================================================

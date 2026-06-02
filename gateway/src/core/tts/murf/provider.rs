@@ -145,6 +145,23 @@ impl MurfTts {
         MurfRequestBuilder::new(self.murf_config.clone(), self.base_config.clone())
     }
 
+    /// Build from the standardized config (W1 keystone for TTS), mirroring
+    /// `DeepgramTTS::from_standard`. Delegates to the config-level
+    /// [`MurfTtsConfig::from_standard`] (which maps `speed`→`rate`, `pitch`→`pitch`,
+    /// `emotion`→`style`, `language`→`multi_native_locale`, `sample_rate`, and the non-standard
+    /// `region` extra) so the mapped Murf settings are honored end-to-end through the dispatch
+    /// path. The matching flat base config is kept for the generic provider's connect/cache layer.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let murf_config = MurfTtsConfig::from_standard(std)?;
+        Ok(Self {
+            provider: TTSProvider::new()?,
+            murf_config,
+            base_config: std.base.clone(),
+        })
+    }
+
     /// List available voices from Murf.ai API
     ///
     /// # Arguments
@@ -274,6 +291,50 @@ impl BaseTTS for MurfTts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the struct-level `from_standard` (the dispatch entry point, mirroring
+    // `DeepgramTTS::from_standard`) must carry the standardized advanced features onto the live
+    // provider's Murf config — not just the config-level helper. Asserts speed→rate, pitch→pitch,
+    // emotion→style, language→multi_native_locale, and the `region` extra reach `murf_config()`.
+    #[test]
+    fn from_standard_reaches_provider_config() {
+        use crate::core::tts::murf::MurfModel;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("region".into(), serde_json::json!("us-east"));
+
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "murf".into(),
+                api_key: "test-key".into(),
+                voice_id: Some("en-US-natalie".into()),
+                model: "GEN2".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(10.0),
+                pitch: Some(-5.0),
+                emotion: Some("Conversational".into()),
+                language: Some("en-US".into()),
+                sample_rate: Some(44100),
+                ..Default::default()
+            },
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+
+        let tts = MurfTts::from_standard(&std).unwrap();
+        let cfg = tts.murf_config();
+        assert_eq!(cfg.rate, Some(10)); // speed -> rate
+        assert_eq!(cfg.pitch, Some(-5)); // pitch -> pitch
+        assert_eq!(cfg.style, Some("Conversational".to_string())); // emotion -> style
+        assert_eq!(cfg.multi_native_locale, Some("en-US".to_string())); // language -> locale
+        assert_eq!(cfg.sample_rate, 44100);
+        assert_eq!(cfg.region, crate::core::tts::murf::MurfRegion::UsEast); // region from extras
+        assert_eq!(cfg.model, MurfModel::Gen2); // base carried through
+        // The flat base config is kept for the generic provider's connect/cache layer.
+        assert_eq!(tts.base_config.api_key, "test-key");
+    }
 
     #[test]
     fn test_murf_tts_creation() {

@@ -87,6 +87,17 @@ pub struct STTWebSocketConfig {
     /// Optional API key for this provider (overrides server config)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+
+    /// Canonical, provider-agnostic advanced STT features (diarization, keyterms, redaction,
+    /// vad_events, …). Defaults to all-unset so existing clients are unaffected; carried across the
+    /// dispatch boundary via [`Self::to_standard_stt`] so providers with a `from_standard` mapping
+    /// (Deepgram first) honor them END-TO-END (W1 keystone, closing BRUTAL_REVIEW.md S1).
+    #[serde(default)]
+    pub features: crate::core::stt::standard::SttFeatures,
+
+    /// Open, typed passthrough for provider-specific parameters not modeled by `features`.
+    #[serde(default)]
+    pub extras: crate::core::stt::standard::ProviderExtras,
 }
 
 impl STTWebSocketConfig {
@@ -107,6 +118,24 @@ impl STTWebSocketConfig {
             punctuation: self.punctuation,
             encoding: self.encoding.clone(),
             model: self.model.clone(),
+        }
+    }
+
+    /// Convert WebSocket STT config to the standardized [`StandardSTTConfig`] that crosses the
+    /// dispatch/factory boundary — carrying the flat base **plus** advanced `features`/`extras`.
+    ///
+    /// This is the reachable W1 keystone path: the live handler routes through here so client
+    /// features survive to `create_stt_standard` → `from_standard` instead of being dropped by the
+    /// flat factory. Additive — [`Self::to_stt_config`] is unchanged for callers that don't need
+    /// features.
+    ///
+    /// # Arguments
+    /// * `api_key` - The resolved API key (client-provided or server config) for this provider.
+    pub fn to_standard_stt(&self, api_key: String) -> crate::core::stt::standard::StandardSTTConfig {
+        crate::core::stt::standard::StandardSTTConfig {
+            base: self.to_stt_config(api_key),
+            features: self.features.clone(),
+            extras: self.extras.clone(),
         }
     }
 }
@@ -249,6 +278,17 @@ pub struct TTSWebSocketConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(example = "warm, friendly, inviting"))]
     pub emotion_description: Option<String>,
+
+    /// Canonical, provider-agnostic advanced TTS features (voice settings, instructions, SSML,
+    /// streaming, …). Defaults to all-unset so existing clients are unaffected; carried across the
+    /// dispatch boundary via [`Self::to_standard_tts`] so providers with a `from_standard` mapping
+    /// (Deepgram first) honor them END-TO-END (W1 keystone, closing BRUTAL_REVIEW.md S1/S5).
+    #[serde(default)]
+    pub features: crate::core::tts::standard::TtsFeatures,
+
+    /// Open, typed passthrough for provider-specific parameters not modeled by `features`.
+    #[serde(default)]
+    pub extras: crate::core::tts::standard::ProviderExtras,
 }
 
 impl TTSWebSocketConfig {
@@ -280,6 +320,25 @@ impl TTSWebSocketConfig {
             pronunciations: self.pronunciations.clone(),
             request_pool_size: defaults.request_pool_size,
             emotion_config,
+        }
+    }
+
+    /// Convert WebSocket TTS config to the standardized [`StandardTTSConfig`] that crosses the
+    /// dispatch/factory boundary — carrying the flat base (with emotion config applied) **plus**
+    /// advanced `features`/`extras`.
+    ///
+    /// This is the reachable W1 keystone path: the live handler routes through here so client
+    /// features survive to `create_tts_standard` → `from_standard` instead of being dropped by the
+    /// flat factory. Additive — [`Self::to_tts_config`] is unchanged for callers that don't need
+    /// features.
+    ///
+    /// # Arguments
+    /// * `api_key` - The resolved API key (client-provided or server config) for this provider.
+    pub fn to_standard_tts(&self, api_key: String) -> crate::core::tts::standard::StandardTTSConfig {
+        crate::core::tts::standard::StandardTTSConfig {
+            base: self.to_tts_config(api_key),
+            features: self.features.clone(),
+            extras: self.extras.clone(),
         }
     }
 

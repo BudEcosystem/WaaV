@@ -239,6 +239,30 @@ impl ElevenLabsTTS {
         })
     }
 
+    /// Build from the standardized config (W1 keystone), mirroring `DeepgramTTS::from_standard`.
+    /// ElevenLabs' advanced surface is its voice settings (`stability`, `similarity_boost`,
+    /// `style`, `use_speaker_boost`, `speed`); these are mapped by
+    /// [`VoiceSettings::from_standard`] and installed on the request builder so they reach the
+    /// `voice_settings` request body — previously unreachable through the flat factory. The base
+    /// `TTSConfig` (api_key, voice_id, audio_format, sample_rate, …) is carried through `new`.
+    /// Sample-rate-dependent output format is already derived from `base.sample_rate` in the
+    /// request builder. Emotion, instructions, SSML, word timestamps, streaming and seed have no
+    /// ElevenLabs request parameter here and are skipped (capability gaps).
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let voice_settings = VoiceSettings::from_standard(std);
+        let mut base = std.base.clone();
+        // Honor an explicit features.sample_rate (the output-format derivation reads
+        // base.sample_rate) — previously features.sample_rate was ignored for ElevenLabs. (S7.)
+        if let Some(sr) = std.features.sample_rate {
+            base.sample_rate = Some(sr);
+        }
+        let mut tts = Self::new(base)?;
+        tts.request_builder.voice_settings = voice_settings;
+        Ok(tts)
+    }
+
     /// Set the request manager for this instance
     pub async fn set_req_manager(&mut self, req_manager: Arc<ReqManager>) {
         self.provider.set_req_manager(req_manager).await;
@@ -375,6 +399,40 @@ mod tests {
         let mut std2 = std.clone();
         std2.features.speed = Some(2.0);
         assert_eq!(VoiceSettings::from_standard(&std2).speed, Some(2.0));
+    }
+
+    // W1 keystone (struct-level, mirrors DeepgramTTS::from_standard): the standardized voice
+    // features reach the live request builder's `voice_settings` through the provider STRUCT's
+    // `from_standard` — the path the dispatch helper actually constructs.
+    #[tokio::test]
+    async fn from_standard_struct_installs_voice_settings() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "elevenlabs".into(),
+                api_key: "k".into(),
+                voice_id: Some("test_voice".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                stability: Some(0.71),
+                similarity_boost: Some(0.91),
+                style: Some(0.33),
+                use_speaker_boost: Some(true),
+                speed: Some(1.4),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = ElevenLabsTTS::from_standard(&std).unwrap();
+        let vs = &tts.request_builder.voice_settings;
+        assert_eq!(vs.stability, Some(0.71));
+        assert_eq!(vs.similarity_boost, Some(0.91));
+        assert_eq!(vs.style, Some(0.33));
+        assert_eq!(vs.use_speaker_boost, Some(true));
+        assert_eq!(vs.speed, Some(1.4));
+        // base carried through
+        assert_eq!(tts.request_builder.config.voice_id.as_deref(), Some("test_voice"));
     }
 
     #[tokio::test]

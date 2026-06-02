@@ -175,6 +175,33 @@ impl CereprocTts {
         })
     }
 
+    /// Build from the standardized config (W1 keystone). Mirrors [`DeepgramTTS::from_standard`]:
+    /// the provider struct (not just the config) is the dispatch entry point. CereProc maps
+    /// `emotion` → its custom `<emotion>` SSML tags and `sample_rate` → the output sample rate via
+    /// [`CereprocTtsConfig::from_standard`]; the feature-aware CereProc config is what the request
+    /// builder (`wrap_with_emotion` / `build_query_params`) reads. Features CereProc can't express
+    /// are skipped (capability gaps).
+    ///
+    /// [`DeepgramTTS::from_standard`]: crate::core::tts::deepgram::DeepgramTTS::from_standard
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let cereproc_config = CereprocTtsConfig::from_standard(std)?;
+
+        info!(
+            "Creating CereProc TTS provider (standardized): voice={}, format={}, sample_rate={}",
+            cereproc_config.voice_id, cereproc_config.audio_format, cereproc_config.sample_rate
+        );
+
+        Ok(Self {
+            provider: TTSProvider::new()?,
+            cereproc_config,
+            base_config: std.base.clone(),
+            token_cache: Arc::new(RwLock::new(None)),
+            auth_client: reqwest::Client::new(),
+        })
+    }
+
     // -------------------------------------------------------------------------
     // Authentication Methods
     // -------------------------------------------------------------------------
@@ -406,6 +433,32 @@ impl BaseTTS for CereprocTts {
 mod tests {
     use super::*;
     use crate::core::tts::cereproc::CereprocAudioFormat;
+
+    // The provider STRUCT's `from_standard` (the dispatch entry point) carries CereProc's
+    // expressible advanced features — emotion (via its custom <emotion> SSML tags) and the output
+    // sample_rate — onto the stored CereProc config the request builder reads.
+    #[test]
+    fn from_standard_carries_emotion_and_sample_rate_to_provider() {
+        use crate::core::tts::cereproc::config::CereprocEmotion;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "cereproc".into(),
+                api_key: "user@example.com:password123".into(),
+                voice_id: Some("Stuart".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                emotion: Some("happy".into()),
+                sample_rate: Some(16000),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = CereprocTts::from_standard(&std).unwrap();
+        assert_eq!(tts.cereproc_config.emotion, Some(CereprocEmotion::Happy));
+        assert_eq!(tts.cereproc_config.sample_rate, 16000);
+    }
 
     #[test]
     fn test_cereproc_tts_creation() {

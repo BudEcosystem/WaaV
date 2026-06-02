@@ -66,6 +66,36 @@ pub struct NectecStt {
 }
 
 impl NectecStt {
+    /// W1 keystone — construct from the standardized config. NECTEC is a simple batch Thai-only
+    /// engine (Partii4/Partii5) whose config exposes none of the standardized advanced features, so
+    /// this is a uniform standardized entry point that delegates to `from_standard` (a pure
+    /// `from_base` passthrough): the base config carries through and every advanced feature is a
+    /// capability gap left at default.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let nectec_config = NectecSttConfig::from_standard(std)?;
+
+        let timeout_secs = nectec_config.request_timeout_secs;
+        let http_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| {
+                STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+            })?;
+
+        Ok(Self {
+            config: nectec_config,
+            base_config: Some(std.base.clone()),
+            http_client,
+            is_ready: AtomicBool::new(false),
+            connection_state: Arc::new(RwLock::new(STTConnectionState::Disconnected)),
+            audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_AUDIO_BUFFER_SIZE))),
+            result_callback: Arc::new(RwLock::new(None)),
+            error_callback: Arc::new(RwLock::new(None)),
+        })
+    }
+
     /// Process buffered audio and get transcription using Partii5.
     async fn process_partii5(&self, wav_data: Vec<u8>) -> Result<String, STTError> {
         debug!("NECTEC STT: Sending {} bytes to Partii5", wav_data.len());
@@ -562,6 +592,35 @@ mod tests {
         assert!(result.is_ok());
         let stt = result.unwrap();
         assert_eq!(stt.config.model, NectecSttModel::Partii4);
+    }
+
+    // W1 keystone: NECTEC exposes no mappable advanced features, so the meaningful assertion is
+    // that the base config survives through `new_standard` onto the provider config (api_key,
+    // model) even when advanced features are requested (capability gaps, intentionally dropped) —
+    // proving the standardized path is wired.
+    #[test]
+    fn test_nectec_new_standard_carries_base() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "nectec".into(),
+                api_key: "test_key".into(),
+                model: "partii4".into(),
+                sample_rate: 16000,
+                channels: 1,
+                ..Default::default()
+            },
+            // Advanced features the provider cannot express; must not break the standardized path.
+            features: SttFeatures {
+                diarization: Some(true),
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let stt = NectecStt::new_standard(&std).unwrap();
+        assert_eq!(stt.config.api_key, "test_key"); // base api_key survived
+        assert_eq!(stt.config.model, NectecSttModel::Partii4); // base model survived
     }
 
     #[test]

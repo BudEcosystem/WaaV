@@ -191,7 +191,16 @@ impl BhashiniTts {
     /// Create a new Bhashini TTS provider (internal).
     fn create_internal(config: TTSConfig) -> TTSResult<Self> {
         let bhashini_config = BhashiniTtsConfig::from_base(config.clone())?;
+        Self::create_from_bhashini_config(config, bhashini_config)
+    }
 
+    /// Assemble the provider from a base config and an already-resolved Bhashini config. Shared by
+    /// the flat `create_internal` (`from_base`) and the standardized `from_standard` paths so the
+    /// HTTP-client wiring stays in one place.
+    fn create_from_bhashini_config(
+        base_config: TTSConfig,
+        bhashini_config: BhashiniTtsConfig,
+    ) -> TTSResult<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
             .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
@@ -202,13 +211,29 @@ impl BhashiniTts {
             })?;
 
         Ok(Self {
-            base_config: config,
+            base_config,
             config: bhashini_config,
             client,
             pipeline_config: Arc::new(Mutex::new(None)),
             connected: AtomicBool::new(false),
             audio_callback: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Build from the standardized config (W1 keystone). Mirrors [`DeepgramTTS::from_standard`]:
+    /// the provider struct (not just the config) is the dispatch entry point. Bhashini maps
+    /// `sample_rate` → output rate and `language` → the Bhashini language (plus the
+    /// `custom_callback_url` / `custom_service_id` extras passthrough) via
+    /// [`BhashiniTtsConfig::from_standard`]; the resulting Bhashini config is what the provider
+    /// stores and reads at synthesis time. Features Bhashini can't express are skipped (capability
+    /// gaps).
+    ///
+    /// [`DeepgramTTS::from_standard`]: crate::core::tts::deepgram::DeepgramTTS::from_standard
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let bhashini_config = BhashiniTtsConfig::from_standard(std)?;
+        Self::create_from_bhashini_config(std.base.clone(), bhashini_config)
     }
 
     /// Fetch pipeline configuration for TTS.
@@ -572,6 +597,33 @@ mod tests {
         let config = create_test_config();
         let result = BhashiniTts::new(config);
         assert!(result.is_ok());
+    }
+
+    // The provider STRUCT's `from_standard` (the dispatch entry point) carries Bhashini's
+    // expressible advanced features — output sample_rate and the language override — onto the
+    // stored Bhashini config used at synthesis time.
+    #[test]
+    fn from_standard_carries_sample_rate_and_language_to_provider() {
+        use crate::core::tts::bhashini::BhashiniLanguage;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "bhashini".into(),
+                api_key: "test_user|test_key".into(),
+                voice_id: Some("hi".into()),
+                sample_rate: Some(22050),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                sample_rate: Some(16000),
+                language: Some("ta".into()),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = BhashiniTts::from_standard(&std).unwrap();
+        assert_eq!(tts.config.sample_rate, 16000);
+        assert_eq!(tts.config.language, BhashiniLanguage::Tamil);
     }
 
     #[test]

@@ -233,6 +233,16 @@ impl BaiduTts {
     /// Create a new Baidu TTS provider (internal).
     fn create_internal(config: TTSConfig) -> TTSResult<Self> {
         let baidu_config = BaiduTtsConfig::from_base(config.clone())?;
+        Self::create_from_baidu_config(config, baidu_config)
+    }
+
+    /// Assemble the provider from a base config and an already-resolved Baidu config. Shared by the
+    /// flat `create_internal` (`from_base`) and the standardized `from_standard` paths so the
+    /// HTTP/token-manager wiring stays in one place.
+    fn create_from_baidu_config(
+        base_config: TTSConfig,
+        baidu_config: BaiduTtsConfig,
+    ) -> TTSResult<Self> {
         baidu_config.validate()?;
 
         // Create HTTP client with connection pooling
@@ -252,7 +262,7 @@ impl BaiduTts {
         ));
 
         Ok(Self {
-            base_config: config,
+            base_config,
             config: baidu_config,
             token_manager,
             client,
@@ -261,6 +271,21 @@ impl BaiduTts {
             bytes_synthesized: Arc::new(AtomicU64::new(0)),
             requests_count: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Build from the standardized config (W1 keystone). Mirrors [`DeepgramTTS::from_standard`]:
+    /// the provider struct (not just the config) is the dispatch entry point. Baidu maps `speed`,
+    /// `pitch` and `volume` onto its 0-15 prosody knobs (plus the `cuid` / `use_https` extras
+    /// passthrough) via [`BaiduTtsConfig::from_standard`]; the resulting Baidu config — which
+    /// `synthesize_chunk` reads `spd`/`pit`/`vol` from — is what the provider stores. Features
+    /// Baidu can't express are skipped (capability gaps).
+    ///
+    /// [`DeepgramTTS::from_standard`]: crate::core::tts::deepgram::DeepgramTTS::from_standard
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let baidu_config = BaiduTtsConfig::from_standard(std)?;
+        Self::create_from_baidu_config(std.base.clone(), baidu_config)
     }
 
     /// Prepare text for TTS request.
@@ -594,6 +619,33 @@ mod tests {
         let config = create_test_config();
         let result = BaiduTts::new(config);
         assert!(result.is_ok());
+    }
+
+    // The provider STRUCT's `from_standard` (the dispatch entry point) carries Baidu's expressible
+    // advanced features — the 0-15 speed/pitch/volume prosody knobs — onto the stored Baidu config
+    // that `synthesize_chunk` reads `spd`/`pit`/`vol` from.
+    #[test]
+    fn from_standard_carries_prosody_to_provider() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "baidu".into(),
+                api_key: "test_api_key|test_secret_key".into(),
+                voice_id: Some("0".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(4.0), // maps to 15 (max)
+                pitch: Some(8.0),
+                volume: Some(12.0),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = BaiduTts::from_standard(&std).unwrap();
+        assert_eq!(tts.config.speed, 15);
+        assert_eq!(tts.config.pitch, 8);
+        assert_eq!(tts.config.volume, 12);
     }
 
     #[test]

@@ -784,6 +784,14 @@ impl MurfStreamRequest {
             request.variation = config.variation;
             request.pronunciation_dictionary = config.pronunciation_dictionary.clone();
             request.audio_duration = config.audio_duration;
+        } else if config.rate.is_some() || config.pitch.is_some() || config.style.is_some() {
+            // Review S2: rate/pitch/style (standardized speed/pitch/emotion) are Gen2-only on Murf.
+            // The default model is Falcon, so these were silently dropped. Surface the capability
+            // gap loudly instead of failing silently.
+            tracing::warn!(
+                model = %config.model.as_str(),
+                "Murf rate/pitch/style (speed/pitch/emotion) require the GEN2 model; ignored on the current model"
+            );
         }
 
         request

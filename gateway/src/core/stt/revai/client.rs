@@ -80,6 +80,21 @@ impl RevAISTT {
         })
     }
 
+    /// W1 keystone — construct directly from the standardized config so the advanced features
+    /// Rev AI can express (diarization, profanity filtering, filler words) are honored
+    /// END-TO-END. Mirrors `DeepgramSTT::new_standard`: validate the api_key, then build the
+    /// provider from the standardized->provider config mapping (`RevAISTTConfig::from_standard`).
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "API key is required".to_string(),
+            ));
+        }
+        Self::from_revai_config(crate::core::stt::revai::config::RevAISTTConfig::from_standard(std)?)
+    }
+
     /// Get the session ID
     pub async fn get_session_id(&self) -> Option<String> {
         self.session_id.read().await.clone()
@@ -462,6 +477,42 @@ mod tests {
 
         let result = RevAISTT::from_revai_config(config);
         assert!(result.is_ok());
+    }
+
+    // W1 keystone: advanced features Rev AI can express (diarization -> enable_speaker_switch +
+    // machine_v2 transcriber, profanity_filter -> filter_profanity) survive through the
+    // provider-struct `new_standard` method to the provider-specific config.
+    #[test]
+    fn test_revai_new_standard_unlocks_advanced_features() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "revai".into(),
+                api_key: "test-api-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                profanity_filter: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let stt = RevAISTT::new_standard(&std).expect("new_standard must succeed");
+        assert!(stt.revai_config.enable_speaker_switch); // diarization
+        assert_eq!(
+            stt.revai_config.transcriber,
+            super::super::config::RevAITranscriber::MachineV2
+        ); // required by switch
+        assert!(stt.revai_config.filter_profanity); // profanity_filter
+
+        // Missing api_key is rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            provider: "revai".into(),
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(RevAISTT::new_standard(&bad).is_err());
     }
 
     #[test]

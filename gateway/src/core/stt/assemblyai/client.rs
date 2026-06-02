@@ -200,6 +200,31 @@ impl Default for AssemblyAISTT {
 }
 
 impl AssemblyAISTT {
+    /// W1 keystone — construct directly from the standardized config so the advanced features
+    /// AssemblyAI v3 can express (word-level timestamps) are honored END-TO-END. The flat
+    /// `BaseSTT::new` path maps only the base config; this is the reachable standardized path.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "API key is required for AssemblyAI STT".to_string(),
+            ));
+        }
+        let sample_rate = std.base.sample_rate;
+        if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate) {
+            return Err(STTError::ConfigurationError(format!(
+                "Sample rate {} Hz is outside supported range ({}-{} Hz)",
+                sample_rate, MIN_SAMPLE_RATE, MAX_SAMPLE_RATE
+            )));
+        }
+        // `AssemblyAISTT` implements `Drop`, so build the default then set the config field
+        // (struct-update with `..Default::default()` would move out of a Drop type).
+        let mut stt = Self::default();
+        stt.config = Some(AssemblyAISTTConfig::from_standard(std));
+        Ok(stt)
+    }
+
     /// Get the host name from the region for HTTP headers.
     pub(crate) fn get_host_from_region(region: &AssemblyAIRegion) -> &'static str {
         region.host()

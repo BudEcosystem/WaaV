@@ -176,6 +176,28 @@ impl WellSaidTts {
     pub fn wellsaid_config(&self) -> &WellSaidTtsConfig {
         &self.wellsaid_config
     }
+
+    /// Build from the standardized TTS config (W1 keystone). Mirrors [`BaseTTS::new`] but derives
+    /// the WellSaid config via [`WellSaidTtsConfig::from_standard`] and keeps the standardized base
+    /// config as `base_config`. WellSaid's config only carries voice (`speaker_id`) and model
+    /// selection; every standardized prosody/voice feature is a capability gap and is skipped (the
+    /// Caruso AI Director is not represented as config state here).
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let wellsaid_config = WellSaidTtsConfig::from_standard(std)?;
+
+        info!(
+            "Creating WellSaid TTS provider (standardized): speaker_id={}, model={}",
+            wellsaid_config.speaker_id, wellsaid_config.model
+        );
+
+        Ok(Self {
+            provider: TTSProvider::new()?,
+            wellsaid_config,
+            base_config: std.base.clone(),
+        })
+    }
 }
 
 #[async_trait]
@@ -282,6 +304,34 @@ mod tests {
         let tts = tts.unwrap();
         assert_eq!(tts.wellsaid_config().speaker_id, 26);
         assert!(!tts.is_ready());
+    }
+
+    // W1 keystone (TTS): the struct-level `from_standard` builds a real `WellSaidTts` through the
+    // standardized path. WellSaid's config holds only voice/model selection (no prosody fields), so
+    // this is a passthrough: speaker_id (voice_id) and the Caruso model reach the provider, while
+    // standardized prosody features are capability gaps. Mirrors `DeepgramTTS::from_standard`.
+    #[test]
+    fn from_standard_builds_provider_with_voice_and_model() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        use crate::core::tts::wellsaid::config::WellSaidModel;
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "wellsaid".into(),
+                api_key: "test-key".into(),
+                voice_id: Some("26".into()),
+                model: "caruso".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5), // capability gap: no prosody field, must be ignored
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = WellSaidTts::from_standard(&std).unwrap();
+        assert_eq!(tts.wellsaid_config().speaker_id, 26);
+        assert_eq!(tts.wellsaid_config().model, WellSaidModel::Caruso);
+        assert_eq!(tts.wellsaid_config().api_key, "test-key");
     }
 
     #[test]

@@ -506,6 +506,21 @@ impl PlayHtTts {
         })
     }
 
+    /// Builds the provider from the standardized config (W1 keystone for TTS — uniform entry
+    /// point, mirroring `DeepgramTTS::from_standard`).
+    ///
+    /// Delegates the feature mapping to [`PlayHtTtsConfig::from_standard`] (speed → speed,
+    /// style → style_guidance, language, seed, sample_rate; the non-standard `user_id` flows
+    /// through the `extras` passthrough), then constructs the provider via [`Self::with_config`].
+    /// Capability gaps (pitch, volume, stability, similarity_boost, use_speaker_boost, emotion,
+    /// instructions, ssml, word_timestamps, streaming) have no Play.ht field and are skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let playht_config = PlayHtTtsConfig::from_standard(std);
+        Self::with_config(playht_config)
+    }
+
     /// Sets the request manager for connection pooling.
     pub async fn set_req_manager(&mut self, req_manager: Arc<ReqManager>) {
         self.provider.set_req_manager(req_manager).await;
@@ -870,6 +885,46 @@ mod tests {
             request_pool_size: Some(4),
             emotion_config: None,
         }
+    }
+
+    // =========================================================================
+    // W1 keystone (TTS): standardized-path mapping on the provider STRUCT
+    // =========================================================================
+
+    // The standardized config's advanced features (speed/style/language/seed/sample_rate) reach the
+    // built provider's Play.ht config through the struct-level `from_standard` (not just the
+    // config-level one), and the non-standard `user_id` flows via the extras passthrough.
+    #[test]
+    fn from_standard_maps_features_to_provider() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("user_id".into(), serde_json::json!("user-123"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "playht".into(),
+                api_key: "k".into(),
+                voice_id: Some("s3://test-voice/manifest.json".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.4),
+                style: Some(0.6),
+                language: Some("en".into()),
+                seed: Some(42),
+                sample_rate: Some(24000),
+                ..Default::default()
+            },
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        let tts = PlayHtTts::from_standard(&std).unwrap();
+        let cfg = tts.playht_config();
+        assert!((cfg.speed - 1.4).abs() < 0.001);
+        assert_eq!(cfg.style_guidance, Some(0.6));
+        assert_eq!(cfg.language, Some("en".to_string()));
+        assert_eq!(cfg.seed, Some(42));
+        assert_eq!(cfg.sample_rate, 24000);
+        assert_eq!(cfg.user_id, "user-123");
+        assert_eq!(cfg.base.api_key, "k");
     }
 
     // =========================================================================

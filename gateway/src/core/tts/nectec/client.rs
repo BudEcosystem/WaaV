@@ -48,6 +48,37 @@ pub struct NectecTts {
 }
 
 impl NectecTts {
+    /// Build from the standardized config (W1 keystone for TTS), mirroring
+    /// `DeepgramTTS::from_standard`. Delegates to the config-level
+    /// [`NectecTtsConfig::from_standard`]. VAJA9 exposes no prosody/emotion/SSML/sample-rate
+    /// surface, so the standardized [`TtsFeatures`] are a pure `from_base` passthrough (speaker
+    /// selection rides `base.voice_id`); only the non-standard `phrase_break`/`audiovisual` extras
+    /// are mapped. Assembles the REST client exactly like [`BaseTTS::new`].
+    ///
+    /// [`TtsFeatures`]: crate::core::tts::standard::TtsFeatures
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let nectec_config =
+            NectecTtsConfig::from_standard(std).map_err(TTSError::InvalidConfiguration)?;
+
+        let timeout_secs = nectec_config.request_timeout_secs;
+        let http_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| {
+                TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
+            })?;
+
+        Ok(Self {
+            config: nectec_config,
+            http_client,
+            is_ready: AtomicBool::new(false),
+            audio_callback: Arc::new(RwLock::new(None)),
+            connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
+        })
+    }
+
     /// Synthesize text and return audio data.
     async fn synthesize(&self, text: &str) -> TTSResult<Vec<u8>> {
         if text.is_empty() {
@@ -479,6 +510,41 @@ mod tests {
         let tts = result.unwrap();
         assert!(!tts.is_ready());
         assert_eq!(tts.config.voice, NectecVoice::Female);
+    }
+
+    // W1 keystone: the struct-level `from_standard` (the dispatch entry point, mirroring
+    // `DeepgramTTS::from_standard`) must reach the live client's config. VAJA9 has no
+    // prosody/emotion/SSML surface, so the standardized features are a pure passthrough (the
+    // supported "voice settings" ride `base.voice_id`); the provider-specific
+    // `phrase_break`/`audiovisual` knobs flow through the extras passthrough.
+    #[test]
+    fn from_standard_reaches_provider_config() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("phrase_break".into(), serde_json::json!(2));
+        extras.insert("audiovisual".into(), serde_json::json!(1));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "nectec".into(),
+                api_key: "test_key".into(),
+                voice_id: Some("female".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                // Capability gaps: NECTEC has no speed/ssml field, must be ignored.
+                speed: Some(1.5),
+                ssml: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+
+        let tts = NectecTts::from_standard(&std).unwrap();
+        assert_eq!(tts.config.api_key, "test_key"); // base carried through
+        assert_eq!(tts.config.voice, NectecVoice::Female); // voice setting carried through
+        assert_eq!(tts.config.phrase_break, 2); // extras passthrough
+        assert_eq!(tts.config.audiovisual, 1); // extras passthrough
     }
 
     #[test]

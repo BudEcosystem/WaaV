@@ -211,6 +211,32 @@ impl FptStt {
         Ok(transcription)
     }
 
+    /// W1 keystone — construct directly from the standardized config so the standardized entry
+    /// point is uniform across providers. FPT.AI exposes no advanced-feature surface (it is a
+    /// simple batch decode endpoint), so `from_standard` is a pure `from_base` passthrough and no
+    /// [`SttFeatures`](crate::core::stt::standard::SttFeatures) are mapped; only the base transport
+    /// knobs (api_key, sample_rate, channels) survive. Mirrors `DeepgramSTT::new_standard`.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let fpt_config = FptSttConfig::from_standard(std)?;
+
+        let timeout_secs = fpt_config.request_timeout_secs;
+        let http_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| {
+                STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+            })?;
+
+        Ok(Self {
+            config: fpt_config,
+            base_config: Some(std.base.clone()),
+            http_client,
+            ..Default::default()
+        })
+    }
+
     /// Get the FPT-specific configuration.
     pub fn get_fpt_config(&self) -> &FptSttConfig {
         &self.config

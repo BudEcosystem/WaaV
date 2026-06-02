@@ -59,6 +59,19 @@ pub struct GladiaSTT {
 }
 
 impl GladiaSTT {
+    /// W1 keystone — construct directly from the standardized config so Gladia's nested feature
+    /// surface (interim results, word timestamps, custom vocabulary/keyterms, named-entity
+    /// recognition, automatic language detection) is honored END-TO-END. The flat `BaseSTT::new`
+    /// path cannot reach those knobs; this is the reachable standardized path mirroring
+    /// `DeepgramSTT::new_standard`. The api_key is resolved by `from_standard`/`from_base` (config
+    /// or `GLADIA_API_KEY` env var) and validated by `with_config`.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let gladia_config = GladiaSTTConfig::from_standard(std)?;
+        Self::with_config(gladia_config)
+    }
+
     /// Create a new Gladia STT client from provider-specific config
     pub fn with_config(config: GladiaSTTConfig) -> Result<Self, STTError> {
         // Validate configuration
@@ -425,6 +438,33 @@ mod tests {
             provider: "gladia".to_string(),
             ..Default::default()
         }
+    }
+
+    // W1 keystone: advanced features set on the standardized config must survive through
+    // `new_standard` into the nested Gladia provider config (previously dropped by the flat
+    // factory).
+    #[test]
+    fn new_standard_propagates_advanced_features() {
+        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "gladia".into(),
+                api_key: "test-api-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "Gladia".into()]),
+                ..Default::default()
+            },
+            ..StandardSTTConfig::from_base(STTConfig::default())
+        };
+        let stt = GladiaSTT::new_standard(&std).expect("new_standard should succeed");
+        assert!(stt.gladia_config.realtime_processing.words_accurate_timestamps);
+        assert_eq!(
+            stt.gladia_config.realtime_processing.custom_vocabulary,
+            vec!["WaaV", "Gladia"]
+        );
     }
 
     #[test]

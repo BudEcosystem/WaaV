@@ -129,10 +129,18 @@ impl DashScopeTts {
     /// Create a new DashScope TTS provider (internal).
     fn create_internal(config: TTSConfig) -> TTSResult<Self> {
         let dashscope_config = DashScopeTtsConfig::from_base(config.clone())?;
+        Self::create_from_parts(config, dashscope_config)
+    }
+
+    /// Assemble the provider from a base config and a fully-resolved DashScope config.
+    fn create_from_parts(
+        base_config: TTSConfig,
+        dashscope_config: DashScopeTtsConfig,
+    ) -> TTSResult<Self> {
         dashscope_config.validate()?;
 
         Ok(Self {
-            base_config: config,
+            base_config,
             config: dashscope_config,
             connected: Arc::new(AtomicBool::new(false)),
             text_sender: None,
@@ -143,6 +151,18 @@ impl DashScopeTts {
             bytes_synthesized: Arc::new(AtomicU64::new(0)),
             task_id: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Build the provider from the standardized config (W1 keystone), mirroring
+    /// `DeepgramTTS::from_standard`. Delegates feature mapping to
+    /// [`DashScopeTtsConfig::from_standard`] (speed→rate, pitch, volume, sample_rate + the
+    /// `region` extra) so advanced prosody reaches the WebSocket synthesis params through the
+    /// standardized dispatch instead of being dropped at the flat boundary.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let dashscope_config = DashScopeTtsConfig::from_standard(std)?;
+        Self::create_from_parts(std.base.clone(), dashscope_config)
     }
 
     /// Build WebSocket request with authentication headers.
@@ -617,6 +637,37 @@ mod tests {
         let config = create_test_config();
         let result = DashScopeTts::new(config);
         assert!(result.is_ok());
+    }
+
+    // W1 keystone: a StandardTTSConfig advanced feature DashScope supports (prosody speed/pitch/
+    // volume + sample_rate) reaches the provider's resolved `config` through the provider struct's
+    // `from_standard`, mirroring `DeepgramTTS::from_standard`.
+    #[test]
+    fn from_standard_reaches_provider_config() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "alibaba-cloud".into(),
+                api_key: "k".into(),
+                voice_id: Some("longxiaochun".into()),
+                model: "cosyvoice-v3-flash".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.25),
+                pitch: Some(0.9),
+                volume: Some(80.0),
+                sample_rate: Some(24000),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = DashScopeTts::from_standard(&std).unwrap();
+        assert_eq!(tts.config.rate, 1.25);
+        assert_eq!(tts.config.pitch, 0.9);
+        assert_eq!(tts.config.volume, 80);
+        assert_eq!(tts.config.sample_rate, 24000);
+        assert_eq!(tts.base_config.api_key, "k");
     }
 
     #[test]

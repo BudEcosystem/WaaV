@@ -430,6 +430,38 @@ impl CartesiaTTS {
         self.provider.set_req_manager(req_manager).await;
     }
 
+    /// Build from the standardized config (W1 keystone). Mirrors [`DeepgramTTS::from_standard`]:
+    /// the provider struct (not just the config) is the dispatch entry point. Cartesia maps
+    /// `speed` → `generation_config.speed`, `emotion` → `generation_config.emotion` and
+    /// `sample_rate` → `output_format.sample_rate` via [`CartesiaTTSConfig::from_standard`], which
+    /// also mutates the carried base (`speaking_rate`/`emotion_config`) that the request builder
+    /// reads. Features Cartesia can't express are skipped (capability gaps).
+    ///
+    /// [`DeepgramTTS::from_standard`]: crate::core::tts::deepgram::DeepgramTTS::from_standard
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> TTSResult<Self> {
+        let cartesia_config = CartesiaTTSConfig::from_standard(std);
+        // The standardized mapping mutates the carried base (speaking_rate / emotion_config); the
+        // request builder and hash read those from the base, so use the config's mutated base.
+        let base = cartesia_config.base.clone();
+        let request_builder = CartesiaRequestBuilder::new(base.clone(), cartesia_config.clone());
+        let config_hash = compute_cartesia_tts_config_hash(&base, &cartesia_config);
+
+        info!(
+            "Created CartesiaTTS provider (standardized): model={}, voice={:?}, format={:?}",
+            cartesia_config.model,
+            cartesia_config.voice_id(),
+            cartesia_config.output_format.container
+        );
+
+        Ok(Self {
+            provider: TTSProvider::new()?,
+            request_builder,
+            config_hash,
+        })
+    }
+
     /// Returns a reference to the Cartesia-specific configuration.
     ///
     /// Useful for debugging or inspecting the resolved configuration.
@@ -642,6 +674,43 @@ mod tests {
             request_pool_size: Some(4),
             emotion_config: None,
         }
+    }
+
+    // =========================================================================
+    // from_standard (W1 keystone) Tests
+    // =========================================================================
+
+    // The provider STRUCT's `from_standard` (the dispatch entry point) carries Cartesia's
+    // expressible advanced features — speed and emotion (sent via `generation_config`) plus the
+    // output sample_rate — all the way onto the request builder's base + Cartesia config.
+    #[test]
+    fn from_standard_carries_speed_emotion_and_sample_rate_to_provider() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "cartesia".into(),
+                api_key: "k".into(),
+                voice_id: Some("a0e99841-438c-4a64-b679-ae501e7d6091".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.3),
+                emotion: Some("happy".into()),
+                sample_rate: Some(16000),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = CartesiaTTS::from_standard(&std).unwrap();
+        // speed reaches the base the request builder reads for generation_config.speed.
+        assert_eq!(tts.request_builder.config.speaking_rate, Some(1.3));
+        // emotion reaches the base emotion_config the request builder reads.
+        assert!(tts.request_builder.config.emotion_config.is_some());
+        // sample_rate reaches the Cartesia output format.
+        assert_eq!(
+            tts.cartesia_config().output_format.sample_rate,
+            16000
+        );
     }
 
     // =========================================================================
