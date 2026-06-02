@@ -266,22 +266,20 @@ impl AmiVoiceSTT {
                         AmiVoiceMessage::InterimResult(result) => {
                             if interim_results_enabled && !result.text.is_empty() {
                                 let stt_result = result.to_stt_result(false);
-                                if !stt_result.transcript.is_empty() {
-                                    if result_tx.try_send(stt_result).is_err() {
+                                if !stt_result.transcript.is_empty()
+                                    && result_tx.try_send(stt_result).is_err() {
                                         warn!("Failed to send interim result - channel closed");
                                     }
-                                }
                             }
                         }
 
                         AmiVoiceMessage::FinalResult(result) => {
                             if !result.text.is_empty() {
                                 let stt_result = result.to_stt_result(true);
-                                if !stt_result.transcript.is_empty() {
-                                    if result_tx.try_send(stt_result).is_err() {
+                                if !stt_result.transcript.is_empty()
+                                    && result_tx.try_send(stt_result).is_err() {
                                         warn!("Failed to send final result - channel closed");
                                     }
-                                }
                             }
                         }
 
@@ -414,11 +412,10 @@ impl AmiVoiceSTT {
             // Wait for session start response ('s' or 's <error>')
             let session_start_timeout = timeout(Duration::from_secs(10), async {
                 while let Some(msg) = ws_stream.next().await {
-                    if let Ok(Message::Text(text)) = msg {
-                        if text.starts_with('s') {
+                    if let Ok(Message::Text(text)) = msg
+                        && text.starts_with('s') {
                             return AmiVoiceMessage::parse(&text);
                         }
-                    }
                 }
                 Err("No session start response received".to_string())
             })

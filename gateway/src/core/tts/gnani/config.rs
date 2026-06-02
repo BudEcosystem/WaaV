@@ -136,11 +136,10 @@ impl GnaniTTSConfig {
         let f = &std.features;
         let mut cfg = Self::from_base(std.base.clone())?;
 
-        if let Some(language) = f.language.as_deref() {
-            if let Ok(lang) = GnaniTTSLanguage::from_str(language) {
+        if let Some(language) = f.language.as_deref()
+            && let Ok(lang) = GnaniTTSLanguage::from_str(language) {
                 cfg.language_code = lang;
             }
-        }
         if let Some(rate) = f.sample_rate {
             cfg.output_sample_rate = rate;
         }

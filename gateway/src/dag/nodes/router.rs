@@ -339,8 +339,8 @@ impl JoinNode {
                 let mut best: Option<Dynamic> = None;
                 let mut best_score = f64::MIN;
                 for item in arr.iter() {
-                    if let Some(map) = item.clone().try_cast::<rhai::Map>() {
-                        if let Some(val) = map.get(field) {
+                    if let Some(map) = item.clone().try_cast::<rhai::Map>()
+                        && let Some(val) = map.get(field) {
                             let score: f64 = if val.is::<f64>() {
                                 val.clone().cast::<f64>()
                             } else if val.is::<i64>() {
@@ -355,7 +355,6 @@ impl JoinNode {
                                 best = Some(item.clone());
                             }
                         }
-                    }
                 }
                 best.unwrap_or(Dynamic::UNIT)
             });
@@ -507,7 +506,7 @@ impl JoinNode {
             return Ok(DAGData::Json(serde_json::json!(b)));
         }
         if let Some(arr) = result.clone().try_cast::<Array>() {
-            let json_arr: Vec<serde_json::Value> = arr.iter().map(|d| dynamic_to_json(d)).collect();
+            let json_arr: Vec<serde_json::Value> = arr.iter().map(dynamic_to_json).collect();
             return Ok(DAGData::Json(serde_json::json!(json_arr)));
         }
         if let Some(map) = result.clone().try_cast::<rhai::Map>() {
@@ -695,11 +694,10 @@ impl RouterNode {
                 continue; // Skip default routes in first pass
             }
 
-            if let Some(ref condition) = route.condition {
-                if evaluator.evaluate(condition, data, ctx)? {
+            if let Some(ref condition) = route.condition
+                && evaluator.evaluate(condition, data, ctx)? {
                     return Ok(Some(&route.target));
                 }
-            }
             // Routes without conditions and not default are skipped
             // (they should have conditions to be useful)
         }
@@ -846,7 +844,7 @@ mod tests {
         let mut ctx = DAGContext::new("test");
         let input = DAGData::Text("test".into());
 
-        let output = node.execute(input, &mut ctx).await.unwrap();
+        let _output = node.execute(input, &mut ctx).await.unwrap();
         assert_eq!(
             ctx.metadata.get("router_target"),
             Some(&"default_handler".to_string())

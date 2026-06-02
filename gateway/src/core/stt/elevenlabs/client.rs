@@ -109,11 +109,10 @@ impl WsTransport for ElevenLabsTransport {
                                 return ReconnectOutcome::Fatal(StreamError::new("provider error frame"));
                             }
                             // Signal connection ready after the first session_started.
-                            if self.session_id.is_some() {
-                                if let Some(tx) = self.connected_tx.lock().await.take() {
+                            if self.session_id.is_some()
+                                && let Some(tx) = self.connected_tx.lock().await.take() {
                                     let _ = tx.send(());
                                 }
-                            }
                         }
                         Ok(Some(Err(e))) => {
                             let stt_error = STTError::NetworkError(format!("WebSocket error: {e}"));

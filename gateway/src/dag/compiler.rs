@@ -187,8 +187,7 @@ impl DAGCompiler {
             .map(|id| {
                 node_index
                     .get(id)
-                    .ok_or_else(|| DAGError::ExitNodeNotFound(id.clone()))
-                    .map(|idx| *idx)
+                    .ok_or_else(|| DAGError::ExitNodeNotFound(id.clone())).copied()
             })
             .collect::<DAGResult<Vec<_>>>()?;
 
@@ -366,14 +365,13 @@ impl DAGCompiler {
                 };
 
                 // Parse tools from JSON if provided
-                if let Some(tools_json) = tools {
-                    if let Ok(parsed_tools) = serde_json::from_value::<
+                if let Some(tools_json) = tools
+                    && let Ok(parsed_tools) = serde_json::from_value::<
                         Vec<super::nodes::ToolDefinition>,
                     >(tools_json.clone())
                     {
                         llm_config.tools = Some(parsed_tools);
                     }
-                }
 
                 // Use try_new() for SSRF protection on the client-supplied base_url.
                 Arc::new(LlmEndpointNode::try_new(&def.id, llm_config)?)

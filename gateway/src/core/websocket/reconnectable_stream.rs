@@ -584,7 +584,7 @@ mod tests {
         assert_eq!(exit, SupervisorExit::Exhausted);
         // First connect + the reconnect attempts (bounded by max_attempts).
         let n = attempt.load(Ordering::Acquire);
-        assert!(n >= 2 && n <= 5, "bounded retries, saw {n}");
+        assert!((2..=5).contains(&n), "bounded retries, saw {n}");
     }
 
     #[tokio::test]

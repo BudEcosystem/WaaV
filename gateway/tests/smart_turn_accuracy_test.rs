@@ -13,10 +13,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use waav_gateway::core::smart_turn::{
     MelExtractor, MelExtractorConfig, SmartTurnDetector, SmartTurnDetectorConfig,
-    SmartTurnProcessor, SmartTurnProcessorConfig,
 };
 
 const AUDIO_DIR: &str = "/tmp/smart_turn_test/audio";
@@ -82,7 +81,6 @@ fn read_wav_16k_mono(path: &Path) -> Result<Vec<f32>> {
     }
 
     // Find fmt chunk
-    let mut audio_format = 0u16;
     let mut num_channels = 0u16;
     let mut sample_rate = 0u32;
     let mut bits_per_sample = 0u16;
@@ -101,7 +99,6 @@ fn read_wav_16k_mono(path: &Path) -> Result<Vec<f32>> {
             let mut fmt_data = vec![0u8; chunk_size];
             reader.read_exact(&mut fmt_data)?;
 
-            audio_format = u16::from_le_bytes([fmt_data[0], fmt_data[1]]);
             num_channels = u16::from_le_bytes([fmt_data[2], fmt_data[3]]);
             sample_rate = u32::from_le_bytes([fmt_data[4], fmt_data[5], fmt_data[6], fmt_data[7]]);
             bits_per_sample = u16::from_le_bytes([fmt_data[14], fmt_data[15]]);

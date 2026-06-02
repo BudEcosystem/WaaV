@@ -814,12 +814,11 @@ impl DeepgramSTT {
                                         match message {
                                             Ok(Some(Ok(msg))) => {
                                                 // Check if this is a speech_final result before processing
-                                                if let Message::Text(ref text) = msg {
-                                                    if text.contains("\"speech_final\":true") || text.contains("\"speech_final\": true") {
+                                                if let Message::Text(ref text) = msg
+                                                    && (text.contains("\"speech_final\":true") || text.contains("\"speech_final\": true")) {
                                                         info!("Received speech_final after CloseStream");
                                                         received_speech_final = true;
                                                     }
-                                                }
 
                                                 if let Err(e) = Self::handle_websocket_message(msg, &result_tx) {
                                                     warn!("Error handling message after CloseStream: {}", e);

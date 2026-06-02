@@ -7,7 +7,6 @@
 mod fixtures;
 
 use fixtures::audio_fixtures;
-use std::collections::HashMap;
 use std::env;
 use std::time::{Duration, Instant};
 
@@ -547,7 +546,7 @@ async fn test_gateway_tts(provider: &str) -> Result<u64, String> {
 
     if response.status().is_success() {
         let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-        if bytes.len() > 0 {
+        if !bytes.is_empty() {
             Ok(latency)
         } else {
             Err("No audio returned".to_string())
@@ -734,8 +733,8 @@ fn print_test_summary(results: &[TestResult]) {
     // Print STT Results
     println!("\n--- STT PROVIDERS ({}) ---", stt_results.len());
     println!(
-        "{:<20} {:>10} {:>12} {}",
-        "Provider", "Status", "Latency", "Error"
+        "{:<20} {:>10} {:>12} Error",
+        "Provider", "Status", "Latency"
     );
     println!("{}", "-".repeat(70));
     for result in &stt_results {
@@ -763,8 +762,8 @@ fn print_test_summary(results: &[TestResult]) {
     // Print TTS Results
     println!("\n--- TTS PROVIDERS ({}) ---", tts_results.len());
     println!(
-        "{:<20} {:>10} {:>12} {}",
-        "Provider", "Status", "Latency", "Error"
+        "{:<20} {:>10} {:>12} Error",
+        "Provider", "Status", "Latency"
     );
     println!("{}", "-".repeat(70));
     for result in &tts_results {
@@ -793,8 +792,8 @@ fn print_test_summary(results: &[TestResult]) {
     if !realtime_results.is_empty() {
         println!("\n--- REALTIME PROVIDERS ({}) ---", realtime_results.len());
         println!(
-            "{:<20} {:>10} {:>12} {}",
-            "Provider", "Status", "Latency", "Error"
+            "{:<20} {:>10} {:>12} Error",
+            "Provider", "Status", "Latency"
         );
         println!("{}", "-".repeat(70));
         for result in &realtime_results {

@@ -18,6 +18,7 @@ use super::{
 
 /// Authentication method for Phonexia server
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum PhonexiaAuth {
     /// Token-based authentication (login first, then use X-SessionID)
     Token {
@@ -32,14 +33,10 @@ pub enum PhonexiaAuth {
         password: String,
     },
     /// No authentication (for testing or open servers)
+    #[default]
     None,
 }
 
-impl Default for PhonexiaAuth {
-    fn default() -> Self {
-        Self::None
-    }
-}
 
 /// Result type format for transcription
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -412,11 +409,10 @@ impl PhonexiaSTTConfig {
             .with_channels(config.channels as u8);
 
         // Parse model field for result type
-        if !config.model.is_empty() {
-            if let Ok(result_type) = config.model.parse::<PhonexiaResultType>() {
+        if !config.model.is_empty()
+            && let Ok(result_type) = config.model.parse::<PhonexiaResultType>() {
                 phonexia_config = phonexia_config.with_result_type(result_type);
             }
-        }
 
         phonexia_config.validate()?;
         Ok(phonexia_config)

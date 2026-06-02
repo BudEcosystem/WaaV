@@ -393,11 +393,11 @@ impl IFlytekSttConfig {
 
         // Parse language
         let language =
-            IFlytekLanguage::from_code(&config.language).unwrap_or(IFlytekLanguage::default());
+            IFlytekLanguage::from_code(&config.language).unwrap_or_default();
 
         // Parse encoding
         let encoding = IFlytekAudioEncoding::from_str(&config.encoding)
-            .unwrap_or(IFlytekAudioEncoding::default());
+            .unwrap_or_default();
 
         // Determine ASR mode from model field
         let mode = if config.model.to_lowercase().contains("realtime")

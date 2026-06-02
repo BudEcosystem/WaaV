@@ -398,13 +398,11 @@ impl HumeEVI {
                 }
 
                 // If prosody data is available, could emit as speech event
-                if let Some(models) = user_msg.models {
-                    if let Some(prosody) = models.prosody {
-                        if let Some(dominant) = prosody.scores.dominant_emotion() {
+                if let Some(models) = user_msg.models
+                    && let Some(prosody) = models.prosody
+                        && let Some(dominant) = prosody.scores.dominant_emotion() {
                             trace!("User emotion: {} ({:.2})", dominant.0, dominant.1);
                         }
-                    }
-                }
             }
 
             EVIServerMessage::UserInterruption(interruption) => {
@@ -438,11 +436,10 @@ impl HumeEVI {
             EVIServerMessage::AssistantProsody(prosody) => {
                 trace!("Assistant prosody for message {}", prosody.id);
                 // Prosody data for assistant's voice
-                if let Some(p) = prosody.models.prosody {
-                    if let Some(dominant) = p.scores.dominant_emotion() {
+                if let Some(p) = prosody.models.prosody
+                    && let Some(dominant) = p.scores.dominant_emotion() {
                         trace!("Assistant emotion: {} ({:.2})", dominant.0, dominant.1);
                     }
-                }
             }
 
             EVIServerMessage::AudioOutput(output) => {

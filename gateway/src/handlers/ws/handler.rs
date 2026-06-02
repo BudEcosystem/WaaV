@@ -435,11 +435,10 @@ async fn process_message(
             // tests/panic_isolation.rs to prove a panic in one session is contained
             // by the per-session `catch_unwind` in `handle_voice_socket` and does
             // not abort the process or other sessions.
-            if let Ok(token) = std::env::var("WAAV_TEST_PANIC_ON_TEXT") {
-                if !token.is_empty() && text.starts_with(token.as_str()) {
+            if let Ok(token) = std::env::var("WAAV_TEST_PANIC_ON_TEXT")
+                && !token.is_empty() && text.starts_with(token.as_str()) {
                     panic!("WAAV_TEST_PANIC_ON_TEXT injected panic (test seam)");
                 }
-            }
 
             // Pre-deserialization size check to prevent JSON parsing attacks
             if text.len() > MAX_TEXT_MESSAGE_SIZE {

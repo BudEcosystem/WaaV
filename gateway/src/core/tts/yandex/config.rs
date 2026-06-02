@@ -88,8 +88,10 @@ impl std::str::FromStr for YandexAudioFormat {
 /// Supported voices for Yandex SpeechKit TTS
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum YandexVoice {
     // Russian voices
+    #[default]
     Alena,
     Filipp,
     Ermil,
@@ -202,11 +204,6 @@ impl YandexVoice {
     }
 }
 
-impl Default for YandexVoice {
-    fn default() -> Self {
-        Self::Alena
-    }
-}
 
 impl fmt::Display for YandexVoice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -548,11 +545,10 @@ impl YandexTtsConfig {
                 _ => {}
             }
         }
-        if let Some(ref language) = f.language {
-            if let Ok(lang) = language.parse::<YandexLanguage>() {
+        if let Some(ref language) = f.language
+            && let Ok(lang) = language.parse::<YandexLanguage>() {
                 cfg.language = lang;
             }
-        }
         if let Some(sr) = f.sample_rate {
             // Reuse from_base's normalization to Yandex's supported rates.
             cfg.sample_rate = if sr == 0 {

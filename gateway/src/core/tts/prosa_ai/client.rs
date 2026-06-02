@@ -277,8 +277,8 @@ impl ProsaTts {
     /// Parse error response.
     fn parse_error_response(&self, status: u16, body: &str) -> TTSError {
         // Try to parse as JSON error
-        if let Ok(response) = serde_json::from_str::<ProsaTtsResponse>(body) {
-            if let Some(err) = response.error {
+        if let Ok(response) = serde_json::from_str::<ProsaTtsResponse>(body)
+            && let Some(err) = response.error {
                 return match err.code.as_str() {
                     "auth_invalid_api_key" | "auth_unauthorized" => {
                         TTSError::AuthenticationFailed(err.message)
@@ -290,7 +290,6 @@ impl ProsaTts {
                     _ => TTSError::ProviderError(err.message),
                 };
             }
-        }
 
         // Fallback to status code based error
         match status {

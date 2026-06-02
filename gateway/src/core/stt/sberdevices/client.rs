@@ -369,8 +369,8 @@ impl SberDevicesSTT {
                     Ok(response) => {
                         let status = response.status();
                         if status.is_success() {
-                            if let Ok(text) = response.text().await {
-                                if let Ok(recognition_response) =
+                            if let Ok(text) = response.text().await
+                                && let Ok(recognition_response) =
                                     serde_json::from_str::<SberRecognitionResponse>(&text)
                                 {
                                     let transcript = recognition_response.get_all_transcripts();
@@ -388,7 +388,6 @@ impl SberDevicesSTT {
                                         }
                                     }
                                 }
-                            }
                         } else {
                             let body = response.text().await.unwrap_or_default();
                             let api_error = SberApiError::from_response(status.as_u16(), &body);

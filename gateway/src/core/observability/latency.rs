@@ -170,11 +170,10 @@ impl UserBotLatencyObserver {
         let mut latencies = self.latencies_ns.lock();
 
         // Evict oldest if at capacity
-        if latencies.len() >= self.max_samples {
-            if let Some(old) = latencies.pop_front() {
+        if latencies.len() >= self.max_samples
+            && let Some(old) = latencies.pop_front() {
                 self.sum_ns.fetch_sub(old, Ordering::Relaxed);
             }
-        }
 
         // Add new sample
         latencies.push_back(latency_ns);

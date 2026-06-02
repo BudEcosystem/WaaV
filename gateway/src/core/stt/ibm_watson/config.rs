@@ -103,8 +103,10 @@ impl std::fmt::Display for IbmRegion {
 /// - Telephony: Optimized for telephone audio (8kHz)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum IbmModel {
     // English models
+    #[default]
     EnUsMultimedia,
     EnUsTelephony,
     EnGbMultimedia,
@@ -230,11 +232,6 @@ impl IbmModel {
     }
 }
 
-impl Default for IbmModel {
-    fn default() -> Self {
-        Self::EnUsMultimedia
-    }
-}
 
 impl std::fmt::Display for IbmModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

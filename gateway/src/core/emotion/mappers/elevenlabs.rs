@@ -361,10 +361,10 @@ mod tests {
 
             // All emotions should produce valid settings
             if let Some(stability) = mapped.stability {
-                assert!(stability >= 0.0 && stability <= 1.0);
+                assert!((0.0..=1.0).contains(&stability));
             }
             if let Some(style) = mapped.style {
-                assert!(style >= 0.0 && style <= 1.0);
+                assert!((0.0..=1.0).contains(&style));
             }
         }
     }

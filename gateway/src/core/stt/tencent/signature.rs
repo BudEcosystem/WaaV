@@ -409,7 +409,7 @@ impl TencentSignatureBuilder {
 
         // Base64 encode
         let signature_base64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &signature_bytes);
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, signature_bytes);
 
         Ok(signature_base64)
     }

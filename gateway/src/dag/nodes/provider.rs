@@ -171,7 +171,7 @@ impl DAGNode for STTProviderNode {
         // Extract audio from input
         let audio_bytes = match &input {
             DAGData::Audio(bytes) => bytes.clone(),
-            DAGData::TTSAudio(tts) => Bytes::from(tts.data.clone()),
+            DAGData::TTSAudio(tts) => tts.data.clone(),
             DAGData::Empty => return Ok(DAGData::Empty),
             other => {
                 return Err(DAGError::UnsupportedDataType {
@@ -886,7 +886,7 @@ impl DAGNode for RealtimeProviderNode {
         // Extract input data (audio or text)
         let (audio_data, text_data, has_audio_input) = match &input {
             DAGData::Audio(bytes) => (Some(bytes.clone()), None, true),
-            DAGData::TTSAudio(tts) => (Some(Bytes::from(tts.data.clone())), None, true),
+            DAGData::TTSAudio(tts) => (Some(tts.data.clone()), None, true),
             DAGData::Text(text) => (None, Some(text.clone()), false),
             DAGData::STTResult(stt) => (None, Some(stt.transcript.clone()), false),
             DAGData::Empty => return Ok(DAGData::Empty),
@@ -1019,15 +1019,14 @@ impl DAGNode for RealtimeProviderNode {
             }
         }
 
-        if let Some(text) = text_data {
-            if let Err(e) = realtime.send_text(&text).await {
+        if let Some(text) = text_data
+            && let Err(e) = realtime.send_text(&text).await {
                 let _ = realtime.disconnect().await;
                 return Err(DAGError::RealtimeProviderError {
                     provider: self.provider.clone(),
                     error: format!("Failed to send text: {}", e),
                 });
             }
-        }
 
         // Request a response from the model
         if let Err(e) = realtime.create_response().await {

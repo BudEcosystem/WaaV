@@ -295,8 +295,8 @@ impl DAGExecutor {
             executed.insert(node_idx);
 
             // Handle router node output - prune unreachable downstream paths
-            if compiled_node.node.node_type() == "router" {
-                if let Some(router_target) = ctx.metadata.get("router_target").cloned() {
+            if compiled_node.node.node_type() == "router"
+                && let Some(router_target) = ctx.metadata.get("router_target").cloned() {
                     // Find the target node index
                     if let Some(target_idx) = dag.get_node_index(&router_target) {
                         // Prune all outgoing paths except the target
@@ -321,7 +321,6 @@ impl DAGExecutor {
                     // Clear the router_target after processing
                     ctx.metadata.remove("router_target");
                 }
-            }
 
             // Store output for downstream nodes
             node_outputs.insert(node_idx, output);
@@ -500,11 +499,10 @@ impl DAGExecutor {
 
         let mut inputs: Vec<DAGData> = Vec::new();
         for src_idx in source_indices {
-            if let Some(data) = node_outputs.get(&src_idx) {
-                if !matches!(data, DAGData::Empty) {
+            if let Some(data) = node_outputs.get(&src_idx)
+                && !matches!(data, DAGData::Empty) {
                     inputs.push(data.clone());
                 }
-            }
         }
 
         match inputs.len() {

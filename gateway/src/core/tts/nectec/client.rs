@@ -261,7 +261,7 @@ impl Default for NectecTts {
 impl BaseTTS for NectecTts {
     fn new(config: TTSConfig) -> TTSResult<Self> {
         let nectec_config =
-            NectecTtsConfig::from_base(&config).map_err(|e| TTSError::InvalidConfiguration(e))?;
+            NectecTtsConfig::from_base(&config).map_err(TTSError::InvalidConfiguration)?;
 
         let timeout_secs = nectec_config.request_timeout_secs;
         let http_client = Client::builder()

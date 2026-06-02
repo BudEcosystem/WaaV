@@ -184,13 +184,13 @@ async fn do_synthesize(channel: Channel, request: Request<Vec<u8>>) -> Result<By
         .await
         .map_err(|e| TTSError::ConnectionFailed(format!("Service not ready: {}", e)))?;
 
-    let codec = TinkoffTtsCodec::default();
+    let codec = TinkoffTtsCodec;
     let path = PathAndQuery::from_static(GRPC_SYNTHESIZE_PATH);
 
     let response = grpc
         .unary(request, path, codec)
         .await
-        .map_err(|e| grpc_status_to_tts_error(e))?;
+        .map_err(grpc_status_to_tts_error)?;
 
     Ok(response.into_inner())
 }
@@ -208,13 +208,13 @@ async fn do_streaming_synthesize(
         .await
         .map_err(|e| TTSError::ConnectionFailed(format!("Service not ready: {}", e)))?;
 
-    let codec = TinkoffTtsCodec::default();
+    let codec = TinkoffTtsCodec;
     let path = PathAndQuery::from_static(GRPC_STREAMING_SYNTHESIZE_PATH);
 
     let response = grpc
         .server_streaming(request, path, codec)
         .await
-        .map_err(|e| grpc_status_to_tts_error(e))?;
+        .map_err(grpc_status_to_tts_error)?;
 
     Ok(response.into_inner())
 }

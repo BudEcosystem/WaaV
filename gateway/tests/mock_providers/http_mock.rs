@@ -141,16 +141,16 @@ pub async fn start_http_mock(
 
     let app = Router::new()
         // ElevenLabs-like endpoints (use {param} syntax for Axum 0.7+)
-        .route("/v1/text-to-speech/{voice_id}", post(tts_handler.clone()))
+        .route("/v1/text-to-speech/{voice_id}", post(tts_handler))
         .route(
             "/v1/text-to-speech/{voice_id}/stream",
-            post(tts_handler.clone()),
+            post(tts_handler),
         )
-        .route("/v1/voices", axum::routing::get(voices_handler.clone()))
+        .route("/v1/voices", axum::routing::get(voices_handler))
         // OpenAI-like endpoints
-        .route("/v1/audio/speech", post(tts_handler.clone()))
+        .route("/v1/audio/speech", post(tts_handler))
         // PlayHT-like endpoints
-        .route("/api/v2/tts", post(tts_handler.clone()))
+        .route("/api/v2/tts", post(tts_handler))
         // Stats
         .route("/stats", axum::routing::get(stats_handler))
         .with_state(state);

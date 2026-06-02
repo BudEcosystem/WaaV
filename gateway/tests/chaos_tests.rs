@@ -286,19 +286,16 @@ async fn test_client_sudden_disconnect() {
 
     // Connect and immediately disconnect multiple times
     for _ in 0..20 {
-        match timeout(Duration::from_secs(5), connect_async(&ws_url)).await {
-            Ok(Ok((ws, _))) => {
-                // Send partial config then disconnect abruptly
-                let (mut write, _) = ws.split();
+        if let Ok(Ok((ws, _))) = timeout(Duration::from_secs(5), connect_async(&ws_url)).await {
+            // Send partial config then disconnect abruptly
+            let (mut write, _) = ws.split();
 
-                let _ = write
-                    .send(common::text_message(r#"{"type": "config"#))
-                    .await;
+            let _ = write
+                .send(common::text_message(r#"{"type": "config"#))
+                .await;
 
-                // Drop without proper close
-                drop(write);
-            }
-            _ => {}
+            // Drop without proper close
+            drop(write);
         }
     }
 
@@ -679,7 +676,7 @@ async fn test_concurrent_chaos_operations() {
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     let duration = Duration::from_secs(5);
-    let start = Instant::now();
+    let _start = Instant::now();
 
     let mut handles = Vec::new();
 
@@ -699,7 +696,7 @@ async fn test_concurrent_chaos_operations() {
             let mut counter = 0usize;
             while !stop.load(Ordering::Relaxed) {
                 // Mix of valid and invalid requests
-                let req = if counter % 2 == 0 {
+                let req = if counter.is_multiple_of(2) {
                     client.get(format!("{}/", base_url)).send().await
                 } else {
                     client
@@ -733,7 +730,7 @@ async fn test_concurrent_chaos_operations() {
                         successful.fetch_add(1, Ordering::Relaxed);
                         // Send random messages
                         for _ in 0..3 {
-                            let msg = if counter % 2 == 0 {
+                            let msg = if counter.is_multiple_of(2) {
                                 common::text_message("invalid")
                             } else {
                                 common::binary_message(vec![0u8; 100])

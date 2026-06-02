@@ -10,7 +10,6 @@
 //! Run: cargo test --test stress_tests -- --nocapture
 //! Run with release: cargo test --test stress_tests --release -- --nocapture
 
-use axum::Router;
 use futures::future::join_all;
 use futures::{SinkExt, StreamExt};
 use serde_json::json;
@@ -277,12 +276,9 @@ async fn test_rapid_connect_disconnect() {
     let start = Instant::now();
 
     for _ in 0..cycles {
-        match timeout(Duration::from_secs(5), connect_async(&ws_url)).await {
-            Ok(Ok((ws, _))) => {
-                drop(ws);
-                successful_cycles.fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {}
+        if let Ok(Ok((ws, _))) = timeout(Duration::from_secs(5), connect_async(&ws_url)).await {
+            drop(ws);
+            successful_cycles.fetch_add(1, Ordering::Relaxed);
         }
         // Small delay between cycles
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -382,15 +378,14 @@ async fn test_large_binary_websocket_message() {
             // Wait for ready
             let mut ready_received = false;
             for _ in 0..10 {
-                if let Ok(Some(Ok(msg))) = timeout(Duration::from_millis(500), read.next()).await {
-                    if let Message::Text(text) = msg {
+                if let Ok(Some(Ok(msg))) = timeout(Duration::from_millis(500), read.next()).await
+                    && let Message::Text(text) = msg {
                         let text_str: &str = &text;
                         if text_str.contains("ready") {
                             ready_received = true;
                             break;
                         }
                     }
-                }
             }
 
             if ready_received {
@@ -514,15 +509,14 @@ async fn test_websocket_message_throughput() {
             // Wait for ready
             let mut ready_received = false;
             for _ in 0..10 {
-                if let Ok(Some(Ok(msg))) = timeout(Duration::from_millis(500), read.next()).await {
-                    if let Message::Text(text) = msg {
+                if let Ok(Some(Ok(msg))) = timeout(Duration::from_millis(500), read.next()).await
+                    && let Message::Text(text) = msg {
                         let text_str: &str = &text;
                         if text_str.contains("ready") {
                             ready_received = true;
                             break;
                         }
                     }
-                }
             }
 
             if ready_received {

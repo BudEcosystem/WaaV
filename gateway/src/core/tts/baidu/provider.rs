@@ -96,11 +96,10 @@ impl TokenManager {
             let token = self.access_token.read().await;
             let expires_at = self.expires_at.read().await;
 
-            if let (Some(t), Some(exp)) = (token.as_ref(), expires_at.as_ref()) {
-                if *exp > Instant::now() + TOKEN_REFRESH_MARGIN {
+            if let (Some(t), Some(exp)) = (token.as_ref(), expires_at.as_ref())
+                && *exp > Instant::now() + TOKEN_REFRESH_MARGIN {
                     return Ok(t.clone());
                 }
-            }
         }
 
         // Refresh token

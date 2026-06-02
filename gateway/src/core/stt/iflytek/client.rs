@@ -250,8 +250,8 @@ impl IFlytekStt {
                 }
 
                 // Extract transcript
-                if let Some(transcript) = response.transcript() {
-                    if !transcript.is_empty() {
+                if let Some(transcript) = response.transcript()
+                    && !transcript.is_empty() {
                         let is_final = response.is_final();
                         let is_replacement = response.is_replacement();
 
@@ -282,7 +282,6 @@ impl IFlytekStt {
                             }
                         }
                     }
-                }
 
                 // Return true if this is the final response
                 Ok(response.is_final())

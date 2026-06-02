@@ -539,7 +539,7 @@ mod tests {
         let stt = NaverClovaStt::new(config).unwrap();
 
         // 16kHz * 2 bytes * 1 channel * 60 seconds = 1,920,000 bytes
-        let expected = 16000 * 2 * 1 * 60;
+        let expected = (16000 * 2) * 60;
         assert_eq!(stt.max_buffer_bytes(), expected);
     }
 

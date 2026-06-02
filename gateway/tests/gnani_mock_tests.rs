@@ -22,9 +22,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
-use waav_gateway::core::stt::{BaseSTT, STTConfig, STTError, create_stt_provider};
+use waav_gateway::core::stt::{STTConfig, STTError, create_stt_provider};
 use waav_gateway::core::tts::{
-    AudioCallback, AudioData, BaseTTS, TTSConfig, TTSError, create_tts_provider,
+    AudioCallback, AudioData, TTSConfig, TTSError, create_tts_provider,
 };
 
 // ============================================================================
@@ -364,7 +364,7 @@ fn test_gnani_tts_not_connected_initially() {
         emotion_config: None,
     };
 
-    let provider = create_tts_provider("gnani", config).unwrap();
+    let _provider = create_tts_provider("gnani", config).unwrap();
     // TTS providers may or may not have is_connected method
     // The key test is that speak fails without connect
 }

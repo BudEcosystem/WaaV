@@ -137,14 +137,13 @@ impl ViettelTts {
         // Check if response is JSON error (not audio)
         if audio_data.starts_with(b"{") {
             // Try to parse as error JSON
-            if let Ok(error_str) = std::str::from_utf8(&audio_data) {
-                if error_str.contains("error") || error_str.contains("message") {
+            if let Ok(error_str) = std::str::from_utf8(&audio_data)
+                && (error_str.contains("error") || error_str.contains("message")) {
                     return Err(TTSError::ProviderError(format!(
                         "API returned error: {}",
                         error_str
                     )));
                 }
-            }
         }
 
         info!("Viettel TTS: Received {} bytes of audio", audio_data.len());

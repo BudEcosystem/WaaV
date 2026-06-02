@@ -279,7 +279,7 @@ impl Default for ObserverRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     // -------------------------------------------------------------------------
     // Test Fixtures

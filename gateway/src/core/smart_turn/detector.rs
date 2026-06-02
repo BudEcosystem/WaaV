@@ -582,7 +582,7 @@ impl SmartTurnDetector {
         // 2. Check hysteresis - enough consecutive high-probability frames
         //
         // Each mel frame represents 10ms (hop_length=160 at 16kHz)
-        let min_frames_for_speech = (self.config.min_speech_ms as usize + 9) / 10;
+        let min_frames_for_speech = (self.config.min_speech_ms as usize).div_ceil(10);
         let has_enough_speech = frames_count >= min_frames_for_speech;
         let is_turn_complete =
             has_enough_speech && self.high_prob_frames >= self.config.hysteresis_frames;
@@ -848,7 +848,7 @@ impl SmartTurnDetector {
         // Determine if turn is complete:
         // 1. Check min_speech_ms - enough audio must have been processed first
         // 2. Check hysteresis - enough consecutive high-probability frames
-        let min_frames_for_speech = (self.config.min_speech_ms as usize + 9) / 10;
+        let min_frames_for_speech = (self.config.min_speech_ms as usize).div_ceil(10);
         let has_enough_speech = num_frames >= min_frames_for_speech;
         let is_turn_complete =
             has_enough_speech && self.high_prob_frames >= self.config.hysteresis_frames;

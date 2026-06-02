@@ -191,15 +191,14 @@ impl TTSRequestBuilder for CartesiaRequestBuilder {
         }
 
         // Pass emotion from emotion_config if present
-        if let Some(ref emotion_config) = self.config.emotion_config {
-            if let Some(ref emotion) = emotion_config.emotion {
+        if let Some(ref emotion_config) = self.config.emotion_config
+            && let Some(ref emotion) = emotion_config.emotion {
                 // Convert emotion enum to string for Cartesia API
                 generation_config.insert(
                     "emotion".to_string(),
                     json!(emotion.to_string().to_lowercase()),
                 );
             }
-        }
 
         // Build the request body
         let mut body = json!({

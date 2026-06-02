@@ -605,11 +605,10 @@ impl DashScopeSttConfig {
         if let Some(filler) = f.filler_words {
             cfg.disfluency_removal = !filler;
         }
-        if let Some(k) = &f.keyterms {
-            if !k.is_empty() {
+        if let Some(k) = &f.keyterms
+            && !k.is_empty() {
                 cfg.context_text = Some(k.join(" "));
             }
-        }
         if let Some(ms) = f.endpointing_ms {
             cfg.silence_duration_ms = ms;
         }

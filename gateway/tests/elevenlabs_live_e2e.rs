@@ -341,11 +341,10 @@ async fn test_waav_gateway_ws_elevenlabs_tts_live() {
         .expect("send config");
 
     // Read the config ack (ready or error — log it; TTS can still work).
-    if let Ok(Some(Ok(msg))) = timeout(Duration::from_secs(10), read.next()).await {
-        if let Message::Text(t) = msg {
+    if let Ok(Some(Ok(msg))) = timeout(Duration::from_secs(10), read.next()).await
+        && let Message::Text(t) = msg {
             println!("gateway config ack: {t}");
         }
-    }
 
     // Issue a speak command — drives the gateway → ElevenLabs TTS → audio back over the socket.
     let speak_message = json!({

@@ -19,6 +19,7 @@ use std::time::Instant;
 /// Higher priority frames are processed before lower priority frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum FramePriority {
     /// Lowest priority: Background/fill audio, silence frames.
     /// Processed only when no other frames are available.
@@ -26,6 +27,7 @@ pub enum FramePriority {
 
     /// Default priority: Regular audio frames.
     /// Standard processing order.
+    #[default]
     Normal = 1,
 
     /// Elevated priority: User speech during bot speaking.
@@ -55,11 +57,6 @@ impl FramePriority {
     }
 }
 
-impl Default for FramePriority {
-    fn default() -> Self {
-        FramePriority::Normal
-    }
-}
 
 impl PartialOrd for FramePriority {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -273,13 +270,12 @@ impl FramePriorityQueue {
             // Queue is full, need to drop something
             // Find the minimum (lowest priority, oldest) frame in the queue
             let min_priority = self.find_min_priority_locked(&heap);
-            if let Some(min_prio) = min_priority {
-                if frame.priority < min_prio {
+            if let Some(min_prio) = min_priority
+                && frame.priority < min_prio {
                     // New frame has lower priority than everything in queue, drop it
                     self.total_dropped.fetch_add(1, AtomicOrdering::Relaxed);
                     return false;
                 }
-            }
             // Evict the lowest priority frame (which is the minimum)
             // Since BinaryHeap is a max-heap, we need to find and remove the min
             // This is O(n) but acceptable for bounded small queues
@@ -306,12 +302,11 @@ impl FramePriorityQueue {
         if heap.len() >= self.capacity {
             // Find the minimum (lowest priority, oldest) frame in the queue
             let min_priority = self.find_min_priority_locked(&heap);
-            if let Some(min_prio) = min_priority {
-                if frame.priority < min_prio {
+            if let Some(min_prio) = min_priority
+                && frame.priority < min_prio {
                     self.total_dropped.fetch_add(1, AtomicOrdering::Relaxed);
                     return (false, Some(frame));
                 }
-            }
             let evicted = self.evict_min_locked(&mut heap);
             if evicted.is_some() {
                 self.total_dropped.fetch_add(1, AtomicOrdering::Relaxed);

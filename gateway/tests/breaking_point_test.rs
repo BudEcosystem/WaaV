@@ -10,13 +10,7 @@
 
 mod mock_providers;
 
-use mock_providers::{
-    ChaosConfig, LatencyProfile,
-    http_mock::{HttpMockState, spawn_http_mock},
-    websocket_mock::{WebSocketMockState, spawn_stt_websocket_mock, spawn_tts_websocket_mock},
-};
 
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -281,11 +275,10 @@ impl BreakingPointSaver {
 
     async fn write_summary(&self, summary: &BreakingPointSummary) {
         let path = self.output_dir.join("summary.json");
-        if let Ok(json) = serde_json::to_string_pretty(summary) {
-            if let Ok(mut file) = File::create(&path) {
+        if let Ok(json) = serde_json::to_string_pretty(summary)
+            && let Ok(mut file) = File::create(&path) {
                 let _ = file.write_all(json.as_bytes());
             }
-        }
 
         // Also write human-readable report
         let report_path = self.output_dir.join("report.txt");
@@ -299,7 +292,7 @@ impl BreakingPointSaver {
 fn generate_report(summary: &BreakingPointSummary) -> String {
     let mut report = String::new();
 
-    report.push_str("\n");
+    report.push('\n');
     report
         .push_str("╔══════════════════════════════════════════════════════════════════════════╗\n");
     report
@@ -538,7 +531,7 @@ async fn test_find_breaking_point() {
     println!("  Error threshold: {}%", ERROR_THRESHOLD_PERCENT);
     println!("  VU increment: {}", VU_INCREMENT);
     println!("  Iteration duration: {}s", ITERATION_DURATION_SECS);
-    println!("");
+    println!();
 
     while current_vus <= MAX_VUS {
         println!(

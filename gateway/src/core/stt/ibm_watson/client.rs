@@ -358,11 +358,10 @@ impl IbmWatsonSTT {
         // Check if we have a valid cached token
         {
             let token_guard = self.iam_token.read().await;
-            if let Some(token) = token_guard.as_ref() {
-                if !token.is_expired() {
+            if let Some(token) = token_guard.as_ref()
+                && !token.is_expired() {
                     return Ok(token.access_token.clone());
                 }
-            }
         }
 
         // Need to fetch a new token
@@ -402,13 +401,11 @@ impl IbmWatsonSTT {
                                     continue;
                                 }
 
-                                if let Some(stt_result) = result.to_stt_result() {
-                                    if !stt_result.transcript.is_empty() {
-                                        if result_tx.try_send(stt_result).is_err() {
+                                if let Some(stt_result) = result.to_stt_result()
+                                    && !stt_result.transcript.is_empty()
+                                        && result_tx.try_send(stt_result).is_err() {
                                             warn!("Failed to send result - channel closed");
                                         }
-                                    }
-                                }
                             }
                         }
 
@@ -574,11 +571,10 @@ impl IbmWatsonSTT {
             // Wait for "listening" state message
             let listen_timeout = timeout(Duration::from_secs(10), async {
                 while let Some(msg) = ws_stream.next().await {
-                    if let Ok(Message::Text(text)) = msg {
-                        if let Ok(IbmWatsonMessage::Listening(_)) = IbmWatsonMessage::parse(&text) {
+                    if let Ok(Message::Text(text)) = msg
+                        && let Ok(IbmWatsonMessage::Listening(_)) = IbmWatsonMessage::parse(&text) {
                             return true;
                         }
-                    }
                 }
                 false
             })

@@ -83,12 +83,10 @@ impl BaseSTT for MockStt {
             .fired
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
-        {
-            if let Some(cb) = &self.callback {
+            && let Some(cb) = &self.callback {
                 let result = STTResult::new("hello agent".to_string(), true, true, 0.99);
                 cb(result).await;
             }
-        }
         Ok(())
     }
 

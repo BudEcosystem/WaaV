@@ -169,14 +169,13 @@ impl GnaniSTTConfig {
         }
 
         // Validate certificate path exists if provided
-        if let Some(ref path) = self.certificate_path {
-            if !path.exists() {
+        if let Some(ref path) = self.certificate_path
+            && !path.exists() {
                 return Err(format!(
                     "Gnani certificate file not found: {}",
                     path.display()
                 ));
             }
-        }
 
         // Validate language is supported
         GnaniLanguage::from_str(&self.base.language)?;
@@ -236,6 +235,7 @@ impl GnaniAudioFormat {
 
 /// Supported languages for Gnani STT (14 languages)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum GnaniLanguage {
     /// Kannada (kn-IN)
     #[serde(rename = "kn-IN")]
@@ -269,6 +269,7 @@ pub enum GnaniLanguage {
     Urdu,
     /// English - India (en-IN)
     #[serde(rename = "en-IN")]
+    #[default]
     EnglishIndia,
     /// English - UK (en-GB)
     #[serde(rename = "en-GB")]
@@ -281,11 +282,6 @@ pub enum GnaniLanguage {
     EnglishSG,
 }
 
-impl Default for GnaniLanguage {
-    fn default() -> Self {
-        Self::EnglishIndia
-    }
-}
 
 impl GnaniLanguage {
     /// Get the language code string for API requests

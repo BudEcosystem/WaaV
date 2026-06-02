@@ -393,11 +393,10 @@ pub struct ErrorDetails {
 impl BhashiniErrorResponse {
     /// Get the error message.
     pub fn error_message(&self) -> String {
-        if let Some(ref err) = self.error {
-            if let Some(ref msg) = err.message {
+        if let Some(ref err) = self.error
+            && let Some(ref msg) = err.message {
                 return msg.clone();
             }
-        }
         if let Some(ref msg) = self.message {
             return msg.clone();
         }

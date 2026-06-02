@@ -50,9 +50,11 @@ pub const DEFAULT_SAMPLE_RATE: u32 = 22050;
 /// Voices are available in multiple languages with various characteristics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
+#[derive(Default)]
 pub enum IbmVoice {
     // US English voices
     /// Allison - US English, Female, V3 Neural
+    #[default]
     EnUsAllisonV3Voice,
     /// Emily - US English, Female, V3 Neural
     EnUsEmilyV3Voice,
@@ -366,11 +368,6 @@ impl IbmVoice {
     }
 }
 
-impl Default for IbmVoice {
-    fn default() -> Self {
-        Self::EnUsAllisonV3Voice
-    }
-}
 
 impl std::fmt::Display for IbmVoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -703,24 +700,22 @@ impl IbmWatsonTTSConfig {
         }
 
         // Validate rate percentage if set
-        if let Some(rate) = self.rate_percentage {
-            if !(-100..=100).contains(&rate) {
+        if let Some(rate) = self.rate_percentage
+            && !(-100..=100).contains(&rate) {
                 return Err(format!(
                     "Rate percentage must be between -100 and 100, got {}",
                     rate
                 ));
             }
-        }
 
         // Validate pitch percentage if set
-        if let Some(pitch) = self.pitch_percentage {
-            if !(-100..=100).contains(&pitch) {
+        if let Some(pitch) = self.pitch_percentage
+            && !(-100..=100).contains(&pitch) {
                 return Err(format!(
                     "Pitch percentage must be between -100 and 100, got {}",
                     pitch
                 ));
             }
-        }
 
         // Validate customization count (max 2)
         if self.customization_ids.len() > 2 {

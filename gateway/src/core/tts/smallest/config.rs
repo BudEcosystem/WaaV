@@ -19,9 +19,11 @@ use crate::core::tts::base::{TTSConfig, TTSError};
 /// Smallest.ai TTS models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum SmallestModel {
     /// Lightning model - fastest, ~100ms latency, REST API.
     #[serde(alias = "lightning")]
+    #[default]
     Lightning,
 
     /// Lightning-Large model - voice cloning support, ~300ms latency.
@@ -77,11 +79,6 @@ impl SmallestModel {
     }
 }
 
-impl Default for SmallestModel {
-    fn default() -> Self {
-        Self::Lightning
-    }
-}
 
 impl fmt::Display for SmallestModel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

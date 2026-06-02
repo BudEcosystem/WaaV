@@ -347,7 +347,7 @@ async fn test_livekit_configurations() {
 async fn test_graceful_shutdown_simulation() {
     let port = find_available_port();
     let config = create_minimal_config(port);
-    let app_state = AppState::new(config).await;
+    let _app_state = AppState::new(config).await;
 
     // Create a shutdown signal
     let shutdown = Arc::new(AtomicBool::new(false));

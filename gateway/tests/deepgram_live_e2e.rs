@@ -556,15 +556,12 @@ async fn test_deepgram_gateway_ws_live() {
         while let Some(Ok(msg)) = read.next().await {
             match msg {
                 Message::Text(t) => {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
-                        if v.get("type").and_then(|x| x.as_str()) == Some("stt_result") {
-                            if let Some(tr) = v.get("transcript").and_then(|x| x.as_str()) {
-                                if tr.len() > transcript.len() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t)
+                        && v.get("type").and_then(|x| x.as_str()) == Some("stt_result")
+                            && let Some(tr) = v.get("transcript").and_then(|x| x.as_str())
+                                && tr.len() > transcript.len() {
                                     transcript = tr.to_string();
                                 }
-                            }
-                        }
-                    }
                 }
                 Message::Binary(b) => audio_bytes += b.len(),
                 Message::Close(_) => break,

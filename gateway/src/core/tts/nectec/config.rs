@@ -335,7 +335,7 @@ pub fn chunk_text(text: &str, max_len: usize) -> Vec<String> {
 
         // Try to find sentence break
         let break_point = chunk_text
-            .rfind(|c: char| c == '.' || c == '!' || c == '?' || c == '\n')
+            .rfind(['.', '!', '?', '\n'])
             .map(|p| p + 1)
             // Try word break
             .or_else(|| chunk_text.rfind(|c: char| c.is_whitespace()))

@@ -285,7 +285,10 @@ impl CartesiaSTT {
                     let stt_error =
                         STTError::ConnectionFailed(format!("Failed to connect to Cartesia: {e}"));
                     error!("{}", stt_error);
-                    let _ = error_tx_for_task.send(stt_error);
+                    // `.await` the send — previously the future was dropped, so the connection
+                    // error was never actually delivered to the error channel (clippy
+                    // let_underscore_future).
+                    let _ = error_tx_for_task.send(stt_error).await;
                     return;
                 }
             };

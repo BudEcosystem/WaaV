@@ -344,8 +344,8 @@ impl BaiduSttConfig {
         }
 
         // 8kHz is only supported for Mandarin
-        if self.sample_rate == BaiduSampleRate::Rate8000 {
-            if !matches!(
+        if self.sample_rate == BaiduSampleRate::Rate8000
+            && !matches!(
                 self.model,
                 BaiduSttModel::Mandarin | BaiduSttModel::MandarinNoPunctuation
             ) {
@@ -353,7 +353,6 @@ impl BaiduSttConfig {
                     "8kHz sample rate is only supported for Mandarin models".to_string(),
                 ));
             }
-        }
 
         // Custom vocabulary only for Mandarin
         if self.lm_id.is_some() && !self.model.supports_custom_vocabulary() {

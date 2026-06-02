@@ -425,8 +425,8 @@ impl ElevenLabsSTTConfig {
         }
 
         // Add advanced feature parameters
-        if let Some(ref terms) = self.keyterms {
-            if !terms.is_empty() {
+        if let Some(ref terms) = self.keyterms
+            && !terms.is_empty() {
                 // URL-encode each keyterm and join with comma
                 // Use form_urlencoded to properly escape special characters
                 let encoded_terms: Vec<String> = terms
@@ -436,7 +436,6 @@ impl ElevenLabsSTTConfig {
                 url.push_str("&keyterms=");
                 url.push_str(&encoded_terms.join(","));
             }
-        }
 
         if self.enable_entity_detection == Some(true) {
             url.push_str("&entity_detection=true");

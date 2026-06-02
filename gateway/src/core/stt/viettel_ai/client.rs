@@ -461,8 +461,8 @@ impl BaseSTT for ViettelStt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::future::Future;
-    use std::pin::Pin;
+    
+    
     use std::sync::atomic::AtomicUsize;
 
     fn make_test_config() -> STTConfig {

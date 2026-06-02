@@ -268,12 +268,11 @@ impl YandexSTT {
                     Ok(response) => {
                         let status = response.status();
                         if status.is_success() {
-                            if let Ok(text) = response.text().await {
-                                if let Ok(sync_response) =
+                            if let Ok(text) = response.text().await
+                                && let Ok(sync_response) =
                                     serde_json::from_str::<YandexSyncResponse>(&text)
-                                {
-                                    if let Some(transcript) = sync_response.result {
-                                        if !transcript.is_empty() {
+                                    && let Some(transcript) = sync_response.result
+                                        && !transcript.is_empty() {
                                             let stt_result = STTResult::new(
                                                 transcript, true, // is_final
                                                 true, // is_speech_final
@@ -286,9 +285,6 @@ impl YandexSTT {
                                                 callback(stt_result).await;
                                             }
                                         }
-                                    }
-                                }
-                            }
                         } else {
                             let body = response.text().await.unwrap_or_default();
                             let api_error =

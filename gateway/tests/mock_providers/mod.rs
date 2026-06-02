@@ -33,11 +33,11 @@ fn random_f64() -> f64 {
 }
 
 fn random_u32() -> u32 {
-    let nanos = SystemTime::now()
+    
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .subsec_nanos();
-    nanos
+        .subsec_nanos()
 }
 
 /// Realistic provider latency profiles (in milliseconds)

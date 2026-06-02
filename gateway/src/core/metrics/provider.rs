@@ -698,7 +698,7 @@ mod tests {
         thread::sleep(Duration::from_millis(10));
 
         let elapsed = timer.elapsed_ms();
-        assert!(elapsed >= 10 && elapsed < 30);
+        assert!((10..30).contains(&elapsed));
     }
 
     #[test]
@@ -712,7 +712,7 @@ mod tests {
         timer.record_first_byte();
 
         let ttfb = timer.ttfb_ms().unwrap();
-        assert!(ttfb >= 10 && ttfb < 30);
+        assert!((10..30).contains(&ttfb));
     }
 
     #[test]

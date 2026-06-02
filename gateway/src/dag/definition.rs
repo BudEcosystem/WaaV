@@ -261,14 +261,13 @@ impl DAGDefinition {
                     }
                     | NodeType::TextOutput {
                         destination: OutputDestination::Endpoint { node_id },
-                    } => {
-                        if !node_ids.contains(node_id.as_str()) {
+                    }
+                        if !node_ids.contains(node_id.as_str()) => {
                             errors.push(format!(
                                 "Output node '{}' references unknown endpoint node '{}'",
                                 node.id, node_id
                             ));
                         }
-                    }
                     _ => {}
                 }
             }
@@ -284,14 +283,13 @@ impl DAGDefinition {
                             ));
                         }
                     }
-                    if let Some(default) = &switch.default {
-                        if !node_ids.contains(default.as_str()) {
+                    if let Some(default) = &switch.default
+                        && !node_ids.contains(default.as_str()) {
                             errors.push(format!(
                                 "Switch on edge '{}'->'{}' default references unknown target '{}'",
                                 edge.from, edge.to, default
                             ));
                         }
-                    }
                 }
             }
 

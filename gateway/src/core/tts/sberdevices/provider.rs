@@ -133,11 +133,10 @@ impl SberDevicesTts {
         // Check if existing token is valid
         {
             let token_guard = self.token_manager.read().await;
-            if token_guard.is_token_valid() {
-                if let Some(token) = token_guard.get_token() {
+            if token_guard.is_token_valid()
+                && let Some(token) = token_guard.get_token() {
                     return Ok(token.to_string());
                 }
-            }
         }
 
         // Need to refresh token

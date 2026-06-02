@@ -488,14 +488,13 @@ impl GladiaSTTConfig {
         }
 
         // Validate pre-processing speech threshold
-        if let Some(threshold) = self.pre_processing.speech_threshold {
-            if !(0.0..=1.0).contains(&threshold) {
+        if let Some(threshold) = self.pre_processing.speech_threshold
+            && !(0.0..=1.0).contains(&threshold) {
                 return Err(STTError::ConfigurationError(format!(
                     "Speech threshold must be between 0.0 and 1.0, got {}",
                     threshold
                 )));
             }
-        }
 
         Ok(())
     }

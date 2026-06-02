@@ -5,16 +5,11 @@
 //!
 //! Run: cargo test --test e2e_latency_benchmark -- --nocapture
 
-use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::net::TcpListener;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
-use tokio::time::timeout;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
-use wiremock::matchers::{any, method, path};
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // Realistic provider latencies (based on real-world measurements)

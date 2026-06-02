@@ -11,8 +11,6 @@ use axum::{Router, body::Body, http::Request};
 use serde_json::{Value, json};
 use tokio::time::timeout;
 use tower::util::ServiceExt;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use waav_gateway::{
     ServerConfig,
@@ -406,11 +404,10 @@ async fn test_e2e_concurrent_health_checks() {
 
     let mut success_count = 0;
     for task in tasks {
-        if let Ok(status) = task.await {
-            if status == axum::http::StatusCode::OK {
+        if let Ok(status) = task.await
+            && status == axum::http::StatusCode::OK {
                 success_count += 1;
             }
-        }
     }
 
     assert_eq!(success_count, 20);

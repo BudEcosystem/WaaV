@@ -705,7 +705,7 @@ impl HuaweiCloudSttConfig {
         let (model_str, region) = if config.model.contains('@') {
             let model_parts: Vec<&str> = config.model.splitn(2, '@').collect();
             let region =
-                HuaweiCloudRegion::from_str(model_parts[1]).unwrap_or(HuaweiCloudRegion::default());
+                HuaweiCloudRegion::from_str(model_parts[1]).unwrap_or_default();
             (model_parts[0], region)
         } else {
             (config.model.as_str(), HuaweiCloudRegion::default())

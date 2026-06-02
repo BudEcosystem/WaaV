@@ -608,23 +608,21 @@ impl SpeechmaticsSTTConfig {
             )));
         }
 
-        if let Some(sensitivity) = self.punctuation_sensitivity {
-            if !(0.0..=1.0).contains(&sensitivity) {
+        if let Some(sensitivity) = self.punctuation_sensitivity
+            && !(0.0..=1.0).contains(&sensitivity) {
                 return Err(STTError::ConfigurationError(format!(
                     "Punctuation sensitivity must be between 0.0 and 1.0, got {}",
                     sensitivity
                 )));
             }
-        }
 
-        if let Some(max_speakers) = self.max_speakers {
-            if max_speakers < 1 || max_speakers > 20 {
+        if let Some(max_speakers) = self.max_speakers
+            && (!(1..=20).contains(&max_speakers)) {
                 return Err(STTError::ConfigurationError(format!(
                     "Max speakers must be between 1 and 20, got {}",
                     max_speakers
                 )));
             }
-        }
 
         Ok(())
     }

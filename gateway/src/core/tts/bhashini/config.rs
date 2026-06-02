@@ -152,7 +152,7 @@ impl BhashiniTtsConfig {
         let language_str = config
             .voice_id
             .as_deref()
-            .or_else(|| {
+            .or({
                 if config.model.is_empty() {
                     None
                 } else {
@@ -219,11 +219,10 @@ impl BhashiniTtsConfig {
         if let Some(rate) = f.sample_rate {
             cfg.sample_rate = rate;
         }
-        if let Some(lang) = f.language.as_deref() {
-            if let Some(language) = BhashiniLanguage::from_code(lang) {
+        if let Some(lang) = f.language.as_deref()
+            && let Some(language) = BhashiniLanguage::from_code(lang) {
                 cfg.language = language;
             }
-        }
 
         // Provider-specific passthrough.
         if let Some(url) = std
@@ -285,13 +284,9 @@ impl BhashiniLanguage {
                     "ai4bharat/indic-tts-coqui-indo_aryan-gpu--t4"
                 }
             }
-            LanguageFamily::Misc => {
-                if matches!(self, Self::English) {
-                    "ai4bharat/indic-tts-coqui-misc-gpu--t4"
-                } else {
-                    "ai4bharat/indic-tts-coqui-misc-gpu--t4"
-                }
-            }
+            // The Misc family uses a single coqui model regardless of English vs other languages
+            // (both branches were identical — collapsed; clippy if_same_then_else).
+            LanguageFamily::Misc => "ai4bharat/indic-tts-coqui-misc-gpu--t4",
         }
     }
 }

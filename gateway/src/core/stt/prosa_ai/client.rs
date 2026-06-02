@@ -272,8 +272,8 @@ impl ProsaStt {
     /// Parse error response.
     fn parse_error_response(&self, status: u16, body: &str) -> STTError {
         // Try to parse as JSON error
-        if let Ok(response) = serde_json::from_str::<ProsaSttResponse>(body) {
-            if let Some(err) = response.error {
+        if let Ok(response) = serde_json::from_str::<ProsaSttResponse>(body)
+            && let Some(err) = response.error {
                 return match err.code.as_str() {
                     "auth_invalid_api_key" | "auth_unauthorized" => {
                         STTError::AuthenticationFailed(err.message)
@@ -283,7 +283,6 @@ impl ProsaStt {
                     _ => STTError::ProviderError(err.message),
                 };
             }
-        }
 
         // Fallback to status code based error
         match status {
@@ -479,8 +478,8 @@ impl ProsaStt {
     pub async fn flush(&mut self) -> Result<String, STTError> {
         let audio_data = {
             let mut buffer = self.audio_buffer.write().await;
-            let data = std::mem::take(&mut *buffer);
-            data
+            
+            std::mem::take(&mut *buffer)
         };
 
         if audio_data.is_empty() {

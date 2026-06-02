@@ -235,8 +235,8 @@ impl HuaweiCloudTts {
 
         if !status.is_success() {
             // Try to parse error response
-            if let Ok(tts_response) = HuaweiTtsResponse::from_json(&body) {
-                if let Some(error) = tts_response.get_error() {
+            if let Ok(tts_response) = HuaweiTtsResponse::from_json(&body)
+                && let Some(error) = tts_response.get_error() {
                     // Handle specific error codes
                     if error.contains("SIS.0001") || error.contains("SIS.0002") {
                         return Err(TTSError::AuthenticationFailed(error));
@@ -248,7 +248,6 @@ impl HuaweiCloudTts {
                     }
                     return Err(TTSError::ProviderError(error));
                 }
-            }
             return Err(TTSError::ProviderError(format!(
                 "TTS request failed with status {}: {}",
                 status, body

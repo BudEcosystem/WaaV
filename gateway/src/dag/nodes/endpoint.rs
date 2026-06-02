@@ -100,26 +100,24 @@ pub fn validate_url_for_ssrf(url: &str) -> DAGResult<()> {
     }
 
     // Try to parse as IP address
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_private_ip(&ip) {
+    if let Ok(ip) = host.parse::<IpAddr>()
+        && is_private_ip(&ip) {
             return Err(DAGError::ConfigError(format!(
                 "URL points to private IP '{}' (SSRF protection)",
                 ip
             )));
         }
-    }
 
     // Check for IPv6 addresses in brackets
     if host.starts_with('[') && host.ends_with(']') {
         let ip_str = &host[1..host.len() - 1];
-        if let Ok(ip) = ip_str.parse::<Ipv6Addr>() {
-            if is_private_ipv6(&ip) {
+        if let Ok(ip) = ip_str.parse::<Ipv6Addr>()
+            && is_private_ipv6(&ip) {
                 return Err(DAGError::ConfigError(format!(
                     "URL points to private IPv6 '{}' (SSRF protection)",
                     ip
                 )));
             }
-        }
     }
 
     // Resolve-then-validate: when the host is a DNS name (not an IP literal),
@@ -803,11 +801,10 @@ impl DAGNode for GrpcEndpointNode {
         );
 
         // Add API key if available
-        if let Some(api_key) = &ctx.api_key {
-            if let Ok(value) = format!("Bearer {}", api_key).parse() {
+        if let Some(api_key) = &ctx.api_key
+            && let Ok(value) = format!("Bearer {}", api_key).parse() {
                 request.metadata_mut().insert("authorization", value);
             }
-        }
 
         // Set timeout on request
         request.set_timeout(Duration::from_millis(self.timeout_ms));
@@ -1018,26 +1015,21 @@ impl DAGNode for WebSocketEndpointNode {
         if let Ok(val) = ctx
             .stream_id
             .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
-        {
-            if let Ok(name) =
+            && let Ok(name) =
                 "X-Stream-ID".parse::<tokio_tungstenite::tungstenite::http::HeaderName>()
             {
                 request.headers_mut().insert(name, val);
             }
-        }
 
         // Add authorization header if API key available
-        if let Some(api_key) = &ctx.api_key {
-            if let Ok(val) = format!("Bearer {}", api_key)
+        if let Some(api_key) = &ctx.api_key
+            && let Ok(val) = format!("Bearer {}", api_key)
                 .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
-            {
-                if let Ok(name) =
+                && let Ok(name) =
                     "Authorization".parse::<tokio_tungstenite::tungstenite::http::HeaderName>()
                 {
                     request.headers_mut().insert(name, val);
                 }
-            }
-        }
 
         info!(
             node_id = %self.id,

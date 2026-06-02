@@ -75,7 +75,7 @@ async fn receive_audio_blocking_pattern(
     let start = Instant::now();
 
     // BEFORE: Write lock held during entire ML inference (BAD)
-    let mut smart_turn_guard = smart_turn.write().await;
+    let smart_turn_guard = smart_turn.write().await;
     if let Some(ref processor) = *smart_turn_guard {
         let samples: Vec<f32> = audio.chunks(2).map(|_| 0.0f32).collect();
         processor.process_audio(&samples).await;
@@ -100,13 +100,12 @@ async fn receive_audio_non_blocking_pattern(
     let mut processed_smart_turn = false;
 
     // AFTER: Try to get write lock, skip smart turn if busy (GOOD)
-    if let Ok(smart_turn_guard) = smart_turn.try_write() {
-        if let Some(ref processor) = *smart_turn_guard {
+    if let Ok(smart_turn_guard) = smart_turn.try_write()
+        && let Some(ref processor) = *smart_turn_guard {
             let samples: Vec<f32> = audio.chunks(2).map(|_| 0.0f32).collect();
             processor.process_audio(&samples).await;
             processed_smart_turn = true;
         }
-    }
     // If try_write() fails, lock is busy - skip smart turn, audio still goes to STT
 
     // Send to STT (always happens, regardless of smart turn)

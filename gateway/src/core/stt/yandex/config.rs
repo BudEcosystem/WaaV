@@ -63,8 +63,10 @@ impl FromStr for YandexSTTAudioFormat {
 
 /// Supported languages for Yandex STT
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub enum YandexSTTLanguage {
     /// Russian (default)
+    #[default]
     Russian,
     /// English
     English,
@@ -96,11 +98,6 @@ pub enum YandexSTTLanguage {
     Auto,
 }
 
-impl Default for YandexSTTLanguage {
-    fn default() -> Self {
-        Self::Russian
-    }
-}
 
 impl YandexSTTLanguage {
     /// Get the language code for the API

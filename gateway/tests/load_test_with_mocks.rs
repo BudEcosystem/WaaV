@@ -10,13 +10,13 @@
 mod mock_providers;
 
 use mock_providers::{
-    ChaosConfig, LatencyProfile, MockStats,
+    ChaosConfig, LatencyProfile,
     http_mock::{HttpMockState, spawn_http_mock},
-    websocket_mock::{WebSocketMockState, spawn_stt_websocket_mock, spawn_tts_websocket_mock},
+    websocket_mock::{WebSocketMockState, spawn_stt_websocket_mock},
 };
 
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -208,7 +208,7 @@ async fn test_websocket_stt_load_with_mock() {
     let mut handles = vec![];
 
     // Spawn 10 concurrent WebSocket connections
-    for conn_id in 0..10 {
+    for _conn_id in 0..10 {
         let stats = stats.clone();
         let barrier = barrier.clone();
 
@@ -222,7 +222,7 @@ async fn test_websocket_stt_load_with_mock() {
                 let (mut write, mut read) = ws_stream.split();
 
                 // Send 20 audio chunks
-                for chunk_id in 0..20 {
+                for _chunk_id in 0..20 {
                     let start = Instant::now();
 
                     // Send audio chunk (1KB)

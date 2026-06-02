@@ -202,15 +202,14 @@ pub fn validate_emotion_config(config: &EmotionConfig) -> Vec<String> {
     let mut issues = Vec::new();
 
     // Check description length
-    if let Some(desc) = &config.description {
-        if desc.len() > mappers::MAX_DESCRIPTION_LENGTH {
+    if let Some(desc) = &config.description
+        && desc.len() > mappers::MAX_DESCRIPTION_LENGTH {
             issues.push(format!(
                 "Description exceeds maximum length of {} characters (actual: {})",
                 mappers::MAX_DESCRIPTION_LENGTH,
                 desc.len()
             ));
         }
-    }
 
     // Check intensity
     if let Some(intensity) = &config.intensity {

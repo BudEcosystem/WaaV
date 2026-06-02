@@ -52,7 +52,7 @@ impl GnaniTTS {
     /// Create a new Gnani TTS instance
     pub fn create(config: TTSConfig) -> TTSResult<Self> {
         let gnani_config =
-            GnaniTTSConfig::from_base(config).map_err(|e| TTSError::InvalidConfiguration(e))?;
+            GnaniTTSConfig::from_base(config).map_err(TTSError::InvalidConfiguration)?;
 
         Ok(Self {
             config: Some(gnani_config),
@@ -84,15 +84,12 @@ impl GnaniTTS {
             .timeout(std::time::Duration::from_secs(config.request_timeout_secs));
 
         // Add certificate if provided (optional for TTS)
-        if let Some(ref path) = config.certificate_path {
-            if path.exists() {
-                if let Ok(cert_pem) = std::fs::read(path) {
-                    if let Ok(cert) = reqwest::Certificate::from_pem(&cert_pem) {
+        if let Some(ref path) = config.certificate_path
+            && path.exists()
+                && let Ok(cert_pem) = std::fs::read(path)
+                    && let Ok(cert) = reqwest::Certificate::from_pem(&cert_pem) {
                         builder = builder.add_root_certificate(cert);
                     }
-                }
-            }
-        }
 
         builder.build().map_err(|e| {
             TTSError::InvalidConfiguration(format!("Failed to build HTTP client: {}", e))
@@ -422,7 +419,7 @@ mod tests {
         let tts = GnaniTTS::create(config).unwrap();
         let info = tts.get_provider_info();
         assert_eq!(info["provider"], "gnani");
-        assert!(info["features"].as_array().unwrap().len() > 0);
+        assert!(!info["features"].as_array().unwrap().is_empty());
     }
 
     #[test]

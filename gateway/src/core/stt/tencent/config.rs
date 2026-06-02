@@ -673,34 +673,31 @@ impl TencentSttConfig {
         }
 
         // Validate VAD silence time
-        if let Some(vad_time) = self.vad_silence_time {
-            if vad_time < VAD_SILENCE_TIME_MIN || vad_time > VAD_SILENCE_TIME_MAX {
+        if let Some(vad_time) = self.vad_silence_time
+            && (!(VAD_SILENCE_TIME_MIN..=VAD_SILENCE_TIME_MAX).contains(&vad_time)) {
                 return Err(STTError::ConfigurationError(format!(
                     "VAD silence time must be between {} and {} ms",
                     VAD_SILENCE_TIME_MIN, VAD_SILENCE_TIME_MAX
                 )));
             }
-        }
 
         // Validate max speak time
-        if let Some(max_speak) = self.max_speak_time {
-            if max_speak < MAX_SPEAK_TIME_MIN || max_speak > MAX_SPEAK_TIME_MAX {
+        if let Some(max_speak) = self.max_speak_time
+            && (!(MAX_SPEAK_TIME_MIN..=MAX_SPEAK_TIME_MAX).contains(&max_speak)) {
                 return Err(STTError::ConfigurationError(format!(
                     "Max speak time must be between {} and {} ms",
                     MAX_SPEAK_TIME_MIN, MAX_SPEAK_TIME_MAX
                 )));
             }
-        }
 
         // Validate hotword list size
-        if let Some(ref list) = self.hotword_list {
-            if list.len() > MAX_HOTWORD_LIST_SIZE {
+        if let Some(ref list) = self.hotword_list
+            && list.len() > MAX_HOTWORD_LIST_SIZE {
                 return Err(STTError::ConfigurationError(format!(
                     "Hotword list must not exceed {} terms",
                     MAX_HOTWORD_LIST_SIZE
                 )));
             }
-        }
 
         // Validate reinforce_hotword is only used with compatible models
         if self.reinforce_hotword {

@@ -4,18 +4,12 @@
 //! These tests verify the gateway works correctly from a client's perspective.
 
 use std::net::TcpListener;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::{Router, body::Body, http::Request};
-use bytes::Bytes;
-use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use serde_json::json;
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::Message;
 use tower::util::ServiceExt;
 
 use waav_gateway::{
@@ -616,11 +610,10 @@ async fn test_sdk_concurrent_clients() {
 
     let mut success_count = 0;
     for task in tasks {
-        if let Ok(status) = task.await {
-            if status == axum::http::StatusCode::OK {
+        if let Ok(status) = task.await
+            && status == axum::http::StatusCode::OK {
                 success_count += 1;
             }
-        }
     }
 
     assert_eq!(success_count, 50);

@@ -566,34 +566,31 @@ impl MurfTtsConfig {
         }
 
         // Validate rate if provided
-        if let Some(rate) = self.rate {
-            if rate < MIN_RATE || rate > MAX_RATE {
+        if let Some(rate) = self.rate
+            && (!(MIN_RATE..=MAX_RATE).contains(&rate)) {
                 return Err(TTSError::InvalidConfiguration(format!(
                     "Rate must be between {} and {}, got {}",
                     MIN_RATE, MAX_RATE, rate
                 )));
             }
-        }
 
         // Validate pitch if provided
-        if let Some(pitch) = self.pitch {
-            if pitch < MIN_PITCH || pitch > MAX_PITCH {
+        if let Some(pitch) = self.pitch
+            && (!(MIN_PITCH..=MAX_PITCH).contains(&pitch)) {
                 return Err(TTSError::InvalidConfiguration(format!(
                     "Pitch must be between {} and {}, got {}",
                     MIN_PITCH, MAX_PITCH, pitch
                 )));
             }
-        }
 
         // Validate variation if provided
-        if let Some(variation) = self.variation {
-            if variation > MAX_VARIATION {
+        if let Some(variation) = self.variation
+            && variation > MAX_VARIATION {
                 return Err(TTSError::InvalidConfiguration(format!(
                     "Variation must be between {} and {}, got {}",
                     MIN_VARIATION, MAX_VARIATION, variation
                 )));
             }
-        }
 
         // Validate sample rate for telephony formats
         if self.format.requires_telephony_settings() && self.sample_rate != 8000 {

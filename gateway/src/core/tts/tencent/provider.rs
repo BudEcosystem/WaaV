@@ -330,12 +330,11 @@ impl TencentTts {
         let mut current_chunk = String::new();
 
         for sentence in text.split_inclusive(&['.', '!', '?', '。', '！', '？'][..]) {
-            if current_chunk.len() + sentence.len() > MAX_TEXT_LENGTH {
-                if !current_chunk.is_empty() {
+            if current_chunk.len() + sentence.len() > MAX_TEXT_LENGTH
+                && !current_chunk.is_empty() {
                     chunks.push(current_chunk.trim().to_string());
                     current_chunk = String::new();
                 }
-            }
             current_chunk.push_str(sentence);
         }
 

@@ -275,13 +275,13 @@ impl HuaweiRealtimeResponse {
     /// Check if this is an interim/partial result.
     pub fn is_interim(&self) -> bool {
         self.resp_type == HuaweiResponseType::Result
-            && self.result.as_ref().map_or(false, |r| !r.is_final)
+            && self.result.as_ref().is_some_and(|r| !r.is_final)
     }
 
     /// Check if this is a final result.
     pub fn is_final(&self) -> bool {
         self.resp_type == HuaweiResponseType::End
-            || self.result.as_ref().map_or(false, |r| r.is_final)
+            || self.result.as_ref().is_some_and(|r| r.is_final)
     }
 
     /// Check if session has started.

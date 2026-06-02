@@ -401,27 +401,25 @@ impl BaseTTS for DashScopeTts {
 
                     // Send text message (may be multiple JSON for Qwen)
                     for line in msg.lines() {
-                        if !line.is_empty() {
-                            if write
+                        if !line.is_empty()
+                            && write
                                 .send(Message::Text(line.to_string().into()))
                                 .await
                                 .is_err()
                             {
                                 break;
                             }
-                        }
                     }
                 }
 
                 // Send finish message for CosyVoice
-                if !is_qwen {
-                    if let Some(tid) = &task_id_clone {
+                if !is_qwen
+                    && let Some(tid) = &task_id_clone {
                         let finish = CosyVoiceFinishTask::new(tid);
                         let _ = write
                             .send(Message::Text(finish.to_json().unwrap_or_default().into()))
                             .await;
                     }
-                }
 
                 write
             });

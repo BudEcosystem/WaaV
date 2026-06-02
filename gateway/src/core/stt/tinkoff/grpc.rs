@@ -167,7 +167,7 @@ where
         .map_err(|e| Status::unavailable(format!("Service not ready: {}", e)))?;
 
     // Create the codec
-    let codec = TinkoffCodec::default();
+    let codec = TinkoffCodec;
 
     // Parse the path
     let path = PathAndQuery::from_static(GRPC_SERVICE_PATH);

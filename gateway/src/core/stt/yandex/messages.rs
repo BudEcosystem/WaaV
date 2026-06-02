@@ -196,8 +196,8 @@ impl YandexSTTApiError {
 
     /// Get a human-readable error message
     pub fn display_message(&self) -> String {
-        if let Some(ref details) = self.details {
-            if let Some(detail) = details.first() {
+        if let Some(ref details) = self.details
+            && let Some(detail) = details.first() {
                 if let Some(ref msg) = detail.message {
                     return format!("{}: {}", self.message, msg);
                 }
@@ -205,7 +205,6 @@ impl YandexSTTApiError {
                     return format!("{}: {}", self.message, reason);
                 }
             }
-        }
         self.message.clone()
     }
 }

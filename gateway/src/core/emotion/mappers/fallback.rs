@@ -112,18 +112,17 @@ impl EmotionMapper for FallbackEmotionMapper {
         let mut mapped = MappedEmotion::empty();
 
         // Generate warning if emotion was requested
-        if let Some(emotion) = &config.emotion {
-            if *emotion != Emotion::Neutral {
+        if let Some(emotion) = &config.emotion
+            && *emotion != Emotion::Neutral {
                 mapped.add_warning(format!(
                     "Emotion '{}' is not supported by provider '{}'; using neutral voice",
                     emotion, self.provider_id
                 ));
             }
-        }
 
         // Generate warning for free-form description
-        if let Some(description) = &config.description {
-            if !description.is_empty() {
+        if let Some(description) = &config.description
+            && !description.is_empty() {
                 mapped.add_warning(format!(
                     "Emotion descriptions are not supported by provider '{}'; ignoring '{}'",
                     self.provider_id,
@@ -134,17 +133,15 @@ impl EmotionMapper for FallbackEmotionMapper {
                     }
                 ));
             }
-        }
 
         // Generate warning for delivery style
-        if let Some(style) = &config.style {
-            if *style != crate::core::emotion::types::DeliveryStyle::Normal {
+        if let Some(style) = &config.style
+            && *style != crate::core::emotion::types::DeliveryStyle::Normal {
                 mapped.add_warning(format!(
                     "Delivery style '{}' is not supported by provider '{}'; using normal delivery",
                     style, self.provider_id
                 ));
             }
-        }
 
         // Generate warning for intensity if significantly non-default
         if let Some(intensity) = &config.intensity {

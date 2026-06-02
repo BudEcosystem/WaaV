@@ -625,8 +625,8 @@ impl SmartTurnProcessor {
             self.frames_since_inference += 1;
 
             // Run inference if we have enough frames and it's time
-            if let Some(ref mut detector) = self.detector {
-                if mel_frames_count >= self.config.min_frames
+            if let Some(ref mut detector) = self.detector
+                && mel_frames_count >= self.config.min_frames
                     && self.frames_since_inference >= self.config.inference_interval_frames
                 {
                     let mel_frames = self.mel_extractor.get_mel_frames();
@@ -646,7 +646,6 @@ impl SmartTurnProcessor {
                         );
                     }
                 }
-            }
         }
 
         // Process through decision engine

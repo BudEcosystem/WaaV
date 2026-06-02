@@ -36,7 +36,7 @@ fn test_audio_conversion_aligned_data() {
 #[test]
 fn test_audio_conversion_unaligned_data() {
     // Create a buffer and get an unaligned slice
-    let mut buffer = vec![0u8; 17];
+    let mut buffer = [0u8; 17];
     buffer[1] = 0x00;
     buffer[2] = 0x01;
     buffer[3] = 0xFF;
@@ -278,7 +278,7 @@ impl<T: Copy + Default> TestAlignedBuffer<T> {
 
     fn is_aligned(&self) -> bool {
         match self.ptr {
-            Some(ptr) => (ptr.as_ptr() as usize) % CACHE_LINE_SIZE == 0,
+            Some(ptr) => (ptr.as_ptr() as usize).is_multiple_of(CACHE_LINE_SIZE),
             None => true, // Zero-capacity is considered aligned
         }
     }
@@ -288,7 +288,7 @@ impl<T: Copy + Default> TestAlignedBuffer<T> {
             Some(ptr) => {
                 // Debug assertions for safety
                 debug_assert!(self.len <= self.capacity, "len {} > capacity {}", self.len, self.capacity);
-                debug_assert!(!ptr.as_ptr().is_null(), "null pointer in AlignedBuffer");
+                // (No null check: `ptr` is a NonNull, so `as_ptr()` is never null by construction.)
 
                 // SAFETY: ptr is valid, len <= capacity (checked in debug)
                 unsafe { std::slice::from_raw_parts(ptr.as_ptr(), self.len) }
@@ -300,8 +300,8 @@ impl<T: Copy + Default> TestAlignedBuffer<T> {
     fn resize(&mut self, new_len: usize, value: T) {
         assert!(new_len <= self.capacity, "Cannot resize beyond capacity");
 
-        if let Some(ptr) = self.ptr {
-            if new_len > self.len {
+        if let Some(ptr) = self.ptr
+            && new_len > self.len {
                 // Debug assertions for bounds checking
                 debug_assert!(new_len <= self.capacity, "new_len {} > capacity {}", new_len, self.capacity);
 
@@ -314,7 +314,6 @@ impl<T: Copy + Default> TestAlignedBuffer<T> {
                     }
                 }
             }
-        }
 
         self.len = new_len;
     }
@@ -340,8 +339,8 @@ impl<T: Copy + Default> TestAlignedBuffer<T> {
 
 impl<T: Copy + Default> Drop for TestAlignedBuffer<T> {
     fn drop(&mut self) {
-        if let Some(ptr) = self.ptr {
-            if self.capacity > 0 {
+        if let Some(ptr) = self.ptr
+            && self.capacity > 0 {
                 let layout = Layout::from_size_align(
                     self.capacity * std::mem::size_of::<T>(),
                     CACHE_LINE_SIZE,
@@ -353,7 +352,6 @@ impl<T: Copy + Default> Drop for TestAlignedBuffer<T> {
                     dealloc(ptr.as_ptr() as *mut u8, layout);
                 }
             }
-        }
     }
 }
 

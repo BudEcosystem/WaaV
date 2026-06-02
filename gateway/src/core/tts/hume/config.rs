@@ -241,8 +241,10 @@ impl Default for HumeOutputFormat {
 /// Users can also create custom voices via voice cloning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum HumeVoice {
     /// Kora - Default female voice, warm and natural.
+    #[default]
     Kora,
     /// Custom voice by name.
     Custom(String),
@@ -266,11 +268,6 @@ impl HumeVoice {
     }
 }
 
-impl Default for HumeVoice {
-    fn default() -> Self {
-        Self::Kora
-    }
-}
 
 // =============================================================================
 // Main Configuration
@@ -435,15 +432,14 @@ impl HumeTTSConfig {
         }
 
         // Validate description length
-        if let Some(desc) = &self.description {
-            if desc.len() > MAX_DESCRIPTION_LENGTH {
+        if let Some(desc) = &self.description
+            && desc.len() > MAX_DESCRIPTION_LENGTH {
                 return Err(TTSError::InvalidConfiguration(format!(
                     "Acting instructions (description) must be {} characters or less, got {}",
                     MAX_DESCRIPTION_LENGTH,
                     desc.len()
                 )));
             }
-        }
 
         // Validate speed range
         if let Some(speed) = self.speed {
@@ -469,14 +465,13 @@ impl HumeTTSConfig {
         }
 
         // Validate num_generations
-        if let Some(num) = self.num_generations {
-            if !(1..=3).contains(&num) {
+        if let Some(num) = self.num_generations
+            && !(1..=3).contains(&num) {
                 return Err(TTSError::InvalidConfiguration(format!(
                     "num_generations must be between 1 and 3, got {}",
                     num
                 )));
             }
-        }
 
         // Validate output format
         self.output_format.validate()?;

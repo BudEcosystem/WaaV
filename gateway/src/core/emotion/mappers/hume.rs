@@ -126,7 +126,7 @@ impl HumeEmotionMapper {
         let truncated = &description[..safe_end];
 
         // Find last comma or space before the limit for word boundary
-        if let Some(pos) = truncated.rfind(|c| c == ',' || c == ' ') {
+        if let Some(pos) = truncated.rfind([',', ' ']) {
             // Trim both whitespace and trailing commas
             description[..pos]
                 .trim()
@@ -181,11 +181,10 @@ impl EmotionMapper for HumeEmotionMapper {
         }
 
         // Add style description
-        if let Some(style) = &config.style {
-            if let Some(style_desc) = Self::style_to_description(style) {
+        if let Some(style) = &config.style
+            && let Some(style_desc) = Self::style_to_description(style) {
                 parts.push(style_desc.to_string());
             }
-        }
 
         // Add context if it provides useful hints
         if let Some(context) = &config.context {

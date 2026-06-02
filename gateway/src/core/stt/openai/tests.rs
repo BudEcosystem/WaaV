@@ -422,7 +422,7 @@ mod wav_tests {
 
     #[test]
     fn test_wav_file_size_field() {
-        let pcm_data = vec![0u8; 1000];
+        let _pcm_data = vec![0u8; 1000];
         let header = wav::create_header(1000, 16000, 1, 16);
 
         // File size at bytes 4-8 (should be 36 + data_size)

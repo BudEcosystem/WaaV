@@ -75,7 +75,7 @@ fn generate_power_spectrum() -> Vec<f32> {
 
 /// Scalar implementation for comparison
 mod scalar {
-    use super::*;
+    
 
     pub fn pcm_to_float(pcm: &[u8]) -> Vec<f32> {
         const PCM_TO_FLOAT_SCALE: f32 = 1.0 / 32768.0;

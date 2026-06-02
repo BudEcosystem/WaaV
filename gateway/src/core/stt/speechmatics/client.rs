@@ -135,8 +135,8 @@ impl SpeechmaticsSTT {
                                         serde_json::from_str::<AddPartialTranscriptMessage>(&text)
                                     {
                                         let transcript = msg.transcript();
-                                        if !transcript.is_empty() {
-                                            if let Some(callback) =
+                                        if !transcript.is_empty()
+                                            && let Some(callback) =
                                                 result_callback.read().await.as_ref()
                                             {
                                                 let result = STTResult::new(
@@ -147,7 +147,6 @@ impl SpeechmaticsSTT {
                                                 );
                                                 callback(result).await;
                                             }
-                                        }
                                     }
                                 }
                                 "AddTranscript" => {

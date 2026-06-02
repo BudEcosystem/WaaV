@@ -107,19 +107,16 @@ pub type LlmResult<T> = Result<T, LlmError>;
 /// OpenAI-compatible message role.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum MessageRole {
     System,
+    #[default]
     User,
     Assistant,
     Tool,
     Function,
 }
 
-impl Default for MessageRole {
-    fn default() -> Self {
-        Self::User
-    }
-}
 
 /// OpenAI-compatible message format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -652,11 +649,10 @@ impl LlmClient {
             .entry(session_id.to_string())
             .or_insert_with(|| ConversationHistory::new(self.config.max_history));
 
-        if history.messages().is_empty() {
-            if let Some(system_prompt) = &self.config.system_prompt {
+        if history.messages().is_empty()
+            && let Some(system_prompt) = &self.config.system_prompt {
                 history.add(ChatMessage::system(system_prompt));
             }
-        }
         history.add(ChatMessage::user(input));
         history.messages().to_vec()
     }

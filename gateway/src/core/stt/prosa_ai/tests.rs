@@ -216,7 +216,7 @@ fn test_model_display() {
 
 #[test]
 fn test_model_from_str_trait() {
-    use std::str::FromStr;
+    
 
     let model: ProsaSttModel = "general".parse().unwrap();
     assert_eq!(model, ProsaSttModel::General);

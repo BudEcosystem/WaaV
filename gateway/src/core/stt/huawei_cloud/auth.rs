@@ -353,7 +353,7 @@ fn parse_iso8601_timestamp(timestamp: &str) -> Option<u64> {
 /// Calculate days since Unix epoch (1970-01-01).
 fn days_since_unix_epoch(year: i32, month: u32, day: u32) -> Option<i64> {
     // Simplified calculation
-    if year < 1970 || month < 1 || month > 12 || day < 1 || day > 31 {
+    if year < 1970 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
 

@@ -377,16 +377,14 @@ impl DiarizationConfig {
     /// Validate the diarization configuration.
     pub fn validate(&self) -> Result<(), String> {
         // Validate chunking strategy threshold
-        if let Some(ref strategy) = self.chunking_strategy {
-            if let Some(threshold) = strategy.threshold {
-                if !(0.0..=1.0).contains(&threshold) {
+        if let Some(ref strategy) = self.chunking_strategy
+            && let Some(threshold) = strategy.threshold
+                && !(0.0..=1.0).contains(&threshold) {
                     return Err(format!(
                         "Chunking threshold must be between 0.0 and 1.0, got {}",
                         threshold
                     ));
                 }
-            }
-        }
 
         // Validate speaker references have both name and audio
         for (i, speaker) in self.speaker_references.iter().enumerate() {
@@ -606,11 +604,10 @@ impl OpenAISTTConfig {
                 Vec::new()
             };
         }
-        if let Some(k) = &f.keyterms {
-            if !k.is_empty() {
+        if let Some(k) = &f.keyterms
+            && !k.is_empty() {
                 cfg.prompt = Some(k.join(", "));
             }
-        }
         cfg
     }
 
@@ -656,14 +653,13 @@ impl OpenAISTTConfig {
         self.diarization.validate()?;
 
         // Validate that diarized_json format is only used with compatible models
-        if self.response_format == ResponseFormat::DiarizedJson {
-            if !self.supports_diarization() {
+        if self.response_format == ResponseFormat::DiarizedJson
+            && !self.supports_diarization() {
                 return Err(format!(
                     "Diarized JSON format requires gpt-4o-transcribe or gpt-4o-mini-transcribe model, got {}",
                     self.model
                 ));
             }
-        }
 
         Ok(())
     }

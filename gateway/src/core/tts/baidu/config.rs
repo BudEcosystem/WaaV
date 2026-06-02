@@ -372,7 +372,7 @@ fn default_volume() -> u8 {
 fn default_cuid() -> String {
     format!(
         "waav_gateway_{}",
-        uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string()
+        &uuid::Uuid::new_v4().to_string().replace('-', "")[..16]
     )
 }
 

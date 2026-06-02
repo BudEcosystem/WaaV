@@ -172,6 +172,7 @@ impl FromStr for SpeechmaticsOutputFormat {
 
 /// Speechmatics TTS-specific configuration
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct SpeechmaticsTtsConfig {
     /// API key for authentication
     pub api_key: String,
@@ -302,15 +303,6 @@ impl SpeechmaticsTtsConfig {
     }
 }
 
-impl Default for SpeechmaticsTtsConfig {
-    fn default() -> Self {
-        Self {
-            api_key: String::new(),
-            voice: SpeechmaticsVoice::default(),
-            output_format: SpeechmaticsOutputFormat::default(),
-        }
-    }
-}
 
 // =============================================================================
 // Request Types

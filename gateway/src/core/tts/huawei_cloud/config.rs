@@ -119,6 +119,7 @@ impl HuaweiCloudRegion {
 
 /// Huawei Cloud TTS voice identifiers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum HuaweiTtsVoice {
     // Standard Voices (普通发音人)
     /// 小琪 - Female, Standard
@@ -126,6 +127,7 @@ pub enum HuaweiTtsVoice {
     /// 小雯 - Female, Soft
     XiaoWen,
     /// 小燕 - Female, Gentle (default)
+    #[default]
     XiaoYan,
     /// 小倩 - Female, Mature
     XiaoQian,
@@ -154,11 +156,6 @@ pub enum HuaweiTtsVoice {
     Custom(String),
 }
 
-impl Default for HuaweiTtsVoice {
-    fn default() -> Self {
-        Self::XiaoYan
-    }
-}
 
 impl HuaweiTtsVoice {
     /// Get the property string for API requests.
@@ -776,15 +773,11 @@ impl HuaweiTtsResponse {
 
     /// Get error message if present.
     pub fn get_error(&self) -> Option<String> {
-        if let Some(code) = &self.error_code {
-            Some(format!(
+        self.error_code.as_ref().map(|code| format!(
                 "{}: {}",
                 code,
                 self.error_msg.as_deref().unwrap_or("Unknown error")
             ))
-        } else {
-            None
-        }
     }
 
     /// Get audio data if present (base64-decoded).

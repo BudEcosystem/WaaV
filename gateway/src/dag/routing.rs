@@ -323,37 +323,34 @@ fn json_value_to_string(value: &serde_json::Value) -> String {
 
 /// Populate Rhai scope from JSON object
 fn populate_scope_from_json(scope: &mut Scope, prefix: &str, value: &serde_json::Value) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, val) in map {
-                let full_key = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{}_{}", prefix, key)
-                };
+    if let serde_json::Value::Object(map) = value {
+        for (key, val) in map {
+            let full_key = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{}_{}", prefix, key)
+            };
 
-                match val {
-                    serde_json::Value::String(s) => {
-                        scope.push_constant(full_key, s.clone());
-                    }
-                    serde_json::Value::Bool(b) => {
-                        scope.push_constant(full_key, *b);
-                    }
-                    serde_json::Value::Number(n) => {
-                        if let Some(i) = n.as_i64() {
-                            scope.push_constant(full_key, i);
-                        } else if let Some(f) = n.as_f64() {
-                            scope.push_constant(full_key, f);
-                        }
-                    }
-                    serde_json::Value::Null => {
-                        scope.push_constant(full_key, ());
-                    }
-                    _ => {} // Skip arrays and nested objects for now
+            match val {
+                serde_json::Value::String(s) => {
+                    scope.push_constant(full_key, s.clone());
                 }
+                serde_json::Value::Bool(b) => {
+                    scope.push_constant(full_key, *b);
+                }
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        scope.push_constant(full_key, i);
+                    } else if let Some(f) = n.as_f64() {
+                        scope.push_constant(full_key, f);
+                    }
+                }
+                serde_json::Value::Null => {
+                    scope.push_constant(full_key, ());
+                }
+                _ => {} // Skip arrays and nested objects for now
             }
         }
-        _ => {}
     }
 }
 

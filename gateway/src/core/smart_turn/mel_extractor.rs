@@ -412,11 +412,7 @@ impl MelExtractor {
 
             // Keep the LAST max_frames (most recent audio) if we have too many
             let max_frames = self.config.max_frames();
-            let start_frame = if num_frames > max_frames {
-                num_frames - max_frames
-            } else {
-                0
-            };
+            let start_frame = num_frames.saturating_sub(max_frames);
 
             // Transpose from (n_mels, n_frames) to (n_frames, n_mels)
             self.mel_frames.reserve(num_frames - start_frame);
@@ -603,7 +599,7 @@ impl MelExtractor {
         if self.total_extraction_time_us == 0 {
             0.0
         } else {
-            let audio_duration_us = (self.audio_duration_secs() * 1_000_000.0) as f32;
+            let audio_duration_us = self.audio_duration_secs() * 1_000_000.0;
             audio_duration_us / self.total_extraction_time_us as f32
         }
     }

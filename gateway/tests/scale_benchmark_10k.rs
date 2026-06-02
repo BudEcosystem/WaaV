@@ -9,12 +9,11 @@
 mod mock_providers;
 
 use mock_providers::{
-    ChaosConfig, LatencyProfile, MockStats,
+    ChaosConfig, LatencyProfile,
     http_mock::{HttpMockState, spawn_http_mock},
     websocket_mock::{WebSocketMockState, spawn_stt_websocket_mock, spawn_tts_websocket_mock},
 };
 
-use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write as IoWrite};
 use std::path::PathBuf;
@@ -386,6 +385,12 @@ pub struct BenchmarkStats {
     pub result_saver: Option<Arc<ResultSaver>>,
 }
 
+impl Default for BenchmarkStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BenchmarkStats {
     pub fn new() -> Self {
         Self {
@@ -549,6 +554,12 @@ pub struct ResourceMonitor {
     samples: Mutex<Vec<ResourceSnapshot>>,
     start_time: Instant,
     running: AtomicBool,
+}
+
+impl Default for ResourceMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ResourceMonitor {
@@ -820,7 +831,7 @@ async fn run_stage(
     let mut handles = Vec::with_capacity(vus as usize);
     let request_counter = Arc::new(AtomicU64::new(0));
 
-    for worker_id in 0..vus {
+    for _worker_id in 0..vus {
         let client = client.clone();
         let stats = stats.clone();
         let semaphore = semaphore.clone();

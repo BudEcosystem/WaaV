@@ -198,11 +198,10 @@ impl ReverieApiError {
 
     /// Get a human-readable error message.
     pub fn display_message(&self) -> String {
-        if let Some(ref msg) = self.message {
-            if !msg.is_empty() {
+        if let Some(ref msg) = self.message
+            && !msg.is_empty() {
                 return format!("{}: {}", self.error, msg);
             }
-        }
         self.error.clone()
     }
 }

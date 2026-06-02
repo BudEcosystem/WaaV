@@ -122,10 +122,7 @@ impl ReconnectGovernor {
 
     /// Acquire a slot but give up after `timeout` if none becomes free.
     pub async fn acquire_timeout(&self, timeout: Duration) -> Option<ReconnectPermit> {
-        match tokio::time::timeout(timeout, self.acquire()).await {
-            Ok(permit) => Some(permit),
-            Err(_) => None,
-        }
+        tokio::time::timeout(timeout, self.acquire()).await.ok()
     }
 }
 

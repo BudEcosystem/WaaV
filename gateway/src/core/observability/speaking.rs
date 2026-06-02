@@ -509,7 +509,7 @@ mod tests {
 
         // Duration should be approximately 100ms (10 chunks * 10ms)
         let duration_ms = stopped.speaking_duration_ns / 1_000_000;
-        assert!(duration_ms >= 90 && duration_ms <= 150);
+        assert!((90..=150).contains(&duration_ms));
     }
 
     #[test]

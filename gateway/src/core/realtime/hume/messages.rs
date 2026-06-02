@@ -332,18 +332,15 @@ pub struct AudioSettings {
 /// Supported audio encodings for EVI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum AudioEncoding {
     /// Linear 16-bit PCM, little-endian.
+    #[default]
     Linear16,
     /// WebM container format.
     Webm,
 }
 
-impl Default for AudioEncoding {
-    fn default() -> Self {
-        AudioEncoding::Linear16
-    }
-}
 
 /// Context settings for prepopulating conversation.
 #[derive(Debug, Clone, Serialize)]

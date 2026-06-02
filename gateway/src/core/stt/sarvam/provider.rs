@@ -226,8 +226,8 @@ impl SarvamSTT {
                     },
                     Err(parse_err) => {
                         // Try to parse as simple text transcript (fallback)
-                        if let Ok(simple) = serde_json::from_str::<serde_json::Value>(&text) {
-                            if let Some(text_value) = simple.get("text").and_then(|v| v.as_str()) {
+                        if let Ok(simple) = serde_json::from_str::<serde_json::Value>(&text)
+                            && let Some(text_value) = simple.get("text").and_then(|v| v.as_str()) {
                                 let stt_result = STTResult::new(
                                     text_value.to_string(),
                                     simple
@@ -246,7 +246,6 @@ impl SarvamSTT {
                                 }
                                 return Ok(());
                             }
-                        }
 
                         // Check if it's an error message
                         if text.contains("error") || text.contains("Error") {

@@ -121,7 +121,7 @@ impl GroqSTTModel {
     /// Uses centralized pricing from `crate::config::pricing`.
     /// Falls back to hardcoded values if not found in pricing database.
     pub fn cost_per_hour(&self) -> f64 {
-        crate::config::get_stt_price_per_hour("groq", self.as_str()).unwrap_or_else(|| {
+        crate::config::get_stt_price_per_hour("groq", self.as_str()).unwrap_or({
             // Fallback to hardcoded values (should not happen if pricing db is up to date)
             match self {
                 Self::WhisperLargeV3 => 0.111,

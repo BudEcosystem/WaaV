@@ -150,11 +150,10 @@ impl TokenManager {
     /// Get or refresh the access token.
     async fn get_token(&self, api_key: &str, secret_key: &str) -> Result<String, STTError> {
         // Check if we have a valid cached token
-        if self.is_token_valid().await {
-            if let Some(token) = self.access_token.read().await.clone() {
+        if self.is_token_valid().await
+            && let Some(token) = self.access_token.read().await.clone() {
                 return Ok(token);
             }
-        }
 
         // Fetch new token
         let url = format!(

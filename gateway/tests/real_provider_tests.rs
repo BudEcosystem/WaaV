@@ -742,7 +742,7 @@ async fn test_gateway_with_real_deepgram() {
             if status.is_success() {
                 let audio_bytes = resp.bytes().await.unwrap();
                 println!("Gateway returned {} bytes of audio", audio_bytes.len());
-                assert!(audio_bytes.len() > 0, "No audio returned");
+                assert!(!audio_bytes.is_empty(), "No audio returned");
             } else {
                 let body = resp.text().await.unwrap_or_default();
                 println!("Gateway error: {}", body);

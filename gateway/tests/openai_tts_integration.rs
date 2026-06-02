@@ -406,11 +406,10 @@ async fn test_openai_tts_local_server_roundtrip() {
             st.saw_bearer.store(true, Ordering::SeqCst);
         }
         // The OpenAI speech contract is a JSON body containing the input text + voice/model.
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
-            if v.get("input").is_some() && v.get("voice").is_some() {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body)
+            && v.get("input").is_some() && v.get("voice").is_some() {
                 st.saw_json_body.store(true, Ordering::SeqCst);
             }
-        }
         fake_pcm()
     }
 

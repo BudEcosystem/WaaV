@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn test_call_plugin_safely_error() {
         let result: Result<i32, PluginError> = call_plugin_safely(|| {
-            Err::<i32, _>(std::io::Error::new(std::io::ErrorKind::Other, "test error"))
+            Err::<i32, _>(std::io::Error::other("test error"))
         });
         assert!(result.is_err());
         match result {
@@ -348,8 +348,7 @@ mod tests {
     #[tokio::test]
     async fn test_call_plugin_safely_async_error() {
         let result: Result<i32, PluginError> = call_plugin_safely_async(|| async {
-            Err::<i32, _>(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err::<i32, _>(std::io::Error::other(
                 "async error",
             ))
         })

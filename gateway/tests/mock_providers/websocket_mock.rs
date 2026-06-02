@@ -134,7 +134,7 @@ async fn handle_stt_connection(
                     "duration": 0.5,
                     "start": (audio_chunk_count as f64 - 1.0) * 0.5,
                     "is_final": true,
-                    "speech_final": audio_chunk_count % 5 == 0,
+                    "speech_final": audio_chunk_count.is_multiple_of(5),
                     "channel": {
                         "alternatives": [{
                             "transcript": format!("Mock transcript chunk {}", audio_chunk_count),
@@ -158,11 +158,10 @@ async fn handle_stt_connection(
             }
             Ok(Message::Text(text)) => {
                 // Handle control messages
-                if let Ok(msg) = serde_json::from_str::<Value>(&text) {
-                    if msg.get("type").and_then(|t| t.as_str()) == Some("CloseStream") {
+                if let Ok(msg) = serde_json::from_str::<Value>(&text)
+                    && msg.get("type").and_then(|t| t.as_str()) == Some("CloseStream") {
                         break;
                     }
-                }
             }
             Ok(Message::Close(_)) => break,
             Ok(Message::Ping(data)) => {
