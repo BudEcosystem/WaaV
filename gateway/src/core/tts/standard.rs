@@ -43,6 +43,10 @@ pub struct TtsFeatures {
     pub seed: Option<u64>,
     /// Output sample rate override.
     pub sample_rate: Option<u32>,
+    /// Streaming latency-optimization tier 0-4, trading quality for lower TTFB
+    /// (ElevenLabs `optimize_streaming_latency`).
+    #[serde(default)]
+    pub optimize_streaming_latency: Option<u8>,
 }
 
 /// The standardized TTS config crossing the dispatch boundary: flat base + typed features +
@@ -187,11 +191,28 @@ mod tests {
             stability: Some(0.7),
             instructions: Some("speak cheerfully".into()),
             ssml: Some(true),
+            optimize_streaming_latency: Some(3),
             ..Default::default()
         };
         let json = serde_json::to_string(&f).unwrap();
         let back: TtsFeatures = serde_json::from_str(&json).unwrap();
         assert_eq!(f, back);
+    }
+
+    #[test]
+    fn optimize_streaming_latency_defaults_to_none_and_is_serde_default() {
+        // Additive guarantee: the new field defaults to `None` and a payload that omits it still
+        // deserializes (serde-default), so older configs keep working.
+        let f = TtsFeatures::default();
+        assert!(f.optimize_streaming_latency.is_none());
+
+        let back: TtsFeatures = serde_json::from_str("{}").unwrap();
+        assert_eq!(back, TtsFeatures::default());
+
+        // The ElevenLabs latency tier survives as a numeric value.
+        let tier: TtsFeatures =
+            serde_json::from_str(r#"{"optimize_streaming_latency":4}"#).unwrap();
+        assert_eq!(tier.optimize_streaming_latency, Some(4));
     }
 
     #[test]

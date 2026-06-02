@@ -254,6 +254,21 @@ impl GoogleTTSConfig {
         if let Some(sr) = f.sample_rate {
             cfg.base.sample_rate = Some(sr);
         }
+        // `effectsProfileId` is a Google-unique AudioConfig field with no canonical `TtsFeatures`
+        // slot, so it rides the open `extras` passthrough. Accepts either a JSON array of strings
+        // (`["headphone-class-device", ...]`) or a single string. Confirmed per-request on the
+        // `v1/text:synthesize` endpoint: AudioConfig.effectsProfileId (string[]).
+        // Doc: https://cloud.google.com/text-to-speech/docs/reference/rest/v1/AudioConfig
+        if let Some(v) = std.extras.0.get("effects_profile_id") {
+            if let Some(arr) = v.as_array() {
+                cfg.effects_profile_id = arr
+                    .iter()
+                    .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                    .collect();
+            } else if let Some(s) = v.as_str() {
+                cfg.effects_profile_id = vec![s.to_string()];
+            }
+        }
         cfg
     }
 
@@ -453,6 +468,107 @@ mod tests {
         assert_eq!(cfg.base.speaking_rate, Some(1.5));
         assert_eq!(cfg.language_code, "es-ES");
         assert_eq!(cfg.base.sample_rate, Some(48000));
+    }
+
+    // WIRE-LEVEL: the provider-unique `effects_profile_id` extras passthrough must reach the
+    // SERIALIZED `audioConfig.effectsProfileId` the body builder emits — not just sit in the
+    // config struct (the bug class the last review caught). Accepts an array or a single string.
+    // Doc: https://cloud.google.com/text-to-speech/docs/reference/rest/v1/AudioConfig
+    #[test]
+    fn from_standard_effects_profile_id_extras_reach_serialized_body() {
+        use crate::core::providers::google::CredentialSource;
+        use crate::core::stt::standard::ProviderExtras;
+        use crate::core::tts::provider::TTSRequestBuilder;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("project_id".into(), serde_json::json!("p"));
+        extras.insert(
+            "effects_profile_id".into(),
+            serde_json::json!(["headphone-class-device", "wearable-class-device"]),
+        );
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "google".into(),
+                voice_id: Some("en-US-Wavenet-D".to_string()),
+                audio_format: Some("linear16".to_string()),
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+
+        let cfg = GoogleTTSConfig::from_standard(&std);
+        // Struct-level (necessary but NOT sufficient).
+        assert_eq!(
+            cfg.effects_profile_id,
+            vec!["headphone-class-device".to_string(), "wearable-class-device".to_string()]
+        );
+
+        // Wire-level: serialize the actual request body the builder produces and assert the param
+        // is present on the wire under its exact Google field name `effectsProfileId`.
+        let builder = crate::core::tts::google::GoogleRequestBuilder::new(
+            std.base.clone(),
+            cfg.clone(),
+            "tok".to_string(),
+        );
+        let req = builder
+            .build_http_request(&reqwest::Client::new(), "hello")
+            .build()
+            .unwrap();
+        let body_bytes = req.body().unwrap().as_bytes().unwrap();
+        let raw = std::str::from_utf8(body_bytes).unwrap();
+        assert!(
+            raw.contains(
+                "\"effectsProfileId\":[\"headphone-class-device\",\"wearable-class-device\"]"
+            ),
+            "effectsProfileId not on the wire: {raw}"
+        );
+        // Silence unused-import warning when CredentialSource path isn't exercised here.
+        let _ = CredentialSource::from_api_key("");
+    }
+
+    // Single-string form of the extras passthrough is normalized to a one-element wire array.
+    #[test]
+    fn from_standard_effects_profile_id_single_string_reaches_serialized_body() {
+        use crate::core::stt::standard::ProviderExtras;
+        use crate::core::tts::provider::TTSRequestBuilder;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("project_id".into(), serde_json::json!("p"));
+        extras.insert(
+            "effects_profile_id".into(),
+            serde_json::json!("telephony-class-application"),
+        );
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "google".into(),
+                voice_id: Some("en-US-Wavenet-D".to_string()),
+                audio_format: Some("linear16".to_string()),
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+
+        let cfg = GoogleTTSConfig::from_standard(&std);
+        assert_eq!(cfg.effects_profile_id, vec!["telephony-class-application".to_string()]);
+
+        let builder = crate::core::tts::google::GoogleRequestBuilder::new(
+            std.base.clone(),
+            cfg.clone(),
+            "tok".to_string(),
+        );
+        let req = builder
+            .build_http_request(&reqwest::Client::new(), "hello")
+            .build()
+            .unwrap();
+        let raw = std::str::from_utf8(req.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert!(
+            raw.contains("\"effectsProfileId\":[\"telephony-class-application\"]"),
+            "effectsProfileId single-string not on the wire: {raw}"
+        );
     }
 
     // ===== GoogleAudioEncoding Tests =====

@@ -44,6 +44,20 @@ pub struct SttFeatures {
     pub language_detection: Option<bool>,
     /// Named-entity detection.
     pub entity_detection: Option<bool>,
+    /// Convert spoken numbers to digits / numeric formatting (Deepgram `numerals`).
+    #[serde(default)]
+    pub numerals: Option<bool>,
+    /// Transcribe each audio channel independently, with per-channel speakers
+    /// (Deepgram / AssemblyAI `multichannel`).
+    #[serde(default)]
+    pub multichannel: Option<bool>,
+    /// Number of N-best alternative hypotheses to return (Deepgram / Google `alternatives` /
+    /// `maxAlternatives`).
+    #[serde(default)]
+    pub alternatives: Option<u8>,
+    /// Per-utterance sentiment analysis (Deepgram / AssemblyAI `sentiment`).
+    #[serde(default)]
+    pub sentiment: Option<bool>,
 }
 
 /// Open, typed passthrough for any provider-specific parameter not modeled above — the escape
@@ -216,11 +230,34 @@ mod tests {
             diarization: Some(true),
             keyterms: Some(vec!["WaaV".into(), "Deepgram".into()]),
             endpointing_ms: Some(300),
+            numerals: Some(true),
+            multichannel: Some(true),
+            alternatives: Some(3),
+            sentiment: Some(true),
             ..Default::default()
         };
         let json = serde_json::to_string(&f).unwrap();
         let back: SttFeatures = serde_json::from_str(&json).unwrap();
         assert_eq!(f, back);
+    }
+
+    #[test]
+    fn new_features_default_to_none_and_are_omitted_when_absent() {
+        // Additive guarantee: the new fields default to `None` and a config that predates them
+        // still deserializes (serde-default), so older payloads keep working.
+        let f = SttFeatures::default();
+        assert!(f.numerals.is_none());
+        assert!(f.multichannel.is_none());
+        assert!(f.alternatives.is_none());
+        assert!(f.sentiment.is_none());
+
+        // A payload omitting every new key round-trips to all-`None`.
+        let back: SttFeatures = serde_json::from_str("{}").unwrap();
+        assert_eq!(back, SttFeatures::default());
+
+        // N-best `alternatives` survives as a numeric value.
+        let n: SttFeatures = serde_json::from_str(r#"{"alternatives":5}"#).unwrap();
+        assert_eq!(n.alternatives, Some(5));
     }
 
     #[test]

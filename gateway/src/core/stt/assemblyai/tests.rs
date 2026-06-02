@@ -110,6 +110,7 @@ mod config_tests {
             end_of_turn_confidence_threshold: Some(0.75),
             region: AssemblyAIRegion::Eu,
             include_word_timestamps: true,
+            ..Default::default()
         };
 
         let url = config.build_websocket_url();

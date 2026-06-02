@@ -97,6 +97,116 @@ async fn test_waav_elevenlabs_tts_provider_live() {
     );
 }
 
+// =============================================================================
+// NEW FEATURE (feature-vocabulary expansion): determinism `seed`.
+//
+// `seed` is an ElevenLabs request-BODY integer param on the convert endpoint. WaaV's
+// `ElevenLabsRequestBuilder` emits it as `body["seed"]` (clamped to u32::MAX) onto
+// `POST /v1/text-to-speech/{voice_id}`. The provider's request builder is private, so these LIVE
+// tests issue the EXACT same wire request WaaV builds (same URL, output_format, headers, and body
+// shape: text + voice_settings + model_id + seed) against the real API, and assert:
+//   1) the API ACCEPTS the `seed` body param (HTTP 200 with audio),
+//   2) two requests with the SAME seed produce byte-identical audio,
+//   3) a request with a DIFFERENT seed produces different audio bytes.
+// =============================================================================
+
+/// Issue the exact WaaV-shaped ElevenLabs convert request, optionally with a `seed` body param.
+/// Returns the raw audio bytes (or panics with the API error so a rejected `seed` is loud).
+async fn elevenlabs_convert_with_seed(text: &str, seed: Option<u64>) -> Vec<u8> {
+    let client = reqwest::Client::new();
+    // mp3_44100_128 works on free tiers (pcm_* is Pro-only) and is a deterministic codec for a
+    // fixed seed; this matches the gateway live tests' format choice above.
+    let url = format!(
+        "https://api.elevenlabs.io/v1/text-to-speech/{RACHEL_VOICE}?output_format=mp3_44100_128"
+    );
+
+    // Body shape mirrors ElevenLabsRequestBuilder::build_http_request_with_context exactly:
+    // text + voice_settings + model_id (+ seed when set, clamped to the documented u32::MAX).
+    let mut body = serde_json::json!({
+        "text": text,
+        "voice_settings": {
+            "stability": 0.5,
+            "similarity_boost": 0.75,
+        },
+        "model_id": "eleven_multilingual_v2",
+    });
+    if let Some(s) = seed {
+        body["seed"] = serde_json::json!(s.min(u32::MAX as u64));
+    }
+
+    let resp = client
+        .post(url)
+        .header("xi-api-key", api_key())
+        .header("Content-Type", "application/json")
+        .header("Accept", "audio/mpeg")
+        .json(&body)
+        .send()
+        .await
+        .expect("ElevenLabs convert request");
+    let status = resp.status();
+    let bytes = resp.bytes().await.expect("read body").to_vec();
+    assert!(
+        status.is_success(),
+        "ElevenLabs rejected the request (seed={seed:?}): HTTP {status} — {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert!(
+        bytes.len() > 2000,
+        "expected real audio, got {} bytes (seed={seed:?})",
+        bytes.len()
+    );
+    bytes
+}
+
+/// LIVE: same seed → byte-identical audio; different seed → different audio. Also proves the real
+/// API ACCEPTS the `seed` body param that WaaV's `ElevenLabsRequestBuilder` now emits.
+#[tokio::test]
+#[ignore = "Requires ELEVENLABS_API_KEY; makes several real billed ElevenLabs API calls"]
+async fn test_elevenlabs_seed_determinism_live() {
+    let text = "Determinism check: the WaaV gateway seeds ElevenLabs for reproducible audio.";
+
+    // Two requests with the SAME seed must be byte-identical.
+    let a = elevenlabs_convert_with_seed(text, Some(424242)).await;
+    let b = elevenlabs_convert_with_seed(text, Some(424242)).await;
+    println!(
+        "seed=424242: req A = {} bytes, req B = {} bytes (identical = {})",
+        a.len(),
+        b.len(),
+        a == b
+    );
+    assert_eq!(
+        a, b,
+        "same seed must yield byte-identical audio (A={} B={} bytes)",
+        a.len(),
+        b.len()
+    );
+
+    // A DIFFERENT seed must yield different audio bytes.
+    let c = elevenlabs_convert_with_seed(text, Some(999999)).await;
+    println!(
+        "seed=999999: req C = {} bytes; differs from seed=424242 = {}",
+        c.len(),
+        c != a
+    );
+    assert_ne!(
+        a, c,
+        "different seeds should produce different audio (both {} bytes — suspiciously identical)",
+        a.len()
+    );
+}
+
+/// LIVE: the API accepts the documented MAX seed (u32::MAX) that WaaV clamps to — i.e. the clamp
+/// keeps us inside the accepted range rather than tripping a 4xx.
+#[tokio::test]
+#[ignore = "Requires ELEVENLABS_API_KEY; makes a real billed ElevenLabs API call"]
+async fn test_elevenlabs_seed_max_accepted_live() {
+    let text = "Max seed boundary check.";
+    // u32::MAX is the documented upper bound WaaV clamps to; the API must accept it (HTTP 200).
+    let audio = elevenlabs_convert_with_seed(text, Some(u32::MAX as u64)).await;
+    println!("seed=u32::MAX accepted, {} bytes of audio", audio.len());
+    assert!(audio.len() > 2000);
+}
+
 /// Build a minimal gateway `ServerConfig` with the real ElevenLabs key, bound to an OS-assigned port.
 fn gateway_config() -> waav_gateway::ServerConfig {
     use waav_gateway::config::{DAGTimeoutsConfig, PluginConfig};

@@ -358,10 +358,30 @@ pub fn escape_xml(text: &str) -> String {
     result
 }
 
+/// The Microsoft TTS SSML namespace, required on `<speak>` for any `mstts:*` element
+/// (such as `mstts:express-as`). Confirmed against the Azure Speech SSML reference
+/// (`speech-synthesis-markup-voice`, doc ms.date 2026-01-30): every `mstts:express-as`
+/// example declares `xmlns:mstts="https://www.w3.org/2001/mstts"` on the root element.
+pub const AZURE_MSTTS_NAMESPACE: &str = "https://www.w3.org/2001/mstts";
+
 /// Builds an SSML document for Azure TTS.
 ///
 /// Wraps the provided text in a valid SSML document with the specified voice
-/// and language. Optionally includes a prosody element for speaking rate control.
+/// and language. Optionally includes a prosody element for speaking rate control
+/// and an `mstts:express-as` wrapper for emotional/styled delivery.
+///
+/// # Emotion (`mstts:express-as`)
+///
+/// When `emotion` is `Some(style)`, the (prosody-wrapped) text is further wrapped in
+/// `<mstts:express-as style="...">`, and the `xmlns:mstts` namespace is declared on the
+/// `<speak>` element. This is the only wire vector Azure exposes for emotion on the
+/// `cognitiveservices/v1` REST synthesis endpoint — the endpoint consumes SSML, and the
+/// `style` attribute is the documented control (Azure SSML reference, doc ms.date
+/// 2026-01-30). `express-as` is supported only on a subset of neural voices; for voices
+/// that do not support the supplied style the service silently ignores the element and
+/// falls back to neutral speech (per the docs: "If the style value is missing or invalid,
+/// the entire `mstts:express-as` element is ignored"). Emitting it unconditionally is
+/// therefore safe — it never breaks synthesis on unsupported voices.
 ///
 /// # Arguments
 ///
@@ -369,25 +389,31 @@ pub fn escape_xml(text: &str) -> String {
 /// * `voice_name` - Azure voice name (e.g., "en-US-JennyNeural")
 /// * `language` - BCP-47 language code (e.g., "en-US")
 /// * `speaking_rate` - Optional speaking rate multiplier (0.5 to 2.0, where 1.0 is normal)
+/// * `emotion` - Optional `mstts:express-as` style (e.g., "cheerful", "sad", "angry")
 ///
 /// # Example
 ///
 /// ```rust
 /// use waav_gateway::core::tts::azure::build_ssml;
 ///
-/// let ssml = build_ssml("Hello world!", "en-US-JennyNeural", "en-US", None);
+/// let ssml = build_ssml("Hello world!", "en-US-JennyNeural", "en-US", None, None);
 /// assert!(ssml.contains("<speak"));
 /// assert!(ssml.contains("en-US-JennyNeural"));
 /// assert!(ssml.contains("Hello world!"));
 ///
-/// let ssml_with_rate = build_ssml("Fast speech", "en-US-JennyNeural", "en-US", Some(1.5));
+/// let ssml_with_rate = build_ssml("Fast speech", "en-US-JennyNeural", "en-US", Some(1.5), None);
 /// assert!(ssml_with_rate.contains("rate=\"150%\""));
+///
+/// let ssml_emo = build_ssml("Yay!", "en-US-JennyNeural", "en-US", None, Some("cheerful"));
+/// assert!(ssml_emo.contains("mstts:express-as style=\"cheerful\""));
+/// assert!(ssml_emo.contains("xmlns:mstts"));
 /// ```
 pub fn build_ssml(
     text: &str,
     voice_name: &str,
     language: &str,
     speaking_rate: Option<f32>,
+    emotion: Option<&str>,
 ) -> String {
     let escaped_text = escape_xml(text);
 
@@ -401,10 +427,25 @@ pub fn build_ssml(
         _ => escaped_text,
     };
 
+    // Wrap in mstts:express-as when an emotion/style is requested. The style value is
+    // XML-attribute-escaped to keep the SSML well-formed for arbitrary input.
+    let (mstts_ns, voiced_content) = match emotion {
+        Some(style) if !style.is_empty() => {
+            let escaped_style = escape_xml(style);
+            (
+                format!(" xmlns:mstts='{AZURE_MSTTS_NAMESPACE}'"),
+                format!(
+                    "<mstts:express-as style=\"{escaped_style}\">{inner_content}</mstts:express-as>"
+                ),
+            )
+        }
+        _ => (String::new(), inner_content),
+    };
+
     format!(
-        r#"<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='{language}'>
+        r#"<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis'{mstts_ns} xml:lang='{language}'>
     <voice name='{voice_name}'>
-        {inner_content}
+        {voiced_content}
     </voice>
 </speak>"#,
     )
@@ -460,6 +501,17 @@ pub struct AzureTTSConfig {
     /// configured voice and speaking rate. When `false`, the text is
     /// sent as-is (assumes caller provides valid SSML).
     pub use_ssml: bool,
+
+    /// Optional `mstts:express-as` speaking style / emotion (e.g. "cheerful", "sad").
+    ///
+    /// When set (and `use_ssml` is true), `build_ssml_for_text` wraps the synthesized
+    /// text in `<mstts:express-as style="...">` and declares the `xmlns:mstts`
+    /// namespace. This is the documented Azure wire control for emotion on the
+    /// `cognitiveservices/v1` REST synthesis endpoint (the endpoint consumes SSML).
+    /// Only a subset of neural voices honor it; unsupported voices silently fall back
+    /// to neutral speech, so it is safe to emit unconditionally. Populated from the
+    /// standardized `TtsFeatures.emotion`.
+    pub emotion: Option<String>,
 }
 
 impl Default for AzureTTSConfig {
@@ -469,6 +521,7 @@ impl Default for AzureTTSConfig {
             region: AzureRegion::default(),
             output_format: AzureAudioEncoding::default(),
             use_ssml: true,
+            emotion: None,
         }
     }
 }
@@ -510,6 +563,7 @@ impl AzureTTSConfig {
             region: AzureRegion::default(),
             output_format,
             use_ssml: true,
+            emotion: None,
         }
     }
 
@@ -532,6 +586,16 @@ impl AzureTTSConfig {
         }
         if let Some(s) = f.ssml {
             cfg.use_ssml = s;
+        }
+        // Map the standardized emotion into the Azure `mstts:express-as` style. This is wired
+        // into the SSML body by `build_ssml_for_text` → `build_ssml`, which is the only emotion
+        // wire vector Azure's `cognitiveservices/v1` REST synth endpoint exposes (it consumes
+        // SSML; there is no URL/header param for emotion). express-as is voice-gated, but
+        // unsupported voices silently ignore an unknown style and fall back to neutral speech
+        // (Azure SSML reference, doc ms.date 2026-01-30), so passing it through is safe.
+        // Previously features.emotion was silently dropped for Azure.
+        if let Some(emotion) = f.emotion.as_ref().filter(|s| !s.is_empty()) {
+            cfg.emotion = Some(emotion.clone());
         }
         // Fold the standardized speaking speed into the base rate so the SSML <prosody rate> path
         // (build_ssml_for_text) actually applies it — previously features.speed was silently
@@ -719,6 +783,7 @@ impl AzureTTSConfig {
             self.voice_name(),
             &self.language_code(),
             self.base.speaking_rate,
+            self.emotion.as_deref(),
         )
     }
 }
@@ -1053,7 +1118,7 @@ mod tests {
 
     #[test]
     fn test_build_ssml_basic() {
-        let ssml = build_ssml("Hello world!", "en-US-JennyNeural", "en-US", None);
+        let ssml = build_ssml("Hello world!", "en-US-JennyNeural", "en-US", None, None);
 
         assert!(ssml.contains("<speak"));
         assert!(ssml.contains("version='1.0'"));
@@ -1064,11 +1129,14 @@ mod tests {
         assert!(ssml.contains("</voice>"));
         assert!(ssml.contains("</speak>"));
         assert!(!ssml.contains("<prosody"));
+        // No emotion → no express-as wrapper and no mstts namespace.
+        assert!(!ssml.contains("mstts:express-as"));
+        assert!(!ssml.contains("xmlns:mstts"));
     }
 
     #[test]
     fn test_build_ssml_with_speaking_rate() {
-        let ssml = build_ssml("Fast speech", "en-US-JennyNeural", "en-US", Some(1.5));
+        let ssml = build_ssml("Fast speech", "en-US-JennyNeural", "en-US", Some(1.5), None);
 
         assert!(ssml.contains("<prosody rate=\"150%\">"));
         assert!(ssml.contains("Fast speech"));
@@ -1077,7 +1145,7 @@ mod tests {
 
     #[test]
     fn test_build_ssml_with_slow_rate() {
-        let ssml = build_ssml("Slow speech", "en-US-JennyNeural", "en-US", Some(0.75));
+        let ssml = build_ssml("Slow speech", "en-US-JennyNeural", "en-US", Some(0.75), None);
 
         assert!(ssml.contains("<prosody rate=\"75%\">"));
         assert!(ssml.contains("Slow speech"));
@@ -1086,7 +1154,7 @@ mod tests {
     #[test]
     fn test_build_ssml_with_normal_rate() {
         // Rate of exactly 1.0 should not add prosody
-        let ssml = build_ssml("Normal speech", "en-US-JennyNeural", "en-US", Some(1.0));
+        let ssml = build_ssml("Normal speech", "en-US-JennyNeural", "en-US", Some(1.0), None);
 
         assert!(!ssml.contains("<prosody"));
         assert!(ssml.contains("Normal speech"));
@@ -1099,6 +1167,7 @@ mod tests {
             "en-US-JennyNeural",
             "en-US",
             None,
+            None,
         );
 
         assert!(ssml.contains("Hello &lt;user&gt; &amp; welcome!"));
@@ -1107,10 +1176,134 @@ mod tests {
 
     #[test]
     fn test_build_ssml_different_language() {
-        let ssml = build_ssml("Guten Tag!", "de-DE-KatjaNeural", "de-DE", None);
+        let ssml = build_ssml("Guten Tag!", "de-DE-KatjaNeural", "de-DE", None, None);
 
         assert!(ssml.contains("xml:lang='de-DE'"));
         assert!(ssml.contains("<voice name='de-DE-KatjaNeural'>"));
+    }
+
+    // Emotion wire-level (SSML body) tests for mstts:express-as.
+    // Confirmed against the Azure Speech SSML reference (speech-synthesis-markup-voice,
+    // doc ms.date 2026-01-30): emotion is expressed via `<mstts:express-as style="...">`
+    // inside `<voice>`, requiring the `xmlns:mstts` namespace on `<speak>`. The
+    // cognitiveservices/v1 REST synth endpoint consumes SSML, so this body IS the wire.
+
+    #[test]
+    fn test_build_ssml_with_emotion_express_as() {
+        let ssml = build_ssml(
+            "Yay!",
+            "en-US-JennyNeural",
+            "en-US",
+            None,
+            Some("cheerful"),
+        );
+
+        // Wire assertion: the express-as style attribute appears in the serialized SSML body.
+        assert!(
+            ssml.contains("<mstts:express-as style=\"cheerful\">"),
+            "express-as wrapper missing from SSML body: {ssml}"
+        );
+        assert!(ssml.contains("</mstts:express-as>"));
+        // Namespace must be declared on <speak> for mstts:* elements to be valid.
+        assert!(
+            ssml.contains("xmlns:mstts='https://www.w3.org/2001/mstts'"),
+            "mstts namespace missing: {ssml}"
+        );
+        // express-as wraps the spoken text, inside <voice>.
+        assert!(ssml.contains("<mstts:express-as style=\"cheerful\">Yay!</mstts:express-as>"));
+    }
+
+    #[test]
+    fn test_build_ssml_emotion_wraps_prosody() {
+        // Emotion + speaking rate: express-as wraps the prosody element (style applies to
+        // the whole rate-adjusted span).
+        let ssml = build_ssml(
+            "Slow and sad",
+            "en-US-JennyNeural",
+            "en-US",
+            Some(0.8),
+            Some("sad"),
+        );
+
+        assert!(ssml.contains("<mstts:express-as style=\"sad\">"));
+        assert!(ssml.contains("<prosody rate=\"80%\">"));
+        // express-as is the outer wrapper, prosody nested inside it.
+        let express_idx = ssml.find("<mstts:express-as").unwrap();
+        let prosody_idx = ssml.find("<prosody").unwrap();
+        assert!(
+            express_idx < prosody_idx,
+            "express-as should wrap prosody: {ssml}"
+        );
+    }
+
+    #[test]
+    fn test_build_ssml_emotion_escapes_style_attr() {
+        // A hostile style value must not break SSML well-formedness.
+        let ssml = build_ssml(
+            "text",
+            "en-US-JennyNeural",
+            "en-US",
+            None,
+            Some("a\"b"),
+        );
+        assert!(!ssml.contains("style=\"a\"b\""));
+        assert!(ssml.contains("&quot;"));
+    }
+
+    #[test]
+    fn test_build_ssml_empty_emotion_omits_express_as() {
+        // An empty-string style would be ignored by Azure anyway; omit the wrapper entirely.
+        let ssml = build_ssml("text", "en-US-JennyNeural", "en-US", None, Some(""));
+        assert!(!ssml.contains("mstts:express-as"));
+        assert!(!ssml.contains("xmlns:mstts"));
+    }
+
+    #[test]
+    fn test_build_ssml_for_text_emits_emotion_from_config() {
+        // The provider-facing path (build_ssml_for_text) must carry the config emotion into
+        // the SSML body, not just the build_ssml free function.
+        let config = AzureTTSConfig {
+            base: TTSConfig {
+                voice_id: Some("en-US-JennyNeural".to_string()),
+                ..Default::default()
+            },
+            use_ssml: true,
+            emotion: Some("excited".to_string()),
+            ..Default::default()
+        };
+
+        let ssml = config.build_ssml_for_text("Big news");
+        assert!(ssml.contains("<mstts:express-as style=\"excited\">"));
+        assert!(ssml.contains("xmlns:mstts="));
+        assert!(ssml.contains("Big news"));
+    }
+
+    #[test]
+    fn from_standard_maps_emotion_to_express_as_in_ssml() {
+        // RED-class guard: prove features.emotion reaches the serialized SSML body via the
+        // standardized dispatch, not just that it lands in a config struct field.
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "azure".into(),
+                api_key: "k".into(),
+                voice_id: Some("en-US-JennyNeural".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                emotion: Some("cheerful".into()),
+                ..Default::default()
+            },
+            extras: crate::core::stt::standard::ProviderExtras(serde_json::Map::new()),
+        };
+        let cfg = AzureTTSConfig::from_standard(&std);
+        assert_eq!(cfg.emotion.as_deref(), Some("cheerful"));
+        let ssml = cfg.build_ssml_for_text("Hello");
+        assert!(
+            ssml.contains("<mstts:express-as style=\"cheerful\">"),
+            "emotion not wired into SSML body: {ssml}"
+        );
+        assert!(ssml.contains("xmlns:mstts="));
     }
 
     // =========================================================================
@@ -1328,6 +1521,7 @@ mod tests {
             region: AzureRegion::WestEurope,
             output_format: AzureAudioEncoding::Audio24Khz96KbitrateMonoMp3,
             use_ssml: true,
+            emotion: None,
         };
 
         // The output_format should be serializable

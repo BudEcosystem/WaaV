@@ -79,6 +79,19 @@ pub struct DeepgramSTTConfig {
     /// will be redacted from transcripts. Useful for HIPAA compliance.
     /// This adds `redact=phi` to the API request.
     pub redact_phi: bool,
+    /// Convert spoken numbers to numeric digits (`numerals=true`).
+    ///
+    /// Deepgram's `numerals` feature IS supported on the streaming endpoint
+    /// (confirmed in the live AsyncAPI query-parameter schema and the streaming
+    /// feature overview, June 2026), so we map it onto the request URL.
+    pub numerals: bool,
+    /// Transcribe each audio channel independently (`multichannel=true`).
+    ///
+    /// Deepgram's `multichannel` feature IS supported on the streaming endpoint
+    /// (listed under "Media Input Settings: All available" in the streaming
+    /// feature overview and present in the AsyncAPI streaming schema), so we map
+    /// it onto the request URL.
+    pub multichannel: bool,
 }
 
 impl Default for DeepgramSTTConfig {
@@ -98,6 +111,8 @@ impl Default for DeepgramSTTConfig {
             utterance_end_ms: Some(500),
             use_eu_endpoint: false,
             redact_phi: false,
+            numerals: false,
+            multichannel: false,
         }
     }
 }
@@ -121,6 +136,21 @@ impl DeepgramSTTConfig {
             vad_events: f.vad_events.unwrap_or(false),
             endpointing: f.endpointing_ms.or(Some(200)),
             utterance_end_ms: f.utterance_end_ms.or(Some(500)),
+            // `numerals` and `multichannel` ARE supported on Deepgram's streaming endpoint
+            // (confirmed June 2026 against the AsyncAPI streaming query-parameter schema and the
+            // streaming feature overview), so map them straight through to the wire.
+            numerals: f.numerals.unwrap_or(false),
+            multichannel: f.multichannel.unwrap_or(false),
+            // CAPABILITY GAP — intentionally NOT mapped to the wire:
+            //   * `alternatives` (N-best): absent from Deepgram's streaming AsyncAPI
+            //     query-parameter schema and from the streaming feature overview — it is a
+            //     pre-recorded-only feature, so emitting `&alternatives=N` on the websocket would
+            //     be a no-op at best. Leave it unmapped until Deepgram documents streaming support.
+            //   * `language_detection` -> `detect_language`: Deepgram's docs state language
+            //     detection "is not currently supported for streaming"; multilingual nova-2/nova-3
+            //     models handle code-switching instead. Emitting `&detect_language=true` on the
+            //     live endpoint is unsupported, so it stays a gap. (`f.language_detection`,
+            //     `f.alternatives` are deliberately not read here.)
             ..Default::default()
         }
     }
@@ -344,6 +374,16 @@ impl DeepgramSTT {
         // Add VAD events (voice activity detection)
         if config.vad_events {
             url.push_str("&vad_events=true");
+        }
+
+        // Add numerals (spoken numbers -> digits). Supported on the streaming endpoint.
+        if config.numerals {
+            url.push_str("&numerals=true");
+        }
+
+        // Add multichannel (independent per-channel transcription). Supported on streaming.
+        if config.multichannel {
+            url.push_str("&multichannel=true");
         }
 
         // Add redaction (PII, numbers, SSN, etc.)
@@ -1156,6 +1196,77 @@ mod tests {
         assert!(url.contains("keyterm=WaaV")); // nova-3 keyterm prompting
         assert!(url.contains("vad_events=true"));
         assert!(url.contains("profanity_filter=true"));
+    }
+
+    // WIRE-LEVEL guard for numerals + multichannel: assert the params land in the request URL
+    // (not merely on the config struct). This is the exact bug class the last review caught —
+    // a feature mapped onto the struct but never serialized to the wire.
+    #[tokio::test]
+    async fn test_deepgram_numerals_multichannel_reach_the_wire() {
+        let stt = DeepgramSTT::default();
+        let base = STTConfig {
+            model: "nova-3".to_string(),
+            api_key: "k".to_string(),
+            ..Default::default()
+        };
+
+        // Off by default => params MUST NOT appear.
+        let off = DeepgramSTTConfig {
+            base: base.clone(),
+            ..Default::default()
+        };
+        let url_off = stt.build_websocket_url(&off).unwrap();
+        assert!(!url_off.contains("numerals="), "numerals leaked when off: {url_off}");
+        assert!(!url_off.contains("multichannel="), "multichannel leaked when off: {url_off}");
+
+        // On => exact wire params MUST appear.
+        let on = DeepgramSTTConfig {
+            base,
+            numerals: true,
+            multichannel: true,
+            ..Default::default()
+        };
+        let url_on = stt.build_websocket_url(&on).unwrap();
+        assert!(url_on.contains("&numerals=true"), "numerals missing from URL: {url_on}");
+        assert!(url_on.contains("&multichannel=true"), "multichannel missing from URL: {url_on}");
+    }
+
+    // WIRE-LEVEL keystone test: the standardized SttFeatures -> from_standard -> URL path.
+    // numerals/multichannel must round-trip all the way to the request URL through the reachable
+    // standardized config. alternatives/language_detection are streaming capability gaps and must
+    // NOT appear on the wire even when requested in the standardized features.
+    #[tokio::test]
+    async fn test_deepgram_from_standard_numerals_multichannel_and_gaps() {
+        use super::super::standard::{SttFeatures, StandardSTTConfig};
+        let stt = DeepgramSTT::default();
+        let std_cfg = StandardSTTConfig {
+            base: STTConfig {
+                model: "nova-3".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                numerals: Some(true),
+                multichannel: Some(true),
+                // Requested but NOT supported on Deepgram streaming -> must stay capability gaps.
+                alternatives: Some(3),
+                language_detection: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let cfg = DeepgramSTTConfig::from_standard(&std_cfg);
+        // Supported features mapped onto the config...
+        assert!(cfg.numerals);
+        assert!(cfg.multichannel);
+        // ...and they reach the actual request URL.
+        let url = stt.build_websocket_url(&cfg).unwrap();
+        assert!(url.contains("&numerals=true"), "numerals not on wire: {url}");
+        assert!(url.contains("&multichannel=true"), "multichannel not on wire: {url}");
+        // Capability gaps: these params must NEVER appear on the streaming URL, even though the
+        // standardized features requested them (Deepgram does not support them on streaming).
+        assert!(!url.contains("alternatives="), "alternatives must be a streaming gap: {url}");
+        assert!(!url.contains("detect_language="), "detect_language must be a streaming gap: {url}");
     }
 
     #[tokio::test]

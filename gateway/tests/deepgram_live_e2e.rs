@@ -268,6 +268,137 @@ async fn test_deepgram_stt_all_features_live() {
 }
 
 // =============================================================================
+// C2) NEW FEATURES (feature-vocabulary expansion): numerals + multichannel — Deepgram
+//     must ACCEPT both on the live streaming endpoint and numerals must change the
+//     transcript (spoken numbers → digits).
+// =============================================================================
+
+/// LIVE: `numerals=true` must be accepted by Deepgram's streaming endpoint AND must convert
+/// spoken numbers to numeric digits in the transcript. We synthesize speech that says a number
+/// out loud, transcribe it once WITHOUT numerals and once WITH numerals through WaaV's own
+/// `DeepgramSTT` (the standardized `SttFeatures.numerals` → `from_standard` → wire path), and
+/// assert the numerals-on transcript actually contains digit characters.
+#[tokio::test]
+#[ignore = "Requires DEEPGRAM_API_KEY; real billed Deepgram STT+TTS calls"]
+async fn test_deepgram_numerals_live() {
+    // Aura clearly speaks digits as words; numerals=true should render them as digits.
+    let spoken = "I have twenty three apples and forty seven oranges.";
+    let pcm = synth_pcm(spoken, SAMPLE_RATE).await;
+    assert!(pcm.len() > 8000, "synthesized audio too short: {} B", pcm.len());
+
+    // Baseline: numerals OFF — Deepgram returns the number words (or at least no forced digits).
+    let off_cfg = StandardSTTConfig {
+        base: base_stt("nova-3"),
+        features: SttFeatures {
+            smart_format: Some(true),
+            numerals: Some(false),
+            ..Default::default()
+        },
+        extras: ProviderExtras::default(),
+    };
+    let (t_off, e_off) = transcribe_via_waav(off_cfg, &pcm, SAMPLE_RATE).await;
+    println!("[numerals=off] transcript: {t_off:?}  error: {e_off:?}");
+    assert!(e_off.is_none(), "[numerals=off] provider error: {e_off:?}");
+
+    // Feature ON: numerals=true — Deepgram MUST accept the param (no error / non-empty transcript)
+    // and MUST emit digits for the spoken numbers.
+    let on_cfg = StandardSTTConfig {
+        base: base_stt("nova-3"),
+        features: SttFeatures {
+            smart_format: Some(true),
+            numerals: Some(true),
+            ..Default::default()
+        },
+        extras: ProviderExtras::default(),
+    };
+    let (t_on, e_on) = transcribe_via_waav(on_cfg, &pcm, SAMPLE_RATE).await;
+    println!("[numerals=on ] transcript: {t_on:?}  error: {e_on:?}");
+    assert!(
+        e_on.is_none(),
+        "Deepgram rejected numerals=true on the streaming endpoint (a wire param is wrong): {e_on:?}"
+    );
+    assert!(
+        !t_on.is_empty(),
+        "expected a transcript with numerals=true, got empty (param likely rejected the stream)"
+    );
+    // The transcript must reflect numerals: digit characters present.
+    assert!(
+        t_on.chars().any(|c| c.is_ascii_digit()),
+        "numerals=true should render spoken numbers as digits, got {t_on:?}"
+    );
+}
+
+/// LIVE: `multichannel=true` must be accepted by Deepgram's streaming endpoint. Our synthesized
+/// audio is single-channel, so we cannot assert per-channel separation, but we CAN assert the
+/// param is accepted on the wire (no provider error / a non-empty transcript) — i.e. that
+/// `SttFeatures.multichannel` → `from_standard` → `&multichannel=true` does not break the stream.
+#[tokio::test]
+#[ignore = "Requires DEEPGRAM_API_KEY; real billed Deepgram STT+TTS calls"]
+async fn test_deepgram_multichannel_live() {
+    let pcm = synth_pcm(SENTENCE, SAMPLE_RATE).await;
+    assert!(pcm.len() > 8000, "synthesized audio too short: {} B", pcm.len());
+
+    let std_cfg = StandardSTTConfig {
+        base: base_stt("nova-3"),
+        features: SttFeatures {
+            smart_format: Some(true),
+            multichannel: Some(true),
+            ..Default::default()
+        },
+        extras: ProviderExtras::default(),
+    };
+    let (transcript, error) = transcribe_via_waav(std_cfg, &pcm, SAMPLE_RATE).await;
+    println!("[multichannel=on] transcript: {transcript:?}  error: {error:?}");
+    assert!(
+        error.is_none(),
+        "Deepgram rejected multichannel=true on the streaming endpoint: {error:?}"
+    );
+    assert!(
+        !transcript.is_empty(),
+        "expected a transcript with multichannel=true, got empty (param likely rejected the stream)"
+    );
+    let lower = transcript.to_lowercase();
+    assert!(
+        lower.contains("fox") || lower.contains("dog") || lower.contains("quick"),
+        "[multichannel] expected recognizable words, got {transcript:?}"
+    );
+}
+
+/// LIVE: numerals + multichannel TOGETHER on one stream — both new params must be accepted at once
+/// (this is the exact combined wire string `&numerals=true&multichannel=true`).
+#[tokio::test]
+#[ignore = "Requires DEEPGRAM_API_KEY; real billed Deepgram STT+TTS calls"]
+async fn test_deepgram_numerals_and_multichannel_combined_live() {
+    let spoken = "Call me at five five five one two three four.";
+    let pcm = synth_pcm(spoken, SAMPLE_RATE).await;
+
+    let std_cfg = StandardSTTConfig {
+        base: base_stt("nova-3"),
+        features: SttFeatures {
+            smart_format: Some(true),
+            numerals: Some(true),
+            multichannel: Some(true),
+            ..Default::default()
+        },
+        extras: ProviderExtras::default(),
+    };
+    let (transcript, error) = transcribe_via_waav(std_cfg, &pcm, SAMPLE_RATE).await;
+    println!("[numerals+multichannel] transcript: {transcript:?}  error: {error:?}");
+    assert!(
+        error.is_none(),
+        "Deepgram rejected numerals+multichannel together: {error:?}"
+    );
+    assert!(
+        !transcript.is_empty(),
+        "expected a transcript with numerals+multichannel, got empty"
+    );
+    assert!(
+        transcript.chars().any(|c| c.is_ascii_digit()),
+        "numerals=true should render the spoken phone number as digits, got {transcript:?}"
+    );
+}
+
+// =============================================================================
 // D) FULL gateway, live: WS client → gateway → Deepgram STT (transcript) + TTS (audio)
 // =============================================================================
 

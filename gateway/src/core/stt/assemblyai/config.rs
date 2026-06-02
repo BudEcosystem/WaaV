@@ -10,6 +10,20 @@ use std::str::FromStr;
 
 use super::super::base::STTConfig;
 
+/// AssemblyAI streaming keyterms limits (per the keyterms-prompting docs):
+/// at most 100 terms per session, each at most 50 characters.
+const MAX_KEYTERMS: usize = 100;
+const MAX_KEYTERM_CHARS: usize = 50;
+
+/// Percent-encode a query-string value so phrases with spaces ("John Smith") or
+/// JSON punctuation survive intact in the WebSocket connection URL. An unencoded
+/// space (or `[`/`"`) produces a malformed URL and the param is silently dropped
+/// by the server — exactly the wire-level bug class the review flagged.
+#[inline]
+fn encode_query_value(s: &str) -> String {
+    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
 // =============================================================================
 // Audio Encoding
 // =============================================================================
@@ -189,6 +203,24 @@ pub struct AssemblyAISTTConfig {
     /// When enabled, each word includes start/end timing information.
     /// Default is true for AssemblyAI (always provided in API v3).
     pub include_word_timestamps: bool,
+
+    /// Keyterm prompts to boost recognition of domain-specific words/phrases.
+    ///
+    /// Maps the standardized `keyterms` feature onto AssemblyAI v3 streaming's
+    /// `keyterms_prompt` connection query parameter. AssemblyAI does NOT use the
+    /// batch-only `word_boost` field on the streaming endpoint — `keyterms_prompt`
+    /// is the streaming equivalent (see `build_websocket_url`).
+    ///
+    /// Limits enforced at URL-build time: max 100 terms, each ≤ 50 chars
+    /// (longer terms are dropped, the list is truncated to 100).
+    pub keyterms_prompt: Vec<String>,
+
+    /// Enable automatic spoken-language detection.
+    ///
+    /// Maps the standardized `language_detection` feature onto AssemblyAI v3
+    /// streaming's `language_detection` connection query parameter. Only effective
+    /// with the multilingual model; AssemblyAI ignores it for the English-only model.
+    pub language_detection: bool,
 }
 
 impl Default for AssemblyAISTTConfig {
@@ -201,6 +233,8 @@ impl Default for AssemblyAISTTConfig {
             end_of_turn_confidence_threshold: Some(0.5), // Balanced threshold
             region: AssemblyAIRegion::default(),
             include_word_timestamps: true, // Always available in v3
+            keyterms_prompt: Vec::new(),   // No boost terms by default
+            language_detection: false,     // Off by default (multilingual model only)
         }
     }
 }
@@ -249,6 +283,33 @@ impl AssemblyAISTTConfig {
             url.push_str(&format!("{:.2}", threshold.clamp(0.0, 1.0)));
         }
 
+        // Automatic language detection (only effective on the multilingual model;
+        // AssemblyAI ignores it for the English-only model). Only emit when enabled
+        // so the URL matches the provider default (`language_detection=false`) when off.
+        if self.language_detection {
+            url.push_str("&language_detection=true");
+        }
+
+        // Keyterm prompting: AssemblyAI v3 streaming's `keyterms_prompt`. The canonical
+        // wire format (per the keyterms-prompting docs / SDK) is a single JSON-array
+        // string, URL-encoded into one query param. Terms longer than 50 chars are
+        // dropped and the list is capped at 100 (server rejects more than 100).
+        if !self.keyterms_prompt.is_empty() {
+            let terms: Vec<&str> = self
+                .keyterms_prompt
+                .iter()
+                .map(|s| s.as_str())
+                .filter(|s| !s.is_empty() && s.chars().count() <= MAX_KEYTERM_CHARS)
+                .take(MAX_KEYTERMS)
+                .collect();
+            if !terms.is_empty() {
+                // serde_json never fails serializing a `Vec<&str>`.
+                let json = serde_json::to_string(&terms).unwrap_or_default();
+                url.push_str("&keyterms_prompt=");
+                url.push_str(&encode_query_value(&json));
+            }
+        }
+
         url
     }
 
@@ -289,11 +350,42 @@ impl AssemblyAISTTConfig {
     /// degradation rather than a silent lie).
     pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
         let mut cfg = Self::from_base(std.base.clone());
-        if let Some(w) = std.features.word_timestamps {
+        let f = &std.features;
+
+        if let Some(w) = f.word_timestamps {
             cfg.include_word_timestamps = w;
         }
-        // Capability gaps (left at provider defaults, not silently faked): AssemblyAI v3 has no
-        // diarization/keyterms here, and expresses endpointing as a confidence threshold (not ms).
+
+        // Keyterm prompting — AssemblyAI v3 streaming supports `keyterms_prompt` as a connection
+        // query param (canonical: a URL-encoded JSON array; max 100 terms, ≤50 chars each). This
+        // is the STREAMING equivalent of the batch-only `word_boost`, so the standardized
+        // `keyterms` feature maps here. Confirmed:
+        // https://www.assemblyai.com/docs/speech-to-text/universal-streaming/keyterms-prompting
+        // and the streaming API reference (keyterms_prompt connection parameter).
+        if let Some(terms) = &f.keyterms {
+            cfg.keyterms_prompt = terms.clone();
+        }
+
+        // Automatic language detection — supported on streaming as the `language_detection`
+        // connection query param (multilingual model only). Confirmed in the streaming API
+        // reference (language_detection: 'true'|'false', "Only available for the multilingual
+        // model"). https://assemblyai.com/docs/api-reference/streaming-api/streaming-api
+        if let Some(ld) = f.language_detection {
+            cfg.language_detection = ld;
+        }
+
+        // CAPABILITY GAPS — intentionally NOT mapped to the wire (left at provider defaults,
+        // not silently faked). The following standardized features exist ONLY on AssemblyAI's
+        // BATCH transcription API and are absent from the v3 STREAMING WebSocket spec
+        // (https://assemblyai.com/docs/api-reference/streaming-api/streaming-api):
+        //   - `word_boost`            → not a streaming param; streaming uses `keyterms_prompt`
+        //                               (mapped above from `keyterms`), so we never emit word_boost.
+        //   - `f.sentiment`           → `sentiment_analysis` is batch-only; absent from streaming.
+        //   - `f.entity_detection`    → `entity_detection` is batch-only; absent from streaming.
+        // Also unchanged from the prior gap notes: diarization is exposed differently here, and
+        // endpointing is a confidence threshold (not ms), so those stay at provider defaults too.
+        let _ = (f.sentiment, f.entity_detection); // referenced so intent is explicit, not wired.
+
         cfg
     }
 }
@@ -427,6 +519,7 @@ mod tests {
             end_of_turn_confidence_threshold: Some(0.5),
             region: AssemblyAIRegion::Default,
             include_word_timestamps: true,
+            ..Default::default()
         };
 
         let url = config.build_websocket_url();
@@ -437,6 +530,9 @@ mod tests {
         assert!(url.contains("speech_model=universal-streaming-english"));
         assert!(url.contains("format_turns=true"));
         assert!(url.contains("end_of_turn_confidence_threshold=0.50"));
+        // Optional advanced params are omitted when unset (provider defaults).
+        assert!(!url.contains("keyterms_prompt"));
+        assert!(!url.contains("language_detection"));
     }
 
     #[test]
@@ -452,6 +548,7 @@ mod tests {
             end_of_turn_confidence_threshold: None,
             region: AssemblyAIRegion::Eu,
             include_word_timestamps: true,
+            ..Default::default()
         };
 
         let url = config.build_websocket_url();
@@ -533,5 +630,171 @@ mod tests {
         assert_eq!(config.end_of_turn_confidence_threshold, Some(0.5));
         assert_eq!(config.region, AssemblyAIRegion::Default);
         assert!(config.include_word_timestamps);
+        assert!(config.keyterms_prompt.is_empty());
+        assert!(!config.language_detection);
+    }
+
+    // =========================================================================
+    // Wire-level feature tests (the bug class the review caught: a feature can be
+    // present on the config struct yet never reach the request URL). These assert
+    // the param appears in the SERIALIZED WebSocket connection URL, not merely on
+    // the struct.
+    // =========================================================================
+
+    use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+
+    /// keyterms (standardized) → `keyterms_prompt` connection query param. AssemblyAI v3
+    /// streaming uses `keyterms_prompt` (a URL-encoded JSON array), NOT the batch-only
+    /// `word_boost`. WIRE assert: the encoded JSON array is in the URL and `word_boost` is not.
+    #[test]
+    fn keyterms_reach_the_wire_as_keyterms_prompt() {
+        let mut config = AssemblyAISTTConfig {
+            base: STTConfig {
+                sample_rate: 16000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // A multi-word phrase must be percent-encoded; a JSON array must be the wire format.
+        config.keyterms_prompt = vec!["AssemblyAI".into(), "John Smith".into()];
+
+        let url = config.build_websocket_url();
+
+        // `keyterms_prompt=` must be present, carrying a URL-encoded JSON array.
+        assert!(
+            url.contains("keyterms_prompt="),
+            "keyterms_prompt missing from URL: {url}"
+        );
+        // The canonical wire form is a JSON array, URL-encoded: `["AssemblyAI","John Smith"]`
+        // → `%5B%22AssemblyAI%22%2C%22John+Smith%22%5D` (space → `+`, brackets/quotes/comma escaped).
+        let expected =
+            encode_query_value(r#"["AssemblyAI","John Smith"]"#);
+        assert!(
+            url.contains(&format!("keyterms_prompt={expected}")),
+            "keyterms_prompt not encoded as a JSON array: {url}"
+        );
+        // A raw space (unencoded) would silently break the param — must NOT appear.
+        assert!(
+            !url.contains("John Smith"),
+            "raw space leaked into URL: {url}"
+        );
+        // CAPABILITY GAP guard: the batch-only `word_boost` must never reach the streaming URL.
+        assert!(
+            !url.contains("word_boost"),
+            "word_boost (batch-only) must not appear on streaming URL: {url}"
+        );
+    }
+
+    /// keyterms limits: terms >50 chars are dropped, list capped at 100.
+    #[test]
+    fn keyterms_enforce_length_and_count_limits() {
+        let mut config = AssemblyAISTTConfig {
+            base: STTConfig {
+                sample_rate: 16000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let too_long: String = "x".repeat(MAX_KEYTERM_CHARS + 1);
+        config.keyterms_prompt = vec!["ok".into(), too_long.clone()];
+        let url = config.build_websocket_url();
+        let decoded =
+            url::form_urlencoded::parse(url.split("keyterms_prompt=").nth(1).unwrap().as_bytes())
+                .next();
+        // Easier: assert the over-length term's content is absent and "ok" present.
+        let _ = decoded;
+        assert!(url.contains("keyterms_prompt="), "expected keyterms on wire");
+        let encoded_ok = encode_query_value(r#"["ok"]"#);
+        assert!(
+            url.contains(&format!("keyterms_prompt={encoded_ok}")),
+            "over-length keyterm not dropped (expected just [\"ok\"]): {url}"
+        );
+
+        // Over 100 terms → capped at 100 (server rejects >100).
+        let many: Vec<String> = (0..150).map(|i| format!("t{i}")).collect();
+        config.keyterms_prompt = many;
+        let url2 = config.build_websocket_url();
+        let raw = url2.split("keyterms_prompt=").nth(1).unwrap();
+        let json = url::form_urlencoded::parse(format!("k={raw}").as_bytes())
+            .next()
+            .map(|(_, v)| v.into_owned())
+            .unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), MAX_KEYTERMS, "keyterms not capped at 100");
+    }
+
+    /// language_detection (standardized) → `language_detection=true` connection query param.
+    #[test]
+    fn language_detection_reaches_the_wire() {
+        let mut config = AssemblyAISTTConfig {
+            base: STTConfig {
+                sample_rate: 16000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Off → param omitted (matches provider default `language_detection=false`).
+        assert!(!config.build_websocket_url().contains("language_detection"));
+        // On → exact wire param present.
+        config.language_detection = true;
+        assert!(
+            config
+                .build_websocket_url()
+                .contains("language_detection=true"),
+            "language_detection=true missing from URL"
+        );
+    }
+
+    /// KEYSTONE wire test: standardized SttFeatures → from_standard → URL. This is the
+    /// reachable end-to-end path, and it also pins the CAPABILITY GAPS: sentiment /
+    /// entity_detection are batch-only on AssemblyAI and must NOT appear on the streaming URL
+    /// even when requested in the standardized features.
+    #[test]
+    fn from_standard_features_reach_the_wire_and_gaps_stay_off() {
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "assemblyai".into(),
+                api_key: "k".into(),
+                sample_rate: 16000,
+                ..Default::default()
+            },
+            features: SttFeatures {
+                keyterms: Some(vec!["WaaV".into(), "Universal-3".into()]),
+                language_detection: Some(true),
+                // Capability gaps — requested but unsupported on streaming:
+                sentiment: Some(true),
+                entity_detection: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let cfg = AssemblyAISTTConfig::from_standard(&std);
+        // Struct mapping happened.
+        assert_eq!(cfg.keyterms_prompt, vec!["WaaV", "Universal-3"]);
+        assert!(cfg.language_detection);
+
+        let url = cfg.build_websocket_url();
+        // Supported features reach the wire.
+        assert!(url.contains("keyterms_prompt="), "keyterms not on wire: {url}");
+        let expected = encode_query_value(r#"["WaaV","Universal-3"]"#);
+        assert!(
+            url.contains(&format!("keyterms_prompt={expected}")),
+            "keyterms JSON array not on wire: {url}"
+        );
+        assert!(
+            url.contains("language_detection=true"),
+            "language_detection not on wire: {url}"
+        );
+        // CAPABILITY GAPS: streaming v3 has no sentiment/entity_detection — they must be absent.
+        assert!(
+            !url.contains("sentiment"),
+            "sentiment_analysis is batch-only and must not appear on the streaming URL: {url}"
+        );
+        assert!(
+            !url.contains("entity_detection"),
+            "entity_detection is batch-only and must not appear on the streaming URL: {url}"
+        );
+        // And `word_boost` is never emitted (streaming uses keyterms_prompt).
+        assert!(!url.contains("word_boost"), "word_boost must not appear: {url}");
     }
 }

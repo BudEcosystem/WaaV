@@ -786,6 +786,14 @@ impl BaseSTT for AssemblyAISTT {
                 .as_ref()
                 .map(|c| c.include_word_timestamps)
                 .unwrap_or(true),
+            keyterms_prompt: existing
+                .as_ref()
+                .map(|c| c.keyterms_prompt.clone())
+                .unwrap_or_default(),
+            language_detection: existing
+                .as_ref()
+                .map(|c| c.language_detection)
+                .unwrap_or(false),
         };
 
         self.config = Some(assemblyai_config);

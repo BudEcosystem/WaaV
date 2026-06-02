@@ -78,6 +78,14 @@ pub const ELEVENLABS_TTS_URL: &str = "https://api.elevenlabs.io/v1/text-to-speec
 struct ElevenLabsRequestBuilder {
     config: TTSConfig,
     voice_settings: VoiceSettings,
+    /// Determinism seed → emitted in the request BODY as `seed` (integer 0..=4294967295).
+    /// Confirmed body param on both the convert and stream endpoints
+    /// (https://elevenlabs.io/docs/api-reference/text-to-speech/convert).
+    seed: Option<u64>,
+    /// Streaming latency-optimization tier 0..=4 → emitted as the URL QUERY param
+    /// `optimize_streaming_latency`. Confirmed query param on both the convert and stream
+    /// endpoints (https://elevenlabs.io/docs/api-reference/text-to-speech/stream).
+    optimize_streaming_latency: Option<u8>,
 }
 
 impl TTSRequestBuilder for ElevenLabsRequestBuilder {
@@ -153,6 +161,14 @@ impl TTSRequestBuilder for ElevenLabsRequestBuilder {
 
         query_params.push(format!("output_format={output_format}"));
 
+        // Streaming latency-optimization tier (0..=4) is an ElevenLabs URL QUERY param
+        // (`optimize_streaming_latency`), NOT a body field. Confirmed against the live convert
+        // and stream endpoint docs. Clamp to the documented 0..=4 range.
+        if let Some(tier) = self.optimize_streaming_latency {
+            let tier = tier.min(4);
+            query_params.push(format!("optimize_streaming_latency={tier}"));
+        }
+
         // Build the final URL with query parameters
         let final_url = if !query_params.is_empty() {
             format!("{}?{}", url, query_params.join("&"))
@@ -169,6 +185,13 @@ impl TTSRequestBuilder for ElevenLabsRequestBuilder {
         // Add previous_text for context continuity if available
         if let Some(prev) = previous_text {
             body["previous_text"] = json!(prev);
+        }
+
+        // Determinism seed is an ElevenLabs request-BODY param (`seed`, integer 0..=4294967295).
+        // Confirmed against the live convert and stream endpoint docs. Clamp to the documented
+        // upper bound (u32 max) so an out-of-range standardized seed is not silently rejected.
+        if let Some(seed) = self.seed {
+            body["seed"] = json!(seed.min(u32::MAX as u64));
         }
 
         // Add model_id if specified
@@ -231,6 +254,8 @@ impl ElevenLabsTTS {
         let request_builder = ElevenLabsRequestBuilder {
             config,
             voice_settings,
+            seed: None,
+            optimize_streaming_latency: None,
         };
 
         Ok(Self {
@@ -246,8 +271,15 @@ impl ElevenLabsTTS {
     /// `voice_settings` request body — previously unreachable through the flat factory. The base
     /// `TTSConfig` (api_key, voice_id, audio_format, sample_rate, …) is carried through `new`.
     /// Sample-rate-dependent output format is already derived from `base.sample_rate` in the
-    /// request builder. Emotion, instructions, SSML, word timestamps, streaming and seed have no
-    /// ElevenLabs request parameter here and are skipped (capability gaps).
+    /// request builder. Two more standardized features are wired here onto the request builder so
+    /// they reach the live wire (both confirmed against the current ElevenLabs API docs):
+    ///   - `features.seed` → request BODY `seed` (integer 0..=4294967295) for best-effort
+    ///     deterministic sampling (convert + stream endpoints).
+    ///   - `features.optimize_streaming_latency` → URL QUERY `optimize_streaming_latency` (0..=4),
+    ///     trading quality for lower TTFB (convert + stream endpoints).
+    ///
+    /// Emotion, instructions, SSML, word timestamps and streaming have no ElevenLabs request
+    /// parameter on this synth path and are skipped (capability gaps).
     pub fn from_standard(
         std: &crate::core::tts::standard::StandardTTSConfig,
     ) -> TTSResult<Self> {
@@ -260,6 +292,8 @@ impl ElevenLabsTTS {
         }
         let mut tts = Self::new(base)?;
         tts.request_builder.voice_settings = voice_settings;
+        tts.request_builder.seed = std.features.seed;
+        tts.request_builder.optimize_streaming_latency = std.features.optimize_streaming_latency;
         Ok(tts)
     }
 
@@ -494,6 +528,8 @@ mod tests {
         let builder = ElevenLabsRequestBuilder {
             config,
             voice_settings,
+            seed: None,
+            optimize_streaming_latency: None,
         };
         let client = reqwest::Client::new();
         let request = builder.build_http_request(&client, "Test text");
@@ -528,6 +564,8 @@ mod tests {
         let builder = ElevenLabsRequestBuilder {
             config,
             voice_settings,
+            seed: None,
+            optimize_streaming_latency: None,
         };
         let client = reqwest::Client::new();
         let request = builder.build_http_request(&client, "Test text");
@@ -577,6 +615,8 @@ mod tests {
         let builder = ElevenLabsRequestBuilder {
             config,
             voice_settings,
+            seed: None,
+            optimize_streaming_latency: None,
         };
         let client = reqwest::Client::new();
 
@@ -617,6 +657,8 @@ mod tests {
         let builder = ElevenLabsRequestBuilder {
             config,
             voice_settings,
+            seed: None,
+            optimize_streaming_latency: None,
         };
         let client = reqwest::Client::new();
 
@@ -636,5 +678,194 @@ mod tests {
         assert_eq!(body_json["text"], "First utterance");
         assert!(body_json["previous_text"].is_null());
         assert!(body_json["model_id"].is_string());
+    }
+
+    // ---- WIRE-LEVEL: seed reaches the serialized request BODY -----------------------------------
+    // Confirmed body param on the convert + stream endpoints
+    // (https://elevenlabs.io/docs/api-reference/text-to-speech/convert). This asserts the param in
+    // the actual serialized JSON body, not just the builder field — the bug class the review caught.
+    #[tokio::test]
+    async fn test_seed_reaches_request_body() {
+        let config = TTSConfig {
+            voice_id: Some("test_voice_id".to_string()),
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+        let builder = ElevenLabsRequestBuilder {
+            config,
+            voice_settings: VoiceSettings::default(),
+            seed: Some(12345),
+            optimize_streaming_latency: None,
+        };
+        let client = reqwest::Client::new();
+        let built = builder
+            .build_http_request(&client, "hello")
+            .build()
+            .unwrap();
+
+        // seed is a BODY param, not a URL param.
+        assert!(
+            !built.url().to_string().contains("seed"),
+            "seed must not leak into the URL"
+        );
+        let body_str =
+            std::str::from_utf8(built.body().and_then(|b| b.as_bytes()).unwrap()).unwrap();
+        let body_json: serde_json::Value = serde_json::from_str(body_str).unwrap();
+        assert_eq!(body_json["seed"], 12345);
+    }
+
+    // seed clamps to the documented upper bound (u32::MAX = 4294967295).
+    #[tokio::test]
+    async fn test_seed_clamped_to_documented_max() {
+        let config = TTSConfig {
+            voice_id: Some("v".to_string()),
+            api_key: "k".to_string(),
+            ..Default::default()
+        };
+        let builder = ElevenLabsRequestBuilder {
+            config,
+            voice_settings: VoiceSettings::default(),
+            seed: Some(u64::MAX),
+            optimize_streaming_latency: None,
+        };
+        let client = reqwest::Client::new();
+        let built = builder.build_http_request(&client, "x").build().unwrap();
+        let body_str =
+            std::str::from_utf8(built.body().and_then(|b| b.as_bytes()).unwrap()).unwrap();
+        let body_json: serde_json::Value = serde_json::from_str(body_str).unwrap();
+        assert_eq!(body_json["seed"], u32::MAX as u64);
+    }
+
+    // seed is OMITTED from the body when unset (no spurious null/0).
+    #[tokio::test]
+    async fn test_seed_omitted_when_unset() {
+        let config = TTSConfig {
+            voice_id: Some("v".to_string()),
+            api_key: "k".to_string(),
+            ..Default::default()
+        };
+        let builder = ElevenLabsRequestBuilder {
+            config,
+            voice_settings: VoiceSettings::default(),
+            seed: None,
+            optimize_streaming_latency: None,
+        };
+        let client = reqwest::Client::new();
+        let built = builder.build_http_request(&client, "x").build().unwrap();
+        let body_str =
+            std::str::from_utf8(built.body().and_then(|b| b.as_bytes()).unwrap()).unwrap();
+        let body_json: serde_json::Value = serde_json::from_str(body_str).unwrap();
+        assert!(body_json.get("seed").is_none());
+    }
+
+    // ---- WIRE-LEVEL: optimize_streaming_latency reaches the request URL QUERY -------------------
+    // Confirmed query param on the convert + stream endpoints
+    // (https://elevenlabs.io/docs/api-reference/text-to-speech/stream).
+    #[tokio::test]
+    async fn test_optimize_streaming_latency_reaches_url() {
+        let config = TTSConfig {
+            voice_id: Some("test_voice_id".to_string()),
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+        let builder = ElevenLabsRequestBuilder {
+            config,
+            voice_settings: VoiceSettings::default(),
+            seed: None,
+            optimize_streaming_latency: Some(3),
+        };
+        let client = reqwest::Client::new();
+        let built = builder.build_http_request(&client, "hi").build().unwrap();
+        let url = built.url().to_string();
+        assert!(
+            url.contains("optimize_streaming_latency=3"),
+            "expected latency tier in URL, got: {url}"
+        );
+    }
+
+    // optimize_streaming_latency clamps to the documented 0..=4 range.
+    #[tokio::test]
+    async fn test_optimize_streaming_latency_clamped() {
+        let config = TTSConfig {
+            voice_id: Some("v".to_string()),
+            api_key: "k".to_string(),
+            ..Default::default()
+        };
+        let builder = ElevenLabsRequestBuilder {
+            config,
+            voice_settings: VoiceSettings::default(),
+            seed: None,
+            optimize_streaming_latency: Some(9),
+        };
+        let client = reqwest::Client::new();
+        let built = builder.build_http_request(&client, "x").build().unwrap();
+        let url = built.url().to_string();
+        assert!(
+            url.contains("optimize_streaming_latency=4"),
+            "tier should clamp to 4, got: {url}"
+        );
+    }
+
+    // optimize_streaming_latency is OMITTED from the URL when unset.
+    #[tokio::test]
+    async fn test_optimize_streaming_latency_omitted_when_unset() {
+        let config = TTSConfig {
+            voice_id: Some("v".to_string()),
+            api_key: "k".to_string(),
+            ..Default::default()
+        };
+        let builder = ElevenLabsRequestBuilder {
+            config,
+            voice_settings: VoiceSettings::default(),
+            seed: None,
+            optimize_streaming_latency: None,
+        };
+        let client = reqwest::Client::new();
+        let built = builder.build_http_request(&client, "x").build().unwrap();
+        assert!(!built.url().to_string().contains("optimize_streaming_latency"));
+    }
+
+    // ---- WIRE-LEVEL through the STRUCT's from_standard (the dispatch-constructed path) ----------
+    // Asserts that features.seed and features.optimize_streaming_latency, when set on the
+    // StandardTTSConfig, actually reach the serialized body/URL of a request built by the provider
+    // struct's from_standard — not merely the builder fields.
+    #[tokio::test]
+    async fn from_standard_wires_seed_and_latency_to_the_wire() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "elevenlabs".into(),
+                api_key: "k".into(),
+                voice_id: Some("test_voice".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                seed: Some(777),
+                optimize_streaming_latency: Some(2),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = ElevenLabsTTS::from_standard(&std).unwrap();
+        let client = reqwest::Client::new();
+        let built = tts
+            .request_builder
+            .build_http_request(&client, "go")
+            .build()
+            .unwrap();
+
+        // latency tier on the URL
+        assert!(
+            built
+                .url()
+                .to_string()
+                .contains("optimize_streaming_latency=2"),
+            "latency tier must reach the URL via from_standard"
+        );
+        // seed in the body
+        let body_str =
+            std::str::from_utf8(built.body().and_then(|b| b.as_bytes()).unwrap()).unwrap();
+        let body_json: serde_json::Value = serde_json::from_str(body_str).unwrap();
+        assert_eq!(body_json["seed"], 777);
     }
 }

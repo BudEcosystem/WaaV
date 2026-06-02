@@ -447,7 +447,7 @@ struct GoogleTTSResponse {
 ///
 /// This creates a stable hash from configuration fields that affect audio output,
 /// ensuring different configurations produce different cache keys.
-fn compute_google_tts_config_hash(config: &TTSConfig) -> String {
+fn compute_google_tts_config_hash(config: &TTSConfig, google: &GoogleTTSConfig) -> String {
     let mut s = String::new();
     s.push_str("google|");
     s.push_str(config.voice_id.as_deref().unwrap_or(""));
@@ -463,6 +463,21 @@ fn compute_google_tts_config_hash(config: &TTSConfig) -> String {
     if let Some(rate) = config.speaking_rate {
         s.push_str(&format!("{rate:.3}"));
     }
+    // Google-specific audio-changing fields MUST be in the cache key, else requests differing only
+    // in pitch/volume/effects-profile/language collide. effects_profile_id is exactly the feature
+    // this expansion added — previously invisible to the cache. (Review S1.)
+    s.push('|');
+    if let Some(p) = google.pitch {
+        s.push_str(&format!("{p:.3}"));
+    }
+    s.push('|');
+    if let Some(v) = google.volume_gain_db {
+        s.push_str(&format!("{v:.3}"));
+    }
+    s.push('|');
+    s.push_str(&google.effects_profile_id.join(","));
+    s.push('|');
+    s.push_str(&google.language_code);
     let hash = xxh3_128(s.as_bytes());
     format!("{hash:032x}")
 }
@@ -558,7 +573,7 @@ impl GoogleTTS {
         };
 
         // Compute config hash for caching
-        let config_hash = compute_google_tts_config_hash(&config);
+        let config_hash = compute_google_tts_config_hash(&config, &google_config);
 
         Ok(Self {
             config,
@@ -624,6 +639,20 @@ impl GoogleTTS {
         if let Some(l) = &f.language {
             google_config.language_code = l.clone();
         }
+        // `effectsProfileId` is a Google-unique AudioConfig field with no canonical `TtsFeatures`
+        // slot, so it rides the open `extras` passthrough (array of strings, or a single string).
+        // Confirmed per-request on the `v1/text:synthesize` endpoint: AudioConfig.effectsProfileId.
+        // Doc: https://cloud.google.com/text-to-speech/docs/reference/rest/v1/AudioConfig
+        if let Some(v) = std.extras.0.get("effects_profile_id") {
+            if let Some(arr) = v.as_array() {
+                google_config.effects_profile_id = arr
+                    .iter()
+                    .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                    .collect();
+            } else if let Some(s) = v.as_str() {
+                google_config.effects_profile_id = vec![s.to_string()];
+            }
+        }
 
         let pronunciation_replacer = if !config.pronunciations.is_empty() {
             Some(PronunciationReplacer::new(&config.pronunciations))
@@ -631,7 +660,7 @@ impl GoogleTTS {
             None
         };
 
-        let config_hash = compute_google_tts_config_hash(&config);
+        let config_hash = compute_google_tts_config_hash(&config, &google_config);
 
         Ok(Self {
             config,
@@ -1545,21 +1574,32 @@ mod tests {
     #[test]
     fn test_compute_google_tts_config_hash() {
         let config = create_test_config();
-        let hash = compute_google_tts_config_hash(&config);
+        let google = GoogleTTSConfig::from_base_config(config.clone(), "test-project".to_string());
+        let hash = compute_google_tts_config_hash(&config, &google);
 
         // Hash should be a 32-char hex string
         assert_eq!(hash.len(), 32);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
 
         // Same config should produce same hash
-        let hash2 = compute_google_tts_config_hash(&config);
+        let hash2 = compute_google_tts_config_hash(&config, &google);
         assert_eq!(hash, hash2);
 
-        // Different config should produce different hash
-        let mut different_config = config;
+        // Different base config should produce different hash
+        let mut different_config = config.clone();
         different_config.voice_id = Some("different-voice".to_string());
-        let different_hash = compute_google_tts_config_hash(&different_config);
-        assert_ne!(hash, different_hash);
+        let different_google =
+            GoogleTTSConfig::from_base_config(different_config.clone(), "test-project".to_string());
+        assert_ne!(
+            hash,
+            compute_google_tts_config_hash(&different_config, &different_google)
+        );
+
+        // Review S1 regression: an audio-changing Google-specific field (effects_profile_id) MUST
+        // change the cache key, else two requests differing only in audio effects collide.
+        let mut fx_google = google.clone();
+        fx_google.effects_profile_id = vec!["telephony-class-application".to_string()];
+        assert_ne!(hash, compute_google_tts_config_hash(&config, &fx_google));
     }
 
     // W1 keystone (struct-level, mirrors DeepgramTTS::from_standard): the standardized Google
@@ -1598,6 +1638,129 @@ mod tests {
         assert_eq!(tts.config.speaking_rate, Some(1.5));
         assert_eq!(tts.google_config.language_code, "es-ES");
         assert_eq!(tts.config.sample_rate, Some(48000));
+    }
+
+    // ===== WIRE-LEVEL tests for the standardized (`from_standard`) path =====
+    //
+    // These assert the feature value reaches the SERIALIZED `text:synthesize` request body
+    // (the bytes that go on the wire), not merely a config struct field — the exact bug class
+    // the last review caught (a value parked in a struct that the body builder never emits).
+    // Each builds the body from the `from_standard`-produced `google_config` and inspects both
+    // the parsed `audioConfig` and the raw serialized bytes.
+
+    fn std_with(features: crate::core::tts::standard::TtsFeatures, extras: serde_json::Map<String, serde_json::Value>) -> crate::core::tts::standard::StandardTTSConfig {
+        use crate::core::stt::standard::ProviderExtras;
+        use crate::core::tts::standard::StandardTTSConfig;
+        StandardTTSConfig {
+            base: TTSConfig {
+                provider: "google".into(),
+                api_key: TEST_SERVICE_ACCOUNT_JSON.to_string(),
+                voice_id: Some("en-US-Wavenet-D".to_string()),
+                audio_format: Some("linear16".to_string()),
+                ..Default::default()
+            },
+            features,
+            extras: ProviderExtras(extras),
+        }
+    }
+
+    /// Builds the on-wire JSON body produced by the standardized path for `tts`.
+    fn wire_body(tts: &GoogleTTS) -> serde_json::Value {
+        let builder = GoogleRequestBuilder::new(
+            tts.config.clone(),
+            tts.google_config.clone(),
+            "wire-token".to_string(),
+        );
+        builder.build_request_body("wire-text")
+    }
+
+    // pitch (features.pitch -> audioConfig.pitch). Doc: AudioConfig.pitch, range [-20,20],
+    // per-request on v1/text:synthesize.
+    #[tokio::test]
+    async fn wire_from_standard_emits_pitch_in_body() {
+        use crate::core::tts::standard::TtsFeatures;
+        let std = std_with(
+            TtsFeatures { pitch: Some(7.5), ..Default::default() },
+            Default::default(),
+        );
+        let tts = GoogleTTS::from_standard(&std).unwrap();
+        let body = wire_body(&tts);
+        // Parsed structural assertion.
+        assert_eq!(body["audioConfig"]["pitch"], 7.5);
+        // Raw serialized-bytes assertion: the param is actually emitted on the wire.
+        let raw = serde_json::to_string(&body).unwrap();
+        assert!(raw.contains("\"pitch\":7.5"), "pitch not in serialized body: {raw}");
+    }
+
+    // speaking_rate (features.speed -> audioConfig.speakingRate). Doc: AudioConfig.speakingRate,
+    // per-request on v1/text:synthesize.
+    #[tokio::test]
+    async fn wire_from_standard_emits_speaking_rate_in_body() {
+        use crate::core::tts::standard::TtsFeatures;
+        let std = std_with(
+            TtsFeatures { speed: Some(1.75), ..Default::default() },
+            Default::default(),
+        );
+        let tts = GoogleTTS::from_standard(&std).unwrap();
+        let body = wire_body(&tts);
+        assert_eq!(body["audioConfig"]["speakingRate"], 1.75);
+        let raw = serde_json::to_string(&body).unwrap();
+        assert!(raw.contains("\"speakingRate\":1.75"), "speakingRate not in serialized body: {raw}");
+    }
+
+    // effects_profile_id (extras["effects_profile_id"] -> audioConfig.effectsProfileId).
+    // Provider-unique, no canonical TtsFeatures slot; rides the extras passthrough.
+    // Doc: AudioConfig.effectsProfileId (string[]), per-request on v1/text:synthesize.
+    #[tokio::test]
+    async fn wire_from_standard_emits_effects_profile_id_array_in_body() {
+        let mut extras = serde_json::Map::new();
+        extras.insert(
+            "effects_profile_id".into(),
+            serde_json::json!(["headphone-class-device", "small-bluetooth-speaker-class-device"]),
+        );
+        let std = std_with(Default::default(), extras);
+        let tts = GoogleTTS::from_standard(&std).unwrap();
+        let body = wire_body(&tts);
+        assert_eq!(
+            body["audioConfig"]["effectsProfileId"],
+            serde_json::json!(["headphone-class-device", "small-bluetooth-speaker-class-device"])
+        );
+        let raw = serde_json::to_string(&body).unwrap();
+        assert!(
+            raw.contains("\"effectsProfileId\":[\"headphone-class-device\",\"small-bluetooth-speaker-class-device\"]"),
+            "effectsProfileId not in serialized body: {raw}"
+        );
+    }
+
+    // A single string in extras is accepted and emitted as a one-element array.
+    #[tokio::test]
+    async fn wire_from_standard_emits_effects_profile_id_single_string_in_body() {
+        let mut extras = serde_json::Map::new();
+        extras.insert("effects_profile_id".into(), serde_json::json!("telephony-class-application"));
+        let std = std_with(Default::default(), extras);
+        let tts = GoogleTTS::from_standard(&std).unwrap();
+        let body = wire_body(&tts);
+        assert_eq!(
+            body["audioConfig"]["effectsProfileId"],
+            serde_json::json!(["telephony-class-application"])
+        );
+        let raw = serde_json::to_string(&body).unwrap();
+        assert!(
+            raw.contains("\"effectsProfileId\":[\"telephony-class-application\"]"),
+            "effectsProfileId not in serialized body: {raw}"
+        );
+    }
+
+    // Absent extras => the param is omitted from the wire body entirely (no empty array leaks).
+    #[tokio::test]
+    async fn wire_from_standard_omits_effects_profile_id_when_absent() {
+        use crate::core::tts::standard::TtsFeatures;
+        let std = std_with(TtsFeatures::default(), Default::default());
+        let tts = GoogleTTS::from_standard(&std).unwrap();
+        let body = wire_body(&tts);
+        assert!(body["audioConfig"].get("effectsProfileId").is_none());
+        let raw = serde_json::to_string(&body).unwrap();
+        assert!(!raw.contains("effectsProfileId"), "effectsProfileId should be absent: {raw}");
     }
 
     #[test]

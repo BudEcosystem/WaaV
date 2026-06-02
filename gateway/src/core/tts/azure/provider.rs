@@ -177,6 +177,12 @@ fn compute_azure_tts_config_hash(config: &TTSConfig, azure_config: &AzureTTSConf
     }
     s.push('|');
     s.push_str(azure_config.region.as_str());
+    s.push('|');
+    // Emotion (mstts:express-as style) changes the audio, so it MUST be in the cache key — else two
+    // requests with the same text/voice/rate but different emotion collide. (Review S1.)
+    if let Some(emotion) = &azure_config.emotion {
+        s.push_str(emotion);
+    }
 
     let hash = xxh3_128(s.as_bytes());
     format!("{hash:032x}")
@@ -699,6 +705,92 @@ mod tests {
         assert!(body_str.contains("<prosody rate=\"150%\">"));
         assert!(body_str.contains("Fast speech"));
         assert!(body_str.contains("</prosody>"));
+    }
+
+    // WIRE-LEVEL emotion test: the `mstts:express-as style` attribute must appear in the
+    // SERIALIZED HTTP request body (the actual bytes sent to cognitiveservices/v1), not just
+    // in a config struct field. This is the bug class the last review caught — a feature that
+    // is stored but never reaches the wire. Confirmed against the Azure Speech SSML reference
+    // (speech-synthesis-markup-voice, doc ms.date 2026-01-30): the v1 REST synth endpoint
+    // consumes SSML, and emotion is the `<mstts:express-as style="...">` element.
+    #[test]
+    fn test_build_http_request_body_contains_express_as_emotion() {
+        let config = create_test_config();
+        let mut azure_config = AzureTTSConfig::from_base(config.clone());
+        azure_config.emotion = Some("cheerful".to_string());
+
+        let builder = AzureRequestBuilder::new(config, azure_config);
+
+        let client = reqwest::Client::new();
+        let request_builder = builder.build_http_request(&client, "Great news");
+        let request = request_builder.build().unwrap();
+
+        let body = request.body().unwrap().as_bytes().unwrap();
+        let body_str = std::str::from_utf8(body).unwrap();
+
+        // The express-as style attribute is on the wire.
+        assert!(
+            body_str.contains("<mstts:express-as style=\"cheerful\">"),
+            "express-as missing from request body: {body_str}"
+        );
+        assert!(body_str.contains("</mstts:express-as>"));
+        // Namespace declared so the mstts element is valid SSML.
+        assert!(
+            body_str.contains("xmlns:mstts="),
+            "mstts namespace missing from request body: {body_str}"
+        );
+        assert!(body_str.contains("Great news"));
+    }
+
+    // Wire-level negative: no emotion configured → no express-as on the wire.
+    #[test]
+    fn test_build_http_request_body_no_emotion_omits_express_as() {
+        let config = create_test_config();
+        let azure_config = AzureTTSConfig::from_base(config.clone());
+
+        let builder = AzureRequestBuilder::new(config, azure_config);
+
+        let client = reqwest::Client::new();
+        let request_builder = builder.build_http_request(&client, "Plain");
+        let request = request_builder.build().unwrap();
+
+        let body = request.body().unwrap().as_bytes().unwrap();
+        let body_str = std::str::from_utf8(body).unwrap();
+
+        assert!(!body_str.contains("mstts:express-as"));
+        assert!(!body_str.contains("xmlns:mstts"));
+    }
+
+    // Wire-level end-to-end: a StandardTTSConfig with features.emotion set produces a request
+    // body carrying express-as through the full standardized dispatch
+    // (from_standard → request builder → serialized HTTP body).
+    #[test]
+    fn from_standard_emotion_reaches_request_body() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                emotion: Some("sad".into()),
+                ..Default::default()
+            },
+            extras: ProviderExtras(serde_json::Map::new()),
+        };
+        let tts = AzureTTS::from_standard(&std).unwrap();
+        assert_eq!(tts.azure_config().emotion.as_deref(), Some("sad"));
+
+        let client = reqwest::Client::new();
+        let request_builder = tts
+            .request_builder
+            .build_http_request(&client, "Oh no");
+        let request = request_builder.build().unwrap();
+        let body = request.body().unwrap().as_bytes().unwrap();
+        let body_str = std::str::from_utf8(body).unwrap();
+
+        assert!(
+            body_str.contains("<mstts:express-as style=\"sad\">"),
+            "emotion not on the wire via from_standard: {body_str}"
+        );
+        assert!(body_str.contains("xmlns:mstts="));
     }
 
     #[test]
