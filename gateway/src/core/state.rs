@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::ServerConfig;
 use crate::core::cache::store::{CacheConfig, CacheStore};
+use crate::core::metrics::MetricsRegistry;
 use crate::core::tts::get_tts_provider_urls;
 #[cfg(not(feature = "turn-detect"))]
 use crate::core::turn_detect::TurnDetector;
@@ -34,6 +35,9 @@ pub struct CoreState {
     pub turn_detector: Option<Arc<RwLock<TurnDetector>>>,
     /// SIP hooks runtime state with preserved secrets
     pub sip_hooks_state: Option<Arc<RwLock<SipHooksState>>>,
+    /// Per-provider performance metrics shared across handlers; also installs the global
+    /// Prometheus recorder so `GET /metrics` renders (W-C1 observability).
+    pub metrics: Arc<MetricsRegistry>,
 }
 
 impl CoreState {
@@ -120,7 +124,13 @@ impl CoreState {
             cache,
             turn_detector,
             sip_hooks_state,
+            metrics: Arc::new(MetricsRegistry::new()),
         })
+    }
+
+    /// Get the shared per-provider metrics registry.
+    pub fn metrics(&self) -> &Arc<MetricsRegistry> {
+        &self.metrics
     }
 
     /// Get a TTS request manager for a specific provider

@@ -1,3 +1,8 @@
+// W-E1 hot-path unwrap audit: JWT signing runs on every authenticated request.
+// Forbid silent runtime panics here; runtime fallibility must be `?`/structured
+// errors. Tests may still use unwrap/expect for brevity (allowed below).
+#![warn(clippy::unwrap_used, clippy::expect_used)]
+
 use crate::errors::auth_error::{AuthError, AuthResult};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use once_cell::sync::Lazy;
@@ -42,19 +47,27 @@ pub struct AuthClaims {
 }
 
 impl AuthClaims {
-    /// Create new claims with current timestamp and 5-minute expiration
-    pub fn new(auth_data: AuthPayload) -> Self {
+    /// Create new claims with current timestamp and 5-minute expiration.
+    ///
+    /// Returns an error instead of panicking if the system clock is set before
+    /// the Unix epoch (`SystemTime::duration_since` failure). This keeps the
+    /// hot authentication path panic-free (W-E1).
+    pub fn new(auth_data: AuthPayload) -> AuthResult<Self> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
+            .map_err(|e| {
+                AuthError::JwtSigningError(format!(
+                    "system clock is before the Unix epoch: {e}"
+                ))
+            })?
             .as_secs() as i64;
 
-        Self {
+        Ok(Self {
             sub: "waav-auth".to_string(),
             iat: now,
             exp: now + 300, // 5 minutes expiration
             auth_data,
-        }
+        })
     }
 }
 
@@ -196,7 +209,7 @@ pub fn sign_auth_request_with_key(
     algorithm: Algorithm,
 ) -> AuthResult<String> {
     let header = Header::new(algorithm);
-    let claims = AuthClaims::new(payload.clone());
+    let claims = AuthClaims::new(payload.clone())?;
 
     encode(&header, &claims, encoding_key)
         .map_err(|e| AuthError::JwtSigningError(format!("Failed to encode JWT: {e}")))
@@ -209,7 +222,7 @@ pub fn sign_auth_request(payload: &AuthPayload, private_key_path: &Path) -> Auth
     let header = Header::new(algorithm);
 
     // Create claims with the payload nested under auth_data
-    let claims = AuthClaims::new(payload.clone());
+    let claims = AuthClaims::new(payload.clone())?;
 
     // Sign the claims
     encode(&header, &claims, &encoding_key)
@@ -218,6 +231,8 @@ pub fn sign_auth_request(payload: &AuthPayload, private_key_path: &Path) -> Auth
 
 #[cfg(test)]
 mod tests {
+    // Tests may use unwrap/expect freely; the hot-path lint is for runtime code.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use axum::http::HeaderMap;
 
@@ -231,7 +246,7 @@ mod tests {
             request_method: "POST".to_string(),
         };
 
-        let claims = AuthClaims::new(payload.clone());
+        let claims = AuthClaims::new(payload.clone()).unwrap();
 
         assert_eq!(claims.sub, "waav-auth");
         assert_eq!(claims.auth_data.token, "test-token");

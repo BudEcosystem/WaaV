@@ -373,39 +373,38 @@ impl LiveKitClient {
             )));
         }
 
-        // Zero-copy conversion for aligned data
-        // Fall back to manual conversion for unaligned data
-        let samples: Vec<i16> = if (audio_data.as_ptr() as usize).is_multiple_of(2) {
-            // Data is aligned, use zero-copy reinterpretation
-            unsafe {
-                // SAFETY: We've verified:
-                // 1. The pointer is aligned to i16 (2 bytes) - checked above
-                // 2. The length is even - checked at function start
-                // 3. num_samples * 2 <= audio_data.len() - verified by num_samples = len / 2
-                // 4. The data is valid for the lifetime of the slice - audio_data is borrowed
-                debug_assert!(
-                    (audio_data.as_ptr() as usize) % std::mem::align_of::<i16>() == 0,
-                    "Pointer not aligned to i16 boundary"
-                );
-                debug_assert!(
-                    num_samples * std::mem::size_of::<i16>() <= audio_data.len(),
-                    "num_samples {} would read beyond buffer length {}",
-                    num_samples,
-                    audio_data.len()
-                );
-
-                let ptr = audio_data.as_ptr() as *const i16;
-                let slice = std::slice::from_raw_parts(ptr, num_samples);
-                slice.to_vec()
+        // Decode 16-bit little-endian PCM samples.
+        //
+        // The wire format is always little-endian (LiveKit/WebRTC PCM), so the byte
+        // order must NOT depend on host endianness. On little-endian targets an i16
+        // reinterpret of the bytes is identical to `from_le_bytes`, so we take a
+        // zero-copy `bytemuck::cast_slice` fast path when the buffer is aligned.
+        // On big-endian targets (or unaligned buffers) we always go through
+        // `i16::from_le_bytes`, which is endian-correct by construction.
+        let samples: Vec<i16> = {
+            #[cfg(target_endian = "little")]
+            {
+                if bytemuck::try_cast_slice::<u8, i16>(audio_data).is_ok() {
+                    // Aligned + length-checked by bytemuck. On LE this is exactly
+                    // the same value as `from_le_bytes` would produce, with no copy
+                    // beyond the final `to_vec()`.
+                    bytemuck::cast_slice::<u8, i16>(audio_data).to_vec()
+                } else {
+                    // Unaligned buffer: fall back to the endian-explicit decode.
+                    audio_data
+                        .chunks_exact(2)
+                        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+                        .collect()
+                }
             }
-        } else {
-            // Data is unaligned, fall back to manual conversion
-            let mut samples = Vec::with_capacity(num_samples);
-            for chunk in audio_data.chunks_exact(2) {
-                let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-                samples.push(sample);
+            #[cfg(not(target_endian = "little"))]
+            {
+                // Big-endian host: never reinterpret host-endian; always decode LE.
+                audio_data
+                    .chunks_exact(2)
+                    .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+                    .collect()
             }
-            samples
         };
 
         Ok(AudioFrame {

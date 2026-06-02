@@ -103,6 +103,16 @@ pub struct StandardSTTConfig {
     pub extras: ProviderExtras,
 }
 
+/// The reserved [`ProviderExtras`] key carrying an endpoint override.
+///
+/// Generalizes the OpenAI `OPENAI_BASE_URL` pattern (fix #22): when present, the provider
+/// connects to this base URL/host instead of its production endpoint. Used by the
+/// wire-assert/chaos harness to point a provider at an in-repo mock (W-T0), and
+/// operationally to route through a regional/proxy endpoint. Threading it through the
+/// existing open passthrough avoids adding a required field to the ~80 `StandardSTTConfig`
+/// construction sites (additive, zero-churn).
+pub const ENDPOINT_OVERRIDE_KEY: &str = "endpoint_override";
+
 impl StandardSTTConfig {
     /// Wrap an existing flat config with no advanced features (the additive `From` shim).
     pub fn from_base(base: STTConfig) -> Self {
@@ -111,6 +121,24 @@ impl StandardSTTConfig {
             features: SttFeatures::default(),
             extras: ProviderExtras::default(),
         }
+    }
+
+    /// Set the endpoint override (host/URL) the provider should connect to instead of its
+    /// production endpoint. See [`ENDPOINT_OVERRIDE_KEY`].
+    pub fn with_endpoint_override(mut self, endpoint: impl Into<String>) -> Self {
+        self.extras.0.insert(
+            ENDPOINT_OVERRIDE_KEY.to_string(),
+            serde_json::Value::String(endpoint.into()),
+        );
+        self
+    }
+
+    /// The configured endpoint override, if any.
+    pub fn endpoint_override(&self) -> Option<&str> {
+        self.extras
+            .0
+            .get(ENDPOINT_OVERRIDE_KEY)
+            .and_then(|v| v.as_str())
     }
 }
 

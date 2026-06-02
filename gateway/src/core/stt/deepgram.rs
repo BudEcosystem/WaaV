@@ -12,6 +12,37 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
 
 use super::base::{BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback};
+use crate::core::resilience::{CircuitBreaker, ReconnectGovernor};
+use crate::core::websocket::{ReconnectionConfig, ReconnectionManager};
+
+/// Why the Deepgram inner event loop returned — drives the outer reconnect loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeepgramInnerOutcome {
+    /// Client-initiated close (shutdown/CloseStream). Stop; do not reconnect.
+    Intentional,
+    /// Transport-level failure (socket reset, idle timeout, server EOF). Reconnect to
+    /// preserve the session — finals after the drop are recovered on the new connection.
+    Reconnect,
+    /// A provider `Error` frame (bad config/auth). Stop; reconnecting would fail identically.
+    Fatal,
+}
+
+/// Extract the `host[:port]` authority from a `ws://`/`wss://` base URL, for the `Host`
+/// header when an `endpoint_override` is in effect.
+fn ws_authority(base: &str) -> Option<String> {
+    let rest = base
+        .strip_prefix("wss://")
+        .or_else(|| base.strip_prefix("ws://"))
+        .or_else(|| base.strip_prefix("https://"))
+        .or_else(|| base.strip_prefix("http://"))
+        .unwrap_or(base);
+    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+    if authority.is_empty() {
+        None
+    } else {
+        Some(authority.to_string())
+    }
+}
 
 /// Type alias for the complex callback function type
 type AsyncSTTCallback = Box<
@@ -92,6 +123,11 @@ pub struct DeepgramSTTConfig {
     /// feature overview and present in the AsyncAPI streaming schema), so we map
     /// it onto the request URL.
     pub multichannel: bool,
+    /// Override the WebSocket base endpoint (scheme://host[:port]) — e.g. `ws://127.0.0.1:PORT`
+    /// for a local mock (W-T0 harness) or a proxy. When `None`, the production Deepgram
+    /// endpoint (or the EU endpoint if `use_eu_endpoint`) is used. Generalizes the OpenAI
+    /// `OPENAI_BASE_URL` pattern; required so reconnection chaos tests can drive a real mock.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for DeepgramSTTConfig {
@@ -113,6 +149,7 @@ impl Default for DeepgramSTTConfig {
             redact_phi: false,
             numerals: false,
             multichannel: false,
+            endpoint_override: None,
         }
     }
 }
@@ -141,6 +178,10 @@ impl DeepgramSTTConfig {
             // streaming feature overview), so map them straight through to the wire.
             numerals: f.numerals.unwrap_or(false),
             multichannel: f.multichannel.unwrap_or(false),
+            // Endpoint override (W-T0): carried via the standardized extras passthrough so the
+            // restored, *featured* session can be pointed at a mock/proxy without touching the
+            // ~80 StandardSTTConfig construction sites.
+            endpoint_override: std.endpoint_override().map(|s| s.to_string()),
             // CAPABILITY GAP — intentionally NOT mapped to the wire:
             //   * `alternatives` (N-best): absent from Deepgram's streaming AsyncAPI
             //     query-parameter schema and from the streaming feature overview — it is a
@@ -300,8 +341,11 @@ impl DeepgramSTT {
     fn build_websocket_url(&self, config: &DeepgramSTTConfig) -> Result<String, STTError> {
         let mut url = String::with_capacity(256); // Pre-allocate expected size
 
-        // Select endpoint based on EU residency setting
-        let endpoint = if config.use_eu_endpoint {
+        // Select endpoint. An explicit override (mock/proxy) wins; otherwise pick the EU or
+        // default production endpoint per the residency setting.
+        let endpoint: &str = if let Some(o) = &config.endpoint_override {
+            o.trim_end_matches('/')
+        } else if config.use_eu_endpoint {
             DEEPGRAM_EU_ENDPOINT
         } else {
             DEEPGRAM_DEFAULT_ENDPOINT
@@ -522,208 +566,308 @@ impl DeepgramSTT {
         // Clone necessary data for the connection task
         let api_key = config.base.api_key.clone();
         let use_eu_endpoint = config.use_eu_endpoint;
+        // The Host header must match the endpoint actually being dialed. For an override
+        // (mock/proxy) derive it from the override authority; otherwise the production host.
+        let host: String = if let Some(o) = &config.endpoint_override {
+            ws_authority(o).unwrap_or_else(|| "api.deepgram.com".to_string())
+        } else if use_eu_endpoint {
+            "api.eu.deepgram.com".to_string()
+        } else {
+            "api.deepgram.com".to_string()
+        };
+        // Per-connection reconnection policy. (A shared governor + per-provider circuit
+        // breaker via CoreState is the production wiring — tracked as follow-up; here each
+        // session governs its own reconnects, which already prevents the per-session
+        // break-on-first-error data loss.)
+        let reconnection = ReconnectionConfig::aggressive();
+        let reset_after_ms = reconnection.reset_after_ms;
+        let governor = ReconnectGovernor::default();
+        let breaker = std::sync::Arc::new(CircuitBreaker::with_defaults());
 
         // Start the connection task
         let connection_handle = tokio::spawn(async move {
-            // Update state to connecting (this will be set by the main thread)
-            // state_notify.notify_waiters() - don't notify here, main thread handles connecting state
-
-            // Connect to Deepgram (use EU endpoint if configured)
-            let host = if use_eu_endpoint {
-                "api.eu.deepgram.com"
-            } else {
-                "api.deepgram.com"
-            };
-            let request = match tokio_tungstenite::tungstenite::http::Request::builder()
-                .method("GET")
-                .uri(&ws_url)
-                .header("Host", host)
-                .header("Upgrade", "websocket")
-                .header("Connection", "upgrade")
-                .header("Sec-WebSocket-Key", generate_key())
-                .header("Sec-WebSocket-Version", "13")
-                .header("Authorization", format!("Token {api_key}"))
-                .body(())
-            {
-                Ok(request) => request,
-                Err(e) => {
-                    let stt_error = STTError::ConnectionFailed(format!(
-                        "Failed to create WebSocket request: {e}"
-                    ));
-                    error!("{}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
-                }
-            };
-
-            let (ws_stream, _) = match connect_async(request).await {
-                Ok(result) => result,
-                Err(e) => {
-                    let stt_error =
-                        STTError::ConnectionFailed(format!("Failed to connect to Deepgram: {e}"));
-                    error!("{}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
-                }
-            };
-
-            info!("Connected to Deepgram WebSocket");
-
-            // Signal successful connection
-            let _ = connected_tx.send(());
-
-            let (mut ws_sink, mut ws_stream) = ws_stream.split();
-
-            // Keep-alive mechanism to prevent connection timeout
-            // Deepgram connections timeout after 10 seconds of inactivity
-            // Send keep-alive messages every 1 second when no audio is being sent
-            let mut keepalive_timer = interval(Duration::from_secs(1));
-            let mut last_activity = Instant::now();
-
-            // Main event loop
-            loop {
-                tokio::select! {
-                    // Handle outgoing audio data
-                    Some(audio_data) = ws_rx.recv() => {
-                        let message = Message::Binary(audio_data);
-                        if let Err(e) = ws_sink.send(message).await {
-                            let stt_error = STTError::NetworkError(format!(
-                                "Failed to send WebSocket message: {e}"
-                            ));
-                            error!("{}", stt_error);
-                            let _ = error_tx.try_send(stt_error);
-                            break;
-                        }
-                        // Update last activity time when audio is sent
-                        last_activity = Instant::now();
+            let manager = ReconnectionManager::new(reconnection);
+            // `connected_tx` is a oneshot: signal success exactly once (the first connect).
+            let mut connected_tx = Some(connected_tx);
+            // Outer reconnect loop. Each iteration establishes a *featured* connection (the
+            // URL carries diarize/keyterm/redaction/...) and runs the inner event loop until
+            // it yields an outcome. Reconnectable outcomes loop; intentional/exhausted stop.
+            'reconnect: loop {
+                // Storm control + breaker gate before dialing.
+                if !breaker.allow_request() {
+                    if !manager.should_retry() {
+                        error!("Deepgram circuit open and reconnection budget exhausted");
+                        break 'reconnect;
                     }
+                    let delay = manager.next_delay_duration();
+                    tokio::time::sleep(delay).await;
+                    continue 'reconnect;
+                }
+                let _permit = governor.acquire().await;
+                manager.start_attempt();
 
-                    // Handle incoming messages with idle timeout
-                    message = timeout(WS_MESSAGE_TIMEOUT, ws_stream.next()) => {
-                        match message {
-                            Ok(Some(Ok(msg))) => {
-                                if let Err(e) = Self::handle_websocket_message(msg, &result_tx) {
-                                    error!("Streaming error from Deepgram: {}", e);
-                                    let _ = error_tx.try_send(e);
+                // --- Dial + restore the featured session (re-send via the featured URL) ---
+                let request = match tokio_tungstenite::tungstenite::http::Request::builder()
+                    .method("GET")
+                    .uri(&ws_url)
+                    .header("Host", host.clone())
+                    .header("Upgrade", "websocket")
+                    .header("Connection", "upgrade")
+                    .header("Sec-WebSocket-Key", generate_key())
+                    .header("Sec-WebSocket-Version", "13")
+                    .header("Authorization", format!("Token {api_key}"))
+                    .body(())
+                {
+                    Ok(request) => request,
+                    Err(e) => {
+                        // A malformed request is fatal — retrying is pointless.
+                        let stt_error = STTError::ConnectionFailed(format!(
+                            "Failed to create WebSocket request: {e}"
+                        ));
+                        error!("{}", stt_error);
+                        let _ = error_tx.try_send(stt_error);
+                        break 'reconnect;
+                    }
+                };
+
+                let ws_stream = match connect_async(request).await {
+                    Ok((s, _)) => s,
+                    Err(e) => {
+                        // Eligible for reconnection: the upstream may just be flapping.
+                        let stt_error = STTError::ConnectionFailed(format!(
+                            "Failed to connect to Deepgram: {e}"
+                        ));
+                        error!("{}", stt_error);
+                        breaker.record_failure();
+                        manager.record_attempt(false);
+                        drop(_permit);
+                        if connected_tx.is_some() {
+                            // Never connected yet and dialing failed — surface to the
+                            // waiting connect() and give up (matches prior behavior of not
+                            // hanging the initial connect on a dead endpoint).
+                            let _ = error_tx.try_send(stt_error);
+                            break 'reconnect;
+                        }
+                        if !manager.should_retry() {
+                            let _ = error_tx.try_send(stt_error);
+                            break 'reconnect;
+                        }
+                        let delay = manager.next_delay_duration();
+                        tokio::time::sleep(delay).await;
+                        continue 'reconnect;
+                    }
+                };
+
+                info!("Connected to Deepgram WebSocket");
+                // The dial succeeded — tell the breaker. We do NOT zero the attempt counter
+                // here: a connect that immediately drops must still count against
+                // `max_attempts` (a fast connect→drop flap would otherwise retry forever). The
+                // counter is reset only after the connection proves *stable* (below).
+                breaker.record_success();
+                drop(_permit);
+                let connected_since = Instant::now();
+
+                // Signal the waiting connect() exactly once.
+                if let Some(tx) = connected_tx.take() {
+                    let _ = tx.send(());
+                }
+
+                let (mut ws_sink, mut ws_stream) = ws_stream.split();
+
+                // Keep-alive mechanism to prevent connection timeout
+                // Deepgram connections timeout after 10 seconds of inactivity
+                // Send keep-alive messages every 1 second when no audio is being sent
+                let mut keepalive_timer = interval(Duration::from_secs(1));
+                let mut last_activity = Instant::now();
+
+                // Outcome of the inner event loop: do we reconnect, or stop intentionally?
+                let outcome: DeepgramInnerOutcome;
+
+                // Main event loop
+                loop {
+                    tokio::select! {
+                        // Handle outgoing audio data
+                        Some(audio_data) = ws_rx.recv() => {
+                            let message = Message::Binary(audio_data);
+                            if let Err(e) = ws_sink.send(message).await {
+                                let stt_error = STTError::NetworkError(format!(
+                                    "Failed to send WebSocket message: {e}"
+                                ));
+                                error!("{}", stt_error);
+                                let _ = error_tx.try_send(stt_error);
+                                outcome = DeepgramInnerOutcome::Reconnect;
+                                break;
+                            }
+                            // Update last activity time when audio is sent
+                            last_activity = Instant::now();
+                        }
+
+                        // Handle incoming messages with idle timeout
+                        message = timeout(WS_MESSAGE_TIMEOUT, ws_stream.next()) => {
+                            match message {
+                                Ok(Some(Ok(msg))) => {
+                                    if let Err(e) = Self::handle_websocket_message(msg, &result_tx) {
+                                        error!("Streaming error from Deepgram: {}", e);
+                                        let _ = error_tx.try_send(e);
+                                        // A provider `Error` frame is typically fatal (bad
+                                        // config / auth); do not hammer it with reconnects.
+                                        outcome = DeepgramInnerOutcome::Fatal;
+                                        break;
+                                    }
+                                }
+                                Ok(Some(Err(e))) => {
+                                    let stt_error = STTError::NetworkError(format!(
+                                        "WebSocket error: {e}"
+                                    ));
+                                    error!("{}", stt_error);
+                                    let _ = error_tx.try_send(stt_error);
+                                    outcome = DeepgramInnerOutcome::Reconnect;
+                                    break;
+                                }
+                                Ok(None) => {
+                                    info!("WebSocket stream ended");
+                                    // The server closed the socket mid-stream — reconnect to
+                                    // preserve the session (no finals lost across the gap).
+                                    outcome = DeepgramInnerOutcome::Reconnect;
+                                    break;
+                                }
+                                Err(_elapsed) => {
+                                    // Idle timeout - no message received for 60s
+                                    let stt_error = STTError::NetworkError(
+                                        "WebSocket idle timeout - no message for 60 seconds".into()
+                                    );
+                                    error!("Deepgram STT idle timeout: {}", stt_error);
+                                    let _ = error_tx.try_send(stt_error);
+                                    outcome = DeepgramInnerOutcome::Reconnect;
                                     break;
                                 }
                             }
-                            Ok(Some(Err(e))) => {
-                                let stt_error = STTError::NetworkError(format!(
-                                    "WebSocket error: {e}"
-                                ));
-                                error!("{}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
-                            }
-                            Ok(None) => {
-                                info!("WebSocket stream ended");
-                                break;
-                            }
-                            Err(_elapsed) => {
-                                // Idle timeout - no message received for 60s
-                                let stt_error = STTError::NetworkError(
-                                    "WebSocket idle timeout - no message for 60 seconds".into()
-                                );
-                                error!("Deepgram STT idle timeout: {}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
+                        }
+
+                        // Handle keep-alive timer
+                        _ = keepalive_timer.tick() => {
+                            // Check if we need to send a keep-alive message
+                            // Only send if no audio was sent in the last second
+                            if last_activity.elapsed() >= Duration::from_secs(1) {
+                                let keepalive_message = Message::Text(r#"{"type":"KeepAlive"}"#.into());
+                                if let Err(e) = ws_sink.send(keepalive_message).await {
+                                    let stt_error = STTError::NetworkError(format!(
+                                        "Failed to send keep-alive message: {e}"
+                                    ));
+                                    error!("{}", stt_error);
+                                    let _ = error_tx.try_send(stt_error);
+                                    outcome = DeepgramInnerOutcome::Reconnect;
+                                    break;
+                                }
+                                debug!("Sent keep-alive message to Deepgram");
                             }
                         }
-                    }
 
-                    // Handle keep-alive timer
-                    _ = keepalive_timer.tick() => {
-                        // Check if we need to send a keep-alive message
-                        // Only send if no audio was sent in the last second
-                        if last_activity.elapsed() >= Duration::from_secs(1) {
-                            let keepalive_message = Message::Text(r#"{"type":"KeepAlive"}"#.into());
-                            if let Err(e) = ws_sink.send(keepalive_message).await {
-                                let stt_error = STTError::NetworkError(format!(
-                                    "Failed to send keep-alive message: {e}"
-                                ));
-                                error!("{}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
+                        // Handle shutdown signal
+                        _ = &mut shutdown_rx => {
+                            info!("Received shutdown signal, sending CloseStream to Deepgram");
+                            // CRITICAL: Send CloseStream message to signal end of audio
+                            // This tells Deepgram to finalize any pending transcripts and send speech_final
+                            let close_stream_message = Message::Text(r#"{"type":"CloseStream"}"#.into());
+                            if let Err(e) = ws_sink.send(close_stream_message).await {
+                                warn!("Failed to send CloseStream message: {}", e);
+                                outcome = DeepgramInnerOutcome::Intentional;
                                 break;
                             }
-                            debug!("Sent keep-alive message to Deepgram");
-                        }
-                    }
+                            debug!("Sent CloseStream message to Deepgram, waiting for final results");
 
-                    // Handle shutdown signal
-                    _ = &mut shutdown_rx => {
-                        info!("Received shutdown signal, sending CloseStream to Deepgram");
-                        // CRITICAL: Send CloseStream message to signal end of audio
-                        // This tells Deepgram to finalize any pending transcripts and send speech_final
-                        let close_stream_message = Message::Text(r#"{"type":"CloseStream"}"#.into());
-                        if let Err(e) = ws_sink.send(close_stream_message).await {
-                            warn!("Failed to send CloseStream message: {}", e);
-                            break;
-                        }
-                        debug!("Sent CloseStream message to Deepgram, waiting for final results");
+                            // CRITICAL: Continue receiving messages after CloseStream to capture speech_final
+                            // Don't just sleep - actively receive and process any final results
+                            let close_timeout = tokio::time::Instant::now() + Duration::from_millis(1000);
+                            let mut received_speech_final = false;
 
-                        // CRITICAL: Continue receiving messages after CloseStream to capture speech_final
-                        // Don't just sleep - actively receive and process any final results
-                        let close_timeout = tokio::time::Instant::now() + Duration::from_millis(1000);
-                        let mut received_speech_final = false;
+                            while tokio::time::Instant::now() < close_timeout {
+                                tokio::select! {
+                                    biased; // Prefer receiving messages over timeout
 
-                        while tokio::time::Instant::now() < close_timeout {
-                            tokio::select! {
-                                biased; // Prefer receiving messages over timeout
+                                    message = tokio::time::timeout(Duration::from_millis(200), ws_stream.next()) => {
+                                        match message {
+                                            Ok(Some(Ok(msg))) => {
+                                                // Check if this is a speech_final result before processing
+                                                if let Message::Text(ref text) = msg {
+                                                    if text.contains("\"speech_final\":true") || text.contains("\"speech_final\": true") {
+                                                        info!("Received speech_final after CloseStream");
+                                                        received_speech_final = true;
+                                                    }
+                                                }
 
-                                message = tokio::time::timeout(Duration::from_millis(200), ws_stream.next()) => {
-                                    match message {
-                                        Ok(Some(Ok(msg))) => {
-                                            // Check if this is a speech_final result before processing
-                                            if let Message::Text(ref text) = msg {
-                                                if text.contains("\"speech_final\":true") || text.contains("\"speech_final\": true") {
-                                                    info!("Received speech_final after CloseStream");
-                                                    received_speech_final = true;
+                                                if let Err(e) = Self::handle_websocket_message(msg, &result_tx) {
+                                                    warn!("Error handling message after CloseStream: {}", e);
+                                                }
+
+                                                // If we got speech_final, we can exit sooner
+                                                if received_speech_final {
+                                                    debug!("Got speech_final, exiting early");
+                                                    break;
                                                 }
                                             }
-
-                                            if let Err(e) = Self::handle_websocket_message(msg, &result_tx) {
-                                                warn!("Error handling message after CloseStream: {}", e);
-                                            }
-
-                                            // If we got speech_final, we can exit sooner
-                                            if received_speech_final {
-                                                debug!("Got speech_final, exiting early");
+                                            Ok(Some(Err(e))) => {
+                                                debug!("WebSocket error after CloseStream: {}", e);
                                                 break;
                                             }
-                                        }
-                                        Ok(Some(Err(e))) => {
-                                            debug!("WebSocket error after CloseStream: {}", e);
-                                            break;
-                                        }
-                                        Ok(None) => {
-                                            info!("WebSocket stream ended after CloseStream");
-                                            break;
-                                        }
-                                        Err(_) => {
-                                            // 200ms timeout - continue waiting
-                                            debug!("Still waiting for final results after CloseStream...");
+                                            Ok(None) => {
+                                                info!("WebSocket stream ended after CloseStream");
+                                                break;
+                                            }
+                                            Err(_) => {
+                                                // 200ms timeout - continue waiting
+                                                debug!("Still waiting for final results after CloseStream...");
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
 
-                        if !received_speech_final {
-                            debug!("CloseStream timeout reached without receiving speech_final");
-                        }
+                            if !received_speech_final {
+                                debug!("CloseStream timeout reached without receiving speech_final");
+                            }
 
-                        break;
+                            outcome = DeepgramInnerOutcome::Intentional;
+                            break;
+                        }
+                    }
+                }
+
+                // Send graceful close frame before disconnecting from this socket.
+                if let Err(e) = ws_sink.close().await {
+                    debug!("Error closing WebSocket sink: {}", e);
+                }
+
+                // A connection that survived `reset_after_ms` is stable: clear backoff so a
+                // long, occasionally-flaky session never exhausts max_attempts over its life.
+                if reset_after_ms > 0
+                    && connected_since.elapsed().as_millis() as u64 >= reset_after_ms
+                {
+                    manager.reset();
+                }
+
+                match outcome {
+                    DeepgramInnerOutcome::Intentional | DeepgramInnerOutcome::Fatal => {
+                        info!("Deepgram WebSocket connection closed");
+                        break 'reconnect;
+                    }
+                    DeepgramInnerOutcome::Reconnect => {
+                        breaker.record_failure();
+                        if !manager.should_retry() {
+                            warn!("Deepgram reconnection budget exhausted; closing session");
+                            break 'reconnect;
+                        }
+                        let delay = manager.next_delay_duration();
+                        info!(
+                            "Deepgram transport dropped; reconnecting (attempt {}) in {:?}",
+                            manager.attempt_count() + 1,
+                            delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        // loop -> re-dial the same featured URL (restore_session)
                     }
                 }
             }
-
-            // Send graceful close frame before disconnecting
-            if let Err(e) = ws_sink.close().await {
-                debug!("Error closing WebSocket sink: {}", e);
-            }
-
-            info!("Deepgram WebSocket connection closed");
         });
 
         self.connection_handle = Some(connection_handle);

@@ -44,6 +44,9 @@ use crate::handlers::{
     ),
     paths(
         crate::handlers::api::health_check,
+        crate::handlers::api::livez,
+        crate::handlers::api::readyz,
+        crate::handlers::api::metrics_handler,
         crate::handlers::voices::list_voices,
         crate::handlers::speak::speak_handler,
         crate::handlers::livekit::generate_token,
@@ -60,6 +63,8 @@ use crate::handlers::{
     components(schemas(
         // REST API types
         HealthResponse,
+        crate::core::readiness::ReadinessReport,
+        crate::core::readiness::ProviderReadiness,
         Voice,
         SpeakRequest,
         TokenRequest,

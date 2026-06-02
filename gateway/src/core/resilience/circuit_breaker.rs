@@ -1,0 +1,536 @@
+//! Per-provider circuit breaker for streaming connections.
+//!
+//! A circuit breaker prevents a failing upstream from being hammered by an endless
+//! reconnect loop. It is a three-state machine:
+//!
+//! ```text
+//!            error-rate >= threshold (with min volume)
+//!   ┌────────┐ ───────────────────────────────────────► ┌──────┐
+//!   │ Closed │                                           │ Open │
+//!   └────────┘ ◄───────────────────────────────────────  └──────┘
+//!        ▲          probe succeeds (Closed)                  │
+//!        │                                                   │ cooldown elapsed
+//!        │                                                   ▼
+//!        │   probe fails (back to Open)              ┌───────────┐
+//!        └───────────────────────────────────────── │ HalfOpen  │
+//!                                                    └───────────┘
+//! ```
+//!
+//! - **Closed**: traffic flows normally. Successes/failures are tallied over a
+//!   sliding window. When the failure *rate* crosses [`CircuitBreakerConfig::error_rate_threshold`]
+//!   AND the window has at least [`CircuitBreakerConfig::min_request_volume`] samples,
+//!   the breaker trips to **Open**.
+//! - **Open**: all calls are rejected immediately ([`CircuitBreaker::allow_request`]
+//!   returns `false`) until [`CircuitBreakerConfig::cooldown`] elapses, at which point
+//!   the next [`CircuitBreaker::allow_request`] returns `true` and moves the breaker to
+//!   **HalfOpen** (a single trial is permitted).
+//! - **HalfOpen**: a single probe is allowed. If it succeeds the breaker closes and the
+//!   window resets; if it fails the breaker re-opens and the cooldown restarts.
+//!
+//! The breaker is `Send + Sync` and lock-free on the hot path (atomics only), so it can
+//! be shared across the reconnect supervisor, the metrics exporter (W-C1), and the
+//! readiness probe.
+
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::time::{Duration, Instant};
+
+/// Observable state of a [`CircuitBreaker`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitState {
+    /// Normal operation — requests flow and outcomes are tallied.
+    Closed,
+    /// Tripped — requests are rejected until the cooldown elapses.
+    Open,
+    /// Cooldown elapsed — a single probe request is permitted.
+    HalfOpen,
+}
+
+impl CircuitState {
+    /// A stable string label for metrics/serialization.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CircuitState::Closed => "closed",
+            CircuitState::Open => "open",
+            CircuitState::HalfOpen => "half_open",
+        }
+    }
+
+    /// A stable numeric code for `waav_circuit_breaker_state` gauges (W-C1).
+    /// 0 = closed (healthy), 1 = half-open (probing), 2 = open (tripped).
+    pub fn as_code(&self) -> u8 {
+        match self {
+            CircuitState::Closed => 0,
+            CircuitState::HalfOpen => 1,
+            CircuitState::Open => 2,
+        }
+    }
+}
+
+// Internal numeric encoding of the state for the atomic.
+const STATE_CLOSED: u8 = 0;
+const STATE_OPEN: u8 = 1;
+const STATE_HALF_OPEN: u8 = 2;
+
+/// Configuration for a [`CircuitBreaker`].
+#[derive(Debug, Clone)]
+pub struct CircuitBreakerConfig {
+    /// Failure *rate* in `[0.0, 1.0]` at or above which the breaker trips. Default 0.5.
+    pub error_rate_threshold: f64,
+    /// Minimum number of samples in the window before the rate is trusted. Below this,
+    /// the breaker never trips (avoids tripping on a single early failure). Default 5.
+    pub min_request_volume: u32,
+    /// Sliding-window size: only the most recent `window_size` outcomes are counted.
+    /// Default 20.
+    pub window_size: u32,
+    /// How long the breaker stays Open before allowing a half-open probe. Default 5s.
+    pub cooldown: Duration,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            error_rate_threshold: 0.5,
+            min_request_volume: 5,
+            window_size: 20,
+            cooldown: Duration::from_secs(5),
+        }
+    }
+}
+
+impl CircuitBreakerConfig {
+    /// A breaker tuned for fast tripping/recovery (low-latency streaming).
+    pub fn aggressive() -> Self {
+        Self {
+            error_rate_threshold: 0.4,
+            min_request_volume: 3,
+            window_size: 10,
+            cooldown: Duration::from_secs(2),
+        }
+    }
+
+    /// A breaker tuned to tolerate transient blips before tripping.
+    pub fn conservative() -> Self {
+        Self {
+            error_rate_threshold: 0.7,
+            min_request_volume: 10,
+            window_size: 50,
+            cooldown: Duration::from_secs(15),
+        }
+    }
+}
+
+/// A point-in-time snapshot of a breaker's counters (for metrics/health endpoints).
+#[derive(Debug, Clone)]
+pub struct CircuitBreakerSnapshot {
+    pub state: CircuitState,
+    pub successes: u32,
+    pub failures: u32,
+    pub total_trips: u64,
+    pub error_rate: f64,
+}
+
+/// A lock-free, thread-safe circuit breaker.
+///
+/// Counters use a fixed sliding window of the most recent `window_size` outcomes. The
+/// window is approximated by halving both counters whenever their sum reaches
+/// `window_size` — this keeps the rate responsive to recent behaviour without storing a
+/// per-sample ring buffer, and keeps every operation O(1) and allocation-free.
+pub struct CircuitBreaker {
+    config: CircuitBreakerConfig,
+    /// Encoded [`CircuitState`] (`STATE_*`).
+    state: AtomicU8,
+    successes: AtomicU32,
+    failures: AtomicU32,
+    /// Monotonic nanos at which the breaker last opened (start of cooldown).
+    opened_at_ns: AtomicU64,
+    /// Total number of times the breaker has tripped to Open (cumulative).
+    total_trips: AtomicU64,
+}
+
+impl CircuitBreaker {
+    /// Create a breaker in the Closed state.
+    pub fn new(config: CircuitBreakerConfig) -> Self {
+        Self {
+            config,
+            state: AtomicU8::new(STATE_CLOSED),
+            successes: AtomicU32::new(0),
+            failures: AtomicU32::new(0),
+            opened_at_ns: AtomicU64::new(0),
+            total_trips: AtomicU64::new(0),
+        }
+    }
+
+    /// Create a breaker with the default config.
+    pub fn with_defaults() -> Self {
+        Self::new(CircuitBreakerConfig::default())
+    }
+
+    /// The current observable state.
+    ///
+    /// This is a pure read — it does NOT transition Open→HalfOpen even if the cooldown has
+    /// elapsed. The Open→HalfOpen transition only happens through [`allow_request`], which
+    /// is the gate the supervisor actually consults. (Otherwise a metrics scrape could
+    /// "use up" the half-open probe.)
+    pub fn state(&self) -> CircuitState {
+        match self.state.load(Ordering::Acquire) {
+            STATE_OPEN => CircuitState::Open,
+            STATE_HALF_OPEN => CircuitState::HalfOpen,
+            _ => CircuitState::Closed,
+        }
+    }
+
+    /// Whether a request (e.g. a reconnect attempt) may proceed *now*.
+    ///
+    /// - Closed → always `true`.
+    /// - Open → `false` until the cooldown elapses, then transitions to HalfOpen and
+    ///   returns `true` exactly once (the probe). Concurrent callers race for the single
+    ///   probe via a CAS; losers see HalfOpen and are denied.
+    /// - HalfOpen → `false` (the single probe is already outstanding).
+    pub fn allow_request(&self) -> bool {
+        match self.state.load(Ordering::Acquire) {
+            STATE_CLOSED => true,
+            STATE_HALF_OPEN => false,
+            _ /* STATE_OPEN */ => {
+                let opened = self.opened_at_ns.load(Ordering::Acquire);
+                let elapsed = now_ns().saturating_sub(opened);
+                if elapsed >= self.config.cooldown.as_nanos() as u64 {
+                    // Cooldown elapsed: try to claim the single probe slot.
+                    self.state
+                        .compare_exchange(
+                            STATE_OPEN,
+                            STATE_HALF_OPEN,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Record a successful outcome.
+    ///
+    /// - HalfOpen → close the breaker and reset the window (recovery confirmed).
+    /// - Closed → tally toward the window.
+    pub fn record_success(&self) {
+        if self.state.load(Ordering::Acquire) == STATE_HALF_OPEN {
+            self.close_and_reset();
+            return;
+        }
+        self.successes.fetch_add(1, Ordering::AcqRel);
+        self.maybe_decay_window();
+    }
+
+    /// Record a failed outcome.
+    ///
+    /// - HalfOpen → re-open and restart the cooldown (probe failed).
+    /// - Closed → tally toward the window and trip if the rate crosses the threshold.
+    pub fn record_failure(&self) {
+        if self.state.load(Ordering::Acquire) == STATE_HALF_OPEN {
+            self.trip();
+            return;
+        }
+        self.failures.fetch_add(1, Ordering::AcqRel);
+        self.maybe_decay_window();
+        self.maybe_trip();
+    }
+
+    /// Current failure rate over the window, `0.0` if there are no samples.
+    pub fn error_rate(&self) -> f64 {
+        let s = self.successes.load(Ordering::Acquire) as f64;
+        let f = self.failures.load(Ordering::Acquire) as f64;
+        let total = s + f;
+        if total == 0.0 { 0.0 } else { f / total }
+    }
+
+    /// Total number of times the breaker has tripped to Open.
+    pub fn total_trips(&self) -> u64 {
+        self.total_trips.load(Ordering::Relaxed)
+    }
+
+    /// A snapshot of the current counters.
+    pub fn snapshot(&self) -> CircuitBreakerSnapshot {
+        CircuitBreakerSnapshot {
+            state: self.state(),
+            successes: self.successes.load(Ordering::Relaxed),
+            failures: self.failures.load(Ordering::Relaxed),
+            total_trips: self.total_trips.load(Ordering::Relaxed),
+            error_rate: self.error_rate(),
+        }
+    }
+
+    /// Force the breaker back to Closed and clear the window (administrative reset).
+    pub fn reset(&self) {
+        self.close_and_reset();
+    }
+
+    // --- internals -----------------------------------------------------------------
+
+    fn close_and_reset(&self) {
+        self.successes.store(0, Ordering::Release);
+        self.failures.store(0, Ordering::Release);
+        self.state.store(STATE_CLOSED, Ordering::Release);
+    }
+
+    fn trip(&self) {
+        let prev = self.state.swap(STATE_OPEN, Ordering::AcqRel);
+        self.opened_at_ns.store(now_ns(), Ordering::Release);
+        // Only count a trip when we actually transition into Open from a non-Open state.
+        if prev != STATE_OPEN {
+            self.total_trips.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn maybe_trip(&self) {
+        let s = self.successes.load(Ordering::Acquire);
+        let f = self.failures.load(Ordering::Acquire);
+        let total = s + f;
+        if total < self.config.min_request_volume {
+            return;
+        }
+        let rate = f as f64 / total as f64;
+        if rate >= self.config.error_rate_threshold
+            && self.state.load(Ordering::Acquire) == STATE_CLOSED
+        {
+            self.trip();
+        }
+    }
+
+    /// Keep the counters bounded to roughly `window_size` recent samples by halving both
+    /// when their sum reaches the window size (exponential decay of old samples).
+    fn maybe_decay_window(&self) {
+        let s = self.successes.load(Ordering::Acquire);
+        let f = self.failures.load(Ordering::Acquire);
+        if s + f >= self.config.window_size {
+            // Halve both, preserving the ratio. Round so a lone failure isn't erased.
+            self.successes.store(s / 2, Ordering::Release);
+            self.failures.store(f.div_ceil(2), Ordering::Release);
+        }
+    }
+}
+
+/// Monotonic nanoseconds since process start (shared clock; cheap).
+fn now_ns() -> u64 {
+    use std::sync::OnceLock;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fast_cooldown_config() -> CircuitBreakerConfig {
+        CircuitBreakerConfig {
+            error_rate_threshold: 0.5,
+            min_request_volume: 4,
+            window_size: 20,
+            cooldown: Duration::from_millis(30),
+        }
+    }
+
+    #[test]
+    fn starts_closed_and_allows_requests() {
+        let cb = CircuitBreaker::with_defaults();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert!(cb.allow_request());
+        assert_eq!(cb.total_trips(), 0);
+    }
+
+    #[test]
+    fn does_not_trip_below_min_volume() {
+        // 100% failure rate but only 3 samples (< min_request_volume = 5 default).
+        let cb = CircuitBreaker::with_defaults();
+        for _ in 0..3 {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Closed, "must not trip below min volume");
+        assert!(cb.allow_request());
+    }
+
+    #[test]
+    fn trips_open_when_error_rate_crosses_threshold() {
+        let cb = CircuitBreaker::new(fast_cooldown_config());
+        // 4 failures, 0 successes -> rate 1.0 >= 0.5, volume 4 >= min 4.
+        for _ in 0..4 {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert!(!cb.allow_request(), "open breaker rejects immediately");
+        assert_eq!(cb.total_trips(), 1);
+    }
+
+    #[test]
+    fn does_not_trip_when_rate_below_threshold() {
+        let cb = CircuitBreaker::new(fast_cooldown_config());
+        // 6 successes + 2 failures = rate 0.25 < 0.5, volume 8 >= 4.
+        for _ in 0..6 {
+            cb.record_success();
+        }
+        for _ in 0..2 {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert!(cb.error_rate() < 0.5);
+    }
+
+    #[test]
+    fn open_transitions_to_half_open_after_cooldown() {
+        let cb = CircuitBreaker::new(fast_cooldown_config());
+        for _ in 0..4 {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert!(!cb.allow_request());
+
+        std::thread::sleep(Duration::from_millis(45));
+
+        // First allow_request after cooldown claims the half-open probe.
+        assert!(cb.allow_request(), "probe should be allowed after cooldown");
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        // The single probe is now outstanding; further requests are denied.
+        assert!(!cb.allow_request(), "only one probe permitted in half-open");
+    }
+
+    #[test]
+    fn half_open_success_closes_breaker() {
+        let cb = CircuitBreaker::new(fast_cooldown_config());
+        for _ in 0..4 {
+            cb.record_failure();
+        }
+        std::thread::sleep(Duration::from_millis(45));
+        assert!(cb.allow_request());
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed, "successful probe closes breaker");
+        assert!(cb.allow_request());
+        // Window was reset on close.
+        assert_eq!(cb.error_rate(), 0.0);
+    }
+
+    #[test]
+    fn half_open_failure_reopens_breaker() {
+        let cb = CircuitBreaker::new(fast_cooldown_config());
+        for _ in 0..4 {
+            cb.record_failure();
+        }
+        let trips_after_first = cb.total_trips();
+        std::thread::sleep(Duration::from_millis(45));
+        assert!(cb.allow_request());
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open, "failed probe re-opens breaker");
+        assert_eq!(cb.total_trips(), trips_after_first + 1, "re-open counts as a trip");
+        // And immediately denies again.
+        assert!(!cb.allow_request());
+    }
+
+    #[test]
+    fn full_recovery_cycle() {
+        let cb = CircuitBreaker::new(fast_cooldown_config());
+        // Trip.
+        for _ in 0..4 {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+        // Cooldown -> half-open probe -> success -> closed.
+        std::thread::sleep(Duration::from_millis(45));
+        assert!(cb.allow_request());
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        // Healthy traffic keeps it closed.
+        for _ in 0..10 {
+            cb.record_success();
+        }
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert!(cb.allow_request());
+    }
+
+    #[test]
+    fn window_decays_so_old_failures_age_out() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            error_rate_threshold: 0.5,
+            min_request_volume: 4,
+            window_size: 10,
+            cooldown: Duration::from_millis(50),
+        });
+        // Seed some old failures but stay under the trip threshold by interleaving success.
+        cb.record_failure();
+        cb.record_failure();
+        // Now a long run of successes should drive the rate down via window decay.
+        for _ in 0..40 {
+            cb.record_success();
+        }
+        assert!(cb.error_rate() < 0.5, "rate should decay: {}", cb.error_rate());
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn snapshot_reports_counters() {
+        let cb = CircuitBreaker::new(fast_cooldown_config());
+        cb.record_success();
+        cb.record_failure();
+        let snap = cb.snapshot();
+        assert_eq!(snap.state, CircuitState::Closed);
+        assert_eq!(snap.successes, 1);
+        assert_eq!(snap.failures, 1);
+        assert!((snap.error_rate - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn state_code_and_str_are_stable() {
+        assert_eq!(CircuitState::Closed.as_code(), 0);
+        assert_eq!(CircuitState::HalfOpen.as_code(), 1);
+        assert_eq!(CircuitState::Open.as_code(), 2);
+        assert_eq!(CircuitState::Closed.as_str(), "closed");
+        assert_eq!(CircuitState::Open.as_str(), "open");
+        assert_eq!(CircuitState::HalfOpen.as_str(), "half_open");
+    }
+
+    #[test]
+    fn reset_forces_closed() {
+        let cb = CircuitBreaker::new(fast_cooldown_config());
+        for _ in 0..4 {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+        cb.reset();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert!(cb.allow_request());
+    }
+
+    #[test]
+    fn concurrent_half_open_probe_is_single() {
+        use std::sync::Arc;
+        let cb = Arc::new(CircuitBreaker::new(fast_cooldown_config()));
+        for _ in 0..4 {
+            cb.record_failure();
+        }
+        std::thread::sleep(Duration::from_millis(45));
+
+        // Many threads race for the single probe; exactly one must win.
+        let granted = Arc::new(AtomicU32::new(0));
+        let mut handles = vec![];
+        for _ in 0..16 {
+            let cb = Arc::clone(&cb);
+            let granted = Arc::clone(&granted);
+            handles.push(std::thread::spawn(move || {
+                if cb.allow_request() {
+                    granted.fetch_add(1, Ordering::AcqRel);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            granted.load(Ordering::Acquire),
+            1,
+            "exactly one probe should be granted under contention"
+        );
+    }
+}

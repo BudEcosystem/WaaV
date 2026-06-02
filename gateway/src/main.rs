@@ -25,7 +25,7 @@ use anyhow::anyhow;
 
 use waav_gateway::{
     ServerConfig, global_registry, init,
-    middleware::{auth_middleware, connection_limit_middleware},
+    middleware::{auth_middleware, connection_limit_middleware, request_id_middleware},
     routes,
     state::AppState,
 };
@@ -200,11 +200,28 @@ async fn main() -> anyhow::Result<()> {
     // Create webhook routes (no auth - uses LiveKit signature verification)
     let webhook_routes = routes::webhooks::create_webhook_router();
 
-    // Create public health check route (no auth)
-    let public_routes = Router::new().route(
-        "/",
-        axum::routing::get(waav_gateway::handlers::api::health_check),
-    );
+    // Create public, no-auth operability routes (health/readiness/metrics).
+    // - `/` and `/livez`: liveness (process up); never touches upstreams.
+    // - `/readyz`: readiness (config + enabled-provider credentials + cached TCP reachability);
+    //   returns 503 + a per-provider JSON breakdown when an enabled provider is unreachable.
+    // - `/metrics`: Prometheus text exposition (waav_provider_* + waav_circuit_breaker_state).
+    let public_routes = Router::new()
+        .route(
+            "/",
+            axum::routing::get(waav_gateway::handlers::api::health_check),
+        )
+        .route(
+            "/livez",
+            axum::routing::get(waav_gateway::handlers::api::livez),
+        )
+        .route(
+            "/readyz",
+            axum::routing::get(waav_gateway::handlers::api::readyz),
+        )
+        .route(
+            "/metrics",
+            axum::routing::get(waav_gateway::handlers::api::metrics_handler),
+        );
 
     // Configure rate limiting.
     // SECURITY (S7): key on the real TCP peer IP (PeerIpKeyExtractor), NOT SmartIpKeyExtractor,
@@ -309,7 +326,11 @@ async fn main() -> anyhow::Result<()> {
         .with_state(app_state)
         .layer(cors_layer)
         .layer(tower::util::option_layer(governor_layer))
-        .layer(security_headers);
+        .layer(security_headers)
+        // Request-id/trace-context correlation is the OUTERMOST layer so the id exists before
+        // auth, rate-limiting, or any handler logs — every nested `tracing` event inherits it,
+        // and it is echoed on the response `x-request-id` header (W-C1 / E13).
+        .layer(axum::middleware::from_fn(request_id_middleware));
 
     // Parse socket address
     let socket_addr: SocketAddr = address

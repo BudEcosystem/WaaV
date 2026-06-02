@@ -116,8 +116,9 @@ async fn test_e2e_health_check() {
         .unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap();
 
-    // Health check response has status field
-    assert_eq!(json["status"], "OK");
+    // Health check response has status field (lowercase "ok" — W-C1 liveness contract,
+    // matching the CI smoke grep and the /livez endpoint).
+    assert_eq!(json["status"], "ok");
 }
 
 /// Test the speak endpoint validates input correctly

@@ -88,16 +88,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: gateway }
       - run: cargo build --release
-      - name: boot and curl health
+      - name: boot and probe liveness/readiness/metrics
         run: |
           cp config.example.yaml config.yaml || true
           ./target/release/waav-gateway -c config.yaml &
           PID=$!
+          # Liveness: /livez must report {"status":"ok"} (lowercase — matches handlers::api::livez).
           for i in $(seq 1 30); do
-            if curl -fsS http://localhost:3001/ | grep -q '"status":"ok"'; then echo "healthy"; kill $PID; exit 0; fi
+            if curl -fsS http://localhost:3001/livez | grep -q '"status":"ok"'; then echo "live"; break; fi
             sleep 1
+            if [ "$i" -eq 30 ]; then echo "server did not become live"; kill $PID 2>/dev/null; exit 1; fi
           done
-          echo "server did not become healthy"; kill $PID 2>/dev/null; exit 1
+          # Readiness probe must exist and return a JSON report (200 ready or 503 not_ready).
+          # With no provider keys in config.example.yaml, no providers are enabled => ready (200).
+          curl -fsS http://localhost:3001/readyz | grep -q '"status"' || { echo "readyz missing"; kill $PID 2>/dev/null; exit 1; }
+          # Metrics endpoint must expose the Prometheus exposition with the WaaV provider series.
+          curl -fsS http://localhost:3001/metrics | grep -q 'waav_provider' || { echo "metrics missing waav_provider series"; kill $PID 2>/dev/null; exit 1; }
+          echo "healthy"; kill $PID 2>/dev/null; exit 0
 
   neural-accuracy:
     name: VAD/turn accuracy (local ONNX, no secrets)

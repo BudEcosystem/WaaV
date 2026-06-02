@@ -117,6 +117,45 @@ async fn handle_voice_socket(
     auth: Auth,
     client_ip: Option<IpAddr>,
 ) {
+    // Multi-tenant panic isolation (W-E1 / E6).
+    //
+    // The release profile uses `panic = "unwind"` so that a panic inside one
+    // session's task body does NOT abort the whole process (which would drop
+    // every other tenant's connection). Here we contain a panic to THIS session
+    // by running the session body inside `catch_unwind`.
+    //
+    // The connection-slot guard is created OUTSIDE the caught region so that the
+    // per-IP connection counter is released via RAII even if the session panics.
+    // `AssertUnwindSafe` is sound here: on panic we abandon this session entirely
+    // (no shared state is observed after the unwind), so there is no risk of
+    // exposing a logically-torn invariant to another session.
+    let _connection_guard = client_ip.map(|ip| ConnectionGuard {
+        app_state: app_state.clone(),
+        ip,
+    });
+
+    let session = std::panic::AssertUnwindSafe(run_voice_socket_session(
+        socket, app_state, auth, client_ip,
+    ));
+    if futures::FutureExt::catch_unwind(session).await.is_err() {
+        // A panic was caught and contained to this session. The process and all
+        // other sessions remain alive. The connection guard above still releases
+        // the slot on scope exit.
+        error!("WebSocket session panicked; connection terminated (process unaffected)");
+    }
+}
+
+/// Inner body of a single WebSocket voice session.
+///
+/// Separated from [`handle_voice_socket`] so the latter can wrap it in
+/// `catch_unwind` for per-session panic isolation. A panic here unwinds back to
+/// the wrapper and kills only this connection.
+async fn run_voice_socket_session(
+    socket: WebSocket,
+    app_state: Arc<AppState>,
+    auth: Auth,
+    client_ip: Option<IpAddr>,
+) {
     debug!("handle_voice_socket started");
     info!(
         auth_id = ?auth.id,
@@ -124,13 +163,6 @@ async fn handle_voice_socket(
         client_ip = ?client_ip,
         "WebSocket voice connection established"
     );
-
-    // Create a connection guard that will release the connection when dropped
-    // This ensures the connection is released even if the function panics
-    let _connection_guard = client_ip.map(|ip| ConnectionGuard {
-        app_state: app_state.clone(),
-        ip,
-    });
 
     debug!("Splitting socket into sender and receiver");
     // Split the socket into sender and receiver
@@ -396,6 +428,18 @@ async fn process_message(
     match msg {
         Message::Text(text) => {
             debug!("Received text message: {} bytes", text.len());
+
+            // Panic-isolation test seam (W-E1). Inert in production: only fires when
+            // the operator/test explicitly sets `WAAV_TEST_PANIC_ON_TEXT` AND the
+            // incoming text starts with that token. Used by
+            // tests/panic_isolation.rs to prove a panic in one session is contained
+            // by the per-session `catch_unwind` in `handle_voice_socket` and does
+            // not abort the process or other sessions.
+            if let Ok(token) = std::env::var("WAAV_TEST_PANIC_ON_TEXT") {
+                if !token.is_empty() && text.starts_with(token.as_str()) {
+                    panic!("WAAV_TEST_PANIC_ON_TEXT injected panic (test seam)");
+                }
+            }
 
             // Pre-deserialization size check to prevent JSON parsing attacks
             if text.len() > MAX_TEXT_MESSAGE_SIZE {

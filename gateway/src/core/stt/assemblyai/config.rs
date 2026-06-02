@@ -221,6 +221,12 @@ pub struct AssemblyAISTTConfig {
     /// streaming's `language_detection` connection query parameter. Only effective
     /// with the multilingual model; AssemblyAI ignores it for the English-only model.
     pub language_detection: bool,
+
+    /// Override the WebSocket base endpoint (scheme://host[:port]) — e.g. `ws://127.0.0.1:PORT`
+    /// for a local mock (W-T0 harness) or a proxy. When `None`, the regional production
+    /// endpoint is used. Generalizes the OpenAI `OPENAI_BASE_URL` pattern; required so the
+    /// reconnection chaos tests can drive a real mock through this provider.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for AssemblyAISTTConfig {
@@ -235,6 +241,7 @@ impl Default for AssemblyAISTTConfig {
             include_word_timestamps: true, // Always available in v3
             keyterms_prompt: Vec::new(),   // No boost terms by default
             language_detection: false,     // Off by default (multilingual model only)
+            endpoint_override: None,
         }
     }
 }
@@ -252,7 +259,11 @@ impl AssemblyAISTTConfig {
     /// Uses pre-allocated String with estimated capacity (256 bytes)
     /// to minimize allocations during URL construction.
     pub fn build_websocket_url(&self) -> String {
-        let base_url = self.region.websocket_base_url();
+        // An explicit override (mock/proxy) wins over the regional production endpoint.
+        let base_url: &str = match &self.endpoint_override {
+            Some(o) => o.trim_end_matches('/'),
+            None => self.region.websocket_base_url(),
+        };
 
         // Pre-allocate with estimated capacity
         let mut url = String::with_capacity(256);
@@ -373,6 +384,10 @@ impl AssemblyAISTTConfig {
         if let Some(ld) = f.language_detection {
             cfg.language_detection = ld;
         }
+
+        // Endpoint override (W-T0): carried via the standardized extras passthrough so the
+        // restored, *featured* session can be pointed at a mock/proxy.
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
 
         // CAPABILITY GAPS — intentionally NOT mapped to the wire (left at provider defaults,
         // not silently faked). The following standardized features exist ONLY on AssemblyAI's

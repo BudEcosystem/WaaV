@@ -47,6 +47,9 @@ pub struct ProviderMetrics {
     /// Provider name for identification
     provider_name: String,
 
+    /// Channel this provider serves (`stt` / `tts` / `realtime`), used as a Prometheus label.
+    channel: String,
+
     /// Total request count
     request_count: AtomicU64,
 
@@ -82,10 +85,20 @@ pub struct ProviderMetrics {
 }
 
 impl ProviderMetrics {
-    /// Create new metrics for a provider.
+    /// Create new metrics for a provider (channel defaults to `provider`, an unlabelled
+    /// stand-in used by call sites that don't distinguish STT/TTS).
     pub fn new(provider_name: &str) -> Self {
+        Self::with_channel(provider_name, "provider")
+    }
+
+    /// Create new metrics for a provider on a specific `channel` (`stt`/`tts`/`realtime`).
+    ///
+    /// The channel becomes a Prometheus label on every series this instance emits, so the
+    /// same provider name (e.g. `deepgram`) can appear under both `stt` and `tts`.
+    pub fn with_channel(provider_name: &str, channel: &str) -> Self {
         Self {
             provider_name: provider_name.to_string(),
+            channel: channel.to_string(),
             request_count: AtomicU64::new(0),
             success_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
@@ -105,6 +118,11 @@ impl ProviderMetrics {
         &self.provider_name
     }
 
+    /// Get the channel label (`stt` / `tts` / `realtime` / `provider`).
+    pub fn channel(&self) -> &str {
+        &self.channel
+    }
+
     /// Start timing a new request.
     ///
     /// Returns a timer that should be used to record timing events.
@@ -120,31 +138,83 @@ impl ProviderMetrics {
     }
 
     /// Record a successful request (for manual tracking without timer).
+    ///
+    /// Also emits `waav_provider_requests_total{outcome="success"}` to Prometheus.
     pub fn record_success(&self) {
         self.success_count.fetch_add(1, Ordering::Relaxed);
+        crate::core::metrics::bridge::record_request(&self.provider_name, &self.channel, "success");
     }
 
     /// Record a failed request.
+    ///
+    /// Also emits `waav_provider_requests_total{outcome="error"}` and
+    /// `waav_provider_errors_total{kind="error"}` to Prometheus.
     pub fn record_error(&self) {
         self.error_count.fetch_add(1, Ordering::Relaxed);
+        crate::core::metrics::bridge::record_request(&self.provider_name, &self.channel, "error");
+        crate::core::metrics::bridge::record_error(&self.provider_name, &self.channel, "error");
     }
 
     /// Record a timeout.
+    ///
+    /// Counts as an error and emits `waav_provider_errors_total{kind="timeout"}`.
     pub fn record_timeout(&self) {
         self.timeout_count.fetch_add(1, Ordering::Relaxed);
         self.error_count.fetch_add(1, Ordering::Relaxed);
+        crate::core::metrics::bridge::record_request(&self.provider_name, &self.channel, "error");
+        crate::core::metrics::bridge::record_error(&self.provider_name, &self.channel, "timeout");
     }
 
     /// Record a rate limit (429 response).
+    ///
+    /// Counts as an error and emits `waav_provider_errors_total{kind="rate_limit"}`.
     pub fn record_rate_limit(&self) {
         self.rate_limit_count.fetch_add(1, Ordering::Relaxed);
         self.error_count.fetch_add(1, Ordering::Relaxed);
+        crate::core::metrics::bridge::record_request(&self.provider_name, &self.channel, "error");
+        crate::core::metrics::bridge::record_error(
+            &self.provider_name,
+            &self.channel,
+            "rate_limit",
+        );
+    }
+
+    /// Record a fully externally-measured request outcome.
+    ///
+    /// Use this when the caller measured timing itself (e.g. an HTTP handler that tracks the
+    /// first audio chunk through a callback) instead of holding a [`RequestTimer`] across the
+    /// request. Increments the request counter, records the total processing time, optionally
+    /// records a TTFB sample, and records success/error — feeding both the in-memory snapshot
+    /// and the Prometheus exposition exactly as the timer path does.
+    pub fn record_outcome(
+        &self,
+        success: bool,
+        ttfb: Option<std::time::Duration>,
+        total: std::time::Duration,
+    ) {
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+        self.record_processing_time(total.as_nanos() as u64);
+        if let Some(ttfb) = ttfb {
+            self.record_ttfb(ttfb.as_nanos() as u64);
+        }
+        if success {
+            self.record_success();
+        } else {
+            self.record_error();
+        }
     }
 
     /// Record a TTFB sample (internal use by RequestTimer).
+    ///
+    /// Also observes the value (in milliseconds) on the `waav_provider_ttfb_ms` histogram.
     fn record_ttfb(&self, ttfb_ns: u64) {
         self.ttfb_sum_ns.fetch_add(ttfb_ns, Ordering::Relaxed);
         self.ttfb_count.fetch_add(1, Ordering::Relaxed);
+        crate::core::metrics::bridge::observe_ttfb_ms(
+            &self.provider_name,
+            &self.channel,
+            ttfb_ns as f64 / 1_000_000.0,
+        );
 
         // Update max (using compare-exchange loop)
         loop {

@@ -41,6 +41,11 @@ struct AudioCollector {
     error: Arc<Mutex<Option<TTSError>>>,
     /// Notification for completion - more efficient than polling
     notify: Arc<Notify>,
+    /// Request start instant, used to compute time-to-first-byte for metrics.
+    start: std::time::Instant,
+    /// TTFB in nanoseconds since `start`, set when the first audio chunk arrives
+    /// (`u64::MAX` = not yet observed). Lock-free so the audio callback stays cheap.
+    first_byte_ns: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AudioCollector {
@@ -52,6 +57,18 @@ impl AudioCollector {
             completed: Arc::new(Mutex::new(false)),
             error: Arc::new(Mutex::new(None)),
             notify: Arc::new(Notify::new()),
+            start: std::time::Instant::now(),
+            first_byte_ns: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+        }
+    }
+
+    /// The measured time-to-first-byte, if any audio was received.
+    fn ttfb(&self) -> Option<std::time::Duration> {
+        let ns = self.first_byte_ns.load(std::sync::atomic::Ordering::Relaxed);
+        if ns == u64::MAX {
+            None
+        } else {
+            Some(std::time::Duration::from_nanos(ns))
         }
     }
 
@@ -106,6 +123,19 @@ impl AudioCallback for AudioCollector {
         audio_data: AudioData,
     ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
+            // Record time-to-first-byte exactly once (first chunk with data wins).
+            if !audio_data.data.is_empty() {
+                use std::sync::atomic::Ordering;
+                let elapsed = self.start.elapsed().as_nanos() as u64;
+                // Only set if still unset (u64::MAX sentinel); ignore the race loser.
+                let _ = self.first_byte_ns.compare_exchange(
+                    u64::MAX,
+                    elapsed,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
+
             // Store format and sample rate from first chunk
             if self.format.lock().await.is_none() {
                 *self.format.lock().await = Some(audio_data.format.clone());
@@ -299,6 +329,11 @@ pub async fn speak_handler(
     // Synthesize speech
     if let Err(e) = tts_provider.speak(&processed_text, true).await {
         error!("Failed to synthesize speech: {:?}", e);
+        state
+            .core_state
+            .metrics
+            .provider(&tts_config.provider, crate::core::metrics::channel::TTS)
+            .record_outcome(false, collector.ttfb(), collector.start.elapsed());
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -348,6 +383,15 @@ pub async fn speak_handler(
         format,
         sample_rate
     );
+
+    // Record provider metrics (W-C1): total request time + TTFB feed both the in-memory
+    // snapshot and the Prometheus exposition served at /metrics
+    // (waav_provider_requests_total / waav_provider_ttfb_ms).
+    state
+        .core_state
+        .metrics
+        .provider(&tts_config.provider, crate::core::metrics::channel::TTS)
+        .record_outcome(true, collector.ttfb(), collector.start.elapsed());
 
     // Determine content type
     let content_type = match format.as_str() {

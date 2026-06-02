@@ -33,8 +33,13 @@
 //! }
 //! ```
 
+pub mod reconnectable_stream;
 pub mod reconnection;
 
+pub use reconnectable_stream::{
+    DisconnectHandle, ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig,
+    RestoreError, StreamError, SupervisorExit, WsTransport,
+};
 pub use reconnection::{
     ReconnectionConfig, ReconnectionConfigBuilder, ReconnectionManager, ReconnectionSnapshot,
     ReconnectionState,

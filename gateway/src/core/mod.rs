@@ -7,7 +7,9 @@ pub mod metrics;
 pub mod observability;
 pub mod pipeline;
 pub mod providers;
+pub mod readiness;
 pub mod realtime;
+pub mod resilience;
 pub mod silero_vad;
 pub mod smart_turn;
 pub mod state;
@@ -75,7 +77,7 @@ pub use audio::{AudioRingBuffer, VADAnalyzer, VADParams, VADState, VADTransition
 pub use silero_vad::{SileroVAD, SileroVADConfig, SileroVADResult};
 
 // Re-export metrics types for provider monitoring
-pub use metrics::{ProviderMetrics, ProviderMetricsSnapshot, RequestTimer};
+pub use metrics::{MetricsRegistry, ProviderMetrics, ProviderMetricsSnapshot, RequestTimer};
 
 // Re-export observability types for monitoring
 pub use observability::{
@@ -89,6 +91,18 @@ pub use pipeline::{FramePriority, FramePriorityQueue, PriorityFrame, QueueSnapsh
 pub use websocket::{
     ReconnectionConfig, ReconnectionConfigBuilder, ReconnectionManager, ReconnectionSnapshot,
     ReconnectionState,
+};
+
+// Re-export resilience primitives (circuit breaker + reconnect governor) — W-D2.
+pub use resilience::{
+    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerSnapshot, CircuitState, ReconnectGovernor,
+    ReconnectPermit,
+};
+
+// Re-export the generic reconnectable stream supervisor — W-D1.
+pub use websocket::reconnectable_stream::{
+    ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
+    WsTransport,
 };
 
 // Re-export Smart Turn types for audio-based turn detection

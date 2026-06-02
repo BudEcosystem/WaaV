@@ -95,7 +95,9 @@ async fn test_health_check() {
         .unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(json["status"], "OK");
+    // W-C1: the liveness status is lowercase "ok" — this matches the CI smoke grep
+    // ('"status":"ok"') and fixes the prior "OK" vs "ok" mismatch.
+    assert_eq!(json["status"], "ok");
 }
 
 #[tokio::test]
