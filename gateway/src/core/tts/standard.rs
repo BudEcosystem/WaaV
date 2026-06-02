@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 /// Canonical, provider-agnostic advanced TTS features. Every field is `Option`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct TtsFeatures {
     /// Speaking speed multiplier / level (provider-specific range).
     pub speed: Option<f32>,

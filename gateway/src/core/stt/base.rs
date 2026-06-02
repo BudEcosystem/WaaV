@@ -553,6 +553,15 @@ pub trait BaseSTT: Send + Sync {
 
     /// Get provider-specific information
     fn get_provider_info(&self) -> &'static str;
+
+    /// Inject the shared, process-global resilience handles (W-D2): the single reconnect
+    /// governor (storm control across all sessions) and this provider's shared circuit breaker
+    /// (a trip in one session is visible to every other session of the provider).
+    ///
+    /// Streaming providers that run a supervised reconnect loop (Deepgram, AssemblyAI, …)
+    /// override this to store the handles and use them in their connect path instead of
+    /// creating per-session ones. Non-streaming / one-shot providers use the default no-op.
+    fn set_resilience(&mut self, _resilience: crate::core::resilience::ResilienceHandles) {}
 }
 
 /// Factory trait for creating STT providers

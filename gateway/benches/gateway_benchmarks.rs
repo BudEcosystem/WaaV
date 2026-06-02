@@ -152,6 +152,7 @@ fn bench_message_serialization(c: &mut Criterion) {
 
     // Ready message
     let ready_msg = OutgoingMessage::Ready {
+        protocol_version: "1.0".to_string(),
         stream_id: "test-stream-123".to_string(),
         livekit_room_name: Some("test-room".to_string()),
         livekit_url: Some("ws://localhost:7880".to_string()),

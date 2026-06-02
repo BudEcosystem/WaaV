@@ -74,6 +74,11 @@ impl MetricsRegistry {
     pub fn set_circuit_breaker_state(&self, provider: &str, state_code: u8) {
         bridge::set_circuit_breaker_state(provider, state_code);
     }
+
+    /// Record a reconnect attempt outcome (`success`/`failure`/`exhausted`/`circuit_open`).
+    pub fn record_reconnect(&self, provider: &str, outcome: &str) {
+        bridge::record_reconnect(provider, outcome);
+    }
 }
 
 #[cfg(test)]

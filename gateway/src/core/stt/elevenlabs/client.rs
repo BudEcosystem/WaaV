@@ -20,6 +20,133 @@ use super::messages::{ElevenLabsMessage, InputAudioChunk};
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
+use crate::core::websocket::reconnectable_stream::{
+    ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
+    WsTransport,
+};
+use crate::core::websocket::ReconnectionConfig;
+use futures::stream::{SplitSink, SplitStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+/// The concrete WebSocket stream type ElevenLabs dials.
+type ElevenLabsWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A [`WsTransport`] that adapts ElevenLabs' streaming event loop to the generic
+/// [`ReconnectableStream`] supervisor (W-D1 production adoption). One is built per (re)connect by
+/// the supervisor's `connect` closure; its [`run`](WsTransport::run) IS the original `select!`
+/// event loop, now returning a [`ReconnectOutcome`] so transport drops become reconnects instead
+/// of ending the session. ElevenLabs carries all features in the connect URL, so
+/// [`restore_session`](WsTransport::restore_session) is a no-op (the fresh dial already restored
+/// the featured session) — exactly the case the trait doc calls out.
+struct ElevenLabsTransport {
+    ws_sink: SplitSink<ElevenLabsWs, Message>,
+    ws_stream: SplitStream<ElevenLabsWs>,
+    /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
+    audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
+    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
+    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    result_tx: mpsc::Sender<STTResult>,
+    error_tx: mpsc::Sender<STTError>,
+    /// Fires once when the first `session_started` arrives, unblocking `start_connection`.
+    connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    session_id: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl WsTransport for ElevenLabsTransport {
+    async fn restore_session(&mut self) -> Result<(), RestoreError> {
+        // ElevenLabs puts every feature (model, audio format, VAD, timestamps, language) in the
+        // connect URL, so a fresh dial already restored the featured session — nothing to re-send.
+        Ok(())
+    }
+
+    async fn run(&mut self) -> ReconnectOutcome {
+        let mut audio_rx = self.audio_rx.lock().await;
+        let mut shutdown_rx = self.shutdown_rx.lock().await;
+        loop {
+            tokio::select! {
+                // Handle outgoing audio data
+                Some(audio_data) = audio_rx.recv() => {
+                    let audio_base64 = BASE64_STANDARD.encode(&audio_data);
+                    let input_msg = InputAudioChunk::new(audio_base64);
+                    let json_msg = match serde_json::to_string(&input_msg) {
+                        Ok(json) => json,
+                        Err(e) => {
+                            let stt_error = STTError::AudioProcessingError(format!(
+                                "Failed to serialize audio chunk: {e}"
+                            ));
+                            error!("{}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            continue;
+                        }
+                    };
+                    let message = Message::Text(json_msg.into());
+                    if let Err(e) = self.ws_sink.send(message).await {
+                        let stt_error = STTError::NetworkError(format!(
+                            "Failed to send audio to ElevenLabs: {e}"
+                        ));
+                        error!("{}", stt_error);
+                        let _ = self.error_tx.try_send(stt_error);
+                        // Transport-level send failure: reconnect to preserve the session.
+                        return ReconnectOutcome::Reconnectable(StreamError::new("audio send failed"));
+                    }
+                    debug!("Sent {} bytes of audio to ElevenLabs", audio_data.len());
+                }
+
+                // Handle incoming messages with idle timeout
+                message = timeout(WS_MESSAGE_TIMEOUT, self.ws_stream.next()) => {
+                    match message {
+                        Ok(Some(Ok(msg))) => {
+                            if let Err(e) = ElevenLabsSTT::handle_websocket_message(
+                                msg,
+                                &self.result_tx,
+                                &mut self.session_id,
+                            ) {
+                                error!("ElevenLabs streaming error: {}", e);
+                                let _ = self.error_tx.try_send(e);
+                                // A provider-level streaming error is typically fatal (bad config
+                                // / auth); do not hammer it with reconnects.
+                                return ReconnectOutcome::Fatal(StreamError::new("provider error frame"));
+                            }
+                            // Signal connection ready after the first session_started.
+                            if self.session_id.is_some() {
+                                if let Some(tx) = self.connected_tx.lock().await.take() {
+                                    let _ = tx.send(());
+                                }
+                            }
+                        }
+                        Ok(Some(Err(e))) => {
+                            let stt_error = STTError::NetworkError(format!("WebSocket error: {e}"));
+                            error!("{}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("websocket error"));
+                        }
+                        Ok(None) => {
+                            info!("ElevenLabs WebSocket stream ended");
+                            // Server closed mid-stream — reconnect to preserve the session.
+                            return ReconnectOutcome::Reconnectable(StreamError::new("stream ended"));
+                        }
+                        Err(_elapsed) => {
+                            let stt_error = STTError::NetworkError(
+                                "WebSocket idle timeout - no message for 60 seconds".into()
+                            );
+                            error!("ElevenLabs STT idle timeout: {}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("idle timeout"));
+                        }
+                    }
+                }
+
+                // Handle shutdown signal (intentional close — must NOT reconnect)
+                _ = &mut *shutdown_rx => {
+                    info!("Received shutdown signal for ElevenLabs STT");
+                    let _ = self.ws_sink.send(Message::Close(None)).await;
+                    return ReconnectOutcome::Completed;
+                }
+            }
+        }
+    }
+}
 
 // =============================================================================
 // Type Aliases
@@ -139,6 +266,13 @@ pub struct ElevenLabsSTT {
 
     /// Session ID from the ElevenLabs connection
     session_id: Option<String>,
+
+    /// Shared, process-global resilience handles (W-D2): the single reconnect governor + this
+    /// provider's shared circuit breaker, injected by the VoiceManager from CoreState and driven
+    /// by the generic [`ReconnectableStream`](crate::core::websocket::ReconnectableStream)
+    /// supervisor in `start_connection`. `None` when constructed directly (unit tests) — then the
+    /// supervisor uses its own per-session governor/breaker default.
+    resilience: Option<crate::core::resilience::ResilienceHandles>,
 }
 
 impl Default for ElevenLabsSTT {
@@ -157,6 +291,7 @@ impl Default for ElevenLabsSTT {
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
             session_id: None,
+            resilience: None,
         }
     }
 }
@@ -179,6 +314,13 @@ impl ElevenLabsSTT {
         let mut stt = Self::default();
         stt.config = Some(ElevenLabsSTTConfig::from_standard(std));
         Ok(stt)
+    }
+
+    /// The shared circuit breaker this session feeds into the generic supervisor, if the
+    /// process-global resilience handles have been injected (W-D1/W-D2). Two sessions built from
+    /// the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.as_ref().map(|r| &r.breaker)
     }
 
     /// Build the WebSocket URL with query parameters.
@@ -459,8 +601,8 @@ impl ElevenLabsSTT {
         let ws_url = self.build_websocket_url(&config)?;
 
         // Create channels for communication
-        let (ws_tx, mut ws_rx) = mpsc::channel::<Bytes>(32);
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let (ws_tx, ws_rx) = mpsc::channel::<Bytes>(32);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         // Bounded channels for backpressure - 256 should handle bursts while preventing memory exhaustion
         let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
         let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
@@ -474,139 +616,80 @@ impl ElevenLabsSTT {
 
         // Clone necessary data for the connection task
         let api_key = config.base.api_key.clone();
-        let host = Self::get_host_from_region(&config.region);
+        let host = Self::get_host_from_region(&config.region).to_string();
 
-        // Start the connection task
+        // Shared state the supervised transport re-uses across reconnect attempts: a single-
+        // consumer audio receiver + shutdown oneshot (locked per `run`) and the one-shot
+        // connected signal that fires on the first session_started.
+        let audio_rx = Arc::new(Mutex::new(ws_rx));
+        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
+        let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
+
+        // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor (the
+        // same one the chaos tests exercise) with the shared process-global handles from CoreState
+        // (W-D1/W-D2 production adoption). When no handles were injected (a direct unit-test
+        // construction), the supervisor uses its own per-session governor/breaker default.
+        let reconnection = ReconnectionConfig::aggressive();
+        let supervisor = match self.resilience.clone() {
+            Some(r) => ReconnectableStream::with_breaker_and_governor(
+                ReconnectableStreamConfig::new("elevenlabs", reconnection),
+                r.breaker,
+                (*r.governor).clone(),
+            ),
+            None => ReconnectableStream::new(ReconnectableStreamConfig::new(
+                "elevenlabs",
+                reconnection,
+            )),
+        };
+
+        // Start the connection task: the supervisor owns the outer reconnect loop; the `connect`
+        // closure dials the *featured* URL (every feature is in the URL) and hands back a
+        // transport whose `run()` is the original ElevenLabs event loop.
         let connection_handle = tokio::spawn(async move {
-            // Build WebSocket request with ElevenLabs authentication
-            let request = match tokio_tungstenite::tungstenite::http::Request::builder()
-                .method("GET")
-                .uri(&ws_url)
-                .header("Host", host)
-                .header("Upgrade", "websocket")
-                .header("Connection", "upgrade")
-                .header("Sec-WebSocket-Key", generate_key())
-                .header("Sec-WebSocket-Version", "13")
-                .header("xi-api-key", &api_key)
-                .body(())
-            {
-                Ok(request) => request,
-                Err(e) => {
-                    let stt_error = STTError::ConnectionFailed(format!(
-                        "Failed to create WebSocket request: {e}"
-                    ));
-                    error!("{}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
-                }
-            };
+            let exit = supervisor
+                .run(|| {
+                    let ws_url = ws_url.clone();
+                    let host = host.clone();
+                    let api_key = api_key.clone();
+                    let audio_rx = Arc::clone(&audio_rx);
+                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let connected_tx = Arc::clone(&connected_tx);
+                    let result_tx = result_tx.clone();
+                    let error_tx = error_tx.clone();
+                    async move {
+                        let request = tokio_tungstenite::tungstenite::http::Request::builder()
+                            .method("GET")
+                            .uri(&ws_url)
+                            .header("Host", host)
+                            .header("Upgrade", "websocket")
+                            .header("Connection", "upgrade")
+                            .header("Sec-WebSocket-Key", generate_key())
+                            .header("Sec-WebSocket-Version", "13")
+                            .header("xi-api-key", &api_key)
+                            .body(())
+                            .map_err(|e| {
+                                StreamError::new(format!("Failed to create WebSocket request: {e}"))
+                            })?;
 
-            // Connect to ElevenLabs
-            let (ws_stream, _response) = match connect_async(request).await {
-                Ok(result) => result,
-                Err(e) => {
-                    let stt_error =
-                        STTError::ConnectionFailed(format!("Failed to connect to ElevenLabs: {e}"));
-                    error!("{}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
-                }
-            };
-
-            info!("Connected to ElevenLabs STT WebSocket");
-
-            let (mut ws_sink, mut ws_stream) = ws_stream.split();
-
-            // Track session ID
-            let mut session_id: Option<String> = None;
-            let mut connected_tx = Some(connected_tx);
-
-            // Main event loop
-            loop {
-                tokio::select! {
-                    // Handle outgoing audio data
-                    Some(audio_data) = ws_rx.recv() => {
-                        let audio_base64 = BASE64_STANDARD.encode(&audio_data);
-                        let input_msg = InputAudioChunk::new(audio_base64);
-
-                        let json_msg = match serde_json::to_string(&input_msg) {
-                            Ok(json) => json,
-                            Err(e) => {
-                                let stt_error = STTError::AudioProcessingError(format!(
-                                    "Failed to serialize audio chunk: {e}"
-                                ));
-                                error!("{}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                continue;
-                            }
-                        };
-
-                        let message = Message::Text(json_msg.into());
-                        if let Err(e) = ws_sink.send(message).await {
-                            let stt_error = STTError::NetworkError(format!(
-                                "Failed to send audio to ElevenLabs: {e}"
-                            ));
-                            error!("{}", stt_error);
-                            let _ = error_tx.try_send(stt_error);
-                            break;
-                        }
-
-                        debug!("Sent {} bytes of audio to ElevenLabs", audio_data.len());
+                        let (ws_stream, _response) = connect_async(request).await.map_err(|e| {
+                            StreamError::new(format!("Failed to connect to ElevenLabs: {e}"))
+                        })?;
+                        info!("Connected to ElevenLabs STT WebSocket");
+                        let (ws_sink, ws_stream) = ws_stream.split();
+                        Ok(ElevenLabsTransport {
+                            ws_sink,
+                            ws_stream,
+                            audio_rx,
+                            shutdown_rx,
+                            result_tx,
+                            error_tx,
+                            connected_tx,
+                            session_id: None,
+                        })
                     }
-
-                    // Handle incoming messages with idle timeout
-                    message = timeout(WS_MESSAGE_TIMEOUT, ws_stream.next()) => {
-                        match message {
-                            Ok(Some(Ok(msg))) => {
-                                if let Err(e) = Self::handle_websocket_message(
-                                    msg,
-                                    &result_tx,
-                                    &mut session_id,
-                                ) {
-                                    error!("ElevenLabs streaming error: {}", e);
-                                    let _ = error_tx.try_send(e);
-                                    break;
-                                }
-
-                                // Signal connection ready after receiving session_started
-                                if session_id.is_some() && let Some(tx) = connected_tx.take() {
-                                    let _ = tx.send(());
-                                }
-                            }
-                            Ok(Some(Err(e))) => {
-                                let stt_error = STTError::NetworkError(format!(
-                                    "WebSocket error: {e}"
-                                ));
-                                error!("{}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
-                            }
-                            Ok(None) => {
-                                info!("ElevenLabs WebSocket stream ended");
-                                break;
-                            }
-                            Err(_elapsed) => {
-                                // Idle timeout - no message received for 60s
-                                let stt_error = STTError::NetworkError(
-                                    "WebSocket idle timeout - no message for 60 seconds".into()
-                                );
-                                error!("ElevenLabs STT idle timeout: {}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
-                            }
-                        }
-                    }
-
-                    // Handle shutdown signal
-                    _ = &mut shutdown_rx => {
-                        info!("Received shutdown signal for ElevenLabs STT");
-                        let _ = ws_sink.send(Message::Close(None)).await;
-                        break;
-                    }
-                }
-            }
-
-            info!("ElevenLabs STT WebSocket connection closed");
+                })
+                .await;
+            info!("ElevenLabs STT WebSocket connection closed (supervisor exit: {exit:?})");
         });
 
         self.connection_handle = Some(connection_handle);
@@ -720,6 +803,7 @@ impl BaseSTT for ElevenLabsSTT {
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
             session_id: None,
+            resilience: None,
         })
     }
 
@@ -862,6 +946,13 @@ impl BaseSTT for ElevenLabsSTT {
 
     fn get_provider_info(&self) -> &'static str {
         "ElevenLabs STT Real-Time WebSocket"
+    }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared process-global handles; `start_connection` feeds them to the generic
+        // ReconnectableStream supervisor so every ElevenLabs session trips the same breaker and
+        // shares the one reconnect cap (W-D1/W-D2).
+        self.resilience = Some(resilience);
     }
 }
 

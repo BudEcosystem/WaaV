@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 /// Canonical, provider-agnostic advanced STT features. Every field is `Option`, so `None`
 /// means "don't request / use the provider default" and adding fields stays backward compatible.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct SttFeatures {
     /// Emit interim (non-final) hypotheses as they are recognized.
     pub interim_results: Option<bool>,
@@ -63,9 +64,42 @@ pub struct SttFeatures {
 /// Open, typed passthrough for any provider-specific parameter not modeled above — the escape
 /// hatch that lets a brand-new provider knob be set without a gateway release. Deserialized
 /// per-provider so unknown keys fail loudly rather than silently neutralizing a feature.
+///
+/// In the OpenAPI schema this is represented as a free-form JSON object (`type: object` with
+/// `additionalProperties: true`) so generated SDK clients model it as an open string→value map.
+/// The `ToSchema`/`PartialSchema` impls are hand-written (below, feature-gated) because the
+/// derive does not compose cleanly with `#[serde(transparent)]` over a `serde_json::Map`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ProviderExtras(pub serde_json::Map<String, serde_json::Value>);
+
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for ProviderExtras {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{ObjectBuilder, Type};
+        // A free-form object: `type: object`, `additionalProperties: true`.
+        utoipa::openapi::RefOr::T(
+            ObjectBuilder::new()
+                .schema_type(Type::Object)
+                .description(Some(
+                    "Open provider-specific passthrough (string→JSON value map). \
+                     Keys not modeled by the typed feature vocabulary are forwarded verbatim.",
+                ))
+                .additional_properties(Some(utoipa::openapi::schema::AdditionalProperties::FreeForm(
+                    true,
+                )))
+                .build()
+                .into(),
+        )
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for ProviderExtras {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("ProviderExtras")
+    }
+}
 
 impl ProviderExtras {
     /// Merge these extras over a provider's own (serializable) config, last-write-wins.

@@ -93,10 +93,11 @@ pub use websocket::{
     ReconnectionState,
 };
 
-// Re-export resilience primitives (circuit breaker + reconnect governor) — W-D2.
+// Re-export resilience primitives (circuit breaker + reconnect governor + the shared
+// process-global registry) — W-D2.
 pub use resilience::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerSnapshot, CircuitState, ReconnectGovernor,
-    ReconnectPermit,
+    ReconnectPermit, ResilienceHandles, ResilienceRegistry,
 };
 
 // Re-export the generic reconnectable stream supervisor — W-D1.

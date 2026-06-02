@@ -207,6 +207,12 @@ pub struct AssemblyAISTT {
 
     /// Connection state flag (shared with connection task)
     is_connected: Arc<AtomicBool>,
+
+    /// Shared, process-global resilience handles (W-D2): the single reconnect governor + this
+    /// provider's shared circuit breaker, injected by the VoiceManager from CoreState. `None`
+    /// when constructed directly (unit tests) — then the connect path falls back to per-session
+    /// handles so storm control degrades gracefully rather than panicking.
+    resilience: Option<crate::core::resilience::ResilienceHandles>,
 }
 
 impl Default for AssemblyAISTT {
@@ -227,6 +233,7 @@ impl Default for AssemblyAISTT {
             error_callback: Arc::new(Mutex::new(None)),
             session_id: Arc::new(RwLock::new(None)),
             is_connected: Arc::new(AtomicBool::new(false)),
+            resilience: None,
         }
     }
 }
@@ -442,12 +449,20 @@ impl AssemblyAISTT {
         let session_id = self.session_id.clone();
         let is_connected = self.is_connected.clone();
 
-        // Per-connection reconnection policy. (A shared governor + per-provider circuit
-        // breaker via CoreState is the production wiring — tracked as follow-up.)
+        // Per-connection reconnection policy (backoff/jitter is inherently per-connection). The
+        // STORM-CONTROL governor and the PROVIDER circuit breaker are the single process-global
+        // handles injected from CoreState (W-D2) so every AssemblyAI session trips the same
+        // breaker and shares the one process-wide reconnect cap. When no handles were injected (a
+        // unit test constructing the provider directly), fall back to per-session ones.
         let reconnection = ReconnectionConfig::aggressive();
         let reset_after_ms = reconnection.reset_after_ms;
-        let governor = ReconnectGovernor::default();
-        let breaker = Arc::new(CircuitBreaker::with_defaults());
+        let (governor, breaker) = match &self.resilience {
+            Some(r) => ((*r.governor).clone(), Arc::clone(&r.breaker)),
+            None => (
+                ReconnectGovernor::default(),
+                Arc::new(CircuitBreaker::with_defaults()),
+            ),
+        };
 
         // Start the connection task
         let connection_handle = tokio::spawn(async move {
@@ -460,6 +475,7 @@ impl AssemblyAISTT {
             // session restore) and runs the inner loop until it yields an outcome.
             'reconnect: loop {
                 if !breaker.allow_request() {
+                    crate::core::metrics::bridge::record_reconnect("assemblyai", "circuit_open");
                     if !manager.should_retry() {
                         error!("AssemblyAI circuit open and reconnection budget exhausted");
                         break 'reconnect;
@@ -504,6 +520,7 @@ impl AssemblyAISTT {
                         ));
                         error!("{}", stt_error);
                         breaker.record_failure();
+                        crate::core::metrics::bridge::record_reconnect("assemblyai", "failure");
                         manager.record_attempt(false);
                         drop(_permit);
                         if connected_tx.is_some() {
@@ -526,6 +543,7 @@ impl AssemblyAISTT {
                 // zeroed here: a connect that immediately drops must count against
                 // `max_attempts`. The counter resets only after a *stable* run (below).
                 breaker.record_success();
+                crate::core::metrics::bridge::record_reconnect("assemblyai", "success");
                 drop(_permit);
                 let connected_since = std::time::Instant::now();
 
@@ -662,6 +680,7 @@ impl AssemblyAISTT {
                     AssemblyAiInnerOutcome::Reconnect => {
                         breaker.record_failure();
                         if !manager.should_retry() {
+                            crate::core::metrics::bridge::record_reconnect("assemblyai", "exhausted");
                             warn!("AssemblyAI reconnection budget exhausted; closing session");
                             break 'reconnect;
                         }
@@ -784,6 +803,7 @@ impl BaseSTT for AssemblyAISTT {
             error_callback: Arc::new(Mutex::new(None)),
             session_id: Arc::new(RwLock::new(None)),
             is_connected: Arc::new(AtomicBool::new(false)),
+            resilience: None,
         })
     }
 
@@ -931,6 +951,12 @@ impl BaseSTT for AssemblyAISTT {
 
     fn get_provider_info(&self) -> &'static str {
         "AssemblyAI Streaming STT v3"
+    }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared process-global handles; the next `start_connection` uses them so every
+        // AssemblyAI session trips the same breaker and shares the one reconnect cap (W-D2).
+        self.resilience = Some(resilience);
     }
 }
 

@@ -131,7 +131,7 @@ impl VoiceManager {
             None => create_tts_provider(&config.tts_config.provider, config.tts_config.clone())
                 .map_err(VoiceManagerError::TTSError)?,
         };
-        let stt = match &config.standard_stt {
+        let mut stt = match &config.standard_stt {
             Some(std_stt) => {
                 crate::core::stt::standard::create_stt_standard(&std_stt.base.provider, std_stt.clone())
                     .map_err(VoiceManagerError::STTError)?
@@ -139,6 +139,14 @@ impl VoiceManager {
             None => create_stt_provider(&config.stt_config.provider, config.stt_config.clone())
                 .map_err(VoiceManagerError::STTError)?,
         };
+        // W-D2 cross-session wiring: inject the shared process-global resilience handles (the
+        // single reconnect governor + this provider's shared circuit breaker) so all sessions of
+        // the provider trip the same breaker and share the process-wide reconnect cap. A no-op
+        // for providers that don't run a supervised reconnect loop, and skipped entirely when no
+        // handles were supplied (unit tests that don't boot CoreState).
+        if let Some(resilience) = &config.resilience {
+            stt.set_resilience(resilience.clone());
+        }
 
         // Pre-allocate string buffers with reasonable capacity
         const TEXT_BUFFER_CAPACITY: usize = 1024;

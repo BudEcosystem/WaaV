@@ -316,6 +316,7 @@ pub async fn handle_config_message(
     // Send ready message with optional LiveKit room information
     let _ = message_tx
         .send(MessageRoute::Outgoing(OutgoingMessage::Ready {
+            protocol_version: crate::handlers::ws::messages::PROTOCOL_VERSION.to_string(),
             stream_id: stream_id.clone(),
             livekit_room_name: livekit_room_name.clone(),
             livekit_url: Some(app_state.config.livekit_public_url.clone()),
@@ -522,8 +523,14 @@ async fn initialize_voice_manager(
     let tts_config = standard_tts.base.clone();
 
     // Create voice manager configuration with default speech final settings, routed through the
-    // standardized keystone path.
-    let voice_config = VoiceManagerConfig::from_standard(standard_stt, standard_tts);
+    // standardized keystone path, and attach the SHARED process-global resilience handles
+    // (W-D2): the single reconnect governor + this STT provider's shared circuit breaker, both
+    // owned once by CoreState. This is what makes storm control + provider-level tripping work
+    // cross-session — every session of a provider now trips the same breaker and draws from the
+    // one process-wide reconnect cap.
+    let stt_provider = standard_stt.base.provider.clone();
+    let voice_config = VoiceManagerConfig::from_standard(standard_stt, standard_tts)
+        .with_resilience(app_state.core_state.resilience().handles_for(&stt_provider));
 
     let turn_detector = app_state.core_state.get_turn_detector();
 

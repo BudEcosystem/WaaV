@@ -16,8 +16,10 @@
 
 pub mod circuit_breaker;
 pub mod reconnect_governor;
+pub mod registry;
 
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerSnapshot, CircuitState,
 };
 pub use reconnect_governor::{ReconnectGovernor, ReconnectPermit};
+pub use registry::{ResilienceHandles, ResilienceRegistry};

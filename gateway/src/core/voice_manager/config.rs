@@ -1,6 +1,7 @@
 //! Configuration types for the VoiceManager
 
 use crate::core::{
+    resilience::ResilienceHandles,
     stt::{STTConfig, standard::StandardSTTConfig},
     tts::{TTSConfig, standard::StandardTTSConfig},
 };
@@ -56,6 +57,14 @@ pub struct VoiceManagerConfig {
     pub standard_tts: Option<StandardTTSConfig>,
     /// Configuration for speech final timing control
     pub speech_final_config: SpeechFinalConfig,
+    /// Shared, process-global resilience handles for the STT provider (W-D2): the single
+    /// reconnect governor + this provider's shared circuit breaker, from
+    /// [`crate::core::state::CoreState::resilience`]. When present,
+    /// [`VoiceManager::new`](crate::core::voice_manager::VoiceManager::new) injects them into the
+    /// constructed STT provider so all sessions of a provider trip the same breaker and share the
+    /// process-wide reconnect cap. When `None`, the provider falls back to its own per-session
+    /// governor/breaker (legacy behaviour; used by unit tests that don't boot `CoreState`).
+    pub resilience: Option<ResilienceHandles>,
     /// Configuration for audio-based smart turn detection (optional).
     /// When enabled, processes audio through VAD and/or ML-based turn detection
     /// to determine when the user has finished speaking.
@@ -75,6 +84,7 @@ impl VoiceManagerConfig {
             standard_stt: None,
             standard_tts: None,
             speech_final_config: SpeechFinalConfig::default(),
+            resilience: None,
             #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
             smart_turn_config: None,
         }
@@ -96,9 +106,19 @@ impl VoiceManagerConfig {
             standard_stt: Some(standard_stt),
             standard_tts: Some(standard_tts),
             speech_final_config: SpeechFinalConfig::default(),
+            resilience: None,
             #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
             smart_turn_config: None,
         }
+    }
+
+    /// Attach the shared, process-global resilience handles (W-D2) for the STT provider.
+    ///
+    /// Call this on the config built for a live session so the constructed STT provider shares
+    /// the gateway-wide reconnect governor and this provider's circuit breaker.
+    pub fn with_resilience(mut self, resilience: ResilienceHandles) -> Self {
+        self.resilience = Some(resilience);
+        self
     }
 
     /// Create a new VoiceManagerConfig with custom speech final configuration
@@ -113,6 +133,7 @@ impl VoiceManagerConfig {
             standard_stt: None,
             standard_tts: None,
             speech_final_config,
+            resilience: None,
             #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
             smart_turn_config: None,
         }
@@ -135,6 +156,7 @@ impl VoiceManagerConfig {
             standard_stt: None,
             standard_tts: None,
             speech_final_config: SpeechFinalConfig::default(),
+            resilience: None,
             smart_turn_config: Some(smart_turn_config),
         }
     }
@@ -153,6 +175,7 @@ impl VoiceManagerConfig {
             standard_stt: None,
             standard_tts: None,
             speech_final_config,
+            resilience: None,
             smart_turn_config,
         }
     }

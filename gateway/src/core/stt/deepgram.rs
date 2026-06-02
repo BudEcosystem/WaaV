@@ -289,6 +289,11 @@ pub struct DeepgramSTT {
     result_callback: Arc<Mutex<Option<AsyncSTTCallback>>>,
     /// Error callback storage for streaming errors
     error_callback: Arc<Mutex<Option<AsyncErrorCallback>>>,
+    /// Shared, process-global resilience handles (W-D2): the single reconnect governor + this
+    /// provider's shared circuit breaker, injected by the VoiceManager from CoreState. When
+    /// `None` (e.g. constructed directly in a unit test), the connect path falls back to its own
+    /// per-session governor/breaker so storm control degrades gracefully rather than panicking.
+    resilience: Option<crate::core::resilience::ResilienceHandles>,
 }
 
 /// Constants for Deepgram regional endpoints
@@ -318,7 +323,17 @@ impl DeepgramSTT {
             error_forward_handle: None,
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
+            resilience: None,
         }
+    }
+
+    /// The shared circuit breaker this session will use on its connect path, if the
+    /// process-global resilience handles have been injected (W-D2). Two `DeepgramSTT` built from
+    /// the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`, so a trip
+    /// in one is observed by the other. Returns `None` before `set_resilience` (per-session
+    /// fallback).
+    pub fn resilience_breaker(&self) -> Option<&Arc<CircuitBreaker>> {
+        self.resilience.as_ref().map(|r| &r.breaker)
     }
 
     /// W1 keystone — construct directly from the standardized config so advanced features
@@ -575,14 +590,21 @@ impl DeepgramSTT {
         } else {
             "api.deepgram.com".to_string()
         };
-        // Per-connection reconnection policy. (A shared governor + per-provider circuit
-        // breaker via CoreState is the production wiring — tracked as follow-up; here each
-        // session governs its own reconnects, which already prevents the per-session
-        // break-on-first-error data loss.)
+        // Per-connection reconnection policy (backoff/jitter is inherently per-connection). The
+        // STORM-CONTROL governor and the PROVIDER circuit breaker, however, are the single
+        // process-global handles injected from CoreState (W-D2) so every Deepgram session trips
+        // the same breaker and shares the one process-wide reconnect cap. When no handles were
+        // injected (a unit test constructing the provider directly), fall back to per-session
+        // ones so behaviour degrades gracefully instead of panicking.
         let reconnection = ReconnectionConfig::aggressive();
         let reset_after_ms = reconnection.reset_after_ms;
-        let governor = ReconnectGovernor::default();
-        let breaker = std::sync::Arc::new(CircuitBreaker::with_defaults());
+        let (governor, breaker) = match &self.resilience {
+            Some(r) => ((*r.governor).clone(), std::sync::Arc::clone(&r.breaker)),
+            None => (
+                ReconnectGovernor::default(),
+                std::sync::Arc::new(CircuitBreaker::with_defaults()),
+            ),
+        };
 
         // Start the connection task
         let connection_handle = tokio::spawn(async move {
@@ -595,6 +617,7 @@ impl DeepgramSTT {
             'reconnect: loop {
                 // Storm control + breaker gate before dialing.
                 if !breaker.allow_request() {
+                    crate::core::metrics::bridge::record_reconnect("deepgram", "circuit_open");
                     if !manager.should_retry() {
                         error!("Deepgram circuit open and reconnection budget exhausted");
                         break 'reconnect;
@@ -639,6 +662,7 @@ impl DeepgramSTT {
                         ));
                         error!("{}", stt_error);
                         breaker.record_failure();
+                        crate::core::metrics::bridge::record_reconnect("deepgram", "failure");
                         manager.record_attempt(false);
                         drop(_permit);
                         if connected_tx.is_some() {
@@ -664,6 +688,7 @@ impl DeepgramSTT {
                 // `max_attempts` (a fast connect→drop flap would otherwise retry forever). The
                 // counter is reset only after the connection proves *stable* (below).
                 breaker.record_success();
+                crate::core::metrics::bridge::record_reconnect("deepgram", "success");
                 drop(_permit);
                 let connected_since = Instant::now();
 
@@ -854,6 +879,7 @@ impl DeepgramSTT {
                     DeepgramInnerOutcome::Reconnect => {
                         breaker.record_failure();
                         if !manager.should_retry() {
+                            crate::core::metrics::bridge::record_reconnect("deepgram", "exhausted");
                             warn!("Deepgram reconnection budget exhausted; closing session");
                             break 'reconnect;
                         }
@@ -950,6 +976,7 @@ impl Default for DeepgramSTT {
             error_forward_handle: None,
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
+            resilience: None,
         }
     }
 }
@@ -1118,6 +1145,12 @@ impl BaseSTT for DeepgramSTT {
 
     fn get_provider_info(&self) -> &'static str {
         "Deepgram STT WebSocket"
+    }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared process-global handles; the next `start_connection` will use them so
+        // every Deepgram session trips the same breaker and shares the one reconnect cap (W-D2).
+        self.resilience = Some(resilience);
     }
 }
 
@@ -1533,5 +1566,73 @@ mod tests {
         assert!(config.vad_events);
         assert_eq!(config.endpointing, Some(200));
         assert_eq!(config.utterance_end_ms, Some(500));
+    }
+
+    // --- W-D2 cross-session wiring: shared breaker + process-global governor ----------------
+
+    /// Build a `DeepgramSTT` the same way the VoiceManager does for a live session: construct
+    /// from a standardized config, then inject the shared resilience handles from the registry.
+    fn session_from_registry(
+        reg: &crate::core::resilience::ResilienceRegistry,
+    ) -> DeepgramSTT {
+        use crate::core::stt::base::BaseSTT;
+        let std = crate::core::stt::standard::StandardSTTConfig::from_base(STTConfig {
+            provider: "deepgram".to_string(),
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        });
+        let mut stt = DeepgramSTT::new_standard(&std).expect("build deepgram session");
+        stt.set_resilience(reg.handles_for("deepgram"));
+        stt
+    }
+
+    #[tokio::test]
+    async fn two_deepgram_sessions_share_one_breaker_so_a_trip_is_cross_session_visible() {
+        // RED before wiring: each session created its OWN breaker, so a trip in session A was
+        // invisible to session B. With the shared registry breaker injected, the trip is visible.
+        let reg = crate::core::resilience::ResilienceRegistry::new(8);
+        let session_a = session_from_registry(&reg);
+        let session_b = session_from_registry(&reg);
+
+        let breaker_a = session_a.resilience_breaker().expect("A has shared breaker");
+        let breaker_b = session_b.resilience_breaker().expect("B has shared breaker");
+        assert!(
+            Arc::ptr_eq(breaker_a, breaker_b),
+            "both Deepgram sessions must share the one provider breaker"
+        );
+
+        // Session A trips its breaker (a burst of upstream failures).
+        for _ in 0..10 {
+            breaker_a.record_failure();
+        }
+        assert_eq!(breaker_a.state(), crate::core::resilience::CircuitState::Open);
+        // Session B — a different session — sees the open breaker and is denied a reconnect.
+        assert!(
+            !breaker_b.allow_request(),
+            "a trip in session A must be visible to session B (provider-level tripping)"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_sessions_share_the_process_global_governor_cap() {
+        // The governor cap is process-global: both sessions draw from the SAME governor, so two
+        // sessions' reconnects share one cap (storm control across sessions).
+        let reg = crate::core::resilience::ResilienceRegistry::new(3);
+        let session_a = session_from_registry(&reg);
+        let session_b = session_from_registry(&reg);
+
+        let gov_a = &session_a.resilience.as_ref().unwrap().governor;
+        let gov_b = &session_b.resilience.as_ref().unwrap().governor;
+        assert!(
+            Arc::ptr_eq(gov_a, gov_b),
+            "both sessions must share one process-global governor"
+        );
+        assert_eq!(gov_a.max_concurrent(), 3, "the cap is the registry's, not a per-session default");
+
+        // A permit taken via session A's governor is visible as in-flight via session B's
+        // governor handle — proving the cap is shared, not per-session.
+        let _permit = gov_a.acquire().await;
+        assert_eq!(gov_b.in_flight(), 1, "in-flight is shared across sessions");
+        assert_eq!(gov_b.available_permits(), 2);
     }
 }

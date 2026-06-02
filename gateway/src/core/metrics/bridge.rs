@@ -42,6 +42,10 @@ pub const TTFB_MS: &str = "waav_provider_ttfb_ms";
 pub const ERRORS_TOTAL: &str = "waav_provider_errors_total";
 /// Circuit-breaker state gauge (0=closed, 1=half_open, 2=open), labelled `provider`.
 pub const CIRCUIT_BREAKER_STATE: &str = "waav_circuit_breaker_state";
+/// Total streaming reconnect attempts, labelled `provider`, `outcome`
+/// (`success`=reconnected, `failure`=dial/restore failed, `exhausted`=budget spent,
+/// `circuit_open`=breaker rejected the attempt). Makes the reconnect path observable (W-C1).
+pub const RECONNECTS_TOTAL: &str = "waav_reconnects_total";
 
 /// Histogram buckets (milliseconds) for TTFB. Chosen to straddle realtime voice TTFBs
 /// (a good streaming STT/TTS first byte is tens-to-hundreds of ms; the long tail captures
@@ -111,6 +115,11 @@ fn prime_series() {
     .increment(0);
     // Gauge at the closed-state code (0); a neutral placeholder series.
     gauge!(CIRCUIT_BREAKER_STATE, "provider" => "none").set(0.0);
+    counter!(
+        RECONNECTS_TOTAL,
+        "provider" => "none", "outcome" => "none",
+    )
+    .increment(0);
 }
 
 /// Register human-readable descriptions + units so the exposition carries `# HELP`/`# TYPE`.
@@ -131,6 +140,11 @@ fn describe_series() {
     metrics::describe_gauge!(
         CIRCUIT_BREAKER_STATE,
         "Per-provider circuit-breaker state (0=closed, 1=half_open, 2=open)"
+    );
+    metrics::describe_counter!(
+        RECONNECTS_TOTAL,
+        "Total streaming reconnect attempts by provider and outcome \
+         (success/failure/exhausted/circuit_open)"
     );
 }
 
@@ -177,6 +191,18 @@ pub fn set_circuit_breaker_state(provider: &str, state_code: u8) {
     gauge!(CIRCUIT_BREAKER_STATE, "provider" => provider.to_string()).set(state_code as f64);
 }
 
+/// Record a reconnect attempt outcome on `waav_reconnects_total`. `outcome` is one of
+/// `success` / `failure` / `exhausted` / `circuit_open`. Emitted from the streaming reconnect
+/// path so reconnects are observable (W-C1).
+pub fn record_reconnect(provider: &str, outcome: &str) {
+    counter!(
+        RECONNECTS_TOTAL,
+        "provider" => provider.to_string(),
+        "outcome" => outcome.to_string(),
+    )
+    .increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +217,7 @@ mod tests {
         observe_ttfb_ms("unit-provider", "tts", 42.0);
         record_error("unit-provider", "tts", "timeout");
         set_circuit_breaker_state("unit-provider", 2);
+        record_reconnect("unit-provider", "success");
 
         let text = render();
         assert!(text.contains(REQUESTS_TOTAL), "requests series present");
@@ -200,6 +227,7 @@ mod tests {
             text.contains(CIRCUIT_BREAKER_STATE),
             "circuit-breaker gauge present"
         );
+        assert!(text.contains(RECONNECTS_TOTAL), "reconnects counter present: {text}");
         assert!(
             text.contains("unit-provider"),
             "provider label present in exposition"

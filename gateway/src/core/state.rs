@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 use crate::config::ServerConfig;
 use crate::core::cache::store::{CacheConfig, CacheStore};
 use crate::core::metrics::MetricsRegistry;
+use crate::core::resilience::ResilienceRegistry;
 use crate::core::tts::get_tts_provider_urls;
 #[cfg(not(feature = "turn-detect"))]
 use crate::core::turn_detect::TurnDetector;
@@ -38,6 +39,12 @@ pub struct CoreState {
     /// Per-provider performance metrics shared across handlers; also installs the global
     /// Prometheus recorder so `GET /metrics` renders (W-C1 observability).
     pub metrics: Arc<MetricsRegistry>,
+    /// Process-global resilience handles (W-D2): the SINGLE reconnect governor (storm control
+    /// across all sessions) and the per-provider circuit-breaker map (a trip in one session of
+    /// a provider is visible to every other session of that provider). Constructed once here at
+    /// startup and threaded into each streaming provider's connect path — replacing the prior
+    /// per-session `new()` that defeated both behaviours.
+    pub resilience: Arc<ResilienceRegistry>,
 }
 
 impl CoreState {
@@ -119,18 +126,33 @@ impl CoreState {
             None
         };
 
+        // Storm control: the SINGLE process-global reconnect governor caps concurrent in-flight
+        // reconnects across every session/provider. The cap is configurable via env for
+        // operability (a larger fleet may want a wider cap); default 16.
+        let reconnect_cap = std::env::var("WAAV_MAX_CONCURRENT_RECONNECTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(16);
+
         Arc::new(Self {
             tts_req_managers: Arc::new(RwLock::new(tts_req_managers)),
             cache,
             turn_detector,
             sip_hooks_state,
             metrics: Arc::new(MetricsRegistry::new()),
+            resilience: Arc::new(ResilienceRegistry::new(reconnect_cap)),
         })
     }
 
     /// Get the shared per-provider metrics registry.
     pub fn metrics(&self) -> &Arc<MetricsRegistry> {
         &self.metrics
+    }
+
+    /// Get the process-global resilience registry (shared governor + per-provider breakers).
+    pub fn resilience(&self) -> &Arc<ResilienceRegistry> {
+        &self.resilience
     }
 
     /// Get a TTS request manager for a specific provider

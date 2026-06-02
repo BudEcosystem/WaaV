@@ -1649,3 +1649,52 @@ mod advanced_features_tests {
         assert!(msg.has_sensitive_data());
     }
 }
+
+// =============================================================================
+// W-D1/W-D2: generic ReconnectableStream adoption + shared resilience wiring
+// =============================================================================
+
+mod resilience_wiring_tests {
+    use super::*;
+    use crate::core::resilience::{CircuitState, ResilienceRegistry};
+    use crate::core::stt::standard::StandardSTTConfig;
+
+    /// Build an ElevenLabs session the way the VoiceManager does for a live session: construct
+    /// from a standardized config, then inject the shared resilience handles from the registry.
+    fn session_from_registry(reg: &ResilienceRegistry) -> ElevenLabsSTT {
+        let std = StandardSTTConfig::from_base(STTConfig {
+            provider: "elevenlabs".to_string(),
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        });
+        let mut stt = ElevenLabsSTT::new_standard(&std).expect("build elevenlabs session");
+        stt.set_resilience(reg.handles_for("elevenlabs"));
+        stt
+    }
+
+    #[tokio::test]
+    async fn two_elevenlabs_sessions_share_one_breaker_via_the_generic_supervisor() {
+        // The generic ReconnectableStream now drives ElevenLabs in production; this proves the
+        // shared (CoreState-owned) breaker is what it uses — a trip in one session is visible to
+        // the other (provider-level tripping across sessions).
+        let reg = ResilienceRegistry::new(8);
+        let a = session_from_registry(&reg);
+        let b = session_from_registry(&reg);
+
+        let breaker_a = a.resilience_breaker().expect("A has shared breaker");
+        let breaker_b = b.resilience_breaker().expect("B has shared breaker");
+        assert!(
+            Arc::ptr_eq(breaker_a, breaker_b),
+            "both ElevenLabs sessions must share the one provider breaker"
+        );
+
+        for _ in 0..10 {
+            breaker_a.record_failure();
+        }
+        assert_eq!(breaker_a.state(), CircuitState::Open);
+        assert!(
+            !breaker_b.allow_request(),
+            "a trip in session A must be visible to session B (shared provider breaker)"
+        );
+    }
+}
