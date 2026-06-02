@@ -1,6 +1,8 @@
 pub mod audio;
 pub mod cache;
+pub mod conversation;
 pub mod emotion;
+pub mod llm;
 pub mod metrics;
 pub mod observability;
 pub mod pipeline;
@@ -42,6 +44,18 @@ pub use realtime::{
 pub use voice_manager::{
     STTCallback, TTSAudioCallback, TTSErrorCallback, VoiceManager, VoiceManagerConfig,
     VoiceManagerError, VoiceManagerResult,
+};
+
+// Re-export the feature-flag-free LLM client (shared by the conversation loop
+// and the DAG llm node).
+pub use llm::{
+    ChatMessage, LlmClient, LlmClientConfig, LlmError, LlmResponse, LlmResult, MessageRole,
+    ResponseFormat, ToolDefinition,
+};
+
+// Re-export the built-in conversation orchestrator (W-O2).
+pub use conversation::{
+    ConversationConfig, ConversationOrchestrator, ConversationOrchestratorError,
 };
 
 // Re-export CoreState for external use

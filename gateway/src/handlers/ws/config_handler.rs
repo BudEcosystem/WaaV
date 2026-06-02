@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     core::{
+        conversation::ConversationOrchestrator,
         stt::STTResult,
         tts::AudioData,
         voice_manager::{VoiceManager, VoiceManagerConfig},
@@ -23,14 +24,18 @@ use crate::{
 
 #[cfg(feature = "dag-routing")]
 use crate::dag::{
-    compiler::DAGCompiler, context::DAGContext, definition::DAGDefinition, executor::DAGExecutor,
+    compiler::DAGCompiler,
+    context::{DAGContext, DagOutput},
+    definition::DAGDefinition,
+    executor::DAGExecutor,
     global_templates,
+    nodes::STTResultData,
 };
 
 use super::{
     config::{
-        DAGWebSocketConfig, LiveKitWebSocketConfig, STTWebSocketConfig, TTSWebSocketConfig,
-        compute_tts_config_hash,
+        ConversationWebSocketConfig, DAGWebSocketConfig, LiveKitWebSocketConfig,
+        STTWebSocketConfig, TTSWebSocketConfig, compute_tts_config_hash,
     },
     messages::{MessageRoute, OutgoingMessage, ParticipantDisconnectedInfo, UnifiedMessage},
     state::ConnectionState,
@@ -87,6 +92,7 @@ pub async fn handle_config_message(
     tts_ws_config: Option<TTSWebSocketConfig>,
     livekit_ws_config: Option<LiveKitWebSocketConfig>,
     dag_ws_config: Option<DAGWebSocketConfig>,
+    conversation_ws_config: Option<ConversationWebSocketConfig>,
     state: &Arc<RwLock<ConnectionState>>,
     message_tx: &mpsc::Sender<MessageRoute>,
     app_state: &Arc<AppState>,
@@ -214,7 +220,24 @@ pub async fn handle_config_message(
     // Initialize DAG routing if configured
     #[cfg(feature = "dag-routing")]
     let dag_enabled = if let Some(dag_config) = dag_ws_config {
-        match initialize_dag_routing(&dag_config, &stream_id, state, message_tx).await {
+        // The DAG data-plane reuses the same LiveKit delivery path as the simple path.
+        let dag_operation_queue = if livekit_client.is_some() {
+            let state_guard = state.read().await;
+            state_guard.livekit_operation_queue.clone()
+        } else {
+            None
+        };
+        match initialize_dag_routing(
+            &dag_config,
+            &stream_id,
+            state,
+            voice_manager.as_ref(),
+            livekit_client.as_ref(),
+            dag_operation_queue.as_ref(),
+            message_tx,
+        )
+        .await
+        {
             Ok(true) => {
                 info!("DAG routing initialized for stream {}", stream_id);
                 true
@@ -251,6 +274,45 @@ pub async fn handle_config_message(
         false
     };
 
+    // Initialize the built-in conversation loop if configured (plan W-O2).
+    //
+    // Mutually exclusive with the DAG: the DAG owns the post-STT pipeline when
+    // enabled, so we only wire the conversation orchestrator when DAG routing is
+    // not active. When neither is set, the gateway keeps raw STT/TTS behavior.
+    let conversation_enabled = if dag_enabled {
+        if conversation_ws_config.is_some() {
+            warn!(
+                "Both dag_config and conversation_config provided; DAG takes precedence, \
+                 conversation loop not started"
+            );
+        }
+        false
+    } else if let (Some(conv_config), Some(vm)) =
+        (conversation_ws_config.as_ref(), voice_manager.as_ref())
+    {
+        match initialize_conversation_loop(conv_config, &stream_id, vm, message_tx).await {
+            Ok(true) => {
+                info!("Conversation loop initialized for stream {}", stream_id);
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                error!("Conversation loop initialization failed: {}", e);
+                let _ = message_tx
+                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
+                        message: format!("Conversation loop initialization failed: {}", e),
+                    }))
+                    .await;
+                false
+            }
+        }
+    } else {
+        if conversation_ws_config.is_some() && voice_manager.is_none() {
+            warn!("conversation_config provided but audio disabled; conversation loop not started");
+        }
+        false
+    };
+
     // Send ready message with optional LiveKit room information
     let _ = message_tx
         .send(MessageRoute::Outgoing(OutgoingMessage::Ready {
@@ -266,11 +328,71 @@ pub async fn handle_config_message(
         stream_id = %stream_id,
         audio_enabled = audio_enabled,
         dag_enabled = dag_enabled,
+        conversation_enabled = conversation_enabled,
         livekit = livekit_room_name.is_some(),
         "Connection configured and ready"
     );
 
     true
+}
+
+/// Initialize the built-in conversation loop for a session (plan W-O2).
+///
+/// Constructs a [`ConversationOrchestrator`] (validating the client-supplied LLM
+/// `base_url` for SSRF) and registers it as the VoiceManager's STT-result
+/// callback. The callback still forwards every transcript to the client (so
+/// `stt_result` egress is preserved, matching the simple path), then drives the
+/// LLM→TTS loop on each finalized turn. Barge-in and history are handled inside
+/// the orchestrator. Returns `Ok(true)` when the loop is active.
+async fn initialize_conversation_loop(
+    conv_config: &ConversationWebSocketConfig,
+    stream_id: &str,
+    voice_manager: &Arc<VoiceManager>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) -> Result<bool, String> {
+    let orchestrator = ConversationOrchestrator::new(
+        stream_id.to_string(),
+        conv_config.to_conversation_config(),
+        voice_manager.clone(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let orchestrator = Arc::new(orchestrator);
+
+    // Store on the connection so teardown can cancel any in-flight turn.
+    // (Reuses the STT-callback slot in the VoiceManager; the orchestrator both
+    // forwards the transcript and runs the loop, so there is no double delivery.)
+    let message_tx_clone = message_tx.clone();
+    let orch = orchestrator.clone();
+    let register_result = voice_manager
+        .on_stt_result(move |stt: STTResult| {
+            let message_tx = message_tx_clone.clone();
+            let orch = orch.clone();
+            Box::pin(async move {
+                // Transcript egress (interim + final), matching the simple path:
+                // the orchestrator REPLACES the default STT callback, so it must
+                // forward the transcript to the client itself.
+                let _ = message_tx
+                    .send(MessageRoute::Outgoing(OutgoingMessage::STTResult {
+                        transcript: stt.transcript.clone(),
+                        is_final: stt.is_final,
+                        is_speech_final: stt.is_speech_final,
+                        confidence: stt.confidence,
+                    }))
+                    .await;
+
+                // Drive the conversation loop (barge-in on any speech; LLM→TTS on
+                // a finalized turn).
+                orch.on_stt_result(&stt).await;
+            })
+        })
+        .await;
+
+    if let Err(e) = register_result {
+        return Err(format!("failed to register conversation STT callback: {e}"));
+    }
+
+    Ok(true)
 }
 
 /// Validate audio configurations are present
@@ -663,6 +785,92 @@ async fn register_early_tts_callback(
     }
 }
 
+/// Deliver a single TTS audio buffer to the client: LiveKit when connected
+/// (preferring the non-blocking operation queue), else the WS binary sink.
+///
+/// Extracted from `register_final_tts_callback` so the DAG data-plane drain task
+/// (W-O1) reuses exactly the same delivery path as the simple STT→TTS path —
+/// `DagOutput::Audio` produced by a DAG `audio_output` node lands here.
+async fn deliver_tts_audio(
+    audio: Vec<u8>,
+    livekit_client: Option<&Arc<RwLock<LiveKitClient>>>,
+    operation_queue: Option<&crate::livekit::OperationQueue>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) {
+    let mut sent_to_livekit = false;
+
+    // Try to send to LiveKit using the operation queue if available
+    if let Some(queue) = operation_queue {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if queue
+            .queue(crate::livekit::LiveKitOperation::SendAudio {
+                audio_data: audio.clone(),
+                response_tx: tx,
+            })
+            .await
+            .is_ok()
+        {
+            match rx.await {
+                Ok(Ok(())) => {
+                    debug!(
+                        "TTS audio successfully sent to LiveKit via queue: {} bytes",
+                        audio.len()
+                    );
+                    sent_to_livekit = true;
+                }
+                Ok(Err(e)) => {
+                    error!("Failed to send TTS audio to LiveKit: {:?}", e);
+                }
+                Err(_) => {
+                    error!("Operation worker disconnected while sending TTS audio");
+                }
+            }
+        }
+    } else if let Some(livekit_client_arc) = livekit_client {
+        // Fallback to lock-based approach
+        match tokio::time::timeout(
+            tokio::time::Duration::from_millis(LIVEKIT_LOCK_TIMEOUT_MS),
+            livekit_client_arc.write(),
+        )
+        .await
+        {
+            Ok(client) => {
+                if client.is_connected() {
+                    match client.send_tts_audio(audio.clone()).await {
+                        Ok(()) => {
+                            debug!(
+                                "TTS audio successfully sent to LiveKit: {} bytes",
+                                audio.len()
+                            );
+                            sent_to_livekit = true;
+                        }
+                        Err(e) => {
+                            error!("Failed to send TTS audio to LiveKit: {:?}", e);
+                        }
+                    }
+                } else {
+                    debug!("LiveKit client not connected, falling back to WebSocket");
+                }
+            }
+            Err(_) => {
+                error!(
+                    "Failed to acquire LiveKit lock within {}ms timeout, falling back to WebSocket",
+                    LIVEKIT_LOCK_TIMEOUT_MS
+                );
+            }
+        }
+    }
+
+    // Fall back to WebSocket if LiveKit is not available or failed
+    if !sent_to_livekit {
+        debug!("Sending TTS audio to WebSocket client: {} bytes", audio.len());
+        let audio_bytes = Bytes::from(audio);
+        if let Err(e) = message_tx.send(MessageRoute::Binary(audio_bytes)).await {
+            error!("Failed to send TTS audio to WebSocket: {:?}", e);
+        }
+    }
+}
+
 /// Register final TTS audio callback with LiveKit routing
 async fn register_final_tts_callback(
     voice_manager: &Arc<VoiceManager>,
@@ -681,80 +889,13 @@ async fn register_final_tts_callback(
             let operation_queue = operation_queue_for_tts.clone();
 
             Box::pin(async move {
-                let mut sent_to_livekit = false;
-
-                // Try to send to LiveKit using operation queue if available
-                if let Some(queue) = operation_queue {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    if queue
-                        .queue(crate::livekit::LiveKitOperation::SendAudio {
-                            audio_data: audio_data.data.clone(),
-                            response_tx: tx,
-                        })
-                        .await
-                        .is_ok()
-                    {
-                        match rx.await {
-                            Ok(Ok(())) => {
-                                debug!(
-                                    "TTS audio successfully sent to LiveKit via queue: {} bytes",
-                                    audio_data.data.len()
-                                );
-                                sent_to_livekit = true;
-                            }
-                            Ok(Err(e)) => {
-                                error!("Failed to send TTS audio to LiveKit: {:?}", e);
-                            }
-                            Err(_) => {
-                                error!("Operation worker disconnected while sending TTS audio");
-                            }
-                        }
-                    }
-                } else if let Some(livekit_client_arc) = &livekit_client {
-                    // Fallback to lock-based approach
-                    match tokio::time::timeout(
-                        tokio::time::Duration::from_millis(LIVEKIT_LOCK_TIMEOUT_MS),
-                        livekit_client_arc.write()
-                    ).await {
-                        Ok(client) => {
-                            // Check if LiveKit is connected before attempting to send
-                            if client.is_connected() {
-                                match client.send_tts_audio(audio_data.data.clone()).await {
-                                    Ok(()) => {
-                                        debug!(
-                                            "TTS audio successfully sent to LiveKit: {} bytes",
-                                            audio_data.data.len()
-                                        );
-                                        sent_to_livekit = true;
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to send TTS audio to LiveKit: {:?}", e);
-                                    }
-                                }
-                            } else {
-                                debug!("LiveKit client not connected, falling back to WebSocket");
-                            }
-                        }
-                        Err(_) => {
-                            error!(
-                                "Failed to acquire LiveKit lock within {}ms timeout, falling back to WebSocket",
-                                LIVEKIT_LOCK_TIMEOUT_MS
-                            );
-                        }
-                    }
-                }
-
-                // Fall back to WebSocket if LiveKit is not available or failed
-                if !sent_to_livekit {
-                    debug!(
-                        "Sending TTS audio to WebSocket client: {} bytes",
-                        audio_data.data.len()
-                    );
-                    let audio_bytes = Bytes::from(audio_data.data);
-                    if let Err(e) = message_tx.send(MessageRoute::Binary(audio_bytes)).await {
-                        error!("Failed to send TTS audio to WebSocket: {:?}", e);
-                    }
-                }
+                deliver_tts_audio(
+                    audio_data.data,
+                    livekit_client.as_ref(),
+                    operation_queue.as_ref(),
+                    &message_tx,
+                )
+                .await;
             })
         })
         .await
@@ -1193,11 +1334,15 @@ async fn register_audio_clear_callback(
 /// * `Ok(false)` - DAG not configured or disabled
 /// * `Err(String)` - DAG initialization failed
 #[cfg(feature = "dag-routing")]
+#[allow(clippy::too_many_arguments)]
 async fn initialize_dag_routing(
     dag_config: &DAGWebSocketConfig,
     stream_id: &str,
     state: &Arc<RwLock<ConnectionState>>,
-    _message_tx: &mpsc::Sender<MessageRoute>,
+    voice_manager: Option<&Arc<VoiceManager>>,
+    livekit_client: Option<&Arc<RwLock<LiveKitClient>>>,
+    operation_queue: Option<&crate::livekit::OperationQueue>,
+    message_tx: &mpsc::Sender<MessageRoute>,
 ) -> Result<bool, String> {
     // Get DAG definition from template or inline
     let dag_definition: DAGDefinition = if let Some(ref def) = dag_config.definition {
@@ -1230,7 +1375,13 @@ async fn initialize_dag_routing(
 
     let compiled_dag = Arc::new(compiled_dag);
 
-    // Create DAG context with auth info from connection state
+    // Determine the "post-STT node": the node directly downstream of the STT provider
+    // node. The StreamDriver injects the finalized transcript there and runs the rest
+    // of the graph once (STT itself runs in the VoiceManager, not the DAG). If the DAG
+    // has no STT provider node, fall back to the entry node.
+    let post_stt_node_id = find_post_stt_node(&compiled_dag);
+
+    // Create DAG context with auth info from connection state.
     let dag_context = {
         let conn_state = state.read().await;
         DAGContext::with_auth(
@@ -1239,28 +1390,202 @@ async fn initialize_dag_routing(
             conn_state.auth.id.clone(),
         )
     };
-
-    // Apply timeout if specified
     let dag_context = if let Some(timeout_ms) = dag_config.timeout_ms {
         dag_context.with_timeout(std::time::Duration::from_millis(timeout_ms))
     } else {
         dag_context
     };
 
-    // Create executor (executor is decoupled from DAG - uses DAG at execute time)
+    // Create executor (decoupled from the DAG; uses the DAG at execute time).
     let executor = Arc::new(DAGExecutor::new());
 
-    // Store DAG state in connection
+    // ── Output sink + drain task (W-O1) ─────────────────────────────────────────
+    // Output nodes push `DagOutput`s here; the drain task maps them to LiveKit / WS.
+    let (output_tx, mut output_rx) = mpsc::channel::<DagOutput>(64);
+    let dag_context = dag_context.with_output_tx(output_tx.clone());
+
+    {
+        let message_tx = message_tx.clone();
+        let livekit_client = livekit_client.cloned();
+        let operation_queue = operation_queue.cloned();
+        tokio::spawn(async move {
+            while let Some(output) = output_rx.recv().await {
+                match output {
+                    DagOutput::Audio(audio) => {
+                        deliver_tts_audio(
+                            audio.data.to_vec(),
+                            livekit_client.as_ref(),
+                            operation_queue.as_ref(),
+                            &message_tx,
+                        )
+                        .await;
+                    }
+                    DagOutput::Text(text) => {
+                        // Deliver DAG text output (e.g. an LLM response routed to a
+                        // text_output node) as a message envelope.
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let _ = message_tx
+                            .send(MessageRoute::Outgoing(OutgoingMessage::Message {
+                                message: UnifiedMessage {
+                                    message: Some(text),
+                                    data: None,
+                                    identity: "dag".to_string(),
+                                    topic: "dag_output".to_string(),
+                                    room: String::new(),
+                                    timestamp: now_ms,
+                                },
+                            }))
+                            .await;
+                    }
+                }
+            }
+            debug!("DAG output drain task ended");
+        });
+    }
+
+    // Store DAG state in connection.
     {
         let mut state_guard = state.write().await;
-        state_guard.compiled_dag = Some(compiled_dag);
-        state_guard.dag_executor = Some(executor);
-        state_guard.dag_context = Some(dag_context);
+        state_guard.compiled_dag = Some(compiled_dag.clone());
+        state_guard.dag_executor = Some(executor.clone());
+        state_guard.dag_context = Some(dag_context.clone());
         state_guard.set_dag_enabled(true);
+    }
+
+    // ── StreamDriver: run the executor once per finalized turn ───────────────────
+    // Keep STT in the VoiceManager (already streaming, with turn detection). On each
+    // finalized (speech_final) turn, inject the transcript at the post-STT node and
+    // run the executor once. Output nodes deliver via `output_tx`. The transcript
+    // itself still egresses via the standard STT callback (no double delivery: in DAG
+    // mode the simple path never calls `speak()`).
+    if let Some(vm) = voice_manager {
+        register_dag_stream_driver(
+            vm,
+            compiled_dag,
+            executor,
+            dag_context,
+            post_stt_node_id,
+            message_tx,
+        )
+        .await;
+    } else {
+        warn!("DAG routing enabled but no voice manager; StreamDriver not started");
     }
 
     info!(stream_id = %stream_id, "DAG routing enabled");
     Ok(true)
+}
+
+/// Find the node directly downstream of the STT provider node (the "post-STT" node),
+/// which is where the StreamDriver injects each finalized transcript.
+///
+/// Falls back to the entry node when the DAG has no STT provider node (e.g. a
+/// text-only pipeline), so execution still starts somewhere sensible.
+#[cfg(feature = "dag-routing")]
+fn find_post_stt_node(dag: &crate::dag::compiler::CompiledDAG) -> String {
+    // Locate the STT provider node, if any.
+    for node_idx in &dag.topo_order {
+        let node = &dag.graph[*node_idx];
+        if node.node.node_type() == "stt_provider" {
+            // The post-STT node is its first downstream successor.
+            let outgoing = dag.outgoing_edges(*node_idx);
+            if let Some((succ_idx, _edge)) = outgoing.into_iter().next() {
+                return dag.graph[succ_idx].id.clone();
+            }
+            // STT node with no successor: inject at the STT node itself.
+            return node.id.clone();
+        }
+    }
+    // No STT node: start at the entry node.
+    dag.graph[dag.entry].id.clone()
+}
+
+/// Register the StreamDriver: on each finalized STT turn, run the compiled DAG once
+/// starting at the post-STT node, feeding it the transcript as an `STTResult`.
+///
+/// A fresh per-turn `DAGContext` is derived from the template (carrying the same
+/// `stream_id`, auth, deadline and output sink) so per-turn node results don't leak
+/// across turns, while the LLM node's per-`stream_id` conversation history is
+/// preserved across turns.
+#[cfg(feature = "dag-routing")]
+#[allow(clippy::too_many_arguments)]
+async fn register_dag_stream_driver(
+    voice_manager: &Arc<VoiceManager>,
+    compiled_dag: Arc<crate::dag::compiler::CompiledDAG>,
+    executor: Arc<DAGExecutor>,
+    ctx_template: DAGContext,
+    post_stt_node_id: String,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) {
+    let message_tx = message_tx.clone();
+    let result = voice_manager
+        .on_stt_result(move |stt: STTResult| {
+            let compiled_dag = compiled_dag.clone();
+            let executor = executor.clone();
+            let ctx_template = ctx_template.clone();
+            let post_stt_node_id = post_stt_node_id.clone();
+            let message_tx = message_tx.clone();
+
+            Box::pin(async move {
+                // Transcript egress: the DAG path REPLACES the simple-path STT callback
+                // (VoiceManager stores a single STT callback), so we must still forward
+                // the transcript to the client here — for both interim and final results,
+                // matching the simple path. The pipeline (LLM→TTS→audio) only runs on a
+                // finalized turn below; there is no double delivery because in DAG mode
+                // the simple path never calls `speak()`.
+                let _ = message_tx
+                    .send(MessageRoute::Outgoing(OutgoingMessage::STTResult {
+                        transcript: stt.transcript.clone(),
+                        is_final: stt.is_final,
+                        is_speech_final: stt.is_speech_final,
+                        confidence: stt.confidence,
+                    }))
+                    .await;
+
+                // Only fire the pipeline on a finalized turn with real content.
+                if !stt.is_speech_final || stt.transcript.trim().is_empty() {
+                    return;
+                }
+
+                debug!(
+                    transcript = %stt.transcript,
+                    start_node = %post_stt_node_id,
+                    "StreamDriver: running DAG for finalized turn"
+                );
+
+                // Fresh per-turn context (shares stream_id/auth/deadline/output sink).
+                let mut ctx = ctx_template.clone_for_branch();
+
+                let input = crate::dag::nodes::DAGData::STTResult(STTResultData {
+                    transcript: stt.transcript.clone(),
+                    is_final: stt.is_final,
+                    is_speech_final: stt.is_speech_final,
+                    confidence: stt.confidence as f64,
+                    speech_detected: true,
+                    ..Default::default()
+                });
+
+                match executor
+                    .execute_from(&compiled_dag, &post_stt_node_id, input, &mut ctx)
+                    .await
+                {
+                    Ok(_) => {
+                        debug!("StreamDriver: DAG turn completed");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "StreamDriver: DAG turn failed");
+                    }
+                }
+            })
+        })
+        .await;
+
+    if let Err(e) = result {
+        error!("Failed to register DAG StreamDriver STT callback: {}", e);
+    }
 }
 
 #[cfg(test)]

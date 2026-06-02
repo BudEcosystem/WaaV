@@ -424,6 +424,11 @@ impl DAGNode for STTProviderNode {
 /// Default maximum TTS audio size (100 MB)
 const DEFAULT_MAX_TTS_AUDIO_BYTES: usize = 100 * 1024 * 1024;
 
+/// Maximum audio bytes a realtime provider response may accumulate before being
+/// treated as a runaway and terminated (W-O3 bug #5). 100 MB of PCM16 @ 24 kHz
+/// is ~35 minutes — far beyond any single realtime turn.
+const MAX_REALTIME_COLLECTED_AUDIO_BYTES: usize = 100 * 1024 * 1024;
+
 /// TTS (Text-to-Speech) provider node
 ///
 /// Wraps a TTS provider for converting text to audio in a DAG pipeline.
@@ -1080,6 +1085,24 @@ impl DAGNode for RealtimeProviderNode {
                             "Received audio chunk"
                         );
                         collected_audio.extend_from_slice(&audio.data);
+                        // Bound accumulated audio to prevent unbounded memory
+                        // growth from a runaway realtime stream (W-O3 bug #5).
+                        if collected_audio.len() > MAX_REALTIME_COLLECTED_AUDIO_BYTES {
+                            warn!(
+                                node_id = %self.id,
+                                provider = %self.provider,
+                                limit = %MAX_REALTIME_COLLECTED_AUDIO_BYTES,
+                                "Realtime collected audio exceeded max size, terminating"
+                            );
+                            let _ = realtime.disconnect().await;
+                            return Err(DAGError::RealtimeProviderError {
+                                provider: self.provider.clone(),
+                                error: format!(
+                                    "Collected audio exceeded {} bytes",
+                                    MAX_REALTIME_COLLECTED_AUDIO_BYTES
+                                ),
+                            });
+                        }
                         // Check if we have enough context to consider response complete
                         // Audio is complete when we have both audio and a final transcript
                         if !collected_transcript.is_empty() {

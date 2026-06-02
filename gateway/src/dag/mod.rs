@@ -99,7 +99,7 @@ pub mod templates;
 #[cfg(feature = "dag-routing")]
 pub use compiler::{CompiledDAG, DAGCompiler};
 #[cfg(feature = "dag-routing")]
-pub use context::DAGContext;
+pub use context::{DAGContext, DagOutput};
 #[cfg(feature = "dag-routing")]
 pub use definition::{DAGDefinition, EdgeDefinition, NodeDefinition, NodeType};
 #[cfg(feature = "dag-routing")]

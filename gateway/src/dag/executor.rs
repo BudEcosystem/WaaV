@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use petgraph::graph::NodeIndex;
 use rhai::{Dynamic, Scope};
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
@@ -89,7 +90,53 @@ impl DAGExecutor {
 
         // Record metrics
         let duration = start_time.elapsed();
-        match &result {
+        Self::record_outcome(dag, &result, duration);
+
+        result
+    }
+
+    /// Execute the DAG starting at a specific node id, feeding `input` into it.
+    ///
+    /// This is the entry point for the streaming data-plane (W-O1): STT runs in the
+    /// VoiceManager and, on a finalized turn, the StreamDriver injects a
+    /// `DAGData::STTResult` at the **post-STT node** (the node directly downstream of
+    /// the STT provider node) and runs the rest of the graph once. The upstream
+    /// `audio_input`/`stt_provider` nodes are intentionally NOT re-run (the audio was
+    /// already transcribed), so we start partway through the topological order.
+    ///
+    /// Output nodes deliver their results through `ctx.output_tx` (see `DagOutput`).
+    pub async fn execute_from(
+        &self,
+        dag: &CompiledDAG,
+        start_node_id: &str,
+        input: DAGData,
+        ctx: &mut DAGContext,
+    ) -> DAGResult<DAGData> {
+        let start_time = Instant::now();
+
+        let start_node = *dag
+            .node_index
+            .get(start_node_id)
+            .ok_or(DAGError::InvalidStartNode)?;
+
+        debug!(
+            dag_id = %dag.definition.id,
+            start_node = %dag.graph[start_node].id,
+            input_type = %input.type_name(),
+            "Starting DAG execution from explicit node"
+        );
+
+        let result = self.execute_from_node(dag, start_node, input, ctx).await;
+
+        let duration = start_time.elapsed();
+        Self::record_outcome(dag, &result, duration);
+
+        result
+    }
+
+    /// Record success/failure/cancellation metrics + tracing for a finished run.
+    fn record_outcome(dag: &CompiledDAG, result: &DAGResult<DAGData>, duration: Duration) {
+        match result {
             Ok(_) => {
                 dag.metrics.record_success(duration);
                 info!(
@@ -112,8 +159,6 @@ impl DAGExecutor {
                 );
             }
         }
-
-        result
     }
 
     /// Execute from a specific node following topological order
@@ -146,6 +191,12 @@ impl DAGExecutor {
             reachable_nodes.insert(node_idx);
         }
 
+        // Track which nodes have already executed. Split branch interiors are
+        // executed by `execute_split` and recorded here so the outer
+        // topological sweep skips them — each node executes exactly once
+        // (W-O3 bug #1).
+        let mut executed: HashSet<NodeIndex> = HashSet::new();
+
         // Store initial input for entry node
         node_outputs.insert(start, input);
 
@@ -169,12 +220,70 @@ impl DAGExecutor {
                 continue;
             }
 
-            let compiled_node = &dag.graph[node_idx];
+            // Skip nodes already executed as part of a split branch interior.
+            if executed.contains(&node_idx) {
+                continue;
+            }
 
-            // Gather input from predecessors (with edge transforms applied)
-            let node_input = self
-                .gather_inputs_with_transforms(dag, node_idx, &node_outputs, ctx)
-                .await?;
+            let compiled_node = &dag.graph[node_idx];
+            let node_type = compiled_node.node.node_type();
+
+            // ── Split-aware handling (W-O3 bug #1/#2) ───────────────────────
+            // When we reach a split node, execute the split itself once, then
+            // run each branch's interior subtree exactly once (in parallel),
+            // recording branch outputs and marking interior nodes executed so
+            // the outer sweep does not re-run them.
+            if node_type == "split" {
+                let split_input = self
+                    .gather_inputs_with_transforms(dag, node_idx, &node_outputs, ctx)
+                    .await?;
+                if matches!(split_input, DAGData::Empty) && node_idx != start {
+                    continue;
+                }
+                // Execute the split node itself (passthrough; sets metadata).
+                let split_output = self
+                    .execute_node(dag, node_idx, split_input.clone(), ctx)
+                    .await?;
+                node_outputs.insert(node_idx, split_output);
+
+                // Run the precomputed branch interiors exactly once.
+                self.run_split_branches(dag, node_idx, &split_input, ctx, &mut node_outputs)
+                    .await?;
+
+                // Mark every interior node executed so the outer sweep skips it.
+                if let Some(plans) = dag.split_plans.get(&node_idx) {
+                    for plan in plans {
+                        for &interior_idx in &plan.interior {
+                            executed.insert(interior_idx);
+                        }
+                    }
+                }
+
+                executed.insert(node_idx);
+                continue;
+            }
+
+            // Gather input. Join nodes read their declared `sources` from
+            // `node_outputs` by id so parallel branch outputs are never lost
+            // (W-O3 bug #2); all other nodes gather from graph predecessors with
+            // edge transforms applied.
+            //
+            // The start node is special: its input was seeded into `node_outputs`
+            // by the caller (e.g. the StreamDriver injecting an STTResult at the
+            // post-STT node, W-O1). Its graph predecessors were NOT executed, so we
+            // must use the seeded input directly rather than gathering Empty from
+            // them.
+            let node_input = if node_idx == start {
+                node_outputs
+                    .get(&node_idx)
+                    .cloned()
+                    .unwrap_or(DAGData::Empty)
+            } else if node_type == "join" {
+                self.gather_join_inputs(dag, node_idx, &node_outputs)
+            } else {
+                self.gather_inputs_with_transforms(dag, node_idx, &node_outputs, ctx)
+                    .await?
+            };
 
             // Skip if no input (conditional edge didn't match)
             if matches!(node_input, DAGData::Empty) && node_idx != start {
@@ -183,6 +292,7 @@ impl DAGExecutor {
 
             // Execute the node
             let output = self.execute_node(dag, node_idx, node_input, ctx).await?;
+            executed.insert(node_idx);
 
             // Handle router node output - prune unreachable downstream paths
             if compiled_node.node.node_type() == "router" {
@@ -353,6 +463,57 @@ impl DAGExecutor {
         false
     }
 
+    /// Gather inputs for a Join node from its declared `sources` (by node id).
+    ///
+    /// Unlike the generic predecessor gather, this reads each declared source's
+    /// output from `node_outputs` directly, so the aggregate of all parallel
+    /// branch outputs reaches the Join regardless of edge-condition/order quirks
+    /// (W-O3 bug #2). Sources that produced no output are skipped. Falls back to
+    /// the graph-predecessor gather if the node is not actually a Join.
+    fn gather_join_inputs(
+        &self,
+        dag: &CompiledDAG,
+        node_idx: NodeIndex,
+        node_outputs: &HashMap<NodeIndex, DAGData>,
+    ) -> DAGData {
+        use crate::dag::definition::NodeType;
+
+        let compiled = &dag.graph[node_idx];
+        let sources: Vec<String> = match &compiled.definition.node_type {
+            NodeType::Join { sources, .. } => sources.clone(),
+            _ => Vec::new(),
+        };
+
+        // If sources are declared, read them by id; otherwise fall back to the
+        // join node's incoming graph predecessors.
+        let source_indices: Vec<NodeIndex> = if sources.is_empty() {
+            dag.incoming_edges(node_idx)
+                .into_iter()
+                .map(|(src, _)| src)
+                .collect()
+        } else {
+            sources
+                .iter()
+                .filter_map(|id| dag.get_node_index(id))
+                .collect()
+        };
+
+        let mut inputs: Vec<DAGData> = Vec::new();
+        for src_idx in source_indices {
+            if let Some(data) = node_outputs.get(&src_idx) {
+                if !matches!(data, DAGData::Empty) {
+                    inputs.push(data.clone());
+                }
+            }
+        }
+
+        match inputs.len() {
+            0 => DAGData::Empty,
+            1 => inputs.remove(0),
+            _ => DAGData::Multiple(inputs),
+        }
+    }
+
     /// Gather input from predecessor nodes with edge transform support
     ///
     /// This method:
@@ -501,70 +662,22 @@ impl DAGExecutor {
 
         let start = Instant::now();
 
-        // Special handling for Split nodes - execute branches in parallel
-        // All node executions are wrapped with timeout to prevent indefinite blocking
-        let result = if node_type == "split" {
-            // First execute the split node to get branch info
-            let split_result =
-                match timeout(self.default_timeout, node.execute(input.clone(), ctx)).await {
-                    Ok(result) => result?,
-                    Err(_) => {
-                        warn!(
-                            node_id = %node_id,
-                            timeout_ms = %self.default_timeout.as_millis(),
-                            "Split node execution timed out"
-                        );
-                        return Err(DAGError::ExecutionTimeout(
-                            self.default_timeout.as_millis() as u64
-                        ));
-                    }
-                };
-
-            // Get branches from context metadata (set by SplitNode)
-            let branches: Vec<String> = ctx
-                .metadata
-                .get("split_branches")
-                .map(|s| s.split(',').map(String::from).collect())
-                .unwrap_or_default();
-
-            if branches.is_empty() {
-                warn!(node_id = %node_id, "Split node has no branches");
-                Ok(split_result)
-            } else {
-                // Execute branches in parallel (with per-branch timeout handled by execute_split_branches)
-                match timeout(
-                    self.default_timeout,
-                    self.execute_split_branches(dag, &branches, input, ctx),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        warn!(
-                            node_id = %node_id,
-                            timeout_ms = %self.default_timeout.as_millis(),
-                            "Split branch execution timed out"
-                        );
-                        Err(DAGError::ExecutionTimeout(
-                            self.default_timeout.as_millis() as u64
-                        ))
-                    }
-                }
-            }
-        } else {
-            // Regular node execution with timeout
-            match timeout(self.default_timeout, node.execute(input, ctx)).await {
-                Ok(result) => result,
-                Err(_) => {
-                    warn!(
-                        node_id = %node_id,
-                        timeout_ms = %self.default_timeout.as_millis(),
-                        "Node execution timed out"
-                    );
-                    Err(DAGError::ExecutionTimeout(
-                        self.default_timeout.as_millis() as u64
-                    ))
-                }
+        // All node executions (including Split, which is now a passthrough that
+        // records branch metadata) are wrapped with a timeout. Split branch
+        // fan-out is handled by `run_split_branches` in the topological sweep so
+        // each node executes exactly once.
+        let _ = node_type; // retained for tracing above
+        let result = match timeout(self.default_timeout, node.execute(input, ctx)).await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    node_id = %node_id,
+                    timeout_ms = %self.default_timeout.as_millis(),
+                    "Node execution timed out"
+                );
+                Err(DAGError::ExecutionTimeout(
+                    self.default_timeout.as_millis() as u64
+                ))
             }
         };
 
@@ -602,99 +715,148 @@ impl DAGExecutor {
         result
     }
 
-    /// Execute split branches in parallel
+    /// Execute the precomputed branch interiors of a split node exactly once.
     ///
-    /// Uses `Box::pin` to handle recursive async calls properly.
-    fn execute_split_branches<'a>(
-        &'a self,
-        dag: &'a CompiledDAG,
-        branches: &'a [String],
-        input: DAGData,
-        ctx: &'a DAGContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DAGResult<DAGData>> + Send + 'a>> {
-        Box::pin(async move {
-            use futures::future::join_all;
+    /// Each branch's interior subtree (from the compiler's `split_plans`) is
+    /// executed in its own cloned branch context. Branches run in parallel,
+    /// bounded by `max_concurrent_branches` (W-O3 bug #5). The output of every
+    /// interior node is merged back into the shared `node_outputs` map (keyed by
+    /// node index) and each branch's node results are merged back into the main
+    /// context, so the downstream Join node — which executes once in the main
+    /// sweep — can read its declared `sources` from `node_outputs` by id
+    /// (W-O3 bug #2: no parallel-branch data loss).
+    async fn run_split_branches(
+        &self,
+        dag: &CompiledDAG,
+        split_idx: NodeIndex,
+        input: &DAGData,
+        ctx: &mut DAGContext,
+        node_outputs: &mut HashMap<NodeIndex, DAGData>,
+    ) -> DAGResult<()> {
+        use futures::future::join_all;
 
-            if !self.enable_parallelism || branches.len() <= 1 {
-                // Sequential execution for single branch or disabled parallelism
-                let mut results = Vec::with_capacity(branches.len());
-                for branch_id in branches {
-                    let branch_idx = dag
-                        .get_node_index(branch_id)
-                        .ok_or_else(|| DAGError::UnknownNode(branch_id.clone()))?;
+        let plans = match dag.split_plans.get(&split_idx) {
+            Some(p) if !p.is_empty() => p,
+            _ => {
+                warn!(
+                    node_id = %dag.graph[split_idx].id,
+                    "Split node has no branch plans"
+                );
+                return Ok(());
+            }
+        };
 
-                    let mut branch_ctx = ctx.clone_for_branch();
-                    // Use Box::pin for recursive call
-                    let result = Box::pin(self.execute_from_node(
-                        dag,
-                        branch_idx,
-                        input.clone(),
-                        &mut branch_ctx,
-                    ))
-                    .await?;
-                    results.push(result);
+        // Semaphore bounds the number of branches executing concurrently.
+        let permits = self.max_concurrent_branches.max(1);
+        let semaphore = Arc::new(Semaphore::new(permits));
+
+        // Build one future per branch. Each future executes that branch's
+        // interior nodes in topological order in an isolated branch context and
+        // returns the per-node outputs plus the branch's node-result map.
+        let mut branch_futures = Vec::with_capacity(plans.len());
+        for plan in plans {
+            let branch_ctx = ctx.clone_for_branch();
+            let input_clone = input.clone();
+            let sem = semaphore.clone();
+            branch_futures.push(async move {
+                let _permit = sem
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| DAGError::InternalError(e.to_string()))?;
+                let mut branch_ctx = branch_ctx;
+                let outputs = self
+                    .execute_branch_interior(dag, plan, input_clone, &mut branch_ctx)
+                    .await
+                    .map_err(|e| DAGError::SplitBranchError {
+                        branch_id: plan.branch_id.clone(),
+                        error: e.to_string(),
+                    })?;
+                Ok::<_, DAGError>((outputs, branch_ctx))
+            });
+        }
+
+        // Execute branches (concurrently when parallelism is enabled).
+        let branch_results: Vec<DAGResult<(HashMap<NodeIndex, DAGData>, DAGContext)>> =
+            if self.enable_parallelism {
+                join_all(branch_futures).await
+            } else {
+                let mut out = Vec::with_capacity(branch_futures.len());
+                for fut in branch_futures {
+                    out.push(fut.await);
                 }
-                return Ok(DAGData::Multiple(results));
+                out
+            };
+
+        // Merge every branch's outputs and node results back into the shared
+        // state. The first error aborts the whole split.
+        for result in branch_results {
+            let (outputs, branch_ctx) = result?;
+            for (idx, data) in outputs {
+                node_outputs.insert(idx, data);
             }
-
-            // Parallel execution using join_all
-            // First, resolve all branch indices upfront
-            let mut branch_indices = Vec::with_capacity(branches.len());
-            for branch_id in branches {
-                let branch_idx = dag
-                    .get_node_index(branch_id)
-                    .ok_or_else(|| DAGError::UnknownNode(branch_id.clone()))?;
-                branch_indices.push((branch_id.clone(), branch_idx));
-            }
-
-            // Create boxed futures for each branch
-            let futures: Vec<_> = branch_indices
-                .iter()
-                .map(|(_, branch_idx)| {
-                    let input_clone = input.clone();
-                    let mut branch_ctx = ctx.clone_for_branch();
-                    let branch_idx = *branch_idx;
-
-                    // Create a boxed future for each branch
-                    Box::pin(async move {
-                        // Use Box::pin for recursive call
-                        Box::pin(self.execute_from_node(
-                            dag,
-                            branch_idx,
-                            input_clone,
-                            &mut branch_ctx,
-                        ))
-                        .await
-                    })
-                        as std::pin::Pin<
-                            Box<dyn std::future::Future<Output = DAGResult<DAGData>> + Send>,
-                        >
-                })
-                .collect();
-
-            // Execute all branches concurrently
-            let results: Vec<DAGResult<DAGData>> = join_all(futures).await;
-
-            // Check for errors and collect results
-            let mut collected_results = Vec::with_capacity(results.len());
-            for (i, result) in results.into_iter().enumerate() {
-                match result {
-                    Ok(data) => collected_results.push(data),
-                    Err(e) => {
-                        let branch_id = branch_indices
-                            .get(i)
-                            .map(|(id, _)| id.as_str())
-                            .unwrap_or("unknown");
-                        return Err(DAGError::SplitBranchError {
-                            branch_id: branch_id.to_string(),
-                            error: e.to_string(),
-                        });
-                    }
+            // Merge branch context node results back into the main context so
+            // condition/transform evaluation downstream can see them.
+            for key in branch_ctx.result_keys().cloned().collect::<Vec<_>>() {
+                if let Some(arc) = branch_ctx.get_node_result(&key) {
+                    ctx.set_node_result_arc(key, arc.clone());
                 }
             }
+        }
 
-            Ok(DAGData::Multiple(collected_results))
-        })
+        Ok(())
+    }
+
+    /// Execute a single branch's interior nodes in topological order, once.
+    ///
+    /// Returns the output of every interior node keyed by node index. The branch
+    /// context is mutated in place so its node results can be merged back by the
+    /// caller. Interior nodes never include the reconvergence/join node, which
+    /// runs once in the main sweep.
+    async fn execute_branch_interior(
+        &self,
+        dag: &CompiledDAG,
+        plan: &super::compiler::SplitBranchPlan,
+        split_output: DAGData,
+        branch_ctx: &mut DAGContext,
+    ) -> DAGResult<HashMap<NodeIndex, DAGData>> {
+        let interior: HashSet<NodeIndex> = plan.interior.iter().copied().collect();
+        let mut outputs: HashMap<NodeIndex, DAGData> = HashMap::new();
+
+        // The branch entry receives the split's output directly.
+        outputs.insert(plan.entry, split_output);
+
+        for &node_idx in &plan.interior {
+            if !branch_ctx.should_continue() {
+                return Err(if branch_ctx.is_cancelled() {
+                    DAGError::Cancelled
+                } else {
+                    DAGError::ExecutionTimeout(self.default_timeout.as_millis() as u64)
+                });
+            }
+
+            // Gather inputs from interior predecessors only. For the branch
+            // entry, predecessors outside the interior (the split) are ignored
+            // here because its input was injected above.
+            let node_input = if node_idx == plan.entry {
+                outputs.get(&plan.entry).cloned().unwrap_or(DAGData::Empty)
+            } else {
+                self.gather_inputs_with_transforms(dag, node_idx, &outputs, branch_ctx)
+                    .await?
+            };
+
+            if matches!(node_input, DAGData::Empty) && node_idx != plan.entry {
+                continue;
+            }
+
+            let output = self
+                .execute_node(dag, node_idx, node_input, branch_ctx)
+                .await?;
+            outputs.insert(node_idx, output);
+        }
+
+        // Only return outputs for interior nodes (defensive).
+        outputs.retain(|idx, _| interior.contains(idx));
+        Ok(outputs)
     }
 
     /// Execute split node (parallel branches) - public API
@@ -1023,5 +1185,190 @@ mod tests {
         assert_eq!(executor.default_timeout, Duration::from_secs(60));
         assert!(!executor.enable_parallelism);
         assert_eq!(executor.max_concurrent_branches, 5);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Split / Join correctness tests (W-O3 bugs #1 and #2)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    use crate::dag::context::DAGContext;
+    use crate::dag::definition::JoinStrategy;
+    use crate::dag::nodes::{DAGData, DAGNode, NodeCapability};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A test node that counts how many times it executes and tags the output
+    /// with its own id so Join data-flow can be asserted.
+    struct CountingNode {
+        id: String,
+        count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl DAGNode for CountingNode {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn node_type(&self) -> &str {
+            "counting"
+        }
+        fn capabilities(&self) -> Vec<NodeCapability> {
+            vec![
+                NodeCapability::TextInput,
+                NodeCapability::JsonInput,
+                NodeCapability::TextOutput,
+                NodeCapability::JsonOutput,
+            ]
+        }
+        async fn execute(&self, _input: DAGData, _ctx: &mut DAGContext) -> DAGResult<DAGData> {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            Ok(DAGData::Text(self.id.clone()))
+        }
+        fn clone_boxed(&self) -> Arc<dyn DAGNode> {
+            Arc::new(CountingNode {
+                id: self.id.clone(),
+                count: self.count.clone(),
+            })
+        }
+    }
+
+    /// Build a split → 2 branches → join → output DAG where each branch node is
+    /// a `CountingNode`. Returns the compiled DAG and the two per-branch counters.
+    fn build_split_join_dag(
+        join_strategy: JoinStrategy,
+    ) -> (CompiledDAG, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        use crate::dag::definition::NodeType;
+
+        let compiler = DAGCompiler::new();
+        let mut def = DAGDefinition::new("split-join", "Split Join DAG");
+        def.add_node(NodeDefinition::new("input", NodeType::TextInput));
+        def.add_node(NodeDefinition::new(
+            "split",
+            NodeType::Split {
+                branches: vec!["branch_a".into(), "branch_b".into()],
+            },
+        ));
+        // Branch nodes are passthroughs in the definition; we swap them for
+        // CountingNodes after compilation.
+        def.add_node(NodeDefinition::new("branch_a", NodeType::Passthrough));
+        def.add_node(NodeDefinition::new("branch_b", NodeType::Passthrough));
+        def.add_node(NodeDefinition::new(
+            "join",
+            NodeType::Join {
+                sources: vec!["branch_a".into(), "branch_b".into()],
+                strategy: join_strategy,
+                selector: None,
+                merge_script: None,
+            },
+        ));
+        // Passthrough exit so the join's aggregate (a `Multiple`) reaches the
+        // exit intact for assertion (a TextOutput node would reject Multiple).
+        def.add_node(NodeDefinition::new("output", NodeType::Passthrough));
+
+        def.add_edge(EdgeDefinition::new("input", "split"));
+        def.add_edge(EdgeDefinition::new("split", "branch_a"));
+        def.add_edge(EdgeDefinition::new("split", "branch_b"));
+        def.add_edge(EdgeDefinition::new("branch_a", "join"));
+        def.add_edge(EdgeDefinition::new("branch_b", "join"));
+        def.add_edge(EdgeDefinition::new("join", "output"));
+        def.with_entry("input");
+        def.add_exit("output");
+
+        let mut dag = compiler.compile(def).unwrap();
+
+        let count_a = Arc::new(AtomicUsize::new(0));
+        let count_b = Arc::new(AtomicUsize::new(0));
+
+        let idx_a = dag.get_node_index("branch_a").unwrap();
+        let idx_b = dag.get_node_index("branch_b").unwrap();
+        dag.graph[idx_a].node = Arc::new(CountingNode {
+            id: "branch_a".to_string(),
+            count: count_a.clone(),
+        });
+        dag.graph[idx_b].node = Arc::new(CountingNode {
+            id: "branch_b".to_string(),
+            count: count_b.clone(),
+        });
+
+        (dag, count_a, count_b)
+    }
+
+    /// Bug #1: each branch node must execute EXACTLY once (no double execution
+    /// from the recursive split AND the outer topo sweep).
+    #[tokio::test]
+    async fn test_split_branch_executes_exactly_once() {
+        let (dag, count_a, count_b) = build_split_join_dag(JoinStrategy::All);
+        let executor = DAGExecutor::new();
+        let mut ctx = DAGContext::new("test-stream");
+
+        let input = DAGData::Text("hello".to_string());
+        let _ = executor.execute(&dag, input, &mut ctx).await.unwrap();
+
+        assert_eq!(
+            count_a.load(Ordering::SeqCst),
+            1,
+            "branch_a should execute exactly once, got {}",
+            count_a.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            count_b.load(Ordering::SeqCst),
+            1,
+            "branch_b should execute exactly once, got {}",
+            count_b.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Bug #2: parallel split execution must produce the same result as
+    /// sequential execution, and the Join must see BOTH branch outputs (no
+    /// data loss).
+    #[tokio::test]
+    async fn test_parallel_result_equals_sequential() {
+        fn join_outputs(data: &DAGData) -> Vec<String> {
+            // Collect the leaf Text values so order-independent comparison is possible.
+            let mut out = Vec::new();
+            fn walk(d: &DAGData, acc: &mut Vec<String>) {
+                match d {
+                    DAGData::Text(s) => acc.push(s.clone()),
+                    DAGData::Multiple(items) => {
+                        for i in items {
+                            walk(i, acc);
+                        }
+                    }
+                    other => acc.push(other.to_json().to_string()),
+                }
+            }
+            walk(data, &mut out);
+            out.sort();
+            out
+        }
+
+        // Parallel
+        let (dag_par, _a1, _b1) = build_split_join_dag(JoinStrategy::All);
+        let exec_par = DAGExecutor::new(); // parallelism on
+        let mut ctx_par = DAGContext::new("stream-par");
+        let res_par = exec_par
+            .execute(&dag_par, DAGData::Text("x".into()), &mut ctx_par)
+            .await
+            .unwrap();
+
+        // Sequential
+        let (dag_seq, _a2, _b2) = build_split_join_dag(JoinStrategy::All);
+        let exec_seq = DAGExecutor::new().without_parallelism();
+        let mut ctx_seq = DAGContext::new("stream-seq");
+        let res_seq = exec_seq
+            .execute(&dag_seq, DAGData::Text("x".into()), &mut ctx_seq)
+            .await
+            .unwrap();
+
+        let par = join_outputs(&res_par);
+        let seq = join_outputs(&res_seq);
+
+        // The join must carry BOTH branch outputs through to the exit.
+        assert!(
+            par.contains(&"branch_a".to_string()) && par.contains(&"branch_b".to_string()),
+            "parallel result must contain both branch outputs, got {:?}",
+            par
+        );
+        assert_eq!(par, seq, "parallel result must equal sequential result");
     }
 }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use super::{DAGData, DAGNode, NodeCapability, TTSAudioData};
-use crate::dag::context::DAGContext;
+use crate::dag::context::{DAGContext, DagOutput};
 use crate::dag::definition::OutputDestination;
 use crate::dag::error::{DAGError, DAGResult};
 
@@ -96,10 +96,6 @@ impl DAGNode for AudioOutputNode {
             }
         };
 
-        // The actual routing to WebSocket/LiveKit is handled by the executor
-        // based on the destination configuration. Here we just validate and
-        // prepare the data.
-
         debug!(
             node_id = %self.id,
             destination = ?self.destination,
@@ -108,11 +104,27 @@ impl DAGNode for AudioOutputNode {
             "Routing audio to output"
         );
 
-        // Store destination info in context for executor
+        // Store destination info in context for downstream consumers (drain task can
+        // honor LiveKit vs WS routing; Discard means side-effect-only).
         ctx.metadata.insert(
             "output_destination".to_string(),
             format!("{:?}", self.destination),
         );
+
+        // W-O1: deliver the audio out-of-band through the context's output sink so it
+        // actually reaches the client. The drain task in the WS handler maps
+        // `DagOutput::Audio` → LiveKit (operation queue) or WS binary. `Discard` is
+        // intentionally not delivered.
+        if !matches!(self.destination, OutputDestination::Discard)
+            && !audio_data.data.is_empty()
+            && !ctx.emit_output(DagOutput::Audio(audio_data.clone())).await
+        {
+            warn!(
+                node_id = %self.id,
+                "Audio output node has no output sink attached; audio not delivered \
+                 (DAG executed without a StreamDriver drain task)"
+            );
+        }
 
         Ok(DAGData::TTSAudio(audio_data))
     }
@@ -212,7 +224,7 @@ impl DAGNode for TextOutputNode {
             "Routing text to output"
         );
 
-        // Store destination info in context for executor
+        // Store destination info in context for downstream consumers.
         ctx.metadata.insert(
             "output_destination".to_string(),
             format!("{:?}", self.destination),
@@ -220,6 +232,17 @@ impl DAGNode for TextOutputNode {
         if let Some(ref msg_type) = self.message_type {
             ctx.metadata
                 .insert("message_type".to_string(), msg_type.clone());
+        }
+
+        // W-O1: deliver the text out-of-band through the context's output sink.
+        if !matches!(self.destination, OutputDestination::Discard)
+            && !text.is_empty()
+            && !ctx.emit_output(DagOutput::Text(text.clone())).await
+        {
+            debug!(
+                node_id = %self.id,
+                "Text output node has no output sink attached; text returned only as result"
+            );
         }
 
         Ok(DAGData::Text(text))

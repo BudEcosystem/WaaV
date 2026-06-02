@@ -214,6 +214,104 @@ impl DAGDefinition {
                     errors.push(format!("Edge target '{}' not found in nodes", edge.to));
                 }
             }
+
+            // === Control-flow target validation (W-O3 bug #4) ===
+            //
+            // Split branches, Join sources, Router/switch targets, and Endpoint
+            // output destinations all reference other nodes by id. A typo here
+            // would otherwise surface as a confusing runtime UnknownNode (or
+            // silently drop data), so validate them at compile time.
+            let node_ids: std::collections::HashSet<&str> =
+                self.nodes.iter().map(|n| n.id.as_str()).collect();
+
+            for node in &self.nodes {
+                match &node.node_type {
+                    NodeType::Split { branches } => {
+                        for b in branches {
+                            if !node_ids.contains(b.as_str()) {
+                                errors.push(format!(
+                                    "Split node '{}' references unknown branch '{}'",
+                                    node.id, b
+                                ));
+                            }
+                        }
+                    }
+                    NodeType::Join { sources, .. } => {
+                        for s in sources {
+                            if !node_ids.contains(s.as_str()) {
+                                errors.push(format!(
+                                    "Join node '{}' references unknown source '{}'",
+                                    node.id, s
+                                ));
+                            }
+                        }
+                    }
+                    NodeType::Router { routes } => {
+                        for route in routes {
+                            if !node_ids.contains(route.target.as_str()) {
+                                errors.push(format!(
+                                    "Router node '{}' references unknown target '{}'",
+                                    node.id, route.target
+                                ));
+                            }
+                        }
+                    }
+                    NodeType::AudioOutput {
+                        destination: OutputDestination::Endpoint { node_id },
+                    }
+                    | NodeType::TextOutput {
+                        destination: OutputDestination::Endpoint { node_id },
+                    } => {
+                        if !node_ids.contains(node_id.as_str()) {
+                            errors.push(format!(
+                                "Output node '{}' references unknown endpoint node '{}'",
+                                node.id, node_id
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Switch-pattern case targets on edges also reference node ids.
+            for edge in &self.edges {
+                if let Some(switch) = &edge.switch {
+                    for (case_value, target) in &switch.cases {
+                        if !node_ids.contains(target.as_str()) {
+                            errors.push(format!(
+                                "Switch on edge '{}'->'{}' case '{}' references unknown target '{}'",
+                                edge.from, edge.to, case_value, target
+                            ));
+                        }
+                    }
+                    if let Some(default) = &switch.default {
+                        if !node_ids.contains(default.as_str()) {
+                            errors.push(format!(
+                                "Switch on edge '{}'->'{}' default references unknown target '{}'",
+                                edge.from, edge.to, default
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // === Reachability check (W-O3 bug #4) ===
+            //
+            // Every node must be reachable from the entry node (following edges
+            // AND control-flow branch/route targets). An unreachable node is a
+            // configuration error: it can never execute and usually signals a
+            // mis-wired graph. Only checked when references are otherwise valid.
+            if errors.is_empty() && !self.entry_node.is_empty() {
+                let reachable = self.compute_reachable_from_entry();
+                for node in &self.nodes {
+                    if !reachable.contains(node.id.as_str()) {
+                        errors.push(format!(
+                            "Node '{}' is unreachable from entry node '{}'",
+                            node.id, self.entry_node
+                        ));
+                    }
+                }
+            }
         }
 
         // === Duplicate detection ===
@@ -231,6 +329,83 @@ impl DAGDefinition {
         } else {
             Err(errors)
         }
+    }
+
+    /// Compute the set of node ids reachable from the entry node, following
+    /// both edges and control-flow targets (split branches, join sources,
+    /// router routes, switch cases, output endpoints).
+    ///
+    /// Used by `validate_structure` for the reachability check (W-O3 bug #4).
+    fn compute_reachable_from_entry(&self) -> std::collections::HashSet<String> {
+        use std::collections::HashSet;
+
+        // Adjacency from edges.
+        let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
+        for edge in &self.edges {
+            adjacency
+                .entry(edge.from.as_str())
+                .or_default()
+                .push(edge.to.as_str());
+            // Switch case targets are additional reachable destinations.
+            if let Some(switch) = &edge.switch {
+                for target in switch.cases.values() {
+                    adjacency
+                        .entry(edge.from.as_str())
+                        .or_default()
+                        .push(target.as_str());
+                }
+                if let Some(default) = &switch.default {
+                    adjacency
+                        .entry(edge.from.as_str())
+                        .or_default()
+                        .push(default.as_str());
+                }
+            }
+        }
+
+        // Control-flow targets declared on the node itself.
+        for node in &self.nodes {
+            let entry = adjacency.entry(node.id.as_str()).or_default();
+            match &node.node_type {
+                NodeType::Split { branches } => {
+                    for b in branches {
+                        entry.push(b.as_str());
+                    }
+                }
+                NodeType::Router { routes } => {
+                    for route in routes {
+                        entry.push(route.target.as_str());
+                    }
+                }
+                NodeType::AudioOutput {
+                    destination: OutputDestination::Endpoint { node_id },
+                }
+                | NodeType::TextOutput {
+                    destination: OutputDestination::Endpoint { node_id },
+                } => {
+                    entry.push(node_id.as_str());
+                }
+                _ => {}
+            }
+        }
+
+        // BFS/DFS from the entry node.
+        let mut reachable: HashSet<String> = HashSet::new();
+        let mut stack = vec![self.entry_node.as_str()];
+        while let Some(node) = stack.pop() {
+            if !reachable.insert(node.to_string()) {
+                continue;
+            }
+            if let Some(neighbors) = adjacency.get(node) {
+                for &n in neighbors {
+                    if !reachable.contains(n) {
+                        stack.push(n);
+                    }
+                }
+            }
+        }
+
+        reachable
     }
 }
 

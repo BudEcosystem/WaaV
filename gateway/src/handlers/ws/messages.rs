@@ -28,8 +28,8 @@ pub const MAX_STREAM_ID_SIZE: usize = 256;
 pub const MAX_AUTH_TOKEN_SIZE: usize = 4 * 1024;
 
 use super::config::{
-    DAGWebSocketConfig, LiveKitWebSocketConfig, STTWebSocketConfig, TTSWebSocketConfig,
-    default_allow_interruption, default_audio_enabled,
+    ConversationWebSocketConfig, DAGWebSocketConfig, LiveKitWebSocketConfig, STTWebSocketConfig,
+    TTSWebSocketConfig, default_allow_interruption, default_audio_enabled,
 };
 
 /// WebSocket message types for incoming messages
@@ -73,6 +73,12 @@ pub enum IncomingMessage {
         /// When configured, audio flows through the DAG instead of direct STT→TTS
         #[serde(skip_serializing_if = "Option::is_none")]
         dag_config: Option<DAGWebSocketConfig>,
+        /// Optional built-in conversation-loop configuration (plan W-O2).
+        /// When present, finalized STT turns drive an LLM→TTS reply with
+        /// per-session history and barge-in. When absent, raw STT/TTS behavior
+        /// is unchanged.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        conversation_config: Option<ConversationWebSocketConfig>,
     },
     #[serde(rename = "speak")]
     Speak {
@@ -750,6 +756,7 @@ mod tests {
             tts_config: None,
             livekit: None,
             dag_config: None,
+            conversation_config: None,
         };
         assert!(msg.validate_size().is_ok());
     }

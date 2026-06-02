@@ -92,6 +92,7 @@ fn test_incoming_message_serialization() {
         }),
         livekit: None,
         dag_config: None,
+        conversation_config: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -719,6 +720,7 @@ fn test_incoming_message_config_with_livekit() {
             listen_participants: vec![],
         }),
         dag_config: None,
+        conversation_config: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -765,6 +767,7 @@ fn test_incoming_message_config_without_livekit() {
         }),
         livekit: None,
         dag_config: None,
+        conversation_config: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1082,6 +1085,7 @@ fn test_config_message_without_livekit_routing() {
         }),
         livekit: None, // No LiveKit configuration
         dag_config: None,
+        conversation_config: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1145,6 +1149,7 @@ fn test_config_message_with_livekit_routing() {
             listen_participants: vec![],
         }),
         dag_config: None,
+        conversation_config: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1334,6 +1339,7 @@ fn test_config_message_audio_disabled() {
             listen_participants: vec![],
         }),
         dag_config: None,
+        conversation_config: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1404,6 +1410,7 @@ fn test_config_message_audio_default() {
         }),
         livekit: None,
         dag_config: None,
+        conversation_config: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();

@@ -20,6 +20,18 @@ use crate::livekit::LiveKitClient;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+/// Whether loopback/private endpoint targets are explicitly permitted.
+///
+/// OFF by default. Opt-in via `WAAV_ALLOW_LOOPBACK_ENDPOINTS=1` so in-process mock
+/// servers (DAG data-plane e2e / `endpoint_override` harness) can target `127.0.0.1`
+/// without weakening production SSRF protection. Never set in production.
+fn loopback_endpoints_allowed() -> bool {
+    matches!(
+        std::env::var("WAAV_ALLOW_LOOPBACK_ENDPOINTS").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
 /// Validate a URL for SSRF (Server-Side Request Forgery) protection
 ///
 /// This function checks that the URL:
@@ -41,6 +53,15 @@ pub fn validate_url_for_ssrf(url: &str) -> DAGResult<()> {
             "URL scheme '{}' not allowed. Use http, https, ws, or wss",
             scheme
         )));
+    }
+
+    // Test/local-mock escape hatch (opt-in, OFF by default): when
+    // `WAAV_ALLOW_LOOPBACK_ENDPOINTS=1` is set, loopback/private targets are
+    // permitted so in-process mock servers (DAG data-plane e2e, W-O1/W-T0) can be
+    // pointed at `127.0.0.1`. The scheme check above still applies. This mirrors the
+    // `OPENAI_BASE_URL` endpoint-override pattern and is never set in production.
+    if loopback_endpoints_allowed() {
+        return Ok(());
     }
 
     // Get host
@@ -101,7 +122,70 @@ pub fn validate_url_for_ssrf(url: &str) -> DAGResult<()> {
         }
     }
 
+    // Resolve-then-validate: when the host is a DNS name (not an IP literal),
+    // resolve it and reject if ANY resolved address is private/internal. This
+    // closes DNS-rebinding / TOCTOU holes where a public-looking hostname
+    // resolves to a private/metadata address.
+    let is_ip_literal = host.parse::<IpAddr>().is_ok()
+        || (host.starts_with('[') && host.ends_with(']'));
+    if !is_ip_literal {
+        validate_resolved_host_for_ssrf(host)?;
+    }
+
     Ok(())
+}
+
+/// Resolve a DNS hostname and reject if any resolved IP is private/internal.
+///
+/// Uses a synchronous resolver (`ToSocketAddrs`) so it can run inside the
+/// (synchronous) DAG compile path. A host that fails to resolve is allowed
+/// through (it may resolve later, at request time the transport applies its own
+/// checks); the goal here is to reject hosts that *currently* resolve to a
+/// blocked range, which is the DNS-rebind vector for client-supplied DAGs.
+pub fn validate_resolved_host_for_ssrf(host: &str) -> DAGResult<()> {
+    use std::net::ToSocketAddrs;
+
+    // Port is irrelevant for the IP check; use a dummy port for resolution.
+    let resolved = match (host, 0u16).to_socket_addrs() {
+        Ok(addrs) => addrs,
+        Err(_) => return Ok(()), // unresolvable now; nothing to block
+    };
+
+    for addr in resolved {
+        let ip = addr.ip();
+        if is_private_ip(&ip) {
+            return Err(DAGError::ConfigError(format!(
+                "Host '{}' resolves to private/internal IP '{}' (SSRF protection)",
+                host, ip
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate a gRPC target address for SSRF.
+///
+/// gRPC addresses are typically `host:port` or `scheme://host:port`. This
+/// normalizes the address into a URL and runs the same resolve-then-validate
+/// SSRF checks used by HTTP/WS/webhook endpoints (W-O3 bug #3).
+pub fn validate_grpc_address_for_ssrf(address: &str) -> DAGResult<()> {
+    // Normalize to a URL so we can reuse the URL validator. gRPC addresses may
+    // omit a scheme (e.g. "example.com:443") — default to https for parsing.
+    let normalized = if address.starts_with("http://")
+        || address.starts_with("https://")
+        || address.starts_with("grpc://")
+        || address.starts_with("grpcs://")
+    {
+        // Map grpc(s):// to http(s):// for the URL parser / scheme allow-list.
+        address
+            .replacen("grpcs://", "https://", 1)
+            .replacen("grpc://", "http://", 1)
+    } else {
+        format!("https://{}", address)
+    };
+
+    validate_url_for_ssrf(&normalized)
 }
 
 /// Check if an IP address is private/internal
@@ -439,6 +523,9 @@ pub struct GrpcEndpointNode {
 
 impl GrpcEndpointNode {
     /// Create a new gRPC endpoint node
+    ///
+    /// Note: this constructor does NOT validate the address for SSRF attacks.
+    /// Use `try_new()` for client-supplied addresses (the compiler does).
     pub fn new(
         id: impl Into<String>,
         address: impl Into<String>,
@@ -454,6 +541,31 @@ impl GrpcEndpointNode {
             tls_domain_name: None,
             verify_certificates: true,
         }
+    }
+
+    /// Create a new gRPC endpoint node with SSRF address validation.
+    ///
+    /// Validates the target address against SSRF attacks (loopback, link-local,
+    /// RFC1918, cloud-metadata, and DNS names that resolve to those ranges).
+    /// The DAG compiler MUST use this for client-supplied gRPC addresses
+    /// (W-O3 bug #3).
+    pub fn try_new(
+        id: impl Into<String>,
+        address: impl Into<String>,
+        service: impl Into<String>,
+        method: impl Into<String>,
+    ) -> DAGResult<Self> {
+        let address: String = address.into();
+        validate_grpc_address_for_ssrf(&address)?;
+        Ok(Self {
+            id: id.into(),
+            address,
+            service: service.into(),
+            method: method.into(),
+            timeout_ms: 30000,
+            tls_domain_name: None,
+            verify_certificates: true,
+        })
     }
 
     /// Set timeout in milliseconds

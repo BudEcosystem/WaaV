@@ -1,0 +1,537 @@
+//! W-O2 — Built-in automatic conversation loop (extreme TDD RED→GREEN).
+//!
+//! PROBLEM (verified): WaaV exposes STT and TTS as separate primitives; nothing
+//! turns a *final transcript* into an *LLM call* into *TTS*. There is no
+//! turn-taking/barge-in orchestration or per-session history at the gateway, and
+//! the OpenAI-compatible LLM logic was trapped behind the `dag-routing` feature.
+//!
+//! These tests exercise the feature-flag-free `ConversationOrchestrator` +
+//! `LlmClient` (NO `dag-routing` feature required):
+//!
+//! 1. `final_transcript_triggers_llm_then_tts` — a final STT result drives an LLM
+//!    turn (against an in-process OpenAI-compatible mock via the conversation
+//!    `base_url`), and the reply is spoken: `VoiceManager::speak()` runs and the
+//!    mock TTS egresses audio.
+//! 2. `barge_in_interrupts_tts` — while a (slow, streaming) LLM turn is in
+//!    flight and the bot is interruptible, new user speech cancels the in-flight
+//!    turn and clears TTS.
+//! 3. `multi_turn_history_preserved` — across two turns, the second LLM request
+//!    body includes the first turn's user + assistant messages.
+//!
+//! Providers are mocked in-process: a mock TTS that records `speak`/`clear` and
+//! egresses a marker audio frame, and a tiny OpenAI-compatible HTTP mock for the
+//! LLM. STT is driven by feeding `STTResult`s straight into the orchestrator
+//! (the same path the VoiceManager STT callback would take).
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
+
+use axum::{Json, Router, extract::State, routing::post};
+use parking_lot::Mutex;
+use serde_json::{Value, json};
+use tokio::net::TcpListener;
+
+use waav_gateway::core::conversation::{ConversationConfig, ConversationOrchestrator};
+use waav_gateway::core::llm::{LlmClient, LlmClientConfig};
+use waav_gateway::core::stt::{BaseSTT, STTResult};
+use waav_gateway::core::tts::{AudioCallback, AudioData, BaseTTS, TTSConfig, TTSResult};
+use waav_gateway::core::voice_manager::{VoiceManager, VoiceManagerConfig};
+use waav_gateway::core::stt::STTConfig;
+use waav_gateway::global_registry;
+use waav_gateway::plugin::metadata::ProviderMetadata;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Mock TTS provider: records speak()/clear() and egresses a marker audio frame.
+// ──────────────────────────────────────────────────────────────────────────────
+const TTS_MARKER: &[u8] = b"CONV_TTS_AUDIO";
+
+#[derive(Default)]
+struct TtsStats {
+    spoken: Mutex<Vec<String>>,
+    clears: AtomicUsize,
+    audio_emitted: AtomicUsize,
+}
+
+// Global stats so the test can observe a mock created inside the VoiceManager
+// (BaseTTS::new gives us no constructor hook to inject shared state otherwise).
+static TTS_STATS: once_cell::sync::Lazy<Arc<TtsStats>> =
+    once_cell::sync::Lazy::new(|| Arc::new(TtsStats::default()));
+
+fn reset_tts_stats() {
+    TTS_STATS.spoken.lock().clear();
+    TTS_STATS.clears.store(0, Ordering::SeqCst);
+    TTS_STATS.audio_emitted.store(0, Ordering::SeqCst);
+}
+
+struct MockTts {
+    ready: bool,
+    callback: Option<Arc<dyn AudioCallback>>,
+    stats: Arc<TtsStats>,
+}
+
+#[async_trait::async_trait]
+impl BaseTTS for MockTts {
+    fn new(_config: TTSConfig) -> TTSResult<Self> {
+        Ok(Self {
+            ready: false,
+            callback: None,
+            stats: TTS_STATS.clone(),
+        })
+    }
+
+    async fn connect(&mut self) -> TTSResult<()> {
+        self.ready = true;
+        Ok(())
+    }
+
+    async fn disconnect(&mut self) -> TTSResult<()> {
+        self.ready = false;
+        self.callback = None;
+        Ok(())
+    }
+
+    fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    async fn speak(&mut self, text: &str, _flush: bool) -> TTSResult<()> {
+        self.stats.spoken.lock().push(text.to_string());
+        if let Some(cb) = &self.callback {
+            let audio = AudioData {
+                data: TTS_MARKER.to_vec(),
+                sample_rate: 24000,
+                format: "pcm16".to_string(),
+                duration_ms: Some(20),
+            };
+            cb.on_audio(audio).await;
+            self.stats.audio_emitted.fetch_add(1, Ordering::SeqCst);
+            cb.on_complete().await;
+        }
+        Ok(())
+    }
+
+    async fn flush(&self) -> TTSResult<()> {
+        Ok(())
+    }
+
+    async fn clear(&mut self) -> TTSResult<()> {
+        self.stats.clears.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn on_audio(&mut self, callback: Arc<dyn AudioCallback>) -> TTSResult<()> {
+        self.callback = Some(callback);
+        Ok(())
+    }
+
+    fn get_provider_info(&self) -> serde_json::Value {
+        json!({ "provider": "mock-tts-conv" })
+    }
+}
+
+fn register_mock_tts() {
+    let registry = global_registry();
+    registry.register_tts(
+        "mock-tts-conv",
+        Arc::new(|config: TTSConfig| MockTts::new(config).map(|t| Box::new(t) as Box<dyn BaseTTS>)),
+        ProviderMetadata::tts("mock-tts-conv", "Mock TTS (conversation)"),
+    );
+    // STT provider is unused in these tests (we feed STTResults directly), but the
+    // VoiceManager still constructs one. Register a no-op deepgram-style mock.
+    registry.register_stt(
+        "mock-stt-conv",
+        Arc::new(|config: STTConfig| {
+            NoopStt::new(config).map(|s| Box::new(s) as Box<dyn waav_gateway::core::stt::BaseSTT>)
+        }),
+        ProviderMetadata::stt("mock-stt-conv", "No-op STT (conversation)"),
+    );
+}
+
+struct NoopStt {
+    ready: bool,
+}
+
+#[async_trait::async_trait]
+impl waav_gateway::core::stt::BaseSTT for NoopStt {
+    fn new(_config: STTConfig) -> Result<Self, waav_gateway::core::stt::STTError> {
+        Ok(Self { ready: false })
+    }
+    async fn connect(&mut self) -> Result<(), waav_gateway::core::stt::STTError> {
+        self.ready = true;
+        Ok(())
+    }
+    async fn disconnect(&mut self) -> Result<(), waav_gateway::core::stt::STTError> {
+        self.ready = false;
+        Ok(())
+    }
+    fn is_ready(&self) -> bool {
+        self.ready
+    }
+    async fn send_audio(
+        &mut self,
+        _audio: bytes::Bytes,
+    ) -> Result<(), waav_gateway::core::stt::STTError> {
+        Ok(())
+    }
+    async fn on_result(
+        &mut self,
+        _cb: waav_gateway::core::stt::STTResultCallback,
+    ) -> Result<(), waav_gateway::core::stt::STTError> {
+        Ok(())
+    }
+    async fn on_error(
+        &mut self,
+        _cb: waav_gateway::core::stt::STTErrorCallback,
+    ) -> Result<(), waav_gateway::core::stt::STTError> {
+        Ok(())
+    }
+    fn get_config(&self) -> Option<&STTConfig> {
+        None
+    }
+    async fn update_config(
+        &mut self,
+        _config: STTConfig,
+    ) -> Result<(), waav_gateway::core::stt::STTError> {
+        Ok(())
+    }
+    fn get_provider_info(&self) -> &'static str {
+        "mock-stt-conv"
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// In-process OpenAI-compatible chat-completions mock.
+// Records every request body so tests can assert on history; supports an
+// optional per-request delay so a turn can be "in flight" for the barge-in test.
+// ──────────────────────────────────────────────────────────────────────────────
+#[derive(Clone, Default)]
+struct LlmMockState {
+    requests: Arc<Mutex<Vec<Value>>>,
+    delay_ms: Arc<AtomicUsize>,
+    reply: Arc<Mutex<String>>,
+}
+
+async fn start_llm_mock(state: LlmMockState) -> String {
+    async fn chat(State(state): State<LlmMockState>, Json(req): Json<Value>) -> Json<Value> {
+        state.requests.lock().push(req.clone());
+        let delay = state.delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+        }
+        let reply = state.reply.lock().clone();
+        Json(json!({
+            "id": "chatcmpl-conv-mock",
+            "object": "chat.completion",
+            "created": 1_700_000_000u64,
+            "model": "mock-llm",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": reply },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+        }))
+    }
+
+    let app = Router::new()
+        .route("/chat/completions", post(chat))
+        .with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://127.0.0.1:{}", addr.port())
+}
+
+fn build_voice_manager() -> Arc<VoiceManager> {
+    let stt_config = STTConfig {
+        provider: "mock-stt-conv".to_string(),
+        api_key: "test".to_string(),
+        ..Default::default()
+    };
+    let tts_config = TTSConfig {
+        provider: "mock-tts-conv".to_string(),
+        api_key: "test".to_string(),
+        ..Default::default()
+    };
+    let config = VoiceManagerConfig::new(stt_config, tts_config);
+    Arc::new(VoiceManager::new(config, None).expect("voice manager"))
+}
+
+/// Wire the mock TTS callback into a marker channel so the test can assert
+/// audio egress, mirroring the gateway's `register_early_tts_callback`.
+async fn wire_audio_egress(vm: &Arc<VoiceManager>) -> Arc<AtomicBool> {
+    let saw_audio = Arc::new(AtomicBool::new(false));
+    let flag = saw_audio.clone();
+    vm.on_tts_audio(move |audio: AudioData| {
+        let flag = flag.clone();
+        Box::pin(async move {
+            if audio
+                .data
+                .windows(TTS_MARKER.len())
+                .any(|w| w == TTS_MARKER)
+            {
+                flag.store(true, Ordering::SeqCst);
+            }
+        })
+    })
+    .await
+    .expect("register tts audio callback");
+    saw_audio
+}
+
+fn conv_config(base_url: String, streaming: bool) -> ConversationConfig {
+    ConversationConfig {
+        base_url,
+        model: "mock-llm".to_string(),
+        system_prompt: Some("You are a helpful assistant.".to_string()),
+        api_key: Some("test".to_string()),
+        streaming,
+        allow_interruption: true,
+        ..Default::default()
+    }
+}
+
+fn final_result(text: &str) -> STTResult {
+    // is_final = true, is_speech_final = true → a finalized turn.
+    STTResult::new(text.to_string(), true, true, 0.99)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TEST 1: a final transcript triggers an LLM call, then TTS.
+// ──────────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+#[serial_test::serial]
+async fn final_transcript_triggers_llm_then_tts() {
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let llm_state = LlmMockState::default();
+    *llm_state.reply.lock() = "Hi there, how can I help?".to_string();
+    let base_url = start_llm_mock(llm_state.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let saw_audio = wire_audio_egress(&vm).await;
+
+    // Non-streaming for this test so the full reply is spoken in one call.
+    let orchestrator =
+        ConversationOrchestrator::new("session-1", conv_config(base_url, false), vm.clone())
+            .expect("orchestrator");
+
+    // Feed a finalized STT result.
+    orchestrator.on_stt_result(&final_result("hello agent")).await;
+
+    // The LLM mock must have been hit, and the reply must have been spoken.
+    assert_eq!(
+        llm_state.requests.lock().len(),
+        1,
+        "LLM endpoint should be called once on a finalized turn"
+    );
+
+    let spoken = TTS_STATS.spoken.lock().clone();
+    assert!(
+        spoken.iter().any(|s| s.contains("how can I help")),
+        "VoiceManager::speak() should be invoked with the LLM reply, got: {:?}",
+        spoken
+    );
+
+    // And TTS audio must egress.
+    assert!(
+        saw_audio.load(Ordering::SeqCst),
+        "Expected TTS audio egress after the LLM reply was spoken"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TEST 2: barge-in cancels the in-flight LLM turn and clears TTS.
+// ──────────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+#[serial_test::serial]
+async fn barge_in_interrupts_tts() {
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let llm_state = LlmMockState::default();
+    *llm_state.reply.lock() = "This is a long answer.".to_string();
+    // Make the LLM slow so the first turn is still in flight when we barge in.
+    llm_state.delay_ms.store(1500, Ordering::SeqCst);
+    let base_url = start_llm_mock(llm_state.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+
+    let orchestrator = Arc::new(
+        ConversationOrchestrator::new("session-bargein", conv_config(base_url, false), vm.clone())
+            .expect("orchestrator"),
+    );
+
+    // Kick off turn 1 (will block ~1.5s in the LLM mock).
+    let orch1 = orchestrator.clone();
+    let turn1 = tokio::spawn(async move {
+        orch1.run_turn("tell me a long story").await.ok();
+    });
+
+    // Give the turn time to start the (slow) LLM request.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // New user speech arrives → barge-in: cancel the in-flight turn + clear TTS.
+    // (We invoke the barge-in handler directly to isolate the interruption
+    // behavior; the full `on_stt_result` path additionally starts a new turn,
+    // which `final_transcript_triggers_llm_then_tts` already covers.)
+    orchestrator.handle_barge_in().await;
+
+    let clears_after_barge_in = TTS_STATS.clears.load(Ordering::SeqCst);
+    assert!(
+        clears_after_barge_in >= 1,
+        "barge-in must clear TTS at least once, saw {}",
+        clears_after_barge_in
+    );
+
+    // The first (slow) turn must have been cancelled: it should NOT have spoken
+    // its reply. Wait for the spawned task to settle.
+    let _ = tokio::time::timeout(Duration::from_secs(3), turn1).await;
+
+    let spoken = TTS_STATS.spoken.lock().clone();
+    assert!(
+        !spoken.iter().any(|s| s.contains("This is a long answer")),
+        "the in-flight LLM turn must be cancelled before its reply is spoken, got: {:?}",
+        spoken
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TEST 3: multi-turn history is preserved (turn 2 includes turn 1).
+// ──────────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+#[serial_test::serial]
+async fn multi_turn_history_preserved() {
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let llm_state = LlmMockState::default();
+    *llm_state.reply.lock() = "Reply one.".to_string();
+    let base_url = start_llm_mock(llm_state.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+
+    let orchestrator =
+        ConversationOrchestrator::new("session-multi", conv_config(base_url, false), vm.clone())
+            .expect("orchestrator");
+
+    // Turn 1.
+    orchestrator
+        .on_stt_result(&final_result("my name is Ada"))
+        .await;
+    // Change the canned reply so we can distinguish responses if needed.
+    *llm_state.reply.lock() = "Reply two.".to_string();
+    // Turn 2.
+    orchestrator
+        .on_stt_result(&final_result("what is my name?"))
+        .await;
+
+    let requests = llm_state.requests.lock().clone();
+    assert_eq!(requests.len(), 2, "two finalized turns → two LLM requests");
+
+    // The SECOND request's messages must include turn 1's user message AND the
+    // assistant reply from turn 1, proving conversation history is carried.
+    let second = &requests[1];
+    let messages = second["messages"].as_array().expect("messages array");
+
+    let contents: Vec<String> = messages
+        .iter()
+        .filter_map(|m| m["content"].as_str().map(|s| s.to_string()))
+        .collect();
+
+    assert!(
+        contents.iter().any(|c| c.contains("my name is Ada")),
+        "turn 2 request must include turn 1's user message, got: {:?}",
+        contents
+    );
+    assert!(
+        contents.iter().any(|c| c.contains("Reply one")),
+        "turn 2 request must include turn 1's assistant reply, got: {:?}",
+        contents
+    );
+    assert!(
+        contents.iter().any(|c| c.contains("what is my name?")),
+        "turn 2 request must include turn 2's user message, got: {:?}",
+        contents
+    );
+
+    // System prompt seeded on turn 1 must persist.
+    assert!(
+        contents
+            .iter()
+            .any(|c| c.contains("You are a helpful assistant.")),
+        "system prompt must persist across turns, got: {:?}",
+        contents
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Bonus: the LlmClient streams tokens to a callback (the mechanism the
+// orchestrator uses to pipe tokens to TTS). Uses an SSE mock.
+// ──────────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+async fn llm_client_streams_tokens_to_callback() {
+    use axum::response::sse::{Event, Sse};
+    use futures::stream;
+
+    async fn sse_chat(
+    ) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+        let chunks = vec![
+            json!({"id":"1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}),
+            json!({"id":"1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":"stop"}]}),
+        ];
+        let events = chunks
+            .into_iter()
+            .map(|c| Ok(Event::default().data(c.to_string())))
+            .chain(std::iter::once(Ok(Event::default().data("[DONE]"))))
+            .collect::<Vec<_>>();
+        Sse::new(stream::iter(events))
+    }
+
+    let app = Router::new().route("/chat/completions", post(sse_chat));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base_url = format!("http://127.0.0.1:{}", addr.port());
+
+    let client = LlmClient::new(LlmClientConfig {
+        base_url,
+        model: "m".to_string(),
+        streaming: true,
+        ..Default::default()
+    });
+
+    let collected = Arc::new(Mutex::new(String::new()));
+    let collected_cb = collected.clone();
+    let cb: waav_gateway::core::llm::TokenCallback =
+        Arc::new(move |delta: &str| collected_cb.lock().push_str(delta));
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let resp = client
+        .complete("s", "hi", Some("k"), &cancel, Some(cb))
+        .await
+        .expect("stream ok");
+
+    assert_eq!(resp.content, "Hello world");
+    assert_eq!(*collected.lock(), "Hello world");
+}

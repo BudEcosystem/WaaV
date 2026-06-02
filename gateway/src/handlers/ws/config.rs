@@ -41,6 +41,82 @@ pub struct DAGWebSocketConfig {
     pub timeout_ms: Option<u64>,
 }
 
+/// Conversation-loop configuration for WebSocket messages (plan W-O2).
+///
+/// When present on a `config` message, the gateway wires up a built-in
+/// automatic conversation loop: each finalized STT turn is sent to an
+/// OpenAI-compatible LLM and the reply is streamed to TTS, with per-session
+/// history and barge-in. When absent, the gateway keeps its raw STT/TTS
+/// behavior (fully backward-compatible).
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ConversationWebSocketConfig {
+    /// OpenAI-compatible base URL for the LLM (e.g. `https://api.openai.com/v1`).
+    #[cfg_attr(feature = "openapi", schema(example = "https://api.openai.com/v1"))]
+    pub base_url: String,
+
+    /// Model identifier.
+    #[cfg_attr(feature = "openapi", schema(example = "gpt-4o-mini"))]
+    pub model: String,
+
+    /// Optional system prompt seeding the conversation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+
+    /// API key (literal or `${ENV_VAR}`); falls back to `OPENAI_API_KEY`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+
+    /// Sampling temperature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+
+    /// Max tokens per completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+
+    /// Stream tokens to TTS as they arrive (default true).
+    #[serde(default = "default_conversation_streaming")]
+    pub streaming: bool,
+
+    /// Max retained history messages (default 20).
+    #[serde(default = "default_conversation_max_history")]
+    pub max_history: usize,
+
+    /// Whether the bot's speech is interruptible / barge-in (default true).
+    #[serde(default = "default_conversation_allow_interruption")]
+    pub allow_interruption: bool,
+}
+
+fn default_conversation_streaming() -> bool {
+    true
+}
+
+fn default_conversation_max_history() -> usize {
+    20
+}
+
+fn default_conversation_allow_interruption() -> bool {
+    true
+}
+
+impl ConversationWebSocketConfig {
+    /// Convert into the core `ConversationConfig`.
+    pub fn to_conversation_config(&self) -> crate::core::conversation::ConversationConfig {
+        crate::core::conversation::ConversationConfig {
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            system_prompt: self.system_prompt.clone(),
+            api_key: self.api_key.clone(),
+            temperature: self.temperature,
+            max_tokens: self.max_tokens,
+            streaming: self.streaming,
+            max_history: self.max_history,
+            allow_interruption: self.allow_interruption,
+        }
+    }
+}
+
 /// Default value for audio enabled flag (true)
 pub fn default_audio_enabled() -> Option<bool> {
     Some(true)

@@ -430,7 +430,9 @@ pub mod state;
 mod tests;
 
 // Re-export commonly used items
-pub use config::{LiveKitWebSocketConfig, STTWebSocketConfig, TTSWebSocketConfig};
+pub use config::{
+    ConversationWebSocketConfig, LiveKitWebSocketConfig, STTWebSocketConfig, TTSWebSocketConfig,
+};
 pub use handler::ws_voice_handler;
 pub use messages::{IncomingMessage, OutgoingMessage, ParticipantDisconnectedInfo, UnifiedMessage};
 pub use state::ConnectionState;
