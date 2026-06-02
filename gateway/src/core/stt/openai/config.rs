@@ -595,6 +595,12 @@ impl OpenAISTTConfig {
         }
         if let Some(w) = f.word_timestamps {
             cfg.timestamp_granularities = if w {
+                // Granularities are only sent for VerboseJson (client.rs guards on it). Ensure a
+                // word-timestamp request that isn't also a diarization request lands on VerboseJson
+                // so the granularities actually reach the wire. (Review S6.)
+                if cfg.response_format != ResponseFormat::DiarizedJson {
+                    cfg.response_format = ResponseFormat::VerboseJson;
+                }
                 vec![TimestampGranularity::Word]
             } else {
                 Vec::new()

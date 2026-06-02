@@ -56,6 +56,8 @@ struct OpenAIRequestBuilder {
     response_format: AudioOutputFormat,
     /// Speaking speed (0.25 to 4.0)
     speed: f32,
+    /// Delivery/acting instructions (gpt-4o-mini-tts only; ignored by tts-1/tts-1-hd).
+    instructions: Option<String>,
     /// Pronunciation replacer
     pronunciation_replacer: Option<PronunciationReplacer>,
 }
@@ -74,6 +76,14 @@ impl TTSRequestBuilder for OpenAIRequestBuilder {
         // Add speed if not default (1.0)
         if (self.speed - 1.0).abs() > 0.001 {
             body["speed"] = json!(self.speed);
+        }
+
+        // gpt-4o-mini-tts accepts delivery/acting `instructions`; older tts-1/tts-1-hd models do
+        // not (sending it there would be rejected), so it is gated on the model. (Review S3.)
+        if let Some(instr) = &self.instructions
+            && matches!(self.model, OpenAITTSModel::Gpt4oMiniTts)
+        {
+            body["instructions"] = json!(instr);
         }
 
         client
@@ -214,6 +224,7 @@ impl OpenAITTS {
             voice,
             response_format,
             speed,
+            instructions: None,
             pronunciation_replacer,
         };
 
@@ -228,12 +239,11 @@ impl OpenAITTS {
 
     /// Build from the standardized config (W1 keystone for TTS — uniform entry point).
     ///
-    /// OpenAI's speech API exposes a narrow control surface (model, voice, format, speed), so
-    /// most advanced [`TtsFeatures`] are capability gaps and are skipped. Only `speed` maps to a
-    /// real, applied field: it folds into `speaking_rate`, which [`OpenAITTS::new`] reads and
-    /// clamps into the request builder. All other features (instructions, ElevenLabs voice
-    /// settings, pitch/volume, emotion, ssml, word_timestamps, streaming, seed, language,
-    /// sample_rate) have no corresponding OpenAI parameter and are intentionally not mapped.
+    /// OpenAI's speech API exposes a narrow control surface (model, voice, format, speed, plus
+    /// `instructions` on gpt-4o-mini-tts). `speed` folds into `speaking_rate`; `instructions` maps
+    /// to the gpt-4o-mini-tts delivery/acting field (ignored on tts-1/tts-1-hd). The remaining
+    /// features (ElevenLabs voice settings, pitch/volume, emotion, ssml, word_timestamps,
+    /// streaming, seed, language, sample_rate) have no OpenAI parameter and are not mapped.
     ///
     /// [`TtsFeatures`]: crate::core::tts::standard::TtsFeatures
     pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
@@ -242,7 +252,12 @@ impl OpenAITTS {
         if let Some(speed) = f.speed {
             base.speaking_rate = Some(speed);
         }
-        OpenAITTS::new(base)
+        let mut tts = OpenAITTS::new(base)?;
+        // gpt-4o-mini-tts delivery instructions (Review S3); gated to the right model in the body.
+        if let Some(instr) = &f.instructions {
+            tts.request_builder.instructions = Some(instr.clone());
+        }
+        Ok(tts)
     }
 
     /// Get the configured model
@@ -448,6 +463,7 @@ mod tests {
             voice: OpenAIVoice::Nova,
             response_format: AudioOutputFormat::Mp3,
             speed: 1.5,
+            instructions: None,
             pronunciation_replacer: None,
         };
 

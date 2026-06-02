@@ -244,6 +244,12 @@ impl AzureSTTConfig {
         }
         if let Some(w) = f.word_timestamps {
             cfg.word_level_timing = w;
+            // Azure only emits word offsets under the `detailed` output format; force it on so the
+            // toggle is meaningful (otherwise word_level_timing is a no-op the wire never sees).
+            // Review S5. (Azure cannot suppress word offsets when `false`; that is documented.)
+            if w {
+                cfg.output_format = AzureOutputFormat::Detailed;
+            }
         }
         if let Some(p) = f.profanity_filter {
             // Azure masks profanity with asterisks when filtering is on, and returns the
