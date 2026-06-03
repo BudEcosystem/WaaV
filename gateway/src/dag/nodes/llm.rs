@@ -320,6 +320,13 @@ impl DAGNode for LlmEndpointNode {
             .await
             .map_err(map_llm_error)?;
 
+        // A plain text completion (no tool calls) flows downstream as `Text` so it chains directly
+        // into a TTS / text-output / another LLM node (e.g. STT → translate(LLM) → TTS). Tool-call
+        // responses keep the structured `Json` envelope so a router/transform can act on them.
+        if response.tool_calls.is_empty() && !response.content.is_empty() {
+            return Ok(DAGData::Text(response.content));
+        }
+
         let response_json = serde_json::json!({
             "id": response.id,
             "model": response.model,

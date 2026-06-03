@@ -243,7 +243,10 @@ impl DAGCompiler {
                 model,
                 language,
             } => {
-                let mut node = STTProviderNode::new(&def.id, provider);
+                // Thread the node's `config` blob so the provider credential (`"api_key"`,
+                // literal or `${ENV_VAR}`) reaches the STT config at execute time.
+                let mut node =
+                    STTProviderNode::new(&def.id, provider).with_config(def.config.clone());
                 if let Some(m) = model {
                     node = node.with_model(m);
                 }
@@ -257,7 +260,8 @@ impl DAGCompiler {
                 voice_id,
                 model,
             } => {
-                let mut node = TTSProviderNode::new(&def.id, provider);
+                let mut node =
+                    TTSProviderNode::new(&def.id, provider).with_config(def.config.clone());
                 if let Some(v) = voice_id {
                     node = node.with_voice(v);
                 }
@@ -267,7 +271,8 @@ impl DAGCompiler {
                 Arc::new(node)
             }
             NodeType::RealtimeProvider { provider, model } => {
-                let mut node = RealtimeProviderNode::new(&def.id, provider);
+                let mut node =
+                    RealtimeProviderNode::new(&def.id, provider).with_config(def.config.clone());
                 if let Some(m) = model {
                     node = node.with_model(m);
                 }

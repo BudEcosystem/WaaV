@@ -1,0 +1,40 @@
+{
+  "id": "en-to-hindi-multivendor",
+  "name": "English speech -> Hindi speech (Deepgram STT -> Sarvam translate -> ElevenLabs TTS)",
+  "version": "1.0.0",
+  "_comment": "A multi-vendor voice DAG: transcribe English speech (Deepgram), translate EN->HI with an LLM (Sarvam, OpenAI-compatible chat), and synthesize Hindi speech (ElevenLabs multilingual). Credentials are injected from the environment via ${ENV_VAR} — NEVER hardcode keys. Provider nodes read api_key from their `config` blob; the llm node from its typed `api_key` field. Sarvam-30b is a reasoning model, so max_tokens must be generous (>=4000) or it returns null content. Live-validated end-to-end by tests/dag_multivendor_live_e2e.rs. For gateway WS delivery, append an `audio_output` node after `tts`.",
+  "nodes": [
+    {
+      "id": "stt",
+      "type": "stt_provider",
+      "provider": "deepgram",
+      "model": "nova-2",
+      "language": "en-US",
+      "config": { "api_key": "${DEEPGRAM_API_KEY}" }
+    },
+    {
+      "id": "translate",
+      "type": "llm_endpoint",
+      "base_url": "https://api.sarvam.ai/v1",
+      "model": "sarvam-30b",
+      "api_key": "${SARVAM_API_KEY}",
+      "system_prompt": "You are a translation engine. Translate the user's English text into Hindi in Devanagari script. Output ONLY the Hindi translation - no English, no transliteration, no notes.",
+      "temperature": 0.1,
+      "max_tokens": 4000
+    },
+    {
+      "id": "tts",
+      "type": "tts_provider",
+      "provider": "elevenlabs",
+      "voice_id": "21m00Tcm4TlvDq8ikWAM",
+      "model": "eleven_multilingual_v2",
+      "config": { "api_key": "${ELEVENLABS_API_KEY}" }
+    }
+  ],
+  "edges": [
+    { "from": "stt", "to": "translate" },
+    { "from": "translate", "to": "tts" }
+  ],
+  "entry_node": "stt",
+  "exit_nodes": ["tts"]
+}

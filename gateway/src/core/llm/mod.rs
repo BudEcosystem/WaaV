@@ -66,6 +66,8 @@ pub const ALLOWED_ENV_VARS: &[&str] = &[
     "VLLM_API_KEY",
     // LiteLLM proxy
     "LITELLM_API_KEY",
+    // Sarvam (OpenAI-compatible chat; Indic translation/LLM)
+    "SARVAM_API_KEY",
 ];
 
 /// Maximum number of bytes of streamed LLM content to accumulate before the
@@ -692,6 +694,12 @@ impl LlmClient {
         cancel: &CancellationToken,
         on_token: Option<TokenCallback>,
     ) -> LlmResult<LlmResponse> {
+        // Resolve the credential ONCE here (per-call key > config key, literal or `${ENV_VAR}` >
+        // `OPENAI_API_KEY`). Without this, a `None` per-call key (e.g. a DAG node with no
+        // per-connection key) skipped the config/`${ENV_VAR}` fallback entirely and sent an
+        // unauthenticated request — the config `api_key` was silently ignored.
+        let resolved = self.resolve_api_key(api_key);
+        let api_key = resolved.as_deref();
         if self.config.streaming {
             self.complete_streaming(session_id, input, api_key, cancel, on_token)
                 .await

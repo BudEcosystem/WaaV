@@ -23,6 +23,42 @@ use crate::core::tts::{AudioCallback, AudioData, TTSError};
 use crate::dag::context::DAGContext;
 use crate::dag::error::{DAGError, DAGResult};
 
+/// Resolve a provider credential from a DAG node's `config` blob.
+///
+/// Supports either a literal value or `${ENV_VAR}` indirection. To keep a DAG definition from
+/// exfiltrating arbitrary process environment variables, `${ENV_VAR}` is honored ONLY when the
+/// variable name looks like a credential (upper-snake-case ending in a credential suffix such as
+/// `_API_KEY`/`_API_TOKEN`/`_SECRET_KEY`/`_ACCESS_KEY`/`_SUBSCRIPTION_KEY`/`_TOKEN`). Returns
+/// `None` when the field is absent or a non-credential env var was requested (logged + blocked).
+///
+/// Without this, STT/TTS provider nodes built `STTConfig`/`TTSConfig` with an EMPTY `api_key`, so a
+/// DAG could never authenticate to a real vendor — the node failed with "API key is required".
+pub(crate) fn resolve_node_credential(config: &serde_json::Value, field: &str) -> Option<String> {
+    let raw = config.get(field)?.as_str()?;
+    if let Some(var) = raw.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+        let looks_like_credential = !var.is_empty()
+            && var
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            && [
+                "_API_KEY",
+                "_API_TOKEN",
+                "_SECRET_KEY",
+                "_ACCESS_KEY",
+                "_SUBSCRIPTION_KEY",
+                "_TOKEN",
+            ]
+            .iter()
+            .any(|suffix| var.ends_with(suffix));
+        if !looks_like_credential {
+            warn!(var = %var, "DAG node config: blocked ${{}} reference to a non-credential env var");
+            return None;
+        }
+        return std::env::var(var).ok();
+    }
+    Some(raw.to_string())
+}
+
 /// Callback bridge for TTS provider to DAG node
 ///
 /// This struct implements the `AudioCallback` trait and bridges
@@ -197,11 +233,14 @@ impl DAGNode for STTProviderNode {
         // Get STT provider from registry
         let registry = crate::plugin::global_registry();
 
-        // Build STT configuration
+        // Build STT configuration. The credential comes from the node's `config` blob
+        // (`"api_key"`, literal or `${ENV_VAR}`); without it the provider would reject the
+        // connection with "API key is required".
         let stt_config = crate::core::stt::STTConfig {
             provider: self.provider.clone(),
             model: self.model.clone().unwrap_or_default(),
             language: self.language.clone().unwrap_or_else(|| "en-US".to_string()),
+            api_key: resolve_node_credential(&self.config, "api_key").unwrap_or_default(),
             ..Default::default()
         };
 
@@ -565,11 +604,13 @@ impl DAGNode for TTSProviderNode {
         // Get TTS provider from registry
         let registry = crate::plugin::global_registry();
 
-        // Build TTS configuration
+        // Build TTS configuration. The credential comes from the node's `config` blob
+        // (`"api_key"`, literal or `${ENV_VAR}`); without it the provider could not authenticate.
         let tts_config = crate::core::tts::TTSConfig {
             provider: self.provider.clone(),
             voice_id: self.voice_id.clone(),
             model: self.model.clone().unwrap_or_default(),
+            api_key: resolve_node_credential(&self.config, "api_key").unwrap_or_default(),
             ..Default::default()
         };
 
