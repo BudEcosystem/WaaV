@@ -1026,6 +1026,7 @@ fn generate_report(
 /// This test requires the gateway to be running on PORT 3001.
 /// Start gateway with: cargo run --release
 #[tokio::test]
+#[ignore = "scale benchmark: needs a live gateway on :3001 + 10k connections. Run explicitly with --ignored"]
 async fn test_scale_benchmark_10k_live() {
     println!("\n{}", "=".repeat(70));
     println!("WaaV Gateway Scale Benchmark - 10,000 Requests");
@@ -1132,6 +1133,7 @@ async fn test_scale_benchmark_10k_live() {
 ///
 /// Uses mock providers with near-zero latency to isolate gateway performance
 #[tokio::test]
+#[ignore = "perf benchmark (high connection volume). Run explicitly with --ignored"]
 async fn test_gateway_overhead_benchmark() {
     println!("\n{}", "=".repeat(70));
     println!("WaaV Gateway Overhead Benchmark (Zero-Latency Mocks)");
@@ -1237,6 +1239,7 @@ async fn test_gateway_overhead_benchmark() {
 
 /// E2E benchmark with realistic provider latencies
 #[tokio::test]
+#[ignore = "perf benchmark (high connection volume). Run explicitly with --ignored"]
 async fn test_e2e_realistic_benchmark() {
     println!("\n{}", "=".repeat(70));
     println!("WaaV Gateway E2E Benchmark (Realistic Provider Latencies)");
@@ -1316,6 +1319,7 @@ async fn test_e2e_realistic_benchmark() {
 
 /// Chaos benchmark - test gateway resilience under provider failures
 #[tokio::test]
+#[ignore = "perf benchmark (high connection volume). Run explicitly with --ignored"]
 async fn test_chaos_benchmark() {
     println!("\n{}", "=".repeat(70));
     println!("WaaV Gateway Chaos Benchmark (5% Failure Rate)");

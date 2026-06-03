@@ -488,6 +488,7 @@ fn get_hardware_info() -> HardwareInfo {
 
 /// Find the breaking point of the gateway by escalating load
 #[tokio::test]
+#[ignore = "load/breaking-point test: escalates to 50k VUs (~65min). Run explicitly: cargo test --test breaking_point_test --release -- --ignored --nocapture"]
 async fn test_find_breaking_point() {
     println!("\n{}", "=".repeat(70));
     println!("WaaV Gateway Breaking Point Test");
@@ -622,6 +623,7 @@ async fn test_find_breaking_point() {
 
 /// Quick breaking point test (shorter iterations)
 #[tokio::test]
+#[ignore = "load test: 50k-permit semaphore stress. Run explicitly: cargo test --test breaking_point_test --release -- --ignored --nocapture"]
 async fn test_quick_breaking_point() {
     println!("\n{}", "=".repeat(70));
     println!("WaaV Gateway Quick Breaking Point Test (10s iterations)");
