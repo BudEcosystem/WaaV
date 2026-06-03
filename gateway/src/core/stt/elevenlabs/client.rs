@@ -7,6 +7,7 @@ use base64::prelude::*;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::time::timeout;
@@ -232,6 +233,11 @@ pub struct ElevenLabsSTT {
     /// Current connection state
     pub(crate) state: ConnectionState,
 
+    /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
+    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// server-side close can never trigger a spurious reconnect.
+    intentional_disconnect: Arc<AtomicBool>,
+
     /// State change notification
     state_notify: Arc<Notify>,
 
@@ -279,6 +285,7 @@ impl Default for ElevenLabsSTT {
         Self {
             config: None,
             state: ConnectionState::Disconnected,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
             shutdown_tx: None,
@@ -597,6 +604,10 @@ impl ElevenLabsSTT {
 
     /// Start the WebSocket connection to ElevenLabs STT API.
     async fn start_connection(&mut self, config: ElevenLabsSTTConfig) -> Result<(), STTError> {
+        // Fresh session: clear any intent left over from a prior disconnect so the supervisor
+        // does not immediately complete.
+        self.intentional_disconnect.store(false, Ordering::SeqCst);
+
         let ws_url = self.build_websocket_url(&config)?;
 
         // Create channels for communication
@@ -629,6 +640,9 @@ impl ElevenLabsSTT {
         // (W-D1/W-D2 production adoption). When no handles were injected (a direct unit-test
         // construction), the supervisor uses its own per-session governor/breaker default.
         let reconnection = ReconnectionConfig::aggressive();
+        // Capture the shared intentional-disconnect flag clone while `self` is still borrowable,
+        // before the supervisor is moved into `tokio::spawn` (W-D1 disconnect-vs-close race fix).
+        let disconnect_flag = Arc::clone(&self.intentional_disconnect);
         let supervisor = match self.resilience.clone() {
             Some(r) => ReconnectableStream::with_breaker_and_governor(
                 ReconnectableStreamConfig::new("elevenlabs", reconnection),
@@ -639,7 +653,8 @@ impl ElevenLabsSTT {
                 "elevenlabs",
                 reconnection,
             )),
-        };
+        }
+        .with_disconnect_flag(disconnect_flag);
 
         // Start the connection task: the supervisor owns the outer reconnect loop; the `connect`
         // closure dials the *featured* URL (every feature is in the URL) and hands back a
@@ -791,6 +806,7 @@ impl BaseSTT for ElevenLabsSTT {
         Ok(Self {
             config: Some(elevenlabs_config),
             state: ConnectionState::Disconnected,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
             shutdown_tx: None,
@@ -815,6 +831,10 @@ impl BaseSTT for ElevenLabsSTT {
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
+        // Record the intent BEFORE firing `shutdown_tx` so the supervisor sees it even if the
+        // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
         }
@@ -1022,5 +1042,31 @@ impl ElevenLabsSTT {
         }
 
         self.connect().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // W-D1 disconnect-vs-close race: the supervisor-shared intentional-disconnect flag must be set
+    // by disconnect() so a client close racing a server-side close can never trigger a spurious
+    // reconnect. Reads the private field directly (same module), mirroring the reference provider.
+    #[tokio::test]
+    async fn disconnect_sets_intentional_flag_for_supervisor() {
+        let config = STTConfig {
+            api_key: "test-api-key".to_string(),
+            language: "en".to_string(),
+            sample_rate: 16000,
+            encoding: "pcm_s16le".to_string(),
+            ..Default::default()
+        };
+        let mut stt = ElevenLabsSTT::new(config).unwrap();
+        assert!(!stt.intentional_disconnect.load(Ordering::SeqCst));
+        stt.disconnect().await.unwrap();
+        assert!(
+            stt.intentional_disconnect.load(Ordering::SeqCst),
+            "disconnect() must set the supervisor-shared intentional-disconnect flag",
+        );
     }
 }

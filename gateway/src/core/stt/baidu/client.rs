@@ -37,13 +37,16 @@
 //! 3. WebSocket uses appid + appkey in START frame
 
 use bytes::Bytes;
+use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
 use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message,
+};
 use tracing::{debug, error, info, warn};
 
 use super::config::{BAIDU_OAUTH_URL, BaiduOAuthResponse, BaiduSttConfig};
@@ -53,6 +56,11 @@ use super::messages::{
 };
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
+};
+use crate::core::websocket::ReconnectionConfig;
+use crate::core::websocket::reconnectable_stream::{
+    ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
+    WsTransport,
 };
 
 // =============================================================================
@@ -64,6 +72,10 @@ const PROVIDER_INFO: &str = "Baidu AI Cloud Speech (百度语音)";
 
 /// WebSocket connection timeout.
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-message idle timeout for WebSocket message reception. Resets after each successful
+/// message; catches stuck/dead connections so the supervisor can reconnect.
+const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// HTTP request timeout for OAuth and REST API.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -97,6 +109,132 @@ type AsyncErrorCallback = Box<
         + Send
         + Sync,
 >;
+
+/// The concrete WebSocket stream type Baidu dials.
+type BaiduWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+// =============================================================================
+// Reconnect transport (W-D1 fleet adoption)
+// =============================================================================
+
+/// A [`WsTransport`] that adapts Baidu's real-time ASR event loop to the generic
+/// [`ReconnectableStream`] supervisor. One is built per (re)connect by the supervisor's `connect`
+/// closure. Only the WebSocket real-time mode flows through here; the REST short-audio mode has no
+/// persistent stream and is unaffected.
+///
+/// Like Azure (config carried in a **post-handshake message**, not the URL), Baidu opens its
+/// featured session with a `START` frame (appid/appkey, dev_pid model, sample rate, format) sent
+/// after the handshake. So [`restore_session`](WsTransport::restore_session) re-sends that frame on
+/// the fresh socket — without it a reconnect would resume as a *bare* session. [`run`](WsTransport::run)
+/// replaces the original split send/recv tasks with a single `select!` loop that returns a
+/// [`ReconnectOutcome`] so a mid-stream transport drop reconnects instead of silently ending the
+/// session.
+struct BaiduTransport {
+    ws_sink: SplitSink<BaiduWs, Message>,
+    ws_stream: SplitStream<BaiduWs>,
+    /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
+    audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
+    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
+    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    result_tx: mpsc::Sender<STTResult>,
+    error_tx: mpsc::Sender<STTError>,
+    /// Fires once after the featured session is (re)established, unblocking `connect`.
+    connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// The pre-serialized `START` frame JSON, re-sent on every restore so reconnects keep the
+    /// featured session (dev_pid model, sample rate, format, credentials).
+    start_frame_json: String,
+}
+
+#[async_trait::async_trait]
+impl WsTransport for BaiduTransport {
+    async fn restore_session(&mut self) -> Result<(), RestoreError> {
+        // Re-send the featured `START` frame on this fresh socket. A reconnect must NOT resume as
+        // a bare session.
+        self.ws_sink
+            .send(Message::Text(self.start_frame_json.clone().into()))
+            .await
+            .map_err(|e| RestoreError::new(format!("failed to send Baidu START frame: {e}")))?;
+
+        // The featured session is established: signal the waiting connect() exactly once.
+        if let Some(tx) = self.connected_tx.lock().await.take() {
+            let _ = tx.send(());
+        }
+        Ok(())
+    }
+
+    async fn run(&mut self) -> ReconnectOutcome {
+        let mut audio_rx = self.audio_rx.lock().await;
+        let mut shutdown_rx = self.shutdown_rx.lock().await;
+        loop {
+            tokio::select! {
+                // Handle outgoing audio data (raw binary frames)
+                Some(audio) = audio_rx.recv() => {
+                    if let Err(e) = self.ws_sink.send(Message::Binary(audio.to_vec().into())).await {
+                        let stt_error = STTError::NetworkError(format!(
+                            "Failed to send audio to Baidu: {e}"
+                        ));
+                        error!("{}", stt_error);
+                        let _ = self.error_tx.try_send(stt_error);
+                        return ReconnectOutcome::Reconnectable(StreamError::new("audio send failed"));
+                    }
+                }
+
+                // Handle incoming messages with idle timeout
+                message = timeout(WS_MESSAGE_TIMEOUT, self.ws_stream.next()) => {
+                    match message {
+                        Ok(Some(Ok(Message::Text(text)))) => {
+                            BaiduStt::handle_realtime_response(
+                                &text,
+                                &self.result_tx,
+                                &self.error_tx,
+                            );
+                        }
+                        Ok(Some(Ok(Message::Close(_)))) => {
+                            // The provider signalled end-of-session — an intentional completion,
+                            // NOT a transport drop.
+                            debug!("Baidu WebSocket closed by server");
+                            return ReconnectOutcome::Completed;
+                        }
+                        Ok(Some(Ok(Message::Ping(_)))) => {
+                            debug!("Received ping from Baidu");
+                        }
+                        Ok(Some(Ok(_))) => {
+                            // Binary/Pong/Frame — ignore.
+                        }
+                        Ok(Some(Err(e))) => {
+                            let stt_error = STTError::ConnectionFailed(e.to_string());
+                            error!("Baidu WebSocket error: {}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("websocket error"));
+                        }
+                        Ok(None) => {
+                            info!("Baidu WebSocket stream ended");
+                            return ReconnectOutcome::Reconnectable(StreamError::new("stream ended"));
+                        }
+                        Err(_elapsed) => {
+                            let stt_error = STTError::NetworkError(
+                                "Baidu WebSocket idle timeout - no message for 60 seconds".into()
+                            );
+                            error!("{}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("idle timeout"));
+                        }
+                    }
+                }
+
+                // Handle shutdown signal (intentional close — must NOT reconnect)
+                _ = &mut *shutdown_rx => {
+                    debug!("Received shutdown signal for Baidu STT");
+                    // Send the graceful FINISH frame before closing.
+                    if let Ok(finish_json) = BaiduFinishFrame::new().to_json() {
+                        let _ = self.ws_sink.send(Message::Text(finish_json.into())).await;
+                    }
+                    return ReconnectOutcome::Completed;
+                }
+            }
+        }
+    }
+}
 
 // =============================================================================
 // Token Manager
@@ -244,6 +382,11 @@ pub struct BaiduStt {
     /// Connection state.
     connected: Arc<AtomicBool>,
 
+    /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
+    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// server-side close can never trigger a spurious reconnect.
+    intentional_disconnect: Arc<AtomicBool>,
+
     /// State change notification.
     state_notify: Arc<Notify>,
 
@@ -276,6 +419,12 @@ pub struct BaiduStt {
 
     /// Audio buffer for REST API mode (accumulates audio for batch processing).
     audio_buffer: Arc<Mutex<Vec<u8>>>,
+
+    /// Shared, process-global resilience handles (W-D2): the single reconnect governor + this
+    /// provider's shared circuit breaker, injected by the VoiceManager from CoreState and driven
+    /// by the generic [`ReconnectableStream`] supervisor. `None` before `set_resilience` (a direct
+    /// unit-test construction) → the supervisor uses its own per-session governor/breaker default.
+    resilience: Option<crate::core::resilience::ResilienceHandles>,
 }
 
 impl BaiduStt {
@@ -309,6 +458,7 @@ impl BaiduStt {
             config: baidu_config,
             token_manager: Arc::new(TokenManager::new()),
             connected: Arc::new(AtomicBool::new(false)),
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
             shutdown_tx: None,
@@ -323,6 +473,7 @@ impl BaiduStt {
                 .build()
                 .unwrap_or_default(),
             audio_buffer: Arc::new(Mutex::new(Vec::new())),
+            resilience: None,
         })
     }
 
@@ -332,35 +483,18 @@ impl BaiduStt {
 
         info!("Connecting to Baidu real-time ASR: {}", url);
 
-        // Connect with timeout
-        let (ws_stream, _) = match timeout(WS_CONNECT_TIMEOUT, connect_async(&url)).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(e)) => {
-                return Err(STTError::ConnectionFailed(format!(
-                    "WebSocket connection failed: {}",
-                    e
-                )));
-            }
-            Err(_) => {
-                return Err(STTError::ConnectionFailed("Connection timeout".to_string()));
-            }
-        };
-
-        info!("Connected to Baidu real-time ASR");
-
-        // Split stream
-        let (mut write, mut read) = ws_stream.split();
-
         // Create channels
-        let (audio_tx, mut audio_rx) = mpsc::channel::<Bytes>(AUDIO_CHANNEL_BUFFER);
+        let (audio_tx, audio_rx) = mpsc::channel::<Bytes>(AUDIO_CHANNEL_BUFFER);
         let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(RESULT_CHANNEL_BUFFER);
         let (error_tx, mut error_rx) = mpsc::channel::<STTError>(ERROR_CHANNEL_BUFFER);
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         self.ws_sender = Some(audio_tx);
         self.shutdown_tx = Some(shutdown_tx);
 
-        // Send START frame
+        // Build the featured `START` frame once (re-sent verbatim on every restore by the
+        // supervised transport). A reconnect must restore the featured session, not a bare one.
         let start_frame = BaiduStartFrame::new(
             &self.config.api_key,
             &self.config.secret_key,
@@ -369,94 +503,79 @@ impl BaiduStt {
             self.config.sample_rate.value(),
             self.config.audio_format.as_str(),
         );
-
-        let start_json = start_frame.to_json().map_err(|e| {
+        let start_frame_json = start_frame.to_json().map_err(|e| {
             STTError::ConnectionFailed(format!("Failed to serialize START frame: {}", e))
         })?;
 
-        write
-            .send(Message::Text(start_json.into()))
-            .await
-            .map_err(|e| {
-                STTError::ConnectionFailed(format!("Failed to send START frame: {}", e))
-            })?;
+        // Shared state the supervised transport re-uses across reconnect attempts.
+        let audio_rx = Arc::new(Mutex::new(audio_rx));
+        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
+        let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
 
-        debug!("Sent Baidu START frame");
+        // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor with
+        // the shared process-global handles from CoreState (W-D1/W-D2 fleet adoption). When no
+        // handles were injected (a direct unit-test construction), the supervisor uses its own
+        // per-session governor/breaker default.
+        let reconnection = ReconnectionConfig::aggressive();
+        let disconnect_flag = Arc::clone(&self.intentional_disconnect);
+        let supervisor = match self.resilience.clone() {
+            Some(r) => ReconnectableStream::with_breaker_and_governor(
+                ReconnectableStreamConfig::new("baidu", reconnection),
+                r.breaker,
+                (*r.governor).clone(),
+            ),
+            None => ReconnectableStream::new(ReconnectableStreamConfig::new("baidu", reconnection)),
+        }
+        .with_disconnect_flag(disconnect_flag);
 
-        // Set connected state
+        // Set connected state (the BaseSTT contract: `connect()` returns once the session is
+        // accepted; the supervisor owns the durable reconnect loop from here on).
         self.connected.store(true, Ordering::SeqCst);
         self.state_notify.notify_waiters();
 
-        // Clone for tasks
-        let connected = self.connected.clone();
-        let state_notify = self.state_notify.clone();
-        let result_tx_clone = result_tx.clone();
-        let error_tx_clone = error_tx.clone();
-
-        // Spawn connection handler task
+        // Start the connection task: the supervisor owns the outer reconnect loop; the `connect`
+        // closure dials the realtime URL (sn UUID + credentials in the query) and hands back a
+        // transport whose `restore_session` re-sends the `START` frame and whose `run()` is the
+        // Baidu event loop.
         let connection_handle = tokio::spawn(async move {
-            let send_task = tokio::spawn(async move {
-                while let Some(audio) = audio_rx.recv().await {
-                    // Send binary audio data
-                    if write
-                        .send(Message::Binary(audio.to_vec().into()))
-                        .await
-                        .is_err()
-                    {
-                        break;
+            let exit = supervisor
+                .run(|| {
+                    let url = url.clone();
+                    let start_frame_json = start_frame_json.clone();
+                    let audio_rx = Arc::clone(&audio_rx);
+                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let connected_tx = Arc::clone(&connected_tx);
+                    let result_tx = result_tx.clone();
+                    let error_tx = error_tx.clone();
+                    async move {
+                        let (ws_stream, _) =
+                            match timeout(WS_CONNECT_TIMEOUT, connect_async(&url)).await {
+                                Ok(Ok(s)) => s,
+                                Ok(Err(e)) => {
+                                    return Err(StreamError::new(format!(
+                                        "WebSocket connection failed: {e}"
+                                    )));
+                                }
+                                Err(_) => {
+                                    return Err(StreamError::new("Connection timeout".to_string()));
+                                }
+                            };
+                        info!("Connected to Baidu real-time ASR");
+                        let (ws_sink, ws_stream) = ws_stream.split();
+                        Ok(BaiduTransport {
+                            ws_sink,
+                            ws_stream,
+                            audio_rx,
+                            shutdown_rx,
+                            result_tx,
+                            error_tx,
+                            connected_tx,
+                            start_frame_json,
+                        })
                     }
-                }
-
-                // Send FINISH frame
-                let finish_frame = BaiduFinishFrame::new();
-                if let Ok(finish_json) = finish_frame.to_json() {
-                    let _ = write.send(Message::Text(finish_json.into())).await;
-                }
-
-                write
-            });
-
-            let recv_task = tokio::spawn(async move {
-                while let Some(msg_result) = read.next().await {
-                    match msg_result {
-                        Ok(Message::Text(text)) => {
-                            Self::handle_realtime_response(
-                                &text,
-                                &result_tx_clone,
-                                &error_tx_clone,
-                            );
-                        }
-                        Ok(Message::Close(_)) => {
-                            debug!("Baidu WebSocket closed");
-                            break;
-                        }
-                        Ok(Message::Ping(_)) => {
-                            debug!("Received ping from Baidu");
-                        }
-                        Err(e) => {
-                            error!("Baidu WebSocket error: {}", e);
-                            let _ =
-                                error_tx_clone.try_send(STTError::ConnectionFailed(e.to_string()));
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            });
-
-            // Wait for shutdown or completion
-            tokio::select! {
-                _ = &mut shutdown_rx => {
-                    debug!("Baidu shutdown signal received");
-                }
-                _ = recv_task => {
-                    debug!("Baidu receive task completed");
-                }
-            }
-
-            send_task.abort();
-            connected.store(false, Ordering::SeqCst);
-            state_notify.notify_waiters();
+                })
+                .await;
+            info!("Baidu WebSocket connection closed (supervisor exit: {exit:?})");
         });
 
         self.connection_handle = Some(connection_handle);
@@ -487,7 +606,20 @@ impl BaiduStt {
 
         self.error_forward_handle = Some(error_forward_handle);
 
-        Ok(())
+        // Wait for the featured session to be established (first restore) with a timeout.
+        match timeout(WS_CONNECT_TIMEOUT, connected_rx).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => {
+                self.connected.store(false, Ordering::SeqCst);
+                Err(STTError::ConnectionFailed(
+                    "Connection channel closed before confirmation".to_string(),
+                ))
+            }
+            Err(_) => {
+                self.connected.store(false, Ordering::SeqCst);
+                Err(STTError::ConnectionFailed("Connection timeout".to_string()))
+            }
+        }
     }
 
     /// Handle real-time WebSocket response.
@@ -633,6 +765,10 @@ impl BaseSTT for BaiduStt {
             return Ok(());
         }
 
+        // Fresh session: clear any intent left over from a prior disconnect so the supervisor
+        // does not immediately complete.
+        self.intentional_disconnect.store(false, Ordering::SeqCst);
+
         if self.config.use_realtime {
             self.connect_realtime().await
         } else {
@@ -645,6 +781,10 @@ impl BaseSTT for BaiduStt {
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
+        // Record the intent BEFORE the connected-guard so the supervisor sees it even if the
+        // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+
         if !self.connected.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -756,6 +896,14 @@ impl BaseSTT for BaiduStt {
 
     fn get_provider_info(&self) -> &'static str {
         PROVIDER_INFO
+    }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared, process-global handles so `connect_realtime` drives the generic
+        // ReconnectableStream supervisor with them — every Baidu real-time session trips the same
+        // breaker and shares the one process-wide reconnect cap (W-D2). The REST short-audio mode
+        // has no persistent stream and is unaffected.
+        self.resilience = Some(resilience);
     }
 }
 
@@ -1051,5 +1199,17 @@ mod tests {
         let json = start_frame.to_json().unwrap();
         assert!(json.contains("\"type\":\"START\""));
         assert!(json.contains("\"dev_pid\":1537"));
+    }
+
+    #[tokio::test]
+    async fn disconnect_sets_intentional_flag_for_supervisor() {
+        let config = create_test_config();
+        let mut stt = BaiduStt::new(config).unwrap();
+        assert!(!stt.intentional_disconnect.load(Ordering::SeqCst));
+        stt.disconnect().await.unwrap();
+        assert!(
+            stt.intentional_disconnect.load(Ordering::SeqCst),
+            "disconnect() must set the supervisor-shared intentional-disconnect flag",
+        );
     }
 }

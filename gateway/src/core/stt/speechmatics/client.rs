@@ -7,7 +7,9 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tokio::sync::RwLock;
+use std::time::Duration;
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info};
 
@@ -20,9 +22,235 @@ use super::messages::{
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
+use crate::core::websocket::ReconnectionConfig;
+use crate::core::websocket::reconnectable_stream::{
+    ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
+    WsTransport,
+};
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
+type WsReadStream = futures_util::stream::SplitStream<WsStream>;
+
+/// Per-message idle timeout for WebSocket message reception.
+/// Resets after each successful message. Catches stuck/dead connections.
+const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+// =============================================================================
+// Supervised transport (W-D1 production adoption)
+// =============================================================================
+
+/// A [`WsTransport`] that adapts Speechmatics' streaming event loop to the generic
+/// [`ReconnectableStream`] supervisor (W-D1 fleet adoption). One is built per (re)connect by the
+/// supervisor's `connect` closure.
+///
+/// Unlike Cartesia/Rev AI (all features in the URL → no-op restore), Speechmatics carries its
+/// featured session in a **post-handshake `StartRecognition` message** (audio format + the full
+/// `transcription_config`: diarization, partials, vocabulary, punctuation, EoU, …). So
+/// [`restore_session`](WsTransport::restore_session) re-sends that message on the fresh socket —
+/// without it a reconnect would resume as a *bare* (un-featured) session, exactly the failure mode
+/// the supervisor doc warns about. [`run`](WsTransport::run) IS the original receiver loop, now
+/// returning a [`ReconnectOutcome`] so a transport drop reconnects instead of ending the session.
+struct SpeechmaticsTransport {
+    ws_sink: WsSink,
+    ws_stream: WsReadStream,
+    /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
+    audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
+    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
+    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    /// The featured `StartRecognition` JSON, re-sent verbatim on every restore.
+    start_recognition_json: String,
+    /// Set true once `RecognitionStarted` arrives (drives `is_ready`); cleared per (re)connect.
+    is_session_started: Arc<AtomicBool>,
+    /// Audio sequence number (Speechmatics `EndOfStream` carries the last seq_no).
+    seq_no: Arc<AtomicU64>,
+    result_callback: Arc<RwLock<Option<STTResultCallback>>>,
+    error_callback: Arc<RwLock<Option<STTErrorCallback>>>,
+    /// Fires once after `StartRecognition` is (re)sent, unblocking `connect`.
+    connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+#[async_trait]
+impl WsTransport for SpeechmaticsTransport {
+    async fn restore_session(&mut self) -> Result<(), RestoreError> {
+        // Speechmatics: re-send the featured `StartRecognition` (audio format +
+        // transcription_config) on the fresh socket. A reconnect must NOT resume as a bare session.
+        // A fresh connection has not yet observed `RecognitionStarted`, so clear the flag.
+        self.is_session_started.store(false, Ordering::SeqCst);
+        self.ws_sink
+            .send(Message::Text(self.start_recognition_json.clone().into()))
+            .await
+            .map_err(|e| {
+                RestoreError::new(format!("failed to send Speechmatics StartRecognition: {e}"))
+            })?;
+
+        // The featured session has been (re)requested: signal the waiting connect() exactly once.
+        // (The original client returned readiness right after sending StartRecognition, before
+        // RecognitionStarted; we preserve that to keep the happy path identical.)
+        if let Some(tx) = self.connected_tx.lock().await.take() {
+            let _ = tx.send(());
+        }
+        Ok(())
+    }
+
+    async fn run(&mut self) -> ReconnectOutcome {
+        let mut audio_rx = self.audio_rx.lock().await;
+        let mut shutdown_rx = self.shutdown_rx.lock().await;
+        loop {
+            tokio::select! {
+                // Handle outgoing audio data (raw binary frames).
+                Some(audio_data) = audio_rx.recv() => {
+                    if let Err(e) = self
+                        .ws_sink
+                        .send(Message::Binary(audio_data.to_vec().into()))
+                        .await
+                    {
+                        let stt_error = STTError::NetworkError(format!("Failed to send audio: {e}"));
+                        error!("{}", stt_error);
+                        if let Some(ref cb) = *self.error_callback.read().await {
+                            cb(stt_error).await;
+                        }
+                        return ReconnectOutcome::Reconnectable(StreamError::new("audio send failed"));
+                    }
+                    self.seq_no.fetch_add(1, Ordering::SeqCst);
+                }
+
+                // Handle incoming messages with idle timeout.
+                message = timeout(WS_MESSAGE_TIMEOUT, self.ws_stream.next()) => {
+                    match message {
+                        Ok(Some(Ok(Message::Text(text)))) => {
+                            if let Some(outcome) = self.handle_text_message(&text).await {
+                                return outcome;
+                            }
+                        }
+                        Ok(Some(Ok(Message::Binary(_)))) => {
+                            debug!("Received unexpected binary message from server");
+                        }
+                        Ok(Some(Ok(Message::Ping(data)))) => {
+                            let _ = self.ws_sink.send(Message::Pong(data)).await;
+                        }
+                        Ok(Some(Ok(Message::Pong(_)))) => {}
+                        Ok(Some(Ok(Message::Close(_)))) => {
+                            info!("WebSocket closed by server");
+                            self.is_session_started.store(false, Ordering::SeqCst);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("server close"));
+                        }
+                        Ok(Some(Ok(Message::Frame(_)))) => {}
+                        Ok(Some(Err(e))) => {
+                            error!("WebSocket error: {}", e);
+                            self.is_session_started.store(false, Ordering::SeqCst);
+                            if let Some(ref cb) = *self.error_callback.read().await {
+                                cb(STTError::ConnectionFailed(e.to_string())).await;
+                            }
+                            return ReconnectOutcome::Reconnectable(StreamError::new("websocket error"));
+                        }
+                        Ok(None) => {
+                            info!("WebSocket stream ended");
+                            self.is_session_started.store(false, Ordering::SeqCst);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("stream ended"));
+                        }
+                        Err(_elapsed) => {
+                            let stt_error = STTError::NetworkError(
+                                "Speechmatics WebSocket idle timeout - no message for 60 seconds".into(),
+                            );
+                            error!("Speechmatics STT idle timeout: {}", stt_error);
+                            self.is_session_started.store(false, Ordering::SeqCst);
+                            if let Some(ref cb) = *self.error_callback.read().await {
+                                cb(stt_error).await;
+                            }
+                            return ReconnectOutcome::Reconnectable(StreamError::new("idle timeout"));
+                        }
+                    }
+                }
+
+                // Handle shutdown signal (intentional close — must NOT reconnect).
+                _ = &mut *shutdown_rx => {
+                    info!("Speechmatics: Received shutdown signal");
+                    let end_msg = EndOfStreamMessage::new(self.seq_no.load(Ordering::SeqCst));
+                    if let Ok(json) = serde_json::to_string(&end_msg) {
+                        let _ = self.ws_sink.send(Message::Text(json.into())).await;
+                    }
+                    let _ = self.ws_sink.close().await;
+                    return ReconnectOutcome::Completed;
+                }
+            }
+        }
+    }
+}
+
+impl SpeechmaticsTransport {
+    /// Parse and route a Speechmatics text message. Returns `Some(outcome)` when the loop must
+    /// exit (provider `Error` → Fatal), `None` to keep running.
+    async fn handle_text_message(&self, text: &str) -> Option<ReconnectOutcome> {
+        let value: serde_json::Value = match serde_json::from_str(text) {
+            Ok(v) => v,
+            Err(_) => return None,
+        };
+        let message_type = value.get("message").and_then(|v| v.as_str()).unwrap_or("");
+
+        match message_type {
+            "RecognitionStarted" => {
+                info!("Speechmatics session started");
+                self.is_session_started.store(true, Ordering::SeqCst);
+            }
+            "AddPartialTranscript" => {
+                if let Ok(msg) = serde_json::from_str::<AddPartialTranscriptMessage>(text) {
+                    let transcript = msg.transcript();
+                    if !transcript.is_empty()
+                        && let Some(callback) = self.result_callback.read().await.as_ref()
+                    {
+                        let result = STTResult::new(transcript.to_string(), false, false, 0.0);
+                        callback(result).await;
+                    }
+                }
+            }
+            "AddTranscript" => {
+                if let Ok(msg) = serde_json::from_str::<AddTranscriptMessage>(text) {
+                    let transcript = msg.transcript();
+                    if !transcript.is_empty() {
+                        let words: Vec<_> = msg.words().collect();
+                        let confidence = if !words.is_empty() {
+                            words.iter().map(|w| w.confidence() as f32).sum::<f32>()
+                                / words.len() as f32
+                        } else {
+                            0.9
+                        };
+
+                        if let Some(callback) = self.result_callback.read().await.as_ref() {
+                            let result =
+                                STTResult::new(transcript.to_string(), true, false, confidence);
+                            callback(result).await;
+                        }
+                    }
+                }
+            }
+            "EndOfTranscript" => {
+                info!("Speechmatics session ended");
+                self.is_session_started.store(false, Ordering::SeqCst);
+            }
+            "EndOfUtterance" => {
+                if let Some(callback) = self.result_callback.read().await.as_ref() {
+                    let result = STTResult::new(String::new(), true, true, 1.0);
+                    callback(result).await;
+                }
+            }
+            "Error" => {
+                if let Ok(msg) = serde_json::from_str::<ErrorMessage>(text) {
+                    error!("Speechmatics error: {}", msg);
+                    if let Some(callback) = self.error_callback.read().await.as_ref() {
+                        callback(STTError::ProviderError(msg.to_string())).await;
+                    }
+                }
+                // A provider error frame is typically fatal (bad config) — don't hammer it with
+                // reconnects.
+                return Some(ReconnectOutcome::Fatal(StreamError::new("provider error frame")));
+            }
+            _ => {}
+        }
+        None
+    }
+}
 
 /// Speechmatics STT WebSocket client
 pub struct SpeechmaticsSTT {
@@ -30,10 +258,18 @@ pub struct SpeechmaticsSTT {
     config: SpeechmaticsSTTConfig,
     /// Base STT configuration
     base_config: Option<STTConfig>,
-    /// WebSocket connection
-    ws: Arc<RwLock<Option<WsStream>>>,
+    /// Audio sender (bounded channel for backpressure); the supervised transport drains it.
+    ws_sender: Option<mpsc::Sender<Bytes>>,
+    /// Shutdown signal sender.
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Connection task handle (the supervisor's outer reconnect loop).
+    connection_handle: Option<tokio::task::JoinHandle<()>>,
     /// Connection state
     is_connected: Arc<AtomicBool>,
+    /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
+    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// server-side close can never trigger a spurious reconnect.
+    intentional_disconnect: Arc<AtomicBool>,
     /// Session started flag
     is_session_started: Arc<AtomicBool>,
     /// Audio sequence number
@@ -42,6 +278,12 @@ pub struct SpeechmaticsSTT {
     result_callback: Arc<RwLock<Option<STTResultCallback>>>,
     /// Error callback
     error_callback: Arc<RwLock<Option<STTErrorCallback>>>,
+    /// Shared, process-global resilience handles (W-D2): the single reconnect governor + this
+    /// provider's shared circuit breaker, injected by the VoiceManager from CoreState and driven
+    /// by the generic [`ReconnectableStream`](crate::core::websocket::ReconnectableStream)
+    /// supervisor. `None` before `set_resilience` (a direct unit-test construction) → the
+    /// supervisor uses its own per-session governor/breaker default.
+    resilience: Option<crate::core::resilience::ResilienceHandles>,
 }
 
 impl SpeechmaticsSTT {
@@ -65,13 +307,24 @@ impl SpeechmaticsSTT {
         Ok(Self {
             config: speechmatics_config,
             base_config: Some(std.base.clone()),
-            ws: Arc::new(RwLock::new(None)),
+            ws_sender: None,
+            shutdown_tx: None,
+            connection_handle: None,
             is_connected: Arc::new(AtomicBool::new(false)),
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             is_session_started: Arc::new(AtomicBool::new(false)),
             seq_no: Arc::new(AtomicU64::new(0)),
             result_callback: Arc::new(RwLock::new(None)),
             error_callback: Arc::new(RwLock::new(None)),
+            resilience: None,
         })
+    }
+
+    /// The shared circuit breaker this session feeds into the generic supervisor, if the
+    /// process-global resilience handles have been injected (W-D1/W-D2). Two `SpeechmaticsSTT`
+    /// built from the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.as_ref().map(|r| &r.breaker)
     }
 
     /// Build the WebSocket URL with authentication
@@ -171,148 +424,6 @@ impl SpeechmaticsSTT {
 
         StartRecognitionMessage::with_config(audio_format, transcription_config)
     }
-
-    /// Start the message receiving loop
-    fn start_receive_loop(
-        ws: Arc<RwLock<Option<WsStream>>>,
-        is_connected: Arc<AtomicBool>,
-        is_session_started: Arc<AtomicBool>,
-        result_callback: Arc<RwLock<Option<STTResultCallback>>>,
-        error_callback: Arc<RwLock<Option<STTErrorCallback>>>,
-    ) {
-        tokio::spawn(async move {
-            loop {
-                let msg = {
-                    let mut ws_guard = ws.write().await;
-                    if let Some(ws_stream) = ws_guard.as_mut() {
-                        ws_stream.next().await
-                    } else {
-                        break;
-                    }
-                };
-
-                match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        // Parse and handle the message inline
-                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                            let message_type =
-                                value.get("message").and_then(|v| v.as_str()).unwrap_or("");
-
-                            match message_type {
-                                "RecognitionStarted" => {
-                                    info!("Speechmatics session started");
-                                    is_session_started.store(true, Ordering::SeqCst);
-                                }
-                                "AddPartialTranscript" => {
-                                    if let Ok(msg) =
-                                        serde_json::from_str::<AddPartialTranscriptMessage>(&text)
-                                    {
-                                        let transcript = msg.transcript();
-                                        if !transcript.is_empty()
-                                            && let Some(callback) =
-                                                result_callback.read().await.as_ref()
-                                            {
-                                                let result = STTResult::new(
-                                                    transcript.to_string(),
-                                                    false,
-                                                    false,
-                                                    0.0,
-                                                );
-                                                callback(result).await;
-                                            }
-                                    }
-                                }
-                                "AddTranscript" => {
-                                    if let Ok(msg) =
-                                        serde_json::from_str::<AddTranscriptMessage>(&text)
-                                    {
-                                        let transcript = msg.transcript();
-                                        if !transcript.is_empty() {
-                                            let words: Vec<_> = msg.words().collect();
-                                            let confidence = if !words.is_empty() {
-                                                words
-                                                    .iter()
-                                                    .map(|w| w.confidence() as f32)
-                                                    .sum::<f32>()
-                                                    / words.len() as f32
-                                            } else {
-                                                0.9
-                                            };
-
-                                            if let Some(callback) =
-                                                result_callback.read().await.as_ref()
-                                            {
-                                                let result = STTResult::new(
-                                                    transcript.to_string(),
-                                                    true,
-                                                    false,
-                                                    confidence,
-                                                );
-                                                callback(result).await;
-                                            }
-                                        }
-                                    }
-                                }
-                                "EndOfTranscript" => {
-                                    info!("Speechmatics session ended");
-                                    is_session_started.store(false, Ordering::SeqCst);
-                                }
-                                "EndOfUtterance" => {
-                                    if let Some(callback) = result_callback.read().await.as_ref() {
-                                        let result = STTResult::new(String::new(), true, true, 1.0);
-                                        callback(result).await;
-                                    }
-                                }
-                                "Error" => {
-                                    if let Ok(msg) = serde_json::from_str::<ErrorMessage>(&text) {
-                                        error!("Speechmatics error: {}", msg);
-                                        if let Some(callback) = error_callback.read().await.as_ref()
-                                        {
-                                            callback(STTError::ProviderError(msg.to_string()))
-                                                .await;
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Some(Ok(Message::Binary(_))) => {
-                        debug!("Received unexpected binary message from server");
-                    }
-                    Some(Ok(Message::Ping(data))) => {
-                        let mut ws_guard = ws.write().await;
-                        if let Some(ws_stream) = ws_guard.as_mut() {
-                            let _ = ws_stream.send(Message::Pong(data)).await;
-                        }
-                    }
-                    Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(_))) => {
-                        info!("WebSocket closed by server");
-                        is_connected.store(false, Ordering::SeqCst);
-                        is_session_started.store(false, Ordering::SeqCst);
-                        break;
-                    }
-                    Some(Err(e)) => {
-                        error!("WebSocket error: {}", e);
-                        is_connected.store(false, Ordering::SeqCst);
-                        is_session_started.store(false, Ordering::SeqCst);
-                        if let Some(callback) = error_callback.read().await.as_ref() {
-                            callback(STTError::ConnectionFailed(e.to_string())).await;
-                        }
-                        break;
-                    }
-                    None => {
-                        info!("WebSocket stream ended");
-                        is_connected.store(false, Ordering::SeqCst);
-                        is_session_started.store(false, Ordering::SeqCst);
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        });
-    }
 }
 
 #[async_trait]
@@ -334,12 +445,16 @@ impl BaseSTT for SpeechmaticsSTT {
         Ok(Self {
             config: speechmatics_config,
             base_config: Some(config),
-            ws: Arc::new(RwLock::new(None)),
+            ws_sender: None,
+            shutdown_tx: None,
+            connection_handle: None,
             is_connected: Arc::new(AtomicBool::new(false)),
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             is_session_started: Arc::new(AtomicBool::new(false)),
             seq_no: Arc::new(AtomicU64::new(0)),
             result_callback: Arc::new(RwLock::new(None)),
             error_callback: Arc::new(RwLock::new(None)),
+            resilience: None,
         })
     }
 
@@ -347,84 +462,155 @@ impl BaseSTT for SpeechmaticsSTT {
         if self.is_connected.load(Ordering::SeqCst) {
             return Ok(());
         }
+        // Fresh session: clear any intent left over from a prior disconnect so the supervisor
+        // does not immediately complete.
+        self.intentional_disconnect.store(false, Ordering::SeqCst);
 
         let ws_url = self.build_ws_url();
         info!("Connecting to Speechmatics: {}", ws_url);
 
-        // Build request with authorization header
-        let request = http::Request::builder()
-            .uri(&ws_url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("Sec-WebSocket-Protocol", "json")
-            .header("Host", "eu.rt.speechmatics.com")
-            .header("Connection", "Upgrade")
-            .header("Upgrade", "websocket")
-            .header("Sec-WebSocket-Version", "13")
-            .header(
-                "Sec-WebSocket-Key",
-                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
-            )
-            .body(())
-            .map_err(|e| STTError::ConnectionFailed(format!("Failed to build request: {}", e)))?;
-
-        let (ws_stream, _) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| STTError::ConnectionFailed(format!("WebSocket connect failed: {}", e)))?;
-
-        *self.ws.write().await = Some(ws_stream);
-        self.is_connected.store(true, Ordering::SeqCst);
-        self.seq_no.store(0, Ordering::SeqCst);
-
-        // Send StartRecognition message
+        let api_key = self.config.api_key.clone();
+        // Serialize the featured StartRecognition once; the supervised transport re-sends it
+        // verbatim on every (re)connect.
         let start_msg = self.build_start_recognition();
-        let json = serde_json::to_string(&start_msg)
+        let start_recognition_json = serde_json::to_string(&start_msg)
             .map_err(|e| STTError::ProviderError(format!("Failed to serialize: {}", e)))?;
 
-        {
-            let mut ws_guard = self.ws.write().await;
-            if let Some(ws) = ws_guard.as_mut() {
-                ws.send(Message::Text(json.into())).await.map_err(|e| {
-                    STTError::ConnectionFailed(format!("Failed to send start: {}", e))
-                })?;
-            }
+        // Create channels for communication (bounded for backpressure on audio).
+        let (ws_tx, ws_rx) = mpsc::channel::<Bytes>(32);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (connected_tx, connected_rx) = oneshot::channel::<()>();
+
+        self.ws_sender = Some(ws_tx);
+        self.shutdown_tx = Some(shutdown_tx);
+        self.seq_no.store(0, Ordering::SeqCst);
+
+        // Shared state the supervised transport re-uses across reconnect attempts.
+        let audio_rx = Arc::new(Mutex::new(ws_rx));
+        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
+        let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
+
+        let result_callback = Arc::clone(&self.result_callback);
+        let error_callback = Arc::clone(&self.error_callback);
+        let is_session_started = Arc::clone(&self.is_session_started);
+        let seq_no = Arc::clone(&self.seq_no);
+
+        // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor with
+        // the shared process-global handles from CoreState (W-D1/W-D2 fleet adoption). When no
+        // handles were injected, the supervisor uses its own per-session governor/breaker default.
+        let reconnection = ReconnectionConfig::aggressive();
+        let disconnect_flag = Arc::clone(&self.intentional_disconnect);
+        let supervisor = match self.resilience.clone() {
+            Some(r) => ReconnectableStream::with_breaker_and_governor(
+                ReconnectableStreamConfig::new("speechmatics", reconnection),
+                r.breaker,
+                (*r.governor).clone(),
+            ),
+            None => ReconnectableStream::new(ReconnectableStreamConfig::new(
+                "speechmatics",
+                reconnection,
+            )),
         }
+        .with_disconnect_flag(disconnect_flag);
 
-        info!("Speechmatics connected, sent StartRecognition");
+        // Start the connection task: the supervisor owns the outer reconnect loop; the `connect`
+        // closure dials with the Authorization header and hands back a transport whose
+        // `restore_session` re-sends StartRecognition and whose `run()` is the original receiver
+        // loop.
+        let connection_handle = tokio::spawn(async move {
+            let exit = supervisor
+                .run(|| {
+                    let ws_url = ws_url.clone();
+                    let api_key = api_key.clone();
+                    let start_recognition_json = start_recognition_json.clone();
+                    let audio_rx = Arc::clone(&audio_rx);
+                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let connected_tx = Arc::clone(&connected_tx);
+                    let result_callback = Arc::clone(&result_callback);
+                    let error_callback = Arc::clone(&error_callback);
+                    let is_session_started = Arc::clone(&is_session_started);
+                    let seq_no = Arc::clone(&seq_no);
+                    async move {
+                        let request = http::Request::builder()
+                            .uri(&ws_url)
+                            .header("Authorization", format!("Bearer {}", api_key))
+                            .header("Sec-WebSocket-Protocol", "json")
+                            .header("Host", "eu.rt.speechmatics.com")
+                            .header("Connection", "Upgrade")
+                            .header("Upgrade", "websocket")
+                            .header("Sec-WebSocket-Version", "13")
+                            .header(
+                                "Sec-WebSocket-Key",
+                                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+                            )
+                            .body(())
+                            .map_err(|e| {
+                                StreamError::new(format!("Failed to build request: {e}"))
+                            })?;
 
-        // Start receive loop
-        Self::start_receive_loop(
-            self.ws.clone(),
-            self.is_connected.clone(),
-            self.is_session_started.clone(),
-            self.result_callback.clone(),
-            self.error_callback.clone(),
-        );
+                        let (ws_stream, _) = tokio_tungstenite::connect_async(request)
+                            .await
+                            .map_err(|e| {
+                                StreamError::new(format!("WebSocket connect failed: {e}"))
+                            })?;
+                        info!("Speechmatics connected");
+                        let (ws_sink, ws_stream) = ws_stream.split();
+                        Ok(SpeechmaticsTransport {
+                            ws_sink,
+                            ws_stream,
+                            audio_rx,
+                            shutdown_rx,
+                            start_recognition_json,
+                            is_session_started,
+                            seq_no,
+                            result_callback,
+                            error_callback,
+                            connected_tx,
+                        })
+                    }
+                })
+                .await;
+            info!("Speechmatics STT WebSocket connection closed (supervisor exit: {exit:?})");
+        });
 
-        // Wait briefly for RecognitionStarted
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        self.connection_handle = Some(connection_handle);
 
-        Ok(())
+        // Wait for the first successful connect (restore_session fires the connected signal right
+        // after StartRecognition is sent — matching the original "ready after StartRecognition"
+        // semantics, which did not block on RecognitionStarted).
+        match timeout(Duration::from_secs(10), connected_rx).await {
+            Ok(Ok(())) => {
+                self.is_connected.store(true, Ordering::SeqCst);
+                info!("Speechmatics connected, sent StartRecognition");
+                Ok(())
+            }
+            Ok(Err(_)) => Err(STTError::ConnectionFailed(
+                "Connection channel closed before Speechmatics session started".to_string(),
+            )),
+            Err(_) => Err(STTError::ConnectionFailed(
+                "Connection timeout waiting for Speechmatics session".to_string(),
+            )),
+        }
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
+        // Record the intent BEFORE the connected-guard so the supervisor sees it even if the
+        // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
         if !self.is_connected.load(Ordering::SeqCst) {
             return Ok(());
         }
 
-        // Send EndOfStream
-        let end_msg = EndOfStreamMessage::new(self.seq_no.load(Ordering::SeqCst));
-        let json = serde_json::to_string(&end_msg)
-            .map_err(|e| STTError::ProviderError(format!("Failed to serialize: {}", e)))?;
-
-        {
-            let mut ws_guard = self.ws.write().await;
-            if let Some(ws) = ws_guard.as_mut() {
-                let _ = ws.send(Message::Text(json.into())).await;
-                let _ = ws.close(None).await;
-            }
+        // Signal the supervised transport to send EndOfStream + close intentionally (no reconnect).
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
         }
 
-        *self.ws.write().await = None;
+        if let Some(handle) = self.connection_handle.take() {
+            let _ = timeout(Duration::from_secs(5), handle).await;
+        }
+
+        self.ws_sender = None;
         self.is_connected.store(false, Ordering::SeqCst);
         self.is_session_started.store(false, Ordering::SeqCst);
 
@@ -441,15 +627,13 @@ impl BaseSTT for SpeechmaticsSTT {
             return Err(STTError::ConnectionFailed("Not connected".to_string()));
         }
 
-        // Send binary audio data
-        let mut ws_guard = self.ws.write().await;
-        if let Some(ws) = ws_guard.as_mut() {
-            ws.send(Message::Binary(audio_data.to_vec().into()))
+        if let Some(ws_sender) = &self.ws_sender {
+            ws_sender
+                .send(audio_data)
                 .await
                 .map_err(|e| STTError::NetworkError(format!("Failed to send audio: {}", e)))?;
         }
 
-        self.seq_no.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -488,6 +672,24 @@ impl BaseSTT for SpeechmaticsSTT {
     fn get_provider_info(&self) -> &'static str {
         "Speechmatics Real-time STT (55+ languages, WebSocket streaming)"
     }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared, process-global handles so `connect` drives the generic
+        // ReconnectableStream supervisor with them — every Speechmatics session trips the same
+        // breaker and shares the one process-wide reconnect cap (W-D2).
+        self.resilience = Some(resilience);
+    }
+}
+
+impl Drop for SpeechmaticsSTT {
+    fn drop(&mut self) {
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+        if let Some(handle) = self.connection_handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 // =============================================================================
@@ -520,6 +722,28 @@ mod tests {
         let config = STTConfig::default();
         let result = SpeechmaticsSTT::new(config);
         assert!(result.is_err());
+    }
+
+    // W-D1: disconnect() must record intent on the supervisor-shared flag so a client close racing
+    // a server-side close can never trigger a spurious reconnect (the supervisor's loop-top guard
+    // observes this same `Arc<AtomicBool>`). Before this wiring the flag was the supervisor's own
+    // and disconnect() never set it.
+    #[tokio::test]
+    async fn disconnect_sets_intentional_flag_for_supervisor() {
+        let config = STTConfig {
+            api_key: "test-api-key".to_string(),
+            language: "en".to_string(),
+            sample_rate: 16000,
+            encoding: "pcm_s16le".to_string(),
+            ..Default::default()
+        };
+        let mut stt = SpeechmaticsSTT::new(config).unwrap();
+        assert!(!stt.intentional_disconnect.load(Ordering::SeqCst));
+        stt.disconnect().await.unwrap();
+        assert!(
+            stt.intentional_disconnect.load(Ordering::SeqCst),
+            "disconnect() must set the supervisor-shared intentional-disconnect flag",
+        );
     }
 
     // W1 keystone: Speechmatics' rich advanced features (diarization, interim partials, entity

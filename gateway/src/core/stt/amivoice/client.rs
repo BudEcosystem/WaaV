@@ -31,19 +31,27 @@
 //! Server responses use single-letter prefixes (S, E, C, U, A, G, e).
 
 use bytes::Bytes;
+use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::time::{Instant, interval, timeout};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message,
+};
 use tracing::{debug, error, info, warn};
 
 use super::config::AmiVoiceSTTConfig;
 use super::messages::AmiVoiceMessage;
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
+};
+use crate::core::websocket::ReconnectionConfig;
+use crate::core::websocket::reconnectable_stream::{
+    ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
+    WsTransport,
 };
 
 // =============================================================================
@@ -79,6 +87,253 @@ type AsyncErrorCallback = Box<
         + Send
         + Sync,
 >;
+
+/// The concrete WebSocket stream type AmiVoice dials.
+type AmiVoiceWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Timeout to receive AmiVoice's session-start ack (`s` / `s <error>`) after sending the start
+/// command on a fresh connection.
+const SESSION_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A [`WsTransport`] that adapts AmiVoice's proprietary streaming protocol to the generic
+/// [`ReconnectableStream`] supervisor (W-D1 fleet adoption). One is built per (re)connect by the
+/// supervisor's `connect` closure.
+///
+/// Unlike URL-carries-features providers (ElevenLabs/Cartesia), AmiVoice establishes its featured
+/// session with a **post-handshake `s` start command** (format + engine + all advanced-feature
+/// params) and the server replies with a session-start ack (`s` for OK, `s <error>` otherwise).
+/// So [`restore_session`](WsTransport::restore_session) re-sends that start command on the fresh
+/// socket — without it a reconnect would resume as a *bare* (un-featured) session, exactly the
+/// failure mode the supervisor doc warns about. [`run`](WsTransport::run) first awaits the
+/// session-start ack (classifying an auth rejection as [`ReconnectOutcome::Fatal`]), signals the
+/// waiting `connect()`, then drives the original `select!` loop returning a [`ReconnectOutcome`]
+/// so a mid-stream transport drop reconnects instead of ending the session.
+struct AmiVoiceTransport {
+    ws_sink: SplitSink<AmiVoiceWs, Message>,
+    ws_stream: SplitStream<AmiVoiceWs>,
+    /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
+    audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
+    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
+    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    result_tx: mpsc::Sender<STTResult>,
+    error_tx: mpsc::Sender<STTError>,
+    /// Fires once after the featured session is (re)established (session-start ack), unblocking
+    /// `start_connection`.
+    connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// The featured `s` start command (format + engine + advanced-feature params), re-sent on
+    /// every restore so reconnects keep the full-feature session.
+    start_command: String,
+    interim_results_enabled: bool,
+    /// Cleared while the connection is live, set false once it ends (mirrors the original task).
+    connected_flag: Arc<AtomicBool>,
+    /// True once the session-start ack has been processed for this connection, so the main loop
+    /// doesn't re-await it.
+    session_started: bool,
+}
+
+#[async_trait::async_trait]
+impl WsTransport for AmiVoiceTransport {
+    async fn restore_session(&mut self) -> Result<(), RestoreError> {
+        // AmiVoice protocol: (re)send the `s` start command carrying the FULL featured session
+        // (format/engine + every advanced-feature param). The session-start ack is awaited in
+        // `run()` so an auth rejection can map to a non-retryable Fatal. A reconnect must NOT
+        // resume as a bare session.
+        self.session_started = false;
+        debug!("Sending AmiVoice start command: {}", self.start_command);
+        self.ws_sink
+            .send(Message::Text(self.start_command.clone().into()))
+            .await
+            .map_err(|e| RestoreError::new(format!("failed to send AmiVoice start command: {e}")))?;
+        Ok(())
+    }
+
+    async fn run(&mut self) -> ReconnectOutcome {
+        let mut audio_rx = self.audio_rx.lock().await;
+        let mut shutdown_rx = self.shutdown_rx.lock().await;
+
+        // --- Await the session-start ack (`s` / `s <error>`) for this connection ---------------
+        // The start command was sent in restore_session; wait for the server's acknowledgement
+        // before streaming audio. An auth rejection is Fatal (retry would fail identically); any
+        // other failure is reconnect-eligible.
+        if !self.session_started {
+            let ack = timeout(SESSION_START_TIMEOUT, async {
+                while let Some(msg) = self.ws_stream.next().await {
+                    match msg {
+                        Ok(Message::Text(text)) if text.starts_with('s') => {
+                            return Some(AmiVoiceMessage::parse(&text));
+                        }
+                        Ok(_) => continue,
+                        Err(e) => return Some(Err(format!("websocket error: {e}"))),
+                    }
+                }
+                None
+            })
+            .await;
+
+            match ack {
+                Ok(Some(Ok(AmiVoiceMessage::SessionStartOk))) => {
+                    info!("AmiVoice session started successfully");
+                    self.session_started = true;
+                    self.connected_flag.store(true, Ordering::Release);
+                    if let Some(tx) = self.connected_tx.lock().await.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                Ok(Some(Ok(AmiVoiceMessage::SessionStartError(e)))) => {
+                    let is_auth = e.to_lowercase().contains("auth")
+                        || e.to_lowercase().contains("appkey")
+                        || e.to_lowercase().contains("unauthorized");
+                    let stt_error = if is_auth {
+                        STTError::AuthenticationFailed(format!("AmiVoice auth failed: {e}"))
+                    } else {
+                        STTError::ConnectionFailed(format!("AmiVoice session failed: {e}"))
+                    };
+                    error!("{}", stt_error);
+                    let _ = self.error_tx.try_send(stt_error);
+                    if is_auth {
+                        // Auth rejection: retrying would just fail identically — do NOT reconnect.
+                        return ReconnectOutcome::Fatal(StreamError::new("auth rejected"));
+                    }
+                    return ReconnectOutcome::Reconnectable(StreamError::new("session start error"));
+                }
+                Ok(Some(Ok(_other))) => {
+                    let stt_error =
+                        STTError::ConnectionFailed("Unexpected response from AmiVoice".to_string());
+                    error!("{}", stt_error);
+                    let _ = self.error_tx.try_send(stt_error);
+                    return ReconnectOutcome::Reconnectable(StreamError::new("unexpected response"));
+                }
+                Ok(Some(Err(e))) => {
+                    let stt_error = STTError::ConnectionFailed(format!(
+                        "Failed to parse AmiVoice session response: {e}"
+                    ));
+                    error!("{}", stt_error);
+                    let _ = self.error_tx.try_send(stt_error);
+                    return ReconnectOutcome::Reconnectable(StreamError::new("session parse error"));
+                }
+                Ok(None) => {
+                    info!("AmiVoice stream ended before session start");
+                    return ReconnectOutcome::Reconnectable(StreamError::new("stream ended"));
+                }
+                Err(_) => {
+                    let stt_error = STTError::ConnectionFailed(
+                        "Timeout waiting for AmiVoice session start".to_string(),
+                    );
+                    error!("{}", stt_error);
+                    let _ = self.error_tx.try_send(stt_error);
+                    return ReconnectOutcome::Reconnectable(StreamError::new("session start timeout"));
+                }
+            }
+        }
+
+        // --- Main event loop --------------------------------------------------------------------
+        let mut keepalive_timer = interval(KEEPALIVE_INTERVAL);
+        let mut last_audio_time = Instant::now();
+
+        loop {
+            tokio::select! {
+                // Prioritize audio sending for lowest latency
+                biased;
+
+                // Handle outgoing audio data (raw binary frames, as AmiVoice expects)
+                Some(audio_data) = audio_rx.recv() => {
+                    if let Err(e) = self.ws_sink.send(Message::Binary(audio_data)).await {
+                        let stt_error = STTError::NetworkError(format!(
+                            "Failed to send audio to AmiVoice: {e}"
+                        ));
+                        error!("{}", stt_error);
+                        let _ = self.error_tx.try_send(stt_error);
+                        self.connected_flag.store(false, Ordering::Release);
+                        return ReconnectOutcome::Reconnectable(StreamError::new("audio send failed"));
+                    }
+                    last_audio_time = Instant::now();
+                }
+
+                // Handle incoming messages with idle timeout
+                message = timeout(WS_MESSAGE_TIMEOUT, self.ws_stream.next()) => {
+                    match message {
+                        Ok(Some(Ok(msg))) => {
+                            match AmiVoiceSTT::handle_websocket_message(
+                                msg,
+                                &self.result_tx,
+                                &self.error_tx,
+                                self.interim_results_enabled,
+                            ) {
+                                Ok(should_close) => {
+                                    if should_close {
+                                        // `e`/session-end/close ack or a session error frame: an
+                                        // intentional end-of-session signalled by the provider.
+                                        self.connected_flag.store(false, Ordering::Release);
+                                        return ReconnectOutcome::Completed;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("AmiVoice message handling error: {}", e);
+                                    let _ = self.error_tx.try_send(e);
+                                    // A provider recognition error is typically fatal (bad config).
+                                    self.connected_flag.store(false, Ordering::Release);
+                                    return ReconnectOutcome::Fatal(StreamError::new("provider error frame"));
+                                }
+                            }
+                        }
+                        Ok(Some(Err(e))) => {
+                            let stt_error = STTError::NetworkError(format!("WebSocket error: {e}"));
+                            error!("{}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            self.connected_flag.store(false, Ordering::Release);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("websocket error"));
+                        }
+                        Ok(None) => {
+                            info!("AmiVoice WebSocket stream ended");
+                            self.connected_flag.store(false, Ordering::Release);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("stream ended"));
+                        }
+                        Err(_elapsed) => {
+                            let stt_error = STTError::NetworkError(
+                                "WebSocket idle timeout - no message for 60 seconds".into()
+                            );
+                            error!("AmiVoice STT idle timeout: {}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            self.connected_flag.store(false, Ordering::Release);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("idle timeout"));
+                        }
+                    }
+                }
+
+                // Handle keep-alive timer
+                _ = keepalive_timer.tick() => {
+                    if last_audio_time.elapsed() >= AUDIO_IDLE_THRESHOLD {
+                        // Send a small buffer of silence (32 samples at 16kHz = 2ms)
+                        let silence_frame = vec![0u8; 64];
+                        if let Err(e) = self.ws_sink.send(Message::Binary(silence_frame.into())).await {
+                            let stt_error = STTError::NetworkError(format!(
+                                "Failed to send keep-alive: {e}"
+                            ));
+                            error!("{}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            self.connected_flag.store(false, Ordering::Release);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("keepalive send failed"));
+                        }
+                        debug!("Sent keep-alive silence frame to AmiVoice");
+                        last_audio_time = Instant::now();
+                    }
+                }
+
+                // Handle shutdown signal (intentional close — must NOT reconnect)
+                _ = &mut *shutdown_rx => {
+                    info!("Received shutdown signal for AmiVoice STT");
+                    // Send end command to gracefully end recognition, then close.
+                    if let Err(e) = self.ws_sink.send(Message::Text("e".into())).await {
+                        debug!("Failed to send end command: {}", e);
+                    }
+                    let _ = self.ws_sink.send(Message::Close(None)).await;
+                    self.connected_flag.store(false, Ordering::Release);
+                    return ReconnectOutcome::Completed;
+                }
+            }
+        }
+    }
+}
 
 // =============================================================================
 // Connection State
@@ -191,6 +446,18 @@ pub struct AmiVoiceSTT {
 
     /// Connection ready flag for atomic checks.
     connected: Arc<AtomicBool>,
+
+    /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
+    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// server-side close can never trigger a spurious reconnect.
+    intentional_disconnect: Arc<AtomicBool>,
+
+    /// Shared, process-global resilience handles (W-D2): the single reconnect governor + this
+    /// provider's shared circuit breaker, injected by the VoiceManager from CoreState and driven
+    /// by the generic [`ReconnectableStream`](crate::core::websocket::ReconnectableStream)
+    /// supervisor. `None` before `set_resilience` (a direct unit-test construction) → the
+    /// supervisor uses its own per-session governor/breaker default.
+    resilience: Option<crate::core::resilience::ResilienceHandles>,
 }
 
 impl Default for AmiVoiceSTT {
@@ -209,6 +476,8 @@ impl Default for AmiVoiceSTT {
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
             connected: Arc::new(AtomicBool::new(false)),
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
+            resilience: None,
         }
     }
 }
@@ -352,8 +621,8 @@ impl AmiVoiceSTT {
         let ws_url = config.get_websocket_url();
 
         // Create channels for communication
-        let (ws_tx, mut ws_rx) = mpsc::channel::<Bytes>(32);
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let (ws_tx, ws_rx) = mpsc::channel::<Bytes>(32);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
         let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
@@ -364,212 +633,93 @@ impl AmiVoiceSTT {
         self.result_tx = Some(result_tx.clone());
         self.error_tx = Some(error_tx.clone());
 
-        // Clone necessary data for the connection task
+        // Clone necessary data for the connection task. The `s` start command carries the FULL
+        // featured session (format/engine + every advanced-feature param); the supervised
+        // transport re-sends it on every restore so reconnects keep the featured session.
         let start_command = config.build_start_command();
         let interim_results_enabled = config.interim_results;
         let connected_flag = self.connected.clone();
+        // A separate clone for the supervisor-exit cleanup (the per-attempt clone above is moved
+        // into the connect closure).
+        let connected_done = self.connected.clone();
 
-        // Start the connection task
+        // Shared state the supervised transport re-uses across reconnect attempts: a single-
+        // consumer audio receiver + shutdown oneshot (locked per `run`) and the one-shot connected
+        // signal that fires after the featured session is (re)established.
+        let audio_rx = Arc::new(Mutex::new(ws_rx));
+        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
+        let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
+
+        // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor (the
+        // same one the chaos tests exercise) with the shared process-global handles from CoreState
+        // (W-D1/W-D2 fleet adoption). When no handles were injected (a direct unit-test
+        // construction), the supervisor uses its own per-session governor/breaker default.
+        let reconnection = ReconnectionConfig::aggressive();
+        // Capture the client-owned intentional-disconnect flag BEFORE the supervisor is moved into
+        // the spawned task (W-D1): the supervisor's loop-top + post-run() guards observe this same
+        // `Arc<AtomicBool>`, so a client close racing a server-side close can never reconnect.
+        let disconnect_flag = Arc::clone(&self.intentional_disconnect);
+        let supervisor = match self.resilience.clone() {
+            Some(r) => ReconnectableStream::with_breaker_and_governor(
+                ReconnectableStreamConfig::new("amivoice", reconnection),
+                r.breaker,
+                (*r.governor).clone(),
+            ),
+            None => {
+                ReconnectableStream::new(ReconnectableStreamConfig::new("amivoice", reconnection))
+            }
+        }
+        .with_disconnect_flag(disconnect_flag);
+
+        // Start the connection task: the supervisor owns the outer reconnect loop; the `connect`
+        // closure dials AmiVoice and hands back a transport whose `restore_session` re-sends the
+        // `s` start command and whose `run()` awaits the session-start ack then drives the
+        // original AmiVoice event loop.
         let connection_handle = tokio::spawn(async move {
-            // Connect to AmiVoice with timeout
-            let connect_result = match timeout(WS_CONNECT_TIMEOUT, connect_async(ws_url)).await {
-                Ok(result) => result,
-                Err(_) => {
-                    let stt_error = STTError::ConnectionFailed(
-                        "Connection to AmiVoice timed out after 30 seconds".to_string(),
-                    );
-                    error!("{}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
-                }
-            };
-
-            let (ws_stream, _response) = match connect_result {
-                Ok(result) => result,
-                Err(e) => {
-                    let error_msg = format!("Failed to connect to AmiVoice: {e}");
-                    let stt_error = STTError::ConnectionFailed(error_msg);
-                    error!("{}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
-                }
-            };
-
-            info!("Connected to AmiVoice WebSocket");
-
-            let (mut ws_sink, mut ws_stream) = ws_stream.split();
-
-            // Send start command (s command)
-            debug!("Sending start command: {}", start_command);
-            if let Err(e) = ws_sink.send(Message::Text(start_command.into())).await {
-                let stt_error =
-                    STTError::ConnectionFailed(format!("Failed to send start command: {e}"));
-                error!("{}", stt_error);
-                let _ = error_tx.try_send(stt_error);
-                return;
-            }
-
-            // Wait for session start response ('s' or 's <error>')
-            let session_start_timeout = timeout(Duration::from_secs(10), async {
-                while let Some(msg) = ws_stream.next().await {
-                    if let Ok(Message::Text(text)) = msg
-                        && text.starts_with('s') {
-                            return AmiVoiceMessage::parse(&text);
-                        }
-                }
-                Err("No session start response received".to_string())
-            })
-            .await;
-
-            match session_start_timeout {
-                Ok(Ok(AmiVoiceMessage::SessionStartOk)) => {
-                    info!("AmiVoice session started successfully");
-                    connected_flag.store(true, Ordering::Release);
-                    let _ = connected_tx.send(());
-                }
-                Ok(Ok(AmiVoiceMessage::SessionStartError(e))) => {
-                    let stt_error = if e.to_lowercase().contains("auth")
-                        || e.to_lowercase().contains("appkey")
-                    {
-                        STTError::AuthenticationFailed(format!("AmiVoice auth failed: {e}"))
-                    } else {
-                        STTError::ConnectionFailed(format!("AmiVoice session failed: {e}"))
-                    };
-                    error!("{}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
-                }
-                Ok(Err(e)) => {
-                    let stt_error = STTError::ConnectionFailed(format!(
-                        "Failed to parse session response: {e}"
-                    ));
-                    error!("{}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
-                }
-                Err(_) => {
-                    let stt_error = STTError::ConnectionFailed(
-                        "Timeout waiting for AmiVoice session start".to_string(),
-                    );
-                    error!("{}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
-                }
-                _ => {
-                    let stt_error =
-                        STTError::ConnectionFailed("Unexpected response from AmiVoice".to_string());
-                    error!("{}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
-                }
-            }
-
-            // Keep-alive mechanism
-            let mut keepalive_timer = interval(KEEPALIVE_INTERVAL);
-            let mut last_audio_time = Instant::now();
-
-            // Main event loop
-            loop {
-                tokio::select! {
-                    // Prioritize audio sending for lowest latency
-                    biased;
-
-                    // Handle outgoing audio data
-                    Some(audio_data) = ws_rx.recv() => {
-                        // AmiVoice expects raw audio as binary WebSocket frames
-                        // Protocol: 'p' prefix followed by binary data
-                        // But for WebSocket binary frames, we send raw data
-                        let message = Message::Binary(audio_data);
-                        if let Err(e) = ws_sink.send(message).await {
-                            let stt_error = STTError::NetworkError(format!(
-                                "Failed to send audio to AmiVoice: {e}"
-                            ));
-                            error!("{}", stt_error);
-                            let _ = error_tx.try_send(stt_error);
-                            break;
-                        }
-                        last_audio_time = Instant::now();
-                    }
-
-                    // Handle incoming messages with idle timeout
-                    message = timeout(WS_MESSAGE_TIMEOUT, ws_stream.next()) => {
-                        match message {
-                            Ok(Some(Ok(msg))) => {
-                                match Self::handle_websocket_message(
-                                    msg,
-                                    &result_tx,
-                                    &error_tx,
-                                    interim_results_enabled,
-                                ) {
-                                    Ok(should_close) => {
-                                        if should_close {
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("AmiVoice message handling error: {}", e);
-                                        let _ = error_tx.try_send(e);
-                                        break;
-                                    }
+            let exit = supervisor
+                .run(|| {
+                    // `ws_url` is `&'static str` (Copy) — captured by copy into the async block.
+                    let start_command = start_command.clone();
+                    let audio_rx = Arc::clone(&audio_rx);
+                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let connected_tx = Arc::clone(&connected_tx);
+                    let connected_flag = Arc::clone(&connected_flag);
+                    let result_tx = result_tx.clone();
+                    let error_tx = error_tx.clone();
+                    async move {
+                        let connect_result =
+                            match timeout(WS_CONNECT_TIMEOUT, connect_async(ws_url)).await {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    return Err(StreamError::new(
+                                        "Connection to AmiVoice timed out after 30 seconds"
+                                            .to_string(),
+                                    ));
                                 }
-                            }
-                            Ok(Some(Err(e))) => {
-                                let stt_error = STTError::NetworkError(format!(
-                                    "WebSocket error: {e}"
-                                ));
-                                error!("{}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
-                            }
-                            Ok(None) => {
-                                info!("AmiVoice WebSocket stream ended");
-                                break;
-                            }
-                            Err(_elapsed) => {
-                                let stt_error = STTError::NetworkError(
-                                    "WebSocket idle timeout - no message for 60 seconds".into()
-                                );
-                                error!("AmiVoice STT idle timeout: {}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
-                            }
-                        }
+                            };
+                        let (ws_stream, _response) = connect_result.map_err(|e| {
+                            StreamError::new(format!("Failed to connect to AmiVoice: {e}"))
+                        })?;
+                        info!("Connected to AmiVoice WebSocket");
+                        let (ws_sink, ws_stream) = ws_stream.split();
+                        Ok(AmiVoiceTransport {
+                            ws_sink,
+                            ws_stream,
+                            audio_rx,
+                            shutdown_rx,
+                            result_tx,
+                            error_tx,
+                            connected_tx,
+                            start_command,
+                            interim_results_enabled,
+                            connected_flag,
+                            session_started: false,
+                        })
                     }
-
-                    // Handle keep-alive timer
-                    _ = keepalive_timer.tick() => {
-                        if last_audio_time.elapsed() >= AUDIO_IDLE_THRESHOLD {
-                            // Send a small buffer of silence (32 samples at 16kHz = 2ms)
-                            let silence_frame = vec![0u8; 64];
-                            let message = Message::Binary(silence_frame.into());
-                            if let Err(e) = ws_sink.send(message).await {
-                                let stt_error = STTError::NetworkError(format!(
-                                    "Failed to send keep-alive: {e}"
-                                ));
-                                error!("{}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
-                            }
-                            debug!("Sent keep-alive silence frame to AmiVoice");
-                            last_audio_time = Instant::now();
-                        }
-                    }
-
-                    // Handle shutdown signal
-                    _ = &mut shutdown_rx => {
-                        info!("Received shutdown signal for AmiVoice STT");
-                        // Send end command to gracefully end recognition
-                        if let Err(e) = ws_sink.send(Message::Text("e".into())).await {
-                            debug!("Failed to send end command: {}", e);
-                        }
-                        let _ = ws_sink.send(Message::Close(None)).await;
-                        break;
-                    }
-                }
-            }
-
-            connected_flag.store(false, Ordering::Release);
-            info!("AmiVoice STT WebSocket connection closed");
+                })
+                .await;
+            info!("AmiVoice STT WebSocket connection closed (supervisor exit: {exit:?})");
+            connected_done.store(false, Ordering::Release);
         });
 
         self.connection_handle = Some(connection_handle);
@@ -687,6 +837,15 @@ impl AmiVoiceSTT {
         stt.config = Some(AmiVoiceSTTConfig::from_standard(std));
         Ok(stt)
     }
+
+    /// The shared circuit breaker this session feeds into the generic supervisor, if the
+    /// process-global resilience handles have been injected (W-D1/W-D2). Two `AmiVoiceSTT` built
+    /// from the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(
+        &self,
+    ) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.as_ref().map(|r| &r.breaker)
+    }
 }
 
 impl Drop for AmiVoiceSTT {
@@ -729,6 +888,8 @@ impl BaseSTT for AmiVoiceSTT {
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
             connected: Arc::new(AtomicBool::new(false)),
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
+            resilience: None,
         })
     }
 
@@ -740,10 +901,18 @@ impl BaseSTT for AmiVoiceSTT {
             ));
         }
 
+        // Fresh session: clear any intent left over from a prior disconnect so the supervisor
+        // does not immediately complete.
+        self.intentional_disconnect.store(false, Ordering::Release);
+
         self.start_connection().await
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
+        // Record the intent BEFORE firing shutdown_tx so the supervisor sees it even if the
+        // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
+        self.intentional_disconnect.store(true, Ordering::Release);
+
         // Send shutdown signal
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
@@ -893,6 +1062,13 @@ impl BaseSTT for AmiVoiceSTT {
 
     fn get_provider_info(&self) -> &'static str {
         "AmiVoice Cloud Platform (Advanced Media)"
+    }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared, process-global handles so `start_connection` drives the generic
+        // ReconnectableStream supervisor with them — every AmiVoice session trips the same breaker
+        // and shares the one process-wide reconnect cap (W-D2).
+        self.resilience = Some(resilience);
     }
 }
 
@@ -1108,6 +1284,21 @@ mod tests {
         // Should not fail even if not connected
         let result = stt.disconnect().await;
         assert!(result.is_ok());
+    }
+
+    // W-D1: disconnect() must record intent on the supervisor-shared flag so a client close racing
+    // a server-side close can never trigger a spurious reconnect (the supervisor's loop-top guard
+    // observes this same `Arc<AtomicBool>`). Before this wiring the flag was the supervisor's own
+    // and disconnect() never set it.
+    #[tokio::test]
+    async fn disconnect_sets_intentional_flag_for_supervisor() {
+        let mut stt = AmiVoiceSTT::new(make_test_config()).unwrap();
+        assert!(!stt.intentional_disconnect.load(Ordering::Acquire));
+        stt.disconnect().await.unwrap();
+        assert!(
+            stt.intentional_disconnect.load(Ordering::Acquire),
+            "disconnect() must set the supervisor-shared intentional-disconnect flag",
+        );
     }
 
     #[test]

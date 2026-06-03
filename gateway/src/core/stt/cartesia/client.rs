@@ -18,6 +18,7 @@
 //! - Sample rates: 8000, 16000, 22050, 24000, 44100, or 48000 Hz
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -257,6 +258,11 @@ pub struct CartesiaSTT {
     /// Shutdown signal sender.
     shutdown_tx: Option<oneshot::Sender<()>>,
 
+    /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
+    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// server-side close can never trigger a spurious reconnect.
+    intentional_disconnect: Arc<AtomicBool>,
+
     /// Result channel sender.
     result_tx: Option<mpsc::Sender<STTResult>>,
 
@@ -391,6 +397,10 @@ impl CartesiaSTT {
         // Validate configuration before connecting
         config.validate()?;
 
+        // Fresh session: clear any intent left over from a prior disconnect so the supervisor
+        // does not immediately complete.
+        self.intentional_disconnect.store(false, Ordering::SeqCst);
+
         let ws_url = config.build_websocket_url(&config.base.api_key);
 
         // Create channels for communication (bounded for backpressure on audio)
@@ -419,6 +429,7 @@ impl CartesiaSTT {
         // (W-D1/W-D2 fleet adoption). When no handles were injected (a direct unit-test
         // construction), the supervisor uses its own per-session governor/breaker default.
         let reconnection = ReconnectionConfig::aggressive();
+        let disconnect_flag = Arc::clone(&self.intentional_disconnect);
         let supervisor = match self.resilience.clone() {
             Some(r) => ReconnectableStream::with_breaker_and_governor(
                 ReconnectableStreamConfig::new("cartesia", reconnection),
@@ -428,7 +439,8 @@ impl CartesiaSTT {
             None => {
                 ReconnectableStream::new(ReconnectableStreamConfig::new("cartesia", reconnection))
             }
-        };
+        }
+        .with_disconnect_flag(disconnect_flag);
 
         // Start the connection task: the supervisor owns the outer reconnect loop; the `connect`
         // closure dials the *featured* URL (every feature is in the URL) and hands back a transport
@@ -561,6 +573,7 @@ impl Default for CartesiaSTT {
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
             shutdown_tx: None,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             result_tx: None,
             error_tx: None,
             connection_handle: None,
@@ -599,6 +612,7 @@ impl BaseSTT for CartesiaSTT {
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
             shutdown_tx: None,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             result_tx: None,
             error_tx: None,
             connection_handle: None,
@@ -621,6 +635,10 @@ impl BaseSTT for CartesiaSTT {
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
+        // Record the intent BEFORE firing shutdown so the supervisor sees it even if the
+        // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+
         // Send shutdown signal
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
@@ -899,6 +917,32 @@ mod tests {
         // Disconnect should succeed even when not connected
         let result = stt.disconnect().await;
         assert!(result.is_ok());
+    }
+
+    // W-D1: disconnect() must record intent on the supervisor-shared flag so a client close racing
+    // a server-side close can never trigger a spurious reconnect (the supervisor's loop-top guard
+    // observes this same `Arc<AtomicBool>`). Before this wiring the flag was the supervisor's own
+    // and disconnect() never set it.
+    #[tokio::test]
+    async fn disconnect_sets_intentional_flag_for_supervisor() {
+        let config = STTConfig {
+            provider: "cartesia".to_string(),
+            api_key: "test_key".to_string(),
+            language: "en".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "linear16".to_string(),
+            model: "ink-whisper".to_string(),
+        };
+
+        let mut stt = <CartesiaSTT as BaseSTT>::new(config).unwrap();
+        assert!(!stt.intentional_disconnect.load(Ordering::SeqCst));
+        stt.disconnect().await.unwrap();
+        assert!(
+            stt.intentional_disconnect.load(Ordering::SeqCst),
+            "disconnect() must set the supervisor-shared intentional-disconnect flag",
+        );
     }
 
     #[tokio::test]

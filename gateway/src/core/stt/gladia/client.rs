@@ -6,13 +6,20 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tokio::sync::RwLock;
+use std::time::Duration;
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTConnectionState, STTError, STTErrorCallback, STTResult,
     STTResultCallback, STTStats,
+};
+use crate::core::websocket::ReconnectionConfig;
+use crate::core::websocket::reconnectable_stream::{
+    ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
+    WsTransport,
 };
 
 use super::config::GladiaSTTConfig;
@@ -27,6 +34,256 @@ use super::messages::{
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
+type WsReadStream = futures_util::stream::SplitStream<WsStream>;
+
+/// Per-message idle timeout for WebSocket message reception.
+/// Resets after each successful message. Catches stuck/dead connections.
+const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+// =============================================================================
+// Featured session-init helper (shared by connect closure + unit tests)
+// =============================================================================
+
+/// Build the `POST /v2/live` session-init request body from the provider config.
+///
+/// Free function so both `connect`'s reconnect closure and the `build_init_request` test hook
+/// produce byte-identical JSON. (Guards the recurring "feature set on the config but never
+/// serialized" bug class.)
+pub(super) fn build_init_request_from(config: &GladiaSTTConfig) -> InitSessionRequest {
+    // Omit post_processing entirely when no post-processing feature is requested, so the default
+    // body stays byte-for-byte identical to before this feature was added.
+    let post_processing = if config.post_processing.is_empty() {
+        None
+    } else {
+        Some(config.post_processing.clone())
+    };
+    InitSessionRequest {
+        encoding: config.encoding.as_str().to_string(),
+        bit_depth: config.bit_depth.value(),
+        sample_rate: config.sample_rate,
+        channels: config.channels,
+        model: Some(config.model.clone()),
+        endpointing: Some(config.endpointing),
+        maximum_duration_without_endpointing: Some(config.maximum_duration_without_endpointing),
+        language_config: Some(config.language_config.clone()),
+        pre_processing: Some(config.pre_processing.clone()),
+        realtime_processing: Some(config.realtime_processing.clone()),
+        post_processing,
+        messages_config: Some(config.messages_config.clone()),
+        custom_metadata: config.custom_metadata.clone(),
+    }
+}
+
+/// Initialize a Gladia session via the REST API and return the per-session WebSocket URL.
+///
+/// This is the **featured handshake**: every Gladia feature rides the `POST /v2/live` init body,
+/// which mints a fresh session id + WebSocket URL. A reconnect therefore re-runs this so the
+/// restored session is identical to the original.
+async fn init_session(
+    http_client: &reqwest::Client,
+    config: &GladiaSTTConfig,
+) -> Result<InitSessionResponse, STTError> {
+    let url = config.api_url();
+    debug!("Initializing Gladia session at {}", url);
+
+    let request_body = build_init_request_from(config);
+    trace!("Session init request: {:?}", request_body);
+
+    let response = http_client
+        .post(&url)
+        .header("X-Gladia-Key", &config.api_key)
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| STTError::ConnectionFailed(format!("HTTP request failed: {}", e)))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        return Err(match status.as_u16() {
+            401 => STTError::AuthenticationFailed(format!("Invalid API key: {}", error_text)),
+            400 | 422 => STTError::ConfigurationError(format!("Invalid request: {}", error_text)),
+            _ => STTError::ConnectionFailed(format!(
+                "Session init failed ({}): {}",
+                status, error_text
+            )),
+        });
+    }
+
+    let init_response: InitSessionResponse = response
+        .json()
+        .await
+        .map_err(|e| STTError::ConnectionFailed(format!("Failed to parse response: {}", e)))?;
+
+    debug!(
+        "Session initialized: id={}, ws_url={}",
+        init_response.id, init_response.url
+    );
+
+    Ok(init_response)
+}
+
+// =============================================================================
+// Supervised transport (W-D1 production adoption)
+// =============================================================================
+
+/// A [`WsTransport`] that adapts Gladia's streaming event loop to the generic
+/// [`ReconnectableStream`] supervisor (W-D1 fleet adoption). One is built per (re)connect by the
+/// supervisor's `connect` closure.
+///
+/// Gladia is a **REST-init-then-WebSocket** provider: every feature rides the `POST /v2/live` init
+/// body, which mints a per-session WS URL. The reconnect closure re-runs that init (so the restored
+/// session is fully featured) and dials the fresh URL; the WebSocket itself takes no post-handshake
+/// config message, so [`restore_session`](WsTransport::restore_session) is a no-op. [`run`] IS the
+/// original receiver loop, now returning a [`ReconnectOutcome`] so a transport drop reconnects
+/// instead of bare-breaking the session.
+struct GladiaTransport {
+    ws_sink: WsSink,
+    ws_stream: WsReadStream,
+    /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
+    audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
+    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
+    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    on_result: Arc<RwLock<Option<STTResultCallback>>>,
+    on_error: Arc<RwLock<Option<STTErrorCallback>>>,
+    stats: Arc<RwLock<STTStats>>,
+    bytes_sent: Arc<AtomicU64>,
+    /// Fires once on the first successful connect, unblocking `connect`.
+    connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+#[async_trait::async_trait]
+impl WsTransport for GladiaTransport {
+    async fn restore_session(&mut self) -> Result<(), RestoreError> {
+        // The featured session was (re)established by the REST init in the connect closure (which
+        // minted this connection's URL). The WebSocket itself needs no post-handshake config, so
+        // there is nothing to re-send here — just signal the waiting connect() exactly once.
+        if let Some(tx) = self.connected_tx.lock().await.take() {
+            let _ = tx.send(());
+        }
+        Ok(())
+    }
+
+    async fn run(&mut self) -> ReconnectOutcome {
+        let mut audio_rx = self.audio_rx.lock().await;
+        let mut shutdown_rx = self.shutdown_rx.lock().await;
+        loop {
+            tokio::select! {
+                // Handle outgoing audio data (JSON with base64-encoded chunk, per Gladia docs).
+                Some(audio_data) = audio_rx.recv() => {
+                    let chunk_msg = AudioChunkMessage::new(&audio_data);
+                    let json = match chunk_msg.to_json() {
+                        Ok(json) => json,
+                        Err(e) => {
+                            let stt_error = STTError::InvalidAudioFormat(e.to_string());
+                            error!("{}", stt_error);
+                            if let Some(cb) = self.on_error.read().await.as_ref() {
+                                cb(stt_error).await;
+                            }
+                            continue;
+                        }
+                    };
+                    if let Err(e) = self.ws_sink.send(Message::Text(json.into())).await {
+                        let stt_error = STTError::NetworkError(e.to_string());
+                        error!("{}", stt_error);
+                        if let Some(cb) = self.on_error.read().await.as_ref() {
+                            cb(stt_error).await;
+                        }
+                        return ReconnectOutcome::Reconnectable(StreamError::new("audio send failed"));
+                    }
+                    self.bytes_sent.fetch_add(audio_data.len() as u64, Ordering::Relaxed);
+                    self.stats.write().await.total_audio_bytes += audio_data.len() as u64;
+                    trace!("Sent {} bytes of audio", audio_data.len());
+                }
+
+                // Handle incoming messages with idle timeout.
+                message = timeout(WS_MESSAGE_TIMEOUT, self.ws_stream.next()) => {
+                    match message {
+                        Ok(Some(Ok(Message::Text(text)))) => {
+                            trace!("Received text message: {}", text);
+                            match ServerMessage::from_json(&text) {
+                                Ok(ServerMessage::Transcript(transcript)) => {
+                                    let result = STTResult::new(
+                                        transcript.data.utterance.text.clone(),
+                                        transcript.data.is_final,
+                                        transcript.data.is_final,
+                                        transcript.data.utterance.confidence as f32,
+                                    );
+                                    self.stats.write().await.update_with_result(&result);
+                                    if let Some(callback) = self.on_result.read().await.as_ref() {
+                                        callback(result).await;
+                                    }
+                                }
+                                Ok(ServerMessage::Error(err)) => {
+                                    error!("Gladia error: {}", err);
+                                    if let Some(callback) = self.on_error.read().await.as_ref() {
+                                        callback(STTError::ProviderError(err.message)).await;
+                                    }
+                                }
+                                Ok(ServerMessage::Unknown(msg_type)) => {
+                                    debug!("Unknown message type: {}", msg_type);
+                                }
+                                Err(e) => {
+                                    warn!("Failed to parse message: {}", e);
+                                }
+                            }
+                        }
+                        Ok(Some(Ok(Message::Binary(data)))) => {
+                            trace!("Received binary message: {} bytes", data.len());
+                        }
+                        Ok(Some(Ok(Message::Close(frame)))) => {
+                            info!("WebSocket closed: {:?}", frame);
+                            // Server closed mid-stream — reconnect to preserve the session.
+                            return ReconnectOutcome::Reconnectable(StreamError::new("server close"));
+                        }
+                        Ok(Some(Ok(Message::Ping(_)))) | Ok(Some(Ok(Message::Pong(_)))) => {
+                            // Handled by tungstenite.
+                        }
+                        Ok(Some(Ok(Message::Frame(_)))) => {
+                            // Raw frame, ignore.
+                        }
+                        Ok(Some(Err(e))) => {
+                            error!("WebSocket error: {}", e);
+                            if let Some(callback) = self.on_error.read().await.as_ref() {
+                                callback(STTError::NetworkError(e.to_string())).await;
+                            }
+                            return ReconnectOutcome::Reconnectable(StreamError::new("websocket error"));
+                        }
+                        Ok(None) => {
+                            info!("Gladia WebSocket stream ended");
+                            return ReconnectOutcome::Reconnectable(StreamError::new("stream ended"));
+                        }
+                        Err(_elapsed) => {
+                            let stt_error = STTError::NetworkError(
+                                "Gladia WebSocket idle timeout - no message for 60 seconds".into(),
+                            );
+                            error!("Gladia STT idle timeout: {}", stt_error);
+                            if let Some(callback) = self.on_error.read().await.as_ref() {
+                                callback(stt_error).await;
+                            }
+                            return ReconnectOutcome::Reconnectable(StreamError::new("idle timeout"));
+                        }
+                    }
+                }
+
+                // Handle shutdown signal (intentional close — must NOT reconnect).
+                _ = &mut *shutdown_rx => {
+                    info!("Gladia: Received shutdown signal");
+                    let stop_msg = StopRecordingMessage::new();
+                    if let Ok(json) = stop_msg.to_json() {
+                        let _ = self.ws_sink.send(Message::Text(json.into())).await;
+                    }
+                    let _ = self.ws_sink.close().await;
+                    return ReconnectOutcome::Completed;
+                }
+            }
+        }
+    }
+}
 
 // =============================================================================
 // GladiaSTT Implementation
@@ -40,9 +297,13 @@ pub struct GladiaSTT {
     base_config: Option<STTConfig>,
     /// Current connection state
     state: Arc<RwLock<STTConnectionState>>,
-    /// WebSocket sink for sending messages
-    ws_sink: Arc<RwLock<Option<WsSink>>>,
-    /// Session ID from initialization
+    /// Audio sender (bounded channel for backpressure); the supervised transport drains it.
+    ws_sender: Option<mpsc::Sender<Bytes>>,
+    /// Shutdown signal sender.
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Connection task handle (the supervisor's outer reconnect loop).
+    connection_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Session ID from the most recent initialization.
     session_id: Arc<RwLock<Option<String>>>,
     /// Result callback
     on_result: Arc<RwLock<Option<STTResultCallback>>>,
@@ -50,12 +311,22 @@ pub struct GladiaSTT {
     on_error: Arc<RwLock<Option<STTErrorCallback>>>,
     /// Ready flag
     is_ready: Arc<AtomicBool>,
+    /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
+    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// server-side close can never trigger a spurious reconnect.
+    intentional_disconnect: Arc<AtomicBool>,
     /// Statistics
     stats: Arc<RwLock<STTStats>>,
     /// Bytes sent counter
     bytes_sent: Arc<AtomicU64>,
     /// HTTP client for session initialization
     http_client: reqwest::Client,
+    /// Shared, process-global resilience handles (W-D2): the single reconnect governor + this
+    /// provider's shared circuit breaker, injected by the VoiceManager from CoreState and driven
+    /// by the generic [`ReconnectableStream`](crate::core::websocket::ReconnectableStream)
+    /// supervisor. `None` before `set_resilience` (a direct unit-test construction) → the
+    /// supervisor uses its own per-session governor/breaker default.
+    resilience: Option<crate::core::resilience::ResilienceHandles>,
 }
 
 impl GladiaSTT {
@@ -81,174 +352,34 @@ impl GladiaSTT {
             gladia_config: config,
             base_config: None,
             state: Arc::new(RwLock::new(STTConnectionState::Disconnected)),
-            ws_sink: Arc::new(RwLock::new(None)),
+            ws_sender: None,
+            shutdown_tx: None,
+            connection_handle: None,
             session_id: Arc::new(RwLock::new(None)),
             on_result: Arc::new(RwLock::new(None)),
             on_error: Arc::new(RwLock::new(None)),
             is_ready: Arc::new(AtomicBool::new(false)),
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(RwLock::new(STTStats::default())),
             bytes_sent: Arc::new(AtomicU64::new(0)),
             http_client: reqwest::Client::new(),
+            resilience: None,
         })
+    }
+
+    /// The shared circuit breaker this session feeds into the generic supervisor, if the
+    /// process-global resilience handles have been injected (W-D1/W-D2). Two `GladiaSTT` built from
+    /// the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.as_ref().map(|r| &r.breaker)
     }
 
     /// Build the `POST /v2/live` session-init request body from the provider config.
     ///
-    /// Extracted from `init_session` so the exact JSON that hits the wire is unit-testable
-    /// (the recurring "feature set on the config struct but never serialized" bug class).
+    /// Test hook kept for the wire-level feature tests; delegates to the free
+    /// [`build_init_request_from`] the connect closure uses, so they stay byte-identical.
     pub(super) fn build_init_request(&self) -> InitSessionRequest {
-        // Omit post_processing entirely when no post-processing feature is requested, so the
-        // default body stays byte-for-byte identical to before this feature was added.
-        let post_processing = if self.gladia_config.post_processing.is_empty() {
-            None
-        } else {
-            Some(self.gladia_config.post_processing.clone())
-        };
-        InitSessionRequest {
-            encoding: self.gladia_config.encoding.as_str().to_string(),
-            bit_depth: self.gladia_config.bit_depth.value(),
-            sample_rate: self.gladia_config.sample_rate,
-            channels: self.gladia_config.channels,
-            model: Some(self.gladia_config.model.clone()),
-            endpointing: Some(self.gladia_config.endpointing),
-            maximum_duration_without_endpointing: Some(
-                self.gladia_config.maximum_duration_without_endpointing,
-            ),
-            language_config: Some(self.gladia_config.language_config.clone()),
-            pre_processing: Some(self.gladia_config.pre_processing.clone()),
-            realtime_processing: Some(self.gladia_config.realtime_processing.clone()),
-            post_processing,
-            messages_config: Some(self.gladia_config.messages_config.clone()),
-            custom_metadata: self.gladia_config.custom_metadata.clone(),
-        }
-    }
-
-    /// Initialize a session via REST API
-    async fn init_session(&self) -> Result<InitSessionResponse, STTError> {
-        let url = self.gladia_config.api_url();
-        debug!("Initializing Gladia session at {}", url);
-
-        let request_body = self.build_init_request();
-
-        trace!("Session init request: {:?}", request_body);
-
-        let response = self
-            .http_client
-            .post(&url)
-            .header("X-Gladia-Key", &self.gladia_config.api_key)
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| STTError::ConnectionFailed(format!("HTTP request failed: {}", e)))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(match status.as_u16() {
-                401 => STTError::AuthenticationFailed(format!("Invalid API key: {}", error_text)),
-                400 | 422 => {
-                    STTError::ConfigurationError(format!("Invalid request: {}", error_text))
-                }
-                _ => STTError::ConnectionFailed(format!(
-                    "Session init failed ({}): {}",
-                    status, error_text
-                )),
-            });
-        }
-
-        let init_response: InitSessionResponse = response
-            .json()
-            .await
-            .map_err(|e| STTError::ConnectionFailed(format!("Failed to parse response: {}", e)))?;
-
-        debug!(
-            "Session initialized: id={}, ws_url={}",
-            init_response.id, init_response.url
-        );
-
-        Ok(init_response)
-    }
-
-    /// Spawn the WebSocket message receiver task
-    fn spawn_receiver_task(&self, mut ws_stream: futures_util::stream::SplitStream<WsStream>) {
-        let on_result = self.on_result.clone();
-        let on_error = self.on_error.clone();
-        let state = self.state.clone();
-        let is_ready = self.is_ready.clone();
-        let stats = self.stats.clone();
-
-        tokio::spawn(async move {
-            while let Some(message_result) = ws_stream.next().await {
-                match message_result {
-                    Ok(Message::Text(text)) => {
-                        trace!("Received text message: {}", text);
-                        match ServerMessage::from_json(&text) {
-                            Ok(ServerMessage::Transcript(transcript)) => {
-                                // Create STTResult (using only available fields)
-                                let result = STTResult::new(
-                                    transcript.data.utterance.text.clone(),
-                                    transcript.data.is_final,
-                                    transcript.data.is_final, // Use is_final for is_speech_final
-                                    transcript.data.utterance.confidence as f32,
-                                );
-
-                                // Update stats
-                                {
-                                    let mut s = stats.write().await;
-                                    s.update_with_result(&result);
-                                }
-
-                                // Invoke callback
-                                if let Some(callback) = on_result.read().await.as_ref() {
-                                    callback(result).await;
-                                }
-                            }
-                            Ok(ServerMessage::Error(err)) => {
-                                error!("Gladia error: {}", err);
-                                if let Some(callback) = on_error.read().await.as_ref() {
-                                    callback(STTError::ProviderError(err.message)).await;
-                                }
-                            }
-                            Ok(ServerMessage::Unknown(msg_type)) => {
-                                debug!("Unknown message type: {}", msg_type);
-                            }
-                            Err(e) => {
-                                warn!("Failed to parse message: {}", e);
-                            }
-                        }
-                    }
-                    Ok(Message::Binary(data)) => {
-                        trace!("Received binary message: {} bytes", data.len());
-                    }
-                    Ok(Message::Close(frame)) => {
-                        info!("WebSocket closed: {:?}", frame);
-                        is_ready.store(false, Ordering::SeqCst);
-                        *state.write().await = STTConnectionState::Disconnected;
-                        break;
-                    }
-                    Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
-                        // Handled by tungstenite
-                    }
-                    Ok(Message::Frame(_)) => {
-                        // Raw frame, ignore
-                    }
-                    Err(e) => {
-                        error!("WebSocket error: {}", e);
-                        is_ready.store(false, Ordering::SeqCst);
-                        *state.write().await = STTConnectionState::Error(e.to_string());
-                        if let Some(callback) = on_error.read().await.as_ref() {
-                            callback(STTError::NetworkError(e.to_string())).await;
-                        }
-                        break;
-                    }
-                }
-            }
-            debug!("Receiver task ended");
-        });
+        build_init_request_from(&self.gladia_config)
     }
 }
 
@@ -271,14 +402,18 @@ impl BaseSTT for GladiaSTT {
             gladia_config,
             base_config: Some(config),
             state: Arc::new(RwLock::new(STTConnectionState::Disconnected)),
-            ws_sink: Arc::new(RwLock::new(None)),
+            ws_sender: None,
+            shutdown_tx: None,
+            connection_handle: None,
             session_id: Arc::new(RwLock::new(None)),
             on_result: Arc::new(RwLock::new(None)),
             on_error: Arc::new(RwLock::new(None)),
             is_ready: Arc::new(AtomicBool::new(false)),
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(RwLock::new(STTStats::default())),
             bytes_sent: Arc::new(AtomicU64::new(0)),
             http_client: reqwest::Client::new(),
+            resilience: None,
         })
     }
 
@@ -290,55 +425,144 @@ impl BaseSTT for GladiaSTT {
                 return Ok(());
             }
         }
+        // Fresh session: clear any intent left over from a prior disconnect so the supervisor
+        // does not immediately complete.
+        self.intentional_disconnect.store(false, Ordering::SeqCst);
 
-        // Update state to connecting
         *self.state.write().await = STTConnectionState::Connecting;
         info!("Connecting to Gladia STT...");
 
-        // Step 1: Initialize session via REST
-        let init_response = self.init_session().await?;
+        // Create channels for communication (bounded for backpressure on audio).
+        let (ws_tx, ws_rx) = mpsc::channel::<Bytes>(32);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
-        // Store session ID
-        *self.session_id.write().await = Some(init_response.id.clone());
+        self.ws_sender = Some(ws_tx);
+        self.shutdown_tx = Some(shutdown_tx);
 
-        // Step 2: Connect to WebSocket
-        debug!("Connecting to WebSocket: {}", init_response.url);
-        let (ws_stream, _) = connect_async(&init_response.url).await.map_err(|e| {
-            STTError::ConnectionFailed(format!("WebSocket connection failed: {}", e))
-        })?;
+        // Shared state the supervised transport re-uses across reconnect attempts.
+        let audio_rx = Arc::new(Mutex::new(ws_rx));
+        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
+        let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
 
-        // Split the stream
-        let (sink, stream) = ws_stream.split();
+        let on_result = Arc::clone(&self.on_result);
+        let on_error = Arc::clone(&self.on_error);
+        let stats = Arc::clone(&self.stats);
+        let bytes_sent = Arc::clone(&self.bytes_sent);
+        let session_id = Arc::clone(&self.session_id);
+        let http_client = self.http_client.clone();
+        let gladia_config = self.gladia_config.clone();
 
-        // Store the sink
-        *self.ws_sink.write().await = Some(sink);
+        // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor with
+        // the shared process-global handles from CoreState (W-D1/W-D2 fleet adoption). When no
+        // handles were injected, the supervisor uses its own per-session governor/breaker default.
+        let reconnection = ReconnectionConfig::aggressive();
+        let disconnect_flag = Arc::clone(&self.intentional_disconnect);
+        let supervisor = match self.resilience.clone() {
+            Some(r) => ReconnectableStream::with_breaker_and_governor(
+                ReconnectableStreamConfig::new("gladia", reconnection),
+                r.breaker,
+                (*r.governor).clone(),
+            ),
+            None => {
+                ReconnectableStream::new(ReconnectableStreamConfig::new("gladia", reconnection))
+            }
+        }
+        .with_disconnect_flag(disconnect_flag);
 
-        // Spawn receiver task
-        self.spawn_receiver_task(stream);
+        // Start the connection task: the supervisor owns the outer reconnect loop; the `connect`
+        // closure re-runs the REST session-init (every feature rides that body) to mint a fresh
+        // featured WS URL, dials it, and hands back a transport whose `run()` is the original
+        // Gladia receiver loop.
+        let connection_handle = tokio::spawn(async move {
+            let exit = supervisor
+                .run(|| {
+                    let http_client = http_client.clone();
+                    let gladia_config = gladia_config.clone();
+                    let audio_rx = Arc::clone(&audio_rx);
+                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let connected_tx = Arc::clone(&connected_tx);
+                    let on_result = Arc::clone(&on_result);
+                    let on_error = Arc::clone(&on_error);
+                    let stats = Arc::clone(&stats);
+                    let bytes_sent = Arc::clone(&bytes_sent);
+                    let session_id = Arc::clone(&session_id);
+                    async move {
+                        // Featured handshake: REST init mints a fresh session id + WS URL.
+                        let init_response = init_session(&http_client, &gladia_config)
+                            .await
+                            .map_err(|e| StreamError::new(e.to_string()))?;
+                        *session_id.write().await = Some(init_response.id.clone());
 
-        // Update state
-        *self.state.write().await = STTConnectionState::Connected;
-        self.is_ready.store(true, Ordering::SeqCst);
+                        debug!("Connecting to WebSocket: {}", init_response.url);
+                        let (ws_stream, _) =
+                            connect_async(&init_response.url).await.map_err(|e| {
+                                StreamError::new(format!("WebSocket connection failed: {e}"))
+                            })?;
+                        info!("Connected to Gladia STT (session: {})", init_response.id);
+                        let (ws_sink, ws_stream) = ws_stream.split();
+                        Ok(GladiaTransport {
+                            ws_sink,
+                            ws_stream,
+                            audio_rx,
+                            shutdown_rx,
+                            on_result,
+                            on_error,
+                            stats,
+                            bytes_sent,
+                            connected_tx,
+                        })
+                    }
+                })
+                .await;
+            info!("Gladia STT WebSocket connection closed (supervisor exit: {exit:?})");
+        });
 
-        info!("Connected to Gladia STT (session: {})", init_response.id);
-        Ok(())
+        self.connection_handle = Some(connection_handle);
+
+        // Wait for the first successful connect (restore_session fires the connected signal).
+        match timeout(Duration::from_secs(15), connected_rx).await {
+            Ok(Ok(())) => {
+                *self.state.write().await = STTConnectionState::Connected;
+                self.is_ready.store(true, Ordering::SeqCst);
+                info!("Connected to Gladia STT");
+                Ok(())
+            }
+            Ok(Err(_)) => {
+                *self.state.write().await =
+                    STTConnectionState::Error("connection channel closed".to_string());
+                Err(STTError::ConnectionFailed(
+                    "Connection channel closed before Gladia session started".to_string(),
+                ))
+            }
+            Err(_) => {
+                *self.state.write().await =
+                    STTConnectionState::Error("connection timeout".to_string());
+                Err(STTError::ConnectionFailed(
+                    "Connection timeout waiting for Gladia session".to_string(),
+                ))
+            }
+        }
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
+        // Record the intent BEFORE any further work so the supervisor sees it even if the
+        // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
         info!("Disconnecting from Gladia STT...");
 
-        // Send stop recording message
-        if let Some(sink) = self.ws_sink.write().await.as_mut() {
-            let stop_msg = StopRecordingMessage::new();
-            if let Ok(json) = stop_msg.to_json() {
-                let _ = sink.send(Message::Text(json.into())).await;
-            }
-            // Close the WebSocket
-            let _ = sink.close().await;
+        // Signal the supervised transport to send StopRecording + close intentionally (no
+        // reconnect).
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+
+        if let Some(handle) = self.connection_handle.take() {
+            let _ = timeout(Duration::from_secs(5), handle).await;
         }
 
         // Clear state
-        *self.ws_sink.write().await = None;
+        self.ws_sender = None;
         *self.session_id.write().await = None;
         *self.state.write().await = STTConnectionState::Disconnected;
         self.is_ready.store(false, Ordering::SeqCst);
@@ -352,30 +576,13 @@ impl BaseSTT for GladiaSTT {
             return Err(STTError::ConnectionFailed("Not connected".to_string()));
         }
 
-        let mut sink_guard = self.ws_sink.write().await;
-        let sink = sink_guard
-            .as_mut()
-            .ok_or_else(|| STTError::ConnectionFailed("Not connected".to_string()))?;
-
-        // Send as JSON with base64 encoding (per Gladia docs)
-        let chunk_msg = AudioChunkMessage::new(&audio_data);
-        let json = chunk_msg
-            .to_json()
-            .map_err(|e| STTError::InvalidAudioFormat(e.to_string()))?;
-
-        sink.send(Message::Text(json.into()))
-            .await
-            .map_err(|e| STTError::NetworkError(e.to_string()))?;
-
-        // Update stats
-        self.bytes_sent
-            .fetch_add(audio_data.len() as u64, Ordering::Relaxed);
-        {
-            let mut stats = self.stats.write().await;
-            stats.total_audio_bytes += audio_data.len() as u64;
+        if let Some(ws_sender) = &self.ws_sender {
+            ws_sender
+                .send(audio_data)
+                .await
+                .map_err(|e| STTError::NetworkError(e.to_string()))?;
         }
 
-        trace!("Sent {} bytes of audio", audio_data.len());
         Ok(())
     }
 
@@ -414,6 +621,24 @@ impl BaseSTT for GladiaSTT {
 
     fn get_provider_info(&self) -> &'static str {
         "Gladia STT (solaria-1)"
+    }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared, process-global handles so `connect` drives the generic
+        // ReconnectableStream supervisor with them — every Gladia session trips the same breaker
+        // and shares the one process-wide reconnect cap (W-D2).
+        self.resilience = Some(resilience);
+    }
+}
+
+impl Drop for GladiaSTT {
+    fn drop(&mut self) {
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+        if let Some(handle) = self.connection_handle.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -480,6 +705,22 @@ mod tests {
         assert_eq!(
             stt.gladia_config.realtime_processing.custom_vocabulary,
             vec!["WaaV", "Gladia"]
+        );
+    }
+
+    // W-D1: disconnect() must record intent on the supervisor-shared flag so a client close racing
+    // a server-side close can never trigger a spurious reconnect (the supervisor's loop-top guard
+    // observes this same `Arc<AtomicBool>`). Before this wiring the flag was the supervisor's own
+    // and disconnect() never set it.
+    #[tokio::test]
+    async fn disconnect_sets_intentional_flag_for_supervisor() {
+        let config = create_test_base_config();
+        let mut stt = GladiaSTT::new(config).unwrap();
+        assert!(!stt.intentional_disconnect.load(Ordering::SeqCst));
+        stt.disconnect().await.unwrap();
+        assert!(
+            stt.intentional_disconnect.load(Ordering::SeqCst),
+            "disconnect() must set the supervisor-shared intentional-disconnect flag",
         );
     }
 

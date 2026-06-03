@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
-use tokio::time::{Instant, interval, timeout};
+use tokio::time::{interval, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
 
@@ -45,6 +45,13 @@ use super::super::base::{
 };
 use super::config::IFlytekSttConfig;
 use super::messages::{SttRequest, SttResponse};
+use crate::core::websocket::ReconnectionConfig;
+use crate::core::websocket::reconnectable_stream::{
+    ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
+    WsTransport,
+};
+use futures::stream::{SplitSink, SplitStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 // =============================================================================
 // Constants
@@ -92,6 +99,214 @@ type AsyncErrorCallback = Box<
         + Sync,
 >;
 
+/// The concrete WebSocket stream type iFlytek dials.
+type IFlytekWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// The featured first-frame parameters, cloned once per session and re-applied on every
+/// (re)connect. iFlytek carries its entire featured session in the **first frame** (status=0):
+/// language, domain, accent, VAD endpointing, dynamic correction, punctuation, number conversion,
+/// audio format/encoding, and business extras. On a fresh connect the transport's `run()` re-sends
+/// this first frame, so a reconnect restores the *featured* session rather than a bare one.
+#[derive(Clone)]
+struct IFlytekFeatures {
+    app_id: String,
+    language: String,
+    domain: String,
+    accent: String,
+    vad_eos_ms: u32,
+    dynamic_correction: bool,
+    punctuation: bool,
+    convert_numbers: bool,
+    audio_format: String,
+    encoding: String,
+    business_extras: super::messages::IFlytekBusinessExtras,
+}
+
+/// A [`WsTransport`] that adapts iFlytek's frame-paced streaming event loop to the generic
+/// [`ReconnectableStream`] supervisor (W-D1 fleet adoption). One is built per (re)connect by the
+/// supervisor's `connect` closure.
+///
+/// iFlytek's signed connect URL carries only auth — the entire featured session rides the **first
+/// audio frame** (status=0). Like Cartesia (features-in-the-handshake), the featured session is
+/// re-established *inside* `run()` on every fresh connect: the loop resets `is_first_frame = true`
+/// and re-emits the featured first frame from the cloned [`IFlytekFeatures`]. So
+/// [`restore_session`](WsTransport::restore_session) is a no-op beyond signalling the waiting
+/// `connect()` once. [`run`](WsTransport::run) IS the original `select!` loop, now returning a
+/// [`ReconnectOutcome`] so a mid-stream transport drop reconnects instead of ending the session.
+struct IFlytekTransport {
+    ws_sink: SplitSink<IFlytekWs, Message>,
+    ws_stream: SplitStream<IFlytekWs>,
+    /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
+    audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
+    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
+    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    result_tx: mpsc::Sender<STTResult>,
+    error_tx: mpsc::Sender<STTError>,
+    /// Fires once on the first successful connect, unblocking `start_connection`.
+    connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// Featured first-frame parameters, re-applied on every (re)connect.
+    features: IFlytekFeatures,
+    /// Frame counter for status/telemetry (shared with the client).
+    frame_count: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[async_trait::async_trait]
+impl WsTransport for IFlytekTransport {
+    async fn restore_session(&mut self) -> Result<(), RestoreError> {
+        // iFlytek's featured session rides the first audio frame, which `run()` re-sends on every
+        // fresh connect (is_first_frame resets there). Nothing to re-send here — just signal the
+        // waiting connect() exactly once.
+        if let Some(tx) = self.connected_tx.lock().await.take() {
+            let _ = tx.send(());
+        }
+        Ok(())
+    }
+
+    async fn run(&mut self) -> ReconnectOutcome {
+        let mut audio_rx = self.audio_rx.lock().await;
+        let mut shutdown_rx = self.shutdown_rx.lock().await;
+        let f = &self.features;
+
+        // Per-connect framing state: a fresh connection must re-send the featured FIRST frame, so
+        // these reset every time `run()` is (re)entered.
+        let mut frame_timer = interval(FRAME_INTERVAL);
+        let mut is_first_frame = true;
+        let mut audio_buffer: Vec<u8> = Vec::with_capacity(DEFAULT_FRAME_SIZE * 2);
+        let mut session_ended = false;
+
+        loop {
+            tokio::select! {
+                // Handle incoming audio data
+                Some(audio_data) = audio_rx.recv() => {
+                    audio_buffer.extend_from_slice(&audio_data);
+                }
+
+                // Send frames at regular intervals
+                _ = frame_timer.tick() => {
+                    if session_ended {
+                        // The provider signalled end-of-session (final result) — an intentional
+                        // completion, NOT a transport drop.
+                        return ReconnectOutcome::Completed;
+                    }
+
+                    // Check if we have enough data to send
+                    if audio_buffer.len() >= DEFAULT_FRAME_SIZE || !is_first_frame {
+                        let frame_size = audio_buffer.len().min(DEFAULT_FRAME_SIZE);
+                        let frame_data: Vec<u8> = audio_buffer.drain(..frame_size).collect();
+
+                        let request = if is_first_frame {
+                            is_first_frame = false;
+                            SttRequest::first_frame_with_extras(
+                                &f.app_id,
+                                &f.language,
+                                &f.domain,
+                                Some(&f.accent),
+                                f.vad_eos_ms,
+                                f.dynamic_correction,
+                                f.punctuation,
+                                f.convert_numbers,
+                                &f.audio_format,
+                                &f.encoding,
+                                &frame_data,
+                                &f.business_extras,
+                            )
+                        } else {
+                            SttRequest::continue_frame(
+                                &f.app_id,
+                                &f.audio_format,
+                                &f.encoding,
+                                &frame_data,
+                            )
+                        };
+
+                        let json = match request.to_json() {
+                            Ok(j) => j,
+                            Err(e) => {
+                                error!("Failed to serialize request: {}", e);
+                                continue;
+                            }
+                        };
+
+                        if let Err(e) = self.ws_sink.send(Message::Text(json.into())).await {
+                            let err = STTError::NetworkError(format!("Failed to send frame: {}", e));
+                            error!("{}", err);
+                            let _ = self.error_tx.try_send(err);
+                            // Transport-level send failure: reconnect to preserve the session.
+                            return ReconnectOutcome::Reconnectable(StreamError::new("frame send failed"));
+                        }
+
+                        self.frame_count.fetch_add(1, Ordering::Relaxed);
+                        debug!("Sent iFlytek frame #{}", self.frame_count.load(Ordering::Relaxed));
+                    }
+                }
+
+                // Handle incoming messages with timeout
+                message = timeout(WS_MESSAGE_TIMEOUT, self.ws_stream.next()) => {
+                    match message {
+                        Ok(Some(Ok(msg))) => {
+                            match IFlytekStt::handle_websocket_message(msg, &self.result_tx, &self.error_tx) {
+                                Ok(is_final) => {
+                                    if is_final {
+                                        info!("iFlytek STT session complete");
+                                        session_ended = true;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("iFlytek message handling error: {}", e);
+                                    // A non-retryable provider error frame is fatal (bad config /
+                                    // auth) — don't hammer it with reconnects.
+                                    return ReconnectOutcome::Fatal(StreamError::new("provider error frame"));
+                                }
+                            }
+                        }
+                        Ok(Some(Err(e))) => {
+                            let err = STTError::NetworkError(format!("WebSocket error: {}", e));
+                            error!("{}", err);
+                            let _ = self.error_tx.try_send(err);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("websocket error"));
+                        }
+                        Ok(None) => {
+                            info!("iFlytek WebSocket stream ended");
+                            return ReconnectOutcome::Reconnectable(StreamError::new("stream ended"));
+                        }
+                        Err(_) => {
+                            let err = STTError::NetworkError(
+                                "iFlytek WebSocket idle timeout".to_string()
+                            );
+                            error!("{}", err);
+                            let _ = self.error_tx.try_send(err);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("idle timeout"));
+                        }
+                    }
+                }
+
+                // Handle shutdown signal (intentional close — must NOT reconnect)
+                _ = &mut *shutdown_rx => {
+                    info!("iFlytek STT shutdown signal received");
+
+                    // Send remaining buffer as last frame
+                    if !audio_buffer.is_empty() || !is_first_frame {
+                        let request = SttRequest::last_frame(
+                            &f.app_id,
+                            &f.audio_format,
+                            &f.encoding,
+                            &audio_buffer,
+                        );
+
+                        if let Ok(json) = request.to_json() {
+                            let _ = self.ws_sink.send(Message::Text(json.into())).await;
+                            debug!("Sent iFlytek last frame");
+                        }
+                    }
+
+                    let _ = self.ws_sink.close().await;
+                    return ReconnectOutcome::Completed;
+                }
+            }
+        }
+    }
+}
+
 // =============================================================================
 // iFlytek STT Client
 // =============================================================================
@@ -126,6 +341,11 @@ pub struct IFlytekStt {
     /// Connection state.
     connected: AtomicBool,
 
+    /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
+    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// server-side close can never trigger a spurious reconnect.
+    intentional_disconnect: Arc<AtomicBool>,
+
     /// State change notification.
     state_notify: Arc<Notify>,
 
@@ -152,6 +372,13 @@ pub struct IFlytekStt {
 
     /// Frame counter for status tracking.
     frame_count: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Shared, process-global resilience handles (W-D2): the single reconnect governor + this
+    /// provider's shared circuit breaker, injected by the VoiceManager from CoreState and driven
+    /// by the generic [`ReconnectableStream`](crate::core::websocket::ReconnectableStream)
+    /// supervisor. `None` before `set_resilience` (a direct unit-test construction) → the
+    /// supervisor uses its own per-session governor/breaker default.
+    resilience: Option<crate::core::resilience::ResilienceHandles>,
 }
 
 impl IFlytekStt {
@@ -166,6 +393,7 @@ impl IFlytekStt {
             base_config: config,
             config: iflytek_config,
             connected: AtomicBool::new(false),
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
             shutdown_tx: None,
@@ -175,6 +403,7 @@ impl IFlytekStt {
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
             frame_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            resilience: None,
         })
     }
 
@@ -189,6 +418,7 @@ impl IFlytekStt {
             base_config,
             config: iflytek_config,
             connected: AtomicBool::new(false),
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
             shutdown_tx: None,
@@ -198,6 +428,7 @@ impl IFlytekStt {
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
             frame_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            resilience: None,
         }
     }
 
@@ -316,8 +547,8 @@ impl IFlytekStt {
         debug!("Connecting to iFlytek: {}", ws_url);
 
         // Create channels
-        let (ws_tx, mut ws_rx) = mpsc::channel::<Bytes>(AUDIO_CHANNEL_BUFFER);
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let (ws_tx, ws_rx) = mpsc::channel::<Bytes>(AUDIO_CHANNEL_BUFFER);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(RESULT_CHANNEL_BUFFER);
         let (error_tx, mut error_rx) = mpsc::channel::<STTError>(ERROR_CHANNEL_BUFFER);
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
@@ -326,181 +557,102 @@ impl IFlytekStt {
         self.ws_sender = Some(ws_tx);
         self.shutdown_tx = Some(shutdown_tx);
 
-        // Clone config values for the connection task
-        let app_id = self.config.auth.app_id.clone();
-        let language = self.config.language.as_code().to_string();
-        let domain = self.config.domain.as_str().to_string();
-        let accent = self.config.accent.clone();
-        let vad_eos_ms = self.config.vad_eos_ms;
-        let dynamic_correction = self.config.dynamic_correction;
-        let punctuation = self.config.punctuation;
-        let convert_numbers = self.config.convert_numbers;
-        let audio_format = self.config.audio_format_string();
-        let encoding = self.config.encoding.as_str().to_string();
-        let business_extras = self.config.business_extras.clone();
+        // The featured first-frame parameters, cloned once and re-applied on every (re)connect.
+        let features = IFlytekFeatures {
+            app_id: self.config.auth.app_id.clone(),
+            language: self.config.language.as_code().to_string(),
+            domain: self.config.domain.as_str().to_string(),
+            accent: self.config.accent.clone(),
+            vad_eos_ms: self.config.vad_eos_ms,
+            dynamic_correction: self.config.dynamic_correction,
+            punctuation: self.config.punctuation,
+            convert_numbers: self.config.convert_numbers,
+            audio_format: self.config.audio_format_string(),
+            encoding: self.config.encoding.as_str().to_string(),
+            business_extras: self.config.business_extras.clone(),
+        };
         let frame_count = self.frame_count.clone();
 
-        // Start connection task
-        let connection_handle = tokio::spawn(async move {
-            // Connect to WebSocket
-            let ws_stream = match timeout(WS_CONNECT_TIMEOUT, connect_async(&ws_url)).await {
-                Ok(Ok((stream, _))) => stream,
-                Ok(Err(e)) => {
-                    let err =
-                        STTError::ConnectionFailed(format!("WebSocket connection failed: {}", e));
-                    error!("{}", err);
-                    let _ = error_tx.try_send(err);
-                    return;
-                }
-                Err(_) => {
-                    let err = STTError::ConnectionFailed("Connection timeout".to_string());
-                    error!("{}", err);
-                    let _ = error_tx.try_send(err);
-                    return;
-                }
-            };
+        // Shared state the supervised transport re-uses across reconnect attempts: a single-
+        // consumer audio receiver + shutdown oneshot (locked per `run`) and the one-shot connected
+        // signal that fires on the first successful connect.
+        let audio_rx = Arc::new(Mutex::new(ws_rx));
+        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
+        let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
 
-            info!("Connected to iFlytek STT WebSocket");
-            let _ = connected_tx.send(());
-
-            let (mut ws_sink, mut ws_stream) = ws_stream.split();
-
-            // Frame interval timer
-            let mut frame_timer = interval(FRAME_INTERVAL);
-            let mut _last_activity = Instant::now();
-            let mut is_first_frame = true;
-            let mut audio_buffer: Vec<u8> = Vec::with_capacity(DEFAULT_FRAME_SIZE * 2);
-            let mut session_ended = false;
-
-            loop {
-                tokio::select! {
-                    // Handle incoming audio data
-                    Some(audio_data) = ws_rx.recv() => {
-                        audio_buffer.extend_from_slice(&audio_data);
-                        _last_activity = Instant::now();
-                    }
-
-                    // Send frames at regular intervals
-                    _ = frame_timer.tick() => {
-                        if session_ended {
-                            break;
-                        }
-
-                        // Check if we have enough data to send
-                        if audio_buffer.len() >= DEFAULT_FRAME_SIZE || !is_first_frame {
-                            let frame_size = audio_buffer.len().min(DEFAULT_FRAME_SIZE);
-                            let frame_data: Vec<u8> = audio_buffer.drain(..frame_size).collect();
-
-                            let request = if is_first_frame {
-                                is_first_frame = false;
-                                SttRequest::first_frame_with_extras(
-                                    &app_id,
-                                    &language,
-                                    &domain,
-                                    Some(&accent),
-                                    vad_eos_ms,
-                                    dynamic_correction,
-                                    punctuation,
-                                    convert_numbers,
-                                    &audio_format,
-                                    &encoding,
-                                    &frame_data,
-                                    &business_extras,
-                                )
-                            } else {
-                                SttRequest::continue_frame(
-                                    &app_id,
-                                    &audio_format,
-                                    &encoding,
-                                    &frame_data,
-                                )
-                            };
-
-                            let json = match request.to_json() {
-                                Ok(j) => j,
-                                Err(e) => {
-                                    error!("Failed to serialize request: {}", e);
-                                    continue;
-                                }
-                            };
-
-                            if let Err(e) = ws_sink.send(Message::Text(json.into())).await {
-                                let err = STTError::NetworkError(format!("Failed to send frame: {}", e));
-                                error!("{}", err);
-                                let _ = error_tx.try_send(err);
-                                break;
-                            }
-
-                            frame_count.fetch_add(1, Ordering::Relaxed);
-                            debug!("Sent iFlytek frame #{}", frame_count.load(Ordering::Relaxed));
-                        }
-                    }
-
-                    // Handle incoming messages with timeout
-                    message = timeout(WS_MESSAGE_TIMEOUT, ws_stream.next()) => {
-                        match message {
-                            Ok(Some(Ok(msg))) => {
-                                match Self::handle_websocket_message(msg, &result_tx, &error_tx) {
-                                    Ok(is_final) => {
-                                        if is_final {
-                                            info!("iFlytek STT session complete");
-                                            session_ended = true;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("iFlytek message handling error: {}", e);
-                                        break;
-                                    }
-                                }
-                            }
-                            Ok(Some(Err(e))) => {
-                                let err = STTError::NetworkError(format!("WebSocket error: {}", e));
-                                error!("{}", err);
-                                let _ = error_tx.try_send(err);
-                                break;
-                            }
-                            Ok(None) => {
-                                info!("iFlytek WebSocket stream ended");
-                                break;
-                            }
-                            Err(_) => {
-                                let err = STTError::NetworkError(
-                                    "iFlytek WebSocket idle timeout".to_string()
-                                );
-                                error!("{}", err);
-                                let _ = error_tx.try_send(err);
-                                break;
-                            }
-                        }
-                    }
-
-                    // Handle shutdown signal
-                    _ = &mut shutdown_rx => {
-                        info!("iFlytek STT shutdown signal received");
-
-                        // Send remaining buffer as last frame
-                        if !audio_buffer.is_empty() || !is_first_frame {
-                            let request = SttRequest::last_frame(
-                                &app_id,
-                                &audio_format,
-                                &encoding,
-                                &audio_buffer,
-                            );
-
-                            if let Ok(json) = request.to_json() {
-                                let _ = ws_sink.send(Message::Text(json.into())).await;
-                                debug!("Sent iFlytek last frame");
-                            }
-                        }
-
-                        break;
-                    }
-                }
+        // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor (the
+        // same one the chaos tests exercise) with the shared process-global handles from CoreState
+        // (W-D1/W-D2 fleet adoption). When no handles were injected (a direct unit-test
+        // construction), the supervisor uses its own per-session governor/breaker default.
+        let reconnection = ReconnectionConfig::aggressive();
+        let disconnect_flag = Arc::clone(&self.intentional_disconnect);
+        let supervisor = match self.resilience.clone() {
+            Some(r) => ReconnectableStream::with_breaker_and_governor(
+                ReconnectableStreamConfig::new("iflytek", reconnection),
+                r.breaker,
+                (*r.governor).clone(),
+            ),
+            None => {
+                ReconnectableStream::new(ReconnectableStreamConfig::new("iflytek", reconnection))
             }
+        }
+        .with_disconnect_flag(disconnect_flag);
 
-            // Close WebSocket gracefully
-            let _ = ws_sink.close().await;
-            info!("iFlytek STT WebSocket connection closed");
+        // Start connection task: the supervisor owns the outer reconnect loop; the `connect`
+        // closure dials the (signed) URL and hands back a transport whose `run()` re-emits the
+        // featured first frame and is the original iFlytek event loop.
+        let connection_handle = tokio::spawn(async move {
+            let exit = supervisor
+                .run(|| {
+                    let ws_url = ws_url.clone();
+                    let features = features.clone();
+                    let frame_count = frame_count.clone();
+                    let audio_rx = Arc::clone(&audio_rx);
+                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let connected_tx = Arc::clone(&connected_tx);
+                    let result_tx = result_tx.clone();
+                    let error_tx = error_tx.clone();
+                    async move {
+                        let ws_stream =
+                            match timeout(WS_CONNECT_TIMEOUT, connect_async(&ws_url)).await {
+                                Ok(Ok((stream, _))) => stream,
+                                Ok(Err(e)) => {
+                                    let err = STTError::ConnectionFailed(format!(
+                                        "WebSocket connection failed: {}",
+                                        e
+                                    ));
+                                    error!("{}", err);
+                                    let _ = error_tx.try_send(err);
+                                    return Err(StreamError::new(format!(
+                                        "WebSocket connection failed: {e}"
+                                    )));
+                                }
+                                Err(_) => {
+                                    let err =
+                                        STTError::ConnectionFailed("Connection timeout".to_string());
+                                    error!("{}", err);
+                                    let _ = error_tx.try_send(err);
+                                    return Err(StreamError::new("connection timeout"));
+                                }
+                            };
+
+                        info!("Connected to iFlytek STT WebSocket");
+                        let (ws_sink, ws_stream) = ws_stream.split();
+                        Ok(IFlytekTransport {
+                            ws_sink,
+                            ws_stream,
+                            audio_rx,
+                            shutdown_rx,
+                            result_tx,
+                            error_tx,
+                            connected_tx,
+                            features,
+                            frame_count,
+                        })
+                    }
+                })
+                .await;
+            info!("iFlytek STT WebSocket connection closed (supervisor exit: {exit:?})");
         });
 
         self.connection_handle = Some(connection_handle);
@@ -556,6 +708,7 @@ impl Default for IFlytekStt {
             base_config: STTConfig::default(),
             config: IFlytekSttConfig::default(),
             connected: AtomicBool::new(false),
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
             shutdown_tx: None,
@@ -565,6 +718,7 @@ impl Default for IFlytekStt {
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
             frame_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            resilience: None,
         }
     }
 }
@@ -582,6 +736,9 @@ impl BaseSTT for IFlytekStt {
         if self.connected.load(Ordering::SeqCst) {
             return Ok(());
         }
+        // Fresh session: clear any intent left over from a prior disconnect so the supervisor
+        // does not immediately complete.
+        self.intentional_disconnect.store(false, Ordering::SeqCst);
 
         info!(
             "Connecting to iFlytek STT (language: {}, mode: {:?})",
@@ -594,6 +751,9 @@ impl BaseSTT for IFlytekStt {
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
+        // Record the intent BEFORE the connected-guard so the supervisor sees it even if the
+        // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
         if !self.connected.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -702,6 +862,24 @@ impl BaseSTT for IFlytekStt {
     fn get_provider_info(&self) -> &'static str {
         PROVIDER_INFO
     }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared, process-global handles so `start_connection` drives the generic
+        // ReconnectableStream supervisor with them — every iFlytek session trips the same breaker
+        // and shares the one process-wide reconnect cap (W-D2).
+        self.resilience = Some(resilience);
+    }
+}
+
+impl IFlytekStt {
+    /// The shared circuit breaker this session feeds into the generic supervisor, if the
+    /// process-global resilience handles have been injected (W-D1/W-D2). Two `IFlytekStt` built
+    /// from the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(
+        &self,
+    ) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.as_ref().map(|r| &r.breaker)
+    }
 }
 
 impl Drop for IFlytekStt {
@@ -734,6 +912,22 @@ mod tests {
             punctuation: true,
             ..Default::default()
         }
+    }
+
+    // W-D1: disconnect() must record intent on the supervisor-shared flag so a client close racing
+    // a server-side close can never trigger a spurious reconnect (the supervisor's loop-top guard
+    // observes this same `Arc<AtomicBool>`). Before this wiring the flag was the supervisor's own
+    // and disconnect() never set it.
+    #[tokio::test]
+    async fn disconnect_sets_intentional_flag_for_supervisor() {
+        let config = create_test_config();
+        let mut stt = IFlytekStt::new(config).unwrap();
+        assert!(!stt.intentional_disconnect.load(Ordering::SeqCst));
+        stt.disconnect().await.unwrap();
+        assert!(
+            stt.intentional_disconnect.load(Ordering::SeqCst),
+            "disconnect() must set the supervisor-shared intentional-disconnect flag",
+        );
     }
 
     #[test]

@@ -96,9 +96,42 @@ impl TinkoffGrpcClient {
         Self { channel, config }
     }
 
+    /// Open a fresh bidirectional `StreamingRecognize` stream over the given audio receiver.
+    ///
+    /// The featured session is re-established intrinsically by opening a new stream: the request
+    /// metadata (x-api-key / x-secret-key) is rebuilt from config, and [`AudioChunkStream`] sends
+    /// the FIRST request as the featured `StreamingRecognitionConfig` (encoding, language,
+    /// VAD/diarization/profanity/speech-contexts, interim-results), then audio. This is what the
+    /// supervised transport calls per (re)connect, so a reconnect restores the *featured* session
+    /// rather than a bare one. Returns the raw response stream for the caller to drain; a
+    /// connection-level failure here is classified reconnectable vs fatal by
+    /// [`classify_grpc_outcome`].
+    pub(super) async fn open_stream(
+        &self,
+        audio_rx: mpsc::Receiver<Bytes>,
+        streaming_config: StreamingRecognitionConfig,
+    ) -> Result<Streaming<Bytes>, Status> {
+        // Create the request stream (re-yields the featured config first, then audio).
+        let request_stream = AudioChunkStream::new(audio_rx, streaming_config);
+
+        // Create metadata
+        let metadata = create_tinkoff_metadata(&self.config)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        // Create the gRPC request with metadata
+        let mut request = Request::new(request_stream);
+        *request.metadata_mut() = metadata;
+
+        // Clone channel for the streaming call
+        let channel = self.channel.clone();
+        do_streaming_recognize(channel, request).await
+    }
+
     /// Start a bidirectional streaming session
     ///
     /// Returns a sender for audio chunks and a receiver for transcription results.
+    #[allow(dead_code)] // Retained for the non-supervised path / tests; the supervised transport
+    // drives `open_stream` directly.
     pub async fn start_streaming(
         &self,
         streaming_config: StreamingRecognitionConfig,
@@ -145,6 +178,28 @@ impl TinkoffGrpcClient {
         });
 
         Ok((audio_tx, result_rx))
+    }
+}
+
+/// Map a gRPC status to a [`ReconnectOutcome`](crate::core::websocket::reconnectable_stream::ReconnectOutcome):
+/// transient transport failures (Unavailable, DeadlineExceeded, Internal, Cancelled, Aborted,
+/// ResourceExhausted) are reconnectable; auth/permission/argument errors are fatal (retrying would
+/// fail identically). Mirrors Tinkoff's own `is_retriable` taxonomy.
+pub(super) fn classify_grpc_outcome(
+    status: tonic::Status,
+) -> crate::core::websocket::reconnectable_stream::ReconnectOutcome {
+    use crate::core::websocket::reconnectable_stream::{ReconnectOutcome, StreamError};
+    use tonic::Code;
+    match status.code() {
+        Code::Unavailable
+        | Code::DeadlineExceeded
+        | Code::Internal
+        | Code::Cancelled
+        | Code::Aborted
+        | Code::ResourceExhausted => {
+            ReconnectOutcome::Reconnectable(StreamError::new(format!("grpc {}", status.code())))
+        }
+        _ => ReconnectOutcome::Fatal(StreamError::new(format!("grpc {}", status.code()))),
     }
 }
 

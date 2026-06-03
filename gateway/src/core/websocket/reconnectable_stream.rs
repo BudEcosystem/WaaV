@@ -185,6 +185,20 @@ impl ReconnectableStream {
         }
     }
 
+    /// Share an externally-owned intentional-disconnect flag with this supervisor.
+    ///
+    /// The production wiring: a streaming client owns an `Arc<AtomicBool>`, clears it when it
+    /// (re)connects, and sets it in `disconnect()` *before* firing its transport-shutdown signal.
+    /// Handing that same flag to the supervisor here closes the disconnect-vs-server-close race:
+    /// if the transport's `run()` happens to report `Reconnectable` (the stream-ended select arm
+    /// won over the shutdown arm), the supervisor still observes the flag — either immediately at
+    /// the post-`run()` guard, or (if `disconnect()` lands a beat later) at the loop-top check
+    /// before the next dial — and completes cleanly instead of doing one spurious reconnect.
+    pub fn with_disconnect_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.intentional_disconnect = flag;
+        self
+    }
+
     /// A handle to request an intentional disconnect from another task.
     pub fn disconnect_handle(&self) -> DisconnectHandle {
         DisconnectHandle {
@@ -517,6 +531,54 @@ mod tests {
 
         assert_eq!(exit, SupervisorExit::Completed, "intentional close must not reconnect");
         assert_eq!(restore_calls.load(Ordering::Acquire), 1, "connected exactly once");
+    }
+
+    #[tokio::test]
+    async fn shared_flag_set_after_run_blocks_the_next_dial() {
+        // The disconnect-vs-server-close race (case 2): the transport's run() reports
+        // Reconnectable BEFORE disconnect() lands, so the post-run() guard does NOT yet see the
+        // flag. disconnect() then sets the *shared* flag during the backoff sleep. The loop-top
+        // check at the next iteration must observe it and complete WITHOUT a spurious reconnect.
+        let flag = Arc::new(AtomicBool::new(false));
+        let cfg = ReconnectableStreamConfig::new("mock", no_jitter_aggressive());
+        let stream = ReconnectableStream::new(cfg).with_disconnect_flag(Arc::clone(&flag));
+        let attempt = Arc::new(AtomicUsize::new(0));
+
+        let at = Arc::clone(&attempt);
+        let exit = stream
+            .run_with_sleep(
+                move || {
+                    let at = Arc::clone(&at);
+                    async move {
+                        at.fetch_add(1, Ordering::AcqRel);
+                        Ok(MockTransport {
+                            restore_calls: Arc::new(AtomicUsize::new(0)),
+                            // Stream "ended" — eligible for reconnect — but the flag is not set yet.
+                            outcome: ReconnectOutcome::Reconnectable(StreamError::new("server close")),
+                            restore_result: Ok(()),
+                        })
+                    }
+                },
+                // The backoff sleep is where disconnect() lands: set the shared flag here so the
+                // loop-top check sees it before dialing again.
+                {
+                    let flag = Arc::clone(&flag);
+                    move |_d| {
+                        let flag = Arc::clone(&flag);
+                        async move {
+                            flag.store(true, Ordering::Release);
+                        }
+                    }
+                },
+            )
+            .await;
+
+        assert_eq!(exit, SupervisorExit::Completed, "shared flag must stop the next dial");
+        assert_eq!(
+            attempt.load(Ordering::Acquire),
+            1,
+            "connected exactly once — no spurious reconnect after the intentional close",
+        );
     }
 
     #[tokio::test]

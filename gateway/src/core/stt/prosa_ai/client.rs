@@ -19,9 +19,152 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::RwLock;
+use std::time::Duration;
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info};
+
+use crate::core::websocket::ReconnectionConfig;
+use crate::core::websocket::reconnectable_stream::{
+    ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
+    WsTransport,
+};
+use futures_util::stream::{SplitSink, SplitStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+/// Per-message idle timeout for WebSocket message reception.
+/// Resets after each successful message. Catches stuck/dead connections.
+const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The concrete WebSocket stream type Prosa.ai dials.
+type ProsaWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A [`WsTransport`] that adapts Prosa.ai's streaming event loop to the generic
+/// [`ReconnectableStream`] supervisor (W-D1 fleet adoption). One is built per (re)connect by the
+/// supervisor's `connect` closure.
+///
+/// Like Azure (and unlike URL-carries-features providers such as ElevenLabs/Cartesia), Prosa.ai
+/// carries its featured session in a **post-handshake `config` frame** sent as the first WebSocket
+/// message after connect. So [`restore_session`](WsTransport::restore_session) re-sends that
+/// `build_stream_config` frame on the fresh socket — without it a reconnect would resume as a
+/// *bare* (un-featured) session. [`run`](WsTransport::run) IS the original streaming event loop,
+/// now returning a [`ReconnectOutcome`] so a mid-stream transport drop reconnects instead of ending
+/// the session.
+struct ProsaTransport {
+    ws_sink: SplitSink<ProsaWs, Message>,
+    ws_stream: SplitStream<ProsaWs>,
+    /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
+    audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
+    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
+    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    result_callback: Arc<RwLock<Option<STTResultCallback>>>,
+    error_callback: Arc<RwLock<Option<STTErrorCallback>>>,
+    current_job_id: Arc<RwLock<Option<String>>>,
+    /// Fires once after the featured session is (re)established, unblocking `start_streaming`.
+    connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// The serialized streaming `config` frame (the featured session), re-sent on every restore.
+    config_json: String,
+}
+
+#[async_trait]
+impl WsTransport for ProsaTransport {
+    async fn restore_session(&mut self) -> Result<(), RestoreError> {
+        // Prosa.ai sends its featured session as a post-handshake `config` frame (the streaming
+        // analogue of the REST `config`). Re-send it on this fresh socket so the restored session
+        // is identical — same model, label, include_partial, include_filler, audio params.
+        self.ws_sink
+            .send(Message::Text(self.config_json.clone().into()))
+            .await
+            .map_err(|e| RestoreError::new(format!("failed to send Prosa.ai config: {e}")))?;
+
+        // The featured session is established: signal the waiting start_streaming() exactly once.
+        if let Some(tx) = self.connected_tx.lock().await.take() {
+            let _ = tx.send(());
+        }
+        Ok(())
+    }
+
+    async fn run(&mut self) -> ReconnectOutcome {
+        let mut audio_rx = self.audio_rx.lock().await;
+        let mut shutdown_rx = self.shutdown_rx.lock().await;
+        loop {
+            tokio::select! {
+                // Handle outgoing audio data (raw binary chunks).
+                Some(audio_data) = audio_rx.recv() => {
+                    if let Err(e) = self.ws_sink.send(Message::Binary(audio_data)).await {
+                        let stt_error = STTError::ProviderError(format!("Failed to send audio: {e}"));
+                        error!("{}", stt_error);
+                        if let Some(cb) = self.error_callback.read().await.as_ref() {
+                            cb(stt_error).await;
+                        }
+                        // Transport-level send failure: reconnect to preserve the session.
+                        return ReconnectOutcome::Reconnectable(StreamError::new("audio send failed"));
+                    }
+                }
+
+                // Handle incoming messages with idle timeout.
+                message = timeout(WS_MESSAGE_TIMEOUT, self.ws_stream.next()) => {
+                    match message {
+                        Ok(Some(Ok(msg))) => {
+                            match ProsaStt::handle_ws_message(
+                                msg,
+                                &self.result_callback,
+                                &self.error_callback,
+                                &self.current_job_id,
+                            ).await {
+                                ProsaWsAction::Continue => {}
+                                ProsaWsAction::ServerClosed => {
+                                    info!("Prosa.ai WebSocket closed by server");
+                                    return ReconnectOutcome::Reconnectable(StreamError::new("stream ended"));
+                                }
+                            }
+                        }
+                        Ok(Some(Err(e))) => {
+                            let stt_error = STTError::NetworkError(format!("WebSocket error: {e}"));
+                            error!("{}", stt_error);
+                            if let Some(cb) = self.error_callback.read().await.as_ref() {
+                                cb(stt_error).await;
+                            }
+                            return ReconnectOutcome::Reconnectable(StreamError::new("websocket error"));
+                        }
+                        Ok(None) => {
+                            info!("Prosa.ai WebSocket stream ended");
+                            return ReconnectOutcome::Reconnectable(StreamError::new("stream ended"));
+                        }
+                        Err(_elapsed) => {
+                            let stt_error = STTError::NetworkError(
+                                "WebSocket idle timeout - no message for 60 seconds".into()
+                            );
+                            error!("Prosa.ai STT idle timeout: {}", stt_error);
+                            if let Some(cb) = self.error_callback.read().await.as_ref() {
+                                cb(stt_error).await;
+                            }
+                            return ReconnectOutcome::Reconnectable(StreamError::new("idle timeout"));
+                        }
+                    }
+                }
+
+                // Handle shutdown signal (intentional close — must NOT reconnect).
+                _ = &mut *shutdown_rx => {
+                    info!("Received shutdown signal for Prosa.ai STT");
+                    // Signal end of audio stream, then close gracefully.
+                    let _ = self.ws_sink.send(Message::Binary(Bytes::new())).await;
+                    let _ = self.ws_sink.send(Message::Close(None)).await;
+                    return ReconnectOutcome::Completed;
+                }
+            }
+        }
+    }
+}
+
+/// What the inbound-message handler decided the run loop should do next.
+enum ProsaWsAction {
+    /// Keep streaming.
+    Continue,
+    /// The server closed the socket (reconnect-eligible).
+    ServerClosed,
+}
 
 // =============================================================================
 // Prosa STT Client
@@ -38,14 +181,26 @@ pub struct ProsaStt {
     /// HTTP client for REST API.
     http_client: Client,
 
-    /// WebSocket write sink for streaming.
-    ws_sink: Arc<RwLock<Option<WsSink>>>,
+    /// Outbound audio channel to the supervised streaming transport (bounded for backpressure).
+    /// `None` until the streaming session is started.
+    audio_tx: Arc<RwLock<Option<mpsc::Sender<Bytes>>>>,
 
-    /// Audio buffer for batching.
+    /// Shutdown signal sender for the supervised streaming task.
+    shutdown_tx: Arc<RwLock<Option<oneshot::Sender<()>>>>,
+
+    /// Supervised streaming connection task handle.
+    connection_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+
+    /// Audio buffer for batching (REST/batch mode).
     audio_buffer: Arc<RwLock<Vec<u8>>>,
 
     /// Connection state flag.
     is_connected: Arc<AtomicBool>,
+
+    /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
+    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// server-side close can never trigger a spurious reconnect.
+    intentional_disconnect: Arc<AtomicBool>,
 
     /// Result callback.
     result_callback: Arc<RwLock<Option<STTResultCallback>>>,
@@ -55,13 +210,14 @@ pub struct ProsaStt {
 
     /// Current job ID.
     current_job_id: Arc<RwLock<Option<String>>>,
-}
 
-/// Type alias for WebSocket sink.
-type WsSink = futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    Message,
->;
+    /// Shared, process-global resilience handles (W-D2): the single reconnect governor + this
+    /// provider's shared circuit breaker, injected by the VoiceManager from CoreState and driven
+    /// by the generic [`ReconnectableStream`](crate::core::websocket::ReconnectableStream)
+    /// supervisor. `None` before `set_resilience` (a direct unit-test construction) → the
+    /// supervisor uses its own per-session governor/breaker default.
+    resilience: Option<crate::core::resilience::ResilienceHandles>,
+}
 
 impl ProsaStt {
     /// Create a new Prosa.ai STT client.
@@ -90,12 +246,16 @@ impl ProsaStt {
             config: prosa_config,
             base_config,
             http_client,
-            ws_sink: Arc::new(RwLock::new(None)),
+            audio_tx: Arc::new(RwLock::new(None)),
+            shutdown_tx: Arc::new(RwLock::new(None)),
+            connection_handle: Arc::new(RwLock::new(None)),
             audio_buffer: Arc::new(RwLock::new(Vec::new())),
             is_connected: Arc::new(AtomicBool::new(false)),
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             result_callback: Arc::new(RwLock::new(None)),
             error_callback: Arc::new(RwLock::new(None)),
             current_job_id: Arc::new(RwLock::new(None)),
+            resilience: None,
         })
     }
 
@@ -318,7 +478,90 @@ impl ProsaStt {
         }
     }
 
-    /// Connect to WebSocket for streaming.
+    /// Handle one inbound WebSocket message: route transcripts/errors to the registered callbacks
+    /// and tell the run loop whether to keep going. Shared by the supervised transport's `run`.
+    async fn handle_ws_message(
+        msg: Message,
+        result_callback: &Arc<RwLock<Option<STTResultCallback>>>,
+        error_callback: &Arc<RwLock<Option<STTErrorCallback>>>,
+        job_id: &Arc<RwLock<Option<String>>>,
+    ) -> ProsaWsAction {
+        match msg {
+            Message::Text(text) => {
+                if let Ok(ws_msg) = serde_json::from_str::<ProsaSttWsMessage>(&text) {
+                    match ws_msg {
+                        ProsaSttWsMessage::Created { id } => {
+                            debug!("Streaming session created: {}", id);
+                            let mut job = job_id.write().await;
+                            *job = Some(id);
+                        }
+                        ProsaSttWsMessage::Partial { transcript } => {
+                            debug!("Partial transcript: {}", transcript);
+                            let callback = result_callback.read().await;
+                            if let Some(ref cb) = *callback {
+                                let result = STTResult::new(
+                                    transcript.clone(),
+                                    false, // is_final
+                                    false, // is_speech_final
+                                    0.0,   // confidence (not provided by partial)
+                                );
+                                cb(result).await;
+                            }
+                        }
+                        ProsaSttWsMessage::Result {
+                            transcript,
+                            time_start,
+                            time_end,
+                        } => {
+                            debug!(
+                                "Final transcript: {} ({:.2}s - {:.2}s)",
+                                transcript, time_start, time_end
+                            );
+                            let callback = result_callback.read().await;
+                            if let Some(ref cb) = *callback {
+                                let result = STTResult::new(
+                                    transcript.clone(),
+                                    true, // is_final
+                                    true, // is_speech_final (end of segment)
+                                    1.0,  // confidence (Prosa doesn't provide, assume high)
+                                );
+                                cb(result).await;
+                            }
+                        }
+                        ProsaSttWsMessage::Status { status } => {
+                            debug!("Status update: {}", status);
+                        }
+                        ProsaSttWsMessage::Metadata {
+                            duration,
+                            quota_used,
+                        } => {
+                            debug!(
+                                "Session metadata: duration={:?}, quota_used={:?}",
+                                duration, quota_used
+                            );
+                        }
+                        ProsaSttWsMessage::Error { message } => {
+                            error!("WebSocket error: {}", message);
+                            let callback = error_callback.read().await;
+                            if let Some(ref cb) = *callback {
+                                cb(STTError::ProviderError(message)).await;
+                            }
+                        }
+                    }
+                }
+                ProsaWsAction::Continue
+            }
+            Message::Close(_) => ProsaWsAction::ServerClosed,
+            _ => ProsaWsAction::Continue,
+        }
+    }
+
+    /// Start the supervised WebSocket streaming session.
+    ///
+    /// The generic [`ReconnectableStream`] supervisor owns the outer reconnect loop: the `connect`
+    /// closure dials the Prosa.ai endpoint and hands back a [`ProsaTransport`] whose
+    /// `restore_session` re-sends the featured `config` frame and whose `run` is the streaming event
+    /// loop. A mid-stream transport drop reconnects instead of ending the session.
     async fn connect_websocket(&self) -> Result<(), STTError> {
         if !self.config.model.supports_streaming() {
             return Err(STTError::ConnectionFailed(
@@ -337,132 +580,111 @@ impl ProsaStt {
             PROSA_STT_WS_ENDPOINT
         );
 
-        let (ws_stream, _) = connect_async(&url).await.map_err(|e| {
-            STTError::ConnectionFailed(format!("WebSocket connection failed: {}", e))
-        })?;
-
-        let (write, mut read) = ws_stream.split();
-
-        // Store write sink
-        {
-            let mut sink = self.ws_sink.write().await;
-            *sink = Some(write);
-        }
-
-        // Send configuration
-        let config = self.build_stream_config();
-
-        let config_json = serde_json::to_string(&config).map_err(|e| {
+        // Serialize the featured `config` frame once; the transport re-sends it on every restore.
+        let config_json = serde_json::to_string(&self.build_stream_config()).map_err(|e| {
             STTError::ConnectionFailed(format!("Failed to serialize config: {}", e))
         })?;
 
+        // Outbound audio channel + shutdown signal + connected oneshot, mirroring the templates.
+        let (audio_tx, audio_rx) = mpsc::channel::<Bytes>(32);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (connected_tx, connected_rx) = oneshot::channel::<()>();
+
         {
-            let mut sink = self.ws_sink.write().await;
-            if let Some(ref mut ws) = *sink {
-                ws.send(Message::Text(config_json.into()))
-                    .await
-                    .map_err(|e| {
-                        STTError::ConnectionFailed(format!("Failed to send config: {}", e))
-                    })?;
-            }
+            let mut tx = self.audio_tx.write().await;
+            *tx = Some(audio_tx);
+        }
+        {
+            let mut tx = self.shutdown_tx.write().await;
+            *tx = Some(shutdown_tx);
         }
 
-        // Spawn message handler
+        // Shared state the supervised transport re-uses across reconnect attempts.
+        let audio_rx = Arc::new(Mutex::new(audio_rx));
+        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
+        let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
         let result_callback = self.result_callback.clone();
         let error_callback = self.error_callback.clone();
-        let is_connected = self.is_connected.clone();
-        let job_id = self.current_job_id.clone();
+        let current_job_id = self.current_job_id.clone();
 
-        tokio::spawn(async move {
-            while let Some(msg) = read.next().await {
-                match msg {
-                    Ok(Message::Text(text)) => {
-                        if let Ok(ws_msg) = serde_json::from_str::<ProsaSttWsMessage>(&text) {
-                            match ws_msg {
-                                ProsaSttWsMessage::Created { id } => {
-                                    debug!("Streaming session created: {}", id);
-                                    let mut job = job_id.write().await;
-                                    *job = Some(id);
-                                }
-                                ProsaSttWsMessage::Partial { transcript } => {
-                                    debug!("Partial transcript: {}", transcript);
-                                    let callback = result_callback.read().await;
-                                    if let Some(ref cb) = *callback {
-                                        let result = STTResult::new(
-                                            transcript.clone(),
-                                            false, // is_final
-                                            false, // is_speech_final
-                                            0.0,   // confidence (not provided by partial)
-                                        );
-                                        cb(result).await;
-                                    }
-                                }
-                                ProsaSttWsMessage::Result {
-                                    transcript,
-                                    time_start,
-                                    time_end,
-                                } => {
-                                    debug!(
-                                        "Final transcript: {} ({:.2}s - {:.2}s)",
-                                        transcript, time_start, time_end
-                                    );
-                                    let callback = result_callback.read().await;
-                                    if let Some(ref cb) = *callback {
-                                        let result = STTResult::new(
-                                            transcript.clone(),
-                                            true, // is_final
-                                            true, // is_speech_final (end of segment)
-                                            1.0,  // confidence (Prosa doesn't provide, assume high)
-                                        );
-                                        cb(result).await;
-                                    }
-                                }
-                                ProsaSttWsMessage::Status { status } => {
-                                    debug!("Status update: {}", status);
-                                }
-                                ProsaSttWsMessage::Metadata {
-                                    duration,
-                                    quota_used,
-                                } => {
-                                    debug!(
-                                        "Session metadata: duration={:?}, quota_used={:?}",
-                                        duration, quota_used
-                                    );
-                                }
-                                ProsaSttWsMessage::Error { message } => {
-                                    error!("WebSocket error: {}", message);
-                                    let callback = error_callback.read().await;
-                                    if let Some(ref cb) = *callback {
-                                        cb(STTError::ProviderError(message)).await;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Ok(Message::Close(_)) => {
-                        info!("WebSocket closed by server");
-                        is_connected.store(false, Ordering::SeqCst);
-                        break;
-                    }
-                    Err(e) => {
-                        error!("WebSocket error: {}", e);
-                        is_connected.store(false, Ordering::SeqCst);
-                        break;
-                    }
-                    _ => {}
-                }
+        // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor with
+        // the shared process-global handles from CoreState (W-D1/W-D2 fleet adoption). When no
+        // handles were injected (a direct unit-test construction), the supervisor uses its own
+        // per-session governor/breaker default.
+        let reconnection = ReconnectionConfig::aggressive();
+        let disconnect_flag = Arc::clone(&self.intentional_disconnect);
+        let supervisor = match self.resilience.clone() {
+            Some(r) => ReconnectableStream::with_breaker_and_governor(
+                ReconnectableStreamConfig::new("prosa_ai", reconnection),
+                r.breaker,
+                (*r.governor).clone(),
+            ),
+            None => {
+                ReconnectableStream::new(ReconnectableStreamConfig::new("prosa_ai", reconnection))
             }
+        }
+        .with_disconnect_flag(disconnect_flag);
+
+        let connection_handle = tokio::spawn(async move {
+            let exit = supervisor
+                .run(|| {
+                    let url = url.clone();
+                    let config_json = config_json.clone();
+                    let audio_rx = Arc::clone(&audio_rx);
+                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let connected_tx = Arc::clone(&connected_tx);
+                    let result_callback = result_callback.clone();
+                    let error_callback = error_callback.clone();
+                    let current_job_id = current_job_id.clone();
+                    async move {
+                        let (ws_stream, _) = connect_async(&url).await.map_err(|e| {
+                            StreamError::new(format!("WebSocket connection failed: {e}"))
+                        })?;
+                        info!("Connected to Prosa.ai STT WebSocket");
+                        let (ws_sink, ws_stream) = ws_stream.split();
+                        Ok(ProsaTransport {
+                            ws_sink,
+                            ws_stream,
+                            audio_rx,
+                            shutdown_rx,
+                            result_callback,
+                            error_callback,
+                            current_job_id,
+                            connected_tx,
+                            config_json,
+                        })
+                    }
+                })
+                .await;
+            info!("Prosa.ai STT WebSocket connection closed (supervisor exit: {exit:?})");
         });
 
-        info!("Connected to Prosa.ai STT WebSocket");
-        Ok(())
+        {
+            let mut handle = self.connection_handle.write().await;
+            *handle = Some(connection_handle);
+        }
+
+        // Wait for the featured session to be established (config frame sent), with a timeout.
+        match timeout(Duration::from_secs(10), connected_rx).await {
+            Ok(Ok(())) => {
+                info!("Connected to Prosa.ai STT WebSocket");
+                Ok(())
+            }
+            Ok(Err(_)) => Err(STTError::ConnectionFailed(
+                "Connection channel closed before session started".to_string(),
+            )),
+            Err(_) => Err(STTError::ConnectionFailed(
+                "Connection timeout waiting for Prosa.ai streaming session".to_string(),
+            )),
+        }
     }
 
-    /// Send audio chunk via WebSocket.
+    /// Send audio chunk via the supervised streaming transport (queued on the outbound channel).
     async fn send_audio_ws(&self, audio: &[u8]) -> Result<(), STTError> {
-        let mut sink = self.ws_sink.write().await;
-        if let Some(ref mut ws) = *sink {
-            ws.send(Message::Binary(Bytes::copy_from_slice(audio)))
+        let tx = self.audio_tx.read().await;
+        if let Some(ref sender) = *tx {
+            sender
+                .send(Bytes::copy_from_slice(audio))
                 .await
                 .map_err(|e| STTError::ProviderError(format!("Failed to send audio: {}", e)))?;
         } else {
@@ -473,11 +695,11 @@ impl ProsaStt {
         Ok(())
     }
 
-    /// Signal end of audio stream.
+    /// Signal end of audio stream (an empty binary frame), queued on the outbound channel.
     async fn end_audio_stream(&self) -> Result<(), STTError> {
-        let mut sink = self.ws_sink.write().await;
-        if let Some(ref mut ws) = *sink {
-            ws.send(Message::Binary(Bytes::new())).await.map_err(|e| {
+        let tx = self.audio_tx.read().await;
+        if let Some(ref sender) = *tx {
+            sender.send(Bytes::new()).await.map_err(|e| {
                 STTError::ProviderError(format!("Failed to send end signal: {}", e))
             })?;
         }
@@ -565,12 +787,16 @@ impl Default for ProsaStt {
             config: ProsaSttConfig::default(),
             base_config: None,
             http_client: Client::new(),
-            ws_sink: Arc::new(RwLock::new(None)),
+            audio_tx: Arc::new(RwLock::new(None)),
+            shutdown_tx: Arc::new(RwLock::new(None)),
+            connection_handle: Arc::new(RwLock::new(None)),
             audio_buffer: Arc::new(RwLock::new(Vec::new())),
             is_connected: Arc::new(AtomicBool::new(false)),
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             result_callback: Arc::new(RwLock::new(None)),
             error_callback: Arc::new(RwLock::new(None)),
             current_job_id: Arc::new(RwLock::new(None)),
+            resilience: None,
         }
     }
 }
@@ -591,6 +817,10 @@ impl BaseSTT for ProsaStt {
             ));
         }
 
+        // Fresh session: clear any intent left over from a prior disconnect so the supervisor
+        // does not immediately complete.
+        self.intentional_disconnect.store(false, Ordering::SeqCst);
+
         // For streaming model, connect to WebSocket
         if self.config.model.supports_streaming() {
             self.connect_websocket().await?;
@@ -608,16 +838,26 @@ impl BaseSTT for ProsaStt {
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
-        // Send end signal for streaming
+        // Record the intent BEFORE the streaming-guard so the supervisor sees it even if the
+        // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+
+        // Send end signal for streaming, then ask the supervisor to stop (intentional close — must
+        // NOT reconnect).
         if self.config.model.supports_streaming() {
             let _ = self.end_audio_stream().await;
 
-            // Close WebSocket
-            let mut sink = self.ws_sink.write().await;
-            if let Some(ref mut ws) = *sink {
-                let _ = ws.close().await;
+            if let Some(shutdown_tx) = self.shutdown_tx.write().await.take() {
+                let _ = shutdown_tx.send(());
             }
-            *sink = None;
+
+            // Drop the outbound audio sender so the transport's recv() also unblocks.
+            *self.audio_tx.write().await = None;
+
+            // Wait for the supervised connection task to wind down, with a timeout.
+            if let Some(handle) = self.connection_handle.write().await.take() {
+                let _ = timeout(Duration::from_secs(5), handle).await;
+            }
         }
 
         // Clear buffer
@@ -688,6 +928,24 @@ impl BaseSTT for ProsaStt {
         self.config = new_config;
         self.base_config = Some(config);
         Ok(())
+    }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared, process-global handles so `connect_websocket` drives the generic
+        // ReconnectableStream supervisor with them — every Prosa.ai streaming session trips the
+        // same breaker and shares the one process-wide reconnect cap (W-D2).
+        self.resilience = Some(resilience);
+    }
+}
+
+impl ProsaStt {
+    /// The shared circuit breaker this session feeds into the generic supervisor, if the
+    /// process-global resilience handles have been injected (W-D1/W-D2). Two `ProsaStt` built from
+    /// the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(
+        &self,
+    ) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.as_ref().map(|r| &r.breaker)
     }
 }
 
@@ -889,6 +1147,17 @@ mod tests {
         let result = stt.disconnect().await;
         assert!(result.is_ok());
         assert!(!stt.is_ready());
+    }
+
+    #[tokio::test]
+    async fn disconnect_sets_intentional_flag_for_supervisor() {
+        let mut stt = ProsaStt::new(make_test_config()).unwrap();
+        assert!(!stt.intentional_disconnect.load(Ordering::SeqCst));
+        stt.disconnect().await.unwrap();
+        assert!(
+            stt.intentional_disconnect.load(Ordering::SeqCst),
+            "disconnect() must set the supervisor-shared intentional-disconnect flag",
+        );
     }
 
     #[tokio::test]

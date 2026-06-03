@@ -374,3 +374,20 @@ fn create_test_google_config() -> GoogleSTTConfig {
         ..Default::default()
     }
 }
+
+// W-D1: disconnect() must record intent on the supervisor-shared flag so a client close racing a
+// server-side close can never trigger a spurious reconnect (the supervisor's loop-top guard
+// observes this same `Arc<AtomicBool>`). Before this wiring the flag was the supervisor's own and
+// disconnect() never set it.
+#[tokio::test]
+async fn disconnect_sets_intentional_flag_for_supervisor() {
+    use std::sync::atomic::Ordering;
+
+    let mut stt = GoogleSTT::default();
+    assert!(!stt.intentional_disconnect.load(Ordering::SeqCst));
+    stt.disconnect().await.unwrap();
+    assert!(
+        stt.intentional_disconnect.load(Ordering::SeqCst),
+        "disconnect() must set the supervisor-shared intentional-disconnect flag",
+    );
+}

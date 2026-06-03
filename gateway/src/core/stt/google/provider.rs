@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -284,6 +285,10 @@ const AUDIO_CHANNEL_BUFFER_SIZE: usize = 32;
 pub struct GoogleSTT {
     pub(super) config: Option<GoogleSTTConfig>,
     pub(super) state: ConnectionState,
+    /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
+    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// server-side close can never trigger a spurious reconnect.
+    pub(super) intentional_disconnect: Arc<AtomicBool>,
     pub(super) state_notify: Arc<Notify>,
     /// Audio sender uses Bytes for zero-copy transfer
     pub(super) audio_sender: Option<mpsc::Sender<Bytes>>,
@@ -312,6 +317,7 @@ impl Default for GoogleSTT {
         Self {
             config: None,
             state: ConnectionState::Disconnected,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             audio_sender: None,
             shutdown_tx: None,
@@ -347,6 +353,7 @@ impl GoogleSTT {
         Ok(Self {
             config: Some(google_config),
             state: ConnectionState::Disconnected,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             audio_sender: None,
             shutdown_tx: None,
@@ -381,6 +388,10 @@ impl GoogleSTT {
         let auth_client = self.auth_client.clone().ok_or_else(|| {
             STTError::AuthenticationFailed("Auth client not initialized".to_string())
         })?;
+
+        // Fresh session: clear any intent left over from a prior disconnect so the supervisor
+        // does not immediately complete.
+        self.intentional_disconnect.store(false, Ordering::SeqCst);
 
         // Use smaller buffer for lower latency - Bytes enables zero-copy
         let (audio_tx, audio_rx) = mpsc::channel::<Bytes>(AUDIO_CHANNEL_BUFFER_SIZE);
@@ -417,6 +428,7 @@ impl GoogleSTT {
         // handles were injected (a direct unit-test construction), the supervisor uses its own
         // per-session governor/breaker default.
         let reconnection = ReconnectionConfig::aggressive();
+        let disconnect_flag = Arc::clone(&self.intentional_disconnect);
         let supervisor = match self.resilience.clone() {
             Some(r) => ReconnectableStream::with_breaker_and_governor(
                 ReconnectableStreamConfig::new("google", reconnection),
@@ -426,7 +438,8 @@ impl GoogleSTT {
             None => {
                 ReconnectableStream::new(ReconnectableStreamConfig::new("google", reconnection))
             }
-        };
+        }
+        .with_disconnect_flag(disconnect_flag);
 
         // The supervisor owns the outer reconnect loop. The `connect` closure (re)establishes the
         // authenticated gRPC channel with a FRESH auth token (so a long-lived session that
@@ -616,6 +629,7 @@ impl BaseSTT for GoogleSTT {
         Ok(Self {
             config: Some(google_config),
             state: ConnectionState::Disconnected,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             audio_sender: None,
             shutdown_tx: None,
@@ -640,6 +654,10 @@ impl BaseSTT for GoogleSTT {
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
+        // Record the intent BEFORE any teardown so the supervisor sees it even if the transport's
+        // run() just reported a reconnectable drop (the disconnect-vs-close race).
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
         }

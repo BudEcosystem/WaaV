@@ -33,6 +33,7 @@
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::time::{Instant, interval, timeout};
@@ -344,6 +345,11 @@ pub struct AzureSTT {
     /// Current connection state.
     state: ConnectionState,
 
+    /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
+    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// server-side close can never trigger a spurious reconnect.
+    intentional_disconnect: Arc<AtomicBool>,
+
     /// State change notification.
     state_notify: Arc<Notify>,
 
@@ -391,6 +397,7 @@ impl Default for AzureSTT {
         Self {
             config: None,
             state: ConnectionState::Disconnected,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
             shutdown_tx: None,
@@ -644,6 +651,10 @@ impl AzureSTT {
         // (W-D1/W-D2 fleet adoption). When no handles were injected (a direct unit-test
         // construction), the supervisor uses its own per-session governor/breaker default.
         let reconnection = ReconnectionConfig::aggressive();
+        // Share the client-owned intentional-disconnect flag INTO the supervisor (W-D1): a client
+        // close racing a server-side close must never trigger a spurious reconnect. Captured here
+        // while `self` is still borrowable, before the supervisor is moved into `tokio::spawn`.
+        let disconnect_flag = Arc::clone(&self.intentional_disconnect);
         let supervisor = match self.resilience.clone() {
             Some(r) => ReconnectableStream::with_breaker_and_governor(
                 ReconnectableStreamConfig::new("azure", reconnection),
@@ -651,7 +662,8 @@ impl AzureSTT {
                 (*r.governor).clone(),
             ),
             None => ReconnectableStream::new(ReconnectableStreamConfig::new("azure", reconnection)),
-        };
+        }
+        .with_disconnect_flag(disconnect_flag);
 
         // Start the connection task: the supervisor owns the outer reconnect loop; the `connect`
         // closure dials with Azure auth headers and hands back a transport whose `restore_session`
@@ -838,6 +850,7 @@ impl BaseSTT for AzureSTT {
         Ok(Self {
             config: Some(azure_config),
             state: ConnectionState::Disconnected,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
             shutdown_tx: None,
@@ -861,6 +874,10 @@ impl BaseSTT for AzureSTT {
             ));
         }
 
+        // Fresh session: clear any intent left over from a prior disconnect so the supervisor
+        // does not immediately complete.
+        self.intentional_disconnect.store(false, Ordering::SeqCst);
+
         let config = self.config.as_ref().ok_or_else(|| {
             STTError::ConfigurationError("No configuration available".to_string())
         })?;
@@ -872,6 +889,10 @@ impl BaseSTT for AzureSTT {
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
+        // Record the intent BEFORE firing the shutdown signal so the supervisor sees it even if the
+        // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+
         // Send shutdown signal
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
@@ -1188,6 +1209,28 @@ mod tests {
         // YYYY-MM-DDTHH:MM:SS.mmmZ
         assert_eq!(ts.len(), 24);
         assert!(ts.ends_with('Z') && ts.contains('T'));
+    }
+
+    // W-D1: disconnect() must record intent on the supervisor-shared flag so a client close racing
+    // a server-side close can never trigger a spurious reconnect (the supervisor's loop-top guard
+    // observes this same `Arc<AtomicBool>`). Before this wiring the flag was the supervisor's own
+    // and disconnect() never set it.
+    #[tokio::test]
+    async fn disconnect_sets_intentional_flag_for_supervisor() {
+        let config = STTConfig {
+            provider: "azure".to_string(),
+            api_key: "test_key".to_string(),
+            language: "en-US".to_string(),
+            sample_rate: 16000,
+            ..Default::default()
+        };
+        let mut stt = <AzureSTT as BaseSTT>::new(config).unwrap();
+        assert!(!stt.intentional_disconnect.load(Ordering::SeqCst));
+        stt.disconnect().await.unwrap();
+        assert!(
+            stt.intentional_disconnect.load(Ordering::SeqCst),
+            "disconnect() must set the supervisor-shared intentional-disconnect flag",
+        );
     }
 
     #[test]

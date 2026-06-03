@@ -3,18 +3,177 @@
 //! Implements the BaseSTT trait for Tinkoff's gRPC-based Speech-to-Text service.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::{Notify, RwLock, mpsc, oneshot};
-use tracing::{debug, error, info};
+use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
+use tracing::{debug, error, info, warn};
 
 use super::config::TinkoffSttConfig;
-use super::grpc::{TinkoffGrpcClient, create_tinkoff_channel};
-use super::messages::{RecognitionConfig, StreamingRecognitionConfig};
+use super::grpc::{TinkoffGrpcClient, classify_grpc_outcome, create_tinkoff_channel};
+use super::messages::{
+    RecognitionConfig, StreamingRecognitionConfig, StreamingRecognizeResponse,
+};
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
+use crate::core::websocket::ReconnectionConfig;
+use crate::core::websocket::reconnectable_stream::{
+    ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
+    WsTransport,
+};
+
+/// Per-message idle timeout for the gRPC response stream — resets after each successful message.
+/// Catches stuck/dead connections while allowing active streams to continue.
+const GRPC_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A [`WsTransport`] (the trait is transport-agnostic despite the `Ws` name) that adapts Tinkoff
+/// VoiceKit's gRPC **bidirectional** `StreamingRecognize` to the generic [`ReconnectableStream`]
+/// supervisor (W-D1 fleet adoption). One is built per (re)connect by the supervisor's `connect`
+/// closure.
+///
+/// Tinkoff is gRPC, not WebSocket: the featured session lives in the **first request** of the bidi
+/// stream (the `StreamingRecognitionConfig` carrying encoding/language/VAD/diarization/profanity/
+/// speech-contexts/interim-results). So [`run`](WsTransport::run) opens a fresh `StreamingRecognize`
+/// call (via [`TinkoffGrpcClient::open_stream`]) whose request stream yields that featured config
+/// first — the featured-session restore is intrinsic to opening a new stream — then forwards audio
+/// and drains responses until a [`ReconnectOutcome`]. A transport drop
+/// (`Unavailable`/idle timeout/stream end) becomes a reconnect; a clean shutdown or a fatal gRPC
+/// error (auth/invalid-arg) does not. Hence [`restore_session`](WsTransport::restore_session) only
+/// unblocks the waiting connect().
+struct TinkoffTransport {
+    /// The gRPC client over the (per-connect) channel; `open_stream` opens a fresh bidi call.
+    grpc_client: TinkoffGrpcClient,
+    /// The featured first request (recognition config) — re-yielded as the head of every fresh bidi
+    /// stream so a reconnect restores the *featured* session, not a bare one.
+    streaming_config: StreamingRecognitionConfig,
+    /// Durable inbound audio receiver, shared across reconnect attempts (locked for the duration of
+    /// `run`). Each attempt forwards from it into a fresh per-stream channel, so queued audio
+    /// survives a reconnect instead of being lost with the old gRPC stream.
+    audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
+    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
+    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    /// Decoded responses are forwarded here to the callback task.
+    result_tx: mpsc::Sender<Result<StreamingRecognizeResponse, STTError>>,
+    /// Fires once on the first successful stream open, unblocking `start_connection`.
+    connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+#[async_trait::async_trait]
+impl WsTransport for TinkoffTransport {
+    async fn restore_session(&mut self) -> Result<(), RestoreError> {
+        // Tinkoff's featured session (recognition config) is the FIRST request of the bidi stream,
+        // re-sent at the head of every `run()` — so there is nothing to do here beyond unblocking
+        // the waiting connect() exactly once.
+        if let Some(tx) = self.connected_tx.lock().await.take() {
+            let _ = tx.send(());
+        }
+        Ok(())
+    }
+
+    async fn run(&mut self) -> ReconnectOutcome {
+        use futures::StreamExt;
+
+        let mut audio_rx = self.audio_rx.lock().await;
+        let mut shutdown_rx = self.shutdown_rx.lock().await;
+
+        // Per-attempt inner channel handed to the fresh gRPC stream. We forward the durable audio
+        // receiver into it inside the select! below, so a reconnect re-uses the same durable
+        // receiver (and any audio that arrives during the gap). `inner_tx` is held in an Option so
+        // we can DROP it once the outer audio channel closes — that completes the gRPC request
+        // stream while we keep draining responses.
+        let (inner_tx, inner_rx) = mpsc::channel::<Bytes>(100);
+        let mut inner_tx = Some(inner_tx);
+
+        let mut response_stream = match self
+            .grpc_client
+            .open_stream(inner_rx, self.streaming_config.clone())
+            .await
+        {
+            Ok(s) => s,
+            Err(status) => {
+                let stt_error = super::grpc::grpc_status_to_stt_error(status.clone());
+                error!("Failed to start Tinkoff streaming recognition: {}", stt_error);
+                let _ = self.result_tx.try_send(Err(stt_error));
+                return classify_grpc_outcome(status);
+            }
+        };
+
+        loop {
+            tokio::select! {
+                biased;
+
+                // Intentional shutdown — must NOT reconnect.
+                _ = &mut *shutdown_rx => {
+                    info!("Shutdown signal received for Tinkoff STT");
+                    return ReconnectOutcome::Completed;
+                }
+
+                // Forward durable audio into the per-stream channel. Disabled once the outer audio
+                // channel has closed (so a closed channel can't busy-spin returning None).
+                audio_opt = audio_rx.recv(), if inner_tx.is_some() => {
+                    match audio_opt {
+                        Some(audio) => {
+                            if let Some(tx) = inner_tx.as_ref()
+                                && tx.send(audio).await.is_err()
+                            {
+                                // The gRPC request stream closed its end; treat as a drop so the
+                                // session reconnects rather than silently stalling.
+                                return ReconnectOutcome::Reconnectable(StreamError::new("request stream closed"));
+                            }
+                        }
+                        None => {
+                            // Outer audio channel closed (disconnect dropped the sender) — end of
+                            // input. Drop inner_tx so the gRPC request stream completes; keep
+                            // draining responses until the server closes.
+                            debug!("Tinkoff outer audio channel closed");
+                            inner_tx = None;
+                        }
+                    }
+                }
+
+                message = tokio::time::timeout(GRPC_MESSAGE_TIMEOUT, response_stream.next()) => {
+                    match message {
+                        Ok(Some(Ok(data))) => {
+                            match StreamingRecognizeResponse::decode(&data) {
+                                Ok(response) => {
+                                    if !response.results.is_empty()
+                                        && self.result_tx.send(Ok(response)).await.is_err()
+                                    {
+                                        // Receiver dropped (session torn down) — stop cleanly.
+                                        return ReconnectOutcome::Completed;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Failed to decode Tinkoff response");
+                                }
+                            }
+                        }
+                        Ok(Some(Err(status))) => {
+                            let stt_error = super::grpc::grpc_status_to_stt_error(status.clone());
+                            error!("Streaming error from Tinkoff STT: {}", stt_error);
+                            let _ = self.result_tx.try_send(Err(stt_error));
+                            return classify_grpc_outcome(status);
+                        }
+                        Ok(None) => {
+                            info!("Tinkoff STT stream ended");
+                            return ReconnectOutcome::Reconnectable(StreamError::new("stream ended"));
+                        }
+                        Err(_elapsed) => {
+                            let stt_error = STTError::NetworkError(
+                                "gRPC idle timeout - no message received for 60 seconds".into(),
+                            );
+                            error!("Tinkoff STT gRPC idle timeout: {}", stt_error);
+                            let _ = self.result_tx.try_send(Err(stt_error));
+                            return ReconnectOutcome::Reconnectable(StreamError::new("idle timeout"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 type AsyncSTTCallback = Box<
     dyn Fn(STTResult) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
@@ -44,6 +203,10 @@ const AUDIO_CHANNEL_BUFFER_SIZE: usize = 32;
 pub struct TinkoffStt {
     pub(super) config: Option<TinkoffSttConfig>,
     pub(super) state: ConnectionState,
+    /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
+    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// server-side close can never trigger a spurious reconnect.
+    pub(super) intentional_disconnect: Arc<AtomicBool>,
     pub(super) state_notify: Arc<Notify>,
     pub(super) audio_sender: Option<mpsc::Sender<Bytes>>,
     pub(super) shutdown_tx: Option<oneshot::Sender<()>>,
@@ -52,6 +215,12 @@ pub struct TinkoffStt {
     pub(super) error_forward_handle: Option<tokio::task::JoinHandle<()>>,
     pub(super) result_callback: Arc<RwLock<Option<AsyncSTTCallback>>>,
     pub(super) error_callback: Arc<RwLock<Option<AsyncErrorCallback>>>,
+    /// Shared, process-global resilience handles (W-D2): the single reconnect governor + this
+    /// provider's shared circuit breaker, injected by the VoiceManager from CoreState and driven by
+    /// the generic [`ReconnectableStream`](crate::core::websocket::ReconnectableStream) supervisor.
+    /// `None` before `set_resilience` (a direct unit-test construction) → the supervisor uses its
+    /// own per-session governor/breaker default.
+    pub(super) resilience: Option<crate::core::resilience::ResilienceHandles>,
 }
 
 impl Default for TinkoffStt {
@@ -59,6 +228,7 @@ impl Default for TinkoffStt {
         Self {
             config: None,
             state: ConnectionState::Disconnected,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             audio_sender: None,
             shutdown_tx: None,
@@ -67,6 +237,7 @@ impl Default for TinkoffStt {
             error_forward_handle: None,
             result_callback: Arc::new(RwLock::new(None)),
             error_callback: Arc::new(RwLock::new(None)),
+            resilience: None,
         }
     }
 }
@@ -89,6 +260,7 @@ impl TinkoffStt {
         Ok(Self {
             config: Some(tinkoff_config),
             state: ConnectionState::Disconnected,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             audio_sender: None,
             shutdown_tx: None,
@@ -97,6 +269,7 @@ impl TinkoffStt {
             error_forward_handle: None,
             result_callback: Arc::new(RwLock::new(None)),
             error_callback: Arc::new(RwLock::new(None)),
+            resilience: None,
         })
     }
 
@@ -146,148 +319,140 @@ impl TinkoffStt {
         }
     }
 
+    /// Start the supervised gRPC streaming session.
+    ///
+    /// The generic [`ReconnectableStream`] supervisor owns the outer reconnect loop: the `connect`
+    /// closure builds a [`TinkoffGrpcClient`] over the channel and hands back a [`TinkoffTransport`]
+    /// whose `run()` opens a fresh `StreamingRecognize` bidi stream (whose first request restores
+    /// the featured session) and drains responses. A mid-stream transport drop reconnects instead
+    /// of ending the session.
     async fn start_connection(&mut self, config: TinkoffSttConfig) -> Result<(), STTError> {
         // Validate configuration
         config.validate().map_err(STTError::ConfigurationError)?;
 
-        // Create channels
+        // Fresh session: clear any intent left over from a prior disconnect so the supervisor
+        // does not immediately complete.
+        self.intentional_disconnect.store(false, Ordering::SeqCst);
+
+        // Establish the gRPC channel up front so connect/auth errors surface synchronously.
+        let channel = create_tinkoff_channel(&config).await?;
+
+        // Channels
         let (audio_tx, audio_rx) = mpsc::channel::<Bytes>(AUDIO_CHANNEL_BUFFER_SIZE);
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-        let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (result_tx, mut result_rx) =
+            mpsc::channel::<Result<StreamingRecognizeResponse, STTError>>(100);
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         self.audio_sender = Some(audio_tx);
         self.shutdown_tx = Some(shutdown_tx);
 
         let streaming_config = Self::create_streaming_config(&config);
-        let callback_ref = self.result_callback.clone();
-        let error_callback_ref = self.error_callback.clone();
-        let config_clone = config.clone();
+
+        // Shared state the supervised transport re-uses across reconnect attempts.
+        let audio_rx = Arc::new(Mutex::new(audio_rx));
+        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
+        let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
+
+        // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor with
+        // the shared process-global handles from CoreState (W-D1/W-D2 fleet adoption). When no
+        // handles were injected (a direct unit-test construction), the supervisor uses its own
+        // per-session governor/breaker default.
+        let reconnection = ReconnectionConfig::aggressive();
+        let disconnect_flag = Arc::clone(&self.intentional_disconnect);
+        let supervisor = match self.resilience.clone() {
+            Some(r) => ReconnectableStream::with_breaker_and_governor(
+                ReconnectableStreamConfig::new("tinkoff", reconnection),
+                r.breaker,
+                (*r.governor).clone(),
+            ),
+            None => {
+                ReconnectableStream::new(ReconnectableStreamConfig::new("tinkoff", reconnection))
+            }
+        }
+        .with_disconnect_flag(disconnect_flag);
 
         let connection_handle = tokio::spawn(async move {
-            // Create gRPC channel
-            let channel = match create_tinkoff_channel(&config_clone).await {
-                Ok(ch) => ch,
-                Err(e) => {
-                    error!("Failed to create Tinkoff gRPC channel: {}", e);
-                    let _ = error_tx.try_send(e);
-                    return;
-                }
-            };
-
-            // Create gRPC client
-            let client = TinkoffGrpcClient::new(channel, config_clone);
-
-            // Start streaming
-            let (grpc_audio_tx, mut result_rx) =
-                match client.start_streaming(streaming_config).await {
-                    Ok(streams) => streams,
-                    Err(e) => {
-                        error!("Failed to start Tinkoff streaming: {}", e);
-                        let _ = error_tx.try_send(e);
-                        return;
+            let exit = supervisor
+                .run(|| {
+                    let channel = channel.clone();
+                    let config = config.clone();
+                    let streaming_config = streaming_config.clone();
+                    let audio_rx = Arc::clone(&audio_rx);
+                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let connected_tx = Arc::clone(&connected_tx);
+                    let result_tx = result_tx.clone();
+                    async move {
+                        // The channel was already established by `start_connection`; building the
+                        // client is infallible.
+                        let grpc_client = TinkoffGrpcClient::new(channel, config);
+                        Ok(TinkoffTransport {
+                            grpc_client,
+                            streaming_config,
+                            audio_rx,
+                            shutdown_rx,
+                            result_tx,
+                            connected_tx,
+                        })
                     }
-                };
-
-            info!("Connected to Tinkoff VoiceKit STT");
-
-            // Signal successful connection
-            let _ = connected_tx.send(());
-
-            // Forward audio from our channel to gRPC channel
-            let audio_forward_handle = tokio::spawn(async move {
-                let mut audio_rx = audio_rx;
-                while let Some(audio) = audio_rx.recv().await {
-                    if grpc_audio_tx.send(audio).await.is_err() {
-                        debug!("gRPC audio channel closed");
-                        break;
-                    }
-                }
-            });
-
-            // Process results
-            loop {
-                tokio::select! {
-                    result_opt = result_rx.recv() => {
-                        match result_opt {
-                            Some(Ok(response)) => {
-                                // Convert to STTResult
-                                for result in response.results {
-                                    if let Some(alt) = result.alternatives.first() {
-                                        let stt_result = STTResult::new(
-                                            alt.transcript.clone(),
-                                            result.is_final,
-                                            result.is_final,
-                                            alt.confidence,
-                                        );
-
-                                        // Call result callback
-                                        let callback_opt = {
-                                            let guard = callback_ref.read().await;
-                                            guard.as_ref().map(|cb| cb(stt_result.clone()))
-                                        };
-
-                                        if let Some(future) = callback_opt {
-                                            future.await;
-                                        } else {
-                                            debug!(
-                                                "Received STT result but no callback: {} (confidence: {})",
-                                                stt_result.transcript, stt_result.confidence
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            Some(Err(e)) => {
-                                error!("Tinkoff streaming error: {}", e);
-                                // Call error callback
-                                let callback_opt = {
-                                    let guard = error_callback_ref.read().await;
-                                    guard.as_ref().map(|cb| cb(e.clone()))
-                                };
-
-                                if let Some(future) = callback_opt {
-                                    future.await;
-                                }
-                                break;
-                            }
-                            None => {
-                                info!("Tinkoff result stream ended");
-                                break;
-                            }
-                        }
-                    }
-                    _ = &mut shutdown_rx => {
-                        info!("Shutdown signal received");
-                        break;
-                    }
-                }
-            }
-
-            audio_forward_handle.abort();
-            info!("Tinkoff VoiceKit STT connection closed");
+                })
+                .await;
+            info!("Tinkoff VoiceKit STT connection closed (supervisor exit: {exit:?})");
         });
 
         self.connection_handle = Some(connection_handle);
 
-        // Error forwarding task
+        // Result/error forwarding task: convert decoded responses into STTResult and invoke the
+        // registered callbacks (preserving the original per-alternative fan-out).
+        let callback_ref = self.result_callback.clone();
         let error_callback_ref = self.error_callback.clone();
-        let error_forward_handle = tokio::spawn(async move {
-            while let Some(error) = error_rx.recv().await {
-                let callback_opt = {
-                    let guard = error_callback_ref.read().await;
-                    guard.as_ref().map(|cb| cb(error.clone()))
-                };
+        let result_forward_handle = tokio::spawn(async move {
+            while let Some(result) = result_rx.recv().await {
+                match result {
+                    Ok(response) => {
+                        for result in response.results {
+                            if let Some(alt) = result.alternatives.first() {
+                                let stt_result = STTResult::new(
+                                    alt.transcript.clone(),
+                                    result.is_final,
+                                    result.is_final,
+                                    alt.confidence,
+                                );
 
-                if let Some(future) = callback_opt {
-                    future.await;
-                } else {
-                    error!("STT streaming error but no error callback: {}", error);
+                                let callback_opt = {
+                                    let guard = callback_ref.read().await;
+                                    guard.as_ref().map(|cb| cb(stt_result.clone()))
+                                };
+
+                                if let Some(future) = callback_opt {
+                                    future.await;
+                                } else {
+                                    debug!(
+                                        "Received STT result but no callback: {} (confidence: {})",
+                                        stt_result.transcript, stt_result.confidence
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Tinkoff streaming error: {}", e);
+                        let callback_opt = {
+                            let guard = error_callback_ref.read().await;
+                            guard.as_ref().map(|cb| cb(e.clone()))
+                        };
+
+                        if let Some(future) = callback_opt {
+                            future.await;
+                        } else {
+                            error!("STT streaming error but no error callback: {}", e);
+                        }
+                    }
                 }
             }
         });
 
-        self.error_forward_handle = Some(error_forward_handle);
+        self.result_forward_handle = Some(result_forward_handle);
         self.state = ConnectionState::Connecting;
 
         // Wait for connection to be established
@@ -324,6 +489,7 @@ impl BaseSTT for TinkoffStt {
         Ok(Self {
             config: Some(tinkoff_config),
             state: ConnectionState::Disconnected,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             audio_sender: None,
             shutdown_tx: None,
@@ -332,6 +498,7 @@ impl BaseSTT for TinkoffStt {
             error_forward_handle: None,
             result_callback: Arc::new(RwLock::new(None)),
             error_callback: Arc::new(RwLock::new(None)),
+            resilience: None,
         })
     }
 
@@ -344,9 +511,16 @@ impl BaseSTT for TinkoffStt {
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
+        // Record the intent BEFORE anything else so the supervisor sees it even if the transport's
+        // run() just reported a reconnectable drop (the disconnect-vs-close race).
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
         }
+
+        // Drop the outbound audio sender so the transport's recv() also unblocks.
+        self.audio_sender = None;
 
         if let Some(handle) = self.connection_handle.take() {
             let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
@@ -437,6 +611,24 @@ impl BaseSTT for TinkoffStt {
 
     fn get_provider_info(&self) -> &'static str {
         "Tinkoff VoiceKit Speech-to-Text"
+    }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared, process-global handles so `start_connection` drives the generic
+        // ReconnectableStream supervisor with them — every Tinkoff session trips the same breaker
+        // and shares the one process-wide reconnect cap (W-D2).
+        self.resilience = Some(resilience);
+    }
+}
+
+impl TinkoffStt {
+    /// The shared circuit breaker this session feeds into the generic supervisor, if the
+    /// process-global resilience handles have been injected (W-D1/W-D2). Two `TinkoffStt` built from
+    /// the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(
+        &self,
+    ) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.as_ref().map(|r| &r.breaker)
     }
 }
 
@@ -558,6 +750,22 @@ mod tests {
         // Disconnecting when not connected should succeed
         let result = stt.disconnect().await;
         assert!(result.is_ok());
+    }
+
+    // W-D1: disconnect() must record intent on the supervisor-shared flag so a client close racing
+    // a server-side close can never trigger a spurious reconnect (the supervisor's loop-top guard
+    // observes this same `Arc<AtomicBool>`). Before this wiring the flag was the supervisor's own
+    // and disconnect() never set it.
+    #[tokio::test]
+    async fn disconnect_sets_intentional_flag_for_supervisor() {
+        let config = create_test_config();
+        let mut stt = TinkoffStt::new(config).unwrap();
+        assert!(!stt.intentional_disconnect.load(Ordering::SeqCst));
+        stt.disconnect().await.unwrap();
+        assert!(
+            stt.intentional_disconnect.load(Ordering::SeqCst),
+            "disconnect() must set the supervisor-shared intentional-disconnect flag",
+        );
     }
 
     #[test]

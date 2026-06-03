@@ -16,16 +16,18 @@
 
 use bytes::Bytes;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::{Instant, interval, timeout};
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
 
 use super::config::{
@@ -33,6 +35,11 @@ use super::config::{
 };
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
+};
+use crate::core::websocket::ReconnectionConfig;
+use crate::core::websocket::reconnectable_stream::{
+    ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
+    WsTransport,
 };
 
 /// Type alias for the complex callback function type
@@ -114,6 +121,155 @@ struct SarvamError {
     code: Option<String>,
 }
 
+/// The concrete WebSocket stream type Sarvam dials.
+type SarvamWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A [`WsTransport`] that adapts Sarvam's streaming event loop to the generic
+/// [`ReconnectableStream`] supervisor (W-D1 fleet adoption). Like ElevenLabs/Cartesia, Sarvam
+/// carries every feature (model, language, sample rate, VAD/mode params) in the connect URL and
+/// authenticates with the `api-subscription-key` request header, so
+/// [`restore_session`](WsTransport::restore_session) is a no-op — a fresh dial already restored
+/// the featured session. [`run`](WsTransport::run) IS the original `select!` loop (base64-JSON
+/// audio + keep-alive pings), now returning a [`ReconnectOutcome`] so a mid-stream transport drop
+/// reconnects instead of bare-breaking and ending the session.
+struct SarvamTransport {
+    ws_sink: SplitSink<SarvamWs, Message>,
+    ws_stream: SplitStream<SarvamWs>,
+    /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
+    audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
+    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
+    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    result_tx: mpsc::Sender<STTResult>,
+    error_tx: mpsc::Sender<STTError>,
+    /// Fires once on the first successful connect, unblocking `start_connection`.
+    connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+#[async_trait::async_trait]
+impl WsTransport for SarvamTransport {
+    async fn restore_session(&mut self) -> Result<(), RestoreError> {
+        // Sarvam puts every feature in the connect URL and auth in a header, so a fresh dial
+        // already restored the featured session — nothing to re-send. Signal the waiting
+        // connect() exactly once.
+        if let Some(tx) = self.connected_tx.lock().await.take() {
+            let _ = tx.send(());
+        }
+        Ok(())
+    }
+
+    async fn run(&mut self) -> ReconnectOutcome {
+        let mut audio_rx = self.audio_rx.lock().await;
+        let mut shutdown_rx = self.shutdown_rx.lock().await;
+
+        // Keep-alive mechanism - Sarvam requires ping within 60 seconds.
+        let mut keepalive_timer = interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
+        let mut last_activity = Instant::now();
+        // Track speech state for is_speech_final (reset per connection).
+        let mut in_speech = false;
+
+        loop {
+            tokio::select! {
+                // Handle outgoing audio data
+                Some(audio_data) = audio_rx.recv() => {
+                    // Encode audio as base64 and send as JSON
+                    let b64_audio = BASE64_STANDARD.encode(&audio_data);
+                    let msg = SarvamAudioMessage { audio: b64_audio };
+                    match serde_json::to_string(&msg) {
+                        Ok(json) => {
+                            let message = Message::Text(json.into());
+                            if let Err(e) = self.ws_sink.send(message).await {
+                                let stt_error = STTError::NetworkError(format!(
+                                    "Failed to send audio to Sarvam: {e}"
+                                ));
+                                error!("{}", stt_error);
+                                let _ = self.error_tx.try_send(stt_error);
+                                // Transport-level send failure: reconnect to preserve the session.
+                                return ReconnectOutcome::Reconnectable(StreamError::new("audio send failed"));
+                            }
+                            last_activity = Instant::now();
+                        }
+                        Err(e) => {
+                            warn!("Failed to serialize audio message: {}", e);
+                        }
+                    }
+                }
+
+                // Handle incoming messages with idle timeout
+                message = timeout(Duration::from_secs(MESSAGE_TIMEOUT_SECS), self.ws_stream.next()) => {
+                    match message {
+                        Ok(Some(Ok(msg))) => {
+                            let is_close = matches!(msg, Message::Close(_));
+                            if let Err(e) = SarvamSTT::handle_websocket_message(msg, &self.result_tx, &mut in_speech) {
+                                // A provider error frame is typically fatal (bad config) — don't
+                                // hammer it with reconnects.
+                                error!("Sarvam STT error: {}", e);
+                                let _ = self.error_tx.try_send(e);
+                                return ReconnectOutcome::Fatal(StreamError::new("provider error frame"));
+                            }
+                            if is_close {
+                                // Server closed mid-stream — reconnect to preserve the session.
+                                info!("Sarvam WebSocket closed by server");
+                                return ReconnectOutcome::Reconnectable(StreamError::new("server close"));
+                            }
+                        }
+                        Ok(Some(Err(e))) => {
+                            let stt_error = STTError::NetworkError(format!(
+                                "Sarvam WebSocket error: {e}"
+                            ));
+                            error!("{}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("websocket error"));
+                        }
+                        Ok(None) => {
+                            info!("Sarvam WebSocket stream ended");
+                            return ReconnectOutcome::Reconnectable(StreamError::new("stream ended"));
+                        }
+                        Err(_elapsed) => {
+                            let stt_error = STTError::NetworkError(
+                                "Sarvam WebSocket idle timeout - no message for 60 seconds".into()
+                            );
+                            error!("{}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("idle timeout"));
+                        }
+                    }
+                }
+
+                // Handle keep-alive timer
+                _ = keepalive_timer.tick() => {
+                    if last_activity.elapsed() >= Duration::from_secs(KEEPALIVE_INTERVAL_SECS) {
+                        let ping_msg = SarvamPingMessage { msg_type: "ping" };
+                        match serde_json::to_string(&ping_msg) {
+                            Ok(json) => {
+                                let message = Message::Text(json.into());
+                                if let Err(e) = self.ws_sink.send(message).await {
+                                    let stt_error = STTError::NetworkError(format!(
+                                        "Failed to send Sarvam keep-alive: {e}"
+                                    ));
+                                    error!("{}", stt_error);
+                                    let _ = self.error_tx.try_send(stt_error);
+                                    return ReconnectOutcome::Reconnectable(StreamError::new("keepalive send failed"));
+                                }
+                                debug!("Sent keep-alive ping to Sarvam");
+                            }
+                            Err(e) => {
+                                warn!("Failed to serialize ping message: {}", e);
+                            }
+                        }
+                    }
+                }
+
+                // Handle shutdown signal (intentional close — must NOT reconnect)
+                _ = &mut *shutdown_rx => {
+                    info!("Sarvam STT received shutdown signal");
+                    let _ = self.ws_sink.send(Message::Close(None)).await;
+                    return ReconnectOutcome::Completed;
+                }
+            }
+        }
+    }
+}
+
 /// Sarvam.ai STT WebSocket client
 pub struct SarvamSTT {
     /// Base configuration
@@ -122,6 +278,10 @@ pub struct SarvamSTT {
     sarvam_config: Option<SarvamSTTConfig>,
     /// Current connection state
     state: ConnectionState,
+    /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
+    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// server-side close can never trigger a spurious reconnect.
+    intentional_disconnect: Arc<AtomicBool>,
     /// State change notification
     state_notify: Arc<Notify>,
     /// WebSocket sender for audio data (bounded channel for backpressure)
@@ -142,6 +302,12 @@ pub struct SarvamSTT {
     result_callback: Arc<Mutex<Option<AsyncSTTCallback>>>,
     /// Error callback storage for streaming errors
     error_callback: Arc<Mutex<Option<AsyncErrorCallback>>>,
+    /// Shared, process-global resilience handles (W-D2): the single reconnect governor + this
+    /// provider's shared circuit breaker, injected by the VoiceManager from CoreState and driven
+    /// by the generic [`ReconnectableStream`](crate::core::websocket::ReconnectableStream)
+    /// supervisor. `None` before `set_resilience` (a direct unit-test construction) → the
+    /// supervisor uses its own per-session governor/breaker default.
+    resilience: Option<crate::core::resilience::ResilienceHandles>,
 }
 
 impl SarvamSTT {
@@ -162,6 +328,7 @@ impl SarvamSTT {
             config: Some(std.base.clone()),
             sarvam_config: Some(sarvam_config),
             state: ConnectionState::Disconnected,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
             shutdown_tx: None,
@@ -172,7 +339,17 @@ impl SarvamSTT {
             error_forward_handle: None,
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
+            resilience: None,
         })
+    }
+
+    /// The shared circuit breaker this session feeds into the generic supervisor, if the
+    /// process-global resilience handles have been injected (W-D1/W-D2). Two `SarvamSTT` built
+    /// from the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(
+        &self,
+    ) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.as_ref().map(|r| &r.breaker)
     }
 
     /// Handle incoming WebSocket messages
@@ -284,11 +461,15 @@ impl SarvamSTT {
             .validate()
             .map_err(STTError::ConfigurationError)?;
 
+        // Fresh session: clear any intent left over from a prior disconnect so the supervisor
+        // does not immediately complete.
+        self.intentional_disconnect.store(false, Ordering::SeqCst);
+
         let ws_url = sarvam_config.build_websocket_url();
 
         // Create channels for communication (bounded for backpressure)
-        let (ws_tx, mut ws_rx) = mpsc::channel::<Bytes>(32);
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let (ws_tx, ws_rx) = mpsc::channel::<Bytes>(32);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
         let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
@@ -302,152 +483,80 @@ impl SarvamSTT {
         // Clone necessary data for the connection task
         let api_key = base_config.api_key.clone();
 
-        // Start the connection task
-        let connection_handle = tokio::spawn(async move {
-            // Connect to Sarvam
-            // IMPORTANT: Sarvam uses "api-subscription-key" header, NOT "Authorization: Bearer"
-            let request = match tokio_tungstenite::tungstenite::http::Request::builder()
-                .method("GET")
-                .uri(&ws_url)
-                .header("Upgrade", "websocket")
-                .header("Connection", "upgrade")
-                .header("Sec-WebSocket-Key", generate_key())
-                .header("Sec-WebSocket-Version", "13")
-                .header("api-subscription-key", &api_key) // Sarvam's custom auth header
-                .body(())
-            {
-                Ok(request) => request,
-                Err(e) => {
-                    let stt_error = STTError::ConnectionFailed(format!(
-                        "Failed to create Sarvam WebSocket request: {e}"
-                    ));
-                    error!("{}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
-                }
-            };
+        // Shared state the supervised transport re-uses across reconnect attempts: a single-
+        // consumer audio receiver + shutdown oneshot (locked per `run`) and the one-shot connected
+        // signal that fires on the first successful connect.
+        let audio_rx = Arc::new(Mutex::new(ws_rx));
+        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
+        let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
 
-            let (ws_stream, _) = match connect_async(request).await {
-                Ok(result) => result,
-                Err(e) => {
-                    let stt_error =
-                        STTError::ConnectionFailed(format!("Failed to connect to Sarvam: {e}"));
-                    error!("{}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
-                }
-            };
-
-            info!("Connected to Sarvam STT WebSocket");
-
-            // Signal successful connection
-            let _ = connected_tx.send(());
-
-            let (mut ws_sink, mut ws_stream) = ws_stream.split();
-
-            // Keep-alive mechanism - Sarvam requires ping within 60 seconds
-            let mut keepalive_timer = interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
-            let mut last_activity = Instant::now();
-
-            // Track speech state for is_speech_final
-            let mut in_speech = false;
-
-            // Main event loop
-            loop {
-                tokio::select! {
-                    // Handle outgoing audio data
-                    Some(audio_data) = ws_rx.recv() => {
-                        // Encode audio as base64 and send as JSON
-                        let b64_audio = BASE64_STANDARD.encode(&audio_data);
-                        let msg = SarvamAudioMessage { audio: b64_audio };
-
-                        match serde_json::to_string(&msg) {
-                            Ok(json) => {
-                                let message = Message::Text(json.into());
-                                if let Err(e) = ws_sink.send(message).await {
-                                    let stt_error = STTError::NetworkError(format!(
-                                        "Failed to send audio to Sarvam: {e}"
-                                    ));
-                                    error!("{}", stt_error);
-                                    let _ = error_tx.try_send(stt_error);
-                                    break;
-                                }
-                                // Update last activity time
-                                last_activity = Instant::now();
-                            }
-                            Err(e) => {
-                                warn!("Failed to serialize audio message: {}", e);
-                            }
-                        }
-                    }
-
-                    // Handle incoming messages with idle timeout
-                    message = timeout(Duration::from_secs(MESSAGE_TIMEOUT_SECS), ws_stream.next()) => {
-                        match message {
-                            Ok(Some(Ok(msg))) => {
-                                if let Err(e) = Self::handle_websocket_message(msg, &result_tx, &mut in_speech) {
-                                    error!("Sarvam STT error: {}", e);
-                                    let _ = error_tx.try_send(e);
-                                    break;
-                                }
-                            }
-                            Ok(Some(Err(e))) => {
-                                let stt_error = STTError::NetworkError(format!(
-                                    "Sarvam WebSocket error: {e}"
-                                ));
-                                error!("{}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
-                            }
-                            Ok(None) => {
-                                info!("Sarvam WebSocket stream ended");
-                                break;
-                            }
-                            Err(_elapsed) => {
-                                let stt_error = STTError::NetworkError(
-                                    "Sarvam WebSocket idle timeout - no message for 60 seconds".into()
-                                );
-                                error!("{}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
-                            }
-                        }
-                    }
-
-                    // Handle keep-alive timer
-                    _ = keepalive_timer.tick() => {
-                        // Send ping if no activity in the last interval
-                        if last_activity.elapsed() >= Duration::from_secs(KEEPALIVE_INTERVAL_SECS) {
-                            let ping_msg = SarvamPingMessage { msg_type: "ping" };
-                            match serde_json::to_string(&ping_msg) {
-                                Ok(json) => {
-                                    let message = Message::Text(json.into());
-                                    if let Err(e) = ws_sink.send(message).await {
-                                        let stt_error = STTError::NetworkError(format!(
-                                            "Failed to send Sarvam keep-alive: {e}"
-                                        ));
-                                        error!("{}", stt_error);
-                                        let _ = error_tx.try_send(stt_error);
-                                        break;
-                                    }
-                                    debug!("Sent keep-alive ping to Sarvam");
-                                }
-                                Err(e) => {
-                                    warn!("Failed to serialize ping message: {}", e);
-                                }
-                            }
-                        }
-                    }
-
-                    // Handle shutdown signal
-                    _ = &mut shutdown_rx => {
-                        info!("Sarvam STT received shutdown signal");
-                        break;
-                    }
-                }
+        // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor (the
+        // same one the chaos tests exercise) with the shared process-global handles from CoreState
+        // (W-D1/W-D2 fleet adoption). When no handles were injected (a direct unit-test
+        // construction), the supervisor uses its own per-session governor/breaker default.
+        let reconnection = ReconnectionConfig::aggressive();
+        let disconnect_flag = Arc::clone(&self.intentional_disconnect);
+        let supervisor = match self.resilience.clone() {
+            Some(r) => ReconnectableStream::with_breaker_and_governor(
+                ReconnectableStreamConfig::new("sarvam", reconnection),
+                r.breaker,
+                (*r.governor).clone(),
+            ),
+            None => {
+                ReconnectableStream::new(ReconnectableStreamConfig::new("sarvam", reconnection))
             }
+        }
+        .with_disconnect_flag(disconnect_flag);
 
-            info!("Sarvam STT WebSocket connection closed");
+        // Start the connection task: the supervisor owns the outer reconnect loop; the `connect`
+        // closure dials the *featured* URL with Sarvam's custom auth header and hands back a
+        // transport whose `run()` is the original Sarvam event loop.
+        let connection_handle = tokio::spawn(async move {
+            let exit = supervisor
+                .run(|| {
+                    let ws_url = ws_url.clone();
+                    let api_key = api_key.clone();
+                    let audio_rx = Arc::clone(&audio_rx);
+                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let connected_tx = Arc::clone(&connected_tx);
+                    let result_tx = result_tx.clone();
+                    let error_tx = error_tx.clone();
+                    async move {
+                        // IMPORTANT: Sarvam uses "api-subscription-key" header, NOT
+                        // "Authorization: Bearer".
+                        let request = tokio_tungstenite::tungstenite::http::Request::builder()
+                            .method("GET")
+                            .uri(&ws_url)
+                            .header("Upgrade", "websocket")
+                            .header("Connection", "upgrade")
+                            .header("Sec-WebSocket-Key", generate_key())
+                            .header("Sec-WebSocket-Version", "13")
+                            .header("api-subscription-key", &api_key)
+                            .body(())
+                            .map_err(|e| {
+                                StreamError::new(format!(
+                                    "Failed to create Sarvam WebSocket request: {e}"
+                                ))
+                            })?;
+
+                        let (ws_stream, _) = connect_async(request).await.map_err(|e| {
+                            StreamError::new(format!("Failed to connect to Sarvam: {e}"))
+                        })?;
+                        info!("Connected to Sarvam STT WebSocket");
+                        let (ws_sink, ws_stream) = ws_stream.split();
+                        Ok(SarvamTransport {
+                            ws_sink,
+                            ws_stream,
+                            audio_rx,
+                            shutdown_rx,
+                            result_tx,
+                            error_tx,
+                            connected_tx,
+                        })
+                    }
+                })
+                .await;
+            info!("Sarvam STT WebSocket connection closed (supervisor exit: {exit:?})");
         });
 
         self.connection_handle = Some(connection_handle);
@@ -514,6 +623,7 @@ impl Default for SarvamSTT {
             config: None,
             sarvam_config: None,
             state: ConnectionState::Disconnected,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
             shutdown_tx: None,
@@ -524,6 +634,7 @@ impl Default for SarvamSTT {
             error_forward_handle: None,
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
+            resilience: None,
         }
     }
 }
@@ -545,6 +656,7 @@ impl BaseSTT for SarvamSTT {
             config: Some(config),
             sarvam_config: Some(sarvam_config),
             state: ConnectionState::Disconnected,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
             shutdown_tx: None,
@@ -555,6 +667,7 @@ impl BaseSTT for SarvamSTT {
             error_forward_handle: None,
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
+            resilience: None,
         })
     }
 
@@ -574,6 +687,10 @@ impl BaseSTT for SarvamSTT {
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
+        // Record the intent BEFORE firing shutdown_tx so the supervisor sees it even if the
+        // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+
         // Send shutdown signal
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
@@ -677,6 +794,13 @@ impl BaseSTT for SarvamSTT {
 
     fn get_provider_info(&self) -> &'static str {
         "Sarvam.ai STT (Saarika)"
+    }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared, process-global handles so `start_connection` drives the generic
+        // ReconnectableStream supervisor with them — every Sarvam session trips the same breaker
+        // and shares the one process-wide reconnect cap (W-D2).
+        self.resilience = Some(resilience);
     }
 }
 
@@ -864,5 +988,27 @@ mod tests {
         if let Err(STTError::ConnectionFailed(msg)) = result {
             assert!(msg.contains("Not connected"));
         }
+    }
+
+    #[tokio::test]
+    async fn disconnect_sets_intentional_flag_for_supervisor() {
+        let config = STTConfig {
+            model: "saarika:v2.5".to_string(),
+            provider: "sarvam".to_string(),
+            api_key: "test_key".to_string(),
+            language: "hi-IN".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "pcm_s16le".to_string(),
+        };
+
+        let mut stt = <SarvamSTT as BaseSTT>::new(config).unwrap();
+        assert!(!stt.intentional_disconnect.load(Ordering::SeqCst));
+        stt.disconnect().await.unwrap();
+        assert!(
+            stt.intentional_disconnect.load(Ordering::SeqCst),
+            "disconnect() must set the supervisor-shared intentional-disconnect flag",
+        );
     }
 }
