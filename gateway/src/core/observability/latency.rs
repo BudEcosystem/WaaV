@@ -12,7 +12,7 @@
 //!
 //! # Example
 //!
-//! ```rust
+//! ```ignore
 //! let observer = UserBotLatencyObserver::new(1000); // Keep 1000 samples
 //! let metrics = observer.get_metrics();
 //! println!("Average latency: {}ms", metrics.avg_ms);

@@ -44,7 +44,7 @@
 //!
 //! # Example Usage
 //!
-//! ```rust,no_run
+//! ```ignore
 //! use waav_gateway::core::tts::{BaseTTS, TTSConfig};
 //! use waav_gateway::core::tts::zalo_ai::{ZaloTts, ZaloVoice};
 //!

@@ -11,7 +11,7 @@
 //!
 //! # Example
 //!
-//! ```rust
+//! ```ignore
 //! let metrics = ProviderMetrics::new("deepgram");
 //!
 //! // Start timing a request

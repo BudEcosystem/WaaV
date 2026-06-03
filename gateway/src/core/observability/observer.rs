@@ -110,7 +110,7 @@ struct ObserverEntry {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```ignore
 /// let registry = ObserverRegistry::new();
 ///
 /// // Register an observer

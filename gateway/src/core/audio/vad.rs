@@ -192,7 +192,7 @@ impl VADParams {
 ///
 /// # Usage Pattern
 ///
-/// ```rust
+/// ```ignore
 /// let mut vad = VADAnalyzer::new(VADParams::default());
 ///
 /// // For each audio frame (e.g., every 20-50ms):

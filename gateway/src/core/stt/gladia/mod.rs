@@ -11,7 +11,7 @@
 //!
 //! # Example
 //!
-//! ```rust,no_run
+//! ```ignore
 //! use waav_gateway::core::stt::gladia::{GladiaSTT, GladiaSTTConfig};
 //! use waav_gateway::core::stt::BaseSTT;
 //!

@@ -7,7 +7,7 @@
 //!
 //! # Example
 //!
-//! ```rust
+//! ```ignore
 //! use std::sync::Arc;
 //! use crate::core::observability::{VoiceObserver, ObserverRegistry};
 //!

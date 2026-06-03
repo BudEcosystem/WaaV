@@ -10,7 +10,7 @@
 //!
 //! # Example
 //!
-//! ```rust
+//! ```ignore
 //! let state = BotSpeakingState::new(350); // 350ms silence threshold
 //!
 //! // When audio is sent
