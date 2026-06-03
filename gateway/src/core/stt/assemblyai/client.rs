@@ -213,6 +213,12 @@ pub struct AssemblyAISTT {
     /// when constructed directly (unit tests) — then the connect path falls back to per-session
     /// handles so storm control degrades gracefully rather than panicking.
     resilience: Option<crate::core::resilience::ResilienceHandles>,
+
+    /// Intentional-disconnect flag shared with the hand-rolled reconnect loop (W-D1). Cleared on
+    /// `start_connection`, set in `disconnect()` before firing `shutdown_tx`. The outer reconnect
+    /// loop checks it at the top and converts a racy `Reconnect` outcome into `Intentional`, so a
+    /// client close racing a server-side close can never trigger a spurious reconnect.
+    intentional_disconnect: Arc<AtomicBool>,
 }
 
 impl Default for AssemblyAISTT {
@@ -234,6 +240,7 @@ impl Default for AssemblyAISTT {
             session_id: Arc::new(RwLock::new(None)),
             is_connected: Arc::new(AtomicBool::new(false)),
             resilience: None,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -464,6 +471,11 @@ impl AssemblyAISTT {
             ),
         };
 
+        // Fresh session: clear any intent left over from a prior disconnect, and share the flag
+        // into the task so disconnect() can stop a reconnect that races a server-side close (W-D1).
+        self.intentional_disconnect.store(false, Ordering::SeqCst);
+        let intentional_disconnect = Arc::clone(&self.intentional_disconnect);
+
         // Start the connection task
         let connection_handle = tokio::spawn(async move {
             let manager = ReconnectionManager::new(reconnection);
@@ -474,6 +486,12 @@ impl AssemblyAISTT {
             // query carries format_turns/keyterms/language_detection/... — re-sending it is the
             // session restore) and runs the inner loop until it yields an outcome.
             'reconnect: loop {
+                // W-D1: an intentional disconnect (possibly set during the previous iteration's
+                // backoff) must stop the loop before dialing again.
+                if intentional_disconnect.load(Ordering::Acquire) {
+                    info!("AssemblyAI: intentional disconnect; not reconnecting");
+                    break 'reconnect;
+                }
                 if !breaker.allow_request() {
                     crate::core::metrics::bridge::record_reconnect("assemblyai", "circuit_open");
                     if !manager.should_retry() {
@@ -550,7 +568,7 @@ impl AssemblyAISTT {
                 let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
                 // Outcome of the inner event loop.
-                let outcome: AssemblyAiInnerOutcome;
+                let mut outcome: AssemblyAiInnerOutcome;
 
                 // Main event loop
                 loop {
@@ -670,6 +688,16 @@ impl AssemblyAISTT {
                     && connected_since.elapsed().as_millis() as u64 >= reset_after_ms
                 {
                     manager.reset();
+                }
+
+                // W-D1: if the client asked to disconnect while the inner loop was running, a
+                // server-close that won the unbiased select may have classified this as Reconnect.
+                // Honor the intent: convert it to Intentional so we neither reconnect nor record a
+                // spurious breaker failure.
+                if matches!(outcome, AssemblyAiInnerOutcome::Reconnect)
+                    && intentional_disconnect.load(Ordering::Acquire)
+                {
+                    outcome = AssemblyAiInnerOutcome::Intentional;
                 }
 
                 match outcome {
@@ -804,6 +832,7 @@ impl BaseSTT for AssemblyAISTT {
             session_id: Arc::new(RwLock::new(None)),
             is_connected: Arc::new(AtomicBool::new(false)),
             resilience: None,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -816,6 +845,9 @@ impl BaseSTT for AssemblyAISTT {
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
+        // W-D1: record the intent BEFORE firing the shutdown signal so the reconnect loop never
+        // re-dials on a disconnect that races a server-side close.
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
         }
@@ -1182,6 +1214,25 @@ mod tests {
         assert!(url.contains("sample_rate=16000"));
         assert!(url.contains("encoding=pcm_s16le"));
         assert!(url.contains("speech_model=universal-streaming-english"));
+    }
+
+    // W-D1: disconnect() must record intent on the flag shared with the hand-rolled reconnect
+    // loop, so a client close racing a server-side close can never trigger a spurious reconnect.
+    #[tokio::test]
+    async fn disconnect_sets_intentional_flag_for_supervisor() {
+        let config = STTConfig {
+            api_key: "test_key".to_string(),
+            language: "en-US".to_string(),
+            sample_rate: 16000,
+            ..Default::default()
+        };
+        let mut stt = AssemblyAISTT::new(config).unwrap();
+        assert!(!stt.intentional_disconnect.load(Ordering::SeqCst));
+        stt.disconnect().await.unwrap();
+        assert!(
+            stt.intentional_disconnect.load(Ordering::SeqCst),
+            "disconnect() must set the reconnect-loop intentional-disconnect flag",
+        );
     }
 
     #[tokio::test]

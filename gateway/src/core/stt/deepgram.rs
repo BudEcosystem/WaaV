@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -355,6 +356,12 @@ pub struct DeepgramSTT {
     /// `None` (e.g. constructed directly in a unit test), the connect path falls back to its own
     /// per-session governor/breaker so storm control degrades gracefully rather than panicking.
     resilience: Option<crate::core::resilience::ResilienceHandles>,
+    /// Intentional-disconnect flag shared with the hand-rolled reconnect loop (W-D1). Cleared on
+    /// `start_connection`, set in `disconnect()` before firing `shutdown_tx`. The outer reconnect
+    /// loop checks it at the top and converts a racy `Reconnect` outcome into `Intentional`, so a
+    /// client close racing a server-side close can never trigger a spurious reconnect (the unbiased
+    /// inner select may pick the stream-ended arm over the shutdown arm).
+    intentional_disconnect: Arc<AtomicBool>,
 }
 
 /// Constants for Deepgram regional endpoints
@@ -385,6 +392,7 @@ impl DeepgramSTT {
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
             resilience: None,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -718,6 +726,12 @@ impl DeepgramSTT {
             ),
         };
 
+        // Fresh session: clear any intent left over from a prior disconnect so the reconnect loop
+        // does not stop immediately. The same flag is shared into the task so disconnect() can stop
+        // a reconnect that races a server-side close (W-D1).
+        self.intentional_disconnect.store(false, Ordering::SeqCst);
+        let intentional_disconnect = Arc::clone(&self.intentional_disconnect);
+
         // Start the connection task
         let connection_handle = tokio::spawn(async move {
             let manager = ReconnectionManager::new(reconnection);
@@ -727,6 +741,12 @@ impl DeepgramSTT {
             // URL carries diarize/keyterm/redaction/...) and runs the inner event loop until
             // it yields an outcome. Reconnectable outcomes loop; intentional/exhausted stop.
             'reconnect: loop {
+                // W-D1: an intentional disconnect (possibly set during the previous iteration's
+                // backoff) must stop the loop before dialing again.
+                if intentional_disconnect.load(Ordering::Acquire) {
+                    info!("Deepgram: intentional disconnect; not reconnecting");
+                    break 'reconnect;
+                }
                 // Storm control + breaker gate before dialing.
                 if !breaker.allow_request() {
                     crate::core::metrics::bridge::record_reconnect("deepgram", "circuit_open");
@@ -818,7 +838,7 @@ impl DeepgramSTT {
                 let mut last_activity = Instant::now();
 
                 // Outcome of the inner event loop: do we reconnect, or stop intentionally?
-                let outcome: DeepgramInnerOutcome;
+                let mut outcome: DeepgramInnerOutcome;
 
                 // Main event loop
                 loop {
@@ -982,6 +1002,16 @@ impl DeepgramSTT {
                     manager.reset();
                 }
 
+                // W-D1: if the client asked to disconnect while the inner loop was running, a
+                // server-close that won the unbiased select may have classified this as Reconnect.
+                // Honor the intent: convert it to Intentional so we neither reconnect nor record a
+                // spurious breaker failure.
+                if matches!(outcome, DeepgramInnerOutcome::Reconnect)
+                    && intentional_disconnect.load(Ordering::Acquire)
+                {
+                    outcome = DeepgramInnerOutcome::Intentional;
+                }
+
                 match outcome {
                     DeepgramInnerOutcome::Intentional | DeepgramInnerOutcome::Fatal => {
                         info!("Deepgram WebSocket connection closed");
@@ -1088,6 +1118,7 @@ impl Default for DeepgramSTT {
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
             resilience: None,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1133,6 +1164,9 @@ impl BaseSTT for DeepgramSTT {
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
+        // W-D1: record the intent BEFORE firing the shutdown signal so the reconnect loop never
+        // re-dials on a disconnect that races a server-side close.
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
         // Send shutdown signal
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
@@ -1295,6 +1329,29 @@ mod tests {
         let stt = <DeepgramSTT as BaseSTT>::new(config).unwrap();
         assert!(!stt.is_ready());
         assert_eq!(stt.get_provider_info(), "Deepgram STT WebSocket");
+    }
+
+    // W-D1: disconnect() must record intent on the flag shared with the hand-rolled reconnect
+    // loop, so a client close racing a server-side close can never trigger a spurious reconnect.
+    #[tokio::test]
+    async fn disconnect_sets_intentional_flag_for_supervisor() {
+        let config = STTConfig {
+            model: "nova-3".to_string(),
+            provider: "deepgram".to_string(),
+            api_key: "test_key".to_string(),
+            language: "en-US".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "linear16".to_string(),
+        };
+        let mut stt = <DeepgramSTT as BaseSTT>::new(config).unwrap();
+        assert!(!stt.intentional_disconnect.load(Ordering::SeqCst));
+        stt.disconnect().await.unwrap();
+        assert!(
+            stt.intentional_disconnect.load(Ordering::SeqCst),
+            "disconnect() must set the reconnect-loop intentional-disconnect flag",
+        );
     }
 
     #[tokio::test]
