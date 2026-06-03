@@ -836,12 +836,16 @@ fn print_test_summary(results: &[TestResult]) {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "Live integration smoke test: requires a RUNNING gateway at localhost:3001 + provider API keys; makes real billed vendor calls. Run manually with --ignored after `cargo run`."]
 async fn test_all_providers() {
     println!("\n=== WaaV Gateway Provider Test Suite ===\n");
 
-    // Check gateway health first
+    // Check gateway health first (bounded so a half-open localhost socket can't hang the test).
     let gateway_url = get_gateway_url();
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
 
     match client.get(format!("{}/", gateway_url)).send().await {
         Ok(resp) if resp.status().is_success() => {
