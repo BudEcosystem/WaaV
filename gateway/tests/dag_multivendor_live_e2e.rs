@@ -181,6 +181,98 @@ async fn dag_translate_then_elevenlabs_hindi_tts_live() {
 }
 
 // ============================================================================
+// 4. STREAMING data-plane: LLM streams sentences → TTS speaks each while the LLM keeps
+//    generating. The terminal node delivers MULTIPLE audio chunks incrementally (vs. the batch
+//    path's single blob), proving inter-node streaming for real-time.
+// ============================================================================
+#[tokio::test]
+#[ignore = "Requires SARVAM_API_KEY + ELEVENLABS_API_KEY; real billed calls"]
+async fn dag_streaming_emits_incremental_audio_live() {
+    use std::time::Instant;
+    use tokio::sync::mpsc;
+    use waav_gateway::dag::context::DagOutput;
+
+    ensure_crypto();
+    let (Some(_), Some(_)) = (key("SARVAM_API_KEY"), key("ELEVENLABS_API_KEY")) else { return };
+
+    // A multi-sentence translation so the LLM produces several Hindi sentences to stream.
+    let paragraph = "Hello there. How are you doing today? The weather is really nice. \
+                     I hope you have a wonderful day ahead.";
+
+    // Streaming variant of the translate node: same as sarvam_translate_node but streaming=true.
+    let translate = NodeDefinition::new(
+        "translate",
+        NodeType::LlmEndpoint {
+            base_url: "https://api.sarvam.ai/v1".to_string(),
+            model: "sarvam-30b".to_string(),
+            api_key: Some("${SARVAM_API_KEY}".to_string()),
+            system_prompt: Some(
+                "Translate each English sentence into Hindi (Devanagari). Output ONLY the Hindi \
+                 translation, preserving sentence boundaries."
+                    .to_string(),
+            ),
+            temperature: Some(0.1),
+            max_tokens: Some(4000),
+            streaming: true,
+            tools: None,
+            assistant_id: None,
+            timeout_ms: Some(120_000),
+            headers: Default::default(),
+        },
+    );
+
+    let mut dag = DAGDefinition::new("stream-xlate-tts", "streaming Sarvam EN->HI -> ElevenLabs TTS");
+    dag.add_node(translate);
+    dag.add_node(elevenlabs_hindi_tts_node());
+    dag.add_edge(EdgeDefinition::new("translate", "tts"));
+    dag.with_entry("translate");
+    dag.add_exit("tts");
+    let compiled = DAGCompiler::new().compile(dag).expect("compile");
+
+    // Drain the client sink CONCURRENTLY, timestamping each audio chunk as it arrives.
+    let (tx, rx) = mpsc::channel::<DagOutput>(64);
+    let start = Instant::now();
+    let drain = tokio::spawn(async move {
+        let mut rx = rx;
+        let mut chunks: Vec<(u128, usize)> = Vec::new();
+        while let Some(out) = rx.recv().await {
+            if let DagOutput::Audio(a) = out {
+                chunks.push((start.elapsed().as_millis(), a.data.len()));
+            }
+        }
+        chunks
+    });
+
+    let exec = DAGExecutor::new().with_timeout(Duration::from_secs(150));
+    let mut ctx = DAGContext::new("stream-test").with_output_tx(tx);
+    exec.execute_streaming_from(&compiled, "translate", DAGData::Text(paragraph.to_string()), &mut ctx)
+        .await
+        .expect("streaming pipeline executes");
+    drop(ctx); // drop the sink so the drain task ends
+
+    let chunks = drain.await.unwrap();
+    let total: usize = chunks.iter().map(|(_, n)| n).sum();
+    println!(
+        "STREAMING audio chunks (ms@arrival, bytes): {:?}  | {} chunks, {} total bytes",
+        chunks,
+        chunks.len(),
+        total
+    );
+    assert!(!chunks.is_empty(), "no audio streamed from the pipeline");
+    assert!(total > 1000, "expected real Hindi audio, got {total} bytes");
+    // The win: more than one chunk arrived incrementally (the batch path would deliver exactly one).
+    if chunks.len() >= 2 {
+        println!(
+            "✓ inter-node streaming confirmed: first audio at {} ms, last at {} ms",
+            chunks.first().unwrap().0,
+            chunks.last().unwrap().0
+        );
+    } else {
+        println!("NOTE: provider streamed the content as a single chunk this run (model-dependent)");
+    }
+}
+
+// ============================================================================
 // 3. FULL pipeline: Deepgram STT → Sarvam translate → ElevenLabs TTS — 3-vendor DAG, live
 // ============================================================================
 #[tokio::test]

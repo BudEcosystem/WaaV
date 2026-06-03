@@ -14,12 +14,12 @@ use std::time::{Duration, Instant};
 
 use petgraph::graph::NodeIndex;
 use rhai::{Dynamic, Scope};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use super::compiler::CompiledDAG;
-use super::context::DAGContext;
+use super::context::{DAGContext, DagOutput};
 use super::error::{DAGError, DAGResult};
 use super::nodes::DAGData;
 use super::routing::create_rhai_engine;
@@ -132,6 +132,125 @@ impl DAGExecutor {
         Self::record_outcome(dag, &result, duration);
 
         result
+    }
+
+    /// Walk the linear chain from `start` toward an exit. A chain qualifies only while each node
+    /// has exactly ONE outgoing edge and its successor exactly one incoming edge; it terminates at
+    /// a node with no outgoing edges. Returns `None` on any branch/join/cycle (the caller then
+    /// falls back to batch execution).
+    fn linear_chain(&self, dag: &CompiledDAG, start: NodeIndex) -> Option<Vec<NodeIndex>> {
+        let mut chain = vec![start];
+        let mut cur = start;
+        loop {
+            let outs = dag.outgoing_edges(cur);
+            match outs.len() {
+                0 => return Some(chain),
+                1 => {
+                    let (next, _edge) = outs[0];
+                    if dag.incoming_edges(next).len() != 1 || chain.contains(&next) {
+                        return None;
+                    }
+                    chain.push(next);
+                    cur = next;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Run a LINEAR chain from `start_node_id` in STREAMING mode (the streaming data-plane).
+    ///
+    /// Adjacent nodes are connected by bounded channels and run CONCURRENTLY, so a downstream node
+    /// (e.g. TTS) starts producing as soon as an upstream node (e.g. an LLM) emits its first chunk
+    /// — slashing time-to-first-output for real-time voice. Each node runs
+    /// [`DAGNode::execute_streaming`]; non-streaming nodes use the default one-in/one-out adapter,
+    /// so a chain like `stt(batch) → translate(stream) → tts(stream)` works seamlessly. The
+    /// terminal node's outputs are forwarded to `ctx.output_tx` (the client sink) as they arrive.
+    ///
+    /// If the subgraph branches/joins/routes (not linear), this transparently falls back to the
+    /// batch [`execute_from`](Self::execute_from).
+    pub async fn execute_streaming_from(
+        &self,
+        dag: &CompiledDAG,
+        start_node_id: &str,
+        input: DAGData,
+        ctx: &mut DAGContext,
+    ) -> DAGResult<()> {
+        let start = *dag
+            .node_index
+            .get(start_node_id)
+            .ok_or(DAGError::InvalidStartNode)?;
+        let chain = match self.linear_chain(dag, start) {
+            Some(c) => c,
+            None => {
+                self.execute_from(dag, start_node_id, input, ctx).await?;
+                return Ok(());
+            }
+        };
+
+        const CHAN_BUF: usize = 64;
+        // Feed the single input into node 0, then close its input so the chain drains + terminates.
+        let (in_tx, mut prev_rx) = mpsc::channel::<DAGData>(CHAN_BUF);
+        in_tx
+            .send(input)
+            .await
+            .map_err(|_| DAGError::NodeExecutionError {
+                node_id: start_node_id.to_string(),
+                error: "streaming input channel closed".into(),
+            })?;
+        drop(in_tx);
+
+        let mut handles = Vec::with_capacity(chain.len());
+        for &node_idx in &chain {
+            let node = Arc::clone(&dag.graph[node_idx].node);
+            let node_id = dag.graph[node_idx].id.clone();
+            let (out_tx, out_rx) = mpsc::channel::<DAGData>(CHAN_BUF);
+            let rx = std::mem::replace(&mut prev_rx, out_rx);
+            // Each concurrent node gets its own context; the client sink is cleared so ONLY the
+            // terminal-output drain below delivers (no double-delivery), but the cancel token is
+            // shared for barge-in.
+            let mut node_ctx = ctx.clone_for_branch();
+            node_ctx.output_tx = None;
+            handles.push(tokio::spawn(async move {
+                node.execute_streaming(rx, &mut node_ctx, out_tx)
+                    .await
+                    .map_err(|e| (node_id, e))
+            }));
+        }
+
+        // `prev_rx` is the terminal node's output: forward chunks to the client sink as produced.
+        let output_tx = ctx.output_tx.clone();
+        while let Some(chunk) = prev_rx.recv().await {
+            if let Some(sink) = &output_tx {
+                let out = match chunk {
+                    DAGData::TTSAudio(a) => Some(DagOutput::Audio(a)),
+                    DAGData::Text(t) => Some(DagOutput::Text(t)),
+                    _ => None,
+                };
+                if let Some(o) = out {
+                    let _ = sink.send(o).await;
+                }
+            }
+        }
+
+        for h in handles {
+            match h.await {
+                Ok(Ok(())) => {}
+                Ok(Err((node_id, e))) => {
+                    return Err(DAGError::NodeExecutionError {
+                        node_id,
+                        error: e.to_string(),
+                    });
+                }
+                Err(join) => {
+                    return Err(DAGError::NodeExecutionError {
+                        node_id: "<join>".into(),
+                        error: format!("streaming node task failed: {join}"),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Record success/failure/cancellation metrics + tracing for a finished run.

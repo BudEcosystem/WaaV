@@ -18,10 +18,28 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
+
 use super::{DAGData, DAGNode, NodeCapability};
-use crate::core::llm::{LlmClient, LlmClientConfig, LlmError};
+use crate::core::llm::{LlmClient, LlmClientConfig, LlmError, TokenCallback};
 use crate::dag::context::DAGContext;
 use crate::dag::error::{DAGError, DAGResult};
+
+/// Drain and return all COMPLETE sentences from `buf` (everything up to and including the LAST
+/// sentence terminator), leaving the trailing partial sentence behind. Terminators cover ASCII
+/// `.!?`, the Devanagari danda `।`, and a newline — so the LLM streaming path can flush a sentence
+/// to TTS the moment it finishes rather than waiting for the whole completion.
+fn drain_complete_sentences(buf: &mut String) -> Option<String> {
+    const TERMS: &[char] = &['.', '!', '?', '।', '\n'];
+    let mut last_end: Option<usize> = None;
+    for (i, c) in buf.char_indices() {
+        if TERMS.contains(&c) {
+            last_end = Some(i + c.len_utf8());
+        }
+    }
+    let end = last_end?;
+    Some(buf.drain(..end).collect())
+}
 
 // Re-export the OpenAI-compatible wire types from the shared core so the DAG's
 // public surface (`nodes::llm::{ChatMessage, ResponseFormat, ToolDefinition, ...}`)
@@ -341,6 +359,89 @@ impl DAGNode for LlmEndpointNode {
         Ok(DAGData::Json(response_json))
     }
 
+    /// Streaming override: stream LLM tokens and emit each COMPLETE sentence as a `DAGData::Text`
+    /// chunk the moment it finishes — so a downstream TTS node can start speaking sentence 1 while
+    /// the model is still generating sentence 2 (the core real-time win). Requires the node's
+    /// client to be in streaming mode (`streaming: true`); otherwise the provider returns the whole
+    /// completion at once and this emits it as a single chunk. Honors `ctx.cancel_token` for barge-in.
+    async fn execute_streaming(
+        &self,
+        mut inputs: mpsc::Receiver<DAGData>,
+        ctx: &mut DAGContext,
+        outputs: mpsc::Sender<DAGData>,
+    ) -> DAGResult<()> {
+        while let Some(input) = inputs.recv().await {
+            if ctx.cancel_token.is_cancelled() {
+                break;
+            }
+            let input_text = match &input {
+                DAGData::Text(s) => s.clone(),
+                DAGData::STTResult(r) => r.transcript.clone(),
+                DAGData::Empty => continue,
+                other => {
+                    return Err(DAGError::UnsupportedDataType {
+                        expected: "text".to_string(),
+                        actual: other.type_name().to_string(),
+                    });
+                }
+            };
+            if input_text.trim().is_empty() {
+                continue;
+            }
+
+            // Bridge the synchronous per-token callback to this async loop.
+            let (tok_tx, mut tok_rx) = mpsc::unbounded_channel::<String>();
+            let on_token: TokenCallback = Arc::new(move |t: &str| {
+                let _ = tok_tx.send(t.to_string());
+            });
+
+            let mut buf = String::new();
+            let completion = self.client.complete(
+                &ctx.stream_id,
+                &input_text,
+                ctx.api_key.as_deref(),
+                &ctx.cancel_token,
+                Some(on_token),
+            );
+            tokio::pin!(completion);
+
+            // Drain tokens CONCURRENTLY with the completion: flush each finished sentence asap.
+            let completion_result = loop {
+                tokio::select! {
+                    res = &mut completion => break res,
+                    Some(tok) = tok_rx.recv() => {
+                        buf.push_str(&tok);
+                        if let Some(sentence) = drain_complete_sentences(&mut buf) {
+                            if !sentence.trim().is_empty()
+                                && outputs.send(DAGData::Text(sentence)).await.is_err()
+                            {
+                                return Ok(()); // downstream gone
+                            }
+                        }
+                    }
+                }
+            };
+            // Catch any tokens that landed between the last poll and completion.
+            while let Ok(tok) = tok_rx.try_recv() {
+                buf.push_str(&tok);
+            }
+            match completion_result {
+                Ok(response) => {
+                    // Non-streaming providers deliver content only in the final response, not as
+                    // deltas — fall back to the full content so the chain still produces output.
+                    if buf.trim().is_empty() && !response.content.is_empty() {
+                        buf = response.content;
+                    }
+                }
+                Err(e) => return Err(map_llm_error(e)),
+            }
+            if !buf.trim().is_empty() {
+                let _ = outputs.send(DAGData::Text(buf)).await;
+            }
+        }
+        Ok(())
+    }
+
     fn clone_boxed(&self) -> Arc<dyn DAGNode> {
         Arc::new(self.clone())
     }
@@ -361,6 +462,29 @@ mod tests {
 
         let assistant = ChatMessage::assistant("Hi there!");
         assert_eq!(assistant.role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn drain_complete_sentences_flushes_finished_only() {
+        // No terminator yet → nothing to flush, buffer untouched.
+        let mut b = "the quick brown".to_string();
+        assert_eq!(super::drain_complete_sentences(&mut b), None);
+        assert_eq!(b, "the quick brown");
+
+        // One finished sentence + a partial: flush the finished, keep the partial.
+        let mut b = "Hello there. How are y".to_string();
+        assert_eq!(super::drain_complete_sentences(&mut b).as_deref(), Some("Hello there."));
+        assert_eq!(b, " How are y");
+
+        // Devanagari danda terminator (Hindi).
+        let mut b = "नमस्ते। आप".to_string();
+        assert_eq!(super::drain_complete_sentences(&mut b).as_deref(), Some("नमस्ते।"));
+        assert_eq!(b, " आप");
+
+        // Multiple finished sentences flush together (up to the LAST terminator).
+        let mut b = "One. Two! Three? tail".to_string();
+        assert_eq!(super::drain_complete_sentences(&mut b).as_deref(), Some("One. Two! Three?"));
+        assert_eq!(b, " tail");
     }
 
     #[test]
