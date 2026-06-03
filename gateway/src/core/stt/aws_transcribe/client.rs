@@ -48,6 +48,7 @@
 //! }
 //! ```
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,6 +72,11 @@ use super::config::{
 };
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
+};
+use crate::core::websocket::ReconnectionConfig;
+use crate::core::websocket::reconnectable_stream::{
+    ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
+    WsTransport,
 };
 
 use tracing::{debug, error, info, warn};
@@ -131,6 +137,121 @@ const CONNECTION_TIMEOUT_SECS: u64 = 30;
 const AUDIO_CHANNEL_BUFFER_SIZE: usize = 32;
 
 // =============================================================================
+// Supervised transport (W-D1 production adoption)
+// =============================================================================
+
+/// A [`WsTransport`] that adapts Amazon Transcribe's streaming result loop to the generic
+/// [`ReconnectableStream`] supervisor (W-D1 fleet adoption). One is built per (re)connect by the
+/// supervisor's `connect` closure.
+///
+/// Unlike WebSocket providers, Amazon Transcribe streaming is a single bidirectional HTTP/2
+/// request: the featured session (language, diarization, redaction, partials, …) is baked into the
+/// connect `StartStreamTranscriptionInput`, so [`restore_session`](WsTransport::restore_session) is
+/// a no-op — every (re)connect dials a fresh, fully-featured request. [`run`](WsTransport::run) IS
+/// the original transcript-result receiver loop, now returning a [`ReconnectOutcome`] so a transport
+/// drop reconnects instead of ending the session.
+struct AwsTranscribeTransport {
+    /// This connection's OWN result receiver (owned outright, dropped with the transport).
+    /// (`event_receiver` is a private module; the public re-export is via `primitives::event_stream`.)
+    result_stream: aws_sdk_transcribestreaming::primitives::event_stream::EventReceiver<
+        aws_sdk_transcribestreaming::types::TranscriptResultStream,
+        aws_sdk_transcribestreaming::types::error::TranscriptResultStreamError,
+    >,
+    result_tx: mpsc::Sender<STTResult>,
+    error_tx: mpsc::Sender<STTError>,
+}
+
+#[async_trait]
+impl WsTransport for AwsTranscribeTransport {
+    async fn restore_session(&mut self) -> Result<(), RestoreError> {
+        // The full featured session is baked into the connect `StartStreamTranscriptionInput`, so a
+        // (re)connect already dials a fully-featured request — nothing to re-send here.
+        Ok(())
+    }
+
+    async fn run(&mut self) -> ReconnectOutcome {
+        loop {
+            match timeout(STREAM_MESSAGE_TIMEOUT, self.result_stream.recv()).await {
+                Ok(Ok(Some(event))) => {
+                    match event {
+                        TranscriptResultStream::TranscriptEvent(transcript_event) => {
+                            if let Some(transcript) = transcript_event.transcript {
+                                for result in transcript.results.unwrap_or_default() {
+                                    // Get the best transcription
+                                    if let Some(alternatives) = result.alternatives
+                                        && let Some(alt) = alternatives.first()
+                                        && let Some(transcript_text) = &alt.transcript
+                                    {
+                                        // Skip empty transcripts
+                                        if transcript_text.trim().is_empty() {
+                                            continue;
+                                        }
+
+                                        let is_partial = result.is_partial;
+
+                                        // Calculate confidence from items
+                                        let confidence = if let Some(items) = &alt.items {
+                                            let confidences: Vec<f64> = items
+                                                .iter()
+                                                .filter_map(|item| item.confidence)
+                                                .collect();
+                                            if !confidences.is_empty() {
+                                                let sum: f64 = confidences.iter().sum();
+                                                (sum / confidences.len() as f64) as f32
+                                            } else {
+                                                0.0
+                                            }
+                                        } else {
+                                            0.0
+                                        };
+
+                                        let stt_result = STTResult::new(
+                                            transcript_text.clone(),
+                                            !is_partial,
+                                            !is_partial, // is_speech_final same as is_final for Transcribe
+                                            confidence,
+                                        );
+
+                                        if self.result_tx.try_send(stt_result).is_err() {
+                                            warn!("Failed to send STT result - channel closed");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            debug!("Received unknown event type from Transcribe");
+                        }
+                    }
+                }
+                Ok(Ok(None)) => {
+                    // The input audio stream ended (the client dropped the sender). On an INTENTIONAL
+                    // disconnect the supervisor's loop-top/post-run guard observes the shared flag and
+                    // completes WITHOUT reconnecting; otherwise this is a mid-stream drop to recover.
+                    return ReconnectOutcome::Reconnectable(StreamError::new(
+                        "Amazon Transcribe stream ended",
+                    ));
+                }
+                Ok(Err(e)) => {
+                    let _ = self.error_tx.try_send(STTError::ProviderError(format!(
+                        "Amazon Transcribe stream error: {e}"
+                    )));
+                    return ReconnectOutcome::Reconnectable(StreamError::new(format!(
+                        "stream error: {e}"
+                    )));
+                }
+                Err(_elapsed) => {
+                    let _ = self.error_tx.try_send(STTError::NetworkError(
+                        "Transcribe idle timeout - no message for 60 seconds".into(),
+                    ));
+                    return ReconnectOutcome::Reconnectable(StreamError::new("idle timeout"));
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Amazon Transcribe STT Client
 // =============================================================================
 
@@ -148,10 +269,22 @@ pub struct AwsTranscribeSTT {
     /// State change notification.
     state_notify: Arc<Notify>,
 
-    /// Audio sender channel (bounded for backpressure).
-    audio_tx: Option<mpsc::Sender<Bytes>>,
+    /// Shared audio sender SLOT. Each (re)connect installs a FRESH `mpsc::Sender<Bytes>` here,
+    /// dropping the previous one (which closes the previous connection's receiver → its audio input
+    /// stream ends → the old HTTP/2 request finalizes via channel-close, NOT via receiver-drop —
+    /// sidestepping the AWS SDK's input-driving-task-vs-result-receiver-drop uncertainty). The
+    /// receiver lives privately inside each transport's `async_stream`, so there is no shared
+    /// `Mutex<Receiver>` to deadlock on across reconnect.
+    audio_tx_slot: Arc<RwLock<Option<mpsc::Sender<Bytes>>>>,
 
-    /// Shutdown signal sender.
+    /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
+    /// `connect()`, set in `disconnect()` before dropping the active sender, so a client close
+    /// racing a server-side close can never trigger a spurious reconnect (the supervisor's loop-top
+    /// guard observes this same `Arc<AtomicBool>`).
+    intentional_disconnect: Arc<AtomicBool>,
+
+    /// Shutdown signal sender (legacy; the channel-swap drop of `audio_tx_slot` is now the shutdown
+    /// mechanism — this is fired in `disconnect()`/`Drop` but is no longer load-bearing).
     shutdown_tx: Option<oneshot::Sender<()>>,
 
     /// Result channel sender for internal forwarding.
@@ -180,6 +313,13 @@ pub struct AwsTranscribeSTT {
 
     /// Current session ID (if available).
     session_id: Arc<RwLock<Option<String>>>,
+
+    /// Shared, process-global resilience handles (W-D2): the single reconnect governor + this
+    /// provider's shared circuit breaker, injected by the VoiceManager from CoreState and driven by
+    /// the generic [`ReconnectableStream`](crate::core::websocket::ReconnectableStream) supervisor.
+    /// `None` before `set_resilience` (a direct unit-test construction) → the supervisor uses its
+    /// own per-session governor/breaker default.
+    resilience: Option<crate::core::resilience::ResilienceHandles>,
 }
 
 impl AwsTranscribeSTT {
@@ -194,7 +334,8 @@ impl AwsTranscribeSTT {
             config: Some(config),
             state: ConnectionState::Disconnected,
             state_notify: Arc::new(Notify::new()),
-            audio_tx: None,
+            audio_tx_slot: Arc::new(RwLock::new(None)),
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             shutdown_tx: None,
             result_tx: None,
             error_tx: None,
@@ -205,6 +346,7 @@ impl AwsTranscribeSTT {
             error_callback: Arc::new(Mutex::new(None)),
             is_connected: Arc::new(AtomicBool::new(false)),
             session_id: Arc::new(RwLock::new(None)),
+            resilience: None,
         })
     }
 
@@ -387,25 +529,29 @@ impl AwsTranscribeSTT {
 
     /// Start the transcription stream connection.
     async fn start_connection(&mut self, config: AwsTranscribeSTTConfig) -> Result<(), STTError> {
-        // Create channels for communication
-        let (audio_tx, mut audio_rx) = mpsc::channel::<Bytes>(AUDIO_CHANNEL_BUFFER_SIZE);
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         // Bounded channels for backpressure - 256 should handle bursts while preventing memory exhaustion
         let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
         let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
+        // Resolves on the FIRST successful (re)connect only (Arc<Mutex<Option<..>>> so reconnect
+        // attempts don't re-fire it); resolves with Err only if the supervisor exits before ever
+        // connecting (exhausted / circuit-open on the very first dial).
         let (connected_tx, connected_rx) = oneshot::channel::<Result<(), STTError>>();
+        let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
 
-        // Store channels
-        self.audio_tx = Some(audio_tx);
-        self.shutdown_tx = Some(shutdown_tx);
+        // Store channels (the slot is filled per (re)connect by the connect closure).
         self.result_tx = Some(result_tx.clone());
         self.error_tx = Some(error_tx.clone());
+
+        // Fresh session: clear any intent left over from a prior disconnect so the supervisor does
+        // not immediately complete.
+        self.intentional_disconnect.store(false, Ordering::SeqCst);
 
         // Clone data needed for the connection task
         let region_str = config.region.as_str().to_string();
 
         let is_connected = self.is_connected.clone();
         let session_id_storage = self.session_id.clone();
+        let audio_tx_slot = Arc::clone(&self.audio_tx_slot);
 
         let aws_access_key_id = config.aws_access_key_id.clone();
         let aws_secret_access_key = config.aws_secret_access_key.clone();
@@ -414,9 +560,18 @@ impl AwsTranscribeSTT {
         // (the single source of truth shared with the wire-level tests).
         let request_config = config.clone();
 
-        // Spawn the connection task
+        // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor with
+        // the shared process-global handles from CoreState (W-D1/W-D2 fleet adoption). When no
+        // handles were injected, the supervisor uses its own per-session governor/breaker default.
+        let reconnection = ReconnectionConfig::aggressive();
+        let resilience = self.resilience.clone();
+        let disconnect_flag = Arc::clone(&self.intentional_disconnect);
+
+        // Spawn ONE supervisor task: it builds the AWS client ONCE, then the supervisor's connect
+        // closure dials a fresh HTTP/2 streaming request on every (re)connect, each owning its own
+        // audio receiver (channel-swap — see `audio_tx_slot` doc).
         let connection_handle = tokio::spawn(async move {
-            // Build AWS config
+            // Build AWS config + client ONCE (async cred load); reused across reconnect attempts.
             let aws_config = if aws_access_key_id.is_some() && aws_secret_access_key.is_some() {
                 // Use explicit credentials
                 let credentials = aws_credential_types::Credentials::new(
@@ -442,150 +597,102 @@ impl AwsTranscribeSTT {
 
             let client = TranscribeClient::new(&aws_config);
 
-            // Build the streaming request via the single shared param-wiring helper, so every
-            // configured feature reaches the actual SDK `StartStreamTranscriptionInput` (and thus
-            // the `x-amzn-transcribe-*` request headers) — no per-field drift between the live
-            // path and the wire-level tests.
-            let input_builder = Self::apply_request_params(
-                &request_config,
-                aws_sdk_transcribestreaming::operation::start_stream_transcription::StartStreamTranscriptionInput::builder(),
-            );
-
-            // Create the audio stream from incoming chunks
-            let audio_stream = async_stream::stream! {
-                loop {
-                    tokio::select! {
-                        Some(audio_data) = audio_rx.recv() => {
-                            // AWS SDK Blob requires Vec<u8>, so a copy is unavoidable here.
-                            // The upstream send_audio already uses Bytes for zero-copy until this point.
-                            // TODO: Monitor AWS SDK updates for Blob to accept &[u8] or Bytes directly.
-                            let audio_event = AudioEvent::builder()
-                                .audio_chunk(Blob::new(audio_data.to_vec()))
-                                .build();
-                            yield Ok(AudioStream::AudioEvent(audio_event));
-                        }
-                        _ = &mut shutdown_rx => {
-                            debug!("Shutdown signal received, closing audio stream");
-                            break;
-                        }
-                    }
-                }
-            };
-
-            // Start the transcription stream (attach audio, send the prebuilt input).
-            match input_builder
-                .audio_stream(audio_stream.into())
-                .send_with(&client)
-                .await
-            {
-                Ok(output) => {
-                    // Store session ID if provided
-                    if let Some(sid) = output.session_id() {
-                        *session_id_storage.write().await = Some(sid.to_string());
-                        info!("Amazon Transcribe session started: {}", sid);
-                    }
-
-                    is_connected.store(true, Ordering::Release);
-                    let _ = connected_tx.send(Ok(()));
-
-                    // Process the transcript result stream with idle timeout
-                    let mut result_stream = output.transcript_result_stream;
-                    loop {
-                        match timeout(STREAM_MESSAGE_TIMEOUT, result_stream.recv()).await {
-                            Ok(Ok(Some(event))) => {
-                                match event {
-                                    TranscriptResultStream::TranscriptEvent(transcript_event) => {
-                                        if let Some(transcript) = transcript_event.transcript {
-                                            for result in transcript.results.unwrap_or_default() {
-                                                // Get the best transcription
-                                                if let Some(alternatives) = result.alternatives
-                                                    && let Some(alt) = alternatives.first()
-                                                    && let Some(transcript_text) = &alt.transcript
-                                                {
-                                                    // Skip empty transcripts
-                                                    if transcript_text.trim().is_empty() {
-                                                        continue;
-                                                    }
-
-                                                    let is_partial = result.is_partial;
-
-                                                    // Calculate confidence from items
-                                                    let confidence = if let Some(items) = &alt.items
-                                                    {
-                                                        let confidences: Vec<f64> = items
-                                                            .iter()
-                                                            .filter_map(|item| item.confidence)
-                                                            .collect();
-                                                        if !confidences.is_empty() {
-                                                            let sum: f64 = confidences.iter().sum();
-                                                            (sum / confidences.len() as f64) as f32
-                                                        } else {
-                                                            0.0
-                                                        }
-                                                    } else {
-                                                        0.0
-                                                    };
-
-                                                    let stt_result = STTResult::new(
-                                                        transcript_text.clone(),
-                                                        !is_partial,
-                                                        !is_partial, // is_speech_final same as is_final for Transcribe
-                                                        confidence,
-                                                    );
-
-                                                    if result_tx.try_send(stt_result).is_err() {
-                                                        warn!(
-                                                            "Failed to send STT result - channel closed"
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        debug!("Received unknown event type from Transcribe");
-                                    }
-                                }
-                            }
-                            Ok(Ok(None)) => {
-                                info!("Transcribe stream ended");
-                                break;
-                            }
-                            Ok(Err(e)) => {
-                                let stt_error = STTError::ProviderError(format!(
-                                    "Amazon Transcribe stream error: {}",
-                                    e
-                                ));
-                                error!("{}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
-                            }
-                            Err(_elapsed) => {
-                                // Idle timeout - no message received for 60s
-                                let stt_error = STTError::NetworkError(
-                                    "Transcribe stream idle timeout - no message for 60 seconds"
-                                        .into(),
-                                );
-                                error!("AWS Transcribe idle timeout: {}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    let stt_error = STTError::ConnectionFailed(format!(
-                        "Failed to start Amazon Transcribe stream: {}",
-                        e
-                    ));
-                    error!("{}", stt_error);
-                    let _ = connected_tx.send(Err(stt_error.clone()));
-                    let _ = error_tx.try_send(stt_error);
-                }
+            let supervisor = match resilience {
+                Some(r) => ReconnectableStream::with_breaker_and_governor(
+                    ReconnectableStreamConfig::new("aws_transcribe", reconnection),
+                    r.breaker,
+                    (*r.governor).clone(),
+                ),
+                None => ReconnectableStream::new(ReconnectableStreamConfig::new(
+                    "aws_transcribe",
+                    reconnection,
+                )),
             }
+            .with_disconnect_flag(disconnect_flag);
+
+            let exit = supervisor
+                .run(|| {
+                    let client = client.clone();
+                    let request_config = request_config.clone();
+                    let audio_tx_slot = Arc::clone(&audio_tx_slot);
+                    let session_id_storage = Arc::clone(&session_id_storage);
+                    let is_connected = is_connected.clone();
+                    let connected_tx = Arc::clone(&connected_tx);
+                    let result_tx = result_tx.clone();
+                    let error_tx = error_tx.clone();
+                    async move {
+                        // Channel-swap: each (re)connect owns a FRESH receiver. Installing the new
+                        // sender here DROPS the previous one, closing the previous connection's
+                        // receiver → its audio stream ends → the old HTTP/2 request finalizes via
+                        // channel-close (not via receiver-drop) — sidestepping the SDK's
+                        // input-task-vs-result-drop uncertainty. No Mutex, no held guard.
+                        let (audio_tx, mut audio_rx) =
+                            mpsc::channel::<Bytes>(AUDIO_CHANNEL_BUFFER_SIZE);
+                        *audio_tx_slot.write().await = Some(audio_tx);
+
+                        // This connection's audio INPUT stream owns its receiver outright and is
+                        // dropped with this transport.
+                        let audio_stream = async_stream::stream! {
+                            while let Some(audio_data) = audio_rx.recv().await {
+                                // AWS SDK Blob requires Vec<u8>, so a copy is unavoidable here.
+                                // The upstream send_audio already uses Bytes for zero-copy until this point.
+                                let audio_event = AudioEvent::builder()
+                                    .audio_chunk(Blob::new(audio_data.to_vec()))
+                                    .build();
+                                yield Ok(AudioStream::AudioEvent(audio_event));
+                            }
+                        };
+
+                        // Build the streaming request via the single shared param-wiring helper, so
+                        // every configured feature reaches the actual SDK
+                        // `StartStreamTranscriptionInput` (and thus the `x-amzn-transcribe-*`
+                        // request headers) — no per-field drift between the live path and the
+                        // wire-level tests.
+                        let input_builder = AwsTranscribeSTT::apply_request_params(
+                            &request_config,
+                            aws_sdk_transcribestreaming::operation::start_stream_transcription::StartStreamTranscriptionInput::builder(),
+                        );
+
+                        let output = input_builder
+                            .audio_stream(audio_stream.into())
+                            .send_with(&client)
+                            .await
+                            .map_err(|e| {
+                                StreamError::new(format!(
+                                    "Failed to start Amazon Transcribe stream: {e}"
+                                ))
+                            })?;
+
+                        // Store session ID if provided
+                        if let Some(sid) = output.session_id() {
+                            *session_id_storage.write().await = Some(sid.to_string());
+                            info!("Amazon Transcribe session started: {}", sid);
+                        }
+
+                        is_connected.store(true, Ordering::Release);
+                        // Resolve the waiting connect() exactly once (first connect only).
+                        if let Some(tx) = connected_tx.lock().await.take() {
+                            let _ = tx.send(Ok(()));
+                        }
+
+                        Ok(AwsTranscribeTransport {
+                            result_stream: output.transcript_result_stream,
+                            result_tx,
+                            error_tx,
+                        })
+                    }
+                })
+                .await;
 
             is_connected.store(false, Ordering::Release);
-            info!("Amazon Transcribe connection closed");
+            // If we never connected (exhausted/circuit-open on the very first dial), the connect
+            // signal is still pending — resolve it as a failure so connect() doesn't hang.
+            if let Some(tx) = connected_tx.lock().await.take() {
+                let _ = tx.send(Err(STTError::ConnectionFailed(format!(
+                    "Amazon Transcribe supervisor exited: {exit:?}"
+                ))));
+            }
+            info!("Amazon Transcribe connection closed (supervisor exit: {exit:?})");
         });
 
         self.connection_handle = Some(connection_handle);
@@ -658,7 +765,8 @@ impl Default for AwsTranscribeSTT {
             config: None,
             state: ConnectionState::Disconnected,
             state_notify: Arc::new(Notify::new()),
-            audio_tx: None,
+            audio_tx_slot: Arc::new(RwLock::new(None)),
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             shutdown_tx: None,
             result_tx: None,
             error_tx: None,
@@ -669,6 +777,7 @@ impl Default for AwsTranscribeSTT {
             error_callback: Arc::new(Mutex::new(None)),
             is_connected: Arc::new(AtomicBool::new(false)),
             session_id: Arc::new(RwLock::new(None)),
+            resilience: None,
         }
     }
 }
@@ -733,12 +842,21 @@ impl BaseSTT for AwsTranscribeSTT {
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
-        // Send shutdown signal
+        // Record the intent BEFORE any guard so the supervisor sees it even if the transport's
+        // run() just reported a reconnectable drop (the disconnect-vs-stream-end race).
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+
+        // Drop the active sender: ends this connection's audio input stream → the HTTP/2 request
+        // EOS-finalizes → run() returns Reconnectable → the supervisor sees the intentional flag
+        // and Completes WITHOUT reconnecting. This is now the shutdown mechanism.
+        *self.audio_tx_slot.write().await = None;
+
+        // Legacy shutdown signal (no longer load-bearing; fired for harmlessness).
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
         }
 
-        // Wait for connection task to finish
+        // Wait for the supervisor task to finish
         if let Some(handle) = self.connection_handle.take() {
             let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
         }
@@ -755,7 +873,6 @@ impl BaseSTT for AwsTranscribeSTT {
         }
 
         // Clean up channels and state
-        self.audio_tx = None;
         self.result_tx = None;
         self.error_tx = None;
         *self.result_callback.lock().await = None;
@@ -773,7 +890,6 @@ impl BaseSTT for AwsTranscribeSTT {
 
     fn is_ready(&self) -> bool {
         matches!(self.state, ConnectionState::Connected)
-            && self.audio_tx.is_some()
             && self.is_connected.load(Ordering::Acquire)
     }
 
@@ -793,19 +909,25 @@ impl BaseSTT for AwsTranscribeSTT {
             )));
         }
 
-        if let Some(audio_tx) = &self.audio_tx {
-            let data_len = audio_data.len();
-
-            // Send audio data with backpressure handling (zero-copy via Bytes)
-            audio_tx
-                .send(audio_data)
-                .await
-                .map_err(|e| STTError::NetworkError(format!("Failed to send audio data: {}", e)))?;
-
-            debug!("Sent {} bytes of audio data to Amazon Transcribe", data_len);
+        // Read the current sender from the slot. During the brief reconnect window the slot may be
+        // None or its sender closed → treat a send failure as a dropped chunk (losing in-flight
+        // audio across a reconnect is inherent and expected, matching the other providers).
+        let slot = self.audio_tx_slot.read().await;
+        match slot.as_ref() {
+            Some(tx) => {
+                let data_len = audio_data.len();
+                if tx.try_send(audio_data).is_err() {
+                    debug!("aws_transcribe: audio chunk dropped (reconnecting or backpressure)");
+                } else {
+                    debug!("Sent {} bytes of audio data to Amazon Transcribe", data_len);
+                }
+                Ok(())
+            }
+            None => {
+                debug!("aws_transcribe: no active audio sender (reconnect window), chunk dropped");
+                Ok(())
+            }
         }
-
-        Ok(())
     }
 
     async fn on_result(&mut self, callback: STTResultCallback) -> Result<(), STTError> {
@@ -866,13 +988,26 @@ impl BaseSTT for AwsTranscribeSTT {
     fn get_provider_info(&self) -> &'static str {
         "Amazon Transcribe Streaming"
     }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared, process-global handles so `start_connection` drives the generic
+        // ReconnectableStream supervisor with them — every Amazon Transcribe session trips the same
+        // breaker and shares the one process-wide reconnect cap (W-D2).
+        self.resilience = Some(resilience);
+    }
 }
 
 impl Drop for AwsTranscribeSTT {
     fn drop(&mut self) {
-        // Send shutdown signal if still connected
+        // Record intent so a still-running supervisor never reconnects after we're gone.
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+        // Legacy shutdown signal (harmless).
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
+        }
+        // Tear down the supervisor task (a sync Drop cannot async-clear the audio slot).
+        if let Some(handle) = self.connection_handle.take() {
+            handle.abort();
         }
     }
 }
@@ -1211,5 +1346,50 @@ mod tests {
 
         let stt = AwsTranscribeSTT::new(config).unwrap();
         assert!(stt.get_session_id().await.is_none());
+    }
+
+    // W-D1: disconnect() must record intent on the supervisor-shared flag so a client close racing
+    // a server-side close (here: the input-stream-ended → Reconnectable race) can never trigger a
+    // spurious reconnect (the supervisor's loop-top guard observes this same `Arc<AtomicBool>`).
+    #[tokio::test]
+    async fn disconnect_sets_intentional_flag_for_supervisor() {
+        let config = STTConfig {
+            provider: "aws-transcribe".to_string(),
+            api_key: String::new(),
+            language: "en-US".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "pcm".to_string(),
+            model: String::new(),
+        };
+        let mut stt = AwsTranscribeSTT::new(config).unwrap();
+        assert!(!stt.intentional_disconnect.load(Ordering::SeqCst));
+        stt.disconnect().await.unwrap();
+        assert!(
+            stt.intentional_disconnect.load(Ordering::SeqCst),
+            "disconnect() must set the supervisor-shared intentional-disconnect flag",
+        );
+    }
+
+    // The supervised provider still constructs cleanly and reports not-ready before connect (the
+    // transport-level `run` mapping of idle-timeout/stream-end to Reconnectable is exercised only
+    // against a live AWS HTTP/2 stream, so we keep coverage here at the construction/readiness
+    // boundary rather than inventing a fake AWS stream).
+    #[tokio::test]
+    async fn provider_constructs_and_is_not_ready_before_connect() {
+        let config = STTConfig {
+            provider: "aws-transcribe".to_string(),
+            api_key: String::new(),
+            language: "en-US".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "pcm".to_string(),
+            model: String::new(),
+        };
+        let stt = AwsTranscribeSTT::new(config).unwrap();
+        assert!(!stt.is_ready());
+        assert!(!stt.is_connected.load(Ordering::Acquire));
     }
 }
