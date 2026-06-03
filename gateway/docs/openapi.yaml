@@ -2129,6 +2129,15 @@ components:
           - boolean
           - 'null'
           description: Provider "smart formatting" (dates, numbers, etc.).
+        speech_begin_event:
+          type:
+          - boolean
+          - 'null'
+          description: |-
+            Emit a discrete "speech started" event when the recognizer first detects speech
+            (IBM Watson `speech_begin_event`). Distinct from `vad_events` (which is the canonical
+            flag for continuous voice-activity/endpointing events): this requests the single
+            begin-of-speech marker IBM emits as a `speaker_begin`/`speech_begin` notification.
         utterance_end_ms:
           type:
           - integer
@@ -2343,6 +2352,17 @@ components:
           - string
           - 'null'
           description: Emotion / delivery (e.g. "happy", "cheerful"); maps to provider emotion controls.
+        include_timestamp_types:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+          description: |-
+            Request specific timestamp granularities in the response (Hume `include_timestamp_types`:
+            `"word"` and/or `"phoneme"`). Canonical superset of the boolean `word_timestamps` flag for
+            providers that expose per-type timestamp selection. Pure metadata request: does NOT change
+            the synthesized audio (so providers must NOT fold it into the audio cache key).
         instructions:
           type:
           - string
@@ -2368,6 +2388,26 @@ components:
           - 'null'
           format: float
           description: Pitch adjustment.
+        pitch_percentage:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            Pitch adjustment as a signed percentage delta from the per-voice default
+            (IBM Watson `pitch_percentage`: 0 = normal, +50 = 50% higher, -50 = 50% lower).
+            Distinct from the absolute [`pitch`](Self::pitch): this is the provider's native
+            percentage-delta knob.
+        rate_percentage:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            Speaking-rate adjustment as a signed percentage delta from the per-voice default
+            (IBM Watson `rate_percentage`: 0 = normal, +50 = 50% faster, -50 = 50% slower).
+            Distinct from the multiplicative [`speed`](Self::speed): this is the provider's native
+            percentage-delta knob so the value reaches the wire 1:1 without a lossy multiplier round-trip.
         sample_rate:
           type:
           - integer
