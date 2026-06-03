@@ -6,8 +6,12 @@
 use crate::core::stt::base::STTConfig;
 use url::form_urlencoded;
 
-/// Sarvam.ai STT WebSocket endpoint
-pub const SARVAM_STT_WS_URL: &str = "wss://api.sarvam.ai/speech-to-text-translate";
+/// Sarvam.ai STT streaming WebSocket endpoint.
+///
+/// NOTE: `/speech-to-text-translate` (no `/ws`) is the BATCH REST (POST) endpoint and returns HTTP
+/// 405 on a WS upgrade — the streaming WS lives at `/speech-to-text/ws`. (Found by live testing;
+/// see <https://docs.sarvam.ai/api-reference-docs/speech-to-text/transcribe/ws>.)
+pub const SARVAM_STT_WS_URL: &str = "wss://api.sarvam.ai/speech-to-text/ws";
 
 /// Default STT model (Saarika v2.5)
 pub const DEFAULT_MODEL: &str = "saarika:v2.5";
@@ -218,7 +222,7 @@ impl SarvamSTTConfig {
         url.push_str(SARVAM_STT_WS_URL);
         url.push_str("?model=");
         url.push_str(&self.model);
-        url.push_str("&language_code=");
+        url.push_str("&language-code=");
         url.push_str(&self.language_code);
         url.push_str("&sample_rate=");
         url.push_str(&self.sample_rate.to_string());
@@ -457,7 +461,7 @@ mod tests {
 
         assert!(url.starts_with(SARVAM_STT_WS_URL));
         assert!(url.contains("model=saarika:v2.5"));
-        assert!(url.contains("language_code=hi-IN"));
+        assert!(url.contains("language-code=hi-IN"));
         assert!(url.contains("sample_rate=16000"));
         assert!(url.contains("input_audio_codec=pcm_s16le"));
         assert!(url.contains("vad_signals=true"));

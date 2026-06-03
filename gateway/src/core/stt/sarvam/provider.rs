@@ -66,11 +66,25 @@ enum ConnectionState {
     Error(String),
 }
 
-/// Sarvam audio message format
+/// Sarvam audio message format. The streaming WS expects a NESTED `audio` object carrying THREE
+/// required fields per frame — `{"audio":{"data":"<base64>","encoding":"audio/pcm_s16le",
+/// "sample_rate":"16000"}}`. The server rejects a frame missing `encoding`/`sample_rate` with a
+/// pydantic `SarvamAppRequest` validation error (they are NOT inferred from the connect URL query,
+/// despite also appearing there). `encoding` is the `audio/{codec}` MIME form of the configured
+/// `input_audio_codec` (matching the Sarvam SDK / pipecat client); `sample_rate` is sent as a string.
+#[derive(Debug, Serialize)]
+struct SarvamAudioData {
+    /// Base64-encoded audio bytes.
+    data: String,
+    /// `audio/{codec}` MIME of the configured codec (e.g. `audio/pcm_s16le`, `audio/wav`).
+    encoding: String,
+    /// Audio sample rate in Hz, as a string (e.g. `"16000"`).
+    sample_rate: String,
+}
+
 #[derive(Debug, Serialize)]
 struct SarvamAudioMessage {
-    /// Base64-encoded audio data
-    audio: String,
+    audio: SarvamAudioData,
 }
 
 /// Sarvam ping message format
@@ -80,35 +94,52 @@ struct SarvamPingMessage {
     msg_type: &'static str,
 }
 
-/// Sarvam response message types
+/// Sarvam response message types. The Saarika streaming WS wraps EVERY message as
+/// `{"type":<kind>,"data":{...}}` — transcripts arrive as `type:"data"` with a nested
+/// `{request_id, transcript, metrics}` payload, errors as `type:"error"` with `{message, code}`,
+/// and VAD signals (when `vad_signals=true`) as `type:"events"` with a `{signal_type}` payload.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum SarvamResponse {
-    /// Transcript result
-    #[serde(rename = "transcript")]
-    Transcript(SarvamTranscript),
-    /// Speech started event
-    #[serde(rename = "speech_start")]
-    SpeechStart,
-    /// Speech ended event
-    #[serde(rename = "speech_end")]
-    SpeechEnd,
-    /// Error response
+    /// Transcript result — `{"type":"data","data":{"transcript":"...", ...}}`.
+    #[serde(rename = "data")]
+    Data { data: SarvamTranscript },
+    /// VAD speech-activity signal — `{"type":"events","data":{"signal_type":"START"|"END"}}`.
+    #[serde(rename = "events")]
+    Events { data: SarvamEvent },
+    /// Error response — `{"type":"error","data":{"message":"...","code":"..."}}`.
     #[serde(rename = "error")]
-    Error(SarvamError),
+    Error { data: SarvamError },
 }
 
-/// Sarvam transcript response
+/// Sarvam transcript payload (nested under `data`).
 #[derive(Debug, Deserialize)]
 struct SarvamTranscript {
-    /// Transcribed text
-    text: String,
-    /// Whether this is a final result
+    /// Transcribed text.
     #[serde(default)]
+    text: String,
+    /// Whether this is a final result. Saarika streaming emits a transcript per finalized utterance,
+    /// so absence is treated as final.
+    #[serde(default = "default_true")]
     is_final: bool,
-    /// Confidence score (optional)
+    /// Confidence score (optional).
     #[serde(default)]
     confidence: Option<f32>,
+    /// Alternate field name the server uses for the transcribed text.
+    #[serde(default)]
+    transcript: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Sarvam VAD event payload (nested under `data`).
+#[derive(Debug, Deserialize)]
+struct SarvamEvent {
+    /// `"START"` / `"END"` (case-insensitive) speech-activity signal.
+    #[serde(default)]
+    signal_type: String,
 }
 
 /// Sarvam error response
@@ -143,6 +174,10 @@ struct SarvamTransport {
     error_tx: mpsc::Sender<STTError>,
     /// Fires once on the first successful connect, unblocking `start_connection`.
     connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// Per-frame `audio.encoding` value (`audio/{codec}`), required by `SarvamAppRequest`.
+    audio_encoding: String,
+    /// Per-frame `audio.sample_rate` value (Hz, as a string), required by `SarvamAppRequest`.
+    audio_sample_rate: String,
 }
 
 #[async_trait::async_trait]
@@ -171,9 +206,16 @@ impl WsTransport for SarvamTransport {
             tokio::select! {
                 // Handle outgoing audio data
                 Some(audio_data) = audio_rx.recv() => {
-                    // Encode audio as base64 and send as JSON
+                    // Encode audio as base64 and send as the nested-`audio` JSON Sarvam expects,
+                    // carrying the per-frame `encoding`/`sample_rate` the server validates.
                     let b64_audio = BASE64_STANDARD.encode(&audio_data);
-                    let msg = SarvamAudioMessage { audio: b64_audio };
+                    let msg = SarvamAudioMessage {
+                        audio: SarvamAudioData {
+                            data: b64_audio,
+                            encoding: self.audio_encoding.clone(),
+                            sample_rate: self.audio_sample_rate.clone(),
+                        },
+                    };
                     match serde_json::to_string(&msg) {
                         Ok(json) => {
                             let message = Message::Text(json.into());
@@ -365,34 +407,47 @@ impl SarvamSTT {
                 // Try to parse as structured response
                 match serde_json::from_str::<SarvamResponse>(&text) {
                     Ok(response) => match response {
-                        SarvamResponse::Transcript(transcript) => {
-                            let stt_result = STTResult::new(
-                                transcript.text,
-                                transcript.is_final,
-                                transcript.is_final && !*in_speech,
-                                transcript.confidence.unwrap_or(0.95),
-                            );
+                        SarvamResponse::Data { data } => {
+                            // The transcribed text lives in `transcript` (newer schema) or `text`.
+                            let text = data.transcript.unwrap_or(data.text);
+                            // Skip empty interim frames so the consumer only sees real content.
+                            if !text.trim().is_empty() {
+                                let stt_result = STTResult::new(
+                                    text,
+                                    data.is_final,
+                                    data.is_final && !*in_speech,
+                                    data.confidence.unwrap_or(0.95),
+                                );
 
-                            if let Err(e) = result_tx.try_send(stt_result) {
-                                match e {
-                                    mpsc::error::TrySendError::Full(_) => {
-                                        warn!("Sarvam STT result channel full - dropping result");
-                                    }
-                                    mpsc::error::TrySendError::Closed(_) => {
-                                        warn!("Sarvam STT result channel closed");
+                                if let Err(e) = result_tx.try_send(stt_result) {
+                                    match e {
+                                        mpsc::error::TrySendError::Full(_) => {
+                                            warn!(
+                                                "Sarvam STT result channel full - dropping result"
+                                            );
+                                        }
+                                        mpsc::error::TrySendError::Closed(_) => {
+                                            warn!("Sarvam STT result channel closed");
+                                        }
                                     }
                                 }
                             }
                         }
-                        SarvamResponse::SpeechStart => {
-                            debug!("Sarvam: Speech started");
-                            *in_speech = true;
+                        SarvamResponse::Events { data } => {
+                            // VAD speech-activity signals (when `vad_signals=true`).
+                            match data.signal_type.to_ascii_uppercase().as_str() {
+                                "START" => {
+                                    debug!("Sarvam: Speech started");
+                                    *in_speech = true;
+                                }
+                                "END" => {
+                                    debug!("Sarvam: Speech ended");
+                                    *in_speech = false;
+                                }
+                                other => debug!("Sarvam: unknown VAD signal {other:?}"),
+                            }
                         }
-                        SarvamResponse::SpeechEnd => {
-                            debug!("Sarvam: Speech ended");
-                            *in_speech = false;
-                        }
-                        SarvamResponse::Error(err) => {
+                        SarvamResponse::Error { data: err } => {
                             let error_msg = format!(
                                 "Sarvam error: {} (code: {})",
                                 err.message,
@@ -466,6 +521,26 @@ impl SarvamSTT {
         self.intentional_disconnect.store(false, Ordering::SeqCst);
 
         let ws_url = sarvam_config.build_websocket_url();
+        // Sarvam's WS upgrade handshake STALLS (no response → connect timeout) unless a `Host`
+        // header is present. tokio-tungstenite only auto-derives Host when handed a URL string; we
+        // build a manual `Request` (to attach the `api-subscription-key` auth header), so we must
+        // set Host ourselves — exactly as the ElevenLabs/Cartesia manual-request paths do. Derive
+        // it from the dial URL so a regional/base-url override stays correct.
+        let ws_host = ws_url
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.split(['/', '?']).next())
+            .unwrap_or("api.sarvam.ai")
+            .to_string();
+
+        // Per-frame audio metadata the server validates on every message (NOT inferred from the URL).
+        // QUIRK: the per-frame `audio.encoding` is a FIXED enum — the Saarika streaming server only
+        // accepts the literal `"audio/wav"` ("Input should be 'audio/wav'"). It is a container hint,
+        // not the real codec: the actual byte format rides the connect URL's `input_audio_codec`
+        // (e.g. `pcm_s16le` for our headerless linear16), which the server reads to decode the raw
+        // PCM frames. `sample_rate` is sent as a string.
+        let audio_encoding = "audio/wav".to_string();
+        let audio_sample_rate = sarvam_config.sample_rate.to_string();
 
         // Create channels for communication (bounded for backpressure)
         let (ws_tx, ws_rx) = mpsc::channel::<Bytes>(32);
@@ -515,6 +590,9 @@ impl SarvamSTT {
             let exit = supervisor
                 .run(|| {
                     let ws_url = ws_url.clone();
+                    let ws_host = ws_host.clone();
+                    let audio_encoding = audio_encoding.clone();
+                    let audio_sample_rate = audio_sample_rate.clone();
                     let api_key = api_key.clone();
                     let audio_rx = Arc::clone(&audio_rx);
                     let shutdown_rx = Arc::clone(&shutdown_rx);
@@ -527,6 +605,7 @@ impl SarvamSTT {
                         let request = tokio_tungstenite::tungstenite::http::Request::builder()
                             .method("GET")
                             .uri(&ws_url)
+                            .header("Host", &ws_host)
                             .header("Upgrade", "websocket")
                             .header("Connection", "upgrade")
                             .header("Sec-WebSocket-Key", generate_key())
@@ -552,6 +631,8 @@ impl SarvamSTT {
                             result_tx,
                             error_tx,
                             connected_tx,
+                            audio_encoding,
+                            audio_sample_rate,
                         })
                     }
                 })
@@ -891,11 +972,21 @@ mod tests {
     fn test_audio_message_serialization() {
         let audio_data = vec![0u8, 1, 2, 3, 4, 5];
         let b64_audio = BASE64_STANDARD.encode(&audio_data);
-        let msg = SarvamAudioMessage { audio: b64_audio };
+        let msg = SarvamAudioMessage {
+            audio: SarvamAudioData {
+                data: b64_audio,
+                encoding: "audio/wav".to_string(),
+                sample_rate: "16000".to_string(),
+            },
+        };
 
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("audio"));
         assert!(json.contains("AAECAwQF")); // Base64 of [0,1,2,3,4,5]
+        // The server REQUIRES per-frame encoding + sample_rate inside the audio object, and the
+        // `encoding` enum only accepts the literal `audio/wav`.
+        assert!(json.contains(r#""encoding":"audio/wav""#));
+        assert!(json.contains(r#""sample_rate":"16000""#));
     }
 
     #[test]
@@ -907,38 +998,47 @@ mod tests {
 
     #[test]
     fn test_transcript_response_parsing() {
-        let json = r#"{"type":"transcript","text":"नमस्ते","is_final":true,"confidence":0.95}"#;
+        // Real Saarika streaming wire format: `{"type":"data","data":{...}}` with the transcribed
+        // text under `data.transcript` and a `metrics` block alongside it.
+        let json = r#"{"type":"data","data":{"request_id":"r1","transcript":"नमस्ते","metrics":{"audio_duration":1.2,"processing_latency":0.3}}}"#;
         let response: SarvamResponse = serde_json::from_str(json).unwrap();
 
         match response {
-            SarvamResponse::Transcript(t) => {
-                assert_eq!(t.text, "नमस्ते");
-                assert!(t.is_final);
-                assert_eq!(t.confidence, Some(0.95));
+            SarvamResponse::Data { data } => {
+                assert_eq!(data.transcript.as_deref(), Some("नमस्ते"));
+                assert!(data.is_final); // defaults to final for a finalized-utterance frame
             }
-            _ => panic!("Expected Transcript response"),
+            _ => panic!("Expected Data response"),
         }
     }
 
     #[test]
     fn test_speech_events_parsing() {
-        let start_json = r#"{"type":"speech_start"}"#;
-        let end_json = r#"{"type":"speech_end"}"#;
+        // VAD signals arrive wrapped as `{"type":"events","data":{"signal_type":"START"|"END"}}`.
+        let start_json = r#"{"type":"events","data":{"signal_type":"START"}}"#;
+        let end_json = r#"{"type":"events","data":{"signal_type":"END"}}"#;
 
         let start: SarvamResponse = serde_json::from_str(start_json).unwrap();
         let end: SarvamResponse = serde_json::from_str(end_json).unwrap();
 
-        assert!(matches!(start, SarvamResponse::SpeechStart));
-        assert!(matches!(end, SarvamResponse::SpeechEnd));
+        match start {
+            SarvamResponse::Events { data } => assert_eq!(data.signal_type, "START"),
+            _ => panic!("Expected Events response"),
+        }
+        match end {
+            SarvamResponse::Events { data } => assert_eq!(data.signal_type, "END"),
+            _ => panic!("Expected Events response"),
+        }
     }
 
     #[test]
     fn test_error_response_parsing() {
-        let json = r#"{"type":"error","message":"Rate limit exceeded","code":"RATE_LIMIT"}"#;
+        // Errors are wrapped under `data` too: `{"type":"error","data":{"message":...,"code":...}}`.
+        let json = r#"{"type":"error","data":{"message":"Rate limit exceeded","code":"RATE_LIMIT"}}"#;
         let response: SarvamResponse = serde_json::from_str(json).unwrap();
 
         match response {
-            SarvamResponse::Error(e) => {
+            SarvamResponse::Error { data: e } => {
                 assert_eq!(e.message, "Rate limit exceeded");
                 assert_eq!(e.code, Some("RATE_LIMIT".to_string()));
             }
