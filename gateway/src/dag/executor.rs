@@ -134,41 +134,44 @@ impl DAGExecutor {
         result
     }
 
-    /// Walk the linear chain from `start` toward an exit. A chain qualifies only while each node
-    /// has exactly ONE outgoing edge and its successor exactly one incoming edge; it terminates at
-    /// a node with no outgoing edges. Returns `None` on any branch/join/cycle (the caller then
-    /// falls back to batch execution).
-    fn linear_chain(&self, dag: &CompiledDAG, start: NodeIndex) -> Option<Vec<NodeIndex>> {
-        let mut chain = vec![start];
-        let mut cur = start;
-        loop {
-            let outs = dag.outgoing_edges(cur);
-            match outs.len() {
-                0 => return Some(chain),
-                1 => {
-                    let (next, _edge) = outs[0];
-                    if dag.incoming_edges(next).len() != 1 || chain.contains(&next) {
-                        return None;
-                    }
-                    chain.push(next);
-                    cur = next;
-                }
-                _ => return None,
+    /// Collect the nodes reachable from `start` IF they form a streamable TREE — every reachable
+    /// node (besides `start`) has at most one incoming edge from within the set, i.e. there is NO
+    /// join / fan-in. Linear chains AND fan-out (split / conditional router) qualify; a join (>1
+    /// incoming) does not, because a join must synchronize all its inputs before it can emit and so
+    /// is a batch boundary. Returns `None` on a join or a cycle (the caller falls back to batch).
+    fn streamable_tree(&self, dag: &CompiledDAG, start: NodeIndex) -> Option<Vec<NodeIndex>> {
+        let mut order = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack = vec![start];
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n) {
+                return None; // re-reached ⇒ join or cycle
+            }
+            if n != start && dag.incoming_edges(n).len() > 1 {
+                return None; // fan-in / join — needs synchronization, not streaming
+            }
+            order.push(n);
+            for (next, _e) in dag.outgoing_edges(n) {
+                stack.push(next);
             }
         }
+        Some(order)
     }
 
-    /// Run a LINEAR chain from `start_node_id` in STREAMING mode (the streaming data-plane).
+    /// Run the subgraph from `start_node_id` in STREAMING mode (the streaming data-plane).
     ///
-    /// Adjacent nodes are connected by bounded channels and run CONCURRENTLY, so a downstream node
-    /// (e.g. TTS) starts producing as soon as an upstream node (e.g. an LLM) emits its first chunk
-    /// — slashing time-to-first-output for real-time voice. Each node runs
-    /// [`DAGNode::execute_streaming`]; non-streaming nodes use the default one-in/one-out adapter,
-    /// so a chain like `stt(batch) → translate(stream) → tts(stream)` works seamlessly. The
-    /// terminal node's outputs are forwarded to `ctx.output_tx` (the client sink) as they arrive.
+    /// EVERY reachable node runs concurrently, wired by bounded channels, so a downstream node
+    /// (TTS) starts producing as soon as an upstream node (an LLM) emits its first chunk — slashing
+    /// time-to-first-output for real-time voice. Each node runs [`DAGNode::execute_streaming`]
+    /// (non-streaming nodes use the default one-in/one-out adapter, so `stt(batch) → llm(stream) →
+    /// tts(stream)` works seamlessly). Handles arbitrary FAN-OUT: a node with several outgoing
+    /// edges broadcasts each chunk to every downstream (a split), or — when an edge carries a
+    /// condition — only to the matching downstream (a router), evaluated per chunk. Terminal nodes
+    /// (no outgoing edge) deliver to `ctx.output_tx` (the client sink) as chunks arrive, so a
+    /// `… → [tts→audio, text_out]` fan-out streams both audio and text incrementally.
     ///
-    /// If the subgraph branches/joins/routes (not linear), this transparently falls back to the
-    /// batch [`execute_from`](Self::execute_from).
+    /// A JOIN (any reachable node with >1 incoming edge) is a synchronization point that cannot
+    /// stream, so such graphs transparently fall back to the batch [`execute_from`](Self::execute_from).
     pub async fn execute_streaming_from(
         &self,
         dag: &CompiledDAG,
@@ -180,8 +183,8 @@ impl DAGExecutor {
             .node_index
             .get(start_node_id)
             .ok_or(DAGError::InvalidStartNode)?;
-        let chain = match self.linear_chain(dag, start) {
-            Some(c) => c,
+        let nodes = match self.streamable_tree(dag, start) {
+            Some(n) => n,
             None => {
                 self.execute_from(dag, start_node_id, input, ctx).await?;
                 return Ok(());
@@ -189,51 +192,89 @@ impl DAGExecutor {
         };
 
         const CHAN_BUF: usize = 64;
-        // Feed the single input into node 0, then close its input so the chain drains + terminates.
-        let (in_tx, mut prev_rx) = mpsc::channel::<DAGData>(CHAN_BUF);
-        in_tx
-            .send(input)
-            .await
-            .map_err(|_| DAGError::NodeExecutionError {
-                node_id: start_node_id.to_string(),
-                error: "streaming input channel closed".into(),
-            })?;
-        drop(in_tx);
+        // One input channel per node. Edge A→B means A's forwarder sends to B's input sender.
+        let mut in_tx: HashMap<NodeIndex, mpsc::Sender<DAGData>> = HashMap::new();
+        let mut in_rx: HashMap<NodeIndex, mpsc::Receiver<DAGData>> = HashMap::new();
+        for &n in &nodes {
+            let (tx, rx) = mpsc::channel::<DAGData>(CHAN_BUF);
+            in_tx.insert(n, tx);
+            in_rx.insert(n, rx);
+        }
 
-        let mut handles = Vec::with_capacity(chain.len());
-        for &node_idx in &chain {
-            let node = Arc::clone(&dag.graph[node_idx].node);
-            let node_id = dag.graph[node_idx].id.clone();
-            let (out_tx, out_rx) = mpsc::channel::<DAGData>(CHAN_BUF);
-            let rx = std::mem::replace(&mut prev_rx, out_rx);
-            // Each concurrent node gets its own context; the client sink is cleared so ONLY the
-            // terminal-output drain below delivers (no double-delivery), but the cancel token is
-            // shared for barge-in.
+        let mut node_handles = Vec::with_capacity(nodes.len());
+        let mut fwd_handles = Vec::with_capacity(nodes.len());
+        for &n in &nodes {
+            let node = Arc::clone(&dag.graph[n].node);
+            let node_id = dag.graph[n].id.clone();
+            let rx = in_rx.remove(&n).expect("input rx");
+            let (out_tx, mut out_rx) = mpsc::channel::<DAGData>(CHAN_BUF);
+
+            // The node task: stream this node's outputs onto `out_tx`. Own context per node; the
+            // client sink is cleared (only the terminal forwarder below delivers) but the cancel
+            // token is shared for barge-in.
             let mut node_ctx = ctx.clone_for_branch();
             node_ctx.output_tx = None;
-            handles.push(tokio::spawn(async move {
+            node_handles.push(tokio::spawn(async move {
                 node.execute_streaming(rx, &mut node_ctx, out_tx)
                     .await
                     .map_err(|e| (node_id, e))
             }));
-        }
 
-        // `prev_rx` is the terminal node's output: forward chunks to the client sink as produced.
-        let output_tx = ctx.output_tx.clone();
-        while let Some(chunk) = prev_rx.recv().await {
-            if let Some(sink) = &output_tx {
-                let out = match chunk {
-                    DAGData::TTSAudio(a) => Some(DagOutput::Audio(a)),
-                    DAGData::Text(t) => Some(DagOutput::Text(t)),
-                    _ => None,
-                };
-                if let Some(o) = out {
-                    let _ = sink.send(o).await;
+            // The forwarder task: route this node's stream to its downstream inputs (per-chunk
+            // condition eval for routers; broadcast for splits) or to the client sink if terminal.
+            let downstream: Vec<(mpsc::Sender<DAGData>, super::edges::CompiledEdge)> =
+                dag.outgoing_edges(n)
+                    .into_iter()
+                    .filter_map(|(tgt, edge)| {
+                        in_tx.get(&tgt).cloned().map(|tx| (tx, edge.clone()))
+                    })
+                    .collect();
+            let evaluator = Arc::clone(&dag.evaluator);
+            let fwd_ctx = ctx.clone_for_branch();
+            let sink = ctx.output_tx.clone();
+            fwd_handles.push(tokio::spawn(async move {
+                while let Some(chunk) = out_rx.recv().await {
+                    if downstream.is_empty() {
+                        // Terminal node → deliver to the client as produced.
+                        if let Some(s) = &sink {
+                            let out = match &chunk {
+                                DAGData::TTSAudio(a) => Some(DagOutput::Audio(a.clone())),
+                                DAGData::Text(t) => Some(DagOutput::Text(t.clone())),
+                                _ => None,
+                            };
+                            if let Some(o) = out {
+                                let _ = s.send(o).await;
+                            }
+                        }
+                        continue;
+                    }
+                    let chunk_json = chunk.to_json();
+                    for (tx, edge) in &downstream {
+                        let pass = match &edge.condition {
+                            Some(c) => evaluator.evaluate(c, &chunk_json, &fwd_ctx).unwrap_or(false),
+                            None => true,
+                        };
+                        if pass {
+                            let _ = tx.send(chunk.clone()).await;
+                        }
+                    }
                 }
-            }
+            }));
         }
 
-        for h in handles {
+        // Feed the input to the root and drop ALL executor-held senders. Each non-root node's input
+        // now has senders only from its single parent forwarder, so the close cascades root→leaves
+        // as each forwarder finishes.
+        if let Some(s) = in_tx.get(&start) {
+            let _ = s.send(input).await;
+        }
+        drop(in_tx);
+
+        // Forwarders finish first (they end when their node's output closes); then the node tasks.
+        for h in fwd_handles {
+            let _ = h.await;
+        }
+        for h in node_handles {
             match h.await {
                 Ok(Ok(())) => {}
                 Ok(Err((node_id, e))) => {

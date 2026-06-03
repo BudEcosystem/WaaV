@@ -271,6 +271,92 @@ async fn dag_streaming_emits_incremental_audio_live() {
 }
 
 // ============================================================================
+// 5. FAN-OUT streaming (split): translate → [TTS → audio, text_output → text]. Both terminals
+//    stream to the client concurrently — proving the general (non-linear) streaming data-plane.
+// ============================================================================
+#[tokio::test]
+#[ignore = "Requires SARVAM_API_KEY + ELEVENLABS_API_KEY; real billed calls"]
+async fn dag_streaming_fanout_audio_and_text_live() {
+    use tokio::sync::mpsc;
+    use waav_gateway::dag::context::DagOutput;
+    use waav_gateway::dag::definition::OutputDestination;
+
+    ensure_crypto();
+    let (Some(_), Some(_)) = (key("SARVAM_API_KEY"), key("ELEVENLABS_API_KEY")) else { return };
+
+    let paragraph = "Hello there. How are you today? The weather is very nice.";
+
+    let translate = NodeDefinition::new(
+        "translate",
+        NodeType::LlmEndpoint {
+            base_url: "https://api.sarvam.ai/v1".to_string(),
+            model: "sarvam-30b".to_string(),
+            api_key: Some("${SARVAM_API_KEY}".to_string()),
+            system_prompt: Some(
+                "Translate each English sentence into Hindi (Devanagari). Output ONLY the Hindi."
+                    .to_string(),
+            ),
+            temperature: Some(0.1),
+            max_tokens: Some(4000),
+            streaming: true,
+            tools: None,
+            assistant_id: None,
+            timeout_ms: Some(120_000),
+            headers: Default::default(),
+        },
+    );
+    let text_out = NodeDefinition::new(
+        "text_out",
+        NodeType::TextOutput { destination: OutputDestination::WebSocket },
+    );
+
+    // translate fans out to BOTH a TTS branch (audio) and a text-output branch (text).
+    let mut dag = DAGDefinition::new("fanout", "split: translate -> [tts, text_out]");
+    dag.add_node(translate);
+    dag.add_node(elevenlabs_hindi_tts_node());
+    dag.add_node(text_out);
+    dag.add_edge(EdgeDefinition::new("translate", "tts"));
+    dag.add_edge(EdgeDefinition::new("translate", "text_out"));
+    dag.with_entry("translate");
+    dag.add_exit("tts");
+    dag.add_exit("text_out");
+    let compiled = DAGCompiler::new().compile(dag).expect("compile");
+
+    let (tx, rx) = mpsc::channel::<DagOutput>(64);
+    let drain = tokio::spawn(async move {
+        let mut rx = rx;
+        let (mut audio_chunks, mut text_chunks) = (0usize, Vec::<String>::new());
+        while let Some(out) = rx.recv().await {
+            match out {
+                DagOutput::Audio(a) if !a.data.is_empty() => audio_chunks += 1,
+                DagOutput::Text(t) => text_chunks.push(t),
+                _ => {}
+            }
+        }
+        (audio_chunks, text_chunks)
+    });
+
+    let exec = DAGExecutor::new();
+    let mut ctx = DAGContext::new("fanout-test").with_output_tx(tx);
+    exec.execute_streaming_from(&compiled, "translate", DAGData::Text(paragraph.to_string()), &mut ctx)
+        .await
+        .expect("fan-out streaming executes");
+    drop(ctx);
+
+    let (audio_chunks, text_chunks) = drain.await.unwrap();
+    let text_joined = text_chunks.join(" ");
+    println!("FAN-OUT: {audio_chunks} audio chunk(s) + {} text chunk(s); text={text_joined:?}", text_chunks.len());
+    // The proof of fan-out streaming: BOTH terminals (TTS→audio AND text_output→text) delivered to
+    // the client concurrently from the single `translate` source. (We don't assert the script —
+    // Sarvam's streaming output is sometimes Devanagari, sometimes romanized Hindi.)
+    assert!(audio_chunks >= 1, "TTS branch produced no audio");
+    assert!(
+        !text_joined.trim().is_empty(),
+        "text_output branch produced no text — fan-out did not reach the second terminal"
+    );
+}
+
+// ============================================================================
 // 3. FULL pipeline: Deepgram STT → Sarvam translate → ElevenLabs TTS — 3-vendor DAG, live
 // ============================================================================
 #[tokio::test]
