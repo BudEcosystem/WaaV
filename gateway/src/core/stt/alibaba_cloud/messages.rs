@@ -397,6 +397,8 @@ impl ParaformerRunTask {
     ///
     /// `multi_threshold_mode_enabled` is the VAD multi-threshold knob: `Some(true)` requests it,
     /// `None` omits the field (server default), preventing over-segmentation of long sentences.
+    /// `vocabulary_id` is DashScope's hotword/biasing mechanism — a PRE-REGISTERED vocabulary id
+    /// (not free text); `None` omits it. `max_sentence_silence` is the VAD endpointing silence (ms).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: &str,
@@ -406,6 +408,8 @@ impl ParaformerRunTask {
         disfluency_removal: bool,
         punctuation: bool,
         multi_threshold_mode_enabled: Option<bool>,
+        vocabulary_id: Option<String>,
+        max_sentence_silence: u32,
     ) -> Self {
         Self {
             header: ParaformerHeader {
@@ -422,7 +426,7 @@ impl ParaformerRunTask {
                 parameters: ParaformerParameters {
                     format: format.to_string(),
                     sample_rate,
-                    vocabulary_id: None,
+                    vocabulary_id,
                     disfluency_removal_enabled: Some(disfluency_removal),
                     language_hints: if language != "auto" {
                         Some(vec![language.to_string()])
@@ -430,7 +434,7 @@ impl ParaformerRunTask {
                         None
                     },
                     semantic_punctuation_enabled: Some(punctuation),
-                    max_sentence_silence: Some(800),
+                    max_sentence_silence: Some(max_sentence_silence),
                     punctuation_prediction_enabled: Some(punctuation),
                     heartbeat: Some(true),
                     inverse_text_normalization_enabled: Some(true),
@@ -812,7 +816,7 @@ mod tests {
     #[test]
     fn test_paraformer_run_task() {
         let msg =
-            ParaformerRunTask::new("paraformer-realtime-v2", "pcm", 16000, "zh", true, true, None);
+            ParaformerRunTask::new("paraformer-realtime-v2", "pcm", 16000, "zh", true, true, None, None, 800);
         let json = msg.to_json().unwrap();
 
         assert!(json.contains("run-task"));
@@ -827,7 +831,7 @@ mod tests {
     fn test_paraformer_run_task_multi_threshold_reaches_body() {
         // None => the field is omitted entirely (skip_serializing_if).
         let off =
-            ParaformerRunTask::new("paraformer-realtime-v2", "pcm", 16000, "zh", true, true, None);
+            ParaformerRunTask::new("paraformer-realtime-v2", "pcm", 16000, "zh", true, true, None, None, 800);
         let json_off = off.to_json().unwrap();
         assert!(
             !json_off.contains("multi_threshold_mode_enabled"),
@@ -843,6 +847,8 @@ mod tests {
             true,
             true,
             Some(true),
+            None,
+            800,
         );
         let v: Value = serde_json::from_str(&on.to_json().unwrap()).unwrap();
         assert_eq!(

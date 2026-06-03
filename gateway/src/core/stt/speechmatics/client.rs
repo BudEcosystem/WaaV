@@ -531,11 +531,21 @@ impl BaseSTT for SpeechmaticsSTT {
                     let is_session_started = Arc::clone(&is_session_started);
                     let seq_no = Arc::clone(&seq_no);
                     async move {
+                        // Derive the Host header from the ACTUAL dial URL — hardcoding the EU host
+                        // broke every US-region session (dialing us.rt.speechmatics.com while
+                        // sending `Host: eu.rt.speechmatics.com` is a Host/SNI mismatch the server
+                        // rejects). tokio-tungstenite only auto-derives Host for a URL string, not a
+                        // hand-built Request, so we must set it ourselves to match the region.
+                        let ws_host = ws_url
+                            .split("://")
+                            .nth(1)
+                            .and_then(|rest| rest.split(['/', '?']).next())
+                            .unwrap_or("eu.rt.speechmatics.com");
                         let request = http::Request::builder()
                             .uri(&ws_url)
                             .header("Authorization", format!("Bearer {}", api_key))
                             .header("Sec-WebSocket-Protocol", "json")
-                            .header("Host", "eu.rt.speechmatics.com")
+                            .header("Host", ws_host)
                             .header("Connection", "Upgrade")
                             .header("Upgrade", "websocket")
                             .header("Sec-WebSocket-Version", "13")

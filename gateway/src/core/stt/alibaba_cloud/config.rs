@@ -489,17 +489,10 @@ pub struct DashScopeSttConfig {
     #[serde(default = "default_true")]
     pub punctuation: bool,
 
-    /// Context biasing text (hotwords).
-    #[serde(default)]
-    pub context_text: Option<String>,
-
-    /// Custom vocabulary ID.
+    /// Custom vocabulary ID (DashScope hotword biasing — a PRE-REGISTERED vocabulary id, set via
+    /// `extras["vocabulary_id"]`; free-text `keyterms` cannot be expressed and are a capability gap).
     #[serde(default)]
     pub vocabulary_id: Option<String>,
-
-    /// Enable word-level timestamps.
-    #[serde(default)]
-    pub word_timestamps: bool,
 
     /// Paraformer-only: VAD multi-threshold mode, which prevents over-segmentation of long
     /// sentences (`multi_threshold_mode_enabled` in the inference run-task `parameters`).
@@ -541,9 +534,7 @@ impl Default for DashScopeSttConfig {
             emotion_recognition: false,
             disfluency_removal: false,
             punctuation: true,
-            context_text: None,
             vocabulary_id: None,
-            word_timestamps: false,
             multi_threshold_mode_enabled: None,
             turn_detection_threshold: None,
         }
@@ -594,9 +585,7 @@ impl DashScopeSttConfig {
             emotion_recognition: false,
             disfluency_removal: false,
             punctuation: config.punctuation,
-            context_text: None,
             vocabulary_id: None,
-            word_timestamps: false,
             multi_threshold_mode_enabled: None,
             turn_detection_threshold: None,
         })
@@ -604,11 +593,18 @@ impl DashScopeSttConfig {
 
     /// Build from the standardized config (W1 keystone). DashScope exposes a focused feature
     /// surface, so this maps the standardized features it can actually express onto its own
-    /// fields: word-level timestamps (`word_timestamps`), filler words (`disfluency_removal`,
-    /// whose sense is inverted — keeping fillers means *not* removing disfluencies), context
-    /// biasing hotwords (`context_text`, built by joining `keyterms`), the endpointing silence
-    /// window (`silence_duration_ms`) and automatic language detection (`language = Auto`).
-    /// Features DashScope can't express (diarization, smart_format, profanity_filter,
+    /// fields: filler words (`disfluency_removal`, whose sense is inverted — keeping fillers means
+    /// *not* removing disfluencies), the endpointing silence window (`silence_duration_ms` ->
+    /// Paraformer `max_sentence_silence` / Qwen VAD) and automatic language detection
+    /// (`language = Auto`).
+    ///
+    /// Honest capability notes (these do NOT reach the wire, by design):
+    /// - `word_timestamps`: Paraformer real-time ALWAYS returns word-level timestamps in its result
+    ///   `words[]` — there is no enable/disable wire param, so the typed flag is informational only.
+    /// - `keyterms`: DashScope hotword biasing is keyed on a PRE-REGISTERED `vocabulary_id`, not a
+    ///   free-text phrase list, so arbitrary `keyterms` cannot be sent. Callers with a registered
+    ///   vocabulary pass its id through `extras["vocabulary_id"]` (wired to the run-task body below).
+    /// Other features DashScope can't express (diarization, smart_format, profanity_filter,
     /// interim_results, vad_events, utterance_end, redaction, entity_detection) are capability
     /// gaps and stay at their defaults.
     pub fn from_standard(
@@ -616,32 +612,33 @@ impl DashScopeSttConfig {
     ) -> Result<Self, STTError> {
         let f = &std.features;
         let mut cfg = Self::from_base(std.base.clone())?;
-        if let Some(w) = f.word_timestamps {
-            cfg.word_timestamps = w;
-        }
         if let Some(filler) = f.filler_words {
             cfg.disfluency_removal = !filler;
         }
-        if let Some(k) = &f.keyterms
-            && !k.is_empty() {
-                cfg.context_text = Some(k.join(" "));
-            }
         if let Some(ms) = f.endpointing_ms {
             cfg.silence_duration_ms = ms;
         }
         if let Some(true) = f.language_detection {
             cfg.language = DashScopeLanguage::Auto;
         }
-        // Provider-specific VAD knobs forwarded through the open ProviderExtras passthrough (no
-        // canonical SttFeatures field models them). `multi_threshold_mode_enabled` is a Paraformer
-        // inference run-task parameter (prevents over-segmentation of long sentences);
-        // `turn_detection.threshold` is the Qwen-realtime server-VAD speech-activation threshold.
+        // Provider-specific knobs forwarded through the open ProviderExtras passthrough (no canonical
+        // SttFeatures field models them). `multi_threshold_mode_enabled` is a Paraformer inference
+        // run-task parameter (prevents over-segmentation of long sentences); `vocabulary_id` is the
+        // pre-registered DashScope hotword vocabulary; `turn_detection.threshold` is the
+        // Qwen-realtime server-VAD speech-activation threshold.
         let ex = &std.extras.0;
         if let Some(b) = ex
             .get("multi_threshold_mode_enabled")
             .and_then(|v| v.as_bool())
         {
             cfg.multi_threshold_mode_enabled = Some(b);
+        }
+        if let Some(v) = ex
+            .get("vocabulary_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            cfg.vocabulary_id = Some(v.to_string());
         }
         if let Some(t) = ex
             .get("turn_detection.threshold")
@@ -729,11 +726,18 @@ impl DashScopeSttConfig {
 mod tests {
     use super::*;
 
-    // W1 keystone: maps the standardized features DashScope can express (word timestamps +
-    // context-biasing keyterms) onto its own config fields.
+    // W1 keystone: maps the standardized features DashScope can actually express. `word_timestamps`
+    // (always-on in Paraformer results) and free-text `keyterms` (DashScope hotwords need a
+    // PRE-REGISTERED vocabulary id) are honest capability gaps — they do NOT reach the wire. The
+    // registered hotword vocabulary is set via `extras["vocabulary_id"]`, and `endpointing_ms`
+    // drives the VAD silence window.
     #[test]
     fn from_standard_maps_features() {
         use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let mut extras = ProviderExtras::default();
+        extras
+            .0
+            .insert("vocabulary_id".into(), serde_json::json!("vocab-123"));
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "alibaba_cloud".into(),
@@ -741,15 +745,20 @@ mod tests {
                 ..Default::default()
             },
             features: SttFeatures {
+                // These two are capability gaps and must NOT silently pretend to be honored:
                 word_timestamps: Some(true),
                 keyterms: Some(vec!["WaaV".into(), "DashScope".into()]),
+                filler_words: Some(false),
+                endpointing_ms: Some(1200),
                 ..Default::default()
             },
-            extras: ProviderExtras::default(),
+            extras,
         };
         let cfg = DashScopeSttConfig::from_standard(&std).unwrap();
-        assert!(cfg.word_timestamps); // word_timestamps
-        assert_eq!(cfg.context_text.as_deref(), Some("WaaV DashScope")); // keyterms
+        // Honored: registered vocabulary id (extras), filler removal, and the endpointing window.
+        assert_eq!(cfg.vocabulary_id.as_deref(), Some("vocab-123"));
+        assert!(cfg.disfluency_removal); // filler_words=false -> remove disfluencies
+        assert_eq!(cfg.silence_duration_ms, 1200);
     }
 
     #[test]

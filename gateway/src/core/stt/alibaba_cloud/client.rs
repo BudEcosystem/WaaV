@@ -464,6 +464,11 @@ impl DashScopeStt {
             // VAD multi-threshold mode (Paraformer inference), wired from the standardized extras
             // passthrough; `None` omits the field (server default).
             self.config.multi_threshold_mode_enabled,
+            // Hotword biasing via a PRE-REGISTERED DashScope vocabulary id (from extras), and the
+            // endpointing silence threshold (from the standardized `endpointing_ms`). Both were
+            // previously hardcoded (None / 800) and silently ignored the caller's config.
+            self.config.vocabulary_id.clone(),
+            self.config.silence_duration_ms,
         );
 
         let task_id = msg.task_id().to_string();
@@ -862,23 +867,33 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // W1 keystone: a standardized advanced feature DashScope supports (word timestamps +
-    // context-biasing keyterms) survives through `new_standard` into the provider config.
+    // W1 keystone: the DashScope hotword vocabulary id (extras) and the endpointing silence window
+    // survive through `new_standard` into the provider config AND reach the Paraformer run-task wire
+    // body. (`word_timestamps`/free-text `keyterms` are honest capability gaps — see config.rs.)
     #[test]
-    fn test_new_standard_unlocks_word_timestamps_and_keyterms() {
-        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+    fn test_new_standard_wires_vocabulary_id_and_silence_to_run_task() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let mut extras = ProviderExtras::default();
+        extras
+            .0
+            .insert("vocabulary_id".into(), serde_json::json!("vocab-xyz"));
         let std = StandardSTTConfig {
             base: create_test_config(),
             features: SttFeatures {
-                word_timestamps: Some(true),
-                keyterms: Some(vec!["WaaV".into(), "DashScope".into()]),
+                endpointing_ms: Some(1500),
                 ..Default::default()
             },
-            extras: Default::default(),
+            extras,
         };
         let stt = DashScopeStt::new_standard(&std).unwrap();
-        assert!(stt.config.word_timestamps);
-        assert_eq!(stt.config.context_text.as_deref(), Some("WaaV DashScope"));
+        assert_eq!(stt.config.vocabulary_id.as_deref(), Some("vocab-xyz"));
+        assert_eq!(stt.config.silence_duration_ms, 1500);
+
+        // Both must actually reach the Paraformer run-task body (not silently dropped).
+        let (json, _) = stt.create_paraformer_run_task();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["payload"]["parameters"]["vocabulary_id"], "vocab-xyz", "vocab not on wire: {json}");
+        assert_eq!(v["payload"]["parameters"]["max_sentence_silence"], 1500, "silence not on wire: {json}");
 
         // Missing key is rejected through the standardized path too.
         let bad = StandardSTTConfig::from_base(STTConfig {
