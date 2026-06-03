@@ -290,7 +290,7 @@ jobs:
         run: mkdir -p /tmp/nocuda
       # These exercise the gateway end-to-end against the in-repo mock providers
       # (tests/mock_providers) — protocol-level coverage for all providers without paid keys.
-      - run: cargo test --features dag-routing --test e2e_mock_tests --test load_test_with_mocks --test server_startup --test ws_tests
+      - run: cargo test --features dag-routing --test e2e_mock_tests --test load_test_with_mocks --test server_startup --test ws_tests --test keystone_wire --test provider_keystone_completeness
 
   server-smoke:
     name: server boot + health
