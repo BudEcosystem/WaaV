@@ -38,7 +38,7 @@ use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{http::Request, protocol::Message},
+    tungstenite::{client::IntoClientRequest, http::Request, protocol::Message},
 };
 use tracing::{debug, error, info, warn};
 
@@ -77,6 +77,33 @@ const RESULT_CHANNEL_BUFFER: usize = 256;
 
 /// Channel buffer size for errors.
 const ERROR_CHANNEL_BUFFER: usize = 64;
+
+/// Build a DashScope WebSocket upgrade `Request` carrying the 5 mandatory WS handshake headers
+/// (via `into_client_request`) plus DashScope's Bearer auth / `OpenAI-Beta` headers. Shared by the
+/// `build_request` helper and the per-attempt reconnect closure so neither can regress to a bare,
+/// unconnectable request. Returns a plain `String` error so each caller can map it into its own
+/// error type. See `build_request` for why the header set is load-bearing.
+fn build_dashscope_ws_request(
+    url: &str,
+    api_key: &str,
+    is_qwen_model: bool,
+) -> Result<Request<()>, String> {
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| format!("Failed to build request: {e}"))?;
+    let headers = request.headers_mut();
+    headers.insert(
+        "Authorization",
+        format!("Bearer {api_key}")
+            .parse()
+            .map_err(|e| format!("Invalid Authorization header: {e}"))?,
+    );
+    headers.insert("User-Agent", "WaaV-Gateway/1.0".parse().unwrap());
+    if is_qwen_model {
+        headers.insert("OpenAI-Beta", "realtime=v1".parse().unwrap());
+    }
+    Ok(request)
+}
 
 // =============================================================================
 // Type Aliases
@@ -385,23 +412,22 @@ impl DashScopeStt {
         })
     }
 
-    /// Build WebSocket request with authentication headers.
+    /// Build the DashScope WebSocket upgrade request with authentication headers.
+    ///
+    /// CRITICAL: the request MUST be built via `into_client_request` (which derives the 5 mandatory
+    /// WS handshake headers — `Host`, `Connection`, `Upgrade`, `Sec-WebSocket-Version`,
+    /// `Sec-WebSocket-Key`). A bare `Request::builder().uri(url).header("Authorization", ...)` omits
+    /// all of them, so tungstenite's `generate_request` rejects EVERY connect with
+    /// `Protocol(InvalidHeader)` — which the reconnect supervisor swallows and surfaces only as a
+    /// "connection timeout". (This provider was 100% unable to connect before this fix.)
     fn build_request(&self) -> Result<Request<()>, STTError> {
         let url = self.config.get_websocket_url();
-
-        let mut request = Request::builder()
-            .uri(&url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("User-Agent", "WaaV-Gateway/1.0");
-
-        // Add OpenAI-Beta header for Qwen models
-        if self.config.model.is_qwen_model() {
-            request = request.header("OpenAI-Beta", "realtime=v1");
-        }
-
-        request
-            .body(())
-            .map_err(|e| STTError::ConnectionFailed(format!("Failed to build request: {}", e)))
+        build_dashscope_ws_request(
+            &url,
+            &self.config.api_key,
+            self.config.model.is_qwen_model(),
+        )
+        .map_err(STTError::ConnectionFailed)
     }
 
     /// Create session update message for Qwen format.
@@ -612,17 +638,12 @@ impl BaseSTT for DashScopeStt {
                     let result_tx = result_tx.clone();
                     let error_tx = error_tx.clone();
                     async move {
-                        // Build a fresh request per attempt (Bearer auth in the headers).
-                        let mut builder = Request::builder()
-                            .uri(&url)
-                            .header("Authorization", format!("Bearer {api_key}"))
-                            .header("User-Agent", "WaaV-Gateway/1.0");
-                        if is_qwen_model {
-                            builder = builder.header("OpenAI-Beta", "realtime=v1");
-                        }
-                        let request = builder.body(()).map_err(|e| {
-                            StreamError::new(format!("Failed to build request: {e}"))
-                        })?;
+                        // Build a fresh request per attempt via the shared helper so the 5 mandatory
+                        // WS upgrade headers are present (a bare builder → InvalidHeader → the
+                        // reconnect loop retries forever → connect timeout).
+                        let request =
+                            build_dashscope_ws_request(&url, &api_key, is_qwen_model)
+                                .map_err(StreamError::new)?;
 
                         let (ws_stream, _) =
                             match timeout(WS_CONNECT_TIMEOUT, connect_async(request)).await {
@@ -1051,8 +1072,25 @@ mod tests {
         let config = create_test_config();
         let stt = DashScopeStt::new(config).unwrap();
 
-        let request = stt.build_request();
-        assert!(request.is_ok());
+        let request = stt.build_request().expect("build_request");
+        let h = request.headers();
+        // The 5 mandatory WS upgrade headers MUST be present, or tungstenite rejects the connect
+        // with InvalidHeader (the connect-timeout bug). Plus DashScope's Bearer auth.
+        for required in [
+            "host",
+            "connection",
+            "upgrade",
+            "sec-websocket-version",
+            "sec-websocket-key",
+        ] {
+            assert!(h.contains_key(required), "missing WS header: {required}");
+        }
+        assert!(
+            h.get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("Bearer ")),
+            "missing Bearer Authorization header"
+        );
     }
 
     #[test]
