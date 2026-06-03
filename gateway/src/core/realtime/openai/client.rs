@@ -134,9 +134,26 @@ pub struct OpenAIRealtime {
 
     /// Reconnection event callback
     reconnection_callback: Arc<Mutex<Option<ReconnectionCallback>>>,
+
+    /// Shared, process-global resilience handles (W-D2 fleet adoption): the single reconnect
+    /// governor + this provider's shared circuit breaker. Unlike the streaming STT providers, the
+    /// realtime client already owns a mature bespoke reconnect loop (backoff + session restore +
+    /// intentional-disconnect). Rather than rewrite that proven loop onto `ReconnectableStream`,
+    /// we make it *participate* in the shared primitives: it consults the breaker before each
+    /// reconnect dial (storm control + provider tripping) and records the outcome on it — and
+    /// because the registry's breaker self-publishes `waav_circuit_breaker_state{provider="openai"}`
+    /// on every transition, the realtime path now moves the gauge too. `None` (a direct
+    /// construction) → the loop reconnects exactly as before.
+    resilience: Option<crate::core::resilience::ResilienceHandles>,
 }
 
 impl OpenAIRealtime {
+    /// The shared circuit breaker this session feeds, if injected (for metrics/tests).
+    pub fn resilience_breaker(
+        &self,
+    ) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.as_ref().map(|r| &r.breaker)
+    }
     /// Get the configured model.
     pub fn model(&self) -> OpenAIRealtimeModel {
         self.model
@@ -508,6 +525,7 @@ impl BaseRealtime for OpenAIRealtime {
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
             last_session_config: Arc::new(RwLock::new(None)),
             reconnection_callback: Arc::new(Mutex::new(None)),
+            resilience: None,
         })
     }
 
@@ -579,6 +597,16 @@ impl BaseRealtime for OpenAIRealtime {
         let ws_url = url.clone();
         let last_session_config = self.last_session_config.clone();
         let reconnection_callback = self.reconnection_callback.clone();
+        // Shared resilience handles (W-D2): the realtime loop consults the breaker before each
+        // reconnect dial (storm control + provider tripping) and records the outcome. The registry
+        // breaker self-publishes `waav_circuit_breaker_state{provider="openai"}` on transition.
+        let (breaker, governor) = match &self.resilience {
+            Some(r) => (
+                Some(std::sync::Arc::clone(&r.breaker)),
+                Some((*r.governor).clone()),
+            ),
+            None => (None, None),
+        };
 
         // Mark as connected before spawning task
         self.connected.store(true, Ordering::SeqCst);
@@ -717,6 +745,27 @@ impl BaseRealtime for OpenAIRealtime {
                     break 'outer;
                 }
 
+                // W-D2 storm control: consult the shared per-provider breaker before dialing. If a
+                // wide OpenAI outage tripped it (from this or any other realtime session), do NOT
+                // hammer it — skip this attempt and let the next backoff tick re-check. The breaker
+                // self-publishes `waav_circuit_breaker_state{provider="openai"}` on transition.
+                if let Some(b) = &breaker {
+                    if !b.allow_request() {
+                        tracing::warn!(
+                            "OpenAI realtime breaker open; deferring reconnect attempt {}",
+                            reconnect_attempt
+                        );
+                        crate::core::metrics::bridge::record_reconnect("openai", "circuit_open");
+                        continue;
+                    }
+                }
+                // Hold a governed slot across the dial so a fleet-wide outage can't make every
+                // realtime session reconnect at once (shared process-global cap).
+                let _permit = match &governor {
+                    Some(g) => Some(g.acquire().await),
+                    None => None,
+                };
+
                 // Attempt to reconnect
                 let request = match http::Request::builder()
                     .uri(&ws_url)
@@ -743,6 +792,13 @@ impl BaseRealtime for OpenAIRealtime {
                 match tokio_tungstenite::connect_async(request).await {
                     Ok((new_ws_stream, _)) => {
                         tracing::info!("Reconnected to OpenAI Realtime API");
+                        // Tell the shared breaker the dial succeeded (closes a half-open probe /
+                        // tallies a healthy sample) and bump the reconnect counter.
+                        if let Some(b) = &breaker {
+                            b.record_success();
+                        }
+                        crate::core::metrics::bridge::record_reconnect("openai", "success");
+                        drop(_permit);
 
                         let (new_sink, new_stream) = new_ws_stream.split();
                         current_ws_sink = new_sink;
@@ -791,6 +847,13 @@ impl BaseRealtime for OpenAIRealtime {
                     }
                     Err(e) => {
                         tracing::error!("Reconnection attempt {} failed: {}", reconnect_attempt, e);
+                        // Record the failed dial on the shared breaker so a persistently-down
+                        // OpenAI trips it for every realtime session (self-publishes the gauge).
+                        if let Some(b) = &breaker {
+                            b.record_failure();
+                        }
+                        crate::core::metrics::bridge::record_reconnect("openai", "failure");
+                        drop(_permit);
                         // Continue to next iteration which will retry or give up
                         continue;
                     }
@@ -1086,6 +1149,13 @@ impl BaseRealtime for OpenAIRealtime {
             "documentation": "https://platform.openai.com/docs/guides/realtime"
         })
     }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared, process-global handles so the bespoke reconnect loop consults the
+        // breaker before each dial (storm control + per-provider tripping) and records the
+        // outcome — moving `waav_circuit_breaker_state{provider="openai"}` on transition (W-D2).
+        self.resilience = Some(resilience);
+    }
 }
 
 impl OpenAIRealtime {
@@ -1139,6 +1209,7 @@ impl Default for OpenAIRealtime {
                 intentional_disconnect: Arc::new(AtomicBool::new(false)),
                 last_session_config: Arc::new(RwLock::new(None)),
                 reconnection_callback: Arc::new(Mutex::new(None)),
+                resilience: None,
             }
         })
     }

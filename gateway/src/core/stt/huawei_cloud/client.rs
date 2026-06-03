@@ -307,15 +307,8 @@ impl HuaweiCloudStt {
         self.ws_sender = Some(audio_tx);
         self.shutdown_tx = Some(shutdown_tx);
 
-        // Send START frame
-        let start_frame = HuaweiStartFrame::new(
-            self.config.audio_format.as_str(),
-            self.config.model.as_str(),
-            self.config.add_punctuation,
-            self.config.digit_norm,
-            self.config.vocabulary_id.as_deref(),
-            self.config.need_word_info,
-        );
+        // Send START frame (built from the shared single-source-of-truth constructor).
+        let start_frame = HuaweiStartFrame::from_config(&self.config);
 
         let start_json = start_frame.to_json().map_err(|e| {
             STTError::ConnectionFailed(format!("Failed to serialize START frame: {}", e))

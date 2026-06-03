@@ -721,6 +721,7 @@ fn test_stream_config_serialization() {
         model: "stt-general-online".to_string(),
         label: Some("test".to_string()),
         include_partial: Some(true),
+        include_filler: Some(false),
         audio: Some(ProsaSttAudioConfig {
             format: "wav".to_string(),
             channels: Some(1),

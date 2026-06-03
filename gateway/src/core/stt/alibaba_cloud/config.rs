@@ -500,6 +500,19 @@ pub struct DashScopeSttConfig {
     /// Enable word-level timestamps.
     #[serde(default)]
     pub word_timestamps: bool,
+
+    /// Paraformer-only: VAD multi-threshold mode, which prevents over-segmentation of long
+    /// sentences (`multi_threshold_mode_enabled` in the inference run-task `parameters`).
+    /// `None` omits the field (server default). Has no effect on Qwen realtime models.
+    #[serde(default)]
+    pub multi_threshold_mode_enabled: Option<bool>,
+
+    /// Qwen-realtime-only: server-VAD speech-activation threshold (0.0–1.0) sent as
+    /// `turn_detection.threshold` in the `session.update`. Higher = less sensitive (needs louder
+    /// speech to trigger). `None` falls back to the API's default sensitivity. Has no effect on
+    /// Paraformer inference models.
+    #[serde(default)]
+    pub turn_detection_threshold: Option<f32>,
 }
 
 fn default_sample_rate() -> u32 {
@@ -531,6 +544,8 @@ impl Default for DashScopeSttConfig {
             context_text: None,
             vocabulary_id: None,
             word_timestamps: false,
+            multi_threshold_mode_enabled: None,
+            turn_detection_threshold: None,
         }
     }
 }
@@ -582,6 +597,8 @@ impl DashScopeSttConfig {
             context_text: None,
             vocabulary_id: None,
             word_timestamps: false,
+            multi_threshold_mode_enabled: None,
+            turn_detection_threshold: None,
         })
     }
 
@@ -614,6 +631,24 @@ impl DashScopeSttConfig {
         }
         if let Some(true) = f.language_detection {
             cfg.language = DashScopeLanguage::Auto;
+        }
+        // Provider-specific VAD knobs forwarded through the open ProviderExtras passthrough (no
+        // canonical SttFeatures field models them). `multi_threshold_mode_enabled` is a Paraformer
+        // inference run-task parameter (prevents over-segmentation of long sentences);
+        // `turn_detection.threshold` is the Qwen-realtime server-VAD speech-activation threshold.
+        let ex = &std.extras.0;
+        if let Some(b) = ex
+            .get("multi_threshold_mode_enabled")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.multi_threshold_mode_enabled = Some(b);
+        }
+        if let Some(t) = ex
+            .get("turn_detection.threshold")
+            .or_else(|| ex.get("turn_detection_threshold"))
+            .and_then(|v| v.as_f64())
+        {
+            cfg.turn_detection_threshold = Some(t as f32);
         }
         Ok(cfg)
     }

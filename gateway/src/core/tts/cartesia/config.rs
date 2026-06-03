@@ -610,22 +610,58 @@ pub struct CartesiaTTSConfig {
     /// Format: "YYYY-MM-DD"
     /// Default: "2025-04-16"
     pub api_version: String,
+
+    /// Optional spoken-language override sent as the top-level `language` body field.
+    ///
+    /// Cartesia's `/tts/bytes` accepts an optional `language` parameter (BCP-47-ish code,
+    /// e.g. "en", "fr", "de") that controls which language the model speaks. When `None`,
+    /// the request builder falls back to the default ("en"). Populated from the standardized
+    /// [`TtsFeatures::language`].
+    ///
+    /// [`TtsFeatures::language`]: crate::core::tts::standard::TtsFeatures::language
+    pub language: Option<String>,
+
+    /// Optional loudness multiplier sent as `generation_config.volume`.
+    ///
+    /// Cartesia's `generation_config.volume` is a multiplier in [0.5, 2.0] (default 1.0).
+    /// This is an audio-changing field, so it is folded into the cache-key hash. Populated
+    /// from the standardized [`TtsFeatures::volume`].
+    ///
+    /// [`TtsFeatures::volume`]: crate::core::tts::standard::TtsFeatures::volume
+    pub volume: Option<f32>,
+
+    /// Optional pronunciation-dictionary id sent as the top-level `pronunciation_dict_id`
+    /// body field.
+    ///
+    /// Cartesia's `/tts/bytes` accepts an optional `pronunciation_dict_id` (a custom
+    /// pronunciation dictionary reference) that changes how words are spoken, so it is an
+    /// audio-changing field folded into the cache-key hash. Populated from the
+    /// `provider_extras` passthrough (`pronunciation_dict_id`).
+    pub pronunciation_dict_id: Option<String>,
 }
 
 impl CartesiaTTSConfig {
     /// Build from the standardized config (W1 keystone for TTS — uniform entry point).
     ///
-    /// Cartesia's request body exposes a `generation_config` (speed + emotion) and an
-    /// `output_format` (sample rate), so this maps the matching standardized features:
+    /// Cartesia's request body (confirmed against the `POST /tts/bytes` reference) exposes a
+    /// top-level `language` and `pronunciation_dict_id`, a `generation_config` (speed + volume +
+    /// emotion) and an `output_format` (sample rate), so this maps the matching standardized
+    /// features:
     /// - [`TtsFeatures::speed`] → `base.speaking_rate` (sent as `generation_config.speed`)
+    /// - [`TtsFeatures::volume`] → `self.volume` (sent as `generation_config.volume`)
     /// - [`TtsFeatures::emotion`] → `base.emotion_config` (sent as `generation_config.emotion`)
+    /// - [`TtsFeatures::language`] → `self.language` (sent as the top-level `language`)
     /// - [`TtsFeatures::sample_rate`] → `output_format.sample_rate`
+    /// - `provider_extras["pronunciation_dict_id"]` → `self.pronunciation_dict_id` (sent as the
+    ///   top-level `pronunciation_dict_id`)
     ///
-    /// Features Cartesia can't express (pitch, volume, ElevenLabs voice settings, instructions,
-    /// ssml, language, word_timestamps, streaming, seed) are skipped.
+    /// Features Cartesia can't express (pitch, ElevenLabs voice settings, instructions, ssml,
+    /// word_timestamps, streaming, seed) are skipped.
     ///
     /// [`TtsFeatures::speed`]: crate::core::tts::standard::TtsFeatures::speed
+    /// [`TtsFeatures::volume`]: crate::core::tts::standard::TtsFeatures::volume
     /// [`TtsFeatures::emotion`]: crate::core::tts::standard::TtsFeatures::emotion
+    /// [`TtsFeatures::language`]: crate::core::tts::standard::TtsFeatures::language
     /// [`TtsFeatures::sample_rate`]: crate::core::tts::standard::TtsFeatures::sample_rate
     pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
         let f = &std.features;
@@ -643,6 +679,25 @@ impl CartesiaTTSConfig {
         let mut cfg = Self::from_base(base);
         if let Some(rate) = f.sample_rate {
             cfg.output_format.sample_rate = rate;
+        }
+        // Volume → generation_config.volume (audio-changing; folded into the cache hash).
+        if let Some(volume) = f.volume {
+            cfg.volume = Some(volume);
+        }
+        // Language → top-level `language` (replaces the request builder's hardcoded "en").
+        if let Some(language) = f.language.as_ref().filter(|s| !s.is_empty()) {
+            cfg.language = Some(language.clone());
+        }
+        // pronunciation_dict_id → top-level `pronunciation_dict_id` (extras passthrough;
+        // audio-changing, so folded into the cache hash).
+        if let Some(dict_id) = std
+            .extras
+            .0
+            .get("pronunciation_dict_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            cfg.pronunciation_dict_id = Some(dict_id.to_string());
         }
         cfg
     }
@@ -696,6 +751,9 @@ impl CartesiaTTSConfig {
             model,
             output_format,
             api_version: DEFAULT_API_VERSION.to_string(),
+            language: None,
+            volume: None,
+            pronunciation_dict_id: None,
         }
     }
 
@@ -797,6 +855,9 @@ impl Default for CartesiaTTSConfig {
             model: DEFAULT_MODEL.to_string(),
             output_format: CartesiaOutputFormat::default(),
             api_version: DEFAULT_API_VERSION.to_string(),
+            language: None,
+            volume: None,
+            pronunciation_dict_id: None,
         }
     }
 }

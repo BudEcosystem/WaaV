@@ -613,102 +613,93 @@ mod provider_tests {
         assert!(!body.contains("<speak"));
     }
 
+    // WIRE-LEVEL: rate_percentage reaches the native /v1/synthesize query param (replaces the
+    // former SSML-body assertion — prosody is now applied via native query params).
     #[test]
-    fn test_provider_prepare_request_body_with_rate() {
+    fn test_provider_rate_percentage_reaches_query_param() {
         let mut config = IbmWatsonTTSConfig::default();
+        config.instance_id = "inst".to_string();
         config.rate_percentage = Some(25);
 
-        let tts = IbmWatsonTTS::new_from_ibm_config(config).unwrap();
-        let body = tts.prepare_request_body("Test text");
+        let url = reqwest::Url::parse_with_params(
+            &config.build_synthesis_url(),
+            &config.build_query_params(),
+        )
+        .unwrap();
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(pairs.get("rate_percentage").map(String::as_str), Some("25"));
 
-        // Note: JSON escapes quotes, so we check for escaped versions
-        assert!(body.contains("<speak"));
-        assert!(body.contains(r#"rate=\"+25%\""#));
+        // And the JSON body stays plain text (no SSML).
+        let tts = IbmWatsonTTS::new_from_ibm_config(config).unwrap();
+        assert!(!tts.prepare_request_body("Test text").contains("<speak"));
     }
 
     #[test]
-    fn test_provider_prepare_request_body_with_negative_rate() {
+    fn test_provider_negative_rate_percentage_reaches_query_param() {
         let mut config = IbmWatsonTTSConfig::default();
+        config.instance_id = "inst".to_string();
         config.rate_percentage = Some(-30);
 
-        let tts = IbmWatsonTTS::new_from_ibm_config(config).unwrap();
-        let body = tts.prepare_request_body("Test text");
-
-        // Note: JSON escapes quotes
-        assert!(body.contains(r#"rate=\"-30%\""#));
+        let url = reqwest::Url::parse_with_params(
+            &config.build_synthesis_url(),
+            &config.build_query_params(),
+        )
+        .unwrap();
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(pairs.get("rate_percentage").map(String::as_str), Some("-30"));
     }
 
     #[test]
-    fn test_provider_prepare_request_body_with_pitch() {
+    fn test_provider_pitch_percentage_reaches_query_param() {
         let mut config = IbmWatsonTTSConfig::default();
+        config.instance_id = "inst".to_string();
         config.pitch_percentage = Some(15);
 
-        let tts = IbmWatsonTTS::new_from_ibm_config(config).unwrap();
-        let body = tts.prepare_request_body("Test text");
-
-        // Note: JSON escapes quotes
-        assert!(body.contains("<speak"));
-        assert!(body.contains(r#"pitch=\"+15%\""#));
+        let url = reqwest::Url::parse_with_params(
+            &config.build_synthesis_url(),
+            &config.build_query_params(),
+        )
+        .unwrap();
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(pairs.get("pitch_percentage").map(String::as_str), Some("15"));
     }
 
     #[test]
-    fn test_provider_prepare_request_body_with_rate_and_pitch() {
+    fn test_provider_rate_and_pitch_percentage_reach_query_params() {
         let mut config = IbmWatsonTTSConfig::default();
+        config.instance_id = "inst".to_string();
         config.rate_percentage = Some(50);
         config.pitch_percentage = Some(-20);
 
+        let url = reqwest::Url::parse_with_params(
+            &config.build_synthesis_url(),
+            &config.build_query_params(),
+        )
+        .unwrap();
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(pairs.get("rate_percentage").map(String::as_str), Some("50"));
+        assert_eq!(pairs.get("pitch_percentage").map(String::as_str), Some("-20"));
+
+        // Body is plain text, not double-wrapped in SSML.
         let tts = IbmWatsonTTS::new_from_ibm_config(config).unwrap();
         let body = tts.prepare_request_body("Test text");
-
-        // Note: JSON escapes quotes
-        assert!(body.contains("<speak"));
-        assert!(body.contains("<prosody"));
-        assert!(body.contains(r#"rate=\"+50%\""#));
-        assert!(body.contains(r#"pitch=\"-20%\""#));
+        assert!(!body.contains("<prosody"));
     }
 
+    // serde JSON-string-escapes the body text (the SSML XML-escaping path is gone). Plain text with
+    // special characters round-trips through the JSON body unchanged.
     #[test]
-    fn test_provider_prepare_request_body_escapes_ampersand() {
+    fn test_provider_request_body_json_escapes_text() {
         let mut config = IbmWatsonTTSConfig::default();
         config.rate_percentage = Some(10);
 
         let tts = IbmWatsonTTS::new_from_ibm_config(config).unwrap();
-        let body = tts.prepare_request_body("Tom & Jerry");
-
-        assert!(body.contains("Tom &amp; Jerry"));
-    }
-
-    #[test]
-    fn test_provider_prepare_request_body_escapes_less_than() {
-        let mut config = IbmWatsonTTSConfig::default();
-        config.rate_percentage = Some(10);
-
-        let tts = IbmWatsonTTS::new_from_ibm_config(config).unwrap();
-        let body = tts.prepare_request_body("x < y");
-
-        assert!(body.contains("x &lt; y"));
-    }
-
-    #[test]
-    fn test_provider_prepare_request_body_escapes_greater_than() {
-        let mut config = IbmWatsonTTSConfig::default();
-        config.rate_percentage = Some(10);
-
-        let tts = IbmWatsonTTS::new_from_ibm_config(config).unwrap();
-        let body = tts.prepare_request_body("x > y");
-
-        assert!(body.contains("x &gt; y"));
-    }
-
-    #[test]
-    fn test_provider_prepare_request_body_escapes_quotes() {
-        let mut config = IbmWatsonTTSConfig::default();
-        config.rate_percentage = Some(10);
-
-        let tts = IbmWatsonTTS::new_from_ibm_config(config).unwrap();
-        let body = tts.prepare_request_body("He said \"hello\"");
-
-        assert!(body.contains("&quot;hello&quot;"));
+        let body = tts.prepare_request_body("Tom & Jerry <3 \"cats\" > dogs");
+        // The body parses as JSON and the text field is the verbatim string (no XML entities).
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["text"], "Tom & Jerry <3 \"cats\" > dogs");
+        assert!(!body.contains("&amp;"));
+        assert!(!body.contains("&lt;"));
     }
 
     #[test]

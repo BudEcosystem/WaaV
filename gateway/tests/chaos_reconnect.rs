@@ -347,3 +347,193 @@ async fn deepgram_recovers_after_midstream_kill() {
         "finals lost across the Deepgram reconnect: got {got:?}, expected {expected:?}"
     );
 }
+
+// =============================================================================
+// Part C — REAL CartesiaSTT through a mock WS server (newly-migrated provider, W-D1 fleet)
+// =============================================================================
+
+/// A mock Cartesia-style WS server that:
+///   1. captures every connection's request URI (so we can assert the featured query — model +
+///      encoding — is re-sent on reconnect, i.e. the URL *is* the session restore for Cartesia),
+///   2. on the FIRST connection emits finals `0..split` then **drops the socket** mid-stream,
+///   3. on the SECOND connection emits `split..total` then keeps the socket open.
+/// Cartesia speaks raw binary audio in and `{"type":"transcript","text":..,"is_final":..}` out.
+async fn spawn_dropping_cartesia_mock(
+    split: usize,
+    total: usize,
+) -> (u16, Arc<Mutex<MockObservations>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let obs = Arc::new(Mutex::new(MockObservations::default()));
+    let obs_ret = Arc::clone(&obs);
+    let conn_count = Arc::new(AtomicUsize::new(0));
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let obs = Arc::clone(&obs);
+            let conn_count = Arc::clone(&conn_count);
+            tokio::spawn(async move {
+                let captured_uri = Arc::new(std::sync::Mutex::new(String::new()));
+                let cap = Arc::clone(&captured_uri);
+                let callback = move |req: &Request, resp: Response| {
+                    *cap.lock().unwrap() = req.uri().to_string();
+                    Ok(resp)
+                };
+                let ws = match accept_hdr_async(stream, callback).await {
+                    Ok(ws) => ws,
+                    Err(_) => return,
+                };
+                let uri = captured_uri.lock().unwrap().clone();
+                let which = conn_count.fetch_add(1, Ordering::AcqRel);
+                obs.lock().await.connect_uris.push(uri);
+
+                let (mut write, mut read) = ws.split();
+
+                let (lo, hi, drop_after) = if which == 0 {
+                    (0, split, true)
+                } else {
+                    (split, total, false)
+                };
+
+                let mut idx = lo;
+                let mut ticker = tokio::time::interval(Duration::from_millis(15));
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {
+                            if idx < hi {
+                                let transcript = format!(
+                                    r#"{{"type":"transcript","text":"final {idx}","is_final":true}}"#
+                                );
+                                if write.send(Message::Text(transcript.into())).await.is_err() {
+                                    return;
+                                }
+                                idx += 1;
+                            } else if drop_after {
+                                // First connection: emitted our half — drop abruptly (no close
+                                // frame) to simulate a mid-stream kill.
+                                return;
+                            }
+                        }
+                        msg = read.next() => {
+                            match msg {
+                                Some(Ok(Message::Close(_))) | None => return,
+                                Some(Ok(Message::Text(t))) => {
+                                    // Cartesia's graceful shutdown is the JSON string "done".
+                                    if t.contains("done") { return; }
+                                }
+                                Some(Ok(_)) => {} // raw binary audio / ping etc.
+                                Some(Err(_)) => return,
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    (port, obs_ret)
+}
+
+/// Drives the REAL `CartesiaSTT` provider (a newly-migrated W-D1 provider) through the mock that
+/// kills the socket mid-stream. Asserts: it reconnects (>=2 connections), the reconnect re-sends
+/// the *featured* connect URL (model + encoding — Cartesia's session restore IS the URL), recovery
+/// is timely, and NO finals are lost across the drop.
+#[tokio::test]
+async fn cartesia_recovers_after_midstream_kill() {
+    const SPLIT: usize = 5;
+    const TOTAL: usize = 10;
+
+    let (port, obs) = spawn_dropping_cartesia_mock(SPLIT, TOTAL).await;
+    let endpoint = format!("ws://127.0.0.1:{port}");
+
+    let std_cfg = StandardSTTConfig {
+        base: STTConfig {
+            provider: "cartesia".into(),
+            api_key: "test-key".into(),
+            model: "ink-whisper".into(),
+            language: "en".into(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "linear16".into(),
+        },
+        features: SttFeatures {
+            endpointing_ms: Some(500),
+            ..Default::default()
+        },
+        extras: Default::default(),
+    }
+    .with_endpoint_override(&endpoint);
+
+    let mut provider = create_stt_standard("cartesia", std_cfg).expect("build cartesia");
+
+    let collected: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&collected);
+    let cb: STTResultCallback = Arc::new(move |r: STTResult| {
+        let sink = Arc::clone(&sink);
+        Box::pin(async move {
+            if r.is_final {
+                if let Some(n) = r.transcript.rsplit(' ').next().and_then(|s| s.parse().ok()) {
+                    sink.lock().await.push(n);
+                }
+            }
+        })
+    });
+    provider.on_result(cb).await.unwrap();
+
+    let start = Instant::now();
+    provider.connect().await.expect("initial connect");
+
+    let audio = bytes::Bytes::from(vec![0u8; 640]);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let _ = provider.send_audio(audio.clone()).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        if collected.lock().await.len() >= TOTAL {
+            break;
+        }
+        if Instant::now() > deadline {
+            break;
+        }
+    }
+    let elapsed_to_full = start.elapsed();
+    let _ = provider.disconnect().await;
+
+    // 1. The session reconnected: the mock saw (at least) two connections.
+    let uris = obs.lock().await.connect_uris.clone();
+    assert!(
+        uris.len() >= 2,
+        "expected a reconnect (>=2 connections), saw {}: {uris:?}",
+        uris.len()
+    );
+
+    // 2. The reconnect re-sent the FEATURED connect URL (Cartesia carries the featured session in
+    //    the URL): model + encoding present on the SECOND connection, not a bare reconnect.
+    let restore_uri = &uris[1];
+    assert!(
+        restore_uri.contains("model=ink-whisper"),
+        "restore did not re-send the model: {restore_uri}"
+    );
+    assert!(
+        restore_uri.contains("encoding=pcm_s16le"),
+        "restore did not re-send the encoding: {restore_uri}"
+    );
+
+    // 3. Recovery was timely (aggressive preset caps backoff at 5s; full set well under 8s).
+    assert!(
+        elapsed_to_full < Duration::from_secs(8),
+        "recovery to full set took too long: {elapsed_to_full:?}"
+    );
+
+    // 4. No finals lost: union of pre-drop + post-reconnect == the full numbered set.
+    let got: HashSet<usize> = collected.lock().await.iter().copied().collect();
+    let expected: HashSet<usize> = (0..TOTAL).collect();
+    assert_eq!(
+        got, expected,
+        "finals lost across the Cartesia reconnect: got {got:?}, expected {expected:?}"
+    );
+}

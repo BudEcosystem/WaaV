@@ -64,8 +64,12 @@ pub struct AcapelaRequestBuilder {
 impl AcapelaRequestBuilder {
     /// Create a new request builder from configurations
     pub fn new(acapela_config: AcapelaTtsConfig, base_config: TTSConfig, token: String) -> Self {
-        // Build pronunciation replacer from base config
-        let pronunciation_replacer = if !base_config.pronunciations.is_empty() {
+        // Build pronunciation replacer from base config. SSML input is forwarded verbatim — the
+        // word-boundary regex substitution would corrupt the markup — so the replacer is disabled
+        // when `ssml_input` is set (pronunciation control belongs inside the SSML in that case).
+        let pronunciation_replacer = if !base_config.pronunciations.is_empty()
+            && !acapela_config.ssml_input
+        {
             Some(PronunciationReplacer::new(&base_config.pronunciations))
         } else {
             None
@@ -577,6 +581,61 @@ mod tests {
         assert!(tts.acapela_config().word_positions);
         // base carried through.
         assert_eq!(tts.base_config.api_key, "user@example.com:password");
+    }
+
+    // WIRE-LEVEL: with `ssml=true`, the SSML markup must reach the actual `text` query parameter
+    // of the Acapela command request VERBATIM (Acapela auto-detects SSML in `text`; there is no
+    // separate input-type param), and pronunciation replacement — which would corrupt the tags —
+    // must be suppressed on that request. Asserts on the real query the request builder emits, not
+    // just the config struct.
+    #[test]
+    fn ssml_reaches_text_query_param_verbatim_and_disables_replacer() {
+        use crate::core::tts::base::Pronunciation;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        const SSML: &str =
+            r#"<speak>Hello <break time="300ms"/><prosody rate="slow">Acapela</prosody></speak>"#;
+
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "acapela".into(),
+                api_key: "user@example.com:password".into(),
+                voice_id: Some("alice".into()),
+                // A pronunciation that WOULD rewrite "Acapela" inside the SSML if not suppressed.
+                pronunciations: vec![Pronunciation {
+                    word: "Acapela".into(),
+                    pronunciation: "ah-kah-peh-lah".into(),
+                }],
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                ssml: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = AcapelaTts::from_standard(&std).unwrap();
+        assert!(tts.acapela_config().ssml_input, "ssml feature must set ssml_input");
+
+        // The request builder must NOT mangle SSML — the replacer is suppressed.
+        let builder = AcapelaRequestBuilder::new(
+            tts.acapela_config().clone(),
+            std.base.clone(),
+            "test-token".into(),
+        );
+        assert!(
+            builder.get_pronunciation_replacer().is_none(),
+            "pronunciation replacement must be suppressed for SSML input"
+        );
+
+        // The SSML reaches the `text` query parameter verbatim (this is the body the wire carries).
+        let params = tts.acapela_config().build_query_params(SSML);
+        let params_map: std::collections::HashMap<_, _> = params.into_iter().collect();
+        assert_eq!(
+            params_map.get("text"),
+            Some(&SSML.to_string()),
+            "SSML markup must reach the `text` query parameter verbatim"
+        );
     }
 
     #[test]

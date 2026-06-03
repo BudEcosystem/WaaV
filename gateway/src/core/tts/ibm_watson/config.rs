@@ -640,12 +640,13 @@ impl Default for IbmWatsonTTSConfig {
 }
 
 impl IbmWatsonTTSConfig {
-    /// Build from the standardized TTS config. IBM Watson exposes prosody via SSML, so this maps
-    /// `speed` -> `rate_percentage` and `pitch` -> `pitch_percentage` (both IBM percentage deltas,
-    /// 0 = normal), plus `sample_rate` -> `base.sample_rate`. IBM's `instance_id` (not a standard
-    /// field) is read from the `extras` passthrough. Features without an IBM field (stability,
-    /// similarity_boost, style, use_speaker_boost, emotion, instructions, ssml, language,
-    /// word_timestamps, streaming, seed, volume) are skipped.
+    /// Build from the standardized TTS config. IBM Watson exposes prosody via the **native**
+    /// `rate_percentage`/`pitch_percentage` `/v1/synthesize` query params, so this maps the typed
+    /// `rate_percentage`/`pitch_percentage` features 1:1 (or, as a fallback, derives them from the
+    /// provider-agnostic `speed`/`pitch` multipliers), plus `sample_rate` -> `base.sample_rate`.
+    /// IBM's `instance_id` (not a standard field) is read from the `extras` passthrough. Features
+    /// without an IBM field (stability, similarity_boost, style, use_speaker_boost, emotion,
+    /// instructions, ssml, language, word_timestamps, streaming, seed, volume) are skipped.
     pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
         let f = &std.features;
         let instance_id = std
@@ -665,12 +666,19 @@ impl IbmWatsonTTSConfig {
         if let Some(v) = std.base.voice_id.as_deref().filter(|v| !v.is_empty()) {
             cfg.voice = IbmVoice::from_str_or_default(v);
         }
-        if let Some(speed) = f.speed {
-            // IBM rate is an SSML percentage delta (0 = normal); a 1.0 multiplier maps to +0%.
+        // Prefer IBM's native percentage-delta knobs when the caller supplies them directly
+        // (they reach the `rate_percentage`/`pitch_percentage` query params 1:1). Otherwise fall
+        // back to deriving them from the provider-agnostic `speed`/`pitch` multipliers.
+        if let Some(rate) = f.rate_percentage {
+            cfg.rate_percentage = Some(rate);
+        } else if let Some(speed) = f.speed {
+            // IBM rate is a percentage delta (0 = normal); a 1.0 multiplier maps to +0%.
             cfg.rate_percentage = Some(((speed - 1.0) * 100.0) as i32);
         }
-        if let Some(pitch) = f.pitch {
-            // IBM pitch is an SSML percentage delta (0 = normal).
+        if let Some(pitch) = f.pitch_percentage {
+            cfg.pitch_percentage = Some(pitch);
+        } else if let Some(pitch) = f.pitch {
+            // IBM pitch is a percentage delta (0 = normal).
             cfg.pitch_percentage = Some(pitch as i32);
         }
         if let Some(rate) = f.sample_rate {
@@ -735,32 +743,35 @@ impl IbmWatsonTTSConfig {
     }
 
     /// Build query parameters for the synthesis request.
+    ///
+    /// `rate_percentage` and `pitch_percentage` are emitted as IBM Watson's **native**
+    /// `/v1/synthesize` query parameters (introduced 2022-08-31, see release notes) — a signed
+    /// integer percentage delta from the per-voice default (0 = normal). This is the documented
+    /// mechanism and is applied per-request without an SSML wrapper, so the param reaches the wire
+    /// 1:1. See <https://cloud.ibm.com/docs/text-to-speech?topic=text-to-speech-synthesis-params>.
     pub fn build_query_params(&self) -> Vec<(&'static str, String)> {
-        let mut params = vec![("voice".to_string(), self.voice.as_str().to_string())];
+        let mut params: Vec<(&'static str, String)> =
+            vec![("voice", self.voice.as_str().to_string())];
 
         // Add customization IDs if present
         for customization_id in &self.customization_ids {
-            params.push(("customization_id".to_string(), customization_id.clone()));
+            params.push(("customization_id", customization_id.clone()));
         }
 
         // Add spell out mode if set
         if let Some(ref mode) = self.spell_out_mode {
-            params.push(("spell_out_mode".to_string(), mode.clone()));
+            params.push(("spell_out_mode", mode.clone()));
         }
 
-        // Return as static str references with values
+        // Native prosody query params (audio-changing). Emitted as plain signed integers.
+        if let Some(rate) = self.rate_percentage {
+            params.push(("rate_percentage", rate.to_string()));
+        }
+        if let Some(pitch) = self.pitch_percentage {
+            params.push(("pitch_percentage", pitch.to_string()));
+        }
+
         params
-            .into_iter()
-            .map(|(k, v)| {
-                let key: &'static str = match k.as_str() {
-                    "voice" => "voice",
-                    "customization_id" => "customization_id",
-                    "spell_out_mode" => "spell_out_mode",
-                    _ => "voice",
-                };
-                (key, v)
-            })
-            .collect()
     }
 
     /// Get the Accept header for the request.
@@ -810,6 +821,32 @@ mod tests {
         assert_eq!(cfg.pitch_percentage, Some(25));
         assert_eq!(cfg.base.sample_rate, Some(16000));
         assert_eq!(cfg.instance_id, "inst-abc"); // from extras passthrough
+    }
+
+    // The native typed `rate_percentage`/`pitch_percentage` features reach the config 1:1 and take
+    // precedence over the multiplicative `speed`/`pitch` derivation when both are present.
+    #[test]
+    fn from_standard_prefers_native_rate_and_pitch_percentage() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "ibm-watson".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                // Multipliers present too — native percentage knobs must win.
+                speed: Some(2.0),
+                pitch: Some(99.0),
+                rate_percentage: Some(-15),
+                pitch_percentage: Some(40),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let cfg = IbmWatsonTTSConfig::from_standard(&std);
+        assert_eq!(cfg.rate_percentage, Some(-15)); // native knob, not speed-derived
+        assert_eq!(cfg.pitch_percentage, Some(40)); // native knob, not pitch-derived
     }
 
     #[test]

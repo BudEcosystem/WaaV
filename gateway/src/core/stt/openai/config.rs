@@ -509,6 +509,12 @@ pub struct OpenAISTTConfig {
     /// Only used when `response_format` is `DiarizedJson`.
     /// Requires `gpt-4o-transcribe` or `gpt-4o-mini-transcribe` model.
     pub diarization: DiarizationConfig,
+
+    /// Request streaming partial transcripts (server-sent events). Maps the standardized
+    /// `interim_results` feature onto OpenAI's `stream` form parameter. Only supported by the
+    /// `gpt-4o-transcribe`/`gpt-4o-mini-transcribe` models (`whisper-1` ignores it). Ref: OpenAI
+    /// `POST /v1/audio/transcriptions` `stream` field.
+    pub stream: bool,
 }
 
 /// Configuration for silence detection.
@@ -556,6 +562,7 @@ impl Default for OpenAISTTConfig {
             max_file_size_bytes: 25 * 1024 * 1024, // 25MB (OpenAI limit)
             silence_detection: SilenceDetectionConfig::default(),
             diarization: DiarizationConfig::default(),
+            stream: false,
         }
     }
 }
@@ -580,11 +587,19 @@ impl OpenAISTTConfig {
 
     /// Build from the standardized config (W1 keystone). OpenAI models its advanced features on
     /// the `response_format` (diarization needs `DiarizedJson`, word timestamps need a JSON format
-    /// with word granularity) and the free-form `prompt` (the documented spelling/vocabulary hint),
-    /// so this maps the standardized features whose meaning matches an existing OpenAI field:
-    /// diarization, word timestamps and keyterms. Features OpenAI cannot express (interim_results,
-    /// smart_format, profanity_filter, redaction, vad_events, entity/language detection) are
-    /// capability gaps and stay at default.
+    /// with word granularity), the free-form `prompt` (the documented spelling/vocabulary hint),
+    /// the `stream` flag (partial transcripts) and a set of diarization-side knobs. This maps:
+    /// - `diarization` → `DiarizedJson` response format,
+    /// - `word_timestamps` → word timestamp granularity (+ JSON format),
+    /// - `keyterms` → `prompt`,
+    /// - `interim_results` → `stream` (partial transcripts, gpt-4o models),
+    /// - extras `logprobs` (bool) → `include[]=logprobs` (token log probabilities),
+    /// - extras `chunking_strategy` (string `"auto"` or object) → `chunking_strategy` (server VAD),
+    /// - extras `known_speaker_names` (string array) → `known_speaker_names[]`,
+    /// - extras `known_speaker_references` (string array) → `known_speaker_references[]`.
+    ///
+    /// Features OpenAI cannot express (smart_format, profanity_filter, redaction, vad_events,
+    /// entity/language detection) are capability gaps and stay at default.
     pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
         let f = &std.features;
         let mut cfg = Self::from_base(std.base.clone());
@@ -608,7 +623,107 @@ impl OpenAISTTConfig {
             && !k.is_empty() {
                 cfg.prompt = Some(k.join(", "));
             }
+        // interim_results → stream (typed).
+        if let Some(s) = f.interim_results {
+            cfg.stream = s;
+        }
+        // Provider extras → diarization-side knobs (string keys not modeled by the typed vocab).
+        let e = &std.extras.0;
+        if let Some(b) = e.get("logprobs").and_then(|v| v.as_bool()) {
+            cfg.diarization.include_logprobs = b;
+        }
+        if let Some(arr) = e.get("known_speaker_names").and_then(|v| v.as_array()) {
+            cfg.diarization.known_speaker_names = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+        }
+        if let Some(arr) = e.get("known_speaker_references").and_then(|v| v.as_array()) {
+            // References are paired positionally with names: name[i] ↔ reference[i].
+            let names = &cfg.diarization.known_speaker_names;
+            cfg.diarization.speaker_references = arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .enumerate()
+                .map(|(i, audio)| {
+                    let name = names.get(i).cloned().unwrap_or_else(|| format!("speaker_{i}"));
+                    SpeakerReference::new(name, audio.to_string())
+                })
+                .collect();
+        }
+        if let Some(cs) = e.get("chunking_strategy") {
+            cfg.diarization.chunking_strategy =
+                serde_json::from_value::<ChunkingStrategy>(cs.clone()).ok().or_else(|| {
+                    // A bare `"auto"`/`"server_vad"` string selects the default server-VAD strategy.
+                    cs.as_str().filter(|s| !s.is_empty()).map(|_| ChunkingStrategy::default())
+                });
+        }
         cfg
+    }
+
+    /// Build the multipart text form fields (key/value pairs) that accompany the audio file part
+    /// on `POST /v1/audio/transcriptions`. This is the exact wire surface the client serializes
+    /// into the multipart body — extracted as a pure function so a test can assert each advanced
+    /// api_param actually reaches the request (the recurring "lives on the struct but never hits
+    /// the wire" bug class). The `file` part is added separately by the client.
+    ///
+    /// Repeated keys (`timestamp_granularities[]`, `include[]`, `known_speaker_names[]`,
+    /// `known_speaker_references[]`) appear once per value, matching OpenAI's array-form encoding.
+    pub fn transcription_text_fields(&self) -> Vec<(String, String)> {
+        let mut fields: Vec<(String, String)> = Vec::new();
+        fields.push(("model".into(), self.model.as_str().to_string()));
+        fields.push(("response_format".into(), self.response_format.as_str().to_string()));
+
+        if !self.base.language.is_empty() {
+            fields.push(("language".into(), self.base.language.clone()));
+        }
+        if let Some(temp) = self.temperature {
+            fields.push(("temperature".into(), temp.to_string()));
+        }
+        if let Some(ref prompt) = self.prompt {
+            fields.push(("prompt".into(), prompt.clone()));
+        }
+
+        // Timestamp granularities only apply to verbose_json.
+        if self.response_format == ResponseFormat::VerboseJson {
+            for g in &self.timestamp_granularities {
+                fields.push(("timestamp_granularities[]".into(), g.as_str().to_string()));
+            }
+        }
+
+        // Partial transcripts (interim_results → stream).
+        if self.stream {
+            fields.push(("stream".into(), "true".into()));
+        }
+
+        // Token log probabilities (`include[]=logprobs`). OpenAI only honors `include[]` for the
+        // JSON response formats, so guard on a JSON format to avoid a 400.
+        if self.diarization.include_logprobs
+            && matches!(
+                self.response_format,
+                ResponseFormat::Json | ResponseFormat::VerboseJson | ResponseFormat::DiarizedJson
+            )
+        {
+            fields.push(("include[]".into(), "logprobs".into()));
+        }
+
+        // Server-side VAD chunking strategy. Sent as a JSON-encoded value (object), matching the
+        // OpenAI schema for `chunking_strategy`.
+        if let Some(ref cs) = self.diarization.chunking_strategy
+            && let Ok(json) = serde_json::to_string(cs)
+        {
+            fields.push(("chunking_strategy".into(), json));
+        }
+
+        // Known speaker names + reference audio (diarization speaker matching).
+        for name in &self.diarization.known_speaker_names {
+            fields.push(("known_speaker_names[]".into(), name.clone()));
+        }
+        for r in &self.diarization.speaker_references {
+            fields.push(("known_speaker_references[]".into(), r.audio.clone()));
+        }
+
+        fields
     }
 
     /// Get the API endpoint URL.
@@ -683,6 +798,109 @@ impl OpenAISTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // WIRE-LEVEL (the recurring bug class): the advanced features mapped in `from_standard` must
+    // reach the multipart text fields the client serializes into the request body — not merely
+    // live on `DiarizationConfig`. This drives the standardized config through `from_standard`
+    // then through the SAME `transcription_text_fields()` the client posts, asserting each
+    // api_param (`stream`, `include[]=logprobs`, `chunking_strategy`, `known_speaker_names[]`,
+    // `known_speaker_references[]`) is present in the form body.
+    #[test]
+    fn advanced_features_reach_multipart_form_fields() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("logprobs".into(), serde_json::json!(true));
+        extras.insert(
+            "chunking_strategy".into(),
+            serde_json::json!({"type": "server_vad", "threshold": 0.6}),
+        );
+        extras.insert(
+            "known_speaker_names".into(),
+            serde_json::json!(["Alice", "Bob"]),
+        );
+        extras.insert(
+            "known_speaker_references".into(),
+            serde_json::json!(["data:audio/wav;base64,AAA=", "data:audio/wav;base64,BBB="]),
+        );
+
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "openai".into(),
+                api_key: "test-key".into(),
+                model: "gpt-4o-transcribe".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                interim_results: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+
+        let cfg = OpenAISTTConfig::from_standard(&std);
+        // The mapped config must validate (diarization needs a gpt-4o model + DiarizedJson).
+        assert!(cfg.validate().is_ok(), "mapped config should validate");
+
+        let fields = cfg.transcription_text_fields();
+        let has = |k: &str, v: &str| fields.iter().any(|(fk, fv)| fk == k && fv == v);
+
+        // interim_results → stream=true (typed)
+        assert!(has("stream", "true"), "stream not in form: {fields:?}");
+        // logprobs → include[]=logprobs (extras)
+        assert!(
+            has("include[]", "logprobs"),
+            "include[]=logprobs not in form: {fields:?}"
+        );
+        // chunking_strategy (extras): JSON object carrying the server_vad type
+        let cs = fields
+            .iter()
+            .find(|(k, _)| k == "chunking_strategy")
+            .map(|(_, v)| v.clone())
+            .expect("chunking_strategy not in form");
+        assert!(cs.contains("server_vad"), "chunking_strategy wrong: {cs}");
+        // known_speaker_names[] (extras)
+        assert!(has("known_speaker_names[]", "Alice"), "name Alice missing: {fields:?}");
+        assert!(has("known_speaker_names[]", "Bob"), "name Bob missing: {fields:?}");
+        // known_speaker_references[] (extras) — paired positionally with names
+        assert!(
+            has("known_speaker_references[]", "data:audio/wav;base64,AAA="),
+            "reference AAA missing: {fields:?}"
+        );
+        assert!(
+            has("known_speaker_references[]", "data:audio/wav;base64,BBB="),
+            "reference BBB missing: {fields:?}"
+        );
+    }
+
+    // A config with no advanced features omits every new key (additive: unchanged wire shape).
+    #[test]
+    fn default_form_fields_omit_advanced_keys() {
+        let cfg = OpenAISTTConfig {
+            base: STTConfig {
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let fields = cfg.transcription_text_fields();
+        for k in [
+            "stream",
+            "include[]",
+            "chunking_strategy",
+            "known_speaker_names[]",
+            "known_speaker_references[]",
+        ] {
+            assert!(
+                !fields.iter().any(|(fk, _)| fk == k),
+                "{k} should be omitted by default"
+            );
+        }
+        // The base fields are still present.
+        assert!(fields.iter().any(|(k, _)| k == "model"));
+        assert!(fields.iter().any(|(k, _)| k == "response_format"));
+    }
 
     // W1 keystone: the standardized features unlock OpenAI's response-format-driven feature
     // surface (diarization + word timestamps) — previously unreachable via the flat factory.

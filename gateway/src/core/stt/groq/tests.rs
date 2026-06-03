@@ -1567,3 +1567,124 @@ mod confidence_constant_tests {
         assert!((MESSAGE_DEFAULT_UNKNOWN_CONFIDENCE - 0.5).abs() < f64::EPSILON);
     }
 }
+
+// =============================================================================
+// Audio-source-by-URL wire tests (Groq batch REST `url` form field)
+// =============================================================================
+
+mod audio_url_wire_tests {
+    use super::*;
+    use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+    use bytes::Bytes;
+
+    fn std_with_url(url: &str) -> StandardSTTConfig {
+        let mut extras = serde_json::Map::new();
+        extras.insert("url".into(), serde_json::json!(url));
+        StandardSTTConfig {
+            base: STTConfig {
+                provider: "groq".into(),
+                api_key: "gsk_test".into(),
+                model: "whisper-large-v3".into(),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: ProviderExtras(extras),
+        }
+    }
+
+    #[test]
+    fn from_standard_maps_url_from_extras() {
+        // RED guard: the extras `url` passthrough must reach the typed config field.
+        let cfg = GroqSTTConfig::from_standard(&std_with_url(
+            "https://cdn.example.com/clip.mp3",
+        ));
+        assert_eq!(
+            cfg.audio_url.as_deref(),
+            Some("https://cdn.example.com/clip.mp3")
+        );
+    }
+
+    #[test]
+    fn url_reaches_emitted_form_fields_not_just_config() {
+        // WIRE-LEVEL: `build_form_text_fields` is the exact list `send_request` iterates to
+        // build the multipart body, so asserting on it asserts what reaches Groq's body —
+        // not merely a struct field (the recurring "tested config, not wire" bug class).
+        let cfg = GroqSTTConfig::from_standard(&std_with_url(
+            "https://cdn.example.com/clip.mp3",
+        ));
+        let fields = cfg.build_form_text_fields();
+        let url = fields
+            .iter()
+            .find(|(name, _)| name == "url")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(
+            url,
+            Some("https://cdn.example.com/clip.mp3"),
+            "`url` must be emitted as a multipart form field"
+        );
+        // A data:/Base64 URL is forwarded verbatim too.
+        let b64 = GroqSTTConfig::from_standard(&std_with_url("data:audio/wav;base64,AAAA"));
+        assert!(
+            b64.build_form_text_fields()
+                .iter()
+                .any(|(n, v)| n == "url" && v == "data:audio/wav;base64,AAAA")
+        );
+    }
+
+    #[test]
+    fn no_url_emits_no_url_field() {
+        // Default (no extras `url`) must NOT emit a `url` field — the uploaded `file` part path.
+        let cfg = GroqSTTConfig::from_base(STTConfig {
+            api_key: "gsk_test".into(),
+            model: "whisper-large-v3".into(),
+            ..Default::default()
+        });
+        assert!(cfg.audio_url.is_none());
+        assert!(
+            !cfg.build_form_text_fields()
+                .iter()
+                .any(|(name, _)| name == "url")
+        );
+    }
+
+    #[tokio::test]
+    async fn url_reaches_multipart_request_body_over_the_wire() {
+        // End-to-end wire assert: drive the public path (connect → send_audio → flush) against a
+        // mock HTTP server and assert the captured multipart body actually carries `name="url"`
+        // with the URL value, and carries NO `name="file"` part (url replaces the upload).
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/openai/v1/audio/transcriptions")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#"name="url""#.to_string()),
+                mockito::Matcher::Regex(
+                    regex::escape("https://cdn.example.com/clip.mp3"),
+                ),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"text":"hello"}"#)
+            .create_async()
+            .await;
+
+        let mut cfg = GroqSTTConfig::from_standard(&std_with_url(
+            "https://cdn.example.com/clip.mp3",
+        ));
+        cfg.response_format = GroqResponseFormat::Json;
+        cfg.custom_endpoint = Some(format!(
+            "{}/openai/v1/audio/transcriptions",
+            server.url()
+        ));
+
+        let mut stt = GroqSTT::with_config(cfg).expect("client");
+        stt.connect().await.expect("connect");
+        // Buffer a little audio so the flush gate (non-empty buffer) is satisfied; the body
+        // should still carry `url` (not a `file` part) because `audio_url` is set.
+        stt.send_audio(Bytes::from(vec![0u8; 3200]))
+            .await
+            .expect("send_audio");
+        stt.flush().await.expect("flush");
+
+        mock.assert_async().await;
+    }
+}

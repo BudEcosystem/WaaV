@@ -55,9 +55,11 @@ use std::time::Duration;
 
 use aws_config::BehaviorVersion;
 use aws_sdk_transcribestreaming::Client as TranscribeClient;
+use aws_sdk_transcribestreaming::operation::start_stream_transcription::builders::StartStreamTranscriptionInputBuilder;
 use aws_sdk_transcribestreaming::types::{
-    AudioEvent, AudioStream, ContentRedactionType, LanguageCode, MediaEncoding as AwsMediaEncoding,
-    PartialResultsStability as AwsPartialResultsStability, TranscriptResultStream,
+    AudioEvent, AudioStream, ContentIdentificationType, ContentRedactionType, LanguageCode,
+    MediaEncoding as AwsMediaEncoding, PartialResultsStability as AwsPartialResultsStability,
+    TranscriptResultStream,
 };
 use aws_smithy_types::Blob;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
@@ -293,6 +295,96 @@ impl AwsTranscribeSTT {
         }
     }
 
+    /// Apply the provider config to a `StartStreamTranscriptionInput` builder — the ACTUAL AWS SDK
+    /// request object whose fields are serialized 1:1 to the `x-amzn-transcribe-*` request headers.
+    ///
+    /// This is the single source of truth for request-parameter wiring: both the live
+    /// `start_connection` path (which attaches the audio stream and `send_with`s it) and the
+    /// wire-level tests (which assert on the builder's `get_*` accessors) go through here, so a
+    /// param can never be set on our config yet silently dropped from the request — the recurring
+    /// bug class. (The audio stream is attached separately by the caller.)
+    fn apply_request_params(
+        config: &AwsTranscribeSTTConfig,
+        mut input: StartStreamTranscriptionInputBuilder,
+    ) -> StartStreamTranscriptionInputBuilder {
+        input = input
+            .media_sample_rate_hertz(config.base.sample_rate as i32)
+            .media_encoding(Self::convert_media_encoding(&config.media_encoding));
+
+        // Language vs. (single/multiple) language identification.
+        if config.identify_multiple_languages {
+            // Multi-language (code-switching) identification — header
+            // x-amzn-transcribe-identify-multiple-languages. Mutually exclusive with a fixed
+            // language_code, so we do NOT set language_code in this branch.
+            input = input.identify_multiple_languages(true);
+        } else if config.identify_language {
+            input = input.identify_language(true);
+        } else if let Some(lang) = Self::convert_language_code(&config.base.language) {
+            input = input.language_code(lang);
+        }
+
+        // Candidate language list for language-ID mode — header x-amzn-transcribe-language-options.
+        if !config.language_options.is_empty() {
+            input = input.language_options(config.language_options.join(","));
+        }
+
+        // Custom vocabularies/filters for language-ID mode (comma-separated, one per language) —
+        // headers x-amzn-transcribe-vocabulary-names / -vocabulary-filter-names. Distinct from the
+        // single-language vocabulary_name / vocabulary_filter_name below.
+        if let Some(v) = &config.vocabulary_names {
+            input = input.vocabulary_names(v.clone());
+        }
+        if let Some(v) = &config.vocabulary_filter_names {
+            input = input.vocabulary_filter_names(v.clone());
+        }
+
+        // Session resume window (minutes) — header x-amzn-transcribe-session-resume-window.
+        if let Some(w) = config.session_resume_window {
+            input = input.session_resume_window(w);
+        }
+
+        // PII content IDENTIFICATION (flag, not redact) — header
+        // x-amzn-transcribe-content-identification-type=PII. Distinct from content REDACTION below;
+        // AWS rejects both being set at once, so identification wins when requested.
+        if config.enable_content_identification {
+            input = input.content_identification_type(ContentIdentificationType::Pii);
+        } else if config.enable_content_redaction {
+            input = input.content_redaction_type(ContentRedactionType::Pii);
+            if !config.pii_entity_types.is_empty() {
+                input = input.pii_entity_types(config.pii_entity_types.join(","));
+            }
+        }
+
+        // Partial-results stabilization.
+        if config.enable_partial_results_stabilization {
+            input = input
+                .enable_partial_results_stabilization(true)
+                .partial_results_stability(Self::convert_partial_results_stability(
+                    &config.partial_results_stability,
+                ));
+        }
+
+        // Speaker diarization.
+        if config.show_speaker_label {
+            input = input.show_speaker_label(true);
+        }
+
+        // Single-language custom vocabulary / filter.
+        if let Some(vocab) = &config.vocabulary_name {
+            input = input.vocabulary_name(vocab.clone());
+        }
+        if let Some(filter) = &config.vocabulary_filter_name {
+            input = input.vocabulary_filter_name(filter.clone());
+        }
+
+        // Session id (resume token).
+        if let Some(sid) = &config.session_id {
+            input = input.session_id(sid.clone());
+        }
+
+        input
+    }
+
     /// Start the transcription stream connection.
     async fn start_connection(&mut self, config: AwsTranscribeSTTConfig) -> Result<(), STTError> {
         // Create channels for communication
@@ -311,23 +403,6 @@ impl AwsTranscribeSTT {
 
         // Clone data needed for the connection task
         let region_str = config.region.as_str().to_string();
-        let language_code = config.base.language.clone();
-        let sample_rate = config.base.sample_rate as i32;
-        let media_encoding = Self::convert_media_encoding(&config.media_encoding);
-        let enable_partial_stabilization = config.enable_partial_results_stabilization;
-        let partial_stability =
-            Self::convert_partial_results_stability(&config.partial_results_stability);
-        let show_speaker_label = config.show_speaker_label;
-        let vocabulary_name = config.vocabulary_name.clone();
-        let vocabulary_filter_name = config.vocabulary_filter_name.clone();
-        let session_id = config.session_id.clone();
-        let identify_language = config.identify_language;
-        // Content/PII redaction (Review S1): previously set on the config by from_standard but never
-        // forwarded to the request builder, so redaction was silently a no-op (a compliance-grade
-        // failure). Forward it here. Per the AWS SDK, ContentRedactionType=Pii with no
-        // PiiEntityTypes redacts ALL PII; an explicit non-empty list narrows it.
-        let enable_content_redaction = config.enable_content_redaction;
-        let pii_entity_types = config.pii_entity_types.clone();
 
         let is_connected = self.is_connected.clone();
         let session_id_storage = self.session_id.clone();
@@ -335,6 +410,9 @@ impl AwsTranscribeSTT {
         let aws_access_key_id = config.aws_access_key_id.clone();
         let aws_secret_access_key = config.aws_secret_access_key.clone();
         let aws_session_token = config.aws_session_token.clone();
+        // The full provider config drives request-parameter wiring via `apply_request_params`
+        // (the single source of truth shared with the wire-level tests).
+        let request_config = config.clone();
 
         // Spawn the connection task
         let connection_handle = tokio::spawn(async move {
@@ -364,53 +442,14 @@ impl AwsTranscribeSTT {
 
             let client = TranscribeClient::new(&aws_config);
 
-            // Convert language code
-            let language = Self::convert_language_code(&language_code);
-
-            // Build the streaming request
-            let mut request = client
-                .start_stream_transcription()
-                .media_sample_rate_hertz(sample_rate)
-                .media_encoding(media_encoding);
-
-            // Add language code if not using auto-detect
-            if !identify_language {
-                if let Some(lang) = language {
-                    request = request.language_code(lang);
-                }
-            } else {
-                request = request.identify_language(true);
-            }
-
-            // Add optional parameters
-            if enable_partial_stabilization {
-                request = request
-                    .enable_partial_results_stabilization(true)
-                    .partial_results_stability(partial_stability);
-            }
-
-            if show_speaker_label {
-                request = request.show_speaker_label(true);
-            }
-
-            if enable_content_redaction {
-                request = request.content_redaction_type(ContentRedactionType::Pii);
-                if !pii_entity_types.is_empty() {
-                    request = request.pii_entity_types(pii_entity_types.join(","));
-                }
-            }
-
-            if let Some(vocab) = vocabulary_name {
-                request = request.vocabulary_name(vocab);
-            }
-
-            if let Some(filter) = vocabulary_filter_name {
-                request = request.vocabulary_filter_name(filter);
-            }
-
-            if let Some(sid) = session_id {
-                request = request.session_id(sid);
-            }
+            // Build the streaming request via the single shared param-wiring helper, so every
+            // configured feature reaches the actual SDK `StartStreamTranscriptionInput` (and thus
+            // the `x-amzn-transcribe-*` request headers) — no per-field drift between the live
+            // path and the wire-level tests.
+            let input_builder = Self::apply_request_params(
+                &request_config,
+                aws_sdk_transcribestreaming::operation::start_stream_transcription::StartStreamTranscriptionInput::builder(),
+            );
 
             // Create the audio stream from incoming chunks
             let audio_stream = async_stream::stream! {
@@ -433,8 +472,12 @@ impl AwsTranscribeSTT {
                 }
             };
 
-            // Start the transcription stream
-            match request.audio_stream(audio_stream.into()).send().await {
+            // Start the transcription stream (attach audio, send the prebuilt input).
+            match input_builder
+                .audio_stream(audio_stream.into())
+                .send_with(&client)
+                .await
+            {
                 Ok(output) => {
                     // Store session ID if provided
                     if let Some(sid) = output.session_id() {
@@ -665,6 +708,12 @@ impl BaseSTT for AwsTranscribeSTT {
             language_model_name: None,
             identify_language: false,
             preferred_language: Vec::new(),
+            language_options: Vec::new(),
+            identify_multiple_languages: false,
+            vocabulary_names: None,
+            vocabulary_filter_names: None,
+            session_resume_window: None,
+            enable_content_identification: false,
             enable_content_redaction: false,
             content_redaction_types: Vec::new(),
             pii_entity_types: Vec::new(),
@@ -960,6 +1009,191 @@ mod tests {
             AwsTranscribeSTT::convert_media_encoding(&MediaEncoding::OggOpus),
             AwsMediaEncoding::OggOpus
         ));
+    }
+
+    // =========================================================================
+    // WIRE-LEVEL tests: assert the api_param reaches the actual AWS SDK request
+    // object (`StartStreamTranscriptionInput` builder) — whose fields the SDK
+    // serializes 1:1 into the documented `x-amzn-transcribe-*` request headers.
+    // This is materially stronger than asserting on our own config struct (the
+    // recurring "set on config, dropped from the request" bug class): we exercise
+    // the exact same `apply_request_params` the live `start_connection` path uses.
+    // =========================================================================
+
+    use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+    use aws_sdk_transcribestreaming::operation::start_stream_transcription::StartStreamTranscriptionInput;
+
+    /// Build the SDK request-input builder the way the live path does, from a standardized config.
+    fn wire_input(
+        features: SttFeatures,
+        extras: serde_json::Map<String, serde_json::Value>,
+    ) -> aws_sdk_transcribestreaming::operation::start_stream_transcription::builders::StartStreamTranscriptionInputBuilder
+    {
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "aws-transcribe".into(),
+                api_key: String::new(),
+                language: "en-US".into(),
+                sample_rate: 16000,
+                channels: 1,
+                punctuation: true,
+                encoding: "pcm".into(),
+                model: String::new(),
+            },
+            features,
+            extras: ProviderExtras(extras),
+        };
+        let cfg = AwsTranscribeSTTConfig::from_standard(&std);
+        AwsTranscribeSTT::apply_request_params(&cfg, StartStreamTranscriptionInput::builder())
+    }
+
+    /// LanguageOptions (extras) → x-amzn-transcribe-language-options. Accepts list OR csv string.
+    #[test]
+    fn language_options_reaches_the_request() {
+        // Not requested → absent.
+        let b = wire_input(SttFeatures::default(), serde_json::Map::new());
+        assert!(b.get_language_options().is_none());
+
+        // Array form.
+        let mut ex = serde_json::Map::new();
+        ex.insert("language_options".into(), serde_json::json!(["en-US", "es-US"]));
+        ex.insert("identify_multiple_languages".into(), serde_json::json!(true));
+        let b = wire_input(SttFeatures::default(), ex);
+        assert_eq!(
+            b.get_language_options().as_deref(),
+            Some("en-US,es-US"),
+            "LanguageOptions must reach the request as a comma-separated header value"
+        );
+
+        // CSV-string form is accepted too.
+        let mut ex = serde_json::Map::new();
+        ex.insert("language_options".into(), serde_json::json!("en-US, fr-FR"));
+        let b = wire_input(SttFeatures::default(), ex);
+        assert_eq!(b.get_language_options().as_deref(), Some("en-US,fr-FR"));
+    }
+
+    /// IdentifyMultipleLanguages (extras) → x-amzn-transcribe-identify-multiple-languages, and it
+    /// suppresses language_code (mutually exclusive on the wire).
+    #[test]
+    fn identify_multiple_languages_reaches_the_request() {
+        let b = wire_input(SttFeatures::default(), serde_json::Map::new());
+        assert_eq!(b.get_identify_multiple_languages(), &None);
+        // language_code is set in the default (single-language) path.
+        assert!(b.get_language_code().is_some());
+
+        let mut ex = serde_json::Map::new();
+        ex.insert("identify_multiple_languages".into(), serde_json::json!(true));
+        let b = wire_input(SttFeatures::default(), ex);
+        assert_eq!(
+            b.get_identify_multiple_languages(),
+            &Some(true),
+            "IdentifyMultipleLanguages must reach the request"
+        );
+        // Mutually exclusive with a fixed language_code — it must NOT be set.
+        assert!(
+            b.get_language_code().is_none(),
+            "language_code must be suppressed when identifying multiple languages"
+        );
+    }
+
+    /// VocabularyNames (extras) → x-amzn-transcribe-vocabulary-names (language-ID mode).
+    #[test]
+    fn vocabulary_names_reaches_the_request() {
+        let b = wire_input(SttFeatures::default(), serde_json::Map::new());
+        assert!(b.get_vocabulary_names().is_none());
+
+        let mut ex = serde_json::Map::new();
+        ex.insert("vocabulary_names".into(), serde_json::json!("medical-en,medical-es"));
+        let b = wire_input(SttFeatures::default(), ex);
+        assert_eq!(
+            b.get_vocabulary_names().as_deref(),
+            Some("medical-en,medical-es"),
+            "VocabularyNames must reach the request"
+        );
+    }
+
+    /// VocabularyFilterNames (extras) → x-amzn-transcribe-vocabulary-filter-names (language-ID).
+    #[test]
+    fn vocabulary_filter_names_reaches_the_request() {
+        let b = wire_input(SttFeatures::default(), serde_json::Map::new());
+        assert!(b.get_vocabulary_filter_names().is_none());
+
+        let mut ex = serde_json::Map::new();
+        ex.insert("vocabulary_filter_names".into(), serde_json::json!("filt-en,filt-es"));
+        let b = wire_input(SttFeatures::default(), ex);
+        assert_eq!(
+            b.get_vocabulary_filter_names().as_deref(),
+            Some("filt-en,filt-es"),
+            "VocabularyFilterNames must reach the request"
+        );
+    }
+
+    /// SessionResumeWindow (extras) → x-amzn-transcribe-session-resume-window (minutes).
+    #[test]
+    fn session_resume_window_reaches_the_request() {
+        let b = wire_input(SttFeatures::default(), serde_json::Map::new());
+        assert_eq!(b.get_session_resume_window(), &None);
+
+        let mut ex = serde_json::Map::new();
+        ex.insert("session_resume_window".into(), serde_json::json!(60));
+        let b = wire_input(SttFeatures::default(), ex);
+        assert_eq!(
+            b.get_session_resume_window(),
+            &Some(60),
+            "SessionResumeWindow must reach the request"
+        );
+    }
+
+    /// ContentIdentificationType (extras) → x-amzn-transcribe-content-identification-type=PII
+    /// (FLAG mode, distinct from redaction). When identification is on, redaction must be off
+    /// (AWS rejects both at once).
+    #[test]
+    fn content_identification_reaches_the_request_and_excludes_redaction() {
+        let b = wire_input(SttFeatures::default(), serde_json::Map::new());
+        assert!(b.get_content_identification_type().is_none());
+
+        let mut ex = serde_json::Map::new();
+        ex.insert("content_identification_type".into(), serde_json::json!("PII"));
+        // Even if redaction is ALSO requested, identification wins and redaction stays off.
+        let b = wire_input(
+            SttFeatures {
+                redaction: Some(vec!["NAME".into()]),
+                ..Default::default()
+            },
+            ex,
+        );
+        assert_eq!(
+            b.get_content_identification_type(),
+            &Some(ContentIdentificationType::Pii),
+            "ContentIdentificationType=PII must reach the request"
+        );
+        assert!(
+            b.get_content_redaction_type().is_none(),
+            "redaction must NOT be set alongside content identification (AWS rejects both)"
+        );
+    }
+
+    /// KEYSTONE: all six extras-driven features land on a single request input together.
+    #[test]
+    fn from_standard_all_six_streaming_features_reach_the_request() {
+        let mut ex = serde_json::Map::new();
+        ex.insert("language_options".into(), serde_json::json!(["en-US", "es-US"]));
+        ex.insert("identify_multiple_languages".into(), serde_json::json!(true));
+        ex.insert("vocabulary_names".into(), serde_json::json!("v-en,v-es"));
+        ex.insert("vocabulary_filter_names".into(), serde_json::json!("f-en,f-es"));
+        ex.insert("session_resume_window".into(), serde_json::json!(45));
+        ex.insert("content_identification_type".into(), serde_json::json!("PII"));
+
+        let b = wire_input(SttFeatures::default(), ex);
+        assert_eq!(b.get_language_options().as_deref(), Some("en-US,es-US"));
+        assert_eq!(b.get_identify_multiple_languages(), &Some(true));
+        assert_eq!(b.get_vocabulary_names().as_deref(), Some("v-en,v-es"));
+        assert_eq!(b.get_vocabulary_filter_names().as_deref(), Some("f-en,f-es"));
+        assert_eq!(b.get_session_resume_window(), &Some(45));
+        assert_eq!(
+            b.get_content_identification_type(),
+            &Some(ContentIdentificationType::Pii)
+        );
     }
 
     #[tokio::test]

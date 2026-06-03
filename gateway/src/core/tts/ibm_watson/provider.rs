@@ -427,53 +427,14 @@ impl IbmWatsonTTS {
         Ok(audio_bytes)
     }
 
-    /// Prepare the request body with optional SSML prosody for rate/pitch.
+    /// Prepare the JSON request body.
+    ///
+    /// Rate/pitch prosody is applied via IBM Watson's **native** `rate_percentage`/`pitch_percentage`
+    /// `/v1/synthesize` query parameters (see [`IbmWatsonTTSConfig::build_query_params`]), NOT via an
+    /// SSML `<prosody>` wrapper. Wrapping here as well would double-apply the adjustment, so the body
+    /// carries the plain text and serde handles JSON-string escaping.
     pub(crate) fn prepare_request_body(&self, text: &str) -> String {
-        // Check if we need SSML for rate/pitch adjustment
-        let needs_ssml =
-            self.config.rate_percentage.is_some() || self.config.pitch_percentage.is_some();
-
-        if needs_ssml {
-            // Wrap text in SSML with prosody element
-            let mut prosody_attrs = String::new();
-
-            if let Some(rate) = self.config.rate_percentage {
-                let rate_str = if rate >= 0 {
-                    format!("+{}%", rate)
-                } else {
-                    format!("{}%", rate)
-                };
-                prosody_attrs.push_str(&format!(" rate=\"{}\"", rate_str));
-            }
-
-            if let Some(pitch) = self.config.pitch_percentage {
-                let pitch_str = if pitch >= 0 {
-                    format!("+{}%", pitch)
-                } else {
-                    format!("{}%", pitch)
-                };
-                prosody_attrs.push_str(&format!(" pitch=\"{}\"", pitch_str));
-            }
-
-            // Escape XML special characters in text
-            let escaped_text = text
-                .replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;")
-                .replace('"', "&quot;")
-                .replace('\'', "&apos;");
-
-            // Build SSML with required namespace per W3C spec
-            let ssml = format!(
-                "<speak version=\"1.0\" xmlns=\"http://www.w3.org/2001/10/synthesis\"><prosody{}>{}</prosody></speak>",
-                prosody_attrs, escaped_text
-            );
-
-            serde_json::json!({ "text": ssml }).to_string()
-        } else {
-            // Plain text
-            serde_json::json!({ "text": text }).to_string()
-        }
+        serde_json::json!({ "text": text }).to_string()
     }
 
     /// Process audio and deliver to callback with proper chunking.
@@ -869,35 +830,68 @@ mod tests {
         assert!(!body.contains("<speak"));
     }
 
+    // Prosody is now applied via native query params, NOT an SSML body wrapper, so even with
+    // rate/pitch set the body stays plain text (no `<speak>`/`<prosody>`). This is the regression
+    // tripwire against re-introducing the double-applying SSML path.
     #[test]
-    fn test_prepare_request_body_with_ssml() {
+    fn test_prepare_request_body_is_plain_text_even_with_prosody() {
         let mut config = IbmWatsonTTSConfig::default();
         config.rate_percentage = Some(50);
         config.pitch_percentage = Some(-25);
 
         let tts = IbmWatsonTTS::new_from_ibm_config(config).unwrap();
         let body = tts.prepare_request_body("Hello, world!");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
 
-        // Note: JSON escapes quotes, so we check for escaped versions
-        assert!(body.contains("<speak"));
-        assert!(body.contains("xmlns=")); // SSML namespace
-        assert!(body.contains("<prosody"));
-        assert!(body.contains(r#"rate=\"+50%\""#));
-        assert!(body.contains(r#"pitch=\"-25%\""#));
-        assert!(body.contains("Hello, world!"));
+        assert_eq!(parsed["text"], "Hello, world!");
+        assert!(!body.contains("<speak"));
+        assert!(!body.contains("<prosody"));
     }
 
+    // WIRE-LEVEL: rate_percentage/pitch_percentage must reach the actual request URL as native
+    // query params on /v1/synthesize (not just sit on the config). We build the URL exactly as
+    // `synthesize()` does and assert the query string carries the params.
     #[test]
-    fn test_prepare_request_body_escapes_xml() {
+    fn rate_and_pitch_percentage_reach_synthesize_url_query() {
         let mut config = IbmWatsonTTSConfig::default();
-        config.rate_percentage = Some(10);
+        config.instance_id = "inst-1".to_string();
+        config.base.api_key = "k".to_string();
+        config.rate_percentage = Some(50);
+        config.pitch_percentage = Some(-25);
 
-        let tts = IbmWatsonTTS::new_from_ibm_config(config).unwrap();
-        let body = tts.prepare_request_body("Tom & Jerry <3 cats > dogs");
+        // Mirror provider.rs::synthesize URL construction.
+        let base_url = config.build_synthesis_url();
+        let query_params = config.build_query_params();
+        let url = reqwest::Url::parse_with_params(&base_url, &query_params).unwrap();
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
 
-        assert!(body.contains("&amp;"));
-        assert!(body.contains("&lt;"));
-        assert!(body.contains("&gt;"));
+        assert_eq!(url.path(), "/instances/inst-1/v1/synthesize");
+        assert_eq!(
+            pairs.get("rate_percentage").map(String::as_str),
+            Some("50"),
+            "rate_percentage must reach the /v1/synthesize query string"
+        );
+        assert_eq!(
+            pairs.get("pitch_percentage").map(String::as_str),
+            Some("-25"),
+            "pitch_percentage must reach the /v1/synthesize query string"
+        );
+    }
+
+    // When prosody is unset, the params must be ABSENT from the URL (skip semantics) so default
+    // behavior is unchanged.
+    #[test]
+    fn prosody_query_params_absent_when_unset() {
+        let mut config = IbmWatsonTTSConfig::default();
+        config.instance_id = "inst-1".to_string();
+        let url = reqwest::Url::parse_with_params(
+            &config.build_synthesis_url(),
+            &config.build_query_params(),
+        )
+        .unwrap();
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert!(!pairs.contains_key("rate_percentage"));
+        assert!(!pairs.contains_key("pitch_percentage"));
     }
 
     #[test]

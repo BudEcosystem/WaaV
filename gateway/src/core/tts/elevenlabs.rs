@@ -86,6 +86,32 @@ struct ElevenLabsRequestBuilder {
     /// `optimize_streaming_latency`. Confirmed query param on both the convert and stream
     /// endpoints (https://elevenlabs.io/docs/api-reference/text-to-speech/stream).
     optimize_streaming_latency: Option<u8>,
+    /// Language enforcement → request BODY `language_code` (ISO-639-1, e.g. "en"). Forces the
+    /// model to a language rather than auto-detecting. Confirmed body param on the convert + stream
+    /// endpoints (https://elevenlabs.io/docs/api-reference/text-to-speech/convert).
+    language_code: Option<String>,
+    /// Forward context text → request BODY `next_text`: the text that comes AFTER `text`, giving
+    /// the model lookahead for prosody continuity. Confirmed body param (convert + stream).
+    next_text: Option<String>,
+    /// Stitching: request IDs of PRECEDING generations → request BODY `previous_request_ids`
+    /// (array, max 3). Confirmed body param (convert + stream).
+    previous_request_ids: Option<Vec<String>>,
+    /// Stitching: request IDs of FOLLOWING generations → request BODY `next_request_ids`
+    /// (array, max 3). Confirmed body param (convert + stream).
+    next_request_ids: Option<Vec<String>>,
+    /// Text normalization mode → request BODY `apply_text_normalization` ("auto" | "on" | "off").
+    /// Confirmed body param (convert + stream).
+    apply_text_normalization: Option<String>,
+    /// Language-specific text normalization → request BODY `apply_language_text_normalization`
+    /// (bool). Confirmed body param (convert + stream).
+    apply_language_text_normalization: Option<bool>,
+    /// Use IVC instead of PVC voice version → request BODY `use_pvc_as_ivc` (bool). Confirmed body
+    /// param (convert + stream).
+    use_pvc_as_ivc: Option<bool>,
+    /// Zero-retention / disable logging → URL QUERY `enable_logging` (bool). When `false`, ElevenLabs
+    /// runs the request in zero-retention mode (history/logging disabled). Confirmed QUERY param on
+    /// the convert + stream endpoints (https://elevenlabs.io/docs/api-reference/text-to-speech/convert).
+    enable_logging: Option<bool>,
 }
 
 impl TTSRequestBuilder for ElevenLabsRequestBuilder {
@@ -169,6 +195,13 @@ impl TTSRequestBuilder for ElevenLabsRequestBuilder {
             query_params.push(format!("optimize_streaming_latency={tier}"));
         }
 
+        // Zero-retention / disable logging is an ElevenLabs URL QUERY param (`enable_logging`).
+        // When set to `false`, ElevenLabs runs the request with history/logging disabled
+        // (zero-retention mode). Confirmed query param on the convert + stream endpoints.
+        if let Some(enable_logging) = self.enable_logging {
+            query_params.push(format!("enable_logging={enable_logging}"));
+        }
+
         // Build the final URL with query parameters
         let final_url = if !query_params.is_empty() {
             format!("{}?{}", url, query_params.join("&"))
@@ -192,6 +225,45 @@ impl TTSRequestBuilder for ElevenLabsRequestBuilder {
         // upper bound (u32 max) so an out-of-range standardized seed is not silently rejected.
         if let Some(seed) = self.seed {
             body["seed"] = json!(seed.min(u32::MAX as u64));
+        }
+
+        // Language enforcement → BODY `language_code` (ISO-639-1). Forces the synthesis language
+        // rather than auto-detecting. Confirmed body param (convert + stream).
+        if let Some(language_code) = &self.language_code {
+            body["language_code"] = json!(language_code);
+        }
+
+        // Forward context text → BODY `next_text` (lookahead text following `text`). Confirmed body
+        // param (convert + stream). `previous_text` (the lookback) is already emitted above.
+        if let Some(next_text) = &self.next_text {
+            body["next_text"] = json!(next_text);
+        }
+
+        // Stitching: preceding/following generation request IDs → BODY `previous_request_ids` /
+        // `next_request_ids` (each an array, max 3). Confirmed body params (convert + stream).
+        if let Some(ids) = &self.previous_request_ids {
+            body["previous_request_ids"] = json!(ids);
+        }
+        if let Some(ids) = &self.next_request_ids {
+            body["next_request_ids"] = json!(ids);
+        }
+
+        // Text normalization mode → BODY `apply_text_normalization` ("auto" | "on" | "off").
+        // Confirmed body param (convert + stream).
+        if let Some(mode) = &self.apply_text_normalization {
+            body["apply_text_normalization"] = json!(mode);
+        }
+
+        // Language-specific text normalization → BODY `apply_language_text_normalization` (bool).
+        // Confirmed body param (convert + stream).
+        if let Some(flag) = self.apply_language_text_normalization {
+            body["apply_language_text_normalization"] = json!(flag);
+        }
+
+        // Use IVC instead of PVC voice version → BODY `use_pvc_as_ivc` (bool). Confirmed body param
+        // (convert + stream).
+        if let Some(flag) = self.use_pvc_as_ivc {
+            body["use_pvc_as_ivc"] = json!(flag);
         }
 
         // Add model_id if specified
@@ -256,6 +328,14 @@ impl ElevenLabsTTS {
             voice_settings,
             seed: None,
             optimize_streaming_latency: None,
+            language_code: None,
+            next_text: None,
+            previous_request_ids: None,
+            next_request_ids: None,
+            apply_text_normalization: None,
+            apply_language_text_normalization: None,
+            use_pvc_as_ivc: None,
+            enable_logging: None,
         };
 
         Ok(Self {
@@ -278,8 +358,27 @@ impl ElevenLabsTTS {
     ///   - `features.optimize_streaming_latency` → URL QUERY `optimize_streaming_latency` (0..=4),
     ///     trading quality for lower TTFB (convert + stream endpoints).
     ///
+    /// Eight further ElevenLabs synth knobs are wired here (all confirmed on the convert + stream
+    /// endpoints; params are identical on `/stream`). The typed `language` feature carries the
+    /// language enforcement; the rest have no canonical `TtsFeatures` slot and ride the open
+    /// `extras` passthrough under their exact ElevenLabs param names:
+    ///   - `features.language` → BODY `language_code` (language enforcement).
+    ///   - extras `next_text` (string) → BODY `next_text` (forward context / lookahead).
+    ///   - extras `previous_request_ids` (string | string[]) → BODY `previous_request_ids`
+    ///     (stitching; array, max 3).
+    ///   - extras `next_request_ids` (string | string[]) → BODY `next_request_ids` (stitching).
+    ///   - extras `apply_text_normalization` (string "auto"|"on"|"off") → BODY same.
+    ///   - extras `apply_language_text_normalization` (bool) → BODY same.
+    ///   - extras `use_pvc_as_ivc` (bool) → BODY `use_pvc_as_ivc` (use IVC instead of PVC).
+    ///   - extras `enable_logging` (bool) → URL QUERY `enable_logging` (zero-retention when false).
+    ///
     /// Emotion, instructions, SSML, word timestamps and streaming have no ElevenLabs request
     /// parameter on this synth path and are skipped (capability gaps).
+    ///
+    /// Cache note: `language_code`, `next_text`, the stitching IDs, the two normalization knobs and
+    /// `use_pvc_as_ivc` all change the produced audio. ElevenLabs uses the generic [`TTSProvider`],
+    /// whose cache key is computed externally (`voice_manager`) — there is no per-provider config
+    /// hash to extend in this file. (`enable_logging` is a retention/policy flag, not audio-changing.)
     pub fn from_standard(
         std: &crate::core::tts::standard::StandardTTSConfig,
     ) -> TTSResult<Self> {
@@ -294,7 +393,52 @@ impl ElevenLabsTTS {
         tts.request_builder.voice_settings = voice_settings;
         tts.request_builder.seed = std.features.seed;
         tts.request_builder.optimize_streaming_latency = std.features.optimize_streaming_latency;
+
+        // Language enforcement → BODY `language_code` (the typed feature).
+        tts.request_builder.language_code = std.features.language.clone();
+
+        // The remaining ElevenLabs-unique knobs ride the open `extras` passthrough under their
+        // exact API param names.
+        let extras = &std.extras.0;
+        if let Some(s) = extras.get("next_text").and_then(|v| v.as_str()) {
+            tts.request_builder.next_text = Some(s.to_string());
+        }
+        tts.request_builder.previous_request_ids =
+            Self::extract_request_ids(extras.get("previous_request_ids"));
+        tts.request_builder.next_request_ids =
+            Self::extract_request_ids(extras.get("next_request_ids"));
+        if let Some(s) = extras.get("apply_text_normalization").and_then(|v| v.as_str()) {
+            tts.request_builder.apply_text_normalization = Some(s.to_string());
+        }
+        if let Some(b) = extras
+            .get("apply_language_text_normalization")
+            .and_then(|v| v.as_bool())
+        {
+            tts.request_builder.apply_language_text_normalization = Some(b);
+        }
+        if let Some(b) = extras.get("use_pvc_as_ivc").and_then(|v| v.as_bool()) {
+            tts.request_builder.use_pvc_as_ivc = Some(b);
+        }
+        if let Some(b) = extras.get("enable_logging").and_then(|v| v.as_bool()) {
+            tts.request_builder.enable_logging = Some(b);
+        }
+
         Ok(tts)
+    }
+
+    /// Normalize a stitching-IDs extras value into `Vec<String>`. Accepts either a JSON array of
+    /// strings (`["id1","id2"]`) or a single string (`"id1"`, normalized to a one-element vec) so
+    /// the open passthrough is forgiving about either shape.
+    fn extract_request_ids(v: Option<&serde_json::Value>) -> Option<Vec<String>> {
+        match v {
+            Some(serde_json::Value::Array(arr)) => Some(
+                arr.iter()
+                    .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                    .collect(),
+            ),
+            Some(serde_json::Value::String(s)) => Some(vec![s.clone()]),
+            _ => None,
+        }
     }
 
     /// Set the request manager for this instance
@@ -530,6 +674,14 @@ mod tests {
             voice_settings,
             seed: None,
             optimize_streaming_latency: None,
+            language_code: None,
+            next_text: None,
+            previous_request_ids: None,
+            next_request_ids: None,
+            apply_text_normalization: None,
+            apply_language_text_normalization: None,
+            use_pvc_as_ivc: None,
+            enable_logging: None,
         };
         let client = reqwest::Client::new();
         let request = builder.build_http_request(&client, "Test text");
@@ -566,6 +718,14 @@ mod tests {
             voice_settings,
             seed: None,
             optimize_streaming_latency: None,
+            language_code: None,
+            next_text: None,
+            previous_request_ids: None,
+            next_request_ids: None,
+            apply_text_normalization: None,
+            apply_language_text_normalization: None,
+            use_pvc_as_ivc: None,
+            enable_logging: None,
         };
         let client = reqwest::Client::new();
         let request = builder.build_http_request(&client, "Test text");
@@ -617,6 +777,14 @@ mod tests {
             voice_settings,
             seed: None,
             optimize_streaming_latency: None,
+            language_code: None,
+            next_text: None,
+            previous_request_ids: None,
+            next_request_ids: None,
+            apply_text_normalization: None,
+            apply_language_text_normalization: None,
+            use_pvc_as_ivc: None,
+            enable_logging: None,
         };
         let client = reqwest::Client::new();
 
@@ -659,6 +827,14 @@ mod tests {
             voice_settings,
             seed: None,
             optimize_streaming_latency: None,
+            language_code: None,
+            next_text: None,
+            previous_request_ids: None,
+            next_request_ids: None,
+            apply_text_normalization: None,
+            apply_language_text_normalization: None,
+            use_pvc_as_ivc: None,
+            enable_logging: None,
         };
         let client = reqwest::Client::new();
 
@@ -696,6 +872,14 @@ mod tests {
             voice_settings: VoiceSettings::default(),
             seed: Some(12345),
             optimize_streaming_latency: None,
+            language_code: None,
+            next_text: None,
+            previous_request_ids: None,
+            next_request_ids: None,
+            apply_text_normalization: None,
+            apply_language_text_normalization: None,
+            use_pvc_as_ivc: None,
+            enable_logging: None,
         };
         let client = reqwest::Client::new();
         let built = builder
@@ -727,6 +911,14 @@ mod tests {
             voice_settings: VoiceSettings::default(),
             seed: Some(u64::MAX),
             optimize_streaming_latency: None,
+            language_code: None,
+            next_text: None,
+            previous_request_ids: None,
+            next_request_ids: None,
+            apply_text_normalization: None,
+            apply_language_text_normalization: None,
+            use_pvc_as_ivc: None,
+            enable_logging: None,
         };
         let client = reqwest::Client::new();
         let built = builder.build_http_request(&client, "x").build().unwrap();
@@ -749,6 +941,14 @@ mod tests {
             voice_settings: VoiceSettings::default(),
             seed: None,
             optimize_streaming_latency: None,
+            language_code: None,
+            next_text: None,
+            previous_request_ids: None,
+            next_request_ids: None,
+            apply_text_normalization: None,
+            apply_language_text_normalization: None,
+            use_pvc_as_ivc: None,
+            enable_logging: None,
         };
         let client = reqwest::Client::new();
         let built = builder.build_http_request(&client, "x").build().unwrap();
@@ -773,6 +973,14 @@ mod tests {
             voice_settings: VoiceSettings::default(),
             seed: None,
             optimize_streaming_latency: Some(3),
+            language_code: None,
+            next_text: None,
+            previous_request_ids: None,
+            next_request_ids: None,
+            apply_text_normalization: None,
+            apply_language_text_normalization: None,
+            use_pvc_as_ivc: None,
+            enable_logging: None,
         };
         let client = reqwest::Client::new();
         let built = builder.build_http_request(&client, "hi").build().unwrap();
@@ -796,6 +1004,14 @@ mod tests {
             voice_settings: VoiceSettings::default(),
             seed: None,
             optimize_streaming_latency: Some(9),
+            language_code: None,
+            next_text: None,
+            previous_request_ids: None,
+            next_request_ids: None,
+            apply_text_normalization: None,
+            apply_language_text_normalization: None,
+            use_pvc_as_ivc: None,
+            enable_logging: None,
         };
         let client = reqwest::Client::new();
         let built = builder.build_http_request(&client, "x").build().unwrap();
@@ -819,6 +1035,14 @@ mod tests {
             voice_settings: VoiceSettings::default(),
             seed: None,
             optimize_streaming_latency: None,
+            language_code: None,
+            next_text: None,
+            previous_request_ids: None,
+            next_request_ids: None,
+            apply_text_normalization: None,
+            apply_language_text_normalization: None,
+            use_pvc_as_ivc: None,
+            enable_logging: None,
         };
         let client = reqwest::Client::new();
         let built = builder.build_http_request(&client, "x").build().unwrap();
@@ -867,5 +1091,112 @@ mod tests {
             std::str::from_utf8(built.body().and_then(|b| b.as_bytes()).unwrap()).unwrap();
         let body_json: serde_json::Value = serde_json::from_str(body_str).unwrap();
         assert_eq!(body_json["seed"], 777);
+    }
+
+    // ---- WIRE-LEVEL: language enforcement + stitching/context/normalization/IVC + logging -------
+    // All confirmed on the convert + stream endpoints; params identical on `/stream`. These assert
+    // the params reach the actual serialized request BODY / URL of the request built by the provider
+    // struct's from_standard — not merely the builder/config fields (the recurring bug class).
+    #[tokio::test]
+    async fn from_standard_wires_elevenlabs_extended_features_to_the_wire() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("next_text".into(), serde_json::json!("the following sentence"));
+        extras.insert(
+            "previous_request_ids".into(),
+            serde_json::json!(["req-prev-1", "req-prev-2"]),
+        );
+        extras.insert("next_request_ids".into(), serde_json::json!(["req-next-1"]));
+        extras.insert("apply_text_normalization".into(), serde_json::json!("on"));
+        extras.insert(
+            "apply_language_text_normalization".into(),
+            serde_json::json!(true),
+        );
+        extras.insert("use_pvc_as_ivc".into(), serde_json::json!(true));
+        // Zero-retention: enable_logging=false → URL query param.
+        extras.insert("enable_logging".into(), serde_json::json!(false));
+
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "elevenlabs".into(),
+                api_key: "k".into(),
+                voice_id: Some("test_voice".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                language: Some("es".into()), // typed → language_code
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let tts = ElevenLabsTTS::from_standard(&std).unwrap();
+        let built = tts
+            .request_builder
+            .build_http_request(&reqwest::Client::new(), "hola")
+            .build()
+            .unwrap();
+
+        // enable_logging is a URL QUERY param (zero-retention), NOT a body field.
+        let url = built.url().to_string();
+        assert!(
+            url.contains("enable_logging=false"),
+            "enable_logging must reach the URL query, got: {url}"
+        );
+        assert!(
+            !url.contains("language_code"),
+            "language_code must NOT leak into the URL (it is a body param)"
+        );
+
+        // The rest are BODY params.
+        let body_str =
+            std::str::from_utf8(built.body().and_then(|b| b.as_bytes()).unwrap()).unwrap();
+        let body: serde_json::Value = serde_json::from_str(body_str).unwrap();
+        assert_eq!(body["language_code"], "es");
+        assert_eq!(body["next_text"], "the following sentence");
+        assert_eq!(
+            body["previous_request_ids"],
+            serde_json::json!(["req-prev-1", "req-prev-2"])
+        );
+        assert_eq!(body["next_request_ids"], serde_json::json!(["req-next-1"]));
+        assert_eq!(body["apply_text_normalization"], "on");
+        assert_eq!(body["apply_language_text_normalization"], true);
+        assert_eq!(body["use_pvc_as_ivc"], true);
+    }
+
+    // Single-string stitching ID is normalized to a one-element wire array, and unset extended
+    // features are OMITTED from the body (no spurious nulls).
+    #[tokio::test]
+    async fn from_standard_elevenlabs_request_ids_single_string_and_omitted_fields() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("previous_request_ids".into(), serde_json::json!("only-one"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "elevenlabs".into(),
+                api_key: "k".into(),
+                voice_id: Some("v".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+        let tts = ElevenLabsTTS::from_standard(&std).unwrap();
+        let built = tts
+            .request_builder
+            .build_http_request(&reqwest::Client::new(), "x")
+            .build()
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(
+            std::str::from_utf8(built.body().and_then(|b| b.as_bytes()).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["previous_request_ids"], serde_json::json!(["only-one"]));
+        // Unset extended features are omitted entirely.
+        assert!(body.get("language_code").is_none());
+        assert!(body.get("next_text").is_none());
+        assert!(body.get("next_request_ids").is_none());
+        assert!(body.get("apply_text_normalization").is_none());
+        assert!(body.get("use_pvc_as_ivc").is_none());
+        assert!(!built.url().to_string().contains("enable_logging"));
     }
 }

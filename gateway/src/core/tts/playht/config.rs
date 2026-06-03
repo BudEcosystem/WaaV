@@ -350,6 +350,10 @@ pub struct PlayHtTtsConfig {
     /// ISO 639-1 language code (Play3.0-mini only)
     pub language: Option<String>,
 
+    /// Emotion / delivery style label (e.g. "female_happy"). Play.ht supports this only on the
+    /// Play3.0-mini, PlayHT2.0 and PlayHT2.0-turbo engines (not PlayDialog).
+    pub emotion: Option<String>,
+
     /// Text adherence control (Play3.0, PlayHT2.0)
     pub text_guidance: Option<f32>,
 
@@ -374,6 +378,10 @@ pub struct PlayHtTtsConfig {
     /// Voice conditioning seconds (PlayDialog)
     pub voice_conditioning_seconds: Option<f32>,
 
+    /// Second-speaker voice conditioning seconds (PlayDialog only): conditioning duration for the
+    /// secondary `voice_2`, trading similarity-to-clone against model stability/expressiveness.
+    pub voice_conditioning_seconds_2: Option<f32>,
+
     /// Number of candidates for ranking (PlayDialog)
     pub num_candidates: Option<u32>,
 }
@@ -393,8 +401,10 @@ impl PlayHtTtsConfig {
     /// so (like IBM Watson's `instance_id`) it is read from the `provider_extras` passthrough.
     ///
     /// Mapped: `speed` → speed (clamped), `style` → `style_guidance`, `language` → language,
-    /// `seed` → seed, `sample_rate` → sample_rate. Features with no real Play.ht field
-    /// (pitch, volume, stability, similarity_boost, use_speaker_boost, emotion, instructions,
+    /// `seed` → seed, `sample_rate` → sample_rate, `emotion` → emotion (Play.ht's delivery-style
+    /// label, e.g. "female_happy"). The non-standard `voice_conditioning_seconds_2` (PlayDialog
+    /// second-speaker conditioning) rides the `extras` passthrough. Features with no real Play.ht
+    /// field (pitch, volume, stability, similarity_boost, use_speaker_boost, instructions,
     /// ssml, word_timestamps, streaming) are skipped as capability gaps.
     pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
         let f = &std.features;
@@ -420,6 +430,19 @@ impl PlayHtTtsConfig {
         }
         if let Some(r) = f.sample_rate {
             cfg.sample_rate = r;
+        }
+        if let Some(e) = &f.emotion {
+            cfg.emotion = Some(e.clone());
+        }
+        // `voice_conditioning_seconds_2` is a non-standard PlayDialog-only knob with no canonical
+        // TtsFeatures field, so it rides the open `extras` passthrough.
+        if let Some(vcs2) = std
+            .extras
+            .0
+            .get("voice_conditioning_seconds_2")
+            .and_then(|v| v.as_f64())
+        {
+            cfg.voice_conditioning_seconds_2 = Some(vcs2 as f32);
         }
         cfg
     }
@@ -454,6 +477,7 @@ impl PlayHtTtsConfig {
             temperature: None,
             seed: None,
             language: None,
+            emotion: None,
             text_guidance: None,
             voice_guidance: None,
             style_guidance: None,
@@ -462,6 +486,7 @@ impl PlayHtTtsConfig {
             turn_prefix: None,
             turn_prefix_2: None,
             voice_conditioning_seconds: None,
+            voice_conditioning_seconds_2: None,
             num_candidates: None,
         }
     }
@@ -688,6 +713,7 @@ impl PlayHtTtsConfig {
             && self.temperature.is_none()
             && self.seed.is_none()
             && self.language.is_none()
+            && self.emotion.is_none()
             && self.text_guidance.is_none()
             && self.voice_guidance.is_none()
             && self.style_guidance.is_none()

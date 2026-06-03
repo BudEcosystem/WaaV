@@ -102,18 +102,47 @@ impl TinkoffStt {
 
     /// Create streaming recognition config from provider config
     fn create_streaming_config(config: &TinkoffSttConfig) -> StreamingRecognitionConfig {
+        // Map provider-side speech contexts to wire messages (phrase boosting, field 6).
+        let speech_contexts = config
+            .speech_contexts
+            .iter()
+            .map(|ctx| super::messages::SpeechContext {
+                phrases: ctx
+                    .phrases
+                    .iter()
+                    .map(|p| super::messages::SpeechContextPhrase {
+                        text: p.text.clone(),
+                        score: p.score,
+                    })
+                    .collect(),
+                speech_context_dictionary_id: ctx.speech_context_dictionary_id.clone(),
+            })
+            .collect();
+
         StreamingRecognitionConfig {
             config: RecognitionConfig {
                 encoding: config.encoding,
                 sample_rate_hertz: config.base.sample_rate,
                 language_code: config.base.language.clone(),
                 max_alternatives: config.max_alternatives,
+                profanity_filter: config.profanity_filter,
+                speech_contexts,
                 enable_automatic_punctuation: config.enable_punctuation,
                 num_channels: config.base.channels as u32,
-                vad: config.vad_config.clone(),
+                // oneof vad: `do_not_perform_vad` (field 13) takes precedence over `vad_config`
+                // (field 14); never emit both.
+                do_not_perform_vad: config.do_not_perform_vad,
+                vad: if config.do_not_perform_vad {
+                    None
+                } else {
+                    config.vad_config.clone()
+                },
+                enable_denormalization: config.enable_denormalization,
+                enable_gender_identification: config.enable_gender_identification,
             },
             interim_results: config.interim_results,
             single_utterance: config.single_utterance,
+            interim_results_interval: config.interim_results_interval,
         }
     }
 
@@ -545,5 +574,60 @@ mod tests {
         assert_eq!(streaming_config.config.language_code, "ru-RU");
         assert!(streaming_config.interim_results);
         assert!(!streaming_config.single_utterance);
+    }
+
+    // WIRE-LEVEL end-to-end: the standardized features must reach the ENCODED protobuf bytes of the
+    // first streaming request — `StandardSTTConfig` → `from_standard` → `create_streaming_config`
+    // → `StreamingRecognizeRequest::config(..).encode()` (the exact bytes the gRPC stream sends).
+    // This guards the recurring "set on config struct, never serialized to the wire" bug class.
+    #[test]
+    fn test_streaming_features_reach_encoded_request_e2e() {
+        use super::super::messages::StreamingRecognizeRequest;
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("interim_results_config.interval".into(), serde_json::json!(0.25));
+        extras.insert("enable_gender_identification".into(), serde_json::json!(true));
+        extras.insert("vad_config.silence_max".into(), serde_json::json!(1.5));
+        extras.insert("vad_config.silence_min".into(), serde_json::json!(0.3));
+
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "tinkoff".into(),
+                api_key: "test-api-key".into(),
+                language: "ru-RU".into(),
+                sample_rate: 16000,
+                ..Default::default()
+            },
+            features: SttFeatures {
+                interim_results: Some(true),
+                profanity_filter: Some(true),
+                numerals: Some(true),
+                keyterms: Some(vec!["Тинькофф".into()]),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+
+        let cfg = TinkoffSttConfig::from_standard(&std).unwrap();
+        let streaming_config = TinkoffStt::create_streaming_config(&cfg);
+        // Encode the actual first-message bytes the AudioChunkStream emits onto the gRPC stream.
+        let bytes = StreamingRecognizeRequest::config(streaming_config).encode();
+
+        let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+
+        // profanity_filter (field 5) bytes 0x28 0x01 must be present inside the embedded config.
+        assert!(contains(&[0x28, 0x01]), "profanity_filter missing from encoded request");
+        // speech_contexts phrase text bytes must be present.
+        assert!(contains("Тинькофф".as_bytes()), "speech context phrase missing from encoded request");
+        // enable_denormalization (field 16) bytes 0x80 0x01 0x01.
+        assert!(contains(&[0x80, 0x01, 0x01]), "enable_denormalization missing from encoded request");
+        // enable_gender_identification (field 18) bytes 0x90 0x01 0x01.
+        assert!(contains(&[0x90, 0x01, 0x01]), "enable_gender_identification missing from encoded request");
+        // VAD silence_max (1.5) and silence_min (0.3) float bytes.
+        assert!(contains(&1.5f32.to_le_bytes()), "vad silence_max missing from encoded request");
+        assert!(contains(&0.3f32.to_le_bytes()), "vad silence_min missing from encoded request");
+        // interim_results_config.interval (0.25) float bytes.
+        assert!(contains(&0.25f32.to_le_bytes()), "interim interval missing from encoded request");
     }
 }

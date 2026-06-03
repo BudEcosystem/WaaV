@@ -350,6 +350,16 @@ pub struct AcapelaTtsConfig {
 
     /// Application identifier for statistics
     pub application: Option<String>,
+
+    /// Treat the input text as SSML rather than plain text.
+    ///
+    /// Acapela Cloud's `/api/command/` endpoint has no separate input-type query parameter — SSML
+    /// (W3C `<speak>` …, plus Acapela's `\vct=`/`\rspd=` inline tags) is supplied directly in the
+    /// `text` parameter and auto-detected by the engine. So "ssml→text" means: when this is set,
+    /// the SSML markup is forwarded VERBATIM in `text`, and the gateway's pronunciation-replacement
+    /// pass is suppressed (regex word substitution would otherwise corrupt the SSML tags). There is
+    /// no boolean flag to emit on the wire; the markup itself is the wire signal.
+    pub ssml_input: bool,
 }
 
 impl Default for AcapelaTtsConfig {
@@ -372,6 +382,7 @@ impl Default for AcapelaTtsConfig {
             mark_positions: false,
             dictionaries: None,
             application: None,
+            ssml_input: false,
         }
     }
 }
@@ -437,6 +448,7 @@ impl AcapelaTtsConfig {
             mark_positions: false,
             dictionaries: None,
             application: None,
+            ssml_input: false,
         })
     }
 
@@ -446,10 +458,12 @@ impl AcapelaTtsConfig {
     /// [`TtsFeatures::volume`] becomes the integer `volume` level (clamped to
     /// `MIN_VOLUME..=MAX_VOLUME`), [`TtsFeatures::sample_rate`] overrides the output `sample_rate`
     /// (clamped to `MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE`), and [`TtsFeatures::word_timestamps`]
-    /// enables word position events (`word_positions`). The non-standard `bitrate`, `dictionaries`
-    /// and `application` knobs are read from the `extras` passthrough. Acapela has no field for
-    /// pitch, ElevenLabs-style voice settings, emotion, instructions, SSML, language, streaming or
-    /// seed, so those features are skipped.
+    /// enables word position events (`word_positions`). [`TtsFeatures::ssml`] sets `ssml_input`,
+    /// which forwards the SSML markup verbatim in the `text` parameter and suppresses
+    /// pronunciation replacement (Acapela auto-detects SSML; there is no separate input-type
+    /// query param). The non-standard `bitrate`, `dictionaries` and `application` knobs are read
+    /// from the `extras` passthrough. Acapela has no field for pitch, ElevenLabs-style voice
+    /// settings, emotion, instructions, language, streaming or seed, so those features are skipped.
     ///
     /// [`TtsFeatures::speed`]: crate::core::tts::standard::TtsFeatures::speed
     /// [`TtsFeatures::volume`]: crate::core::tts::standard::TtsFeatures::volume
@@ -472,6 +486,9 @@ impl AcapelaTtsConfig {
         }
         if let Some(true) = f.word_timestamps {
             cfg.word_positions = true;
+        }
+        if let Some(true) = f.ssml {
+            cfg.ssml_input = true;
         }
 
         // Provider-specific passthrough.
@@ -737,6 +754,7 @@ impl AcapelaTtsConfigBuilder {
             mark_positions: self.mark_positions,
             dictionaries: self.dictionaries,
             application: self.application,
+            ssml_input: false,
         };
 
         config.validate()?;
@@ -774,7 +792,7 @@ mod tests {
                 volume: Some(40000.0),
                 sample_rate: Some(16000),
                 word_timestamps: Some(true),
-                ssml: Some(true), // capability gap: Acapela has no SSML field, must be ignored
+                ssml: Some(true), // now wired: forwards SSML verbatim in `text` via `ssml_input`
                 ..Default::default()
             },
             extras: ProviderExtras(extras),
@@ -784,6 +802,7 @@ mod tests {
         assert_eq!(cfg.volume, 40000);
         assert_eq!(cfg.sample_rate, 16000);
         assert!(cfg.word_positions);
+        assert!(cfg.ssml_input); // ssml feature → ssml_input
         assert_eq!(cfg.bitrate, Some(128)); // extras passthrough
         assert_eq!(cfg.dictionaries, Some("custom.dic".to_string()));
         assert_eq!(cfg.application, Some("my-app".to_string()));

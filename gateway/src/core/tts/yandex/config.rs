@@ -404,6 +404,10 @@ pub struct YandexTtsConfig {
     pub audio_format: YandexAudioFormat,
     /// Sample rate in Hz (only for LPCM format)
     pub sample_rate: u32,
+    /// Treat the synthesis input as SSML markup. When `true`, the text is sent in the v1
+    /// `:synthesize` request's `ssml` form field instead of `text` (the two are mutually exclusive
+    /// per the Yandex v1 REST API — see docs/providers/yandex.md "SSML Support").
+    pub ssml: bool,
 }
 
 impl YandexTtsConfig {
@@ -508,6 +512,7 @@ impl YandexTtsConfig {
             speed,
             audio_format,
             sample_rate,
+            ssml: false,
         })
     }
 
@@ -517,10 +522,11 @@ impl YandexTtsConfig {
     /// matched to a [`YandexEmotion`] using the same string mapping as `from_base`,
     /// [`TtsFeatures::language`] overrides the [`YandexLanguage`] when it parses, and
     /// [`TtsFeatures::sample_rate`] is normalized to Yandex's supported rates (8000/16000/48000)
-    /// using `from_base`'s bucketing. Yandex's non-standard `folder_id` and `is_iam_token` knobs are
-    /// read from the `extras` passthrough. Features without a Yandex field (pitch, volume, stability,
-    /// similarity_boost, style, use_speaker_boost, instructions, ssml, word_timestamps, streaming,
-    /// seed) are skipped.
+    /// using `from_base`'s bucketing, and [`TtsFeatures::ssml`] flips the input to the v1
+    /// `:synthesize` `ssml` form field (instead of `text`). Yandex's non-standard `folder_id` and
+    /// `is_iam_token` knobs are read from the `extras` passthrough. Features without a Yandex field
+    /// (pitch, volume, stability, similarity_boost, style, use_speaker_boost, instructions,
+    /// word_timestamps, streaming, seed) are skipped.
     ///
     /// [`TtsFeatures::speed`]: crate::core::tts::standard::TtsFeatures::speed
     /// [`TtsFeatures::emotion`]: crate::core::tts::standard::TtsFeatures::emotion
@@ -561,6 +567,10 @@ impl YandexTtsConfig {
                 super::MAX_SAMPLE_RATE
             };
         }
+        if let Some(ssml) = f.ssml {
+            // SSML input is sent in the `ssml` form field instead of `text` on the v1 endpoint.
+            cfg.ssml = ssml;
+        }
 
         // Provider-specific passthrough.
         if let Some(folder_id) = std.extras.0.get("folder_id").and_then(|v| v.as_str()) {
@@ -575,8 +585,11 @@ impl YandexTtsConfig {
 
     /// Build the form parameters for the synthesis request
     pub fn build_form_params(&self, text: &str) -> Vec<(&'static str, String)> {
+        // The v1 `:synthesize` endpoint takes the input under EITHER `text` (plain) OR `ssml`
+        // (SSML markup) — they are mutually exclusive (docs/providers/yandex.md "SSML Support").
+        let input_field = if self.ssml { "ssml" } else { "text" };
         let mut params = vec![
-            ("text", text.to_string()),
+            (input_field, text.to_string()),
             ("voice", self.voice.to_string()),
             ("lang", self.language.to_string()),
             ("format", self.audio_format.to_string()),
@@ -655,7 +668,7 @@ mod tests {
                 emotion: Some("cheerful".into()),
                 language: Some("en-US".into()),
                 sample_rate: Some(16000),
-                ssml: Some(true), // capability gap: Yandex config has no SSML field, must be ignored
+                ssml: Some(true), // now a real field: routes input to the `ssml` form param
                 ..Default::default()
             },
             extras: ProviderExtras(extras),
@@ -665,8 +678,67 @@ mod tests {
         assert_eq!(cfg.emotion, YandexEmotion::Good); // "cheerful" -> Good
         assert_eq!(cfg.language, YandexLanguage::English); // "en-US" -> English
         assert_eq!(cfg.sample_rate, 16000); // 16000 -> 16000 bucket
+        assert!(cfg.ssml); // ssml feature mapped onto the config
         assert_eq!(cfg.folder_id, Some("b1gfolder123".to_string())); // extras passthrough
         assert!(cfg.is_iam_token);
+    }
+
+    // WIRE-LEVEL guard (the recurring bug class is asserting only the config struct). This asserts
+    // the `ssml` feature actually reaches the v1 `:synthesize` form BODY: the synthesis input is
+    // emitted under the `ssml` form key and NOT under `text` (the two are mutually exclusive per the
+    // Yandex v1 REST API). Without the wiring in `build_form_params` the input would stay under
+    // `text` and this test fails.
+    #[test]
+    fn ssml_feature_reaches_synthesize_form_body_under_ssml_key() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let ssml_text = "<speak>Привет<break time=\"500ms\"/>мир</speak>";
+
+        // Plain (ssml = false): input is `text`, no `ssml` key.
+        let plain = YandexTtsConfig::from_standard(&StandardTTSConfig {
+            base: TTSConfig {
+                provider: "yandex".into(),
+                api_key: "AQVN1234567890".into(),
+                voice_id: Some("alena".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: Default::default(),
+        })
+        .unwrap();
+        let plain_params = plain.build_form_params(ssml_text);
+        assert!(
+            plain_params.iter().any(|(k, v)| *k == "text" && v == ssml_text),
+            "plain input must be under `text`"
+        );
+        assert!(
+            !plain_params.iter().any(|(k, _)| *k == "ssml"),
+            "no `ssml` key when the feature is off"
+        );
+
+        // ssml = true: input moves to the `ssml` form key and `text` is absent.
+        let ssml_cfg = YandexTtsConfig::from_standard(&StandardTTSConfig {
+            base: TTSConfig {
+                provider: "yandex".into(),
+                api_key: "AQVN1234567890".into(),
+                voice_id: Some("alena".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                ssml: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        })
+        .unwrap();
+        let ssml_params = ssml_cfg.build_form_params(ssml_text);
+        assert!(
+            ssml_params.iter().any(|(k, v)| *k == "ssml" && v == ssml_text),
+            "ssml input must reach the `ssml` form key"
+        );
+        assert!(
+            !ssml_params.iter().any(|(k, _)| *k == "text"),
+            "`text` must be omitted when sending SSML (mutually exclusive)"
+        );
     }
 
     #[test]

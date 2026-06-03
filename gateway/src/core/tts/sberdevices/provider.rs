@@ -186,6 +186,26 @@ impl SberDevicesTts {
         Ok(token)
     }
 
+    /// Build the `text:synthesize` POST request (URL, auth, body, and — load-bearing — the
+    /// `Content-Type` that selects plain-text vs SSML input mode). Kept as an inspectable seam so
+    /// the wire-level test asserts the exact request the live synth path sends.
+    fn build_synthesis_request(
+        client: &reqwest::Client,
+        config: &SberTtsConfig,
+        url: &str,
+        token: &str,
+        text: &str,
+    ) -> reqwest::RequestBuilder {
+        client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", token))
+            // SSML input mode flips this to `application/ssml`, putting SaluteSpeech into SSML
+            // parsing for the same `text:synthesize` endpoint.
+            .header("Content-Type", config.synthesis_content_type())
+            .body(text.to_string())
+            .timeout(Duration::from_secs(config.request_timeout_secs))
+    }
+
     /// Synthesize text using REST API
     async fn synthesize(&self, text: &str) -> TTSResult<Vec<u8>> {
         let config = self.config.as_ref().ok_or_else(|| {
@@ -214,13 +234,7 @@ impl SberDevicesTts {
             "Synthesizing text with SberDevices TTS"
         );
 
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Content-Type", "application/text")
-            .body(text.to_string())
-            .timeout(Duration::from_secs(config.request_timeout_secs))
+        let response = Self::build_synthesis_request(&self.client, config, &url, &token, text)
             .send()
             .await
             .map_err(|e| TTSError::NetworkError(format!("Synthesis request failed: {}", e)))?;
@@ -508,6 +522,90 @@ mod tests {
         };
         let tts = SberDevicesTts::from_standard(&std).unwrap();
         assert_eq!(tts.config.as_ref().unwrap().sample_rate, 8000);
+    }
+
+    // WIRE-LEVEL (S1/S5 recurring bug class): the typed `ssml` feature must flip the SYNTH REQUEST's
+    // `Content-Type` header to `application/ssml` on the actual POST that hits text:synthesize — not
+    // just a config bool. Build the exact request the live synth path sends and inspect its header.
+    #[test]
+    fn ssml_feature_sets_application_ssml_content_type_on_synth_request() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                ssml: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = SberDevicesTts::from_standard(&std).unwrap();
+        let config = tts.config.as_ref().unwrap();
+        // (1) config carries the flag …
+        assert!(config.ssml_input);
+
+        // (2) … AND the built synth request carries Content-Type: application/ssml on the real
+        // text:synthesize URL.
+        let url = config.synthesis_url();
+        let request =
+            SberDevicesTts::build_synthesis_request(&tts.client, config, &url, "tok", "<speak/>")
+                .build()
+                .unwrap();
+        assert!(request.url().as_str().starts_with(super::super::SBER_TTS_SYNTHESIZE_URL));
+        assert_eq!(
+            request
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "application/ssml",
+            "ssml feature must set Content-Type: application/ssml on the synth request"
+        );
+    }
+
+    // Default path: without the ssml feature the synth request keeps Content-Type: application/text.
+    #[test]
+    fn plain_text_content_type_when_ssml_not_requested() {
+        let tts = SberDevicesTts::new(create_test_config()).unwrap();
+        let config = tts.config.as_ref().unwrap();
+        assert!(!config.ssml_input);
+        let url = config.synthesis_url();
+        let request =
+            SberDevicesTts::build_synthesis_request(&tts.client, config, &url, "tok", "hi")
+                .build()
+                .unwrap();
+        assert_eq!(
+            request
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "application/text"
+        );
+    }
+
+    // Documented capability gap: `language` is NOT a parameter of the REST text:synthesize endpoint
+    // (only voice/format/sample_rate appear in its URL), so a language feature must NOT fabricate a
+    // `language=` query param. This guard locks the gap in place so a future change can't silently
+    // inject one without updating the cited comment in `from_standard`.
+    #[test]
+    fn language_feature_does_not_reach_synth_url() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                language: Some("en-US".into()),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = SberDevicesTts::from_standard(&std).unwrap();
+        let url = tts.config.as_ref().unwrap().synthesis_url();
+        assert!(
+            !url.contains("language="),
+            "REST text:synthesize has no language query param; must not fabricate one: {url}"
+        );
     }
 
     #[test]

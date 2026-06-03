@@ -294,6 +294,9 @@ pub struct ReverieTtsConfig {
     pub sample_rate: u32,
     /// Output audio format.
     pub format: ReverieTtsAudioFormat,
+    /// Treat the synthesis input as SSML markup. When set, the request body carries the input under
+    /// the `ssml` key instead of the plain-text `text` array (Reverie's documented SSML input mode).
+    pub ssml_input: bool,
 }
 
 impl ReverieTtsConfig {
@@ -361,6 +364,7 @@ impl ReverieTtsConfig {
             pitch: super::DEFAULT_PITCH,
             sample_rate,
             format,
+            ssml_input: false,
         })
     }
 
@@ -370,10 +374,11 @@ impl ReverieTtsConfig {
     /// (-3 to +3), so this maps `speed` -> `speed` and `pitch` -> `pitch` reusing `from_base`'s /
     /// `with_*` clamping (`speed` clamped to MIN_SPEED..MAX_SPEED, `pitch` clamped to
     /// MIN_PITCH..MAX_PITCH), `sample_rate` -> `sample_rate` (snapped to the nearest supported rate
-    /// like `with_sample_rate`), and `language` -> the speaker's `language` field. Reverie's
-    /// non-standard audio `format` knob is read from the `extras` passthrough. Features without a
-    /// Reverie field (volume, stability, similarity_boost, style, use_speaker_boost, emotion,
-    /// instructions, ssml, word_timestamps, streaming, seed) are skipped.
+    /// like `with_sample_rate`), `language` -> the speaker's `language` field, and `ssml` ->
+    /// `ssml_input` (the request body then carries the input under the `ssml` key instead of the
+    /// `text` array). Reverie's non-standard audio `format` knob is read from the `extras`
+    /// passthrough. Features without a Reverie field (volume, stability, similarity_boost, style,
+    /// use_speaker_boost, emotion, instructions, word_timestamps, streaming, seed) are skipped.
     pub fn from_standard(
         std: &crate::core::tts::standard::StandardTTSConfig,
     ) -> Result<Self, String> {
@@ -397,6 +402,11 @@ impl ReverieTtsConfig {
         }
         if let Some(language) = &f.language {
             cfg.speaker.language = language.clone();
+        }
+        // SSML input mode: route the text through the `ssml` body key (audio-changing — folded into
+        // the cache-key hash by the provider).
+        if let Some(true) = f.ssml {
+            cfg.ssml_input = true;
         }
 
         // Provider-specific passthrough.
@@ -669,8 +679,8 @@ mod tests {
                 pitch: Some(2.0),
                 sample_rate: Some(16000),
                 language: Some("en".to_string()),
+                ssml: Some(true), // SSML input mode -> ssml_input (now wired)
                 volume: Some(0.5), // capability gap: Reverie has no volume knob, must be ignored
-                ssml: Some(true),  // capability gap: not a Reverie config field, must be ignored
                 ..Default::default()
             },
             extras: ProviderExtras(extras),
@@ -680,6 +690,7 @@ mod tests {
         assert!((cfg.pitch - 2.0).abs() < 0.001); // 2.0 in -3.0..3.0 range
         assert_eq!(cfg.sample_rate, 16000); // valid supported rate
         assert_eq!(cfg.speaker.language, "en"); // language override onto speaker
+        assert!(cfg.ssml_input); // ssml feature mapped to ssml_input
         assert_eq!(cfg.format, ReverieTtsAudioFormat::Mp3); // from extras passthrough
     }
 

@@ -63,12 +63,25 @@ impl TinkoffTts {
             TTSError::InvalidConfiguration("No configuration available".to_string())
         })?;
 
-        Ok(SynthesizeSpeechRequest::new(
-            text,
-            config.voice.as_str(),
-            config.encoding,
-            config.sample_rate,
-        ))
+        // When `ssml` is set, populate the `SynthesisInput.ssml` oneof (proto field 2) instead of
+        // `.text` (proto field 1) so the VoiceKit `TextToSpeech` Synthesize / StreamingSynthesize
+        // RPCs interpret the input as SSML markup. Both RPCs take the same SynthesizeSpeechRequest.
+        let request = if config.ssml {
+            SynthesizeSpeechRequest::with_ssml(
+                text,
+                config.voice.as_str(),
+                config.encoding,
+                config.sample_rate,
+            )
+        } else {
+            SynthesizeSpeechRequest::new(
+                text,
+                config.voice.as_str(),
+                config.encoding,
+                config.sample_rate,
+            )
+        };
+        Ok(request)
     }
 
     /// Synthesize text using non-streaming API
@@ -418,6 +431,58 @@ mod tests {
         let request = request.unwrap();
         let encoded = request.encode();
         assert!(!encoded.is_empty());
+    }
+
+    /// Extract the `input` submessage (outer field 1, tag `0x0a`) from an encoded
+    /// SynthesizeSpeechRequest so the test can inspect which `SynthesisInput` oneof was set.
+    fn extract_input_submessage(encoded: &[u8]) -> &[u8] {
+        assert_eq!(encoded[0], 0x0a, "outer field 1 (input) must be first");
+        let len = encoded[1] as usize; // small messages: single-byte varint length
+        &encoded[2..2 + len]
+    }
+
+    // WIRE-LEVEL: with `ssml` set, the synthesis input must reach the gRPC request as the
+    // `SynthesisInput.ssml` oneof (inner proto field 2, tag 0x12) — NOT the `.text` field
+    // (tag 0x0a). This asserts on the ENCODED protobuf bytes the RPC actually sends, guarding
+    // the "config set but never serialized to the wire" bug class.
+    #[test]
+    fn ssml_input_reaches_synthesis_input_ssml_oneof_on_the_wire() {
+        let mut config = create_test_config();
+        let mut tinkoff = TinkoffTtsConfig::from_base(config.clone()).unwrap();
+        tinkoff.ssml = true;
+        // Rebuild the provider with the ssml-enabled config.
+        let mut tts = TinkoffTts::new(config.clone()).unwrap();
+        tts.config = Some(tinkoff);
+        let _ = &mut config; // silence unused-mut on the clone scaffold
+
+        let markup = "<speak>Привет</speak>";
+        let request = tts.create_synthesis_request(markup).unwrap();
+        let encoded = request.encode();
+        let input = extract_input_submessage(&encoded);
+
+        // The input oneof must lead with the SSML tag (0x12), not the text tag (0x0a).
+        assert_eq!(input[0], 0x12, "ssml input must use SynthesisInput field 2 (ssml)");
+        // And the SSML markup bytes must be present in the wire body.
+        assert!(
+            encoded
+                .windows(markup.len())
+                .any(|w| w == markup.as_bytes()),
+            "SSML markup must reach the wire body"
+        );
+    }
+
+    // WIRE-LEVEL counterpart: with `ssml` unset (default), the input must stay on the `.text`
+    // oneof (inner proto field 1, tag 0x0a) so plain text keeps working unchanged.
+    #[test]
+    fn plain_text_input_uses_synthesis_input_text_oneof_on_the_wire() {
+        let config = create_test_config();
+        let tts = TinkoffTts::new(config).unwrap();
+
+        let request = tts.create_synthesis_request("Привет").unwrap();
+        let encoded = request.encode();
+        let input = extract_input_submessage(&encoded);
+
+        assert_eq!(input[0], 0x0a, "plain text must use SynthesisInput field 1 (text)");
     }
 
     #[tokio::test]

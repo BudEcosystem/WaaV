@@ -246,6 +246,15 @@ pub struct GladiaMessagesConfig {
     /// Receive post-processing events
     #[serde(default)]
     pub receive_post_processing_events: bool,
+    /// Receive acknowledgment messages (Gladia `messages_config.receive_acknowledgments`).
+    #[serde(default)]
+    pub receive_acknowledgments: bool,
+    /// Receive error messages (Gladia `messages_config.receive_errors`).
+    #[serde(default)]
+    pub receive_errors: bool,
+    /// Receive lifecycle event messages (Gladia `messages_config.receive_lifecycle_events`).
+    #[serde(default)]
+    pub receive_lifecycle_events: bool,
 }
 
 fn default_true() -> bool {
@@ -261,6 +270,9 @@ impl Default for GladiaMessagesConfig {
             receive_pre_processing_events: false,
             receive_realtime_processing_events: false,
             receive_post_processing_events: false,
+            receive_acknowledgments: false,
+            receive_errors: false,
+            receive_lifecycle_events: false,
         }
     }
 }
@@ -281,6 +293,39 @@ pub struct GladiaPreProcessing {
 }
 
 // =============================================================================
+// Post-processing Configuration
+// =============================================================================
+
+/// Post-processing configuration (Gladia `post_processing`): summarization + chapterization.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GladiaPostProcessing {
+    /// Enable summarization (`post_processing.summarization`).
+    #[serde(default)]
+    pub summarization: bool,
+    /// Summarization config (`post_processing.summarization_config`), e.g. `{ "type": "bullet_points" }`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summarization_config: Option<GladiaSummarizationConfig>,
+    /// Enable chapterization (`post_processing.chapterization`).
+    #[serde(default)]
+    pub chapterization: bool,
+}
+
+impl GladiaPostProcessing {
+    /// True when no post-processing feature is requested (so the field can be omitted entirely).
+    pub fn is_empty(&self) -> bool {
+        !self.summarization && self.summarization_config.is_none() && !self.chapterization
+    }
+}
+
+/// Summarization config (Gladia `post_processing.summarization_config`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GladiaSummarizationConfig {
+    /// Summary type (e.g. "general", "bullet_points", "concise").
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub summary_type: Option<String>,
+}
+
+// =============================================================================
 // Realtime Processing Configuration
 // =============================================================================
 
@@ -293,18 +338,90 @@ pub struct GladiaRealtimeProcessing {
     /// Custom vocabulary words
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom_vocabulary: Vec<String>,
+    /// Custom vocabulary tuning (per-term intensity / pronunciations + default intensity).
+    /// Maps to Gladia `realtime_processing.custom_vocabulary_config`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_vocabulary_config: Option<GladiaCustomVocabularyConfig>,
+    /// Enable custom spelling dictionary (`realtime_processing.custom_spelling`).
+    #[serde(default)]
+    pub custom_spelling: bool,
+    /// Custom spelling dictionary config (`realtime_processing.custom_spelling_config`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_spelling_config: Option<GladiaCustomSpellingConfig>,
     /// Enable real-time translation
     #[serde(default)]
     pub translation: bool,
     /// Target languages for translation
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub translation_target_languages: Vec<String>,
+    /// Translation tuning options (`realtime_processing.translation_config`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translation_config: Option<GladiaTranslationConfig>,
     /// Enable named entity recognition
     #[serde(default)]
     pub named_entity_recognition: bool,
     /// Enable sentiment analysis
     #[serde(default)]
     pub sentiment_analysis: bool,
+}
+
+/// Custom spelling dictionary config: maps a canonical spelling to the spoken variants that
+/// should be replaced by it. Gladia `realtime_processing.custom_spelling_config`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GladiaCustomSpellingConfig {
+    /// Map of canonical spelling -> list of spoken variants.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub spelling_dictionary: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// Custom vocabulary tuning config. Gladia `realtime_processing.custom_vocabulary_config`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GladiaCustomVocabularyConfig {
+    /// Vocabulary entries (value + optional intensity/pronunciations/language).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vocabulary: Vec<GladiaVocabularyItem>,
+    /// Default boosting intensity applied to entries without an explicit intensity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_intensity: Option<f32>,
+}
+
+/// A single custom-vocabulary entry for Gladia.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GladiaVocabularyItem {
+    /// The vocabulary term.
+    pub value: String,
+    /// Per-term boosting intensity (overrides `default_intensity`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intensity: Option<f32>,
+    /// Alternative pronunciations to bias toward this term.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pronunciations: Vec<String>,
+    /// Language this entry applies to (ISO 639-1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+/// Translation tuning options. Gladia `realtime_processing.translation_config`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GladiaTranslationConfig {
+    /// Translation model to use (e.g. "base", "enhanced").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Match the original utterance segmentation in translations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_original_utterances: Option<bool>,
+    /// Optimize translation timing for lip-sync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lipsync: Option<bool>,
+    /// Adapt translation using prior context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_adaptation: Option<bool>,
+    /// Free-form context string to steer translation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// Use an informal register in the translation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub informal: Option<bool>,
 }
 
 // =============================================================================
@@ -340,6 +457,8 @@ pub struct GladiaSTTConfig {
     pub pre_processing: GladiaPreProcessing,
     /// Realtime processing configuration
     pub realtime_processing: GladiaRealtimeProcessing,
+    /// Post-processing configuration (summarization, chapterization)
+    pub post_processing: GladiaPostProcessing,
     /// Custom metadata for session tracking
     pub custom_metadata: Option<serde_json::Value>,
 }
@@ -360,6 +479,7 @@ impl Default for GladiaSTTConfig {
             messages_config: GladiaMessagesConfig::default(),
             pre_processing: GladiaPreProcessing::default(),
             realtime_processing: GladiaRealtimeProcessing::default(),
+            post_processing: GladiaPostProcessing::default(),
             custom_metadata: None,
         }
     }
@@ -426,6 +546,7 @@ impl GladiaSTTConfig {
         std: &crate::core::stt::standard::StandardSTTConfig,
     ) -> Result<Self, STTError> {
         let f = &std.features;
+        let ex = &std.extras.0;
         let mut cfg = Self::from_base(&std.base)?;
         if let Some(i) = f.interim_results {
             cfg.messages_config.receive_partial_transcripts = i;
@@ -442,6 +563,87 @@ impl GladiaSTTConfig {
         if let Some(true) = f.language_detection {
             cfg.language_config = GladiaLanguageConfig::auto();
         }
+
+        // --- Newly-wired Gladia features via the open ProviderExtras passthrough ---------------
+        // All map onto nested fields of the session-init body (realtime_processing /
+        // post_processing / messages_config) and are confirmed Gladia v2 Live params.
+        let rp = &mut cfg.realtime_processing;
+
+        // Custom spelling dictionary -> custom_spelling + custom_spelling_config.spelling_dictionary.
+        if let Some(dict) = ex
+            .get("custom_spelling_dictionary")
+            .or_else(|| ex.get("spelling_dictionary"))
+            .and_then(|v| v.as_object())
+        {
+            let mut spelling = std::collections::BTreeMap::new();
+            for (k, val) in dict {
+                let variants: Vec<String> = match val {
+                    serde_json::Value::Array(arr) => arr
+                        .iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect(),
+                    serde_json::Value::String(s) => vec![s.clone()],
+                    _ => Vec::new(),
+                };
+                spelling.insert(k.clone(), variants);
+            }
+            if !spelling.is_empty() {
+                rp.custom_spelling = true;
+                rp.custom_spelling_config = Some(GladiaCustomSpellingConfig {
+                    spelling_dictionary: spelling,
+                });
+            }
+        }
+        // Allow an explicit boolean toggle even without a dictionary.
+        if let Some(b) = ex.get("custom_spelling").and_then(|v| v.as_bool()) {
+            rp.custom_spelling = b;
+        }
+
+        // Custom vocabulary intensity / pronunciations -> custom_vocabulary_config.
+        if let Some(cvc) = ex.get("custom_vocabulary_config") {
+            if let Ok(parsed) =
+                serde_json::from_value::<GladiaCustomVocabularyConfig>(cvc.clone())
+            {
+                rp.custom_vocabulary_config = Some(parsed);
+            }
+        }
+
+        // Translation tuning options -> translation_config.
+        if let Some(tc) = ex.get("translation_config") {
+            if let Ok(parsed) = serde_json::from_value::<GladiaTranslationConfig>(tc.clone()) {
+                rp.translation_config = Some(parsed);
+            }
+        }
+
+        // Post-processing: summarization (+ type) and chapterization.
+        if let Some(b) = ex.get("summarization").and_then(|v| v.as_bool()) {
+            cfg.post_processing.summarization = b;
+        }
+        if let Some(t) = ex
+            .get("summarization_config")
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str())
+        {
+            cfg.post_processing.summarization = true;
+            cfg.post_processing.summarization_config = Some(GladiaSummarizationConfig {
+                summary_type: Some(t.to_string()),
+            });
+        }
+        if let Some(b) = ex.get("chapterization").and_then(|v| v.as_bool()) {
+            cfg.post_processing.chapterization = b;
+        }
+
+        // Message stream toggles.
+        if let Some(b) = ex.get("receive_acknowledgments").and_then(|v| v.as_bool()) {
+            cfg.messages_config.receive_acknowledgments = b;
+        }
+        if let Some(b) = ex.get("receive_errors").and_then(|v| v.as_bool()) {
+            cfg.messages_config.receive_errors = b;
+        }
+        if let Some(b) = ex.get("receive_lifecycle_events").and_then(|v| v.as_bool()) {
+            cfg.messages_config.receive_lifecycle_events = b;
+        }
+
         Ok(cfg)
     }
 

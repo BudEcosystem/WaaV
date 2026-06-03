@@ -297,6 +297,27 @@ impl ProsaStt {
         }
     }
 
+    /// Build the streaming session `config` message sent on the WebSocket as the first frame.
+    ///
+    /// Wire-builder for the streaming path: every recognition toggle that must reach the Prosa.ai
+    /// streaming endpoint is materialized here (mirroring `process_audio_rest`'s REST `config`).
+    /// `include_filler` is wired here so the standardized `filler_words` feature reaches the
+    /// streaming wire, not just the REST request body (the prior recurring "set on the struct but
+    /// never serialized to the wire" gap).
+    fn build_stream_config(&self) -> ProsaSttStreamConfig {
+        ProsaSttStreamConfig {
+            model: self.config.model.as_str().to_string(),
+            label: self.config.label.clone(),
+            include_partial: Some(self.config.include_partial),
+            include_filler: Some(self.config.include_filler),
+            audio: Some(ProsaSttAudioConfig {
+                format: self.config.audio_format.as_str().to_string(),
+                channels: Some(self.config.channels),
+                sample_rate: Some(self.config.sample_rate),
+            }),
+        }
+    }
+
     /// Connect to WebSocket for streaming.
     async fn connect_websocket(&self) -> Result<(), STTError> {
         if !self.config.model.supports_streaming() {
@@ -329,16 +350,7 @@ impl ProsaStt {
         }
 
         // Send configuration
-        let config = ProsaSttStreamConfig {
-            model: self.config.model.as_str().to_string(),
-            label: self.config.label.clone(),
-            include_partial: Some(self.config.include_partial),
-            audio: Some(ProsaSttAudioConfig {
-                format: self.config.audio_format.as_str().to_string(),
-                channels: Some(self.config.channels),
-                sample_rate: Some(self.config.sample_rate),
-            }),
-        };
+        let config = self.build_stream_config();
 
         let config_json = serde_json::to_string(&config).map_err(|e| {
             STTError::ConnectionFailed(format!("Failed to serialize config: {}", e))
@@ -707,6 +719,53 @@ mod tests {
 
         let stt = result.unwrap();
         assert!(!stt.is_ready());
+    }
+
+    // WIRE-LEVEL (streaming): the standardized `filler_words` feature must reach the streaming WS
+    // session-config FRAME that `connect_websocket` sends, not just the REST request body. This
+    // serializes exactly what goes on the wire (`build_stream_config`) and asserts the
+    // `include_filler` param is present with the requested value — guarding the recurring
+    // "mapped onto the config struct but never serialized to the streaming wire" gap class.
+    #[test]
+    fn test_filler_words_reaches_streaming_ws_config_frame() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+
+        // filler_words = true  =>  include_filler:true on the streaming frame.
+        let std_on = StandardSTTConfig {
+            base: STTConfig {
+                provider: "prosa-ai".into(),
+                api_key: "test_key".into(),
+                model: "stt-general-online".into(), // streaming model
+                ..Default::default()
+            },
+            features: SttFeatures {
+                filler_words: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let stt = ProsaStt::new_standard(&std_on).unwrap();
+        assert!(stt.config.model.supports_streaming());
+        let frame = serde_json::to_string(&stt.build_stream_config()).unwrap();
+        assert!(
+            frame.contains("\"include_filler\":true"),
+            "streaming WS config frame must carry include_filler=true; got: {frame}"
+        );
+
+        // filler_words = false  =>  include_filler:false on the streaming frame.
+        let std_off = StandardSTTConfig {
+            features: SttFeatures {
+                filler_words: Some(false),
+                ..Default::default()
+            },
+            ..std_on.clone()
+        };
+        let stt_off = ProsaStt::new_standard(&std_off).unwrap();
+        let frame_off = serde_json::to_string(&stt_off.build_stream_config()).unwrap();
+        assert!(
+            frame_off.contains("\"include_filler\":false"),
+            "streaming WS config frame must carry include_filler=false; got: {frame_off}"
+        );
     }
 
     #[test]

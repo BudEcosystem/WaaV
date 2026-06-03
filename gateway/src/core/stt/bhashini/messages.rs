@@ -35,6 +35,11 @@ pub struct PipelineTask {
 pub struct TaskConfig {
     /// Language configuration.
     pub language: LanguageConfig,
+    /// ASR post-processors to apply server-side (ULCA `postProcessors`, e.g.
+    /// `["itn"]` for inverse text normalization). Omitted when empty so existing
+    /// requests are byte-for-byte unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_processors: Option<Vec<String>>,
 }
 
 /// Language configuration.
@@ -44,6 +49,10 @@ pub struct LanguageConfig {
     /// Source language code (ISO-639).
     #[serde(default)]
     pub source_language: String,
+    /// Source script code (ULCA `sourceScriptCode`, ISO-15924, e.g. `"Latn"` to
+    /// transliterate Indian-language output into Latin script). Omitted when absent.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_script_code: Option<String>,
     /// Target language code (for translation only).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub target_language: Option<String>,
@@ -58,16 +67,34 @@ pub struct PipelineRequestConfig {
 }
 
 impl PipelineConfigRequest {
-    /// Create a new ASR pipeline config request.
+    /// Create a new ASR pipeline config request (no advanced ASR knobs).
     pub fn new_asr(source_language: &str, pipeline_id: &str) -> Self {
+        Self::new_asr_with(source_language, pipeline_id, None, None)
+    }
+
+    /// Create a new ASR pipeline config request, optionally carrying advanced ULCA
+    /// ASR knobs into `pipelineTasks[].config`:
+    /// - `source_script_code` → `config.language.sourceScriptCode` (ISO-15924 output script)
+    /// - `post_processors` → `config.postProcessors` (e.g. `["itn"]`)
+    ///
+    /// Both are omitted from the serialized body when `None`/empty, so the default
+    /// request is byte-for-byte identical to the prior `new_asr`.
+    pub fn new_asr_with(
+        source_language: &str,
+        pipeline_id: &str,
+        source_script_code: Option<String>,
+        post_processors: Option<Vec<String>>,
+    ) -> Self {
         Self {
             pipeline_tasks: vec![PipelineTask {
                 task_type: "asr".to_string(),
                 config: TaskConfig {
                     language: LanguageConfig {
                         source_language: source_language.to_string(),
+                        source_script_code,
                         target_language: None,
                     },
+                    post_processors: post_processors.filter(|p| !p.is_empty()),
                 },
             }],
             pipeline_request_config: PipelineRequestConfig {
@@ -84,8 +111,10 @@ impl PipelineConfigRequest {
                 config: TaskConfig {
                     language: LanguageConfig {
                         source_language: source_language.to_string(),
+                        source_script_code: None,
                         target_language: None,
                     },
+                    post_processors: None,
                 },
             }],
             pipeline_request_config: PipelineRequestConfig {
@@ -286,6 +315,7 @@ impl PipelineComputeRequest {
                 config: ComputeTaskConfig {
                     language: LanguageConfig {
                         source_language: source_language.to_string(),
+                        source_script_code: None,
                         target_language: None,
                     },
                     service_id: service_id.to_string(),
@@ -495,6 +525,40 @@ mod tests {
         assert!(json.contains("\"taskType\":\"asr\""));
         assert!(json.contains("\"sourceLanguage\":\"ta\""));
         assert!(json.contains("\"pipelineId\":\"pipeline123\""));
+        // Default request must NOT carry the advanced knobs (byte-for-byte unchanged).
+        assert!(!json.contains("sourceScriptCode"));
+        assert!(!json.contains("postProcessors"));
+    }
+
+    // WIRE-LEVEL: the source script code and ASR post-processors must land in the
+    // serialized pipeline-config request body — `config.language.sourceScriptCode`
+    // and `config.postProcessors` (camelCase ULCA keys), not just on a struct.
+    #[test]
+    fn source_script_code_and_post_processors_reach_config_body() {
+        let request = PipelineConfigRequest::new_asr_with(
+            "hi",
+            "pipeline123",
+            Some("Latn".to_string()),
+            Some(vec!["itn".to_string()]),
+        );
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(
+            json.contains("\"sourceScriptCode\":\"Latn\""),
+            "sourceScriptCode missing from config body: {json}"
+        );
+        assert!(
+            json.contains("\"postProcessors\":[\"itn\"]"),
+            "postProcessors missing from config body: {json}"
+        );
+    }
+
+    // Empty post-processor list is treated as absence (omitted from the wire body).
+    #[test]
+    fn empty_post_processors_are_omitted() {
+        let request =
+            PipelineConfigRequest::new_asr_with("hi", "p", None, Some(Vec::new()));
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("postProcessors"), "empty list must be omitted: {json}");
     }
 
     #[test]
@@ -600,6 +664,7 @@ mod tests {
     fn test_language_config_serialization() {
         let config = LanguageConfig {
             source_language: "hi".to_string(),
+            source_script_code: None,
             target_language: Some("en".to_string()),
         };
         let json = serde_json::to_string(&config).unwrap();
@@ -611,6 +676,7 @@ mod tests {
     fn test_language_config_without_target() {
         let config = LanguageConfig {
             source_language: "ta".to_string(),
+            source_script_code: None,
             target_language: None,
         };
         let json = serde_json::to_string(&config).unwrap();

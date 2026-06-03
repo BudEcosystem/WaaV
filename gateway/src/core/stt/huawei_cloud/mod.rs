@@ -398,6 +398,10 @@ mod tests {
             true,
             None,
             false,
+            true,
+            None,
+            None,
+            None,
         );
 
         let json = frame.to_json().unwrap();

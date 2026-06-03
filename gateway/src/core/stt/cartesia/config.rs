@@ -15,12 +15,19 @@ use url::form_urlencoded;
 
 /// Supported audio encodings for Cartesia STT WebSocket API.
 ///
-/// Currently only PCM signed 16-bit little-endian is supported.
+/// The Cartesia STT WebSocket accepts several raw-PCM `encoding` values in addition to the
+/// default signed-16-bit LE; the format must match the bytes sent on the socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CartesiaAudioEncoding {
-    /// PCM signed 16-bit little-endian
+    /// PCM signed 16-bit little-endian (`pcm_s16le`, the default).
     #[default]
     PcmS16le,
+    /// PCM 32-bit float little-endian (`pcm_f32le`).
+    PcmF32le,
+    /// PCM 8-bit μ-law (`pcm_mulaw`, telephony).
+    PcmMulaw,
+    /// PCM 8-bit A-law (`pcm_alaw`, telephony).
+    PcmAlaw,
 }
 
 impl CartesiaAudioEncoding {
@@ -29,6 +36,24 @@ impl CartesiaAudioEncoding {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::PcmS16le => "pcm_s16le",
+            Self::PcmF32le => "pcm_f32le",
+            Self::PcmMulaw => "pcm_mulaw",
+            Self::PcmAlaw => "pcm_alaw",
+        }
+    }
+
+    /// Parse a base `STTConfig.encoding` string onto a Cartesia encoding.
+    ///
+    /// Accepts the Cartesia wire spellings plus the shared-vocabulary aliases the rest of the
+    /// gateway uses (`linear16` is the `STTConfig` default and means signed-16-bit LE). Unknown
+    /// values fall back to the default so a stray value cannot get the connection rejected.
+    pub fn from_base_str(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "pcm_f32le" | "f32le" | "pcm_float32" => Self::PcmF32le,
+            "pcm_mulaw" | "mulaw" | "ulaw" | "pcmu" | "g711u" => Self::PcmMulaw,
+            "pcm_alaw" | "alaw" | "pcma" | "g711a" => Self::PcmAlaw,
+            // pcm_s16le / linear16 / pcm / "" -> default signed-16-bit LE
+            _ => Self::PcmS16le,
         }
     }
 }
@@ -84,6 +109,19 @@ pub struct CartesiaSTTConfig {
     ///
     /// If not specified, the latest API version is used.
     pub cartesia_version: Option<String>,
+
+    /// Short-lived client access token (Cartesia `access_token` query param).
+    ///
+    /// When set, the WebSocket authenticates with this ephemeral token instead of the
+    /// long-lived `api_key` — the recommended pattern for browser/edge clients so the
+    /// secret API key is never shipped to untrusted environments. Carried via the
+    /// standardized extras passthrough.
+    pub access_token: Option<String>,
+
+    /// Override the WebSocket base endpoint (`scheme://host[:port]`) — e.g. `ws://127.0.0.1:PORT`.
+    /// Carried from the standardized `endpoint_override`. Used by the in-repo chaos/integration
+    /// mock WebSocket server; `None` → the production `WEBSOCKET_BASE_URL`.
+    pub endpoint_override: Option<String>,
 }
 
 /// Default Cartesia API version date. REQUIRED on the STT WebSocket — without it the
@@ -100,6 +138,8 @@ impl Default for CartesiaSTTConfig {
             min_volume: None,
             max_silence_duration_secs: None,
             cartesia_version: Some(DEFAULT_API_VERSION.to_string()),
+            access_token: None,
+            endpoint_override: None,
         }
     }
 }
@@ -193,12 +233,28 @@ impl CartesiaSTTConfig {
         // Pre-allocate URL string capacity for performance
         let mut url = String::with_capacity(256);
 
-        // Base URL
-        url.push_str(Self::WEBSOCKET_BASE_URL);
+        // Base URL: honor an `endpoint_override` (scheme://host[:port]) for the in-repo mock/proxy
+        // (the chaos test points this at a local ws:// server); otherwise the production endpoint.
+        match self.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
+            Some(o) => {
+                url.push_str(o.trim_end_matches('/'));
+                url.push_str("/stt/websocket");
+            }
+            None => url.push_str(Self::WEBSOCKET_BASE_URL),
+        }
 
-        // Required parameters - URL encode api_key, model, and language
-        url.push_str("?api_key=");
-        url.push_str(&encode(api_key));
+        // Authentication: a short-lived `access_token` (extras) takes precedence over the
+        // long-lived `api_key` — the recommended pattern for untrusted clients. Exactly one
+        // auth param is emitted so the two are never sent together.
+        if let Some(token) = self.access_token.as_deref().filter(|t| !t.is_empty()) {
+            url.push_str("?access_token=");
+            url.push_str(&encode(token));
+        } else {
+            url.push_str("?api_key=");
+            url.push_str(&encode(api_key));
+        }
+
+        // Required parameters - URL encode model and language
         url.push_str("&model=");
         url.push_str(&encode(&self.model));
         url.push_str("&language=");
@@ -241,20 +297,50 @@ impl CartesiaSTTConfig {
         }
     }
 
-    /// Build from the standardized config (W1 keystone). Cartesia's `ink-whisper` streaming model
-    /// exposes a narrow VAD-oriented surface, so the only standardized feature it can actually
-    /// express is endpointing: `endpointing_ms` (silence after speech before finalizing) maps onto
-    /// `max_silence_duration_secs` (Cartesia's endpointing window, expressed in seconds — converted
-    /// from milliseconds). The other standardized features (interim_results, diarization,
-    /// word_timestamps, smart_format, profanity_filter, filler_words, vad_events, utterance_end,
-    /// keyterms, redaction, entity/language detection) have no corresponding Cartesia field and are
-    /// capability gaps that stay at their defaults.
+    /// Build from the standardized config (W1 keystone).
+    ///
+    /// Mapped onto Cartesia wire params:
+    /// - `endpointing_ms` (typed) → `max_silence_duration_secs` (ms → seconds), the endpointing
+    ///   window after speech before a transcript is finalized.
+    /// - `base.model` (typed) → `model` query param — Cartesia now ships selectable streaming
+    ///   models (e.g. `ink-2`); a non-empty, non-Deepgram-default model is honored.
+    /// - `base.encoding` (typed) → `encoding` query param — formats beyond `pcm_s16le`
+    ///   (`pcm_f32le`, `pcm_mulaw`, `pcm_alaw`).
+    /// - `access_token` (extras) → `access_token` query param — a short-lived client token that
+    ///   replaces `api_key` on the connect URL.
+    ///
+    /// Remaining standardized features (interim_results, diarization, word_timestamps,
+    /// smart_format, profanity_filter, filler_words, vad_events, utterance_end, keyterms,
+    /// redaction, entity/language detection) have no Cartesia field and stay at their defaults.
     pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
         let f = &std.features;
         let mut cfg = Self::from_base(std.base.clone());
         if let Some(ms) = f.endpointing_ms {
             cfg.max_silence_duration_secs = Some(ms as f32 / 1000.0);
         }
+        // Streaming model selection (typed). `from_base` deliberately drops `base.model` because
+        // the `STTConfig` default is the Deepgram-specific "nova-3"; honor any other explicit
+        // value so callers can select e.g. `ink-2` without it being silently overridden.
+        let model = std.base.model.trim();
+        if !model.is_empty() && model != "nova-3" {
+            cfg.model = model.to_string();
+        }
+        // Audio encoding selection (typed): map the shared `STTConfig.encoding` onto Cartesia's
+        // `encoding` enum (formats beyond pcm_s16le). The `STTConfig` default ("linear16") maps
+        // back to the Cartesia default, so the wire param is unchanged for default callers.
+        cfg.encoding = CartesiaAudioEncoding::from_base_str(&std.base.encoding);
+        // Short-lived client access token (extras) → `access_token` on the connect URL.
+        if let Some(token) = std
+            .extras
+            .0
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .filter(|t| !t.is_empty())
+        {
+            cfg.access_token = Some(token.to_string());
+        }
+        // Endpoint override (scheme://host[:port]) for the in-repo mock/proxy (chaos test).
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
         cfg
     }
 }
@@ -288,5 +374,96 @@ mod tests {
         let cfg = CartesiaSTTConfig::from_standard(&std);
         assert_eq!(cfg.max_silence_duration_secs, Some(0.5)); // endpointing_ms -> seconds
         assert_eq!(cfg.base.api_key, "test-key"); // base carried through
+    }
+
+    // WIRE-LEVEL: a selected streaming model (e.g. `ink-2`) must reach the connect URL's
+    // `model=` query param, not just sit on the config struct.
+    #[test]
+    fn model_selection_reaches_ws_url() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "cartesia".into(),
+                api_key: "k".into(),
+                language: "en".into(),
+                model: "ink-2".into(),
+                ..Default::default()
+            },
+            features: SttFeatures::default(),
+            extras: ProviderExtras::default(),
+        };
+        let cfg = CartesiaSTTConfig::from_standard(&std);
+        assert_eq!(cfg.model, "ink-2");
+        let url = cfg.build_websocket_url("k");
+        assert!(url.contains("&model=ink-2"), "model not on wire: {url}");
+    }
+
+    // WIRE-LEVEL: an audio encoding beyond pcm_s16le must reach the connect URL's `encoding=`
+    // query param.
+    #[test]
+    fn encoding_selection_reaches_ws_url() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "cartesia".into(),
+                api_key: "k".into(),
+                language: "en".into(),
+                encoding: "pcm_mulaw".into(),
+                ..Default::default()
+            },
+            features: SttFeatures::default(),
+            extras: ProviderExtras::default(),
+        };
+        let cfg = CartesiaSTTConfig::from_standard(&std);
+        assert_eq!(cfg.encoding, CartesiaAudioEncoding::PcmMulaw);
+        let url = cfg.build_websocket_url("k");
+        assert!(url.contains("&encoding=pcm_mulaw"), "encoding not on wire: {url}");
+    }
+
+    // The shared default encoding ("linear16") must map back to Cartesia's default so default
+    // callers' wire body is unchanged.
+    #[test]
+    fn default_linear16_encoding_maps_to_pcm_s16le() {
+        use crate::core::stt::standard::StandardSTTConfig;
+        let std = StandardSTTConfig::from_base(STTConfig {
+            api_key: "k".into(),
+            language: "en".into(),
+            ..Default::default() // encoding == "linear16"
+        });
+        let cfg = CartesiaSTTConfig::from_standard(&std);
+        assert_eq!(cfg.encoding, CartesiaAudioEncoding::PcmS16le);
+        let url = cfg.build_websocket_url("k");
+        assert!(url.contains("&encoding=pcm_s16le"), "default encoding wrong: {url}");
+    }
+
+    // WIRE-LEVEL: a short-lived `access_token` (extras) must reach the connect URL's
+    // `access_token=` query param AND replace `api_key=` (exactly one auth param).
+    #[test]
+    fn access_token_extra_reaches_ws_url_and_replaces_api_key() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let mut extras = serde_json::Map::new();
+        extras.insert("access_token".into(), serde_json::json!("ephemeral-xyz"));
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "cartesia".into(),
+                api_key: "long-lived-key".into(),
+                language: "en".into(),
+                ..Default::default()
+            },
+            features: SttFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+        let cfg = CartesiaSTTConfig::from_standard(&std);
+        assert_eq!(cfg.access_token.as_deref(), Some("ephemeral-xyz"));
+        let url = cfg.build_websocket_url(&cfg.base.api_key);
+        assert!(
+            url.contains("access_token=ephemeral-xyz"),
+            "access_token not on wire: {url}"
+        );
+        // The long-lived api_key must NOT also be present once a token is supplied.
+        assert!(
+            !url.contains("api_key="),
+            "api_key must be replaced by access_token: {url}"
+        );
     }
 }

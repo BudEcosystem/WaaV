@@ -130,6 +130,12 @@ pub struct TencentSignatureBuilder {
 
     /// Filter empty result callbacks (0=off, 1=on).
     filter_empty_result: Option<u32>,
+
+    /// Noise filter threshold (float in -1.0..=1.0).
+    noise_threshold: Option<f64>,
+
+    /// Sample rate of the input audio when it differs from the engine's nominal rate.
+    input_sample_rate: Option<u32>,
 }
 
 impl TencentSignatureBuilder {
@@ -159,6 +165,8 @@ impl TencentSignatureBuilder {
             convert_num_mode: None,
             customization_id: None,
             filter_empty_result: None,
+            noise_threshold: None,
+            input_sample_rate: None,
         }
     }
 
@@ -308,6 +316,18 @@ impl TencentSignatureBuilder {
         self
     }
 
+    /// Set the noise filter threshold (float in -1.0..=1.0).
+    pub fn with_noise_threshold(mut self, threshold: f64) -> Self {
+        self.noise_threshold = Some(threshold);
+        self
+    }
+
+    /// Set the input audio sample rate (`input_sample_rate`).
+    pub fn with_input_sample_rate(mut self, rate: u32) -> Self {
+        self.input_sample_rate = Some(rate);
+        self
+    }
+
     /// Build the sorted parameter map.
     fn build_params(&self) -> BTreeMap<String, String> {
         let mut params = BTreeMap::new();
@@ -380,6 +400,17 @@ impl TencentSignatureBuilder {
             params.insert(
                 "filter_empty_result".to_string(),
                 filter_empty_result.to_string(),
+            );
+        }
+
+        if let Some(noise_threshold) = self.noise_threshold {
+            params.insert("noise_threshold".to_string(), noise_threshold.to_string());
+        }
+
+        if let Some(input_sample_rate) = self.input_sample_rate {
+            params.insert(
+                "input_sample_rate".to_string(),
+                input_sample_rate.to_string(),
             );
         }
 

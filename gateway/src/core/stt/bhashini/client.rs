@@ -176,10 +176,11 @@ impl BhashiniStt {
         Self::create_internal(config)
     }
 
-    /// W1 keystone — construct directly from the standardized config. Bhashini is a batch ULCA
-    /// provider with no advanced-feature knobs, so `from_standard` is a pure `from_base`
-    /// passthrough; this gives the provider a uniform standardized entry point on the keystone
-    /// path (every standardized feature is a capability gap and stays at default).
+    /// W1 keystone — construct directly from the standardized config. The typed `SttFeatures`
+    /// are all capability gaps for this batch ULCA provider and stay at default, but two
+    /// Bhashini-specific ULCA pipeline knobs (`sourceScriptCode`, `postProcessors`) carried via
+    /// the standardized extras passthrough DO reach `pipelineTasks[].config` on the wire — see
+    /// `BhashiniSttConfig::from_standard` and `fetch_pipeline_config`.
     pub fn new_standard(
         std: &crate::core::stt::standard::StandardSTTConfig,
     ) -> Result<Self, STTError> {
@@ -196,9 +197,13 @@ impl BhashiniStt {
             self.config.language.as_code()
         );
 
-        let request = PipelineConfigRequest::new_asr(
+        // Carry the advanced ULCA ASR knobs (sourceScriptCode + postProcessors) into the
+        // pipeline-config request body when configured via the standardized extras passthrough.
+        let request = PipelineConfigRequest::new_asr_with(
             self.config.language.as_code(),
             self.config.pipeline_id(),
+            self.config.source_script_code.clone(),
+            self.config.post_processors.clone(),
         );
 
         let response = self

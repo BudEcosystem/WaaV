@@ -45,6 +45,12 @@ pub struct TinkoffTtsConfig {
     #[serde(default)]
     pub volume_gain_db: f32,
 
+    /// Treat synthesis input as SSML. When set, the gRPC `SynthesisInput.ssml` oneof field is
+    /// populated instead of `SynthesisInput.text`, unlocking `<speak>`/`<prosody>` markup on the
+    /// `tinkoff.cloud.tts.v1.TextToSpeech` Synthesize / StreamingSynthesize RPCs.
+    #[serde(default)]
+    pub ssml: bool,
+
     /// Connection timeout in seconds
     #[serde(default = "default_connection_timeout")]
     pub connection_timeout_secs: u64,
@@ -82,6 +88,7 @@ impl Default for TinkoffTtsConfig {
             speaking_rate: default_speaking_rate(),
             pitch: 0.0,
             volume_gain_db: 0.0,
+            ssml: false,
             connection_timeout_secs: default_connection_timeout(),
             request_timeout_secs: default_request_timeout(),
         }
@@ -134,6 +141,7 @@ impl TinkoffTtsConfig {
             speaking_rate: default_speaking_rate(),
             pitch: 0.0,
             volume_gain_db: 0.0,
+            ssml: false,
             connection_timeout_secs: default_connection_timeout(),
             request_timeout_secs: default_request_timeout(),
         })
@@ -143,10 +151,12 @@ impl TinkoffTtsConfig {
     /// maps `speed` -> `speaking_rate` (both are 1.0-is-normal multipliers, clamped to the API's
     /// 0.25-4.0 range), `pitch` -> `pitch` (direct semitone offset, clamped to -20.0..=20.0), and
     /// `volume` -> `volume_gain_db` (direct dB gain, clamped to -96.0..=16.0). `sample_rate`
-    /// overrides the output sample rate (clamped to the API's 1000-48000 Hz range). Tinkoff's
-    /// non-standard `connection_timeout_secs` / `request_timeout_secs` knobs are read from the
-    /// `extras` passthrough. Features without a Tinkoff field (stability, similarity_boost, style,
-    /// use_speaker_boost, emotion, instructions, ssml, language, word_timestamps, streaming, seed)
+    /// overrides the output sample rate (clamped to the API's 1000-48000 Hz range). `ssml` flips
+    /// the input oneof so synthesis input is sent as `SynthesisInput.ssml` instead of `.text`
+    /// (the VoiceKit `TextToSpeech` API accepts SSML on both Synthesize and StreamingSynthesize).
+    /// Tinkoff's non-standard `connection_timeout_secs` / `request_timeout_secs` knobs are read
+    /// from the `extras` passthrough. Features without a Tinkoff field (stability, similarity_boost,
+    /// style, use_speaker_boost, emotion, instructions, language, word_timestamps, streaming, seed)
     /// are skipped.
     pub fn from_standard(
         std: &crate::core::tts::standard::StandardTTSConfig,
@@ -168,6 +178,10 @@ impl TinkoffTtsConfig {
         }
         if let Some(rate) = f.sample_rate {
             cfg.sample_rate = rate.clamp(1000, 48000);
+        }
+        if let Some(ssml) = f.ssml {
+            // Flip the SynthesisInput oneof from `.text` to `.ssml` (audio-changing).
+            cfg.ssml = ssml;
         }
 
         // Provider-specific passthrough.
@@ -392,7 +406,7 @@ mod tests {
                 pitch: Some(5.0),
                 volume: Some(-6.0),
                 sample_rate: Some(48000),
-                ssml: Some(true), // capability gap: no Tinkoff SSML field here, must be ignored
+                ssml: Some(true), // now wired: flips the SynthesisInput oneof to `.ssml`
                 ..Default::default()
             },
             extras: crate::core::stt::standard::ProviderExtras(extras),
@@ -402,8 +416,38 @@ mod tests {
         assert_eq!(cfg.pitch, 5.0); // direct semitone offset
         assert_eq!(cfg.volume_gain_db, -6.0); // direct dB gain
         assert_eq!(cfg.sample_rate, 48000);
+        assert!(cfg.ssml); // features.ssml -> config.ssml
         assert_eq!(cfg.connection_timeout_secs, 20); // from extras passthrough
         assert_eq!(cfg.request_timeout_secs, 45);
+    }
+
+    // `features.ssml` toggles the typed config flag that selects the SynthesisInput.ssml oneof;
+    // when unset it stays false so the plain-text path is preserved.
+    #[test]
+    fn from_standard_maps_ssml_flag() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let base = TTSConfig {
+            provider: "tinkoff".into(),
+            api_key: "test".into(),
+            voice_id: Some("alyona".into()),
+            ..Default::default()
+        };
+        let with_ssml = StandardTTSConfig {
+            base: base.clone(),
+            features: TtsFeatures {
+                ssml: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        assert!(TinkoffTtsConfig::from_standard(&with_ssml).unwrap().ssml);
+
+        let without = StandardTTSConfig {
+            base,
+            features: TtsFeatures::default(),
+            extras: Default::default(),
+        };
+        assert!(!TinkoffTtsConfig::from_standard(&without).unwrap().ssml);
     }
 
     #[test]

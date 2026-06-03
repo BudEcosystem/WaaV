@@ -44,8 +44,9 @@ use tracing::{debug, error, info, warn};
 
 use super::config::DashScopeTtsConfig;
 use super::messages::{
-    CosyVoiceContinueTask, CosyVoiceFinishTask, CosyVoiceResponse, CosyVoiceRunTask,
-    QwenTtsServerMessage, QwenTtsSessionUpdate, QwenTtsTextAppend, QwenTtsTextCommit,
+    CosyVoiceContinueTask, CosyVoiceFinishTask, CosyVoiceParameters, CosyVoiceResponse,
+    CosyVoiceRunTask, QwenTtsServerMessage, QwenTtsSessionUpdate, QwenTtsTextAppend,
+    QwenTtsTextCommit,
 };
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
@@ -196,15 +197,32 @@ impl DashScopeTts {
     }
 
     /// Create run-task message for CosyVoice.
+    ///
+    /// Carries both the base prosody (`voice`/`format`/`sample_rate`/`volume`/`rate`/`pitch`) and
+    /// the advanced CosyVoice inference-protocol knobs (`enable_ssml`, `instruction`,
+    /// `word_timestamp_enabled`, `seed`, `language_hints`, `bit_rate`, `hot_fix`,
+    /// `enable_markdown_filter`, `enable_aigc_tag`) from the resolved config into the run-task
+    /// `payload.parameters`. Unset advanced knobs are omitted from the wire.
     fn create_cosyvoice_run_task(&self) -> (String, String) {
-        let msg = CosyVoiceRunTask::new(
+        let msg = CosyVoiceRunTask::with_parameters(
             self.config.model.as_model_id(),
-            &self.config.voice,
-            self.config.audio_format.as_format_str(),
-            self.config.sample_rate,
-            self.config.volume,
-            self.config.rate,
-            self.config.pitch,
+            CosyVoiceParameters {
+                voice: self.config.voice.clone(),
+                format: self.config.audio_format.as_format_str().to_string(),
+                sample_rate: self.config.sample_rate,
+                volume: self.config.volume,
+                rate: self.config.rate,
+                pitch: self.config.pitch,
+                enable_ssml: self.config.enable_ssml,
+                instruction: self.config.instruction.clone(),
+                word_timestamp_enabled: self.config.word_timestamp_enabled,
+                seed: self.config.seed,
+                language_hints: self.config.language_hints.clone(),
+                bit_rate: self.config.bit_rate,
+                hot_fix: self.config.hot_fix.clone(),
+                enable_markdown_filter: self.config.enable_markdown_filter,
+                enable_aigc_tag: self.config.enable_aigc_tag,
+            },
         );
         let task_id = msg.task_id().to_string();
         let json = msg.to_json().unwrap_or_default();
@@ -730,6 +748,88 @@ mod tests {
         assert!(json.contains("run-task"));
         assert!(json.contains("cosyvoice-v3-flash"));
         assert!(!task_id.is_empty());
+    }
+
+    // WIRE-LEVEL: the advanced CosyVoice features set through the standardized config must reach
+    // the actual run-task JSON sent over the WebSocket (under `payload.parameters`), not merely
+    // sit on the config struct. This guards the recurring "config set but never emitted" bug.
+    #[test]
+    fn cosyvoice_features_reach_run_task_payload_parameters() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("bit_rate".into(), serde_json::json!(48000));
+        extras.insert(
+            "hot_fix".into(),
+            serde_json::json!({"WaaV": "wave", "TTS": "tee tee ess"}),
+        );
+        extras.insert("enable_markdown_filter".into(), serde_json::json!(true));
+        extras.insert("enable_aigc_tag".into(), serde_json::json!(true));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "alibaba-cloud".into(),
+                api_key: "k".into(),
+                voice_id: Some("longxiaochun".into()),
+                model: "cosyvoice-v3-flash".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                ssml: Some(true),
+                instructions: Some("speak with a cheerful Sichuan dialect".into()),
+                word_timestamps: Some(true),
+                seed: Some(2024),
+                language: Some("zh".into()),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let tts = DashScopeTts::from_standard(&std).unwrap();
+        let (json, _task_id) = tts.create_cosyvoice_run_task();
+
+        // Parse the emitted bytes and assert each knob landed under payload.parameters.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let params = &v["payload"]["parameters"];
+        assert_eq!(params["enable_ssml"], serde_json::json!(true));
+        assert_eq!(
+            params["instruction"],
+            serde_json::json!("speak with a cheerful Sichuan dialect")
+        );
+        assert_eq!(params["word_timestamp_enabled"], serde_json::json!(true));
+        assert_eq!(params["seed"], serde_json::json!(2024));
+        assert_eq!(params["language_hints"], serde_json::json!(["zh"]));
+        assert_eq!(params["bit_rate"], serde_json::json!(48000));
+        assert_eq!(
+            params["hot_fix"],
+            serde_json::json!({"WaaV": "wave", "TTS": "tee tee ess"})
+        );
+        assert_eq!(params["enable_markdown_filter"], serde_json::json!(true));
+        assert_eq!(params["enable_aigc_tag"], serde_json::json!(true));
+    }
+
+    // The default (no advanced features) run-task must stay byte-compatible: the optional knobs
+    // are omitted from the wire entirely (skip_serializing_if), not emitted as null.
+    #[test]
+    fn cosyvoice_run_task_omits_unset_advanced_knobs() {
+        let config = create_test_config();
+        let tts = DashScopeTts::new(config).unwrap();
+        let (json, _) = tts.create_cosyvoice_run_task();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let params = &v["payload"]["parameters"];
+        for key in [
+            "enable_ssml",
+            "instruction",
+            "word_timestamp_enabled",
+            "seed",
+            "language_hints",
+            "bit_rate",
+            "hot_fix",
+            "enable_markdown_filter",
+            "enable_aigc_tag",
+        ] {
+            assert!(params.get(key).is_none(), "{key} must be omitted when unset");
+        }
+        // Base prosody still present.
+        assert!(params.get("voice").is_some());
+        assert!(params.get("rate").is_some());
     }
 
     #[test]

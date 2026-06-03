@@ -248,6 +248,10 @@ pub struct ResembleStreamRequest {
     /// Enable HD synthesis
     #[serde(skip_serializing_if = "Option::is_none")]
     pub use_hd: Option<bool>,
+    /// Apply the project's custom pronunciation rules during synthesis
+    /// (Resemble `/stream` body flag — audio-changing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apply_custom_pronunciations: Option<bool>,
 }
 
 impl ResembleStreamRequest {
@@ -261,6 +265,7 @@ impl ResembleStreamRequest {
             precision: None,
             sample_rate: None,
             use_hd: None,
+            apply_custom_pronunciations: None,
         }
     }
 
@@ -286,6 +291,13 @@ impl ResembleStreamRequest {
                 Some(config.sample_rate)
             },
             use_hd: if config.use_hd { Some(true) } else { None },
+            // Only emit the flag when explicitly enabled; omit otherwise so the request matches the
+            // pre-feature wire shape (Resemble defaults to off).
+            apply_custom_pronunciations: if config.apply_custom_pronunciations {
+                Some(true)
+            } else {
+                None
+            },
         }
     }
 
@@ -355,6 +367,8 @@ pub struct ResembleTtsConfig {
     pub sample_rate: u32,
     /// Enable HD synthesis
     pub use_hd: bool,
+    /// Apply the project's custom pronunciation rules during synthesis.
+    pub apply_custom_pronunciations: bool,
 }
 
 impl ResembleTtsConfig {
@@ -369,6 +383,7 @@ impl ResembleTtsConfig {
             precision: ResemblePrecision::default(),
             sample_rate: DEFAULT_SAMPLE_RATE,
             use_hd: false,
+            apply_custom_pronunciations: false,
         }
     }
 
@@ -408,12 +423,19 @@ impl ResembleTtsConfig {
         self
     }
 
+    /// Apply the project's custom pronunciation rules during synthesis.
+    pub fn with_custom_pronunciations(mut self, apply: bool) -> Self {
+        self.apply_custom_pronunciations = apply;
+        self
+    }
+
     /// Build from the standardized TTS config (W1 keystone — TTS fleet).
     ///
     /// Resemble exposes a narrow advanced surface, so only `sample_rate` maps to a real field.
-    /// Non-standard Resemble settings (`project_uuid`, `use_hd`) are read from the open
-    /// `extras` passthrough. Voice-tone features (stability, style, emotion, instructions, SSML,
-    /// speed/pitch/volume, word_timestamps, streaming, seed) have no matching field and are skipped.
+    /// Non-standard Resemble settings (`project_uuid`, `use_hd`, `apply_custom_pronunciations`) are
+    /// read from the open `extras` passthrough. Voice-tone features (stability, style, emotion,
+    /// instructions, SSML, speed/pitch/volume, word_timestamps, streaming, seed) have no matching
+    /// field and are skipped.
     pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let f = &std.features;
         let mut cfg = Self::from_base(&std.base)?;
@@ -431,6 +453,16 @@ impl ResembleTtsConfig {
         }
         if let Some(hd) = std.extras.0.get("use_hd").and_then(|v| v.as_bool()) {
             cfg.use_hd = hd;
+        }
+        // Resemble has no canonical `TtsFeatures` field for this project-level pronunciation flag,
+        // so it travels through the open extras passthrough and is emitted in the `/stream` body.
+        if let Some(apply) = std
+            .extras
+            .0
+            .get("apply_custom_pronunciations")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.apply_custom_pronunciations = apply;
         }
         Ok(cfg)
     }
@@ -489,6 +521,7 @@ impl ResembleTtsConfig {
             precision: ResemblePrecision::default(),
             sample_rate,
             use_hd: false,
+            apply_custom_pronunciations: false,
         };
 
         // Validate
@@ -547,6 +580,7 @@ impl Default for ResembleTtsConfig {
             precision: ResemblePrecision::default(),
             sample_rate: DEFAULT_SAMPLE_RATE,
             use_hd: false,
+            apply_custom_pronunciations: false,
         }
     }
 }

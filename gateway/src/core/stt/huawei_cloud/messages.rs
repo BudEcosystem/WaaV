@@ -65,13 +65,25 @@ pub struct HuaweiStartConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interim_results: Option<String>,
 
-    /// Maximum audio silence before auto-ending (seconds).
+    /// Initial-silence VAD head: max leading silence before speech, in milliseconds
+    /// (Huawei SIS RASR `vad_head`, valid 0–60000).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_seconds_of_silence: Option<u32>,
+    pub vad_head: Option<u32>,
+
+    /// Tail-silence VAD endpointing: trailing silence after speech that finalizes the utterance,
+    /// in milliseconds (Huawei SIS RASR `vad_tail`, valid 0–3000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vad_tail: Option<u32>,
+
+    /// Maximum utterance/sentence audio duration in seconds
+    /// (Huawei SIS RASR `max_seconds`, valid 1–60).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_seconds: Option<u32>,
 }
 
 impl HuaweiStartFrame {
     /// Create a new START frame.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         audio_format: &str,
         property: &str,
@@ -79,6 +91,10 @@ impl HuaweiStartFrame {
         digit_norm: bool,
         vocabulary_id: Option<&str>,
         need_word_info: bool,
+        interim_results: bool,
+        vad_head: Option<u32>,
+        vad_tail: Option<u32>,
+        max_seconds: Option<u32>,
     ) -> Self {
         Self {
             command: HuaweiWsCommand::Start,
@@ -89,15 +105,35 @@ impl HuaweiStartFrame {
                 digit_norm: Some(if digit_norm { "yes" } else { "no" }.to_string()),
                 vocabulary_id: vocabulary_id.map(|s| s.to_string()),
                 need_word_info: Some(if need_word_info { "yes" } else { "no" }.to_string()),
-                interim_results: Some("yes".to_string()),
-                max_seconds_of_silence: None,
+                interim_results: Some(if interim_results { "yes" } else { "no" }.to_string()),
+                vad_head,
+                vad_tail,
+                max_seconds,
             },
         }
     }
 
-    /// Set maximum silence duration.
-    pub fn with_max_silence(mut self, seconds: u32) -> Self {
-        self.config.max_seconds_of_silence = Some(seconds);
+    /// Build the START frame directly from the resolved provider config — the single source of
+    /// truth shared by the live client and the wire-assert tests, so what the test serializes is
+    /// byte-for-byte what the client sends on the WebSocket.
+    pub fn from_config(config: &super::config::HuaweiCloudSttConfig) -> Self {
+        Self::new(
+            config.audio_format.as_str(),
+            config.model.as_str(),
+            config.add_punctuation,
+            config.digit_norm,
+            config.vocabulary_id.as_deref(),
+            config.need_word_info,
+            config.interim_results,
+            config.vad_head,
+            config.vad_tail,
+            config.max_seconds,
+        )
+    }
+
+    /// Set maximum tail-silence VAD endpointing (ms).
+    pub fn with_vad_tail(mut self, ms: u32) -> Self {
+        self.config.vad_tail = Some(ms);
         self
     }
 
@@ -559,6 +595,10 @@ mod tests {
             true,
             None,
             false,
+            true,
+            None,
+            None,
+            None,
         );
 
         let json = frame.to_json().unwrap();
@@ -577,6 +617,10 @@ mod tests {
             true,
             Some("vocab123"),
             true,
+            true,
+            None,
+            None,
+            None,
         );
 
         let json = frame.to_json().unwrap();
@@ -585,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn test_start_frame_with_max_silence() {
+    fn test_start_frame_with_vad_tail() {
         let frame = HuaweiStartFrame::new(
             "pcm16k16bit",
             "chinese_16k_general",
@@ -593,11 +637,62 @@ mod tests {
             true,
             None,
             false,
+            true,
+            None,
+            None,
+            None,
         )
-        .with_max_silence(5);
+        .with_vad_tail(800);
 
         let json = frame.to_json().unwrap();
-        assert!(json.contains("\"max_seconds_of_silence\":5"));
+        assert!(json.contains("\"vad_tail\":800"));
+    }
+
+    // WIRE-LEVEL: the standardized features/extras must reach the *serialized START frame* — the
+    // exact JSON text frame the client sends on the WebSocket (`HuaweiStartFrame::from_config` is
+    // the single source of truth the live client uses). This asserts the wire body, not the
+    // config struct (the recurring "tested config, not wire" bug class).
+    #[test]
+    fn vad_and_interim_features_reach_serialized_start_frame() {
+        use crate::core::stt::base::STTConfig;
+        use crate::core::stt::huawei_cloud::config::HuaweiCloudSttConfig;
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("vad_head".into(), serde_json::json!(1500)); // initial-silence VAD (ms)
+        extras.insert("max_seconds".into(), serde_json::json!(42)); // max utterance duration (s)
+
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "huawei_cloud".into(),
+                api_key: "user|pass|domain|project123".into(),
+                model: "chinese_16k_general".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                interim_results: Some(false),  // typed → interim_results
+                endpointing_ms: Some(900),     // canonical tail-silence → vad_tail (ms)
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+
+        let cfg = HuaweiCloudSttConfig::from_standard(&std).expect("from_standard");
+        let json = HuaweiStartFrame::from_config(&cfg)
+            .to_json()
+            .expect("serialize START frame");
+
+        // tail-silence VAD endpointing (typed endpointing_ms → vad_tail), in ms.
+        assert!(json.contains("\"vad_tail\":900"), "vad_tail missing: {json}");
+        // initial-silence VAD head (extras vad_head), in ms.
+        assert!(json.contains("\"vad_head\":1500"), "vad_head missing: {json}");
+        // max utterance/sentence duration (extras max_seconds), in s.
+        assert!(json.contains("\"max_seconds\":42"), "max_seconds missing: {json}");
+        // interim/partial results toggle (typed) — false → "no" on the wire.
+        assert!(
+            json.contains("\"interim_results\":\"no\""),
+            "interim_results missing: {json}"
+        );
     }
 
     #[test]

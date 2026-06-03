@@ -99,6 +99,8 @@ mod config_tests {
             min_volume: Some(0.1),
             max_silence_duration_secs: Some(0.5),
             cartesia_version: Some("2025-01-15".to_string()),
+            access_token: None,
+            endpoint_override: None,
         };
 
         let url = config.build_websocket_url("my_api_key");
@@ -361,6 +363,8 @@ mod config_tests {
             min_volume: Some(0.1),
             max_silence_duration_secs: Some(0.4),
             cartesia_version: Some("2025-01-15".to_string()),
+            access_token: None,
+            endpoint_override: None,
         };
 
         assert!(config.validate().is_ok());

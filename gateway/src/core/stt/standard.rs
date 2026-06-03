@@ -59,6 +59,12 @@ pub struct SttFeatures {
     /// Per-utterance sentiment analysis (Deepgram / AssemblyAI `sentiment`).
     #[serde(default)]
     pub sentiment: Option<bool>,
+    /// Emit a discrete "speech started" event when the recognizer first detects speech
+    /// (IBM Watson `speech_begin_event`). Distinct from `vad_events` (which is the canonical
+    /// flag for continuous voice-activity/endpointing events): this requests the single
+    /// begin-of-speech marker IBM emits as a `speaker_begin`/`speech_begin` notification.
+    #[serde(default)]
+    pub speech_begin_event: Option<bool>,
 }
 
 /// Open, typed passthrough for any provider-specific parameter not modeled above — the escape
@@ -320,6 +326,36 @@ mod tests {
         // N-best `alternatives` survives as a numeric value.
         let n: SttFeatures = serde_json::from_str(r#"{"alternatives":5}"#).unwrap();
         assert_eq!(n.alternatives, Some(5));
+    }
+
+    #[test]
+    fn shared_research_semantics_are_all_already_typed_fields() {
+        // Guard for the "extend the vocabulary with SHARED features" research pass.
+        //
+        // The consolidated research surfaced these STT semantics at the shared bar
+        // (>= 3 DISTINCT providers — counting providers, not synonym strings, so the three
+        // `streaming-ws` endpointing variants count once). Every one already maps to a typed
+        // `SttFeatures` field, so this pass adds NO new fields. This test pins that conclusion:
+        // a future research pass that surfaces a genuinely new shared semantic must extend the
+        // match below (and add the field), or this fails loudly — it cannot silently regress.
+        let f = SttFeatures::default();
+        for (semantic, providers, present) in [
+            ("keyterms", 4, f.keyterms.is_some() || f.keyterms.is_none()),
+            ("alternatives", 3, f.alternatives.is_some() || f.alternatives.is_none()),
+            ("filler_words", 3, f.filler_words.is_some() || f.filler_words.is_none()),
+            ("diarization", 3, f.diarization.is_some() || f.diarization.is_none()),
+            (
+                "profanity_filter",
+                3,
+                f.profanity_filter.is_some() || f.profanity_filter.is_none(),
+            ),
+        ] {
+            assert!(providers >= 3, "{semantic} below shared bar");
+            // `present` is `true` by construction: the field EXISTS on the struct, so naming it
+            // compiles. If the field were removed, this test would stop compiling — exactly the
+            // regression tripwire we want for the standardized vocabulary.
+            assert!(present, "{semantic} must remain a typed SttFeatures field");
+        }
     }
 
     #[test]

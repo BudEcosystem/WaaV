@@ -277,6 +277,20 @@ pub struct ElevenLabsSTTConfig {
     /// Results are returned in the sensitive_data field.
     /// Useful for HIPAA compliance in healthcare applications.
     pub enable_phi_detection: Option<bool>,
+
+    /// Detect and report the spoken language (ElevenLabs `include_language_detection`).
+    ///
+    /// When `Some(true)`, the realtime API runs automatic language identification and
+    /// returns the detected language alongside the transcript. Maps from the standardized
+    /// `SttFeatures::language_detection`.
+    pub include_language_detection: Option<bool>,
+
+    /// Suppress filler words / disfluencies (ElevenLabs `no_verbatim`).
+    ///
+    /// This is the INVERSE of the standardized `SttFeatures::filler_words`: a caller asking
+    /// to *keep* filler words (`filler_words = true`) sets `no_verbatim = false`, and a caller
+    /// asking to drop them (`filler_words = false`) sets `no_verbatim = true`.
+    pub no_verbatim: Option<bool>,
 }
 
 impl Default for ElevenLabsSTTConfig {
@@ -302,6 +316,8 @@ impl Default for ElevenLabsSTTConfig {
             max_speakers: None,
             enable_pii_detection: None,
             enable_phi_detection: None,
+            include_language_detection: None,
+            no_verbatim: None,
         }
     }
 }
@@ -456,6 +472,20 @@ impl ElevenLabsSTTConfig {
             url.push_str("&phi_detection=true");
         }
 
+        // Automatic spoken-language detection (only emitted when explicitly set, so the default
+        // connect URL is unchanged).
+        if let Some(detect) = self.include_language_detection {
+            url.push_str("&include_language_detection=");
+            url.push_str(if detect { "true" } else { "false" });
+        }
+
+        // Filler-word suppression. ElevenLabs' `no_verbatim` is the inverse of "keep filler
+        // words"; only emitted when explicitly configured.
+        if let Some(no_verbatim) = self.no_verbatim {
+            url.push_str("&no_verbatim=");
+            url.push_str(if no_verbatim { "true" } else { "false" });
+        }
+
         url
     }
 
@@ -479,10 +509,11 @@ impl ElevenLabsSTTConfig {
     }
 
     /// Build from the standardized config (W1 keystone). ElevenLabs exposes a rich advanced
-    /// surface (word timestamps, diarization, entity detection, key terms, PII/PHI redaction),
-    /// so this maps those features through the standardized API — previously unreachable via the
-    /// flat factory. Features ElevenLabs cannot express (smart_format, profanity_filter,
-    /// interim_results, vad_events, endpointing, language_detection) stay at provider defaults.
+    /// surface (word timestamps, diarization, entity detection, key terms, PII/PHI redaction,
+    /// automatic language detection, filler-word suppression), so this maps those features
+    /// through the standardized API — previously unreachable via the flat factory. Features
+    /// ElevenLabs cannot express (smart_format, profanity_filter, interim_results, vad_events,
+    /// endpointing) stay at provider defaults.
     pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
         let f = &std.features;
         let mut cfg = Self::from_base(std.base.clone());
@@ -507,6 +538,14 @@ impl ElevenLabsSTTConfig {
             if phi {
                 cfg.enable_phi_detection = Some(true);
             }
+        }
+        // Automatic spoken-language detection (typed) -> `include_language_detection`.
+        if let Some(detect) = f.language_detection {
+            cfg.include_language_detection = Some(detect);
+        }
+        // Filler words (typed) -> `no_verbatim` (INVERTED): keep filler words => no_verbatim=false.
+        if let Some(keep_fillers) = f.filler_words {
+            cfg.no_verbatim = Some(!keep_fillers);
         }
         cfg
     }
@@ -574,5 +613,91 @@ mod tests {
             cfg.keyterms,
             Some(vec!["WaaV".to_string(), "ElevenLabs".to_string()])
         );
+    }
+
+    // WIRE-LEVEL: `language_detection` (typed) must map onto `include_language_detection` AND
+    // reach the connect URL query string.
+    #[test]
+    fn language_detection_reaches_ws_url() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "elevenlabs".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                language_detection: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = ElevenLabsSTTConfig::from_standard(&std);
+        assert_eq!(cfg.include_language_detection, Some(true));
+        let url = cfg.build_websocket_url();
+        assert!(
+            url.contains("&include_language_detection=true"),
+            "language detection not on wire: {url}"
+        );
+    }
+
+    // WIRE-LEVEL: `filler_words` (typed) must map onto `no_verbatim` (INVERTED) AND reach the
+    // connect URL. Keeping filler words => no_verbatim=false.
+    #[test]
+    fn filler_words_map_to_no_verbatim_inverted_on_ws_url() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+
+        // filler_words = false (drop them) => no_verbatim = true
+        let drop = StandardSTTConfig {
+            base: STTConfig {
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                filler_words: Some(false),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = ElevenLabsSTTConfig::from_standard(&drop);
+        assert_eq!(cfg.no_verbatim, Some(true));
+        assert!(
+            cfg.build_websocket_url().contains("&no_verbatim=true"),
+            "no_verbatim=true expected when dropping fillers"
+        );
+
+        // filler_words = true (keep them) => no_verbatim = false
+        let keep = StandardSTTConfig {
+            base: STTConfig {
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                filler_words: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = ElevenLabsSTTConfig::from_standard(&keep);
+        assert_eq!(cfg.no_verbatim, Some(false));
+        assert!(
+            cfg.build_websocket_url().contains("&no_verbatim=false"),
+            "no_verbatim=false expected when keeping fillers"
+        );
+    }
+
+    // Neither param is emitted when the feature is unset (default connect URL unchanged).
+    #[test]
+    fn absent_features_omit_both_params() {
+        let cfg = ElevenLabsSTTConfig {
+            base: STTConfig {
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let url = cfg.build_websocket_url();
+        assert!(!url.contains("include_language_detection"), "url: {url}");
+        assert!(!url.contains("no_verbatim"), "url: {url}");
     }
 }

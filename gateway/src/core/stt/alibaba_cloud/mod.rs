@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_qwen_session_update_creation() {
-        let msg = QwenSessionUpdate::new("zh", 16000, "pcm16", 400, "server_vad");
+        let msg = QwenSessionUpdate::new("zh", 16000, "pcm16", 400, "server_vad", None);
         let json = msg.to_json().unwrap();
 
         assert!(json.contains("session.update"));
@@ -222,7 +222,8 @@ mod tests {
 
     #[test]
     fn test_paraformer_run_task() {
-        let msg = ParaformerRunTask::new("paraformer-realtime-v2", "pcm", 16000, "zh", true, true);
+        let msg =
+            ParaformerRunTask::new("paraformer-realtime-v2", "pcm", 16000, "zh", true, true, None);
         let json = msg.to_json().unwrap();
 
         assert!(json.contains("run-task"));

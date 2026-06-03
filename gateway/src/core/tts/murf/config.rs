@@ -511,9 +511,10 @@ impl MurfTtsConfig {
     /// matches a real Murf field: `speed`→`rate` (-50..50), `pitch`→`pitch` (-50..50),
     /// `emotion`→`style` (Murf's named speaking style, e.g. "Conversational"),
     /// `language`→`multi_native_locale` (cross-language pronunciation), `sample_rate`→`sample_rate`.
-    /// The non-standard `region` (data-residency endpoint) is read from `extras`. Features Murf
-    /// cannot express (volume, stability/similarity_boost/style-exaggeration/use_speaker_boost,
-    /// instructions, ssml, word_timestamps, streaming, seed) are skipped.
+    /// The non-standard `region` (data-residency endpoint) and `variation` (Gen2-only 0..=5
+    /// dynamic-delivery level) are read from `extras`. Features Murf cannot express (volume,
+    /// stability/similarity_boost/style-exaggeration/use_speaker_boost, instructions, ssml,
+    /// word_timestamps, streaming, seed) are skipped.
     ///
     /// [`TtsFeatures`]: crate::core::tts::standard::TtsFeatures
     pub fn from_standard(
@@ -544,6 +545,17 @@ impl MurfTtsConfig {
             .and_then(MurfRegion::from_str)
         {
             cfg.region = region;
+        }
+        // `variation` (0..=5 dynamic-delivery level) is a Gen2-only, non-standard Murf knob with no
+        // canonical TtsFeatures field, so it rides the open `extras` passthrough. `with_variation`
+        // clamps to MAX_VARIATION; `MurfStreamRequest::from_config` emits it on the wire for Gen2.
+        if let Some(variation) = std
+            .extras
+            .0
+            .get("variation")
+            .and_then(|v| v.as_u64())
+        {
+            cfg = cfg.with_variation(variation as u8);
         }
         cfg.validate()?;
         Ok(cfg)

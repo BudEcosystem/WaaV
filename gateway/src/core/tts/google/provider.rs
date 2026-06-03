@@ -310,6 +310,28 @@ impl GoogleRequestBuilder {
             );
         }
 
+        // Voice gender preference → `voice.ssmlGender` ("MALE" | "FEMALE" | "NEUTRAL").
+        // Doc: VoiceSelectionParams.ssmlGender.
+        if let Some(gender) = &self.google_config.ssml_gender {
+            voice.insert(
+                "ssmlGender".to_string(),
+                serde_json::Value::String(gender.clone()),
+            );
+        }
+        // Chirp 3 Instant Custom Voice clone key → `voice.voiceClone.voiceCloningKey`.
+        // Doc: VoiceSelectionParams.voiceClone (VoiceCloneParams).
+        if let Some(key) = &self.google_config.voice_cloning_key {
+            voice.insert(
+                "voiceClone".to_string(),
+                serde_json::json!({ "voiceCloningKey": key }),
+            );
+        }
+        // AutoML custom voice → `voice.customVoice` (object: { model, reportedUsage? }).
+        // Doc: VoiceSelectionParams.customVoice (CustomVoiceParams).
+        if let Some(cv) = &self.google_config.custom_voice {
+            voice.insert("customVoice".to_string(), cv.clone());
+        }
+
         // Build audioConfig object
         let mut audio_config = serde_json::Map::new();
         audio_config.insert(
@@ -372,14 +394,49 @@ impl GoogleRequestBuilder {
             );
         }
 
+        // Build the `input` (SynthesisInput) object. Exactly one synthesis source is set — `markup`
+        // (HD voices) > `ssml` (typed SSML flag) > plain `text` — matching Google's mutually-
+        // exclusive SynthesisInput.{text,ssml,markup,multiSpeakerMarkup} oneof. `prompt` and
+        // `customPronunciations` are additive sibling fields.
+        // Doc: https://cloud.google.com/text-to-speech/docs/reference/rest/v1/text/synthesize#SynthesisInput
+        let mut input = serde_json::Map::new();
+        if let Some(markup) = &self.google_config.markup {
+            // Markup for HD voices → `input.markup`.
+            input.insert("markup".to_string(), serde_json::Value::String(markup.clone()));
+        } else if let Some(ms) = &self.google_config.multi_speaker_markup {
+            // Multi-speaker dialogue input → `input.multiSpeakerMarkup` (object).
+            input.insert("multiSpeakerMarkup".to_string(), ms.clone());
+        } else if self.google_config.ssml {
+            // SSML input → `input.ssml` instead of `input.text` (typed `ssml` feature).
+            input.insert("ssml".to_string(), serde_json::Value::String(text.to_string()));
+        } else {
+            input.insert("text".to_string(), serde_json::Value::String(text.to_string()));
+        }
+        // Prompt / system instruction for promptable voices → `input.prompt` (typed `instructions`).
+        if let Some(prompt) = &self.google_config.prompt {
+            input.insert("prompt".to_string(), serde_json::Value::String(prompt.clone()));
+        }
+        // API-side custom pronunciations → `input.customPronunciations` (object).
+        if let Some(cp) = &self.google_config.custom_pronunciations {
+            input.insert("customPronunciations".to_string(), cp.clone());
+        }
+
         // Construct the final request body
-        serde_json::json!({
-            "input": {
-                "text": text
-            },
-            "voice": voice,
-            "audioConfig": audio_config
-        })
+        let mut body = serde_json::Map::new();
+        body.insert("input".to_string(), serde_json::Value::Object(input));
+        body.insert("voice".to_string(), serde_json::Value::Object(voice));
+        body.insert("audioConfig".to_string(), serde_json::Value::Object(audio_config));
+
+        // Journey low-latency synthesis toggle → `advancedVoiceOptions.lowLatencyJourneySynthesis`.
+        // Doc: SynthesizeSpeechRequest.advancedVoiceOptions (AdvancedVoiceOptions).
+        if let Some(low_latency) = self.google_config.low_latency_journey_synthesis {
+            body.insert(
+                "advancedVoiceOptions".to_string(),
+                serde_json::json!({ "lowLatencyJourneySynthesis": low_latency }),
+            );
+        }
+
+        serde_json::Value::Object(body)
     }
 }
 
@@ -478,6 +535,36 @@ fn compute_google_tts_config_hash(config: &TTSConfig, google: &GoogleTTSConfig) 
     s.push_str(&google.effects_profile_id.join(","));
     s.push('|');
     s.push_str(&google.language_code);
+    // Newly-wired synthesis features that CHANGE the produced audio MUST be in the cache key, else
+    // requests differing only in (e.g.) SSML-vs-plain interpretation, prompt, gender, voice clone,
+    // custom voice/pronunciations, markup, multi-speaker markup or the Journey low-latency toggle
+    // collide on the same key and serve the wrong audio. (Review S1 cache-collision bug class.)
+    s.push('|');
+    s.push_str(if google.ssml { "ssml" } else { "" });
+    s.push('|');
+    s.push_str(google.prompt.as_deref().unwrap_or(""));
+    s.push('|');
+    s.push_str(google.ssml_gender.as_deref().unwrap_or(""));
+    s.push('|');
+    s.push_str(google.voice_cloning_key.as_deref().unwrap_or(""));
+    s.push('|');
+    if let Some(cv) = &google.custom_voice {
+        s.push_str(&cv.to_string());
+    }
+    s.push('|');
+    if let Some(cp) = &google.custom_pronunciations {
+        s.push_str(&cp.to_string());
+    }
+    s.push('|');
+    s.push_str(google.markup.as_deref().unwrap_or(""));
+    s.push('|');
+    if let Some(ms) = &google.multi_speaker_markup {
+        s.push_str(&ms.to_string());
+    }
+    s.push('|');
+    if let Some(low_latency) = google.low_latency_journey_synthesis {
+        s.push_str(if low_latency { "ll1" } else { "ll0" });
+    }
     let hash = xxh3_128(s.as_bytes());
     format!("{hash:032x}")
 }
@@ -639,20 +726,12 @@ impl GoogleTTS {
         if let Some(l) = &f.language {
             google_config.language_code = l.clone();
         }
-        // `effectsProfileId` is a Google-unique AudioConfig field with no canonical `TtsFeatures`
-        // slot, so it rides the open `extras` passthrough (array of strings, or a single string).
-        // Confirmed per-request on the `v1/text:synthesize` endpoint: AudioConfig.effectsProfileId.
-        // Doc: https://cloud.google.com/text-to-speech/docs/reference/rest/v1/AudioConfig
-        if let Some(v) = std.extras.0.get("effects_profile_id") {
-            if let Some(arr) = v.as_array() {
-                google_config.effects_profile_id = arr
-                    .iter()
-                    .filter_map(|e| e.as_str().map(|s| s.to_string()))
-                    .collect();
-            } else if let Some(s) = v.as_str() {
-                google_config.effects_profile_id = vec![s.to_string()];
-            }
-        }
+        // Map the typed `ssml`/`instructions` features and the Google-unique `extras` knobs
+        // (ssmlGender, voiceClone, customVoice, customPronunciations, markup, multiSpeakerMarkup,
+        // lowLatencyJourneySynthesis, effectsProfileId) onto the config via the shared helper, so the
+        // dispatch-constructed path and `GoogleTTSConfig::from_standard` wire identically. These flow
+        // into the config BEFORE the cache hash below, so audio-changing ones are in the cache key.
+        google_config.apply_standard_synthesis_features(std);
 
         let pronunciation_replacer = if !config.pronunciations.is_empty() {
             Some(PronunciationReplacer::new(&config.pronunciations))
@@ -1623,7 +1702,8 @@ mod tests {
                 speed: Some(1.5),
                 language: Some("es-ES".into()),
                 sample_rate: Some(48000),
-                // Capability gaps Google can't express — must be ignored, not invented.
+                // `ssml` IS now expressible on Google (→ input.ssml), wired separately below.
+                // `stability` remains a capability gap Google can't express — must be ignored.
                 stability: Some(0.7),
                 ssml: Some(true),
                 ..Default::default()
@@ -1638,6 +1718,10 @@ mod tests {
         assert_eq!(tts.config.speaking_rate, Some(1.5));
         assert_eq!(tts.google_config.language_code, "es-ES");
         assert_eq!(tts.config.sample_rate, Some(48000));
+        // `ssml` typed feature reached the config (capability, not a gap).
+        assert!(tts.google_config.ssml);
+        // `stability` has no Google field — confirm it was NOT smuggled anywhere.
+        assert!(tts.google_config.prompt.is_none());
     }
 
     // ===== WIRE-LEVEL tests for the standardized (`from_standard`) path =====
@@ -1761,6 +1845,187 @@ mod tests {
         assert!(body["audioConfig"].get("effectsProfileId").is_none());
         let raw = serde_json::to_string(&body).unwrap();
         assert!(!raw.contains("effectsProfileId"), "effectsProfileId should be absent: {raw}");
+    }
+
+    // ===== WIRE-LEVEL: the 9 newly-wired synthesis features reach the serialized body =====
+    // All confirmed on the synchronous `v1/text:synthesize` endpoint
+    // (https://cloud.google.com/text-to-speech/docs/reference/rest/v1/text/synthesize). Each builds
+    // the body via the from_standard-produced config and asserts the exact Google field on the wire.
+
+    // SSML input → `input.ssml` instead of `input.text` (typed `ssml`).
+    #[tokio::test]
+    async fn wire_from_standard_emits_input_ssml() {
+        use crate::core::tts::standard::TtsFeatures;
+        let std = std_with(TtsFeatures { ssml: Some(true), ..Default::default() }, Default::default());
+        let tts = GoogleTTS::from_standard(&std).unwrap();
+        let body = wire_body(&tts);
+        // The synthesis source is `input.ssml`, NOT `input.text`.
+        assert_eq!(body["input"]["ssml"], "wire-text");
+        assert!(body["input"].get("text").is_none(), "must not also emit input.text");
+        let raw = serde_json::to_string(&body).unwrap();
+        assert!(raw.contains("\"ssml\":\"wire-text\""), "input.ssml not on wire: {raw}");
+    }
+
+    // Prompt / system instruction for promptable voices → `input.prompt` (typed `instructions`).
+    #[tokio::test]
+    async fn wire_from_standard_emits_input_prompt() {
+        use crate::core::tts::standard::TtsFeatures;
+        let std = std_with(
+            TtsFeatures { instructions: Some("Speak like a calm narrator".into()), ..Default::default() },
+            Default::default(),
+        );
+        let tts = GoogleTTS::from_standard(&std).unwrap();
+        let body = wire_body(&tts);
+        assert_eq!(body["input"]["prompt"], "Speak like a calm narrator");
+        // prompt is a sibling of text — both present.
+        assert_eq!(body["input"]["text"], "wire-text");
+        let raw = serde_json::to_string(&body).unwrap();
+        assert!(raw.contains("\"prompt\":\"Speak like a calm narrator\""), "input.prompt not on wire: {raw}");
+    }
+
+    // Voice gender preference → `voice.ssmlGender` (extras).
+    #[tokio::test]
+    async fn wire_from_standard_emits_voice_ssml_gender() {
+        let mut extras = serde_json::Map::new();
+        extras.insert("ssml_gender".into(), serde_json::json!("FEMALE"));
+        let std = std_with(Default::default(), extras);
+        let tts = GoogleTTS::from_standard(&std).unwrap();
+        let body = wire_body(&tts);
+        assert_eq!(body["voice"]["ssmlGender"], "FEMALE");
+        let raw = serde_json::to_string(&body).unwrap();
+        assert!(raw.contains("\"ssmlGender\":\"FEMALE\""), "voice.ssmlGender not on wire: {raw}");
+    }
+
+    // Chirp 3 Instant Custom Voice clone → `voice.voiceClone.voiceCloningKey` (extras).
+    #[tokio::test]
+    async fn wire_from_standard_emits_voice_clone_key() {
+        let mut extras = serde_json::Map::new();
+        extras.insert("voice_cloning_key".into(), serde_json::json!("clone-key-abc123"));
+        let std = std_with(Default::default(), extras);
+        let tts = GoogleTTS::from_standard(&std).unwrap();
+        let body = wire_body(&tts);
+        assert_eq!(body["voice"]["voiceClone"]["voiceCloningKey"], "clone-key-abc123");
+        let raw = serde_json::to_string(&body).unwrap();
+        assert!(
+            raw.contains("\"voiceClone\":{\"voiceCloningKey\":\"clone-key-abc123\"}"),
+            "voice.voiceClone.voiceCloningKey not on wire: {raw}"
+        );
+    }
+
+    // AutoML custom voice → `voice.customVoice` (extras, object).
+    #[tokio::test]
+    async fn wire_from_standard_emits_voice_custom_voice() {
+        let mut extras = serde_json::Map::new();
+        extras.insert(
+            "custom_voice".into(),
+            serde_json::json!({ "model": "projects/p/locations/us/models/m", "reportedUsage": "REALTIME" }),
+        );
+        let std = std_with(Default::default(), extras);
+        let tts = GoogleTTS::from_standard(&std).unwrap();
+        let body = wire_body(&tts);
+        assert_eq!(body["voice"]["customVoice"]["model"], "projects/p/locations/us/models/m");
+        assert_eq!(body["voice"]["customVoice"]["reportedUsage"], "REALTIME");
+    }
+
+    // API-side custom pronunciations → `input.customPronunciations` (extras, object).
+    #[tokio::test]
+    async fn wire_from_standard_emits_input_custom_pronunciations() {
+        let mut extras = serde_json::Map::new();
+        extras.insert(
+            "custom_pronunciations".into(),
+            serde_json::json!({ "pronunciations": [{ "phrase": "WaaV", "phoneticEncoding": "PHONETIC_ENCODING_IPA", "pronunciation": "wɑːv" }] }),
+        );
+        let std = std_with(Default::default(), extras);
+        let tts = GoogleTTS::from_standard(&std).unwrap();
+        let body = wire_body(&tts);
+        assert_eq!(body["input"]["customPronunciations"]["pronunciations"][0]["phrase"], "WaaV");
+        let raw = serde_json::to_string(&body).unwrap();
+        assert!(raw.contains("customPronunciations"), "input.customPronunciations not on wire: {raw}");
+    }
+
+    // Markup for HD voices → `input.markup` (extras). Takes precedence over plain text.
+    #[tokio::test]
+    async fn wire_from_standard_emits_input_markup() {
+        let mut extras = serde_json::Map::new();
+        extras.insert("markup".into(), serde_json::json!("Hello [pause] world"));
+        let std = std_with(Default::default(), extras);
+        let tts = GoogleTTS::from_standard(&std).unwrap();
+        let body = wire_body(&tts);
+        assert_eq!(body["input"]["markup"], "Hello [pause] world");
+        assert!(body["input"].get("text").is_none(), "markup must replace text");
+        let raw = serde_json::to_string(&body).unwrap();
+        assert!(raw.contains("\"markup\":\"Hello [pause] world\""), "input.markup not on wire: {raw}");
+    }
+
+    // Multi-speaker dialogue input → `input.multiSpeakerMarkup` (extras, object).
+    #[tokio::test]
+    async fn wire_from_standard_emits_input_multi_speaker_markup() {
+        let mut extras = serde_json::Map::new();
+        extras.insert(
+            "multi_speaker_markup".into(),
+            serde_json::json!({ "turns": [{ "speaker": "R", "text": "Hi" }, { "speaker": "S", "text": "Hey" }] }),
+        );
+        let std = std_with(Default::default(), extras);
+        let tts = GoogleTTS::from_standard(&std).unwrap();
+        let body = wire_body(&tts);
+        assert_eq!(body["input"]["multiSpeakerMarkup"]["turns"][0]["speaker"], "R");
+        assert!(body["input"].get("text").is_none(), "multiSpeakerMarkup must replace text");
+        let raw = serde_json::to_string(&body).unwrap();
+        assert!(raw.contains("multiSpeakerMarkup"), "input.multiSpeakerMarkup not on wire: {raw}");
+    }
+
+    // Journey low-latency synthesis toggle → `advancedVoiceOptions.lowLatencyJourneySynthesis`.
+    #[tokio::test]
+    async fn wire_from_standard_emits_advanced_voice_options_low_latency() {
+        let mut extras = serde_json::Map::new();
+        extras.insert("low_latency_journey_synthesis".into(), serde_json::json!(true));
+        let std = std_with(Default::default(), extras);
+        let tts = GoogleTTS::from_standard(&std).unwrap();
+        let body = wire_body(&tts);
+        assert_eq!(body["advancedVoiceOptions"]["lowLatencyJourneySynthesis"], true);
+        let raw = serde_json::to_string(&body).unwrap();
+        assert!(
+            raw.contains("\"advancedVoiceOptions\":{\"lowLatencyJourneySynthesis\":true}"),
+            "advancedVoiceOptions.lowLatencyJourneySynthesis not on wire: {raw}"
+        );
+    }
+
+    // CACHE-KEY: two configs differing ONLY in an audio-changing synthesis feature (here `ssml`)
+    // must produce DIFFERENT config hashes, else they collide and serve the wrong cached audio
+    // (Review S1 collision bug class). Mirrors the existing pitch/effects-profile cache coverage.
+    #[tokio::test]
+    async fn cache_key_differs_for_audio_changing_synthesis_features() {
+        use crate::core::tts::standard::TtsFeatures;
+        let plain = GoogleTTS::from_standard(&std_with(TtsFeatures::default(), Default::default()))
+            .unwrap()
+            .config_hash
+            .clone();
+
+        let ssml = GoogleTTS::from_standard(&std_with(
+            TtsFeatures { ssml: Some(true), ..Default::default() },
+            Default::default(),
+        ))
+        .unwrap()
+        .config_hash
+        .clone();
+        assert_ne!(plain, ssml, "ssml must change the cache key");
+
+        let mut g_extras = serde_json::Map::new();
+        g_extras.insert("ssml_gender".into(), serde_json::json!("MALE"));
+        let gender = GoogleTTS::from_standard(&std_with(TtsFeatures::default(), g_extras))
+            .unwrap()
+            .config_hash
+            .clone();
+        assert_ne!(plain, gender, "ssmlGender must change the cache key");
+
+        let prompt = GoogleTTS::from_standard(&std_with(
+            TtsFeatures { instructions: Some("calm".into()), ..Default::default() },
+            Default::default(),
+        ))
+        .unwrap()
+        .config_hash
+        .clone();
+        assert_ne!(plain, prompt, "prompt must change the cache key");
     }
 
     #[test]

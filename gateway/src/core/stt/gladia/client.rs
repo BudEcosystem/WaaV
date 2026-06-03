@@ -92,12 +92,19 @@ impl GladiaSTT {
         })
     }
 
-    /// Initialize a session via REST API
-    async fn init_session(&self) -> Result<InitSessionResponse, STTError> {
-        let url = self.gladia_config.api_url();
-        debug!("Initializing Gladia session at {}", url);
-
-        let request_body = InitSessionRequest {
+    /// Build the `POST /v2/live` session-init request body from the provider config.
+    ///
+    /// Extracted from `init_session` so the exact JSON that hits the wire is unit-testable
+    /// (the recurring "feature set on the config struct but never serialized" bug class).
+    pub(super) fn build_init_request(&self) -> InitSessionRequest {
+        // Omit post_processing entirely when no post-processing feature is requested, so the
+        // default body stays byte-for-byte identical to before this feature was added.
+        let post_processing = if self.gladia_config.post_processing.is_empty() {
+            None
+        } else {
+            Some(self.gladia_config.post_processing.clone())
+        };
+        InitSessionRequest {
             encoding: self.gladia_config.encoding.as_str().to_string(),
             bit_depth: self.gladia_config.bit_depth.value(),
             sample_rate: self.gladia_config.sample_rate,
@@ -110,9 +117,18 @@ impl GladiaSTT {
             language_config: Some(self.gladia_config.language_config.clone()),
             pre_processing: Some(self.gladia_config.pre_processing.clone()),
             realtime_processing: Some(self.gladia_config.realtime_processing.clone()),
+            post_processing,
             messages_config: Some(self.gladia_config.messages_config.clone()),
             custom_metadata: self.gladia_config.custom_metadata.clone(),
-        };
+        }
+    }
+
+    /// Initialize a session via REST API
+    async fn init_session(&self) -> Result<InitSessionResponse, STTError> {
+        let url = self.gladia_config.api_url();
+        debug!("Initializing Gladia session at {}", url);
+
+        let request_body = self.build_init_request();
 
         trace!("Session init request: {:?}", request_body);
 
@@ -464,6 +480,152 @@ mod tests {
         assert_eq!(
             stt.gladia_config.realtime_processing.custom_vocabulary,
             vec!["WaaV", "Gladia"]
+        );
+    }
+
+    // ===================== WIRE-LEVEL feature tests (session-init body) =====================
+    //
+    // These build the EXACT `POST /v2/live` JSON body via `build_init_request` (the same
+    // builder `init_session` posts) and assert each newly-wired feature reaches the wire —
+    // not merely the config struct. Construction goes through `new_standard`, the reachable
+    // standardized path, so the assertion covers from_standard -> config -> body end-to-end.
+
+    use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+
+    fn std_with_extras(extras: serde_json::Value) -> StandardSTTConfig {
+        StandardSTTConfig {
+            base: STTConfig {
+                provider: "gladia".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: ProviderExtras(extras.as_object().unwrap().clone()),
+        }
+    }
+
+    /// Build the session-init body JSON for a Gladia provider built from the given extras.
+    fn init_body_json(extras: serde_json::Value) -> serde_json::Value {
+        let stt = GladiaSTT::new_standard(&std_with_extras(extras)).expect("new_standard");
+        serde_json::to_value(stt.build_init_request()).expect("serialize body")
+    }
+
+    #[test]
+    fn wire_custom_spelling_dictionary_reaches_body() {
+        let body = init_body_json(serde_json::json!({
+            "custom_spelling_dictionary": { "WaaV": ["wave", "wav"], "Gladia": ["gladiya"] }
+        }));
+        let rp = &body["realtime_processing"];
+        assert_eq!(rp["custom_spelling"], true, "custom_spelling flag missing: {body}");
+        assert_eq!(
+            rp["custom_spelling_config"]["spelling_dictionary"]["WaaV"],
+            serde_json::json!(["wave", "wav"]),
+            "spelling_dictionary entry missing on wire: {body}"
+        );
+    }
+
+    #[test]
+    fn wire_custom_vocabulary_config_reaches_body() {
+        let body = init_body_json(serde_json::json!({
+            "custom_vocabulary_config": {
+                "vocabulary": [
+                    { "value": "WaaV", "intensity": 0.8, "pronunciations": ["wave"], "language": "en" }
+                ],
+                "default_intensity": 0.5
+            }
+        }));
+        let cvc = &body["realtime_processing"]["custom_vocabulary_config"];
+        // f32 round-trips with widening, so compare numerics with a tolerance.
+        let default_intensity = cvc["default_intensity"].as_f64().expect("default_intensity");
+        assert!(
+            (default_intensity - 0.5).abs() < 1e-6,
+            "default_intensity missing on wire: {body}"
+        );
+        assert_eq!(cvc["vocabulary"][0]["value"], "WaaV");
+        let intensity = cvc["vocabulary"][0]["intensity"].as_f64().expect("intensity");
+        assert!((intensity - 0.8).abs() < 1e-6, "intensity missing on wire: {body}");
+        assert_eq!(cvc["vocabulary"][0]["pronunciations"], serde_json::json!(["wave"]));
+        assert_eq!(cvc["vocabulary"][0]["language"], "en");
+    }
+
+    #[test]
+    fn wire_translation_config_reaches_body() {
+        let body = init_body_json(serde_json::json!({
+            "translation_config": {
+                "model": "enhanced",
+                "match_original_utterances": true,
+                "lipsync": true,
+                "context_adaptation": true,
+                "context": "medical",
+                "informal": false
+            }
+        }));
+        let tc = &body["realtime_processing"]["translation_config"];
+        assert_eq!(tc["model"], "enhanced", "translation model missing: {body}");
+        assert_eq!(tc["match_original_utterances"], true);
+        assert_eq!(tc["lipsync"], true);
+        assert_eq!(tc["context_adaptation"], true);
+        assert_eq!(tc["context"], "medical");
+        assert_eq!(tc["informal"], false);
+    }
+
+    #[test]
+    fn wire_summarization_reaches_body() {
+        let body = init_body_json(serde_json::json!({
+            "summarization": true,
+            "summarization_config": { "type": "bullet_points" }
+        }));
+        let pp = &body["post_processing"];
+        assert_eq!(pp["summarization"], true, "summarization flag missing: {body}");
+        assert_eq!(
+            pp["summarization_config"]["type"], "bullet_points",
+            "summarization type missing on wire: {body}"
+        );
+    }
+
+    #[test]
+    fn wire_chapterization_reaches_body() {
+        let body = init_body_json(serde_json::json!({ "chapterization": true }));
+        assert_eq!(
+            body["post_processing"]["chapterization"], true,
+            "chapterization missing on wire: {body}"
+        );
+    }
+
+    #[test]
+    fn wire_message_toggles_reach_body() {
+        let body = init_body_json(serde_json::json!({
+            "receive_acknowledgments": true,
+            "receive_errors": true,
+            "receive_lifecycle_events": true
+        }));
+        let mc = &body["messages_config"];
+        assert_eq!(mc["receive_acknowledgments"], true, "acks missing: {body}");
+        assert_eq!(mc["receive_errors"], true, "errors toggle missing: {body}");
+        assert_eq!(
+            mc["receive_lifecycle_events"], true,
+            "lifecycle toggle missing: {body}"
+        );
+    }
+
+    #[test]
+    fn wire_defaults_omit_post_processing_and_leave_toggles_off() {
+        // No extras: post_processing must be omitted entirely and message toggles default off.
+        let body = init_body_json(serde_json::json!({}));
+        assert!(
+            body.get("post_processing").is_none() || body["post_processing"].is_null(),
+            "post_processing must be omitted by default: {body}"
+        );
+        let mc = &body["messages_config"];
+        assert_eq!(mc["receive_acknowledgments"], false);
+        assert_eq!(mc["receive_errors"], false);
+        assert_eq!(mc["receive_lifecycle_events"], false);
+        let rp = &body["realtime_processing"];
+        assert_eq!(rp["custom_spelling"], false);
+        assert!(rp.get("custom_spelling_config").is_none() || rp["custom_spelling_config"].is_null());
+        assert!(rp.get("translation_config").is_none() || rp["translation_config"].is_null());
+        assert!(
+            rp.get("custom_vocabulary_config").is_none() || rp["custom_vocabulary_config"].is_null()
         );
     }
 

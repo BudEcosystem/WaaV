@@ -450,6 +450,26 @@ pub struct HuaweiCloudSttConfig {
     /// Include word-level timing information.
     pub need_word_info: bool,
 
+    /// Emit interim (partial) recognition results (Huawei SIS RASR `interim_results`).
+    /// Default `true` (Huawei's streaming default).
+    #[serde(default = "huawei_default_interim_results")]
+    pub interim_results: bool,
+
+    /// Initial-silence VAD: max leading silence (ms) before the recognizer gives up waiting for
+    /// speech (Huawei SIS RASR `vad_head`, valid 0–60000). `None` = provider default.
+    #[serde(default)]
+    pub vad_head: Option<u32>,
+
+    /// Tail-silence VAD endpointing: trailing silence (ms) after speech that finalizes the
+    /// utterance (Huawei SIS RASR `vad_tail`, valid 0–3000). `None` = provider default.
+    #[serde(default)]
+    pub vad_tail: Option<u32>,
+
+    /// Maximum utterance/sentence audio duration in seconds (Huawei SIS RASR `max_seconds`,
+    /// valid 1–60). `None` = provider default.
+    #[serde(default)]
+    pub max_seconds: Option<u32>,
+
     /// Cached IAM token.
     #[serde(skip)]
     pub token: Option<String>,
@@ -474,10 +494,19 @@ impl Default for HuaweiCloudSttConfig {
             digit_norm: true,
             vocabulary_id: None,
             need_word_info: false,
+            interim_results: huawei_default_interim_results(),
+            vad_head: None,
+            vad_tail: None,
+            max_seconds: None,
             token: None,
             token_expires_at: None,
         }
     }
+}
+
+/// Huawei SIS streaming defaults interim (partial) results on.
+fn huawei_default_interim_results() -> bool {
+    true
 }
 
 impl HuaweiCloudSttConfig {
@@ -730,12 +759,17 @@ impl HuaweiCloudSttConfig {
         Ok(huawei_config)
     }
 
-    /// Build from the standardized config (W1 keystone). Huawei Cloud SIS exposes a narrow set of
-    /// recognition knobs, so this maps the standardized features whose meaning matches an existing
-    /// Huawei field: word-level timing (`need_word_info`) and smart formatting, which Huawei
-    /// expresses as automatic punctuation (`add_punctuation`). Features Huawei can't express
-    /// (diarization, profanity_filter, interim_results, vad/endpointing, keyterms — Huawei requires
-    /// a pre-registered vocabulary table ID rather than inline terms, redaction, entity/language
+    /// Build from the standardized config (W1 keystone). Huawei Cloud SIS RASR exposes a set of
+    /// recognition knobs this maps from the standardized vocabulary:
+    /// - word-level timing → `need_word_info`
+    /// - smart formatting → `add_punctuation` (Huawei expresses formatting as auto-punctuation)
+    /// - `interim_results` (typed) → `interim_results`
+    /// - tail-silence VAD endpointing (`endpointing_ms`, canonical) → `vad_tail`
+    /// - initial-silence VAD head (extras `vad_head`) → `vad_head`
+    /// - max utterance/sentence duration (extras `max_seconds`) → `max_seconds`
+    ///
+    /// Features Huawei can't express (diarization, profanity_filter, keyterms — Huawei requires a
+    /// pre-registered vocabulary table ID rather than inline terms — redaction, entity/language
     /// detection) are capability gaps and stay at their defaults.
     pub fn from_standard(
         std: &crate::core::stt::standard::StandardSTTConfig,
@@ -747,6 +781,22 @@ impl HuaweiCloudSttConfig {
         }
         if let Some(s) = f.smart_format {
             cfg.add_punctuation = s;
+        }
+        if let Some(i) = f.interim_results {
+            cfg.interim_results = i;
+        }
+        // Tail-silence VAD endpointing: the canonical `endpointing_ms` IS Huawei's `vad_tail`
+        // (trailing-silence finalization), both in milliseconds — no unit conversion.
+        if let Some(tail_ms) = f.endpointing_ms {
+            cfg.vad_tail = Some(tail_ms);
+        }
+        // Initial-silence VAD head (no canonical typed field) — extras passthrough, milliseconds.
+        if let Some(head) = std.extras.0.get("vad_head").and_then(|v| v.as_u64()) {
+            cfg.vad_head = Some(head as u32);
+        }
+        // Max utterance/sentence duration (no canonical typed field) — extras passthrough, seconds.
+        if let Some(max_s) = std.extras.0.get("max_seconds").and_then(|v| v.as_u64()) {
+            cfg.max_seconds = Some(max_s as u32);
         }
         Ok(cfg)
     }

@@ -261,6 +261,10 @@ pub struct IFlytekTtsConfig {
     pub english_pronunciation: u32,
     /// Number pronunciation mode (0=auto, 1=digit, 2=value, 3=auto v2).
     pub number_pronunciation: u32,
+    /// Streaming MP3 return (`sfl`): when set, combine with `aue=lame` to enable streaming-return
+    /// of MP3-format audio. iFlytek only defines the value `1` (enabled); `None` omits the field.
+    /// See <https://global.xfyun.cn/doc/tts/online_tts/API.html> (business param `sfl`).
+    pub streaming_mp3_return: Option<u32>,
 }
 
 impl Default for IFlytekTtsConfig {
@@ -277,6 +281,7 @@ impl Default for IFlytekTtsConfig {
             background_sound: false,
             english_pronunciation: 0,
             number_pronunciation: 0,
+            streaming_mp3_return: None,
         }
     }
 }
@@ -333,6 +338,7 @@ impl IFlytekTtsConfig {
             background_sound: false,
             english_pronunciation: 0,
             number_pronunciation: 0,
+            streaming_mp3_return: None,
         })
     }
 
@@ -376,6 +382,14 @@ impl IFlytekTtsConfig {
             .and_then(|v| v.as_bool())
         {
             cfg.background_sound = bg;
+        }
+        // `streaming_mp3_return` -> business `sfl` (streaming MP3 return; pair with aue=lame).
+        // Accept a bool (true -> 1) or a numeric level so callers can pass either shape.
+        if let Some(v) = std.extras.0.get("streaming_mp3_return") {
+            cfg.streaming_mp3_return = v
+                .as_u64()
+                .map(|n| n as u32)
+                .or_else(|| v.as_bool().map(|b| if b { 1 } else { 0 }));
         }
 
         Ok(cfg)

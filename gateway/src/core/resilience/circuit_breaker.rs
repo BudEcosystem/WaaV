@@ -135,6 +135,14 @@ pub struct CircuitBreakerSnapshot {
 /// window is approximated by halving both counters whenever their sum reaches
 /// `window_size` — this keeps the rate responsive to recent behaviour without storing a
 /// per-sample ring buffer, and keeps every operation O(1) and allocation-free.
+///
+/// If the breaker carries a `label` (set by [`CircuitBreaker::with_label`], which the
+/// [`crate::core::resilience::ResilienceRegistry`] uses to stamp the provider name on each
+/// breaker it creates), then **every state transition self-publishes** the
+/// `waav_circuit_breaker_state{provider=<label>}` gauge (W-C1). This is what makes the gauge
+/// truthful for *all* providers — including the inline Deepgram/AssemblyAI reconnect loops that
+/// only ever called the `record_reconnect` counter — without each call site having to remember
+/// to emit the gauge: it is now a property of tripping the breaker itself.
 pub struct CircuitBreaker {
     config: CircuitBreakerConfig,
     /// Encoded [`CircuitState`] (`STATE_*`).
@@ -145,10 +153,14 @@ pub struct CircuitBreaker {
     opened_at_ns: AtomicU64,
     /// Total number of times the breaker has tripped to Open (cumulative).
     total_trips: AtomicU64,
+    /// Optional metrics label (the provider name). When set, every state transition publishes
+    /// `waav_circuit_breaker_state{provider=<label>}` so the gauge tracks the breaker in
+    /// near-real-time. `None` for anonymous breakers (e.g. unit-test fixtures) which stay silent.
+    label: Option<String>,
 }
 
 impl CircuitBreaker {
-    /// Create a breaker in the Closed state.
+    /// Create a breaker in the Closed state (no metrics label — stays silent on the gauge).
     pub fn new(config: CircuitBreakerConfig) -> Self {
         Self {
             config,
@@ -157,7 +169,21 @@ impl CircuitBreaker {
             failures: AtomicU32::new(0),
             opened_at_ns: AtomicU64::new(0),
             total_trips: AtomicU64::new(0),
+            label: None,
         }
+    }
+
+    /// Create a labelled breaker. The `label` (the provider name) is stamped on every
+    /// `waav_circuit_breaker_state` sample this breaker publishes on a transition, so the gauge
+    /// is attributed to the right provider. The [`crate::core::resilience::ResilienceRegistry`]
+    /// uses this for every per-provider breaker it owns.
+    pub fn with_label(config: CircuitBreakerConfig, label: impl Into<String>) -> Self {
+        let mut cb = Self::new(config);
+        cb.label = Some(label.into());
+        // Seed the gauge at the initial (closed) state so the series exists from creation and a
+        // scrape before the first failure reports "closed" rather than absent.
+        cb.publish_state();
+        cb
     }
 
     /// Create a breaker with the default config.
@@ -195,14 +221,20 @@ impl CircuitBreaker {
                 let elapsed = now_ns().saturating_sub(opened);
                 if elapsed >= self.config.cooldown.as_nanos() as u64 {
                     // Cooldown elapsed: try to claim the single probe slot.
-                    self.state
+                    let claimed = self
+                        .state
                         .compare_exchange(
                             STATE_OPEN,
                             STATE_HALF_OPEN,
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         )
-                        .is_ok()
+                        .is_ok();
+                    if claimed {
+                        // We transitioned Open → HalfOpen (probing): reflect it on the gauge.
+                        self.publish_state();
+                    }
+                    claimed
                 } else {
                     false
                 }
@@ -268,18 +300,34 @@ impl CircuitBreaker {
 
     // --- internals -----------------------------------------------------------------
 
+    /// Publish this breaker's current state on the `waav_circuit_breaker_state{provider}` gauge,
+    /// if it carries a label. A no-op for anonymous breakers. Cheap and lock-free (one atomic
+    /// load + a gauge set); safe to call on every transition.
+    fn publish_state(&self) {
+        if let Some(label) = self.label.as_deref() {
+            crate::core::metrics::bridge::set_circuit_breaker_state(label, self.state().as_code());
+        }
+    }
+
     fn close_and_reset(&self) {
         self.successes.store(0, Ordering::Release);
         self.failures.store(0, Ordering::Release);
-        self.state.store(STATE_CLOSED, Ordering::Release);
+        let prev = self.state.swap(STATE_CLOSED, Ordering::AcqRel);
+        // Only re-publish on an actual transition into Closed (avoid spamming the gauge on every
+        // healthy success, which calls record_success → maybe_decay but not close_and_reset).
+        if prev != STATE_CLOSED {
+            self.publish_state();
+        }
     }
 
     fn trip(&self) {
         let prev = self.state.swap(STATE_OPEN, Ordering::AcqRel);
         self.opened_at_ns.store(now_ns(), Ordering::Release);
-        // Only count a trip when we actually transition into Open from a non-Open state.
+        // Only count a trip / re-publish the gauge when we actually transition into Open from a
+        // non-Open state.
         if prev != STATE_OPEN {
             self.total_trips.fetch_add(1, Ordering::Relaxed);
+            self.publish_state();
         }
     }
 
@@ -501,6 +549,82 @@ mod tests {
         cb.reset();
         assert_eq!(cb.state(), CircuitState::Closed);
         assert!(cb.allow_request());
+    }
+
+    #[test]
+    fn labelled_breaker_publishes_open_state_on_the_gauge() {
+        // W-C1 RED: a labelled breaker that trips Open must publish state-code 2 (open) on the
+        // `waav_circuit_breaker_state{provider}` gauge — NOT leave it stuck at 0 (closed). This is
+        // the bug the inline Deepgram/AssemblyAI loops had: they bumped the reconnect counter but
+        // never moved the gauge, so an open breaker still read "closed" to dashboards/readiness.
+        use crate::core::metrics::bridge;
+        // Touch the recorder so the global exposition exists.
+        let _ = bridge::metrics_handle();
+
+        let provider = "gauge-test-open";
+        let cb = CircuitBreaker::with_label(fast_cooldown_config(), provider);
+        // Freshly labelled: seeded at closed (code 0).
+        assert!(
+            gauge_value(&bridge::render(), provider)
+                .map(|v| v == 0.0)
+                .unwrap_or(true),
+            "a fresh breaker should report closed (0) or be unseeded"
+        );
+
+        // Trip it.
+        for _ in 0..4 {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        let v = gauge_value(&bridge::render(), provider)
+            .expect("open breaker must have published a gauge sample");
+        assert_eq!(
+            v, 2.0,
+            "open breaker must report state-code 2 (open) on waav_circuit_breaker_state, got {v}"
+        );
+
+        // Recovery must walk the gauge back down: cooldown → half-open (1) → success → closed (0).
+        std::thread::sleep(Duration::from_millis(45));
+        assert!(cb.allow_request(), "probe allowed after cooldown");
+        let v = gauge_value(&bridge::render(), provider).expect("half-open sample");
+        assert_eq!(v, 1.0, "half-open breaker must report state-code 1, got {v}");
+
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        let v = gauge_value(&bridge::render(), provider).expect("closed sample");
+        assert_eq!(v, 0.0, "recovered breaker must report state-code 0 (closed), got {v}");
+    }
+
+    /// Parse the `waav_circuit_breaker_state{provider="<provider>"}` sample value out of a
+    /// Prometheus text exposition, if present.
+    fn gauge_value(exposition: &str, provider: &str) -> Option<f64> {
+        let needle = format!("provider=\"{provider}\"");
+        exposition
+            .lines()
+            .filter(|l| l.starts_with("waav_circuit_breaker_state") && l.contains(&needle))
+            .filter_map(|l| l.rsplit(' ').next())
+            .filter_map(|v| v.parse::<f64>().ok())
+            .next_back()
+    }
+
+    #[test]
+    fn anonymous_breaker_does_not_publish_a_gauge() {
+        // A breaker without a label (unit-test fixtures, ReconnectableStream::new default) must
+        // stay silent on the gauge — no phantom provider="" series.
+        use crate::core::metrics::bridge;
+        let _ = bridge::metrics_handle();
+        let cb = CircuitBreaker::new(fast_cooldown_config());
+        for _ in 0..4 {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+        // No empty-provider open sample should appear from this breaker.
+        assert!(
+            gauge_value(&bridge::render(), "").is_none()
+                || gauge_value(&bridge::render(), "").unwrap_or(0.0) != 2.0,
+            "anonymous breaker must not publish an open gauge under an empty provider label"
+        );
     }
 
     #[test]

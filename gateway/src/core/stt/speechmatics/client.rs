@@ -13,8 +13,9 @@ use tracing::{debug, error, info};
 
 use super::config::SpeechmaticsSTTConfig;
 use super::messages::{
-    AddPartialTranscriptMessage, AddTranscriptMessage, AudioFormat, EndOfStreamMessage,
-    ErrorMessage, StartRecognitionMessage, TranscriptionConfig,
+    AddPartialTranscriptMessage, AddTranscriptMessage, AdditionalVocabWord, AudioFormat,
+    EndOfStreamMessage, ErrorMessage, PunctuationOverrides, Replacement, SpeakerDiarizationConfig,
+    StartRecognitionMessage, TranscriptFilteringConfig, TranscriptionConfig,
 };
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
@@ -87,13 +88,85 @@ impl SpeechmaticsSTT {
             .with_partials(self.config.enable_partials)
             .with_max_delay(self.config.max_delay);
 
-        if self.config.enable_diarization {
-            transcription_config = transcription_config.with_diarization(self.config.max_speakers);
+        // Diarization: an explicit channel/speaker mode override (from the standardized
+        // `multichannel`/`diarization` features) takes precedence over the legacy speaker-only flag.
+        match self.config.diarization_mode.as_deref() {
+            Some(mode) => {
+                transcription_config = transcription_config.with_diarization_mode(mode);
+            }
+            None if self.config.enable_diarization => {
+                transcription_config =
+                    transcription_config.with_diarization(self.config.max_speakers);
+            }
+            None => {}
         }
 
-        if !self.config.additional_vocab.is_empty() {
+        // Speaker diarization sub-config (sensitivity / prefer-current-speaker / max-speakers).
+        if self.config.speaker_sensitivity.is_some()
+            || self.config.prefer_current_speaker.is_some()
+            || (self.config.diarization_mode.is_some() && self.config.max_speakers.is_some())
+        {
             transcription_config =
-                transcription_config.with_vocab(self.config.additional_vocab.clone());
+                transcription_config.with_speaker_diarization_config(SpeakerDiarizationConfig {
+                    max_speakers: self.config.max_speakers,
+                    speaker_sensitivity: self.config.speaker_sensitivity,
+                    prefer_current_speaker: self.config.prefer_current_speaker,
+                });
+        }
+
+        // Custom vocabulary: fold per-word phonetic hints (`sounds_like`) in where present.
+        if !self.config.additional_vocab.is_empty() {
+            let words: Vec<AdditionalVocabWord> = self
+                .config
+                .additional_vocab
+                .iter()
+                .map(|w| match self.config.vocab_sounds_like.get(w) {
+                    Some(hints) => AdditionalVocabWord::with_sounds_like(w.clone(), hints.clone()),
+                    None => AdditionalVocabWord::new(w.clone()),
+                })
+                .collect();
+            transcription_config = transcription_config.with_vocab_words(words);
+        }
+
+        // End-of-utterance silence trigger (turn detection).
+        if let Some(secs) = self.config.end_of_utterance_silence_trigger {
+            transcription_config =
+                transcription_config.with_end_of_utterance_silence_trigger(secs);
+        }
+
+        // Transcript filtering: disfluency removal + find-and-replace.
+        if self.config.remove_disfluencies.is_some() || self.config.replacements.is_some() {
+            transcription_config =
+                transcription_config.with_transcript_filtering_config(TranscriptFilteringConfig {
+                    remove_disfluencies: self.config.remove_disfluencies,
+                    replacements: self.config.replacements.as_ref().map(|reps| {
+                        reps.iter()
+                            .map(|(from, to)| Replacement {
+                                from: from.clone(),
+                                to: to.clone(),
+                            })
+                            .collect()
+                    }),
+                });
+        }
+
+        // Punctuation overrides: permitted marks + sensitivity.
+        if self.config.permitted_marks.is_some() || self.config.punctuation_sensitivity.is_some() {
+            transcription_config =
+                transcription_config.with_punctuation_overrides(PunctuationOverrides {
+                    permitted_marks: self.config.permitted_marks.clone(),
+                    sensitivity: self.config.punctuation_sensitivity,
+                });
+        }
+
+        if let Some(ref locale) = self.config.output_locale {
+            transcription_config = transcription_config.with_output_locale(locale.clone());
+        }
+        if let Some(ref domain) = self.config.domain {
+            transcription_config = transcription_config.with_domain(domain.clone());
+        }
+        if let Some(ref mode) = self.config.max_delay_mode {
+            transcription_config = transcription_config.with_max_delay_mode(mode.clone());
         }
 
         StartRecognitionMessage::with_config(audio_format, transcription_config)
@@ -501,6 +574,126 @@ mod tests {
         assert_eq!(msg.audio_format.format_type, "raw");
         assert_eq!(msg.audio_format.sample_rate, Some(44100));
         assert_eq!(msg.transcription_config.language, "fr");
+    }
+
+    // WIRE-LEVEL: every standardized Speechmatics knob must travel from the standardized config
+    // into the SERIALIZED `transcription_config` JSON of the StartRecognition message — the bytes
+    // that actually reach `wss://{eu,us}.rt.speechmatics.com/v2`, not merely the config struct.
+    // Guards the recurring "set on the struct but never emitted to the wire" gap class.
+    #[test]
+    fn standardized_features_reach_start_recognition_json() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let mut extras = serde_json::Map::new();
+        extras.insert("speaker_sensitivity".into(), serde_json::json!(0.7));
+        extras.insert("prefer_current_speaker".into(), serde_json::json!(true));
+        extras.insert(
+            "permitted_marks".into(),
+            serde_json::json!([".", ",", "?"]),
+        );
+        extras.insert("punctuation_sensitivity".into(), serde_json::json!(0.4));
+        extras.insert(
+            "replacements".into(),
+            serde_json::json!([{"from": "gonna", "to": "going to"}]),
+        );
+        extras.insert("output_locale".into(), serde_json::json!("en-US"));
+        extras.insert("domain".into(), serde_json::json!("finance"));
+        extras.insert("max_delay_mode".into(), serde_json::json!("flexible"));
+        extras.insert(
+            "additional_vocab".into(),
+            serde_json::json!([{"content": "Speechmatics", "sounds_like": ["speech matics"]}]),
+        );
+
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "speechmatics".into(),
+                api_key: "test-api-key".into(),
+                language: "en".into(),
+                sample_rate: 16000,
+                encoding: "pcm_s16le".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                // channel diarization mode: multichannel + speaker -> "channel_and_speaker"
+                multichannel: Some(true),
+                diarization: Some(true),
+                // end-of-utterance silence trigger: 750ms -> 0.75s
+                utterance_end_ms: Some(750),
+                // disfluency removal: filler_words=false -> remove_disfluencies=true
+                filler_words: Some(false),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+
+        let stt = SpeechmaticsSTT::new_standard(&std).unwrap();
+        let msg = stt.build_start_recognition();
+        let json = serde_json::to_string(&msg).unwrap();
+
+        // -- typed features --
+        assert!(
+            json.contains("\"diarization\":\"channel_and_speaker\""),
+            "channel diarization mode missing: {json}"
+        );
+        assert!(
+            json.contains("\"end_of_utterance_silence_trigger\":0.75"),
+            "end-of-utterance silence trigger missing: {json}"
+        );
+        assert!(
+            json.contains("\"conversation_config\""),
+            "conversation_config missing: {json}"
+        );
+        assert!(
+            json.contains("\"remove_disfluencies\":true"),
+            "remove_disfluencies missing: {json}"
+        );
+        assert!(
+            json.contains("\"transcript_filtering_config\""),
+            "transcript_filtering_config missing: {json}"
+        );
+
+        // -- extras passthrough --
+        assert!(
+            json.contains("\"speaker_sensitivity\":0.7"),
+            "speaker_sensitivity missing: {json}"
+        );
+        assert!(
+            json.contains("\"prefer_current_speaker\":true"),
+            "prefer_current_speaker missing: {json}"
+        );
+        assert!(
+            json.contains("\"punctuation_overrides\""),
+            "punctuation_overrides missing: {json}"
+        );
+        assert!(
+            json.contains("\"permitted_marks\":[\".\",\",\",\"?\"]"),
+            "permitted_marks missing: {json}"
+        );
+        assert!(
+            json.contains("\"sensitivity\":0.4"),
+            "punctuation sensitivity missing: {json}"
+        );
+        assert!(
+            json.contains("\"from\":\"gonna\"") && json.contains("\"to\":\"going to\""),
+            "replacements missing: {json}"
+        );
+        assert!(
+            json.contains("\"output_locale\":\"en-US\""),
+            "output_locale missing: {json}"
+        );
+        assert!(json.contains("\"domain\":\"finance\""), "domain missing: {json}");
+        assert!(
+            json.contains("\"max_delay_mode\":\"flexible\""),
+            "max_delay_mode missing: {json}"
+        );
+        // additional_vocab carries the phonetic hints on the word.
+        assert!(
+            json.contains("\"content\":\"Speechmatics\""),
+            "vocab content missing: {json}"
+        );
+        assert!(
+            json.contains("\"sounds_like\":[\"speech matics\"]"),
+            "vocab sounds_like hint missing: {json}"
+        );
     }
 
     #[test]

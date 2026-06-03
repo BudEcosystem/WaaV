@@ -450,6 +450,15 @@ pub struct GroqSTTConfig {
 
     /// Custom API endpoint URL (for enterprise or custom deployments).
     pub custom_endpoint: Option<String>,
+
+    /// Remote audio source URL (Groq/OpenAI-Whisper REST `url` form field).
+    ///
+    /// When set, the request transcribes audio fetched from this URL instead of an uploaded
+    /// `file` part. Groq accepts EITHER `file` OR `url` on `/audio/transcriptions` and
+    /// `/audio/translations`; a `data:` (Base64) URL is also accepted here. Sourced from the
+    /// standardized `extras["url"]` passthrough (no canonical typed field — this is a
+    /// REST-batch-only audio-source knob with no streaming analog).
+    pub audio_url: Option<String>,
 }
 
 impl Default for GroqSTTConfig {
@@ -468,6 +477,7 @@ impl Default for GroqSTTConfig {
             silence_detection: SilenceDetectionConfig::default(),
             translate_to_english: false,
             custom_endpoint: None,
+            audio_url: None,
         }
     }
 }
@@ -510,7 +520,57 @@ impl GroqSTTConfig {
                     .push(TimestampGranularity::Word);
             }
         }
+        // Audio source by URL / Base64 data-URL → `url` form field (extras passthrough).
+        // Groq's OpenAI-Whisper-compatible REST accepts EITHER `file` OR `url`; the streaming
+        // vocabulary has no analog (Groq has no streaming WS STT endpoint), so this rides the
+        // open `extras` passthrough rather than a typed feature.
+        if let Some(url) = std.extras.0.get("url").and_then(|v| v.as_str()) {
+            cfg.audio_url = Some(url.to_string());
+        }
         cfg
+    }
+
+    /// Build the non-file multipart text fields exactly as they are emitted onto the wire.
+    ///
+    /// This is the single source of truth for the request body: [`crate::core::stt::groq`]'s
+    /// `send_request` builds its `reqwest` `Form` by iterating this list (plus the audio part),
+    /// so a wire-level test can assert on the precise `(name, value)` pairs that reach Groq —
+    /// instead of re-asserting struct fields (the recurring "tested the config, not the wire"
+    /// bug class). The audio `file`/`url` source itself is signalled by [`Self::audio_url`].
+    pub fn build_form_text_fields(&self) -> Vec<(String, String)> {
+        let mut fields = vec![
+            ("model".to_string(), self.model.as_str().to_string()),
+            (
+                "response_format".to_string(),
+                self.response_format.as_str().to_string(),
+            ),
+        ];
+
+        // Remote audio source: emit `url` instead of an uploaded `file` part.
+        if let Some(ref url) = self.audio_url {
+            fields.push(("url".to_string(), url.clone()));
+        }
+
+        if !self.base.language.is_empty() {
+            fields.push(("language".to_string(), self.base.language.clone()));
+        }
+        if let Some(temp) = self.temperature {
+            fields.push(("temperature".to_string(), temp.to_string()));
+        }
+        if let Some(ref prompt) = self.prompt {
+            fields.push(("prompt".to_string(), prompt.clone()));
+        }
+        if self.response_format == GroqResponseFormat::VerboseJson
+            && !self.timestamp_granularities.is_empty()
+        {
+            for granularity in &self.timestamp_granularities {
+                fields.push((
+                    "timestamp_granularities[]".to_string(),
+                    granularity.as_str().to_string(),
+                ));
+            }
+        }
+        fields
     }
 
     /// Get the API endpoint URL.

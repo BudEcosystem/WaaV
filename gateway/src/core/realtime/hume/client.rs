@@ -96,6 +96,14 @@ pub struct HumeEVI {
 
     /// Handle to the message processing task.
     task_handle: Option<tokio::task::JoinHandle<()>>,
+
+    /// Shared, process-global resilience handles (W-D2 fleet adoption). Hume EVI's message loop is
+    /// single-connection (no bespoke reconnect), so adoption here means *participating in the
+    /// shared breaker*: a successful connect records a success, a transport drop records a failure,
+    /// and because the registry breaker self-publishes `waav_circuit_breaker_state{provider="hume"}`
+    /// on transition, a persistently-down Hume now trips the gauge for every session. `None` (a
+    /// direct construction) → silent, exactly as before.
+    resilience: Option<crate::core::resilience::ResilienceHandles>,
 }
 
 /// Chat metadata information.
@@ -126,7 +134,15 @@ impl HumeEVI {
             response_done_callback: None,
             reconnection_callback: None,
             task_handle: None,
+            resilience: None,
         })
+    }
+
+    /// The shared circuit breaker this session feeds, if injected (for metrics/tests).
+    pub fn resilience_breaker(
+        &self,
+    ) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.as_ref().map(|r| &r.breaker)
     }
 
     /// Get the chat ID for the current session.
@@ -179,6 +195,12 @@ impl HumeEVI {
 
         info!("Connected to Hume EVI (status: {})", response.status());
 
+        // W-D2: a successful connect is a healthy sample for the shared breaker (and closes a
+        // half-open probe if one was outstanding). The registry breaker self-publishes the gauge.
+        if let Some(r) = &self.resilience {
+            r.breaker.record_success();
+        }
+
         // Split the WebSocket stream
         let (ws_write, ws_read) = ws_stream.split();
 
@@ -196,10 +218,12 @@ impl HumeEVI {
         let function_call_cb = self.function_call_callback.clone();
         let speech_event_cb = self.speech_event_callback.clone();
         let response_done_cb = self.response_done_callback.clone();
+        // The shared breaker the loop records a transport drop on (so a flapping Hume trips it).
+        let breaker = self.resilience.as_ref().map(|r| Arc::clone(&r.breaker));
 
         // Spawn message processing task
         let handle = tokio::spawn(async move {
-            Self::message_loop(
+            let ended_on_transport_error = Self::message_loop(
                 ws_write,
                 ws_read,
                 rx,
@@ -214,6 +238,15 @@ impl HumeEVI {
                 response_done_cb,
             )
             .await;
+            // W-D2: if the single connection dropped on a transport error (not a clean close),
+            // record a failure on the shared breaker so a persistently-flaky Hume trips it for
+            // every session (self-publishes `waav_circuit_breaker_state{provider="hume"}`).
+            if ended_on_transport_error {
+                if let Some(b) = &breaker {
+                    b.record_failure();
+                }
+                crate::core::metrics::bridge::record_reconnect("hume", "failure");
+            }
         });
 
         self.task_handle = Some(handle);
@@ -276,7 +309,10 @@ impl HumeEVI {
         function_call_cb: Option<FunctionCallCallback>,
         speech_event_cb: Option<SpeechEventCallback>,
         response_done_cb: Option<ResponseDoneCallback>,
-    ) {
+    ) -> bool {
+        // True if the loop ended on a transport-level error (send failure / WS error / stream end),
+        // false if it ended on a clean Close frame. Drives the shared breaker's failure recording.
+        let mut transport_error = false;
         loop {
             tokio::select! {
                 // Handle outgoing messages
@@ -286,6 +322,7 @@ impl HumeEVI {
                             trace!("Sending EVI message: {}", json.chars().take(100).collect::<String>());
                             if let Err(e) = ws_write.send(Message::Text(json.into())).await {
                                 error!("Failed to send WebSocket message: {e}");
+                                transport_error = true;
                                 break;
                             }
                         }
@@ -335,18 +372,28 @@ impl HumeEVI {
                         Ok(_) => {}
                         Err(e) => {
                             error!("WebSocket error: {e}");
+                            transport_error = true;
                             break;
                         }
                     }
                 }
 
-                else => break,
+                // The stream closed without a Close frame, or the outgoing channel was dropped.
+                // The latter is a clean shutdown (sender gone); a bare stream end is a transport
+                // drop. `select!`'s `else` fires when all branches are disabled — treat as a drop
+                // only if we still had a live read side, which a bare `None` from `ws_read.next()`
+                // (handled above via the `Some(result)` guard not matching) implies.
+                else => {
+                    transport_error = true;
+                    break;
+                }
             }
         }
 
         // Connection closed
         *state.write().await = ConnectionState::Disconnected;
-        info!("Hume EVI message loop ended");
+        info!("Hume EVI message loop ended (transport_error={transport_error})");
+        transport_error
     }
 
     /// Handle a server message.
@@ -690,6 +737,13 @@ impl BaseRealtime for HumeEVI {
             "channels": self.config.channels,
             "encoding": format!("{:?}", self.config.input_encoding),
         })
+    }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared, process-global handles so the connection lifecycle records success on
+        // connect and failure on a transport drop against the shared breaker — moving
+        // `waav_circuit_breaker_state{provider="hume"}` on transition (W-D2).
+        self.resilience = Some(resilience);
     }
 }
 

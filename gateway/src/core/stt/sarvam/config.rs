@@ -4,6 +4,7 @@
 //! Sarvam specializes in Indian language STT with support for 11 languages.
 
 use crate::core::stt::base::STTConfig;
+use url::form_urlencoded;
 
 /// Sarvam.ai STT WebSocket endpoint
 pub const SARVAM_STT_WS_URL: &str = "wss://api.sarvam.ai/speech-to-text-translate";
@@ -55,6 +56,37 @@ pub struct SarvamSTTConfig {
     pub vad_signals: bool,
     /// Enable manual flush signal support
     pub flush_signal: bool,
+    // -------------------------------------------------------------------------
+    // Provider-extras passthrough params (Sarvam Saarika streaming query params not modeled by the
+    // typed `SttFeatures` vocabulary). All optional; `None` => omitted from the URL (provider
+    // default). Carried verbatim from `StandardSTTConfig::extras`.
+    // -------------------------------------------------------------------------
+    /// Transcription `mode` (e.g. transcription vs. translation behavior). Sarvam streaming `mode`
+    /// query param.
+    pub mode: Option<String>,
+    /// ASR prompt / biasing text that nudges recognition toward expected vocabulary. Sarvam
+    /// streaming `prompt` query param (free text — percent-encoded on the wire).
+    pub prompt: Option<String>,
+    /// VAD: positive speech probability threshold (0.0-1.0) above which a frame counts as speech.
+    pub positive_speech_threshold: Option<f64>,
+    /// VAD: negative speech probability threshold (0.0-1.0) below which a frame counts as silence.
+    pub negative_speech_threshold: Option<f64>,
+    /// VAD: minimum consecutive speech frames required to emit a speech segment.
+    pub min_speech_frames: Option<u32>,
+    /// VAD: minimum speech frames required specifically for the first turn of the session.
+    pub first_turn_min_speech_frames: Option<u32>,
+    /// VAD: number of negative (silence) frames that close a segment.
+    pub negative_frames_count: Option<u32>,
+    /// VAD: sliding window (in frames) over which negative frames are counted.
+    pub negative_frames_window: Option<u32>,
+    /// VAD: start-of-speech volume threshold (0.0-1.0) gating segment onset.
+    pub start_speech_volume_threshold: Option<f64>,
+    /// VAD: minimum speech frames required to treat speech as a barge-in / interrupt.
+    pub interrupt_min_speech_frames: Option<u32>,
+    /// VAD: number of audio frames pre-pended to a segment as lead-in padding.
+    pub pre_speech_pad_frames: Option<u32>,
+    /// VAD: number of initial frames to ignore at session start (warm-up).
+    pub num_initial_ignored_frames: Option<u32>,
 }
 
 impl Default for SarvamSTTConfig {
@@ -67,6 +99,18 @@ impl Default for SarvamSTTConfig {
             high_vad_sensitivity: false,
             vad_signals: true,
             flush_signal: false,
+            mode: None,
+            prompt: None,
+            positive_speech_threshold: None,
+            negative_speech_threshold: None,
+            min_speech_frames: None,
+            first_turn_min_speech_frames: None,
+            negative_frames_count: None,
+            negative_frames_window: None,
+            start_speech_volume_threshold: None,
+            interrupt_min_speech_frames: None,
+            pre_speech_pad_frames: None,
+            num_initial_ignored_frames: None,
         }
     }
 }
@@ -98,6 +142,8 @@ impl SarvamSTTConfig {
             high_vad_sensitivity: false,
             vad_signals: true,
             flush_signal: false,
+            // Extras-only params are absent on the flat path (no extras to read here).
+            ..Default::default()
         }
     }
 
@@ -112,6 +158,52 @@ impl SarvamSTTConfig {
         let mut cfg = Self::from_base(&std.base);
         if let Some(v) = f.vad_events {
             cfg.vad_signals = v;
+        }
+        // Provider extras → Sarvam streaming query params not modeled by the typed vocabulary:
+        // transcription `mode`, ASR `prompt`/biasing, and the fine-grained VAD tuning knobs.
+        // Keys not present are left as `None` and omitted from the URL (provider default).
+        let e = &std.extras.0;
+        if let Some(v) = e.get("mode").and_then(|v| v.as_str()) {
+            cfg.mode = Some(v.to_string());
+        }
+        if let Some(v) = e.get("prompt").and_then(|v| v.as_str()) {
+            cfg.prompt = Some(v.to_string());
+        }
+        if let Some(v) = e.get("positive_speech_threshold").and_then(|v| v.as_f64()) {
+            cfg.positive_speech_threshold = Some(v);
+        }
+        if let Some(v) = e.get("negative_speech_threshold").and_then(|v| v.as_f64()) {
+            cfg.negative_speech_threshold = Some(v);
+        }
+        if let Some(v) = e.get("min_speech_frames").and_then(|v| v.as_u64()) {
+            cfg.min_speech_frames = Some(v as u32);
+        }
+        if let Some(v) = e
+            .get("first_turn_min_speech_frames")
+            .and_then(|v| v.as_u64())
+        {
+            cfg.first_turn_min_speech_frames = Some(v as u32);
+        }
+        if let Some(v) = e.get("negative_frames_count").and_then(|v| v.as_u64()) {
+            cfg.negative_frames_count = Some(v as u32);
+        }
+        if let Some(v) = e.get("negative_frames_window").and_then(|v| v.as_u64()) {
+            cfg.negative_frames_window = Some(v as u32);
+        }
+        if let Some(v) = e
+            .get("start_speech_volume_threshold")
+            .and_then(|v| v.as_f64())
+        {
+            cfg.start_speech_volume_threshold = Some(v);
+        }
+        if let Some(v) = e.get("interrupt_min_speech_frames").and_then(|v| v.as_u64()) {
+            cfg.interrupt_min_speech_frames = Some(v as u32);
+        }
+        if let Some(v) = e.get("pre_speech_pad_frames").and_then(|v| v.as_u64()) {
+            cfg.pre_speech_pad_frames = Some(v as u32);
+        }
+        if let Some(v) = e.get("num_initial_ignored_frames").and_then(|v| v.as_u64()) {
+            cfg.num_initial_ignored_frames = Some(v as u32);
         }
         cfg
     }
@@ -143,6 +235,50 @@ impl SarvamSTTConfig {
 
         if self.flush_signal {
             url.push_str("&flush_signal=true");
+        }
+
+        // Provider-extras passthrough params. `mode`/`prompt` are free text (the `prompt` biasing
+        // string may contain spaces and delimiters) and so ARE percent-encoded here, unlike the
+        // constrained identifiers above.
+        let encode =
+            |s: &str| -> String { form_urlencoded::byte_serialize(s.as_bytes()).collect() };
+        if let Some(ref mode) = self.mode {
+            url.push_str("&mode=");
+            url.push_str(&encode(mode));
+        }
+        if let Some(ref prompt) = self.prompt {
+            url.push_str("&prompt=");
+            url.push_str(&encode(prompt));
+        }
+        if let Some(v) = self.positive_speech_threshold {
+            url.push_str(&format!("&positive_speech_threshold={v}"));
+        }
+        if let Some(v) = self.negative_speech_threshold {
+            url.push_str(&format!("&negative_speech_threshold={v}"));
+        }
+        if let Some(v) = self.min_speech_frames {
+            url.push_str(&format!("&min_speech_frames={v}"));
+        }
+        if let Some(v) = self.first_turn_min_speech_frames {
+            url.push_str(&format!("&first_turn_min_speech_frames={v}"));
+        }
+        if let Some(v) = self.negative_frames_count {
+            url.push_str(&format!("&negative_frames_count={v}"));
+        }
+        if let Some(v) = self.negative_frames_window {
+            url.push_str(&format!("&negative_frames_window={v}"));
+        }
+        if let Some(v) = self.start_speech_volume_threshold {
+            url.push_str(&format!("&start_speech_volume_threshold={v}"));
+        }
+        if let Some(v) = self.interrupt_min_speech_frames {
+            url.push_str(&format!("&interrupt_min_speech_frames={v}"));
+        }
+        if let Some(v) = self.pre_speech_pad_frames {
+            url.push_str(&format!("&pre_speech_pad_frames={v}"));
+        }
+        if let Some(v) = self.num_initial_ignored_frames {
+            url.push_str(&format!("&num_initial_ignored_frames={v}"));
         }
 
         url
@@ -202,6 +338,64 @@ mod tests {
         };
         let cfg = SarvamSTTConfig::from_standard(&std);
         assert!(!cfg.vad_signals); // vad_events -> vad_signals
+    }
+
+    // WIRE-LEVEL: `mode`, `prompt` and the 10 VAD tuning extras must travel from the standardized
+    // `extras` passthrough onto the streaming WebSocket URL — the bytes that actually reach Sarvam,
+    // not merely the config struct. Guards the recurring "set on the struct but never emitted to
+    // the wire" gap class.
+    #[test]
+    fn extras_mode_prompt_and_vad_params_reach_websocket_url() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+        let mut extras = serde_json::Map::new();
+        extras.insert("mode".into(), serde_json::json!("transcription"));
+        extras.insert("prompt".into(), serde_json::json!("WaaV gateway demo"));
+        extras.insert("positive_speech_threshold".into(), serde_json::json!(0.6));
+        extras.insert("negative_speech_threshold".into(), serde_json::json!(0.35));
+        extras.insert("min_speech_frames".into(), serde_json::json!(3));
+        extras.insert("first_turn_min_speech_frames".into(), serde_json::json!(5));
+        extras.insert("negative_frames_count".into(), serde_json::json!(8));
+        extras.insert("negative_frames_window".into(), serde_json::json!(16));
+        extras.insert("start_speech_volume_threshold".into(), serde_json::json!(0.2));
+        extras.insert("interrupt_min_speech_frames".into(), serde_json::json!(4));
+        extras.insert("pre_speech_pad_frames".into(), serde_json::json!(2));
+        extras.insert("num_initial_ignored_frames".into(), serde_json::json!(10));
+
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "sarvam".into(),
+                api_key: "test-key".into(),
+                language: "hi-IN".into(),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: ProviderExtras(extras),
+        };
+        let cfg = SarvamSTTConfig::from_standard(&std);
+        let url = cfg.build_websocket_url();
+
+        // mode + prompt (prompt is free text -> form-urlencoded; spaces become `+`, the same
+        // x-www-form-urlencoded convention `url::form_urlencoded` and the Rev AI builder use).
+        assert!(url.contains("mode=transcription"), "mode missing: {url}");
+        assert!(
+            url.contains("prompt=WaaV+gateway+demo"),
+            "prompt must be url-encoded on the wire (spaces -> '+'): {url}"
+        );
+        // 10 VAD params.
+        for needle in [
+            "positive_speech_threshold=0.6",
+            "negative_speech_threshold=0.35",
+            "min_speech_frames=3",
+            "first_turn_min_speech_frames=5",
+            "negative_frames_count=8",
+            "negative_frames_window=16",
+            "start_speech_volume_threshold=0.2",
+            "interrupt_min_speech_frames=4",
+            "pre_speech_pad_frames=2",
+            "num_initial_ignored_frames=10",
+        ] {
+            assert!(url.contains(needle), "VAD param `{needle}` missing from URL: {url}");
+        }
     }
 
     #[test]

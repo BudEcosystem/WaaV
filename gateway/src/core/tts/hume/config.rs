@@ -338,6 +338,24 @@ pub struct HumeTTSConfig {
     /// Number of audio variations to generate (1-3).
     /// Higher values increase latency but provide options.
     pub num_generations: Option<u8>,
+
+    /// Voice library the voice name/id resolves against (`HUME_AI` or `CUSTOM_VOICE`).
+    /// Maps to the per-utterance `voice.provider` field. Audio-changing (selects the voice engine).
+    pub voice_provider: Option<String>,
+
+    /// Timestamp granularities to request (`"word"`/`"phoneme"`); top-level `include_timestamp_types`.
+    /// Pure metadata request: does NOT change the audio, so it is excluded from the cache key.
+    pub include_timestamp_types: Option<Vec<String>>,
+
+    /// Sampling temperature (top-level). Audio-changing.
+    pub temperature: Option<f32>,
+
+    /// Auto-split input into utterance segments (top-level `split_utterances`). Audio-changing.
+    pub split_utterances: Option<bool>,
+
+    /// Strip per-chunk audio headers on concatenation (top-level `strip_headers`).
+    /// Changes the returned byte framing, so it is part of the cache key.
+    pub strip_headers: Option<bool>,
 }
 
 impl HumeTTSConfig {
@@ -374,6 +392,11 @@ impl HumeTTSConfig {
             generation_id: None,
             output_format,
             num_generations: None,
+            voice_provider: None,
+            include_timestamp_types: None,
+            temperature: None,
+            split_utterances: None,
+            strip_headers: None,
         }
     }
 
@@ -406,6 +429,11 @@ impl HumeTTSConfig {
             cfg.output_format.sample_rate = rate;
         }
 
+        // Typed feature: timestamp granularities (top-level `include_timestamp_types`).
+        if let Some(types) = f.include_timestamp_types.as_ref() {
+            cfg.include_timestamp_types = Some(types.clone());
+        }
+
         // Provider-specific passthrough.
         if let Some(id) = std.extras.0.get("generation_id").and_then(|v| v.as_str()) {
             cfg.generation_id = Some(id.to_string());
@@ -417,6 +445,22 @@ impl HumeTTSConfig {
             .and_then(|v| v.as_u64())
         {
             cfg.num_generations = Some(num as u8);
+        }
+        // `voice_provider` -> per-utterance `voice.provider` (e.g. HUME_AI / CUSTOM_VOICE).
+        if let Some(p) = std.extras.0.get("voice_provider").and_then(|v| v.as_str()) {
+            cfg.voice_provider = Some(p.to_string());
+        }
+        // `temperature` -> top-level `temperature` (sampling variation).
+        if let Some(t) = std.extras.0.get("temperature").and_then(|v| v.as_f64()) {
+            cfg.temperature = Some(t as f32);
+        }
+        // `split_utterances` -> top-level `split_utterances`.
+        if let Some(s) = std.extras.0.get("split_utterances").and_then(|v| v.as_bool()) {
+            cfg.split_utterances = Some(s);
+        }
+        // `strip_headers` -> top-level `strip_headers`.
+        if let Some(s) = std.extras.0.get("strip_headers").and_then(|v| v.as_bool()) {
+            cfg.strip_headers = Some(s);
         }
 
         cfg
@@ -544,6 +588,11 @@ impl Default for HumeTTSConfig {
             generation_id: None,
             output_format: HumeOutputFormat::default(),
             num_generations: None,
+            voice_provider: None,
+            include_timestamp_types: None,
+            temperature: None,
+            split_utterances: None,
+            strip_headers: None,
         }
     }
 }

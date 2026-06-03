@@ -519,6 +519,19 @@ pub struct TencentSttConfig {
 
     /// Filter empty result callbacks.
     pub filter_empty_result: bool,
+
+    // -------------------------------------------------------------------------
+    // Provider-extras passthrough params (Tencent Real-Time ASR query params not modeled by the
+    // typed `SttFeatures` vocabulary). All optional; `None` => omitted from the URL (provider
+    // default). Carried verbatim from `StandardSTTConfig::extras`.
+    // -------------------------------------------------------------------------
+    /// Noise filter threshold (`noise_threshold`, float in -1.0..=1.0; higher filters more noise,
+    /// lower keeps more audio). Tencent Real-Time ASR `noise_threshold` query param.
+    pub noise_threshold: Option<f64>,
+
+    /// Sample rate of the *input* audio (`input_sample_rate`) for engines that accept a different
+    /// input rate than their nominal model rate. Tencent Real-Time ASR `input_sample_rate` param.
+    pub input_sample_rate: Option<u32>,
 }
 
 impl Default for TencentSttConfig {
@@ -542,6 +555,8 @@ impl Default for TencentSttConfig {
             convert_num_mode: TencentNumeralMode::default(),
             customization_id: None,
             filter_empty_result: false,
+            noise_threshold: None,
+            input_sample_rate: None,
         }
     }
 }
@@ -824,6 +839,15 @@ impl TencentSttConfig {
         }
         if let Some(k) = &f.keyterms {
             cfg.hotword_list = Some(k.iter().take(MAX_HOTWORD_LIST_SIZE).cloned().collect());
+        }
+        // Provider extras → Tencent Real-Time ASR query params not modeled by the typed vocabulary.
+        // Keys not present stay `None` and are omitted from the URL (provider default).
+        let e = &std.extras.0;
+        if let Some(v) = e.get("noise_threshold").and_then(|v| v.as_f64()) {
+            cfg.noise_threshold = Some(v);
+        }
+        if let Some(v) = e.get("input_sample_rate").and_then(|v| v.as_u64()) {
+            cfg.input_sample_rate = Some(v as u32);
         }
         Ok(cfg)
     }

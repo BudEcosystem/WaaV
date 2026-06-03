@@ -335,6 +335,66 @@ mod tests {
         assert!(cfg.use_hd);
     }
 
+    // WIRE-LEVEL (S1/S5 recurring bug class): assert the `apply_custom_pronunciations` flag set via
+    // the standardized extras passthrough actually reaches the SERIALIZED `/stream` request BODY —
+    // not merely the config struct. We build the real reqwest request through the same path the
+    // live provider uses and inspect its body bytes.
+    #[tokio::test]
+    async fn apply_custom_pronunciations_reaches_stream_request_body() {
+        use crate::core::stt::standard::ProviderExtras;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert(
+            "apply_custom_pronunciations".into(),
+            serde_json::json!(true),
+        );
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                api_key: "test-key".to_string(),
+                voice_id: Some("voice-uuid".to_string()),
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+        let tts = ResembleTts::from_standard(&std).unwrap();
+        // (1) config carries the flag …
+        assert!(tts.resemble_config().apply_custom_pronunciations);
+
+        // (2) … AND the built HTTP request body contains the api_param.
+        let builder = tts.create_request_builder();
+        let client = reqwest::Client::new();
+        let request = builder
+            .build_http_request(&client, "Hello world")
+            .build()
+            .unwrap();
+        assert_eq!(request.url().as_str(), RESEMBLE_TTS_STREAM_URL);
+        let body_bytes = request.body().unwrap().as_bytes().unwrap();
+        let body: serde_json::Value = serde_json::from_slice(body_bytes).unwrap();
+        assert_eq!(
+            body["apply_custom_pronunciations"], true,
+            "apply_custom_pronunciations must reach the /stream request body"
+        );
+        assert_eq!(body["voice_uuid"], "voice-uuid");
+        assert_eq!(body["data"], "Hello world");
+    }
+
+    // Default-off guard: when the flag is not requested, the body keeps its pre-feature shape
+    // (the key is omitted, not emitted as `false`).
+    #[test]
+    fn apply_custom_pronunciations_omitted_from_body_by_default() {
+        let config = TTSConfig {
+            api_key: "test-key".to_string(),
+            voice_id: Some("voice-uuid".to_string()),
+            ..Default::default()
+        };
+        let resemble_config = ResembleTtsConfig::from_base(&config).unwrap();
+        let request = ResembleStreamRequest::from_config(&resemble_config, "Hi");
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("apply_custom_pronunciations"));
+    }
+
     #[test]
     fn test_resemble_tts_creation() {
         let config = TTSConfig {

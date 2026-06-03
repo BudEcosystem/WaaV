@@ -16,6 +16,23 @@ pub const DEEPGRAM_TTS_URL: &str = "https://api.deepgram.com/v1/speak";
 struct DeepgramRequestBuilder {
     config: TTSConfig,
     pronunciation_replacer: Option<PronunciationReplacer>,
+    /// Deepgram `/v1/speak` advanced query parameters, populated from the standardized config.
+    speak: DeepgramSpeakParams,
+}
+
+/// Advanced Deepgram `/v1/speak` query parameters that the flat `TTSConfig` cannot express.
+///
+/// All optional; absent fields are omitted from the URL so default behavior is preserved.
+#[derive(Clone, Default)]
+struct DeepgramSpeakParams {
+    /// Speaking rate (`speed`, range 0.7–1.5, default 1.0). Audio-changing → part of cache key.
+    speed: Option<f32>,
+    /// Output audio bitrate in bits/sec (`bit_rate`). Audio-changing → part of cache key.
+    bit_rate: Option<u32>,
+    /// Async result callback URL (`callback`). Delivery-only → NOT part of cache key.
+    callback: Option<String>,
+    /// Callback HTTP method (`callback_method`, POST|PUT). Delivery-only → NOT part of cache key.
+    callback_method: Option<String>,
 }
 
 impl TTSRequestBuilder for DeepgramRequestBuilder {
@@ -50,6 +67,27 @@ impl TTSRequestBuilder for DeepgramRequestBuilder {
         } else {
             // Use 24000 to match defaults elsewhere (e.g., WS path)
             params.push("sample_rate=24000".to_string());
+        }
+
+        // Speaking speed/rate (`speed`, Deepgram range 0.7–1.5). Only emitted when explicitly set
+        // via the standardized features, so existing default behavior (no `speed` param) is kept.
+        if let Some(speed) = self.speak.speed {
+            params.push(format!("speed={speed}"));
+        }
+
+        // Output audio bitrate (`bit_rate`, bits/sec).
+        if let Some(bit_rate) = self.speak.bit_rate {
+            params.push(format!("bit_rate={bit_rate}"));
+        }
+
+        // Async result callback URL (`callback`).
+        if let Some(callback) = &self.speak.callback {
+            params.push(format!("callback={callback}"));
+        }
+
+        // Callback HTTP method (`callback_method`, POST|PUT).
+        if let Some(method) = &self.speak.callback_method {
+            params.push(format!("callback_method={method}"));
         }
 
         if !params.is_empty() {
@@ -89,7 +127,7 @@ impl TTSRequestBuilder for DeepgramRequestBuilder {
     }
 }
 
-fn compute_tts_config_hash(config: &TTSConfig) -> String {
+fn compute_tts_config_hash(config: &TTSConfig, speak: &DeepgramSpeakParams) -> String {
     // Build a stable representation of config fields that impact audio output
     let mut s = String::new();
     s.push_str(config.provider.as_str());
@@ -106,6 +144,17 @@ fn compute_tts_config_hash(config: &TTSConfig) -> String {
     s.push('|');
     if let Some(rate) = config.speaking_rate {
         s.push_str(&format!("{rate:.3}"));
+    }
+    // Audio-changing `/v1/speak` params: `speed` and `bit_rate` alter the synthesized bytes, so
+    // they MUST participate in the cache key (prior review's collision bug class). `callback` /
+    // `callback_method` are delivery-only and intentionally excluded (they don't change audio).
+    s.push('|');
+    if let Some(speed) = speak.speed {
+        s.push_str(&format!("{speed:.3}"));
+    }
+    s.push('|');
+    if let Some(bit_rate) = speak.bit_rate {
+        s.push_str(&bit_rate.to_string());
     }
     let hash = xxh3_128(s.as_bytes());
     format!("{hash:032x}")
@@ -124,16 +173,22 @@ pub struct DeepgramTTS {
 impl DeepgramTTS {
     /// Create a new Deepgram TTS instance
     pub fn new(config: TTSConfig) -> TTSResult<Self> {
+        Self::new_with_speak(config, DeepgramSpeakParams::default())
+    }
+
+    /// Create a new Deepgram TTS instance with advanced `/v1/speak` query parameters.
+    fn new_with_speak(config: TTSConfig, speak: DeepgramSpeakParams) -> TTSResult<Self> {
         let pronunciation_replacer = if !config.pronunciations.is_empty() {
             Some(PronunciationReplacer::new(&config.pronunciations))
         } else {
             None
         };
+        let hash = compute_tts_config_hash(&config, &speak);
         let request_builder = DeepgramRequestBuilder {
             config: config.clone(),
             pronunciation_replacer,
+            speak,
         };
-        let hash = compute_tts_config_hash(&config);
         Ok(Self {
             provider: TTSProvider::new()?,
             request_builder,
@@ -142,11 +197,18 @@ impl DeepgramTTS {
     }
 
     /// Build from the standardized config (W1 keystone). Deepgram's flat `TTSConfig` is the
-    /// constructor input, so this maps the standardized features onto it before delegating to
-    /// `new`. Deepgram's `/v1/speak` REST surface is narrow: only `sample_rate` is expressible
-    /// (the request builder emits `sample_rate=` from `config.sample_rate`). Speed/pitch/volume,
-    /// emotion, instructions, SSML, voice settings, word timestamps, streaming, seed and language
-    /// have no Deepgram `/v1/speak` parameter and are skipped (capability gaps).
+    /// constructor input, so this maps the standardized features onto it (plus the advanced
+    /// `/v1/speak` query params from `ProviderExtras`) before delegating to the constructor.
+    ///
+    /// Wired `/v1/speak` params:
+    /// - `sample_rate` (typed) → `sample_rate=` (output rate)
+    /// - `speed` (typed)       → `speed=` (speaking rate, Deepgram range 0.7–1.5; audio-changing)
+    /// - `bit_rate` (extras)   → `bit_rate=` (output bitrate; audio-changing)
+    /// - `callback` (extras)   → `callback=` (async result callback URL; delivery-only)
+    /// - `callback_method` (extras) → `callback_method=` (POST|PUT; delivery-only)
+    ///
+    /// Pitch/volume, emotion, instructions, SSML, voice settings, word timestamps, streaming, seed
+    /// and language have no Deepgram `/v1/speak` parameter and are skipped (capability gaps).
     pub fn from_standard(
         std: &crate::core::tts::standard::StandardTTSConfig,
     ) -> TTSResult<Self> {
@@ -155,7 +217,30 @@ impl DeepgramTTS {
         if let Some(sr) = f.sample_rate {
             base.sample_rate = Some(sr);
         }
-        Self::new(base)
+
+        let extras = &std.extras.0;
+        let speak = DeepgramSpeakParams {
+            // Typed speed → mirror onto `speaking_rate` (so the flat config stays consistent) and
+            // emit `speed=` on the wire.
+            speed: f.speed,
+            bit_rate: extras
+                .get("bit_rate")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32),
+            callback: extras
+                .get("callback")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            callback_method: extras
+                .get("callback_method")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        };
+        if let Some(speed) = f.speed {
+            base.speaking_rate = Some(speed);
+        }
+
+        Self::new_with_speak(base, speak)
     }
 
     /// Set the request manager for this instance
@@ -309,6 +394,7 @@ mod tests {
         let builder = DeepgramRequestBuilder {
             config,
             pronunciation_replacer: None,
+            speak: DeepgramSpeakParams::default(),
         };
         let client = reqwest::Client::new();
         let request = builder.build_http_request(&client, "Test text");
@@ -321,5 +407,112 @@ mod tests {
         assert!(url.contains("encoding=mp3"));
         assert!(url.contains("sample_rate=24000"));
         assert!(url.starts_with(DEEPGRAM_TTS_URL));
+        // With default (empty) speak params, none of the advanced params appear.
+        assert!(!url.contains("speed="));
+        assert!(!url.contains("bit_rate="));
+        assert!(!url.contains("callback"));
+    }
+
+    // WIRE-LEVEL: the standardized speed/bit_rate/callback/callback_method features must reach the
+    // built `/v1/speak` request URL — not merely the config struct (the recurring "set but never
+    // serialized" bug class). We build the real reqwest request and inspect its URL.
+    #[tokio::test]
+    async fn from_standard_features_reach_speak_url() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("bit_rate".into(), serde_json::json!(48000));
+        extras.insert(
+            "callback".into(),
+            serde_json::json!("https://example.com/cb"),
+        );
+        extras.insert("callback_method".into(), serde_json::json!("PUT"));
+
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "deepgram".into(),
+                api_key: "k".into(),
+                voice_id: Some("aura-2-thalia-en".into()),
+                audio_format: Some("mp3".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(0.9),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+
+        let tts = DeepgramTTS::from_standard(&std).unwrap();
+        let client = reqwest::Client::new();
+        let url = tts
+            .request_builder
+            .build_http_request(&client, "hi")
+            .build()
+            .unwrap()
+            .url()
+            .to_string();
+
+        assert!(url.contains("speed=0.9"), "speed missing from URL: {url}");
+        assert!(url.contains("bit_rate=48000"), "bit_rate missing from URL: {url}");
+        assert!(
+            url.contains("callback=https") || url.contains("callback=https%3A"),
+            "callback missing from URL: {url}"
+        );
+        assert!(
+            url.contains("callback_method=PUT"),
+            "callback_method missing from URL: {url}"
+        );
+    }
+
+    // CACHE-KEY: audio-changing params (`speed`, `bit_rate`) must change the cache hash to avoid
+    // serving stale/colliding audio (prior review's collision bug class). Delivery-only params
+    // (`callback`, `callback_method`) must NOT change the hash.
+    #[tokio::test]
+    async fn speed_and_bit_rate_change_cache_key_but_callback_does_not() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+
+        let base = || TTSConfig {
+            provider: "deepgram".into(),
+            api_key: "k".into(),
+            voice_id: Some("aura-2-thalia-en".into()),
+            ..Default::default()
+        };
+        let mk = |features: TtsFeatures, extras: serde_json::Map<String, serde_json::Value>| {
+            DeepgramTTS::from_standard(&StandardTTSConfig {
+                base: base(),
+                features,
+                extras: ProviderExtras(extras),
+            })
+            .unwrap()
+            .config_hash
+        };
+
+        let baseline = mk(TtsFeatures::default(), serde_json::Map::new());
+
+        // speed changes the hash.
+        let with_speed = mk(
+            TtsFeatures {
+                speed: Some(1.2),
+                ..Default::default()
+            },
+            serde_json::Map::new(),
+        );
+        assert_ne!(baseline, with_speed, "speed must change the cache key");
+
+        // bit_rate changes the hash.
+        let mut br = serde_json::Map::new();
+        br.insert("bit_rate".into(), serde_json::json!(32000));
+        let with_bitrate = mk(TtsFeatures::default(), br);
+        assert_ne!(baseline, with_bitrate, "bit_rate must change the cache key");
+
+        // callback / callback_method must NOT change the hash (delivery-only).
+        let mut cb = serde_json::Map::new();
+        cb.insert("callback".into(), serde_json::json!("https://example.com/cb"));
+        cb.insert("callback_method".into(), serde_json::json!("POST"));
+        let with_callback = mk(TtsFeatures::default(), cb);
+        assert_eq!(
+            baseline, with_callback,
+            "callback must NOT change the cache key (delivery-only)"
+        );
     }
 }

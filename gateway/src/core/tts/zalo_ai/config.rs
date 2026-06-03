@@ -55,6 +55,14 @@ pub const AUDIO_CHANNELS: u8 = 1;
 /// Audio sample width in bytes (16-bit).
 pub const AUDIO_SAMPLE_WIDTH: u8 = 2;
 
+/// Default `encode_type` (audio encoding selector) sent to `/v1/tts/synthesize`.
+///
+/// `encode_type=1` is the value used by the reference Home Assistant integration
+/// (`minhdanh/ha-zalo-tts`, `data_payload = {.., 'encode_type': '1', ..}`), which corresponds to
+/// the documented WAV/PCM output (16kHz, mono, 16-bit). The official ZaloTTS Python library omits
+/// the field and gets the same default server-side, so `1` is the safe, audio-stable default.
+pub const DEFAULT_ENCODE_TYPE: u8 = 1;
+
 // =============================================================================
 // Voice Types
 // =============================================================================
@@ -188,6 +196,15 @@ pub struct ZaloTtsConfig {
     /// Speech speed (0.8 - 1.2).
     pub speed: f32,
 
+    /// Audio encoding selector sent as the `encode_type` form param to `/v1/tts/synthesize`.
+    ///
+    /// This is the standardized `output_audio_format` feature mapped to Zalo's native integer
+    /// encoding code (confirmed wire param: `minhdanh/ha-zalo-tts` posts `encode_type=1`). It is an
+    /// audio-changing field. NOTE: `ZaloTts` implements `BaseTTS` directly and does NOT maintain a
+    /// `compute_*_tts_config_hash` (no cache participation, unlike e.g. reverie/smallest), so there
+    /// is no provider cache key to fold this into.
+    pub encode_type: u8,
+
     /// Request timeout in seconds.
     pub request_timeout_secs: u64,
 }
@@ -198,6 +215,7 @@ impl Default for ZaloTtsConfig {
             api_key: String::new(),
             voice: ZaloVoice::default(),
             speed: DEFAULT_SPEED,
+            encode_type: DEFAULT_ENCODE_TYPE,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
         }
     }
@@ -239,17 +257,32 @@ impl ZaloTtsConfig {
             api_key,
             voice,
             speed,
+            encode_type: DEFAULT_ENCODE_TYPE,
             request_timeout_secs,
         })
     }
 
     /// Build from the standardized TTS config. Zalo's only prosody knob is `speed`, a
     /// 1.0-is-normal multiplier matching the standardized feature, so `speed` -> `speed`
-    /// (reusing `from_base`'s `MIN_SPEED..=MAX_SPEED` clamp for consistency). The non-standard
-    /// `request_timeout_secs` knob is read from the `extras` passthrough. Zalo has no field for
-    /// pitch, volume, stability, similarity_boost, style, use_speaker_boost, emotion, instructions,
-    /// SSML, language, word_timestamps, streaming, seed or sample_rate, so those features are
-    /// skipped.
+    /// (reusing `from_base`'s `MIN_SPEED..=MAX_SPEED` clamp for consistency).
+    ///
+    /// Wired extras passthrough (Zalo has no typed `TtsFeatures` field for these):
+    /// - `output_audio_format` (extras) -> the `encode_type` form param on `/v1/tts/synthesize`.
+    ///   Zalo's native encoding selector is an integer code; the reference Home Assistant
+    ///   integration (`minhdanh/ha-zalo-tts`) posts `encode_type=1`. Accepted as a JSON number or a
+    ///   numeric string. This is an audio-changing field (see [`ZaloTtsConfig::encode_type`] for the
+    ///   cache-hash note — `ZaloTts` keeps no provider cache key).
+    /// - `request_timeout_secs` (extras, non-standard knob) -> HTTP client timeout.
+    ///
+    /// Capability gap (skipped, NOT fabricated): the standardized `speech_quality_tier`/`quality`
+    /// feature has no counterpart on Zalo's `/v1/tts/synthesize` endpoint. The confirmed wire params
+    /// are exactly `input`, `speed`, `speaker_id`, `encode_type` (verified against the official
+    /// `iconclub/zalo-tts` Python library and the `minhdanh/ha-zalo-tts` integration — neither sends
+    /// a `quality` field, and there is no public `quality` parameter on the synthesize endpoint).
+    ///
+    /// Zalo also has no field for pitch, volume, stability, similarity_boost, style,
+    /// use_speaker_boost, emotion, instructions, SSML, language, word_timestamps, streaming, seed or
+    /// sample_rate, so those features are skipped too.
     pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Result<Self, TTSError> {
         let f = &std.features;
         let mut cfg = Self::from_base(std.base.clone())?;
@@ -260,6 +293,16 @@ impl ZaloTtsConfig {
         }
 
         // Provider-specific passthrough.
+        // `output_audio_format` -> `encode_type`: accept a JSON integer (e.g. 2) or a numeric
+        // string (e.g. "2"); a non-numeric value leaves the default in place.
+        if let Some(v) = std.extras.0.get("output_audio_format") {
+            let encode_type = v
+                .as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()));
+            if let Some(et) = encode_type {
+                cfg.encode_type = et as u8;
+            }
+        }
         if let Some(timeout) = std
             .extras
             .0
@@ -293,11 +336,14 @@ impl ZaloTtsConfig {
         // URL-encode text for form submission
         let encoded_text: String = url::form_urlencoded::byte_serialize(text.as_bytes()).collect();
 
+        // `encode_type` is Zalo's native audio-encoding selector (confirmed wire param posted by the
+        // `minhdanh/ha-zalo-tts` integration); it carries the standardized `output_audio_format`.
         format!(
-            "input={}&speed={}&speaker_id={}",
+            "input={}&speed={}&speaker_id={}&encode_type={}",
             encoded_text,
             self.speed,
-            self.voice.speaker_id()
+            self.voice.speaker_id(),
+            self.encode_type
         )
     }
 }
@@ -379,6 +425,96 @@ mod tests {
         assert_eq!(cfg.speed, 1.1); // 1.1 is within 0.8..=1.2, unchanged by the clamp
         assert_eq!(cfg.voice, ZaloVoice::MaleNorth); // from_base passthrough
         assert_eq!(cfg.request_timeout_secs, 45); // from extras passthrough
+    }
+
+    // WIRE-LEVEL: the standardized `output_audio_format` extra must reach the actual POST body of
+    // `/v1/tts/synthesize` as the `encode_type` form param (NOT just live on the config struct —
+    // that is the recurring config-only bug class). Drives from_standard -> build_request_body.
+    #[test]
+    fn output_audio_format_reaches_request_body_as_encode_type() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        // Override the default encode_type (1) with 2 so the assertion proves the value flows
+        // through rather than coinciding with the default.
+        extras.insert("output_audio_format".into(), serde_json::json!(2));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "zalo_ai".into(),
+                api_key: "test_key".into(),
+                voice_id: Some("male_north".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+        let cfg = ZaloTtsConfig::from_standard(&std).unwrap();
+        let body = cfg.build_request_body("Xin chào");
+        // The wire param, with the standardized value, must appear in the URL-encoded body.
+        assert!(
+            body.contains("encode_type=2"),
+            "encode_type must reach the request body; got: {body}"
+        );
+
+        // A numeric STRING value is also accepted and reaches the wire identically.
+        let mut extras_str = serde_json::Map::new();
+        extras_str.insert("output_audio_format".into(), serde_json::json!("3"));
+        let std_str = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "zalo_ai".into(),
+                api_key: "test_key".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(extras_str),
+        };
+        let body_str = ZaloTtsConfig::from_standard(&std_str)
+            .unwrap()
+            .build_request_body("Xin chào");
+        assert!(
+            body_str.contains("encode_type=3"),
+            "numeric-string encode_type must reach the request body; got: {body_str}"
+        );
+    }
+
+    // The `encode_type` form param is emitted unconditionally with its documented default (1) even
+    // when no `output_audio_format` is supplied, matching the reference HA integration's payload.
+    #[test]
+    fn build_request_body_emits_default_encode_type() {
+        let mut config = ZaloTtsConfig::default();
+        config.api_key = "test_key".to_string();
+        let body = config.build_request_body("Xin chào");
+        assert!(
+            body.contains(&format!("encode_type={DEFAULT_ENCODE_TYPE}")),
+            "default encode_type must be on the wire; got: {body}"
+        );
+    }
+
+    // Capability gap guard: the standardized `speech_quality_tier`/`quality` feature has NO wire
+    // param on Zalo's `/v1/tts/synthesize` endpoint (confirmed against iconclub/zalo-tts and
+    // minhdanh/ha-zalo-tts). Supplying it as an extra must be ignored and must NOT inject a
+    // fabricated `quality=` field into the body.
+    #[test]
+    fn speech_quality_tier_is_a_capability_gap_not_on_the_wire() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("speech_quality_tier".into(), serde_json::json!("premium"));
+        extras.insert("quality".into(), serde_json::json!("high"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "zalo_ai".into(),
+                api_key: "test_key".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+        let body = ZaloTtsConfig::from_standard(&std)
+            .unwrap()
+            .build_request_body("Xin chào");
+        assert!(
+            !body.contains("quality"),
+            "quality must NOT be fabricated onto the Zalo wire (capability gap); got: {body}"
+        );
     }
 
     #[test]
@@ -511,6 +647,7 @@ mod tests {
         assert!(body.contains("input=Xin"));
         assert!(body.contains("speaker_id=4"));
         assert!(body.contains("speed=1.1"));
+        assert!(body.contains("encode_type=1")); // default encode_type on the wire
     }
 
     #[test]

@@ -551,6 +551,15 @@ pub struct AwsPollyTTSConfig {
     /// Custom lexicon names to apply
     #[serde(default)]
     pub lexicon_names: Vec<String>,
+
+    /// Requested speech-mark types (`word` / `sentence` / `viseme` / `ssml`). When non-empty,
+    /// Polly's `SynthesizeSpeech` returns a JSON metadata stream of timing/viseme/SSML marks
+    /// instead of audio (AWS forbids audio + marks in one request — they are a separate `Json`
+    /// output-format call). Canonical lowercase names; the provider maps them to the SDK
+    /// `SpeechMarkType` enum on the wire.
+    /// Ref: <https://docs.aws.amazon.com/polly/latest/dg/API_SynthesizeSpeech.html#polly-SynthesizeSpeech-request-SpeechMarkTypes>
+    #[serde(default)]
+    pub speech_mark_types: Vec<String>,
 }
 
 impl Default for AwsPollyTTSConfig {
@@ -580,9 +589,14 @@ impl Default for AwsPollyTTSConfig {
             text_type: TextType::default(),
             language_code: None,
             lexicon_names: Vec::new(),
+            speech_mark_types: Vec::new(),
         }
     }
 }
+
+/// The valid AWS Polly speech-mark type names. Used to filter the `speech_mark_types` extra so a
+/// typo cannot silently reach the wire as an `Unknown` SDK variant.
+pub const VALID_SPEECH_MARK_TYPES: [&str; 4] = ["word", "sentence", "viseme", "ssml"];
 
 impl AwsPollyTTSConfig {
     /// Build from the standardized config (W1 keystone). Maps the TTS features Polly can express
@@ -617,6 +631,18 @@ impl AwsPollyTTSConfig {
         }
         if let Some(rate) = f.sample_rate {
             cfg.base.sample_rate = Some(rate);
+        }
+        // Speech marks (word / sentence / viseme / ssml timing & metadata). There is no shared
+        // `TtsFeatures` field for this Polly-specific knob, so it flows through the `extras`
+        // passthrough as a string array; only the four valid AWS names are kept so a typo cannot
+        // reach the wire as an SDK `Unknown` variant.
+        if let Some(marks) = std.extras.0.get("speech_mark_types").and_then(|v| v.as_array()) {
+            cfg.speech_mark_types = marks
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_ascii_lowercase())
+                .filter(|s| VALID_SPEECH_MARK_TYPES.contains(&s.as_str()))
+                .collect();
         }
         cfg
     }

@@ -206,6 +206,18 @@ pub struct RevAISTTConfig {
     /// Skip text post-processing/normalization
     #[serde(default)]
     pub skip_postprocessing: bool,
+
+    /// Optimization mode for the streaming session: `speed` (default) or `accuracy`
+    /// (Rev AI streaming query param `priority`; see docs/providers/rev_ai.md). Carried via the
+    /// standardized `extras` passthrough since it has no canonical typed feature.
+    #[serde(default)]
+    pub priority: Option<String>,
+
+    /// Maximum time (seconds, 60-600) Rev AI will hold the connection open waiting for the next
+    /// audio chunk before closing (Rev AI streaming query param `max_connection_wait_seconds`;
+    /// see docs/providers/rev_ai.md). Carried via the standardized `extras` passthrough.
+    #[serde(default)]
+    pub max_connection_wait_seconds: Option<u32>,
 }
 
 fn default_language() -> String {
@@ -240,6 +252,8 @@ impl Default for RevAISTTConfig {
             max_segment_duration_seconds: None,
             enable_speaker_switch: false,
             skip_postprocessing: false,
+            priority: None,
+            max_connection_wait_seconds: None,
         }
     }
 }
@@ -437,6 +451,15 @@ impl RevAISTTConfig {
             url.push_str("&skip_postprocessing=true");
         }
 
+        // Provider-extras passthrough params (Rev AI streaming query params; docs/providers/rev_ai.md).
+        if let Some(ref priority) = self.priority {
+            url.push_str(&format!("&priority={}", encode(priority)));
+        }
+
+        if let Some(wait) = self.max_connection_wait_seconds {
+            url.push_str(&format!("&max_connection_wait_seconds={}", wait));
+        }
+
         url
     }
 
@@ -493,6 +516,16 @@ impl RevAISTTConfig {
         if let Some(filler) = f.filler_words {
             cfg.remove_disfluencies = !filler;
         }
+        // Provider extras → Rev AI streaming query params not modeled by the typed vocabulary
+        // (docs/providers/rev_ai.md): `priority` (speed/accuracy) and `max_connection_wait_seconds`
+        // (60-600). String keys are forwarded verbatim onto the WebSocket URL.
+        let e = &std.extras.0;
+        if let Some(p) = e.get("priority").and_then(|v| v.as_str()) {
+            cfg.priority = Some(p.to_string());
+        }
+        if let Some(w) = e.get("max_connection_wait_seconds").and_then(|v| v.as_u64()) {
+            cfg.max_connection_wait_seconds = Some(w as u32);
+        }
         Ok(cfg)
     }
 }
@@ -546,6 +579,42 @@ mod tests {
         assert!(cfg.enable_speaker_switch); // diarization
         assert_eq!(cfg.transcriber, RevAITranscriber::MachineV2); // required by speaker switch
         assert!(cfg.filter_profanity); // profanity_filter
+    }
+
+    // WIRE-LEVEL: the `priority` and `max_connection_wait_seconds` extras must travel from the
+    // standardized `extras` passthrough all the way onto the streaming WebSocket URL — not merely
+    // land on the config struct. Asserts the actual query string `build_websocket_url` produces
+    // (the bytes that hit the wire), guarding the recurring "set on the struct but never emitted"
+    // gap class.
+    #[test]
+    fn priority_and_max_connection_wait_reach_websocket_url() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+        let mut extras = serde_json::Map::new();
+        extras.insert("priority".into(), serde_json::json!("accuracy"));
+        extras.insert("max_connection_wait_seconds".into(), serde_json::json!(120));
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "revai".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: ProviderExtras(extras),
+        };
+        let cfg = RevAISTTConfig::from_standard(&std).unwrap();
+        // mapped onto the config struct...
+        assert_eq!(cfg.priority.as_deref(), Some("accuracy"));
+        assert_eq!(cfg.max_connection_wait_seconds, Some(120));
+        // ...AND emitted on the wire (the URL the WebSocket actually connects to).
+        let url = cfg.build_websocket_url();
+        assert!(
+            url.contains("priority=accuracy"),
+            "priority must reach the WS URL; got: {url}"
+        );
+        assert!(
+            url.contains("max_connection_wait_seconds=120"),
+            "max_connection_wait_seconds must reach the WS URL; got: {url}"
+        );
     }
 
     #[test]

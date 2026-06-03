@@ -477,11 +477,15 @@ mod tests {
     }
 
     // W1 keystone (TTS): the struct-level `from_standard` builds a real `ZaloTts` through the
-    // standardized path, carrying the `speed` feature (Zalo's only prosody knob) onto the provider
-    // config the request builder reads. Mirrors `DeepgramTTS::from_standard`.
+    // standardized path, carrying the `speed` feature (Zalo's only prosody knob) AND the
+    // `output_audio_format` extra onto the provider config the request builder reads. The wire
+    // assertion drives the real request body so `encode_type` is proven on the wire, not just on the
+    // struct. Mirrors `DeepgramTTS::from_standard`.
     #[test]
-    fn from_standard_builds_provider_with_speed() {
-        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+    fn from_standard_builds_provider_with_speed_and_encode_type_on_wire() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("output_audio_format".into(), serde_json::json!(2));
         let std = StandardTTSConfig {
             base: TTSConfig {
                 provider: "zalo_ai".into(),
@@ -493,12 +497,19 @@ mod tests {
                 speed: Some(1.1),
                 ..Default::default()
             },
-            extras: Default::default(),
+            extras: ProviderExtras(extras),
         };
         let tts = ZaloTts::from_standard(&std).unwrap();
         assert!((tts.config.speed - 1.1).abs() < f32::EPSILON);
         assert_eq!(tts.config.voice, ZaloVoice::MaleNorth);
         assert_eq!(tts.config.api_key, "test_key");
+        // The standardized output_audio_format must reach the POST body via the provider built
+        // through the full standardized dispatch path.
+        let body = tts.config.build_request_body("Xin chào");
+        assert!(
+            body.contains("encode_type=2"),
+            "encode_type must reach the wire via ZaloTts::from_standard; got: {body}"
+        );
     }
 
     #[test]

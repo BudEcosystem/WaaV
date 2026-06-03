@@ -50,7 +50,7 @@ mod provider;
 // Re-export configuration types
 pub use config::{
     AZURE_MSTTS_NAMESPACE, AZURE_OUTPUT_FORMAT_HEADER, AZURE_TTS_URL, AzureAudioEncoding,
-    AzureTTSConfig, build_ssml, escape_xml,
+    AzureSsmlOptions, AzureTTSConfig, build_ssml, build_ssml_with_options, escape_xml,
 };
 
 // Re-export provider types

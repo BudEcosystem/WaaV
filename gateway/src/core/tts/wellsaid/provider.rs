@@ -69,10 +69,16 @@ impl TTSRequestBuilder for WellSaidRequestBuilder {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(ACCEPT, HeaderValue::from_static("audio/mpeg"));
 
+        // SSML opt-in: when enabled, tell WellSaid to parse the body's `text` as SSML markup.
+        if self.config.ssml {
+            headers.insert("X-Enable-SSML", HeaderValue::from_static("true"));
+        }
+
         debug!(
-            "WellSaid TTS request: speaker_id={}, model={}, text_len={}",
+            "WellSaid TTS request: speaker_id={}, model={}, ssml={}, text_len={}",
             request_body.speaker_id,
             self.config.model,
+            self.config.ssml,
             text.len()
         );
 
@@ -363,6 +369,53 @@ mod tests {
         // Verify config
         assert_eq!(builder.wellsaid_config().speaker_id, 3);
         assert_eq!(builder.wellsaid_config().model, WellSaidModel::Legacy);
+    }
+
+    // WIRE-LEVEL guard: assert the `X-Enable-SSML` header actually reaches the built HTTP request
+    // when (and only when) the standardized `ssml` feature is set. The recurring bug class is
+    // asserting only the config struct, so this builds the real `reqwest::Request` and inspects its
+    // headers.
+    #[test]
+    fn ssml_feature_sets_x_enable_ssml_header_on_request() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        let client = reqwest::Client::new();
+        let mk = |ssml: Option<bool>| {
+            let std = StandardTTSConfig {
+                base: TTSConfig {
+                    provider: "wellsaid".into(),
+                    api_key: "test-key".into(),
+                    voice_id: Some("26".into()),
+                    ..Default::default()
+                },
+                features: TtsFeatures {
+                    ssml,
+                    ..Default::default()
+                },
+                extras: Default::default(),
+            };
+            let cfg = WellSaidTtsConfig::from_standard(&std).unwrap();
+            let builder = WellSaidRequestBuilder::new(cfg, std.base.clone());
+            builder
+                .build_http_request(&client, "<speak>hi</speak>")
+                .build()
+                .unwrap()
+        };
+
+        // ssml = true: header present and equal to "true".
+        let req = mk(Some(true));
+        assert_eq!(
+            req.headers().get("X-Enable-SSML").map(|v| v.to_str().unwrap()),
+            Some("true"),
+            "X-Enable-SSML must be set when the ssml feature is on"
+        );
+
+        // ssml unset: header must be absent (API default = plain text).
+        let req_off = mk(None);
+        assert!(
+            req_off.headers().get("X-Enable-SSML").is_none(),
+            "X-Enable-SSML must be absent when the ssml feature is off"
+        );
     }
 
     #[test]

@@ -312,6 +312,10 @@ pub struct NaverClovaTtsConfig {
     /// Output audio format.
     pub format: NaverClovaTtsFormat,
 
+    /// Output sampling rate in Hz (8000, 16000, 24000, 48000). CLOVA Voice Premium honors the
+    /// `sampling-rate` parameter for WAV output only (MP3 is fixed); `None` keeps the API default.
+    pub sampling_rate: Option<u32>,
+
     /// Alpha (timbre) adjustment (-5 to 5, default 0).
     pub alpha: i8,
 
@@ -337,6 +341,7 @@ impl Default for NaverClovaTtsConfig {
             emotion: 0,
             emotion_strength: 1,
             format: NaverClovaTtsFormat::default(),
+            sampling_rate: None,
             alpha: 0,
             end_pitch: 0,
             request_timeout_secs: 30,
@@ -416,6 +421,7 @@ impl NaverClovaTtsConfig {
             emotion: 0,
             emotion_strength: 1,
             format,
+            sampling_rate: None,
             alpha: 0,
             end_pitch: 0,
             request_timeout_secs,
@@ -432,9 +438,12 @@ impl NaverClovaTtsConfig {
     /// - [`TtsFeatures::pitch`] -> `pitch` (clamped to -5..=5)
     /// - [`TtsFeatures::volume`] -> `volume` (clamped to -5..=5)
     ///
+    /// - [`TtsFeatures::sample_rate`] -> `sampling_rate` (CLOVA's `sampling-rate` form param; the
+    ///   API honors it for WAV output only, so it is emitted on the wire only when `format == wav`)
+    ///
     /// CLOVA's `custom_endpoint` (not a standard field) is read from the `extras` passthrough.
     /// Features without a CLOVA field — `emotion` (CLOVA's emotion is a numeric intensity, not a
-    /// free-text label), `sample_rate`, `ssml`, `stability`, `similarity_boost`, `style`,
+    /// free-text label), `ssml`, `stability`, `similarity_boost`, `style`,
     /// `use_speaker_boost`, `instructions`, `language`, `word_timestamps`, `streaming`, `seed` —
     /// are skipped.
     ///
@@ -460,6 +469,10 @@ impl NaverClovaTtsConfig {
         }
         if let Some(volume) = f.volume {
             cfg.volume = (volume as i32).clamp(-5, 5) as i8;
+        }
+        if let Some(sample_rate) = f.sample_rate {
+            // Reaches the wire as `sampling-rate` (WAV-only) in `build_request_body`.
+            cfg.sampling_rate = Some(sample_rate);
         }
 
         // Provider-specific passthrough.
@@ -542,6 +555,14 @@ impl NaverClovaTtsConfig {
         if self.emotion > 0 {
             params.push(format!("emotion={}", self.emotion));
             params.push(format!("emotion-strength={}", self.emotion_strength));
+        }
+
+        // CLOVA Voice Premium honors `sampling-rate` for WAV output only (MP3 is fixed by the
+        // codec), so emit it only when the requested format is WAV — otherwise the API rejects it.
+        if let Some(sampling_rate) = self.sampling_rate
+            && self.format == NaverClovaTtsFormat::Wav
+        {
+            params.push(format!("sampling-rate={}", sampling_rate));
         }
 
         if self.alpha != 0 {

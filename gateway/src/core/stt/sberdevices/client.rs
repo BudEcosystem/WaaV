@@ -13,8 +13,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::config::{
-    MAX_SYNC_AUDIO_SIZE, OAUTH_ENDPOINT, STT_RECOGNIZE_ENDPOINT, SberSTTConfig,
-    TOKEN_REFRESH_THRESHOLD_SECS,
+    MAX_SYNC_AUDIO_SIZE, OAUTH_ENDPOINT, SberSTTConfig, TOKEN_REFRESH_THRESHOLD_SECS,
 };
 use super::messages::{
     OAuthTokenRequest, OAuthTokenResponse, SberApiError, SberRecognitionResponse, SberStatusCode,
@@ -236,10 +235,10 @@ impl SberDevicesSTT {
             audio_data.len()
         );
 
-        // Send request
+        // Send request (recognition options travel as query params on the recognize URL)
         let response = self
             .client
-            .post(STT_RECOGNIZE_ENDPOINT)
+            .post(self.sber_config.recognize_url())
             .headers(headers)
             .body(audio_data.to_vec())
             .send()
@@ -357,9 +356,9 @@ impl SberDevicesSTT {
                     headers.insert(CONTENT_TYPE, ct);
                 }
 
-                // Send request
+                // Send request (recognition options travel as query params on the recognize URL)
                 let result = client
-                    .post(STT_RECOGNIZE_ENDPOINT)
+                    .post(sber_config.recognize_url())
                     .headers(headers)
                     .body(audio_data)
                     .send()

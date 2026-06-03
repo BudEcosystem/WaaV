@@ -375,6 +375,13 @@ pub struct HuaweiCloudTtsConfig {
     #[serde(default = "default_volume")]
     pub volume: u8,
 
+    /// Word/phoneme timestamps ("subtitle"). When enabled, Huawei SIS returns word-level timing
+    /// metadata alongside the audio. Maps to the SIS `subtitle` config field (integer 0=off, 1=on)
+    /// on BOTH the REST `/tts` config and the RTTS `/rtts` START config.
+    /// Doc: Huawei SIS Real-Time/Standard TTS — `config.subtitle`.
+    #[serde(default)]
+    pub subtitle: bool,
+
     /// TTS operation mode.
     #[serde(default)]
     pub mode: HuaweiTtsMode,
@@ -402,6 +409,7 @@ impl Default for HuaweiCloudTtsConfig {
             speed: DEFAULT_SPEED,
             pitch: DEFAULT_PITCH,
             volume: DEFAULT_VOLUME,
+            subtitle: false,
             mode: HuaweiTtsMode::default(),
         }
     }
@@ -553,6 +561,7 @@ impl HuaweiCloudTtsConfig {
             speed,
             pitch: DEFAULT_PITCH,
             volume: DEFAULT_VOLUME,
+            subtitle: false,
             mode: HuaweiTtsMode::default(),
         })
     }
@@ -560,10 +569,12 @@ impl HuaweiCloudTtsConfig {
     /// Build from the standardized TTS config. Huawei SIS exposes prosody knobs directly, so this
     /// maps `speed` -> `speed` (the same `speaking_rate`-style normalization into the -500..=500
     /// range used by `from_base`), `pitch` -> `pitch` and `volume` -> `volume` (both clamped to the
-    /// SIS ranges), plus `sample_rate` -> `sample_rate`. Huawei's `region` (not a standard field) is
-    /// read from the `extras` passthrough, overriding the `model`-derived region. Features without a
-    /// Huawei field (stability, similarity_boost, style, use_speaker_boost, emotion, instructions,
-    /// ssml, language, word_timestamps, streaming, seed) are skipped.
+    /// SIS ranges), plus `sample_rate` -> `sample_rate`. The typed `word_timestamps` feature maps to
+    /// SIS `subtitle` (word/phoneme timing metadata), emitted on both the REST `/tts` and RTTS START
+    /// configs. Huawei's `region` (not a standard field) is read from the `extras` passthrough,
+    /// overriding the `model`-derived region. Features without a Huawei field (stability,
+    /// similarity_boost, style, use_speaker_boost, emotion, instructions, ssml, language, streaming,
+    /// seed) are skipped.
     pub fn from_standard(
         std: &crate::core::tts::standard::StandardTTSConfig,
     ) -> Result<Self, TTSError> {
@@ -583,6 +594,11 @@ impl HuaweiCloudTtsConfig {
         }
         if let Some(rate) = f.sample_rate {
             cfg.sample_rate = rate;
+        }
+        // Word/phoneme timestamps → SIS `subtitle` (typed `word_timestamps`). Reaches the REST `/tts`
+        // and RTTS START configs as the integer `subtitle` field (0/1).
+        if let Some(ts) = f.word_timestamps {
+            cfg.subtitle = ts;
         }
 
         // Provider-specific passthrough: region override.
@@ -711,6 +727,10 @@ pub struct HuaweiTtsRequestConfig {
     pub pitch: i16,
     /// Volume (0 to 100).
     pub volume: u8,
+    /// Word/phoneme timestamps ("subtitle"): SIS integer flag (0=off, 1=on). Omitted when off so
+    /// the default request shape is unchanged. Doc: Huawei SIS Standard TTS — `config.subtitle`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<u8>,
 }
 
 impl HuaweiTtsRequest {
@@ -729,6 +749,7 @@ impl HuaweiTtsRequest {
                     0
                 },
                 volume: config.volume,
+                subtitle: if config.subtitle { Some(1) } else { None },
             },
         }
     }
@@ -823,6 +844,10 @@ pub struct HuaweiRttsConfig {
     /// Volume.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume: Option<u8>,
+    /// Word/phoneme timestamps ("subtitle"): SIS integer flag (0=off, 1=on). Omitted when off so the
+    /// default START shape is unchanged. Doc: Huawei SIS Real-Time TTS — `config.subtitle`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<u8>,
 }
 
 impl HuaweiRttsStartCommand {
@@ -850,6 +875,7 @@ impl HuaweiRttsStartCommand {
                 } else {
                     None
                 },
+                subtitle: if config.subtitle { Some(1) } else { None },
             },
         }
     }
@@ -940,6 +966,83 @@ mod tests {
         assert_eq!(cfg.volume, 80);
         assert_eq!(cfg.sample_rate, 8000);
         assert_eq!(cfg.region, HuaweiCloudRegion::CnEast3); // from extras passthrough
+    }
+
+    // The typed `word_timestamps` feature maps to the SIS `subtitle` config flag.
+    #[test]
+    fn from_standard_maps_word_timestamps_to_subtitle() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "huawei-cloud".into(),
+                api_key: "user|pass|domain|project123".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures { word_timestamps: Some(true), ..Default::default() },
+            extras: Default::default(),
+        };
+        let cfg = HuaweiCloudTtsConfig::from_standard(&std).unwrap();
+        assert!(cfg.subtitle);
+    }
+
+    // WIRE-LEVEL: `subtitle` reaches the SERIALIZED REST `/tts` request config (not just the config
+    // struct). Doc: Huawei SIS Standard TTS — `config.subtitle` (integer 0/1).
+    #[test]
+    fn word_timestamps_reach_serialized_rest_tts_body() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "huawei-cloud".into(),
+                api_key: "user|pass|domain|project123".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures { word_timestamps: Some(true), ..Default::default() },
+            extras: Default::default(),
+        };
+        let cfg = HuaweiCloudTtsConfig::from_standard(&std).unwrap();
+        let json = HuaweiTtsRequest::new("hello", &cfg).to_json().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["config"]["subtitle"], 1, "subtitle must be on the REST wire: {json}");
+    }
+
+    // WIRE-LEVEL: `subtitle` reaches the SERIALIZED RTTS START command config.
+    // Doc: Huawei SIS Real-Time TTS — `config.subtitle` (integer 0/1).
+    #[test]
+    fn word_timestamps_reach_serialized_rtts_start_command() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "huawei-cloud".into(),
+                api_key: "user|pass|domain|project123".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures { word_timestamps: Some(true), ..Default::default() },
+            extras: Default::default(),
+        };
+        let cfg = HuaweiCloudTtsConfig::from_standard(&std).unwrap();
+        let json = HuaweiRttsStartCommand::new("hello", &cfg).to_json().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["command"], "START");
+        assert_eq!(v["config"]["subtitle"], 1, "subtitle must be on the RTTS START wire: {json}");
+    }
+
+    // When word_timestamps is unset/false, `subtitle` is OMITTED from both wire shapes (no spurious
+    // 0 that would change the default request and could be rejected by stricter SIS validation).
+    #[test]
+    fn subtitle_omitted_from_wire_when_unset() {
+        let cfg = HuaweiCloudTtsConfig::from_base(TTSConfig {
+            provider: "huawei-cloud".into(),
+            api_key: "user|pass|domain|project123".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!cfg.subtitle);
+        let rest: serde_json::Value =
+            serde_json::from_str(&HuaweiTtsRequest::new("hi", &cfg).to_json().unwrap()).unwrap();
+        assert!(rest["config"].get("subtitle").is_none(), "subtitle must be absent on REST when off");
+        let rtts: serde_json::Value =
+            serde_json::from_str(&HuaweiRttsStartCommand::new("hi", &cfg).to_json().unwrap()).unwrap();
+        assert!(rtts["config"].get("subtitle").is_none(), "subtitle must be absent on RTTS when off");
     }
 
     #[test]

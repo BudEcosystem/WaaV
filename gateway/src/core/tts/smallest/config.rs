@@ -372,6 +372,12 @@ pub struct SmallestTtsConfig {
     /// Audio enhancement level (0-2, for lightning-large only).
     pub enhancement: u8,
 
+    /// Max wait (ms) before the lightning-v2 streaming WebSocket flushes its output buffer
+    /// (`max_buffer_flush_ms` in the `get_speech/stream` request; 0-1000ms). A latency/chunking
+    /// knob, not an audio-content knob, so it stays out of the synthesis cache key. `None` lets
+    /// the server default apply.
+    pub max_buffer_flush_ms: Option<u32>,
+
     /// Connection timeout in seconds.
     pub connection_timeout: u64,
 
@@ -433,6 +439,7 @@ impl SmallestTtsConfig {
             consistency: DEFAULT_CONSISTENCY,
             similarity: DEFAULT_SIMILARITY,
             enhancement: DEFAULT_ENHANCEMENT,
+            max_buffer_flush_ms: None,
             connection_timeout,
             request_timeout,
         })
@@ -445,9 +452,10 @@ impl SmallestTtsConfig {
     /// normal), the ElevenLabs-style `stability` -> `consistency` and `similarity_boost` ->
     /// `similarity` (both direct 0-1 levels, clamped to their valid ranges), `language` -> the
     /// `SmallestLanguage` enum (only when it parses), and `sample_rate` -> `sample_rate` (snapped to
-    /// the nearest supported rate). Smallest's non-standard `enhancement` level is read from the
-    /// `extras` passthrough. Features without a Smallest field (pitch, volume, style,
-    /// use_speaker_boost, emotion, instructions, ssml, word_timestamps, streaming, seed) are skipped.
+    /// the nearest supported rate). Smallest's non-standard `enhancement` level and the
+    /// lightning-v2 streaming `max_buffer_flush_ms` knob are read from the `extras` passthrough.
+    /// Features without a Smallest field (pitch, volume, style, use_speaker_boost, emotion,
+    /// instructions, ssml, word_timestamps, streaming, seed) are skipped.
     pub fn from_standard(
         std: &crate::core::tts::standard::StandardTTSConfig,
     ) -> Result<Self, TTSError> {
@@ -476,6 +484,15 @@ impl SmallestTtsConfig {
         // Provider-specific passthrough.
         if let Some(enhancement) = std.extras.0.get("enhancement").and_then(|v| v.as_u64()) {
             cfg.enhancement = (enhancement as u8).clamp(MIN_ENHANCEMENT, MAX_ENHANCEMENT);
+        }
+        // lightning-v2 streaming buffer-flush latency knob (0-1000ms), reaches the WS request body.
+        if let Some(ms) = std
+            .extras
+            .0
+            .get("max_buffer_flush_ms")
+            .and_then(|v| v.as_u64())
+        {
+            cfg.max_buffer_flush_ms = Some((ms.min(1000)) as u32);
         }
 
         Ok(cfg)
@@ -640,6 +657,33 @@ mod tests {
         assert_eq!(cfg.language, SmallestLanguage::Hindi);
         assert_eq!(cfg.sample_rate, 16000);
         assert_eq!(cfg.enhancement, 2); // from extras passthrough
+    }
+
+    // The lightning-v2 streaming `max_buffer_flush_ms` knob arrives via the extras passthrough and
+    // reaches the config field (clamped to the 0-1000ms documented range).
+    #[test]
+    fn from_standard_maps_max_buffer_flush_ms_from_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("max_buffer_flush_ms".into(), serde_json::json!(250));
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+        let cfg = SmallestTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.max_buffer_flush_ms, Some(250));
+
+        // Over-range values are clamped to the documented 1000ms ceiling.
+        let mut extras = serde_json::Map::new();
+        extras.insert("max_buffer_flush_ms".into(), serde_json::json!(5000));
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+        let cfg = SmallestTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.max_buffer_flush_ms, Some(1000));
     }
 
     // =========================================================================

@@ -223,6 +223,44 @@ pub struct DashScopeTtsConfig {
     /// Volume level (0-100).
     #[serde(default = "default_volume")]
     pub volume: u8,
+
+    // --- CosyVoice inference-protocol knobs (run-task `payload.parameters`) ---
+    /// Treat input text as SSML (`enable_ssml`). CosyVoice parses `<speak>` prosody/break tags.
+    #[serde(default)]
+    pub enable_ssml: Option<bool>,
+
+    /// Natural-language delivery `instruction` (emotion / dialect / style control on CosyVoice v3).
+    #[serde(default)]
+    pub instruction: Option<String>,
+
+    /// Emit word-level timestamps (`word_timestamp_enabled`).
+    #[serde(default)]
+    pub word_timestamp_enabled: Option<bool>,
+
+    /// Determinism `seed` (same text + voice + seed → identical audio).
+    #[serde(default)]
+    pub seed: Option<u64>,
+
+    /// Language hint(s) (`language_hints`, e.g. `["zh","en"]`) to disambiguate mixed-language text.
+    #[serde(default)]
+    pub language_hints: Option<Vec<String>>,
+
+    /// Opus output bitrate in bits/sec (`bit_rate`); only meaningful for the opus format.
+    #[serde(default)]
+    pub bit_rate: Option<u32>,
+
+    /// Text hotpatch / pronunciation override (`hot_fix`) — a free-form JSON object of
+    /// word→pronunciation overrides forwarded verbatim.
+    #[serde(default)]
+    pub hot_fix: Option<serde_json::Value>,
+
+    /// Strip Markdown markup before synthesis (`enable_markdown_filter`).
+    #[serde(default)]
+    pub enable_markdown_filter: Option<bool>,
+
+    /// Embed an AIGC watermark tag in the audio (`enable_aigc_tag`).
+    #[serde(default)]
+    pub enable_aigc_tag: Option<bool>,
 }
 
 fn default_voice() -> String {
@@ -257,6 +295,15 @@ impl Default for DashScopeTtsConfig {
             rate: 1.0,
             pitch: 1.0,
             volume: 50,
+            enable_ssml: None,
+            instruction: None,
+            word_timestamp_enabled: None,
+            seed: None,
+            language_hints: None,
+            bit_rate: None,
+            hot_fix: None,
+            enable_markdown_filter: None,
+            enable_aigc_tag: None,
         }
     }
 }
@@ -344,6 +391,15 @@ impl DashScopeTtsConfig {
             rate: config.speaking_rate.unwrap_or(1.0),
             pitch: 1.0,
             volume: 50,
+            enable_ssml: None,
+            instruction: None,
+            word_timestamp_enabled: None,
+            seed: None,
+            language_hints: None,
+            bit_rate: None,
+            hot_fix: None,
+            enable_markdown_filter: None,
+            enable_aigc_tag: None,
         })
     }
 
@@ -351,9 +407,22 @@ impl DashScopeTtsConfig {
     ///
     /// CosyVoice/Qwen expose prosody knobs directly, so `speed` maps to `rate`, `pitch` to
     /// `pitch`, and `volume` (a 0..=100 level here) is taken from the 0-100 `volume` feature;
-    /// `sample_rate` overrides the output rate. The non-standard `region` is read from the
-    /// `extras` passthrough. DashScope has no SSML / emotion / instructions / stability /
-    /// language / timestamp surface, so those features are skipped.
+    /// `sample_rate` overrides the output rate.
+    ///
+    /// The CosyVoice inference protocol (`run-task` `payload.parameters`, the protocol WaaV uses
+    /// for its default `cosyvoice-v3-flash` model) also exposes several knobs that previously had
+    /// no home; these are now mapped from the shared typed [`TtsFeatures`] fields:
+    /// - `ssml` → `enable_ssml`
+    /// - `instructions` → `instruction` (emotion / dialect / style control)
+    /// - `word_timestamps` → `word_timestamp_enabled`
+    /// - `seed` → `seed` (determinism)
+    /// - `language` → `language_hints` (single-element hint list)
+    ///
+    /// The provider-specific knobs without a shared field flow through `extras`: `region`,
+    /// `bit_rate` (Opus), `hot_fix` (text hotpatch / pronunciation override), `enable_markdown_filter`,
+    /// and `enable_aigc_tag` (AIGC watermark). The Qwen3 realtime endpoint (session.update) is
+    /// instruction-driven and only honors voice/format/sample_rate/speed; CosyVoice-only knobs are
+    /// emitted only on the inference path (see `create_cosyvoice_run_task`).
     pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Result<Self, TTSError> {
         let f = &std.features;
         let mut cfg = Self::from_base(std.base.clone())?;
@@ -371,9 +440,43 @@ impl DashScopeTtsConfig {
             cfg.sample_rate = rate;
         }
 
+        // CosyVoice inference-protocol knobs (typed shared fields).
+        if let Some(ssml) = f.ssml {
+            cfg.enable_ssml = Some(ssml);
+        }
+        if let Some(instruction) = &f.instructions {
+            cfg.instruction = Some(instruction.clone());
+        }
+        if let Some(wt) = f.word_timestamps {
+            cfg.word_timestamp_enabled = Some(wt);
+        }
+        if let Some(seed) = f.seed {
+            cfg.seed = Some(seed);
+        }
+        if let Some(language) = &f.language {
+            cfg.language_hints = Some(vec![language.clone()]);
+        }
+
         // Provider-specific passthrough.
         if let Some(region) = std.extras.0.get("region").and_then(|v| v.as_str()) {
             cfg.region = DashScopeRegion::from_str(region);
+        }
+        if let Some(bit_rate) = std.extras.0.get("bit_rate").and_then(|v| v.as_u64()) {
+            cfg.bit_rate = Some(bit_rate as u32);
+        }
+        if let Some(hot_fix) = std.extras.0.get("hot_fix") {
+            cfg.hot_fix = Some(hot_fix.clone());
+        }
+        if let Some(flag) = std
+            .extras
+            .0
+            .get("enable_markdown_filter")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.enable_markdown_filter = Some(flag);
+        }
+        if let Some(flag) = std.extras.0.get("enable_aigc_tag").and_then(|v| v.as_bool()) {
+            cfg.enable_aigc_tag = Some(flag);
         }
 
         Ok(cfg)
@@ -461,6 +564,46 @@ mod tests {
         assert_eq!(cfg.volume, 80);
         assert_eq!(cfg.sample_rate, 24000);
         assert_eq!(cfg.region, DashScopeRegion::Singapore); // extras passthrough
+    }
+
+    // The CosyVoice inference-protocol knobs map from the shared typed fields + extras onto the
+    // resolved config (the value that the run-task builder reads). The byte-level reach is proven
+    // separately in provider.rs::cosyvoice_features_reach_run_task_payload_parameters.
+    #[test]
+    fn from_standard_maps_cosyvoice_inference_knobs() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("bit_rate".into(), serde_json::json!(32000));
+        extras.insert("hot_fix".into(), serde_json::json!({"AI": "ay eye"}));
+        extras.insert("enable_markdown_filter".into(), serde_json::json!(true));
+        extras.insert("enable_aigc_tag".into(), serde_json::json!(false));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "alibaba-cloud".into(),
+                api_key: "k".into(),
+                model: "cosyvoice-v3-flash".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                ssml: Some(true),
+                instructions: Some("happy".into()),
+                word_timestamps: Some(true),
+                seed: Some(7),
+                language: Some("en".into()),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = DashScopeTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.enable_ssml, Some(true));
+        assert_eq!(cfg.instruction, Some("happy".to_string()));
+        assert_eq!(cfg.word_timestamp_enabled, Some(true));
+        assert_eq!(cfg.seed, Some(7));
+        assert_eq!(cfg.language_hints, Some(vec!["en".to_string()]));
+        assert_eq!(cfg.bit_rate, Some(32000));
+        assert_eq!(cfg.hot_fix, Some(serde_json::json!({"AI": "ay eye"})));
+        assert_eq!(cfg.enable_markdown_filter, Some(true));
+        assert_eq!(cfg.enable_aigc_tag, Some(false));
     }
 
     #[test]

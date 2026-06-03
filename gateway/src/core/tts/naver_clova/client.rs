@@ -436,6 +436,38 @@ mod tests {
         );
     }
 
+    // WIRE-LEVEL (recurring bug class: assert the request body, not the config struct): the
+    // standardized `sample_rate` feature must reach the `sampling-rate` form param in the body
+    // POSTed to tts-premium/v1/tts — the exact form `synthesize` sends via `build_request_body`.
+    // CLOVA Voice Premium honors `sampling-rate` only for WAV output, so the request uses WAV.
+    #[test]
+    fn from_standard_sample_rate_reaches_form_body_sampling_rate() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "naver-clova".into(),
+                api_key: "client_id|client_secret".into(),
+                voice_id: Some("clara".into()),
+                audio_format: Some("wav".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                sample_rate: Some(48000),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+
+        let tts = NaverClovaTts::from_standard(&std).unwrap();
+        // The EXACT form-encoded body the live `synthesize` path posts to the synth endpoint.
+        let body = tts.config.build_request_body("Hello world");
+        assert!(
+            body.contains("sampling-rate=48000"),
+            "sample_rate must reach the tts-premium/v1/tts `sampling-rate` form param, got: {body}"
+        );
+    }
+
     #[test]
     fn test_new_invalid_api_key() {
         let config = TTSConfig {

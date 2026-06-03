@@ -226,6 +226,11 @@ pub struct YandexSTTConfig {
     pub max_alternatives: u32,
     /// Custom vocabulary words for improved recognition
     pub hints: Vec<String>,
+    /// Disable number normalization — write numbers as words instead of figures
+    /// (`rawResults` query param). `true` → words ("twenty-five"); `false`/default → figures
+    /// ("25"). Maps from the canonical `numerals` feature (which requests digits) as
+    /// `raw_results = !numerals`.
+    pub raw_results: bool,
 }
 
 impl YandexSTTConfig {
@@ -291,6 +296,7 @@ impl YandexSTTConfig {
             speaker_identification: false,
             max_alternatives: 1,
             hints: Vec::new(),
+            raw_results: false,
         })
     }
 
@@ -315,6 +321,12 @@ impl YandexSTTConfig {
         }
         if let Some(v) = &f.keyterms {
             cfg.hints = v.clone();
+        }
+        // Number normalization (words vs figures). Canonical `numerals` requests digits/figures,
+        // which is Yandex's DEFAULT (rawResults=false). `rawResults=true` disables normalization,
+        // emitting numbers as words — so map `raw_results = !numerals`.
+        if let Some(n) = f.numerals {
+            cfg.raw_results = !n;
         }
         Ok(cfg)
     }
@@ -361,6 +373,12 @@ impl YandexSTTConfig {
             params.push(("maxAlternatives", self.max_alternatives.to_string()));
         }
 
+        // Number normalization: only emit when disabling normalization (words). The API default
+        // (rawResults absent / false) already yields figures, so we keep the URL minimal.
+        if self.raw_results {
+            params.push(("rawResults", "true".to_string()));
+        }
+
         params
     }
 }
@@ -394,6 +412,70 @@ mod tests {
         let cfg = YandexSTTConfig::from_standard(&std).unwrap();
         assert!(cfg.speaker_identification); // diarization
         assert_eq!(cfg.hints, vec!["WaaV", "Yandex"]); // keyterms
+    }
+
+    // WIRE-LEVEL: the canonical `numerals` feature must reach the request URL as the Yandex
+    // `rawResults` query param (number normalization: figures vs words) — proving it lands on the
+    // wire, not merely on the config struct. We build the actual reqwest request and inspect its
+    // serialized URL (this is the same `.query(&build_query_params())` path the STT client uses).
+    #[test]
+    fn numerals_reaches_request_url_as_raw_results() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+
+        // `numerals: Some(false)` = numbers as WORDS = rawResults=true.
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "yandex".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                numerals: Some(false),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg = YandexSTTConfig::from_standard(&std).unwrap();
+        assert!(cfg.raw_results);
+
+        let params = cfg.build_query_params();
+        // Build the real request and assert the param is in the serialized URL.
+        let client = reqwest::Client::new();
+        let req = client
+            .post(crate::core::stt::yandex::YANDEX_STT_RECOGNIZE_URL)
+            .query(&params)
+            .build()
+            .unwrap();
+        let url = req.url().as_str();
+        assert!(
+            url.contains("rawResults=true"),
+            "rawResults not in request URL: {url}"
+        );
+
+        // `numerals: Some(true)` = figures = Yandex default = NO rawResults param (minimal URL).
+        let std_figures = StandardSTTConfig {
+            base: STTConfig {
+                provider: "yandex".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                numerals: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        let cfg2 = YandexSTTConfig::from_standard(&std_figures).unwrap();
+        assert!(!cfg2.raw_results);
+        let req2 = reqwest::Client::new()
+            .post(crate::core::stt::yandex::YANDEX_STT_RECOGNIZE_URL)
+            .query(&cfg2.build_query_params())
+            .build()
+            .unwrap();
+        assert!(
+            !req2.url().as_str().contains("rawResults"),
+            "rawResults must be absent for figures (default)"
+        );
     }
 
     #[test]
@@ -526,6 +608,7 @@ mod tests {
             speaker_identification: false,
             max_alternatives: 1,
             hints: Vec::new(),
+            raw_results: false,
         };
 
         assert_eq!(config.auth_header_value(), "Api-Key test-key");
@@ -547,6 +630,7 @@ mod tests {
             speaker_identification: false,
             max_alternatives: 3,
             hints: Vec::new(),
+            raw_results: false,
         };
 
         let params = config.build_query_params();

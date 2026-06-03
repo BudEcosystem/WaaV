@@ -871,6 +871,18 @@ impl BaseSTT for AmiVoiceSTT {
                 .as_ref()
                 .map(|c| c.inactivity_timeout_secs)
                 .unwrap_or(30),
+            // Preserve the advanced AmiVoice request knobs across a config update.
+            keep_filler_words: existing.as_ref().and_then(|c| c.keep_filler_words),
+            no_input_timeout: existing.as_ref().and_then(|c| c.no_input_timeout),
+            usage_aggregation_tag: existing
+                .as_ref()
+                .and_then(|c| c.usage_aggregation_tag.clone()),
+            max_decoding_time: existing.as_ref().and_then(|c| c.max_decoding_time),
+            max_response_time: existing.as_ref().and_then(|c| c.max_response_time),
+            max_decoding_rate: existing.as_ref().and_then(|c| c.max_decoding_rate),
+            target_response_time: existing.as_ref().and_then(|c| c.target_response_time),
+            target_decoding_rate: existing.as_ref().and_then(|c| c.target_decoding_rate),
+            recognition_timeout: existing.as_ref().and_then(|c| c.recognition_timeout),
         };
 
         self.config = Some(amivoice_config);

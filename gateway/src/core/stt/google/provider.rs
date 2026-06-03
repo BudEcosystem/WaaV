@@ -2,8 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use google_api_proto::google::cloud::speech::v2::StreamingRecognizeRequest;
 use google_api_proto::google::cloud::speech::v2::speech_client::SpeechClient;
-use tokio::sync::{Notify, RwLock, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
 use tracing::{debug, error, info};
 
 use crate::core::providers::google::{
@@ -13,12 +14,200 @@ use crate::core::providers::google::{
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
+use crate::core::websocket::ReconnectionConfig;
+use crate::core::websocket::reconnectable_stream::{
+    ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
+    WsTransport,
+};
 
 use super::config::GoogleSTTConfig;
 use super::streaming::{
     KEEPALIVE_INTERVAL_SECS, KeepaliveTracker, build_audio_request, build_config_request,
     chunk_audio, handle_grpc_error, handle_streaming_response,
 };
+
+/// Per-message idle timeout for the gRPC response stream — resets after each successful message.
+/// Catches stuck/dead connections while allowing active streams to continue.
+const GRPC_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A [`WsTransport`] (the trait is transport-agnostic despite the `Ws` name) that adapts Google
+/// STT's gRPC **bidirectional** streaming to the generic [`ReconnectableStream`] supervisor (W-D1
+/// fleet adoption).
+///
+/// Google is gRPC, not WebSocket: the featured session lives in the **first request** of the
+/// bidi stream (`build_config_request`, carrying the recognizer + recognition config). So
+/// [`run`](WsTransport::run) opens a fresh `streaming_recognize` call whose request stream yields
+/// that config request first (the featured-session restore is intrinsic to opening a new stream),
+/// then forwards audio + keep-alive, and drains responses until a [`ReconnectOutcome`]. A
+/// transport drop (`Unavailable`/idle timeout/stream end) becomes a reconnect; a clean shutdown or
+/// a fatal gRPC error (auth/invalid-arg) does not.
+struct GoogleTransport {
+    /// A ready-to-use Speech client over the authenticated channel (the auth interceptor is baked
+    /// in at construction). Cheap to hold; the channel is cloned per connect by the closure.
+    client: SpeechClient<
+        tonic::service::interceptor::InterceptedService<
+            tonic::transport::Channel,
+            Box<dyn FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Send>,
+        >,
+    >,
+    /// The featured first request (recognizer + recognition config) — re-yielded as the head of
+    /// every fresh bidi stream so a reconnect restores the *featured* session, not a bare one.
+    initial_config: StreamingRecognizeRequest,
+    recognizer_path: String,
+    sample_rate: u32,
+    channels: u32,
+    /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
+    audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
+    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
+    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    result_tx: mpsc::Sender<STTResult>,
+    error_tx: mpsc::Sender<STTError>,
+    /// Fires once on the first successful stream open, unblocking `start_connection`.
+    connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// Set true once a clean shutdown was requested mid-stream so `run` can report Completed.
+    shutdown_seen: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl WsTransport for GoogleTransport {
+    async fn restore_session(&mut self) -> Result<(), RestoreError> {
+        // Google's featured session (recognizer + recognition config) is the FIRST request of the
+        // bidi stream, re-sent at the head of every `run()` — so there is nothing to do here beyond
+        // unblocking the waiting connect() exactly once.
+        if let Some(tx) = self.connected_tx.lock().await.take() {
+            let _ = tx.send(());
+        }
+        Ok(())
+    }
+
+    async fn run(&mut self) -> ReconnectOutcome {
+        // Use OWNED guards (lock_owned) so the request-stream generator can move them in and remain
+        // `'static`, which `streaming_recognize` requires. The guards are released when the stream
+        // is dropped at the end of this attempt, so the next reconnect re-locks the same receivers.
+        let mut audio_rx = Arc::clone(&self.audio_rx).lock_owned().await;
+        let mut shutdown_rx = Arc::clone(&self.shutdown_rx).lock_owned().await;
+        let initial_config = self.initial_config.clone();
+        let recognizer_for_stream = self.recognizer_path.clone();
+        let sample_rate = self.sample_rate;
+        let channels = self.channels;
+        let shutdown_seen = Arc::clone(&self.shutdown_seen);
+
+        // Build the request stream for THIS attempt. It re-yields the featured config first, then
+        // forwards audio + keep-alive. The owned guards are moved into the generator so it is
+        // `'static`; they release when the stream drops at the end of the attempt.
+        let request_stream = async_stream::stream! {
+            debug!("Sending initial streaming configuration (Google bidi)");
+            yield initial_config;
+
+            let mut keepalive_timer =
+                tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
+            let mut keepalive_tracker = KeepaliveTracker::new(sample_rate, channels);
+
+            loop {
+                tokio::select! {
+                    biased;
+
+                    audio_opt = audio_rx.recv() => {
+                        match audio_opt {
+                            Some(audio_data) => {
+                                keepalive_tracker.touch();
+                                for chunk in chunk_audio(audio_data) {
+                                    yield build_audio_request(chunk, recognizer_for_stream.clone());
+                                }
+                            }
+                            None => {
+                                debug!("Audio channel closed, ending Google request stream");
+                                break;
+                            }
+                        }
+                    }
+
+                    _ = keepalive_timer.tick() => {
+                        if keepalive_tracker.needs_keepalive() {
+                            let silence = keepalive_tracker.generate_keepalive();
+                            yield build_audio_request(silence, recognizer_for_stream.clone());
+                            keepalive_tracker.touch();
+                        }
+                    }
+
+                    _ = &mut *shutdown_rx => {
+                        info!("Shutdown signal received, ending Google request stream");
+                        shutdown_seen.store(true, std::sync::atomic::Ordering::Release);
+                        break;
+                    }
+                }
+            }
+        };
+
+        let response = match self.client.streaming_recognize(request_stream).await {
+            Ok(r) => r,
+            Err(e) => {
+                let stt_error = handle_grpc_error(e.clone());
+                error!("Failed to start Google streaming recognition: {}", stt_error);
+                let _ = self.error_tx.try_send(stt_error);
+                // Connection-level gRPC errors (Unavailable, etc.) are reconnectable; auth/config
+                // are fatal. Reuse the status-code classification.
+                return classify_grpc_outcome(e);
+            }
+        };
+
+        let mut response_stream = response.into_inner();
+        loop {
+            // If a shutdown was requested while draining, stop cleanly.
+            if self.shutdown_seen.load(std::sync::atomic::Ordering::Acquire) {
+                return ReconnectOutcome::Completed;
+            }
+            match tokio::time::timeout(GRPC_MESSAGE_TIMEOUT, response_stream.message()).await {
+                Ok(Ok(Some(msg))) => {
+                    if let Err(e) = handle_streaming_response(msg, &self.result_tx) {
+                        error!("Error handling Google streaming response: {}", e);
+                        let _ = self.error_tx.try_send(e);
+                        return ReconnectOutcome::Fatal(StreamError::new("provider response error"));
+                    }
+                }
+                Ok(Ok(None)) => {
+                    info!("Google Speech-to-Text stream ended");
+                    if self.shutdown_seen.load(std::sync::atomic::Ordering::Acquire) {
+                        return ReconnectOutcome::Completed;
+                    }
+                    return ReconnectOutcome::Reconnectable(StreamError::new("stream ended"));
+                }
+                Ok(Err(status)) => {
+                    let stt_error = handle_grpc_error(status.clone());
+                    error!("Streaming error from Google STT: {}", stt_error);
+                    let _ = self.error_tx.try_send(stt_error);
+                    return classify_grpc_outcome(status);
+                }
+                Err(_elapsed) => {
+                    let stt_error = STTError::NetworkError(
+                        "gRPC idle timeout - no message received for 60 seconds".into(),
+                    );
+                    error!("Google STT gRPC idle timeout: {}", stt_error);
+                    let _ = self.error_tx.try_send(stt_error);
+                    return ReconnectOutcome::Reconnectable(StreamError::new("idle timeout"));
+                }
+            }
+        }
+    }
+}
+
+/// Map a gRPC status to a [`ReconnectOutcome`]: transient transport failures (Unavailable,
+/// DeadlineExceeded, Internal, Cancelled, Aborted) are reconnectable; auth/permission/argument
+/// errors are fatal (retrying would fail identically).
+fn classify_grpc_outcome(status: tonic::Status) -> ReconnectOutcome {
+    use tonic::Code;
+    match status.code() {
+        Code::Unavailable
+        | Code::DeadlineExceeded
+        | Code::Internal
+        | Code::Cancelled
+        | Code::Aborted
+        | Code::ResourceExhausted => {
+            ReconnectOutcome::Reconnectable(StreamError::new(format!("grpc {}", status.code())))
+        }
+        _ => ReconnectOutcome::Fatal(StreamError::new(format!("grpc {}", status.code()))),
+    }
+}
 
 /// Converts a GoogleError to an STTError.
 pub(crate) fn google_error_to_stt(e: GoogleError) -> STTError {
@@ -111,6 +300,11 @@ pub struct GoogleSTT {
     /// Error callback for streaming errors
     pub(super) error_callback: Arc<RwLock<Option<AsyncErrorCallback>>>,
     pub(super) auth_client: Option<Arc<dyn TokenProvider>>,
+    /// Shared, process-global resilience handles (W-D2): the single reconnect governor + this
+    /// provider's shared circuit breaker, injected by the VoiceManager from CoreState and driven
+    /// by the generic [`ReconnectableStream`](crate::core::websocket::ReconnectableStream)
+    /// supervisor. `None` before `set_resilience` → per-session governor/breaker default.
+    pub(super) resilience: Option<crate::core::resilience::ResilienceHandles>,
 }
 
 impl Default for GoogleSTT {
@@ -129,6 +323,7 @@ impl Default for GoogleSTT {
             result_callback: Arc::new(RwLock::new(None)),
             error_callback: Arc::new(RwLock::new(None)),
             auth_client: None,
+            resilience: None,
         }
     }
 }
@@ -163,6 +358,7 @@ impl GoogleSTT {
             result_callback: Arc::new(RwLock::new(None)),
             error_callback: Arc::new(RwLock::new(None)),
             auth_client: Some(Arc::new(auth_client)),
+            resilience: None,
         })
     }
 
@@ -177,6 +373,7 @@ impl GoogleSTT {
             speech_start_timeout: None,
             speech_end_timeout: None,
             single_utterance: false,
+            ..GoogleSTTConfig::default()
         }
     }
 
@@ -207,170 +404,100 @@ impl GoogleSTT {
         let sample_rate = config.base.sample_rate;
         let channels = config.base.channels as u32;
 
-        let connection_handle = tokio::spawn(async move {
-            // Use generic authenticated channel from providers
-            let authenticated_channel =
-                match create_authenticated_channel(GOOGLE_SPEECH_ENDPOINT, auth_client.clone())
-                    .await
-                {
-                    Ok(client) => client,
-                    Err(e) => {
-                        let stt_error = google_error_to_stt(e);
-                        error!("Failed to create speech client: {}", stt_error);
-                        let _ = error_tx.try_send(stt_error);
-                        return;
-                    }
-                };
+        // Shared state the supervised transport re-uses across reconnect attempts: a single-
+        // consumer audio receiver + shutdown oneshot (locked per `run`), the one-shot connected
+        // signal, and a flag that records whether a clean shutdown was requested mid-stream.
+        let audio_rx = Arc::new(Mutex::new(audio_rx));
+        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
+        let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
+        let shutdown_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-            // Get initial auth header
-            let auth_header = match authenticated_channel.get_authorization_header().await {
-                Ok(header) => header,
-                Err(e) => {
-                    let stt_error = google_error_to_stt(e);
-                    error!("Failed to get authorization header: {}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
-                }
-            };
-
-            // Pre-parse the header value once to avoid repeated parsing
-            let auth_metadata_value: tonic::metadata::MetadataValue<_> = match auth_header.parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    let stt_error = STTError::AuthenticationFailed(
-                        "Failed to parse authorization header".to_string(),
-                    );
-                    error!("{}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
-                }
-            };
-
-            let channel = authenticated_channel.clone_channel();
-            let mut client =
-                SpeechClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
-                    req.metadata_mut()
-                        .insert("authorization", auth_metadata_value.clone());
-                    Ok(req)
-                });
-
-            info!(
-                "Connected to Google Speech-to-Text API, recognizer: {}",
-                recognizer_path
-            );
-
-            // Signal successful connection IMMEDIATELY after gRPC client is created
-            // (like Deepgram does after WebSocket handshake completes)
-            // This allows the main thread to proceed while streaming runs in background
-            let _ = connected_tx.send(());
-
-            // Clone recognizer path once for the stream
-            let recognizer_for_stream = recognizer_path.clone();
-
-            let request_stream = async_stream::stream! {
-                debug!("Sending initial streaming configuration");
-                yield initial_config;
-
-                let mut shutdown_rx = shutdown_rx;
-                let mut audio_rx = audio_rx;
-
-                // Keep-alive mechanism to prevent Google's server-side timeout (~10 seconds).
-                // Similar to Deepgram's keep-alive, but we send silent audio frames instead of JSON.
-                let mut keepalive_timer = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
-                let mut keepalive_tracker = KeepaliveTracker::new(sample_rate, channels);
-
-                loop {
-                    tokio::select! {
-                        // Prioritize audio data (biased) for lowest latency
-                        biased;
-
-                        audio_opt = audio_rx.recv() => {
-                            match audio_opt {
-                                Some(audio_data) => {
-                                    // Update activity tracker
-                                    keepalive_tracker.touch();
-                                    // Use iterator to avoid Vec allocation
-                                    for chunk in chunk_audio(audio_data) {
-                                        debug!("Sending {} bytes of audio data", chunk.len());
-                                        yield build_audio_request(chunk, recognizer_for_stream.clone());
-                                    }
-                                }
-                                None => {
-                                    debug!("Audio channel closed, ending request stream");
-                                    break;
-                                }
-                            }
-                        }
-
-                        // Handle keep-alive timer - send silent audio to prevent timeout
-                        _ = keepalive_timer.tick() => {
-                            if keepalive_tracker.needs_keepalive() {
-                                let silence = keepalive_tracker.generate_keepalive();
-                                debug!("Sending keep-alive silence ({} bytes) to Google STT", silence.len());
-                                yield build_audio_request(silence, recognizer_for_stream.clone());
-                                keepalive_tracker.touch();
-                            }
-                        }
-
-                        _ = &mut shutdown_rx => {
-                            info!("Shutdown signal received, ending request stream");
-                            break;
-                        }
-                    }
-                }
-            };
-
-            let response = match client.streaming_recognize(request_stream).await {
-                Ok(r) => r,
-                Err(e) => {
-                    let stt_error = handle_grpc_error(e);
-                    error!("Failed to start streaming recognition: {}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
-                }
-            };
-
-            let mut response_stream = response.into_inner();
-
-            // Per-message idle timeout - resets after each successful message reception.
-            // This catches stuck/dead connections while allowing active streams to continue.
-            // 60 seconds is generous enough for slow transcription but catches hung connections.
-            const GRPC_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
-
-            // Process all incoming messages from Google STT
-            // Permission/auth errors will come through as gRPC errors and be sent via error_tx
-            loop {
-                match tokio::time::timeout(GRPC_MESSAGE_TIMEOUT, response_stream.message()).await {
-                    Ok(Ok(Some(msg))) => {
-                        if let Err(e) = handle_streaming_response(msg, &result_tx) {
-                            error!("Error handling streaming response: {}", e);
-                            let _ = error_tx.try_send(e);
-                            break;
-                        }
-                    }
-                    Ok(Ok(None)) => {
-                        info!("Google Speech-to-Text stream ended");
-                        break;
-                    }
-                    Ok(Err(status)) => {
-                        let stt_error = handle_grpc_error(status);
-                        error!("Streaming error from Google STT: {}", stt_error);
-                        let _ = error_tx.try_send(stt_error);
-                        break;
-                    }
-                    Err(_elapsed) => {
-                        // Idle timeout - no message received for 60s, connection likely stuck
-                        let stt_error = STTError::NetworkError(
-                            "gRPC idle timeout - no message received for 60 seconds".into(),
-                        );
-                        error!("Google STT gRPC idle timeout: {}", stt_error);
-                        let _ = error_tx.try_send(stt_error);
-                        break;
-                    }
-                }
+        // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor with
+        // the shared process-global handles from CoreState (W-D1/W-D2 fleet adoption). When no
+        // handles were injected (a direct unit-test construction), the supervisor uses its own
+        // per-session governor/breaker default.
+        let reconnection = ReconnectionConfig::aggressive();
+        let supervisor = match self.resilience.clone() {
+            Some(r) => ReconnectableStream::with_breaker_and_governor(
+                ReconnectableStreamConfig::new("google", reconnection),
+                r.breaker,
+                (*r.governor).clone(),
+            ),
+            None => {
+                ReconnectableStream::new(ReconnectableStreamConfig::new("google", reconnection))
             }
+        };
 
-            info!("Google Speech-to-Text connection closed");
+        // The supervisor owns the outer reconnect loop. The `connect` closure (re)establishes the
+        // authenticated gRPC channel with a FRESH auth token (so a long-lived session that
+        // reconnects after token expiry re-authenticates), and hands back a transport whose `run()`
+        // opens a fresh bidi `streaming_recognize` whose first request restores the featured
+        // session.
+        let connection_handle = tokio::spawn(async move {
+            let exit = supervisor
+                .run(|| {
+                    let auth_client = auth_client.clone();
+                    let initial_config = initial_config.clone();
+                    let recognizer_path = recognizer_path.clone();
+                    let audio_rx = Arc::clone(&audio_rx);
+                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let connected_tx = Arc::clone(&connected_tx);
+                    let shutdown_seen = Arc::clone(&shutdown_seen);
+                    let result_tx = result_tx.clone();
+                    let error_tx = error_tx.clone();
+                    async move {
+                        let authenticated_channel =
+                            create_authenticated_channel(GOOGLE_SPEECH_ENDPOINT, auth_client.clone())
+                                .await
+                                .map_err(|e| StreamError::new(google_error_to_stt(e).to_string()))?;
+
+                        let auth_header = authenticated_channel
+                            .get_authorization_header()
+                            .await
+                            .map_err(|e| StreamError::new(google_error_to_stt(e).to_string()))?;
+
+                        let auth_metadata_value: tonic::metadata::MetadataValue<_> =
+                            auth_header.parse().map_err(|_| {
+                                StreamError::new("Failed to parse authorization header".to_string())
+                            })?;
+
+                        let channel = authenticated_channel.clone_channel();
+                        // Box the interceptor closure so the client type is nameable on the struct.
+                        let interceptor: Box<
+                            dyn FnMut(
+                                    tonic::Request<()>,
+                                )
+                                    -> Result<tonic::Request<()>, tonic::Status>
+                                + Send,
+                        > = Box::new(move |mut req: tonic::Request<()>| {
+                            req.metadata_mut()
+                                .insert("authorization", auth_metadata_value.clone());
+                            Ok(req)
+                        });
+                        let client = SpeechClient::with_interceptor(channel, interceptor);
+
+                        info!(
+                            "Connected to Google Speech-to-Text API, recognizer: {}",
+                            recognizer_path
+                        );
+
+                        Ok(GoogleTransport {
+                            client,
+                            initial_config,
+                            recognizer_path,
+                            sample_rate,
+                            channels,
+                            audio_rx,
+                            shutdown_rx,
+                            result_tx,
+                            error_tx,
+                            connected_tx,
+                            shutdown_seen,
+                        })
+                    }
+                })
+                .await;
+            info!("Google Speech-to-Text connection closed (supervisor exit: {exit:?})");
         });
 
         self.connection_handle = Some(connection_handle);
@@ -500,6 +627,7 @@ impl BaseSTT for GoogleSTT {
             result_callback: Arc::new(RwLock::new(None)),
             error_callback: Arc::new(RwLock::new(None)),
             auth_client: Some(Arc::new(auth_client)),
+            resilience: None,
         })
     }
 
@@ -635,6 +763,24 @@ impl BaseSTT for GoogleSTT {
 
     fn get_provider_info(&self) -> &'static str {
         "Google Cloud Speech-to-Text v2"
+    }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared, process-global handles so `start_connection` drives the generic
+        // ReconnectableStream supervisor with them — every Google session trips the same breaker
+        // and shares the one process-wide reconnect cap (W-D2).
+        self.resilience = Some(resilience);
+    }
+}
+
+impl GoogleSTT {
+    /// The shared circuit breaker this session feeds into the generic supervisor, if the
+    /// process-global resilience handles have been injected (W-D1/W-D2). Two `GoogleSTT` built from
+    /// the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(
+        &self,
+    ) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.as_ref().map(|r| &r.breaker)
     }
 }
 

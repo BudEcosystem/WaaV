@@ -630,43 +630,22 @@ impl GroqSTT {
         wav_data: Vec<u8>,
         config: &GroqSTTConfig,
     ) -> Result<TranscriptionResult, STTError> {
-        // Build multipart form - wav_data ownership is transferred here (no copy)
-        let file_part = Part::bytes(wav_data)
-            .file_name(format!("audio.{}", config.audio_input_format.extension()))
-            .mime_str(config.audio_input_format.mime_type())
-            .map_err(|e| STTError::ConfigurationError(format!("Invalid MIME type: {e}")))?;
-
-        let mut form = Form::new()
-            .part("file", file_part)
-            .text("model", config.model.as_str().to_string())
-            .text(
-                "response_format",
-                config.response_format.as_str().to_string(),
-            );
-
-        // Add optional parameters
-        if !config.base.language.is_empty() {
-            form = form.text("language", config.base.language.clone());
+        // Build multipart form. The non-file text fields come from the single wire source of
+        // truth on the config (`build_form_text_fields`), so what a test asserts is exactly what
+        // is serialized here. The audio source is either an uploaded `file` part (default) or a
+        // remote `url` form field (when `config.audio_url` is set) — never both, per the
+        // Groq/OpenAI-Whisper REST contract.
+        let mut form = Form::new();
+        if config.audio_url.is_none() {
+            // wav_data ownership is transferred here (no copy).
+            let file_part = Part::bytes(wav_data)
+                .file_name(format!("audio.{}", config.audio_input_format.extension()))
+                .mime_str(config.audio_input_format.mime_type())
+                .map_err(|e| STTError::ConfigurationError(format!("Invalid MIME type: {e}")))?;
+            form = form.part("file", file_part);
         }
-
-        if let Some(temp) = config.temperature {
-            form = form.text("temperature", temp.to_string());
-        }
-
-        if let Some(ref prompt) = config.prompt {
-            form = form.text("prompt", prompt.clone());
-        }
-
-        // Add timestamp granularities for verbose_json format
-        if config.response_format == GroqResponseFormat::VerboseJson
-            && !config.timestamp_granularities.is_empty()
-        {
-            for granularity in &config.timestamp_granularities {
-                form = form.text(
-                    "timestamp_granularities[]",
-                    granularity.as_str().to_string(),
-                );
-            }
+        for (name, value) in config.build_form_text_fields() {
+            form = form.text(name, value);
         }
 
         // Send request to Groq API

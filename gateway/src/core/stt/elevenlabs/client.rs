@@ -935,6 +935,10 @@ impl BaseSTT for ElevenLabsSTT {
             max_speakers: existing.as_ref().and_then(|c| c.max_speakers),
             enable_pii_detection: existing.as_ref().and_then(|c| c.enable_pii_detection),
             enable_phi_detection: existing.as_ref().and_then(|c| c.enable_phi_detection),
+            include_language_detection: existing
+                .as_ref()
+                .and_then(|c| c.include_language_detection),
+            no_verbatim: existing.as_ref().and_then(|c| c.no_verbatim),
         };
 
         self.config = Some(elevenlabs_config);

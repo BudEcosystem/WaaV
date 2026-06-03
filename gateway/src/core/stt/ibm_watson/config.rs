@@ -366,6 +366,57 @@ pub struct IbmWatsonSTTConfig {
 
     /// Character insertion bias (-1.0 to 1.0).
     pub character_insertion_bias: Option<f32>,
+
+    // ---- Keyword spotting / N-best / metrics / model knobs (W-feature wiring) ----
+    /// Keyword spotting: phrases to detect in the audio (IBM `keywords` array). Sourced from the
+    /// canonical typed `keyterms` feature.
+    #[serde(default)]
+    pub keywords: Vec<String>,
+
+    /// Keyword-spotting confidence threshold, 0.0–1.0 (IBM `keywords_threshold`). When set,
+    /// keyword spotting is enabled. Extras passthrough.
+    pub keywords_threshold: Option<f32>,
+
+    /// Maximum N-best alternative transcripts to return (IBM `max_alternatives`). Sourced from the
+    /// canonical typed `alternatives` feature.
+    pub max_alternatives: Option<u32>,
+
+    /// Word-alternatives ("confusion network") confidence threshold, 0.0–1.0
+    /// (IBM `word_alternatives_threshold`). Extras passthrough.
+    pub word_alternatives_threshold: Option<f32>,
+
+    /// Custom language-model interpolation weight, 0.0–1.0 (IBM `customization_weight`).
+    /// Extras passthrough.
+    pub customization_weight: Option<f32>,
+
+    /// Pin a specific base-model version for reproducible results (IBM `base_model_version`).
+    /// Emitted as a URL query parameter. Extras passthrough.
+    pub base_model_version: Option<String>,
+
+    /// Grammar name for FSM/constrained recognition, used with a custom language model
+    /// (IBM `grammar_name`). Extras passthrough.
+    pub grammar_name: Option<String>,
+
+    /// Return audio-quality metrics in the response (IBM `audio_metrics`). Extras passthrough.
+    #[serde(default)]
+    pub audio_metrics: bool,
+
+    /// Return real-time processing metrics during recognition (IBM `processing_metrics`).
+    /// Extras passthrough.
+    #[serde(default)]
+    pub processing_metrics: bool,
+
+    /// Interval (seconds) between processing-metrics events (IBM `processing_metrics_interval`).
+    /// Extras passthrough.
+    pub processing_metrics_interval: Option<f32>,
+
+    /// Smart-formatting version to apply (IBM `smart_formatting_version`). Extras passthrough.
+    pub smart_formatting_version: Option<u32>,
+
+    /// Emit a discrete begin-of-speech event when speech is first detected
+    /// (IBM `speech_begin_event`). Sourced from the typed `speech_begin_event` feature.
+    #[serde(default)]
+    pub speech_begin_event: bool,
 }
 
 fn default_interim_results() -> bool {
@@ -400,6 +451,18 @@ impl Default for IbmWatsonSTTConfig {
             split_transcript_at_phrase_end: false,
             low_latency: false,
             character_insertion_bias: None,
+            keywords: Vec::new(),
+            keywords_threshold: None,
+            max_alternatives: None,
+            word_alternatives_threshold: None,
+            customization_weight: None,
+            base_model_version: None,
+            grammar_name: None,
+            audio_metrics: false,
+            processing_metrics: false,
+            processing_metrics_interval: None,
+            smart_formatting_version: None,
+            speech_begin_event: false,
         }
     }
 }
@@ -435,6 +498,48 @@ impl IbmWatsonSTTConfig {
         }
         if let Some(r) = &f.redaction {
             cfg.redaction = !r.is_empty();
+        }
+        // Keyword spotting: canonical typed `keyterms` → IBM `keywords` array.
+        if let Some(k) = &f.keyterms {
+            cfg.keywords = k.clone();
+        }
+        // N-best: canonical typed `alternatives` → IBM `max_alternatives`.
+        if let Some(n) = f.alternatives {
+            cfg.max_alternatives = Some(n as u32);
+        }
+        // Begin-of-speech event: typed `speech_begin_event` → IBM `speech_begin_event`.
+        if let Some(b) = f.speech_begin_event {
+            cfg.speech_begin_event = b;
+        }
+
+        // Provider-specific knobs with no shared typed vocabulary — read from `extras` passthrough.
+        let e = &std.extras.0;
+        if let Some(v) = e.get("keywords_threshold").and_then(|v| v.as_f64()) {
+            cfg.keywords_threshold = Some(v as f32);
+        }
+        if let Some(v) = e.get("word_alternatives_threshold").and_then(|v| v.as_f64()) {
+            cfg.word_alternatives_threshold = Some(v as f32);
+        }
+        if let Some(v) = e.get("customization_weight").and_then(|v| v.as_f64()) {
+            cfg.customization_weight = Some(v as f32);
+        }
+        if let Some(v) = e.get("base_model_version").and_then(|v| v.as_str()) {
+            cfg.base_model_version = Some(v.to_string());
+        }
+        if let Some(v) = e.get("grammar_name").and_then(|v| v.as_str()) {
+            cfg.grammar_name = Some(v.to_string());
+        }
+        if let Some(v) = e.get("audio_metrics").and_then(|v| v.as_bool()) {
+            cfg.audio_metrics = v;
+        }
+        if let Some(v) = e.get("processing_metrics").and_then(|v| v.as_bool()) {
+            cfg.processing_metrics = v;
+        }
+        if let Some(v) = e.get("processing_metrics_interval").and_then(|v| v.as_f64()) {
+            cfg.processing_metrics_interval = Some(v as f32);
+        }
+        if let Some(v) = e.get("smart_formatting_version").and_then(|v| v.as_u64()) {
+            cfg.smart_formatting_version = Some(v as u32);
         }
         cfg
     }
@@ -507,6 +612,18 @@ impl IbmWatsonSTTConfig {
             split_transcript_at_phrase_end: false,
             low_latency: false,
             character_insertion_bias: None,
+            keywords: Vec::new(),
+            keywords_threshold: None,
+            max_alternatives: None,
+            word_alternatives_threshold: None,
+            customization_weight: None,
+            base_model_version: None,
+            grammar_name: None,
+            audio_metrics: false,
+            processing_metrics: false,
+            processing_metrics_interval: None,
+            smart_formatting_version: None,
+            speech_begin_event: false,
         }
     }
 
@@ -536,6 +653,13 @@ impl IbmWatsonSTTConfig {
 
         if let Some(ref am_id) = self.acoustic_model_id {
             params.push(format!("acoustic_customization_id={}", encode(am_id)));
+        }
+
+        // Base model version is selected per-connection via a URL query parameter (it pins which
+        // version of the base model the recognizer loads), unlike the per-utterance recognition
+        // knobs that ride the START message.
+        if let Some(ref bmv) = self.base_model_version {
+            params.push(format!("base_model_version={}", encode(bmv)));
         }
 
         format!("{}?{}", base_url, params.join("&"))
@@ -570,6 +694,49 @@ impl IbmWatsonSTTConfig {
         }
         if let Some(cib) = self.character_insertion_bias {
             msg["character_insertion_bias"] = serde_json::json!(cib);
+        }
+
+        // Keyword spotting: `keywords` only takes effect alongside `keywords_threshold`, so both
+        // are emitted together (per IBM's recognition-parameters contract).
+        if !self.keywords.is_empty() {
+            msg["keywords"] = serde_json::json!(self.keywords);
+        }
+        if let Some(kt) = self.keywords_threshold {
+            msg["keywords_threshold"] = serde_json::json!(kt);
+        }
+        // N-best alternatives.
+        if let Some(ma) = self.max_alternatives {
+            msg["max_alternatives"] = serde_json::json!(ma);
+        }
+        // Word alternatives (confusion network).
+        if let Some(wat) = self.word_alternatives_threshold {
+            msg["word_alternatives_threshold"] = serde_json::json!(wat);
+        }
+        // Custom language-model interpolation weight.
+        if let Some(cw) = self.customization_weight {
+            msg["customization_weight"] = serde_json::json!(cw);
+        }
+        // Grammar name (FSM/constrained recognition; used with a custom language model).
+        if let Some(ref gn) = self.grammar_name {
+            msg["grammar_name"] = serde_json::json!(gn);
+        }
+        // Audio / processing metrics.
+        if self.audio_metrics {
+            msg["audio_metrics"] = serde_json::json!(true);
+        }
+        if self.processing_metrics {
+            msg["processing_metrics"] = serde_json::json!(true);
+        }
+        if let Some(pmi) = self.processing_metrics_interval {
+            msg["processing_metrics_interval"] = serde_json::json!(pmi);
+        }
+        // Smart-formatting version.
+        if let Some(sfv) = self.smart_formatting_version {
+            msg["smart_formatting_version"] = serde_json::json!(sfv);
+        }
+        // Begin-of-speech event.
+        if self.speech_begin_event {
+            msg["speech_begin_event"] = serde_json::json!(true);
         }
 
         msg
@@ -611,6 +778,94 @@ mod tests {
         assert!(cfg.smart_formatting);
         assert!(cfg.redaction);
         assert_eq!(cfg.instance_id, "inst-123"); // from provider_extras passthrough
+    }
+
+    // WIRE-LEVEL: every keyword-spotting / N-best / metrics / model feature must reach the
+    // *serialized START message* (the JSON text frame the client sends on the WebSocket) or the
+    // *WebSocket URL query* — not merely a config struct field (the recurring "tested config, not
+    // wire" bug class). `build_start_message`/`build_websocket_url` are exactly the bytes the
+    // live client emits (verified above: client.rs uses both).
+    #[test]
+    fn keyword_nbest_metrics_features_reach_start_message_and_url() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("instance_id".into(), serde_json::json!("inst-9"));
+        extras.insert("keywords_threshold".into(), serde_json::json!(0.5));
+        extras.insert("word_alternatives_threshold".into(), serde_json::json!(0.4));
+        extras.insert("customization_weight".into(), serde_json::json!(0.3));
+        extras.insert("base_model_version".into(), serde_json::json!("en-US_NarrowbandModel.v2021"));
+        extras.insert("grammar_name".into(), serde_json::json!("digits"));
+        extras.insert("audio_metrics".into(), serde_json::json!(true));
+        extras.insert("processing_metrics".into(), serde_json::json!(true));
+        extras.insert("processing_metrics_interval".into(), serde_json::json!(0.25));
+        extras.insert("smart_formatting_version".into(), serde_json::json!(2));
+
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "ibm-watson".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                keyterms: Some(vec!["WaaV".into(), "Watson".into()]), // → keywords
+                alternatives: Some(3),                                // → max_alternatives
+                speech_begin_event: Some(true),                       // → speech_begin_event
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+
+        let cfg = IbmWatsonSTTConfig::from_standard(&std);
+        let msg = cfg.build_start_message();
+        let url = cfg.build_websocket_url("tok");
+
+        // f32 round-trip precision: compare numeric knobs as f64 within tolerance.
+        let approx = |v: &serde_json::Value, want: f64| {
+            (v.as_f64().expect("number") - want).abs() < 1e-4
+        };
+
+        // --- START message body (per-utterance recognition knobs) ---
+        assert_eq!(msg["keywords"], serde_json::json!(["WaaV", "Watson"]));
+        assert!(approx(&msg["keywords_threshold"], 0.5));
+        assert_eq!(msg["max_alternatives"], serde_json::json!(3));
+        assert!(approx(&msg["word_alternatives_threshold"], 0.4));
+        assert!(approx(&msg["customization_weight"], 0.3));
+        assert_eq!(msg["grammar_name"], serde_json::json!("digits"));
+        assert_eq!(msg["audio_metrics"], serde_json::json!(true));
+        assert_eq!(msg["processing_metrics"], serde_json::json!(true));
+        assert!(approx(&msg["processing_metrics_interval"], 0.25));
+        assert_eq!(msg["smart_formatting_version"], serde_json::json!(2));
+        assert_eq!(msg["speech_begin_event"], serde_json::json!(true));
+
+        // --- WebSocket URL query (per-connection base-model version) ---
+        assert!(
+            url.contains("base_model_version=en-US_NarrowbandModel.v2021"),
+            "base_model_version must reach the WS URL query: {url}"
+        );
+    }
+
+    // Defaults must NOT emit any of the new knobs (no accidental always-on params on the wire).
+    #[test]
+    fn defaults_emit_no_keyword_or_metrics_params() {
+        let cfg = IbmWatsonSTTConfig::default();
+        let msg = cfg.build_start_message();
+        for k in [
+            "keywords",
+            "keywords_threshold",
+            "max_alternatives",
+            "word_alternatives_threshold",
+            "customization_weight",
+            "grammar_name",
+            "audio_metrics",
+            "processing_metrics",
+            "processing_metrics_interval",
+            "smart_formatting_version",
+            "speech_begin_event",
+        ] {
+            assert!(msg.get(k).is_none(), "{k} must be absent by default");
+        }
+        assert!(!cfg.build_websocket_url("tok").contains("base_model_version"));
     }
 
     #[test]

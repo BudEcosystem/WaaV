@@ -36,8 +36,8 @@ use tracing::{debug, info};
 use xxhash_rust::xxh3::xxh3_128;
 
 use super::config::{SmallestLanguage, SmallestModel, SmallestOutputFormat, SmallestTtsConfig};
-use super::messages::{SmallestTtsRequest, SmallestVoice, SmallestVoicesResponse};
-use super::{MAX_TEXT_LENGTH, SMALLEST_TTS_URL, SUPPORTED_SAMPLE_RATES, voices_url};
+use super::messages::{SmallestTtsRequest, SmallestVoice, SmallestVoicesResponse, SmallestWsRequest};
+use super::{MAX_TEXT_LENGTH, SMALLEST_TTS_URL, SMALLEST_TTS_WS_URL, SUPPORTED_SAMPLE_RATES, voices_url};
 use crate::core::tts::base::{
     AudioCallback, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
 };
@@ -84,9 +84,36 @@ impl SmallestRequestBuilder {
         SMALLEST_TTS_URL
     }
 
+    /// Get the lightning-v2 streaming WebSocket endpoint URL.
+    pub fn ws_url(&self) -> &str {
+        SMALLEST_TTS_WS_URL
+    }
+
     /// Get the Smallest configuration
     pub fn smallest_config(&self) -> &SmallestTtsConfig {
         &self.config
+    }
+
+    /// Build the lightning-v2 streaming WebSocket request body for the
+    /// `wss://waves-api.smallest.ai/api/v1/lightning-v2/get_speech/stream` endpoint.
+    ///
+    /// This is the wire body the streaming path sends; it carries the voice params plus the
+    /// `max_buffer_flush_ms` buffer-flush latency knob (omitted when unset so the server default
+    /// applies). Mirrors [`Self::build_http_request`] for the REST path.
+    pub fn build_ws_request(&self, text: &str) -> SmallestWsRequest {
+        let mut request = SmallestWsRequest::new(text, &self.config.voice_id)
+            .with_language(self.config.language.as_code())
+            .with_sample_rate(self.config.sample_rate)
+            .with_speed(self.config.speed)
+            .with_consistency(self.config.consistency)
+            .with_similarity(self.config.similarity)
+            .with_enhancement(self.config.enhancement);
+
+        if let Some(ms) = self.config.max_buffer_flush_ms {
+            request = request.with_max_buffer_flush_ms(ms);
+        }
+
+        request
     }
 }
 
@@ -181,6 +208,11 @@ fn compute_smallest_tts_config_hash(
     if let Some(rate) = config.speaking_rate {
         s.push_str(&format!("{rate:.3}"));
     }
+
+    // NOTE: `max_buffer_flush_ms` is deliberately NOT part of this key. It is a streaming
+    // buffer-flush latency/chunking knob (lightning-v2 WS), not an audio-content parameter — the
+    // synthesized samples are identical regardless of its value — so folding it in would only
+    // fragment the cache without correctness benefit (the cache-collision/over-keying review note).
 
     // Compute xxHash3-128 and format as hex
     let hash = xxh3_128(s.as_bytes());
@@ -612,6 +644,60 @@ mod tests {
         };
         let tts = SmallestTts::from_standard(&std).unwrap();
         assert_eq!(tts.smallest_config().speed, 1.5);
+    }
+
+    // WIRE-LEVEL: `max_buffer_flush_ms` (from the extras passthrough) must reach the actual
+    // lightning-v2 streaming WS request BODY that is sent to
+    // wss://waves-api.smallest.ai/api/v1/lightning-v2/get_speech/stream — not merely the config
+    // struct. Asserts on the serialized JSON the streaming endpoint receives, guarding the
+    // recurring "config set but never serialized to the wire" bug class.
+    #[test]
+    fn max_buffer_flush_ms_reaches_streaming_ws_request_body() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("max_buffer_flush_ms".into(), serde_json::json!(250));
+        let std = StandardTTSConfig {
+            base: {
+                let mut c = create_test_config();
+                c.model = "lightning-v2".to_string();
+                c
+            },
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+        let tts = SmallestTts::from_standard(&std).unwrap();
+        assert_eq!(tts.smallest_config().max_buffer_flush_ms, Some(250));
+
+        // Build the actual streaming WS request body and serialize it to the wire JSON.
+        let builder = tts.create_request_builder();
+        assert_eq!(
+            builder.ws_url(),
+            "wss://waves-api.smallest.ai/api/v1/lightning-v2/get_speech/stream"
+        );
+        let ws_request = builder.build_ws_request("Hello streaming");
+        let json = serde_json::to_string(&ws_request).unwrap();
+        // The exact wire param name with the configured value must be present in the body.
+        assert!(
+            json.contains("\"max_buffer_flush_ms\":250"),
+            "max_buffer_flush_ms missing from streaming WS body: {json}"
+        );
+    }
+
+    // WIRE-LEVEL counterpart: when unset, `max_buffer_flush_ms` must be OMITTED from the WS body
+    // (serde skip_serializing_if) so the server default applies — no spurious value on the wire.
+    #[test]
+    fn max_buffer_flush_ms_omitted_from_ws_body_when_unset() {
+        let mut config = create_test_config();
+        config.model = "lightning-v2".to_string();
+        let tts = SmallestTts::new(config).unwrap();
+
+        let builder = tts.create_request_builder();
+        let ws_request = builder.build_ws_request("Hello");
+        let json = serde_json::to_string(&ws_request).unwrap();
+        assert!(
+            !json.contains("max_buffer_flush_ms"),
+            "max_buffer_flush_ms must be omitted when unset: {json}"
+        );
     }
 
     // =========================================================================

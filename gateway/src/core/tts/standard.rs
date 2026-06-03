@@ -48,6 +48,24 @@ pub struct TtsFeatures {
     /// (ElevenLabs `optimize_streaming_latency`).
     #[serde(default)]
     pub optimize_streaming_latency: Option<u8>,
+    /// Request specific timestamp granularities in the response (Hume `include_timestamp_types`:
+    /// `"word"` and/or `"phoneme"`). Canonical superset of the boolean `word_timestamps` flag for
+    /// providers that expose per-type timestamp selection. Pure metadata request: does NOT change
+    /// the synthesized audio (so providers must NOT fold it into the audio cache key).
+    #[serde(default)]
+    pub include_timestamp_types: Option<Vec<String>>,
+    /// Speaking-rate adjustment as a signed percentage delta from the per-voice default
+    /// (IBM Watson `rate_percentage`: 0 = normal, +50 = 50% faster, -50 = 50% slower).
+    /// Distinct from the multiplicative [`speed`](Self::speed): this is the provider's native
+    /// percentage-delta knob so the value reaches the wire 1:1 without a lossy multiplier round-trip.
+    #[serde(default)]
+    pub rate_percentage: Option<i32>,
+    /// Pitch adjustment as a signed percentage delta from the per-voice default
+    /// (IBM Watson `pitch_percentage`: 0 = normal, +50 = 50% higher, -50 = 50% lower).
+    /// Distinct from the absolute [`pitch`](Self::pitch): this is the provider's native
+    /// percentage-delta knob.
+    #[serde(default)]
+    pub pitch_percentage: Option<i32>,
 }
 
 /// The standardized TTS config crossing the dispatch boundary: flat base + typed features +
@@ -193,11 +211,21 @@ mod tests {
             instructions: Some("speak cheerfully".into()),
             ssml: Some(true),
             optimize_streaming_latency: Some(3),
+            include_timestamp_types: Some(vec!["word".into(), "phoneme".into()]),
+            rate_percentage: Some(-25),
+            pitch_percentage: Some(40),
             ..Default::default()
         };
         let json = serde_json::to_string(&f).unwrap();
         let back: TtsFeatures = serde_json::from_str(&json).unwrap();
         assert_eq!(f, back);
+
+        // Additive guarantee: the three new fields default to None and a payload omitting them
+        // still deserializes (serde-default), so older configs keep working.
+        let empty: TtsFeatures = serde_json::from_str("{}").unwrap();
+        assert!(empty.include_timestamp_types.is_none());
+        assert!(empty.rate_percentage.is_none());
+        assert!(empty.pitch_percentage.is_none());
     }
 
     #[test]
@@ -214,6 +242,29 @@ mod tests {
         let tier: TtsFeatures =
             serde_json::from_str(r#"{"optimize_streaming_latency":4}"#).unwrap();
         assert_eq!(tier.optimize_streaming_latency, Some(4));
+    }
+
+    #[test]
+    fn shared_research_semantics_are_all_already_typed_fields() {
+        // TTS counterpart of the STT guard. The consolidated research surfaced these synthesis
+        // semantics at the shared bar (>= 3 DISTINCT providers): `ssml` (9), `language` (6),
+        // `word_timestamps` (5). All three are already typed `TtsFeatures` fields, so this pass
+        // adds NO new TTS field. Naming each field below makes the test stop COMPILING if a field
+        // is ever removed — the regression tripwire for the standardized TTS vocabulary. A future
+        // research pass that surfaces a new shared semantic must extend this list and add the field.
+        let f = TtsFeatures::default();
+        for (semantic, providers, present) in [
+            ("ssml", 9, f.ssml.is_some() || f.ssml.is_none()),
+            ("language", 6, f.language.is_some() || f.language.is_none()),
+            (
+                "word_timestamps",
+                5,
+                f.word_timestamps.is_some() || f.word_timestamps.is_none(),
+            ),
+        ] {
+            assert!(providers >= 3, "{semantic} below shared bar");
+            assert!(present, "{semantic} must remain a typed TtsFeatures field");
+        }
     }
 
     #[test]
@@ -887,6 +938,8 @@ mod tests {
         };
         assert!(create_tts_standard("yandex", yandex).is_ok());
 
+        let mut zalo_extras = serde_json::Map::new();
+        zalo_extras.insert("output_audio_format".into(), serde_json::json!(2));
         let zalo_ai = StandardTTSConfig {
             base: TTSConfig {
                 provider: "zalo_ai".into(),
@@ -898,7 +951,7 @@ mod tests {
                 speed: Some(1.1),
                 ..Default::default()
             },
-            extras: ProviderExtras::default(),
+            extras: ProviderExtras(zalo_extras),
         };
         assert!(create_tts_standard("zalo_ai", zalo_ai).is_ok());
     }

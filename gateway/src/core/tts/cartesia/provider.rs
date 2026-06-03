@@ -137,14 +137,16 @@ impl CartesiaRequestBuilder {
 
     /// Determines the language code for the request.
     ///
-    /// Currently defaults to "en". Future enhancement could:
-    /// - Extract from voice metadata
-    /// - Accept language in TTSConfig
-    /// - Auto-detect from text
+    /// Uses the standardized `language` override (`CartesiaTTSConfig::language`, populated from
+    /// `TtsFeatures::language`) when present, otherwise defaults to "en". Sent as the top-level
+    /// `language` field of the `/tts/bytes` body.
     #[inline]
-    fn get_language(&self) -> &'static str {
-        // TODO: Consider adding language to TTSConfig or CartesiaTTSConfig
-        "en"
+    fn get_language(&self) -> &str {
+        self.cartesia_config
+            .language
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("en")
     }
 }
 
@@ -190,6 +192,11 @@ impl TTSRequestBuilder for CartesiaRequestBuilder {
             generation_config.insert("speed".to_string(), json!(rate));
         }
 
+        // Pass volume as generation_config.volume (Cartesia loudness multiplier, [0.5, 2.0]).
+        if let Some(volume) = self.cartesia_config.volume {
+            generation_config.insert("volume".to_string(), json!(volume));
+        }
+
         // Pass emotion from emotion_config if present
         if let Some(ref emotion_config) = self.config.emotion_config
             && let Some(ref emotion) = emotion_config.emotion {
@@ -208,6 +215,11 @@ impl TTSRequestBuilder for CartesiaRequestBuilder {
             "output_format": self.cartesia_config.build_output_format_json(),
             "language": self.get_language()
         });
+
+        // Optional custom pronunciation dictionary (top-level body field).
+        if let Some(ref dict_id) = self.cartesia_config.pronunciation_dict_id {
+            body["pronunciation_dict_id"] = json!(dict_id);
+        }
 
         // Only add generation_config if it has values
         if !generation_config.is_empty() {
@@ -304,6 +316,26 @@ fn compute_cartesia_tts_config_hash(
     // Speaking rate (affects prosody)
     if let Some(rate) = config.speaking_rate {
         s.push_str(&format!("{rate:.3}"));
+    }
+    s.push('|');
+
+    // Volume (generation_config.volume) changes the audio, so it MUST be in the cache key — else
+    // two requests with the same text/voice/rate but different volume collide. (Review S1.)
+    if let Some(volume) = cartesia_config.volume {
+        s.push_str(&format!("{volume:.3}"));
+    }
+    s.push('|');
+
+    // Language (top-level `language`) changes the spoken output, so it is part of the cache key.
+    if let Some(language) = &cartesia_config.language {
+        s.push_str(language);
+    }
+    s.push('|');
+
+    // pronunciation_dict_id changes how words are pronounced (audio-changing), so it is part of
+    // the cache key.
+    if let Some(dict_id) = &cartesia_config.pronunciation_dict_id {
+        s.push_str(dict_id);
     }
 
     // Compute xxHash3-128 and format as hex
@@ -709,6 +741,158 @@ mod tests {
         assert_eq!(
             tts.cartesia_config().output_format.sample_rate,
             16000
+        );
+    }
+
+    // WIRE-LEVEL: volume must reach the serialized request body as
+    // `generation_config.volume` (the bytes sent to /tts/bytes), not merely a config struct
+    // field. Confirmed against the Cartesia `POST /tts/bytes` reference: volume is a
+    // `generation_config` multiplier in [0.5, 2.0].
+    #[test]
+    fn from_standard_volume_reaches_request_body() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                volume: Some(1.5),
+                ..Default::default()
+            },
+            extras: ProviderExtras(serde_json::Map::new()),
+        };
+        let tts = CartesiaTTS::from_standard(&std).unwrap();
+        assert_eq!(tts.cartesia_config().volume, Some(1.5));
+
+        let client = reqwest::Client::new();
+        let request = tts
+            .request_builder
+            .build_http_request(&client, "Hi")
+            .build()
+            .unwrap();
+        let body = request.body().unwrap().as_bytes().unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let volume = body_json["generation_config"]["volume"].as_f64().unwrap();
+        assert!(
+            (volume - 1.5).abs() < 0.001,
+            "volume not on the wire: {body_json}"
+        );
+    }
+
+    // WIRE-LEVEL: language must reach the serialized request body as the top-level `language`
+    // field, replacing the previously hardcoded "en". Confirmed against the Cartesia
+    // `POST /tts/bytes` reference (optional top-level `language`).
+    #[test]
+    fn from_standard_language_reaches_request_body() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                language: Some("fr".into()),
+                ..Default::default()
+            },
+            extras: ProviderExtras(serde_json::Map::new()),
+        };
+        let tts = CartesiaTTS::from_standard(&std).unwrap();
+        assert_eq!(tts.cartesia_config().language.as_deref(), Some("fr"));
+
+        let client = reqwest::Client::new();
+        let request = tts
+            .request_builder
+            .build_http_request(&client, "Bonjour")
+            .build()
+            .unwrap();
+        let body = request.body().unwrap().as_bytes().unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(
+            body_json["language"], "fr",
+            "language not on the wire: {body_json}"
+        );
+    }
+
+    // WIRE-LEVEL: pronunciation_dict_id (extras passthrough) must reach the serialized request
+    // body as the top-level `pronunciation_dict_id` field. Confirmed against the Cartesia
+    // `POST /tts/bytes` reference (optional top-level `pronunciation_dict_id`).
+    #[test]
+    fn from_standard_pronunciation_dict_id_reaches_request_body() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("pronunciation_dict_id".into(), serde_json::json!("dict-123"));
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+        let tts = CartesiaTTS::from_standard(&std).unwrap();
+        assert_eq!(
+            tts.cartesia_config().pronunciation_dict_id.as_deref(),
+            Some("dict-123")
+        );
+
+        let client = reqwest::Client::new();
+        let request = tts
+            .request_builder
+            .build_http_request(&client, "Hi")
+            .build()
+            .unwrap();
+        let body = request.body().unwrap().as_bytes().unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(
+            body_json["pronunciation_dict_id"], "dict-123",
+            "pronunciation_dict_id not on the wire: {body_json}"
+        );
+    }
+
+    // Negative wire assertion: with no language/volume/dict configured, the default "en" is sent
+    // and no pronunciation_dict_id / volume appears.
+    #[test]
+    fn build_http_request_defaults_omit_new_fields() {
+        let config = create_test_config();
+        let cartesia_config = CartesiaTTSConfig::from_base(config.clone());
+        let builder = CartesiaRequestBuilder::new(config, cartesia_config);
+
+        let client = reqwest::Client::new();
+        let request = builder.build_http_request(&client, "Hi").build().unwrap();
+        let body = request.body().unwrap().as_bytes().unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(body).unwrap();
+
+        assert_eq!(body_json["language"], "en");
+        assert!(body_json.get("pronunciation_dict_id").is_none());
+        // No generation_config emitted at all when nothing prosody-related is set.
+        assert!(body_json.get("generation_config").is_none());
+    }
+
+    // Cache-hash collision guard: volume changes audio, so two otherwise-identical configs with
+    // different volume MUST hash differently (Review S1 collision bug class).
+    #[test]
+    fn config_hash_differs_on_volume() {
+        let config = create_test_config();
+        let mut cc1 = CartesiaTTSConfig::from_base(config.clone());
+        cc1.volume = Some(1.0);
+        let mut cc2 = CartesiaTTSConfig::from_base(config.clone());
+        cc2.volume = Some(1.5);
+        assert_ne!(
+            compute_cartesia_tts_config_hash(&config, &cc1),
+            compute_cartesia_tts_config_hash(&config, &cc2)
+        );
+    }
+
+    // Cache-hash collision guard: language and pronunciation_dict_id change audio.
+    #[test]
+    fn config_hash_differs_on_language_and_dict() {
+        let config = create_test_config();
+        let base_cc = CartesiaTTSConfig::from_base(config.clone());
+
+        let mut lang_cc = base_cc.clone();
+        lang_cc.language = Some("de".into());
+        assert_ne!(
+            compute_cartesia_tts_config_hash(&config, &base_cc),
+            compute_cartesia_tts_config_hash(&config, &lang_cc)
+        );
+
+        let mut dict_cc = base_cc.clone();
+        dict_cc.pronunciation_dict_id = Some("dict-9".into());
+        assert_ne!(
+            compute_cartesia_tts_config_hash(&config, &base_cc),
+            compute_cartesia_tts_config_hash(&config, &dict_cc)
         );
     }
 

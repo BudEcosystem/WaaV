@@ -153,6 +153,38 @@ pub struct GoogleTTSConfig {
     /// Audio effects profiles for playback optimization
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects_profile_id: Vec<String>,
+
+    // ---- Standardized features wired onto the `v1/text:synthesize` request (W1 keystone). All
+    // confirmed against the SynthesisInput / VoiceSelectionParams / AdvancedVoiceOptions schemas:
+    // https://cloud.google.com/text-to-speech/docs/reference/rest/v1/text/synthesize ----
+    /// Treat the input text as SSML → emit `input.ssml` instead of `input.text` (typed `ssml`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ssml: bool,
+    /// Prompt / system instruction for promptable voices → `input.prompt` (typed `instructions`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Voice gender preference → `voice.ssmlGender` ("MALE" | "FEMALE" | "NEUTRAL"). (extras)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssml_gender: Option<String>,
+    /// Chirp 3 Instant Custom Voice clone key → `voice.voiceClone.voiceCloningKey`. (extras)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_cloning_key: Option<String>,
+    /// AutoML custom voice → `voice.customVoice` (a JSON object: { model, reportedUsage? }). (extras)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_voice: Option<serde_json::Value>,
+    /// API-side custom pronunciations → `input.customPronunciations` (a JSON object). (extras)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_pronunciations: Option<serde_json::Value>,
+    /// Markup for HD voices → `input.markup` (string). (extras)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markup: Option<String>,
+    /// Multi-speaker dialogue input → `input.multiSpeakerMarkup` (a JSON object). (extras)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_speaker_markup: Option<serde_json::Value>,
+    /// Journey low-latency synthesis toggle → `advancedVoiceOptions.lowLatencyJourneySynthesis`
+    /// (bool). (extras)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low_latency_journey_synthesis: Option<bool>,
 }
 
 impl Default for GoogleTTSConfig {
@@ -165,6 +197,15 @@ impl Default for GoogleTTSConfig {
             pitch: None,
             volume_gain_db: None,
             effects_profile_id: Vec::new(),
+            ssml: false,
+            prompt: None,
+            ssml_gender: None,
+            voice_cloning_key: None,
+            custom_voice: None,
+            custom_pronunciations: None,
+            markup: None,
+            multi_speaker_markup: None,
+            low_latency_journey_synthesis: None,
         }
     }
 }
@@ -215,6 +256,15 @@ impl GoogleTTSConfig {
             pitch: None,
             volume_gain_db: None,
             effects_profile_id: Vec::new(),
+            ssml: false,
+            prompt: None,
+            ssml_gender: None,
+            voice_cloning_key: None,
+            custom_voice: None,
+            custom_pronunciations: None,
+            markup: None,
+            multi_speaker_markup: None,
+            low_latency_journey_synthesis: None,
         }
     }
 
@@ -254,22 +304,85 @@ impl GoogleTTSConfig {
         if let Some(sr) = f.sample_rate {
             cfg.base.sample_rate = Some(sr);
         }
+        cfg.apply_standard_synthesis_features(std);
+        cfg
+    }
+
+    /// Maps the standardized `ssml`/`instructions` typed features and the Google-unique `extras`
+    /// passthrough knobs onto this config. Shared by both [`Self::from_standard`] and the provider
+    /// struct's `from_standard` (the dispatch-constructed path) so the wire mapping is identical.
+    ///
+    /// All fields confirmed against the `v1/text:synthesize` request schemas (SynthesisInput,
+    /// VoiceSelectionParams, AdvancedVoiceOptions, AudioConfig):
+    /// https://cloud.google.com/text-to-speech/docs/reference/rest/v1/text/synthesize
+    pub fn apply_standard_synthesis_features(
+        &mut self,
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) {
+        let f = &std.features;
+        // SSML input → emit `input.ssml` instead of `input.text` (typed feature).
+        if let Some(true) = f.ssml {
+            self.ssml = true;
+        }
+        // Prompt / system instruction for promptable voices → `input.prompt` (typed `instructions`).
+        if let Some(p) = &f.instructions {
+            self.prompt = Some(p.clone());
+        }
+
+        let extras = &std.extras.0;
+        // Voice gender preference → `voice.ssmlGender`.
+        if let Some(g) = extras.get("ssml_gender").and_then(|v| v.as_str()) {
+            self.ssml_gender = Some(g.to_string());
+        }
+        // Chirp 3 Instant Custom Voice → `voice.voiceClone.voiceCloningKey`.
+        if let Some(k) = extras.get("voice_cloning_key").and_then(|v| v.as_str()) {
+            self.voice_cloning_key = Some(k.to_string());
+        }
+        // AutoML custom voice → `voice.customVoice` (object).
+        if let Some(v) = extras.get("custom_voice") {
+            if v.is_object() {
+                self.custom_voice = Some(v.clone());
+            }
+        }
+        // API-side custom pronunciations → `input.customPronunciations` (object).
+        if let Some(v) = extras.get("custom_pronunciations") {
+            if v.is_object() {
+                self.custom_pronunciations = Some(v.clone());
+            }
+        }
+        // Markup for HD voices → `input.markup` (string).
+        if let Some(m) = extras.get("markup").and_then(|v| v.as_str()) {
+            self.markup = Some(m.to_string());
+        }
+        // Multi-speaker dialogue input → `input.multiSpeakerMarkup` (object).
+        if let Some(v) = extras.get("multi_speaker_markup") {
+            if v.is_object() {
+                self.multi_speaker_markup = Some(v.clone());
+            }
+        }
+        // Journey low-latency synthesis toggle → `advancedVoiceOptions.lowLatencyJourneySynthesis`.
+        if let Some(b) = extras
+            .get("low_latency_journey_synthesis")
+            .and_then(|v| v.as_bool())
+        {
+            self.low_latency_journey_synthesis = Some(b);
+        }
+
         // `effectsProfileId` is a Google-unique AudioConfig field with no canonical `TtsFeatures`
         // slot, so it rides the open `extras` passthrough. Accepts either a JSON array of strings
         // (`["headphone-class-device", ...]`) or a single string. Confirmed per-request on the
         // `v1/text:synthesize` endpoint: AudioConfig.effectsProfileId (string[]).
         // Doc: https://cloud.google.com/text-to-speech/docs/reference/rest/v1/AudioConfig
-        if let Some(v) = std.extras.0.get("effects_profile_id") {
+        if let Some(v) = extras.get("effects_profile_id") {
             if let Some(arr) = v.as_array() {
-                cfg.effects_profile_id = arr
+                self.effects_profile_id = arr
                     .iter()
                     .filter_map(|e| e.as_str().map(|s| s.to_string()))
                     .collect();
             } else if let Some(s) = v.as_str() {
-                cfg.effects_profile_id = vec![s.to_string()];
+                self.effects_profile_id = vec![s.to_string()];
             }
         }
-        cfg
     }
 
     /// Extracts the BCP-47 language code from a Google voice name.
@@ -910,6 +1023,7 @@ mod tests {
             pitch: Some(2.5),
             volume_gain_db: None,
             effects_profile_id: vec!["handset-class-device".to_string()],
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&config).expect("Failed to serialize");

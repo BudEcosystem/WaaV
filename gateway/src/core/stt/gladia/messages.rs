@@ -5,7 +5,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::config::{
-    GladiaLanguageConfig, GladiaMessagesConfig, GladiaPreProcessing, GladiaRealtimeProcessing,
+    GladiaLanguageConfig, GladiaMessagesConfig, GladiaPostProcessing, GladiaPreProcessing,
+    GladiaRealtimeProcessing,
 };
 
 // =============================================================================
@@ -41,6 +42,9 @@ pub struct InitSessionRequest {
     /// Realtime processing configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub realtime_processing: Option<GladiaRealtimeProcessing>,
+    /// Post-processing configuration (summarization, chapterization)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_processing: Option<GladiaPostProcessing>,
     /// Messages configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub messages_config: Option<GladiaMessagesConfig>,
@@ -62,6 +66,7 @@ impl Default for InitSessionRequest {
             language_config: None,
             pre_processing: None,
             realtime_processing: None,
+            post_processing: None,
             messages_config: None,
             custom_metadata: None,
         }

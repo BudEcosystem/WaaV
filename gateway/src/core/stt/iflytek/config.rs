@@ -361,6 +361,9 @@ pub struct IFlytekSttConfig {
     pub punctuation: bool,
     /// Convert numbers to digits.
     pub convert_numbers: bool,
+    /// Advanced `business` parameters (`vinfo`/`nbest`/`wbest`/`pd`/`rlang`) wired from the
+    /// standardized features + provider extras. Sent on the first frame.
+    pub business_extras: super::messages::IFlytekBusinessExtras,
 }
 
 impl Default for IFlytekSttConfig {
@@ -377,6 +380,7 @@ impl Default for IFlytekSttConfig {
             dynamic_correction: true,
             punctuation: true,
             convert_numbers: true,
+            business_extras: super::messages::IFlytekBusinessExtras::default(),
         }
     }
 }
@@ -421,15 +425,23 @@ impl IFlytekSttConfig {
             dynamic_correction: true,
             punctuation: config.punctuation,
             convert_numbers: true,
+            business_extras: super::messages::IFlytekBusinessExtras::default(),
         })
     }
 
-    /// Build from the standardized config (W1 keystone). iFlytek exposes a narrow feature
-    /// surface, so only the features it can actually express are mapped: `smart_format` →
-    /// `convert_numbers` (spoken-number normalization) and `endpointing_ms` → `vad_eos_ms`
-    /// (end-of-speech silence timeout). Features iFlytek cannot express (diarization, redaction,
-    /// keyterms, interim_results, word_timestamps, profanity_filter, …) are capability gaps and
-    /// left at their defaults.
+    /// Build from the standardized config (W1 keystone). iFlytek's `business` block exposes
+    /// several advanced knobs; this maps the standardized features and provider extras it can
+    /// express onto them:
+    /// - `smart_format` → `convert_numbers` (spoken-number normalization, wire `nunum`),
+    /// - `endpointing_ms` → `vad_eos_ms` (end-of-speech silence timeout, wire `vad_eos`),
+    /// - `word_timestamps` → `vinfo` (per-word frame-offset info),
+    /// - `alternatives` → `nbest` (sentence-level N-best),
+    /// - extras `word_alternatives` → `wbest` (word-level N-best),
+    /// - extras `domain_personalization` → `pd` (personalization vertical),
+    /// - extras `result_character_set` → `rlang` (result character set / language variant).
+    ///
+    /// Features iFlytek cannot express (diarization, redaction, profanity_filter, …) are
+    /// capability gaps and left at their defaults.
     pub fn from_standard(
         std: &crate::core::stt::standard::StandardSTTConfig,
     ) -> Result<Self, STTError> {
@@ -440,6 +452,24 @@ impl IFlytekSttConfig {
         }
         if let Some(ms) = f.endpointing_ms {
             cfg.vad_eos_ms = ms;
+        }
+        // Typed features → business params.
+        if let Some(w) = f.word_timestamps {
+            cfg.business_extras.word_timestamps = Some(w);
+        }
+        if let Some(n) = f.alternatives {
+            cfg.business_extras.nbest = Some(n);
+        }
+        // Provider extras → business params (string keys not modeled by the typed vocabulary).
+        let e = &std.extras.0;
+        if let Some(v) = e.get("word_alternatives").and_then(|v| v.as_u64()) {
+            cfg.business_extras.wbest = Some(v as u8);
+        }
+        if let Some(v) = e.get("domain_personalization").and_then(|v| v.as_str()) {
+            cfg.business_extras.pd = Some(v.to_string());
+        }
+        if let Some(v) = e.get("result_character_set").and_then(|v| v.as_str()) {
+            cfg.business_extras.rlang = Some(v.to_string());
         }
         Ok(cfg)
     }
@@ -498,6 +528,82 @@ mod tests {
 
     fn create_test_api_key() -> String {
         "test_app_id|test_api_key_xxxxx|test_api_secret_xx".to_string()
+    }
+
+    // WIRE-LEVEL (the recurring bug class): the advanced features mapped in `from_standard` must
+    // actually reach the serialized first-frame `business` JSON the client sends — not just live
+    // on the config struct. This drives the standardized config through `from_standard` and then
+    // through the SAME `first_frame_with_extras(...).to_json()` path the client uses, asserting
+    // every api_param (`vinfo`/`nbest`/`wbest`/`pd`/`rlang`) is present in the request body.
+    #[test]
+    fn advanced_features_reach_first_frame_business_json() {
+        use super::super::messages::SttRequest;
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+
+        let mut extras_map = serde_json::Map::new();
+        extras_map.insert("word_alternatives".into(), serde_json::json!(3));
+        extras_map.insert("domain_personalization".into(), serde_json::json!("medical"));
+        extras_map.insert("result_character_set".into(), serde_json::json!("zh-cn"));
+
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "iflytek".into(),
+                api_key: create_test_api_key(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(true),
+                alternatives: Some(2),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras_map),
+        };
+        let cfg = IFlytekSttConfig::from_standard(&std).unwrap();
+
+        // Reproduce the client's first-frame build path with the mapped business extras.
+        let request = SttRequest::first_frame_with_extras(
+            &cfg.auth.app_id,
+            cfg.language.as_code(),
+            cfg.domain.as_str(),
+            Some(&cfg.accent),
+            cfg.vad_eos_ms,
+            cfg.dynamic_correction,
+            cfg.punctuation,
+            cfg.convert_numbers,
+            &cfg.audio_format_string(),
+            cfg.encoding.as_str(),
+            &[0u8; 8],
+            &cfg.business_extras,
+        );
+        let json = request.to_json().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let business = &v["business"];
+
+        // word_timestamps → vinfo=1 (typed)
+        assert_eq!(business["vinfo"], 1, "vinfo not on the wire: {json}");
+        // alternatives → nbest=2 (typed)
+        assert_eq!(business["nbest"], 2, "nbest not on the wire: {json}");
+        // word_alternatives → wbest=3 (extras)
+        assert_eq!(business["wbest"], 3, "wbest not on the wire: {json}");
+        // domain_personalization → pd (extras)
+        assert_eq!(business["pd"], "medical", "pd not on the wire: {json}");
+        // result_character_set → rlang (extras)
+        assert_eq!(business["rlang"], "zh-cn", "rlang not on the wire: {json}");
+    }
+
+    // A first frame with no advanced features omits every new key (additive: unchanged wire shape).
+    #[test]
+    fn first_frame_without_extras_omits_advanced_business_keys() {
+        use super::super::messages::SttRequest;
+        let request = SttRequest::first_frame(
+            "app", "zh_cn", "iat", Some("mandarin"), 2000, true, true, true,
+            "audio/L16;rate=16000", "raw", &[0u8; 8],
+        );
+        let v: serde_json::Value = serde_json::from_str(&request.to_json().unwrap()).unwrap();
+        let business = &v["business"];
+        for k in ["vinfo", "nbest", "wbest", "pd", "rlang"] {
+            assert!(business.get(k).is_none(), "{k} should be omitted when unset");
+        }
     }
 
     // W1 keystone: maps the standardized features iFlytek can express (smart_format +

@@ -476,6 +476,12 @@ async fn handle_config(
         }
     };
 
+    // W-D2 fleet adoption: inject the shared, process-global resilience handles so the realtime
+    // reconnect loop participates in process-wide storm control + per-provider breaker tripping and
+    // publishes `waav_circuit_breaker_state{provider}` on transition. A no-op for providers that
+    // don't consume the handles (default trait method).
+    provider.set_resilience(app_state.core_state.resilience().handles_for(provider_name));
+
     // Register callbacks before connecting
     let tx_clone = message_tx.clone();
     provider

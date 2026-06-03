@@ -128,6 +128,30 @@ pub struct DeepgramSTTConfig {
     /// endpoint (or the EU endpoint if `use_eu_endpoint`) is used. Generalizes the OpenAI
     /// `OPENAI_BASE_URL` pattern; required so reconnection chaos tests can drive a real mock.
     pub endpoint_override: Option<String>,
+    /// Named-entity detection (`detect_entities=true`). Deepgram supports `detect_entities` on the
+    /// streaming endpoint (live AsyncAPI query-parameter schema, June 2026). Mapped from the typed
+    /// `SttFeatures::entity_detection`.
+    pub detect_entities: bool,
+    /// Find-and-replace pairs (`replace=FIND:REPLACE`). One `replace=` param per pair; each value is
+    /// percent-encoded. Streaming-supported.
+    pub replace: Vec<String>,
+    /// Search terms / keyword spotting (`search=TERM`). One `search=` param per term; each value is
+    /// percent-encoded. Streaming-supported.
+    pub search: Vec<String>,
+    /// Dictation mode (`dictation=true`) — convert spoken punctuation commands ("comma", "period")
+    /// into punctuation. Streaming-supported.
+    pub dictation: bool,
+    /// Callback URL (`callback=URL`) — Deepgram POSTs results to this URL. Streaming-supported.
+    pub callback: Option<String>,
+    /// HTTP method for the callback (`callback_method=POST|PUT`). Streaming-supported.
+    pub callback_method: Option<String>,
+    /// Model Improvement Program opt-out (`mip_opt_out=true`). Streaming-supported.
+    pub mip_opt_out: bool,
+    /// Arbitrary request metadata tags (`extra=KEY:VALUE`). One `extra=` param per entry; each value
+    /// is percent-encoded. Streaming-supported.
+    pub extra: Vec<String>,
+    /// Pin a specific model version (`version=ID`). Streaming-supported.
+    pub version: Option<String>,
 }
 
 impl Default for DeepgramSTTConfig {
@@ -150,6 +174,15 @@ impl Default for DeepgramSTTConfig {
             numerals: false,
             multichannel: false,
             endpoint_override: None,
+            detect_entities: false,
+            replace: Vec::new(),
+            search: Vec::new(),
+            dictation: false,
+            callback: None,
+            callback_method: None,
+            mip_opt_out: false,
+            extra: Vec::new(),
+            version: None,
         }
     }
 }
@@ -161,6 +194,18 @@ impl DeepgramSTTConfig {
     /// (EU endpoint, PHI redaction, tag) keep their defaults.
     pub fn from_standard(std: &super::standard::StandardSTTConfig) -> Self {
         let f = &std.features;
+        let ex = &std.extras.0;
+        // Helper: read a `Vec<String>` from an extras key that may be a JSON string or array.
+        let str_vec = |key: &str| -> Vec<String> {
+            match ex.get(key) {
+                Some(serde_json::Value::String(s)) => vec![s.clone()],
+                Some(serde_json::Value::Array(a)) => a
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
         Self {
             base: std.base.clone(),
             diarize: f.diarization.unwrap_or(false),
@@ -182,6 +227,22 @@ impl DeepgramSTTConfig {
             // restored, *featured* session can be pointed at a mock/proxy without touching the
             // ~80 StandardSTTConfig construction sites.
             endpoint_override: std.endpoint_override().map(|s| s.to_string()),
+            // --- Newly-wired Deepgram streaming features ----------------------------------------
+            // Entity detection is a typed `SttFeatures` field; the rest are provider-specific knobs
+            // forwarded through the open `ProviderExtras` passthrough. All confirmed on the
+            // streaming endpoint (Deepgram live AsyncAPI query-parameter schema, June 2026).
+            detect_entities: f.entity_detection.unwrap_or(false),
+            replace: str_vec("replace"),
+            search: str_vec("search"),
+            dictation: ex.get("dictation").and_then(|v| v.as_bool()).unwrap_or(false),
+            callback: ex.get("callback").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            callback_method: ex
+                .get("callback_method")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            mip_opt_out: ex.get("mip_opt_out").and_then(|v| v.as_bool()).unwrap_or(false),
+            extra: str_vec("extra"),
+            version: ex.get("version").and_then(|v| v.as_str()).map(|s| s.to_string()),
             // CAPABILITY GAP — intentionally NOT mapped to the wire:
             //   * `alternatives` (N-best): absent from Deepgram's streaming AsyncAPI
             //     query-parameter schema and from the streaming feature overview — it is a
@@ -443,6 +504,57 @@ impl DeepgramSTT {
         // Add multichannel (independent per-channel transcription). Supported on streaming.
         if config.multichannel {
             url.push_str("&multichannel=true");
+        }
+
+        // Add entity detection (`detect_entities`). Supported on streaming.
+        if config.detect_entities {
+            url.push_str("&detect_entities=true");
+        }
+
+        // Find-and-replace: one `replace=` per FIND:REPLACE pair (percent-encoded).
+        for pair in &config.replace {
+            url.push_str("&replace=");
+            url.push_str(&encode_query_value(pair));
+        }
+
+        // Search / keyword spotting: one `search=` per term (percent-encoded).
+        for term in &config.search {
+            url.push_str("&search=");
+            url.push_str(&encode_query_value(term));
+        }
+
+        // Dictation mode (spoken-punctuation commands → punctuation).
+        if config.dictation {
+            url.push_str("&dictation=true");
+        }
+
+        // Callback URL — Deepgram POSTs results to this URL (percent-encoded).
+        if let Some(callback) = &config.callback {
+            url.push_str("&callback=");
+            url.push_str(&encode_query_value(callback));
+        }
+
+        // Callback HTTP method (POST/PUT).
+        if let Some(method) = &config.callback_method {
+            url.push_str("&callback_method=");
+            url.push_str(&encode_query_value(method));
+        }
+
+        // Model Improvement Program opt-out.
+        if config.mip_opt_out {
+            url.push_str("&mip_opt_out=true");
+        }
+
+        // Extra request metadata: one `extra=` per KEY:VALUE entry (percent-encoded).
+        for entry in &config.extra {
+            url.push_str("&extra=");
+            url.push_str(&encode_query_value(entry));
+        }
+
+        // Pin a specific model version.
+        if let Some(version) = &config.version {
+            url.push_str("&version=");
+            url.push_str(&encode_query_value(version));
         }
 
         // Add redaction (PII, numbers, SSN, etc.)
@@ -1443,6 +1555,121 @@ mod tests {
         // standardized features requested them (Deepgram does not support them on streaming).
         assert!(!url.contains("alternatives="), "alternatives must be a streaming gap: {url}");
         assert!(!url.contains("detect_language="), "detect_language must be a streaming gap: {url}");
+    }
+
+    // WIRE-LEVEL guard: entity detection + find/replace + search + dictation + callback +
+    // callback_method + mip_opt_out + extra + version must all land in the request URL with their
+    // exact Deepgram param names — NOT merely on the config struct (the recurring bug class).
+    #[tokio::test]
+    async fn test_deepgram_extended_features_reach_the_wire() {
+        let stt = DeepgramSTT::default();
+        let base = STTConfig {
+            model: "nova-3".to_string(),
+            api_key: "k".to_string(),
+            ..Default::default()
+        };
+
+        // Off by default => none of the params appear.
+        let off = DeepgramSTTConfig {
+            base: base.clone(),
+            ..Default::default()
+        };
+        let url_off = stt.build_websocket_url(&off).unwrap();
+        for p in [
+            "detect_entities=", "replace=", "search=", "dictation=", "callback=",
+            "callback_method=", "mip_opt_out=", "extra=", "version=",
+        ] {
+            assert!(!url_off.contains(p), "{p} leaked when unset: {url_off}");
+        }
+
+        // On => exact wire params must appear, multi-valued ones repeated and percent-encoded.
+        let on = DeepgramSTTConfig {
+            base,
+            detect_entities: true,
+            replace: vec!["John Smith:Jon Smith".to_string()],
+            search: vec!["medication".to_string(), "blood pressure".to_string()],
+            dictation: true,
+            callback: Some("https://example.com/cb?x=1".to_string()),
+            callback_method: Some("PUT".to_string()),
+            mip_opt_out: true,
+            extra: vec!["session:abc 123".to_string()],
+            version: Some("2024-01-09.0".to_string()),
+            ..Default::default()
+        };
+        let url = stt.build_websocket_url(&on).unwrap();
+        assert!(url.contains("&detect_entities=true"), "detect_entities missing: {url}");
+        // find/replace + search values are percent-encoded (space -> +, ':' escaped).
+        assert!(url.contains("&replace=John+Smith%3AJon+Smith"), "replace not encoded: {url}");
+        assert!(url.contains("&search=medication"), "search[0] missing: {url}");
+        assert!(url.contains("&search=blood+pressure"), "search[1] not encoded: {url}");
+        assert!(url.contains("&dictation=true"), "dictation missing: {url}");
+        assert!(
+            url.contains("&callback=https%3A%2F%2Fexample.com%2Fcb%3Fx%3D1"),
+            "callback not encoded: {url}"
+        );
+        assert!(url.contains("&callback_method=PUT"), "callback_method missing: {url}");
+        assert!(url.contains("&mip_opt_out=true"), "mip_opt_out missing: {url}");
+        assert!(url.contains("&extra=session%3Aabc+123"), "extra not encoded: {url}");
+        assert!(url.contains("&version=2024-01-09.0"), "version missing: {url}");
+    }
+
+    // WIRE-LEVEL keystone: SttFeatures (typed entity_detection) + ProviderExtras passthrough ->
+    // from_standard -> URL. Proves the standardized config actually drives these params onto the
+    // wire, end-to-end through the reachable path.
+    #[tokio::test]
+    async fn test_deepgram_from_standard_extended_features_reach_the_wire() {
+        use super::super::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let stt = DeepgramSTT::default();
+        let extras = ProviderExtras(
+            serde_json::json!({
+                "replace": ["color:colour"],
+                "search": "refund",
+                "dictation": true,
+                "callback": "https://cb.test/hook",
+                "callback_method": "POST",
+                "mip_opt_out": true,
+                "extra": ["tenant:acme", "trace:42"],
+                "version": "beta"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let std_cfg = StandardSTTConfig {
+            base: STTConfig {
+                model: "nova-3".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                entity_detection: Some(true),
+                ..Default::default()
+            },
+            extras,
+        };
+        let cfg = DeepgramSTTConfig::from_standard(&std_cfg);
+        // Mapped onto the config...
+        assert!(cfg.detect_entities);
+        assert_eq!(cfg.replace, vec!["color:colour".to_string()]);
+        assert_eq!(cfg.search, vec!["refund".to_string()]);
+        assert!(cfg.dictation);
+        assert_eq!(cfg.callback.as_deref(), Some("https://cb.test/hook"));
+        assert_eq!(cfg.callback_method.as_deref(), Some("POST"));
+        assert!(cfg.mip_opt_out);
+        assert_eq!(cfg.extra, vec!["tenant:acme".to_string(), "trace:42".to_string()]);
+        assert_eq!(cfg.version.as_deref(), Some("beta"));
+        // ...and reach the request URL.
+        let url = stt.build_websocket_url(&cfg).unwrap();
+        assert!(url.contains("&detect_entities=true"), "{url}");
+        assert!(url.contains("&replace=color%3Acolour"), "{url}");
+        assert!(url.contains("&search=refund"), "{url}");
+        assert!(url.contains("&dictation=true"), "{url}");
+        assert!(url.contains("&callback=https%3A%2F%2Fcb.test%2Fhook"), "{url}");
+        assert!(url.contains("&callback_method=POST"), "{url}");
+        assert!(url.contains("&mip_opt_out=true"), "{url}");
+        assert!(url.contains("&extra=tenant%3Aacme"), "{url}");
+        assert!(url.contains("&extra=trace%3A42"), "{url}");
+        assert!(url.contains("&version=beta"), "{url}");
     }
 
     #[tokio::test]

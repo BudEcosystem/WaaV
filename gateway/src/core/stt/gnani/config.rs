@@ -47,6 +47,18 @@ pub struct GnaniSTTConfig {
     /// Enable interim (partial) results
     #[serde(default = "default_interim_results")]
     pub interim_results: bool,
+
+    /// Sensitive-data flag: sent to Gnani as the `sensitive` gRPC request header so the
+    /// provider treats the audio as sensitive (e.g. suppresses logging/retention). `None`
+    /// omits the header entirely. Maps from the `sensitive` ProviderExtras key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensitive: Option<bool>,
+
+    /// Optional audio filename forwarded as the `filename` gRPC request header for
+    /// server-side debugging/correlation. `None` omits the header. Maps from the
+    /// `filename` ProviderExtras key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
 }
 
 fn default_connection_timeout() -> u64 {
@@ -82,6 +94,8 @@ impl Default for GnaniSTTConfig {
             connection_timeout_secs: default_connection_timeout(),
             request_timeout_secs: default_request_timeout(),
             interim_results: default_interim_results(),
+            sensitive: None,
+            filename: None,
         }
     }
 }
@@ -91,8 +105,9 @@ impl GnaniSTTConfig {
     /// whose only standardized-feature surface is interim (partial) results, so this maps that one
     /// boolean; the remaining advanced features (diarization, word_timestamps, redaction, keyterms,
     /// …) are capability gaps Gnani cannot express and are left at default. Gnani's non-standard
-    /// credentials (`token`, `access_key`) are read from `provider_extras` when present, overriding
-    /// the env-var defaults that `from_base` supplies.
+    /// credentials (`token`, `access_key`) and request headers (`sensitive`, `filename`) are read
+    /// from `provider_extras` when present, overriding the env-var defaults that `from_base`
+    /// supplies. `sensitive`/`filename` are forwarded as gRPC metadata by `create_gnani_metadata`.
     pub fn from_standard(
         std: &crate::core::stt::standard::StandardSTTConfig,
     ) -> Result<Self, String> {
@@ -106,6 +121,13 @@ impl GnaniSTTConfig {
         }
         if let Some(k) = std.extras.0.get("access_key").and_then(|v| v.as_str()) {
             cfg.access_key = k.to_string();
+        }
+        // Newly-wired Gnani request headers (forwarded as gRPC metadata by create_gnani_metadata).
+        if let Some(s) = std.extras.0.get("sensitive").and_then(|v| v.as_bool()) {
+            cfg.sensitive = Some(s);
+        }
+        if let Some(fname) = std.extras.0.get("filename").and_then(|v| v.as_str()) {
+            cfg.filename = Some(fname.to_string());
         }
         Ok(cfg)
     }
@@ -144,6 +166,8 @@ impl GnaniSTTConfig {
             connection_timeout_secs: default_connection_timeout(),
             request_timeout_secs: default_request_timeout(),
             interim_results: default_interim_results(),
+            sensitive: None,
+            filename: None,
         })
     }
 

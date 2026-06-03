@@ -82,9 +82,13 @@ impl ReverieRequestBuilder {
 
     /// Builds the request body as JSON.
     fn build_request_body(&self, text: &str) -> serde_json::Value {
-        let mut body = json!({
-            "text": [text],
-        });
+        // SSML input mode routes the input under the `ssml` body key (Reverie's documented SSML
+        // input), otherwise the input is the plain-text `text` array.
+        let mut body = if self.reverie_config.ssml_input {
+            json!({ "ssml": text })
+        } else {
+            json!({ "text": [text] })
+        };
 
         // Add speed if non-default
         if (self.reverie_config.speed - DEFAULT_SPEED).abs() > 0.001 {
@@ -198,6 +202,11 @@ fn compute_reverie_tts_config_hash(
     s.push('|');
     s.push_str(&format!("{:.3}", reverie_config.pitch));
     s.push('|');
+
+    // SSML input mode changes how the SAME text is synthesized (markup vs literal), so it must be
+    // part of the cache key to avoid serving a literal-text render for an SSML request (or vice
+    // versa) — the prior review's audio cache-collision bug class.
+    s.push_str(if reverie_config.ssml_input { "ssml|" } else { "text|" });
 
     // Speaking rate from base config
     if let Some(rate) = config.speaking_rate {
@@ -573,6 +582,61 @@ mod tests {
         };
         let tts = ReverieTts::from_standard(&std).unwrap();
         assert_eq!(tts.reverie_config().speed, 1.4);
+    }
+
+    // WIRE-LEVEL (S1/S5 recurring bug class): the typed `ssml` feature must route the input into the
+    // `ssml` BODY key (not the `text` array) of the POST body that hits revapi.reverieinc.com — not
+    // merely flip a config bool. Build the real request body and assert the wire shape.
+    #[test]
+    fn ssml_feature_routes_input_to_ssml_body_key() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                ssml: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = ReverieTts::from_standard(&std).unwrap();
+        // (1) config carries the flag …
+        assert!(tts.reverie_config().ssml_input);
+
+        // (2) … AND the built request body carries the input under `ssml`, with NO `text` array.
+        let body = tts.request_builder.build_request_body("<speak>नमस्ते</speak>");
+        assert_eq!(body["ssml"], "<speak>नमस्ते</speak>");
+        assert!(
+            body.get("text").is_none(),
+            "SSML input mode must omit the plain-text `text` array"
+        );
+    }
+
+    // Default path stays plain-text: without the ssml feature the body keeps the `text` array shape.
+    #[test]
+    fn plain_text_body_when_ssml_not_requested() {
+        let config = create_test_config();
+        let reverie_config = ReverieTtsConfig::from_base(config.clone()).unwrap();
+        let builder = ReverieRequestBuilder::new(config, reverie_config);
+        let body = builder.build_request_body("नमस्ते");
+        assert_eq!(body["text"], json!(["नमस्ते"]));
+        assert!(body.get("ssml").is_none());
+    }
+
+    // Cache-collision guard (prior review's bug class): the SAME text under SSML-on vs SSML-off must
+    // produce DIFFERENT config hashes, since SSML changes how the audio is synthesized.
+    #[test]
+    fn config_hash_differs_for_ssml_input_mode() {
+        let config = create_test_config();
+        let plain = ReverieTtsConfig::from_base(config.clone()).unwrap();
+        let mut ssml = plain.clone();
+        ssml.ssml_input = true;
+
+        let hash_plain = compute_reverie_tts_config_hash(&config, &plain);
+        let hash_ssml = compute_reverie_tts_config_hash(&config, &ssml);
+        assert_ne!(
+            hash_plain, hash_ssml,
+            "ssml_input must change the cache key to avoid serving a literal-text render for SSML"
+        );
     }
 
     // =========================================================================

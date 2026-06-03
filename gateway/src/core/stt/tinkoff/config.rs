@@ -41,6 +41,33 @@ pub struct TinkoffSttConfig {
     #[serde(default)]
     pub single_utterance: bool,
 
+    /// Enable profanity filter (`RecognitionConfig.profanity_filter`).
+    #[serde(default)]
+    pub profanity_filter: bool,
+
+    /// Phrase-boosting speech contexts (`RecognitionConfig.speech_contexts`).
+    #[serde(default)]
+    pub speech_contexts: Vec<SpeechContextConfig>,
+
+    /// Enable denormalization — convert spoken numerals to numeric form
+    /// (`RecognitionConfig.enable_denormalization`).
+    #[serde(default)]
+    pub enable_denormalization: bool,
+
+    /// Enable gender identification (`RecognitionConfig.enable_gender_identification`).
+    #[serde(default)]
+    pub enable_gender_identification: bool,
+
+    /// Disable phrase range detection — all speech recognised as one phrase
+    /// (`RecognitionConfig.do_not_perform_vad`). Mutually exclusive with `vad_config`.
+    #[serde(default)]
+    pub do_not_perform_vad: bool,
+
+    /// Desired interval (seconds) between interim results
+    /// (`InterimResultsConfig.interval`). `None` → service default cadence.
+    #[serde(default)]
+    pub interim_results_interval: Option<f32>,
+
     /// VAD (Voice Activity Detection) configuration
     #[serde(default)]
     pub vad_config: Option<VadConfig>,
@@ -74,6 +101,25 @@ fn default_request_timeout() -> u64 {
     60
 }
 
+/// Coerce a JSON extras value (number or numeric string) into an `f32`.
+fn value_as_f32(v: &serde_json::Value) -> Option<f32> {
+    v.as_f64()
+        .map(|n| n as f32)
+        .or_else(|| v.as_str().and_then(|s| s.parse::<f32>().ok()))
+}
+
+/// Read a string-valued `ProviderExtras` key.
+fn extras_str(
+    std: &crate::core::stt::standard::StandardSTTConfig,
+    key: &str,
+) -> Option<String> {
+    std.extras
+        .0
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 impl Default for TinkoffSttConfig {
     fn default() -> Self {
         Self {
@@ -94,6 +140,12 @@ impl Default for TinkoffSttConfig {
             enable_punctuation: default_punctuation(),
             interim_results: default_interim_results(),
             single_utterance: false,
+            profanity_filter: false,
+            speech_contexts: Vec::new(),
+            enable_denormalization: false,
+            enable_gender_identification: false,
+            do_not_perform_vad: false,
+            interim_results_interval: None,
             vad_config: None,
             connection_timeout_secs: default_connection_timeout(),
             request_timeout_secs: default_request_timeout(),
@@ -102,20 +154,92 @@ impl Default for TinkoffSttConfig {
 }
 
 impl TinkoffSttConfig {
-    /// Build from the standardized config (W1 keystone). Tinkoff's VoiceKit gRPC surface is
-    /// narrow: of the canonical features it can only express interim/partial results, so this
-    /// maps `interim_results` and leaves the rest at provider defaults. Diarization, redaction,
-    /// keyterms, word timestamps, smart formatting, profanity filtering, entity/language
-    /// detection and explicit VAD-event toggles have no corresponding field on this provider and
-    /// are capability gaps (intentionally skipped).
+    /// Build from the standardized config (W1 keystone). Tinkoff's VoiceKit gRPC
+    /// `RecognitionConfig`/`StreamingRecognitionConfig` is richer than previously wired; this maps
+    /// the canonical typed features it CAN express and threads the remaining provider-specific
+    /// knobs through `ProviderExtras`:
+    ///
+    /// Typed → wire:
+    /// - `interim_results`  → `StreamingRecognitionConfig.interim_results_config.enable_interim_results`
+    /// - `profanity_filter` → `RecognitionConfig.profanity_filter` (field 5)
+    /// - `numerals`         → `RecognitionConfig.enable_denormalization` (field 16; spoken→digits)
+    /// - `keyterms`         → `RecognitionConfig.speech_contexts[].phrases[].text` (phrase boosting, field 6)
+    ///
+    /// Extras → wire (provider-specific, no canonical field):
+    /// - `interim_results_config.interval` (f32)        → `InterimResultsConfig.interval` (field 2)
+    /// - `do_not_perform_vad` (bool)                    → `RecognitionConfig.do_not_perform_vad` (field 13)
+    /// - `vad_config.silence_max` (f32)                 → `VoiceActivityDetectionConfig.silence_max` (field 6)
+    /// - `vad_config.silence_min` (f32)                 → `VoiceActivityDetectionConfig.silence_min` (field 7)
+    /// - `enable_gender_identification` (bool)          → `RecognitionConfig.enable_gender_identification` (field 18)
+    /// - `speech_context_dictionary_id` (string)        → `SpeechContext.speech_context_dictionary_id` (field 4)
+    ///
+    /// Word timestamps, smart formatting, redaction, entity/language detection have no field on
+    /// this provider and stay at defaults (capability gaps).
     pub fn from_standard(
         std: &crate::core::stt::standard::StandardSTTConfig,
     ) -> Result<Self, String> {
         let f = &std.features;
         let mut cfg = Self::from_base(std.base.clone())?;
+
+        // ---- typed features ----
         if let Some(i) = f.interim_results {
             cfg.interim_results = i;
         }
+        if let Some(p) = f.profanity_filter {
+            cfg.profanity_filter = p;
+        }
+        // Canonical `numerals` = "convert spoken numbers to digits" == Tinkoff denormalization.
+        if let Some(n) = f.numerals {
+            cfg.enable_denormalization = n;
+        }
+        // Phrase boosting: canonical keyterms map to a single SpeechContext of phrases.
+        if let Some(terms) = &f.keyterms {
+            let phrases: Vec<SpeechContextPhraseConfig> = terms
+                .iter()
+                .filter(|t| !t.is_empty())
+                .map(|t| SpeechContextPhraseConfig {
+                    text: t.clone(),
+                    score: None,
+                })
+                .collect();
+            if !phrases.is_empty() {
+                cfg.speech_contexts.push(SpeechContextConfig {
+                    phrases,
+                    speech_context_dictionary_id: extras_str(
+                        std,
+                        "speech_context_dictionary_id",
+                    ),
+                });
+            }
+        }
+
+        // ---- ProviderExtras passthrough ----
+        let extras = &std.extras.0;
+        if let Some(v) = extras.get("interim_results_config.interval").and_then(value_as_f32) {
+            cfg.interim_results_interval = Some(v);
+        }
+        if let Some(b) = extras.get("do_not_perform_vad").and_then(|v| v.as_bool()) {
+            cfg.do_not_perform_vad = b;
+        }
+        if let Some(b) = extras
+            .get("enable_gender_identification")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.enable_gender_identification = b;
+        }
+        let silence_max = extras.get("vad_config.silence_max").and_then(value_as_f32);
+        let silence_min = extras.get("vad_config.silence_min").and_then(value_as_f32);
+        if silence_max.is_some() || silence_min.is_some() {
+            let mut vad = cfg.vad_config.take().unwrap_or_default();
+            if let Some(v) = silence_max {
+                vad.silence_max = v;
+            }
+            if let Some(v) = silence_min {
+                vad.silence_min = v;
+            }
+            cfg.vad_config = Some(vad);
+        }
+
         Ok(cfg)
     }
 
@@ -152,6 +276,12 @@ impl TinkoffSttConfig {
             enable_punctuation: default_punctuation(),
             interim_results: default_interim_results(),
             single_utterance: false,
+            profanity_filter: false,
+            speech_contexts: Vec::new(),
+            enable_denormalization: false,
+            enable_gender_identification: false,
+            do_not_perform_vad: false,
+            interim_results_interval: None,
             vad_config: None,
             connection_timeout_secs: default_connection_timeout(),
             request_timeout_secs: default_request_timeout(),
@@ -262,6 +392,27 @@ impl TinkoffAudioEncoding {
     }
 }
 
+/// A phrase to boost (or suppress) during recognition (`SpeechContextPhrase`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SpeechContextPhraseConfig {
+    /// Phrase text.
+    pub text: String,
+    /// Phrase score (recommended `[1.0, 10.0]`). `None` → service default of `1.0`.
+    #[serde(default)]
+    pub score: Option<f32>,
+}
+
+/// A set of phrases to be recognised with higher (or lower) probability (`SpeechContext`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SpeechContextConfig {
+    /// Phrases to recognise with higher (or lower) probability.
+    #[serde(default)]
+    pub phrases: Vec<SpeechContextPhraseConfig>,
+    /// Use a cloud-stored speech-context object by dictionary id.
+    #[serde(default)]
+    pub speech_context_dictionary_id: Option<String>,
+}
+
 /// Voice Activity Detection configuration
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VadConfig {
@@ -277,6 +428,14 @@ pub struct VadConfig {
     /// Silence probability threshold (0.0 to 1.0)
     #[serde(default)]
     pub silence_prob_threshold: f32,
+    /// Maximum duration of silence (seconds) required to end a phrase
+    /// (`VoiceActivityDetectionConfig.silence_max`).
+    #[serde(default)]
+    pub silence_max: f32,
+    /// Minimum duration of silence (seconds) required to end a phrase
+    /// (`VoiceActivityDetectionConfig.silence_min`).
+    #[serde(default)]
+    pub silence_min: f32,
 }
 
 #[cfg(test)]
@@ -392,5 +551,57 @@ mod tests {
         assert_eq!(vad.max_speech_duration, 0.0);
         assert_eq!(vad.silence_duration_threshold, 0.0);
         assert_eq!(vad.silence_prob_threshold, 0.0);
+        assert_eq!(vad.silence_max, 0.0);
+        assert_eq!(vad.silence_min, 0.0);
+    }
+
+    // from_standard mapping guard: the typed + extras features land on the provider config the
+    // wire encoder reads. (That they reach the ENCODED bytes is asserted in provider.rs's
+    // wire-level test via `create_streaming_config(..).encode()`.)
+    #[test]
+    fn from_standard_maps_new_features_onto_config() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let mut extras = serde_json::Map::new();
+        extras.insert("interim_results_config.interval".into(), serde_json::json!(0.3));
+        extras.insert("do_not_perform_vad".into(), serde_json::json!(true));
+        extras.insert("enable_gender_identification".into(), serde_json::json!(true));
+        extras.insert("vad_config.silence_max".into(), serde_json::json!(1.5));
+        extras.insert("vad_config.silence_min".into(), serde_json::json!(0.2));
+        extras.insert(
+            "speech_context_dictionary_id".into(),
+            serde_json::json!("dict-7"),
+        );
+
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "tinkoff".into(),
+                api_key: "test-api-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                profanity_filter: Some(true),
+                numerals: Some(true),
+                keyterms: Some(vec!["Тинькофф".into(), "WaaV".into()]),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = TinkoffSttConfig::from_standard(&std).unwrap();
+
+        assert!(cfg.profanity_filter);
+        assert!(cfg.enable_denormalization); // from numerals
+        assert!(cfg.enable_gender_identification);
+        assert!(cfg.do_not_perform_vad);
+        assert_eq!(cfg.interim_results_interval, Some(0.3));
+        assert_eq!(cfg.speech_contexts.len(), 1);
+        assert_eq!(cfg.speech_contexts[0].phrases.len(), 2);
+        assert_eq!(cfg.speech_contexts[0].phrases[0].text, "Тинькофф");
+        assert_eq!(
+            cfg.speech_contexts[0].speech_context_dictionary_id.as_deref(),
+            Some("dict-7")
+        );
+        let vad = cfg.vad_config.as_ref().expect("vad config built from extras");
+        assert_eq!(vad.silence_max, 1.5);
+        assert_eq!(vad.silence_min, 0.2);
     }
 }

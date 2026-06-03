@@ -474,6 +474,48 @@ pub struct AwsTranscribeSTTConfig {
     #[serde(default)]
     pub preferred_language: Vec<String>,
 
+    /// Candidate language list for language identification (`LanguageOptions`,
+    /// wire header `x-amzn-transcribe-language-options`). A comma-separated list of
+    /// language codes the identifier should choose between. Carried via `ProviderExtras`
+    /// (`language_options`). Only meaningful when `identify_language` /
+    /// `identify_multiple_languages` is on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub language_options: Vec<String>,
+
+    /// Multi-language (code-switching) identification (`IdentifyMultipleLanguages`,
+    /// wire header `x-amzn-transcribe-identify-multiple-languages`). When true, Transcribe
+    /// detects multiple languages within a single stream. Carried via `ProviderExtras`
+    /// (`identify_multiple_languages`).
+    #[serde(default)]
+    pub identify_multiple_languages: bool,
+
+    /// Custom vocabulary names for language-ID mode (`VocabularyNames`, wire header
+    /// `x-amzn-transcribe-vocabulary-names`). A comma-separated list of custom vocabularies,
+    /// one per candidate language. Distinct from the single-language `vocabulary_name`.
+    /// Carried via `ProviderExtras` (`vocabulary_names`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vocabulary_names: Option<String>,
+
+    /// Custom vocabulary filter names for language-ID mode (`VocabularyFilterNames`, wire header
+    /// `x-amzn-transcribe-vocabulary-filter-names`). Comma-separated, one per candidate language.
+    /// Distinct from the single-language `vocabulary_filter_name`. Carried via `ProviderExtras`
+    /// (`vocabulary_filter_names`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vocabulary_filter_names: Option<String>,
+
+    /// Session resume window in minutes (`SessionResumeWindow`, wire header
+    /// `x-amzn-transcribe-session-resume-window`). How long a dropped session may be resumed.
+    /// Carried via `ProviderExtras` (`session_resume_window`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_resume_window: Option<i32>,
+
+    /// PII content identification — FLAG (not redact) mode (`ContentIdentificationType`,
+    /// wire header `x-amzn-transcribe-content-identification-type`). Tags PII in the
+    /// transcript instead of masking it (distinct from `enable_content_redaction`). The only
+    /// accepted value is `PII`. Carried via `ProviderExtras` (`content_identification_type`).
+    #[serde(default)]
+    pub enable_content_identification: bool,
+
     /// Enable content redaction (e.g., PII masking)
     #[serde(default)]
     pub enable_content_redaction: bool,
@@ -533,6 +575,12 @@ impl Default for AwsTranscribeSTTConfig {
             language_model_name: None,
             identify_language: false,
             preferred_language: Vec::new(),
+            language_options: Vec::new(),
+            identify_multiple_languages: false,
+            vocabulary_names: None,
+            vocabulary_filter_names: None,
+            session_resume_window: None,
+            enable_content_identification: false,
             enable_content_redaction: false,
             content_redaction_types: Vec::new(),
             pii_entity_types: Vec::new(),
@@ -548,6 +596,7 @@ impl AwsTranscribeSTTConfig {
     /// plus partial-results stabilization, through the standardized API.
     pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
         let f = &std.features;
+        let ex = &std.extras.0;
         let mut cfg = Self {
             base: std.base.clone(),
             ..Default::default()
@@ -565,6 +614,59 @@ impl AwsTranscribeSTTConfig {
             cfg.enable_content_redaction = true;
             cfg.pii_entity_types = r.clone();
         }
+
+        // --- Newly-wired StartStreamTranscription features (all provider-specific → extras) ----
+        // These have no canonical typed `SttFeatures` field, so they ride the open
+        // `ProviderExtras` passthrough. Each maps to a documented `x-amzn-transcribe-*` request
+        // header serialized by the aws-sdk-transcribestreaming `StartStreamTranscriptionInput`
+        // (confirmed against the SDK protocol_serde header serializer, June 2026).
+
+        // `language_options` (x-amzn-transcribe-language-options): comma-separated string OR JSON
+        // array of language codes. Accept either form so callers can pass a list or a string.
+        cfg.language_options = match ex.get("language_options") {
+            Some(serde_json::Value::String(s)) => {
+                s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
+            }
+            Some(serde_json::Value::Array(a)) => a
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        // `identify_multiple_languages` (x-amzn-transcribe-identify-multiple-languages).
+        cfg.identify_multiple_languages = ex
+            .get("identify_multiple_languages")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // `vocabulary_names` (x-amzn-transcribe-vocabulary-names): comma-separated list for
+        // language-ID mode (distinct from the single-language `vocabulary_name`).
+        cfg.vocabulary_names = ex
+            .get("vocabulary_names")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        // `vocabulary_filter_names` (x-amzn-transcribe-vocabulary-filter-names): language-ID mode.
+        cfg.vocabulary_filter_names = ex
+            .get("vocabulary_filter_names")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        // `session_resume_window` (x-amzn-transcribe-session-resume-window): minutes.
+        cfg.session_resume_window = ex
+            .get("session_resume_window")
+            .and_then(|v| v.as_i64())
+            .map(|n| n as i32);
+
+        // `content_identification_type` (x-amzn-transcribe-content-identification-type): PII FLAG
+        // mode (not redaction). Accept a bool toggle or the literal "PII" string.
+        cfg.enable_content_identification = match ex.get("content_identification_type") {
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(serde_json::Value::String(s)) => s.eq_ignore_ascii_case("pii"),
+            _ => false,
+        };
+
         cfg
     }
 

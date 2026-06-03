@@ -378,37 +378,14 @@ impl OpenAISTT {
             .mime_str(config.audio_input_format.mime_type())
             .map_err(|e| STTError::ConfigurationError(format!("Invalid MIME type: {e}")))?;
 
-        let mut form = Form::new()
-            .part("file", file_part)
-            .text("model", config.model.as_str().to_string())
-            .text(
-                "response_format",
-                config.response_format.as_str().to_string(),
-            );
+        let mut form = Form::new().part("file", file_part);
 
-        // Add optional parameters
-        if !config.base.language.is_empty() {
-            form = form.text("language", config.base.language.clone());
-        }
-
-        if let Some(temp) = config.temperature {
-            form = form.text("temperature", temp.to_string());
-        }
-
-        if let Some(ref prompt) = config.prompt {
-            form = form.text("prompt", prompt.clone());
-        }
-
-        // Add timestamp granularities for verbose_json format
-        if config.response_format == ResponseFormat::VerboseJson
-            && !config.timestamp_granularities.is_empty()
-        {
-            for granularity in &config.timestamp_granularities {
-                form = form.text(
-                    "timestamp_granularities[]",
-                    granularity.as_str().to_string(),
-                );
-            }
+        // All text form fields (model, response_format, language, temperature, prompt,
+        // timestamp_granularities[], stream, include[]=logprobs, chunking_strategy,
+        // known_speaker_names[], known_speaker_references[]) come from the single wire-surface
+        // builder so what is tested is exactly what is sent. See `transcription_text_fields`.
+        for (key, value) in config.transcription_text_fields() {
+            form = form.text(key, value);
         }
 
         // Send request to OpenAI API

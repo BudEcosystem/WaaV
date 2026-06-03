@@ -449,6 +449,18 @@ pub struct TencentTtsConfig {
 
     /// Region (for domestic API).
     pub region: Option<String>,
+
+    /// Model type selection (`ModelType` in the TextToVoice request; 0 = standard, 1 = premium
+    /// per the Tencent Cloud TTS docs). `None` omits the field so the account default applies.
+    pub model_type: Option<i64>,
+
+    /// Fast voice clone selection (`FastVoiceType` in the TextToVoice request — the cloned
+    /// voice's identifier). `None` omits the field.
+    pub fast_voice_type: Option<String>,
+
+    /// Speech segmentation sensitivity (`SegmentRate` in the TextToVoice request; 0 = off,
+    /// 1 = light, 2 = aggressive per the docs). `None` omits the field.
+    pub segment_rate: Option<i64>,
 }
 
 impl Default for TencentTtsConfig {
@@ -468,6 +480,9 @@ impl Default for TencentTtsConfig {
             emotion_category: None,
             emotion_intensity: None,
             region: None,
+            model_type: None,
+            fast_voice_type: None,
+            segment_rate: None,
         }
     }
 }
@@ -673,7 +688,8 @@ impl TencentTtsConfig {
     /// `with_speed`) and `volume` -> `volume` (clamped to `MIN_VOLUME..=MAX_VOLUME`, matching
     /// `with_volume`). `word_timestamps` toggles `enable_subtitles` and `emotion` maps to the
     /// emotional-voice `emotion_category` field. Tencent's non-standard knobs (`project_id`,
-    /// `use_intl_endpoint`, `emotion_intensity`, `primary_language`, `region`) are read from the
+    /// `use_intl_endpoint`, `emotion_intensity`, `primary_language`, `region`, plus the TextToVoice
+    /// `model_type` / `fast_voice_type` / `segment_rate` synthesis knobs) are read from the
     /// `extras` passthrough. Features without a Tencent field (pitch, stability, similarity_boost,
     /// style, use_speaker_boost, instructions, ssml, language, streaming, seed, sample_rate) are
     /// skipped.
@@ -724,6 +740,21 @@ impl TencentTtsConfig {
         if let Some(region) = std.extras.0.get("region").and_then(|v| v.as_str()) {
             cfg.region = Some(region.to_string());
         }
+        // TextToVoice synthesis knobs (audio-changing): model type, fast voice clone, segmentation.
+        if let Some(model_type) = std.extras.0.get("ModelType").and_then(|v| v.as_i64()) {
+            cfg.model_type = Some(model_type);
+        }
+        if let Some(fast_voice_type) = std
+            .extras
+            .0
+            .get("FastVoiceType")
+            .and_then(|v| v.as_str())
+        {
+            cfg.fast_voice_type = Some(fast_voice_type.to_string());
+        }
+        if let Some(segment_rate) = std.extras.0.get("SegmentRate").and_then(|v| v.as_i64()) {
+            cfg.segment_rate = Some(segment_rate);
+        }
 
         Ok(cfg)
     }
@@ -773,6 +804,30 @@ mod tests {
         assert!(!cfg.use_intl_endpoint);
         assert_eq!(cfg.emotion_intensity, Some(150));
         assert_eq!(cfg.region, Some("ap-guangzhou".to_string()));
+    }
+
+    // The TextToVoice synthesis knobs (ModelType / FastVoiceType / SegmentRate) arrive via the
+    // `extras` passthrough using their exact wire names and reach the config fields.
+    #[test]
+    fn from_standard_maps_textovoice_synthesis_knobs_from_extras() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("ModelType".into(), serde_json::json!(1));
+        extras.insert("FastVoiceType".into(), serde_json::json!("clone-voice-42"));
+        extras.insert("SegmentRate".into(), serde_json::json!(2));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "tencent".into(),
+                api_key: "secret_id|secret_key".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        let cfg = TencentTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.model_type, Some(1));
+        assert_eq!(cfg.fast_voice_type, Some("clone-voice-42".to_string()));
+        assert_eq!(cfg.segment_rate, Some(2));
     }
 
     // =========================================================================

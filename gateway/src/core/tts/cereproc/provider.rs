@@ -460,6 +460,59 @@ mod tests {
         assert_eq!(tts.cereproc_config.sample_rate, 16000);
     }
 
+    // WIRE-LEVEL capability-gap tripwire: `features.language`, `features.streaming`, and
+    // `extras["accent"]` have no parameter on the v2 `/speak` endpoint (language/accent are
+    // determined by the voice; `/speak` returns a fileUrl, not a stream). This test asserts that
+    // none of them leak onto the wire — neither into the query string nor the XML body — so a
+    // future change that fabricates them as `/speak` params fails here. Confirmed against the
+    // published CereVoice Cloud v2 client surface: `/speak` accepts only
+    // voice/audioFormat/sampleRate/audio3D/metadata.
+    #[test]
+    fn from_standard_language_streaming_accent_are_capability_gaps_off_the_wire() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("accent".into(), serde_json::json!("us"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "cereproc".into(),
+                api_key: "user@example.com:password123".into(),
+                voice_id: Some("Stuart".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                language: Some("fr-FR".into()),
+                streaming: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let tts = CereprocTts::from_standard(&std).unwrap();
+
+        // Build a real request with a known token and inspect URL query + XML body.
+        let builder = CereprocRequestBuilder::new(
+            tts.cereproc_config.clone(),
+            tts.base_config.clone(),
+            "tok".into(),
+        );
+        let client = reqwest::Client::new();
+        let request = builder.build_http_request(&client, "Bonjour").build().unwrap();
+
+        let query = request.url().query().unwrap_or("");
+        // The voice is the only language/accent carrier; no lang/accent/streaming query params.
+        assert!(query.contains("voice=Stuart"), "voice missing: {query}");
+        assert!(!query.contains("lang"), "language leaked to /speak query: {query}");
+        assert!(!query.contains("accent"), "accent leaked to /speak query: {query}");
+        assert!(
+            !query.contains("stream"),
+            "streaming leaked to /speak query: {query}"
+        );
+
+        let body = request.body().unwrap().as_bytes().unwrap();
+        let body_str = std::str::from_utf8(body).unwrap();
+        assert!(!body_str.contains("lang"), "language leaked to body: {body_str}");
+        assert!(!body_str.contains("accent"), "accent leaked to body: {body_str}");
+    }
+
     #[test]
     fn test_cereproc_tts_creation() {
         // With valid credentials

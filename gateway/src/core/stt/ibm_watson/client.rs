@@ -963,6 +963,25 @@ impl BaseSTT for IbmWatsonSTT {
                 .is_some_and(|c| c.split_transcript_at_phrase_end),
             low_latency: existing.as_ref().is_some_and(|c| c.low_latency),
             character_insertion_bias: existing.as_ref().and_then(|c| c.character_insertion_bias),
+            keywords: existing
+                .as_ref()
+                .map(|c| c.keywords.clone())
+                .unwrap_or_default(),
+            keywords_threshold: existing.as_ref().and_then(|c| c.keywords_threshold),
+            max_alternatives: existing.as_ref().and_then(|c| c.max_alternatives),
+            word_alternatives_threshold: existing
+                .as_ref()
+                .and_then(|c| c.word_alternatives_threshold),
+            customization_weight: existing.as_ref().and_then(|c| c.customization_weight),
+            base_model_version: existing.as_ref().and_then(|c| c.base_model_version.clone()),
+            grammar_name: existing.as_ref().and_then(|c| c.grammar_name.clone()),
+            audio_metrics: existing.as_ref().is_some_and(|c| c.audio_metrics),
+            processing_metrics: existing.as_ref().is_some_and(|c| c.processing_metrics),
+            processing_metrics_interval: existing
+                .as_ref()
+                .and_then(|c| c.processing_metrics_interval),
+            smart_formatting_version: existing.as_ref().and_then(|c| c.smart_formatting_version),
+            speech_begin_event: existing.as_ref().is_some_and(|c| c.speech_begin_event),
         };
 
         self.config = Some(ibm_config);

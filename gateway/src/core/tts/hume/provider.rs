@@ -102,9 +102,14 @@ impl HumeRequestBuilder {
         self.previous_text = text;
     }
 
-    /// Builds the voice specification for the request.
+    /// Builds the voice specification for the request, including the optional `provider`
+    /// (voice library: HUME_AI / CUSTOM_VOICE) when configured.
     fn build_voice_spec(&self) -> HumeVoiceSpec {
-        HumeVoiceSpec::by_name(self.hume_config.voice_name())
+        let spec = HumeVoiceSpec::by_name(self.hume_config.voice_name());
+        match &self.hume_config.voice_provider {
+            Some(p) => spec.with_provider(p.clone()),
+            None => spec,
+        }
     }
 
     /// Builds the output format for the request.
@@ -148,6 +153,26 @@ impl HumeRequestBuilder {
         // Add num_generations if configured
         if let Some(num) = self.hume_config.num_generations {
             request = request.with_num_generations(num);
+        }
+
+        // Top-level timestamp granularities (typed feature).
+        if let Some(types) = &self.hume_config.include_timestamp_types {
+            request = request.with_include_timestamp_types(types.clone());
+        }
+
+        // Top-level sampling temperature (extras passthrough).
+        if let Some(temp) = self.hume_config.temperature {
+            request = request.with_temperature(temp);
+        }
+
+        // Top-level split_utterances (extras passthrough).
+        if let Some(split) = self.hume_config.split_utterances {
+            request = request.with_split_utterances(split);
+        }
+
+        // Top-level strip_headers (extras passthrough).
+        if let Some(strip) = self.hume_config.strip_headers {
+            request = request.with_strip_headers(strip);
         }
 
         request
@@ -297,6 +322,28 @@ fn compute_hume_tts_config_hash(config: &TTSConfig, hume_config: &HumeTTSConfig)
     // Speaking rate from base config
     if let Some(rate) = config.speaking_rate {
         s.push_str(&format!("{rate:.3}"));
+    }
+    s.push('|');
+
+    // Audio-changing advanced features (cache-collision guard — prior-review bug class):
+    //   voice_provider (selects the voice engine/library), temperature (sampling variation),
+    //   split_utterances (changes segmentation/prosody), strip_headers (changes returned byte
+    //   framing). `include_timestamp_types` is metadata-only and deliberately excluded — it does
+    //   NOT change the synthesized audio, so it must not fragment the cache.
+    if let Some(p) = &hume_config.voice_provider {
+        s.push_str(p);
+    }
+    s.push('|');
+    if let Some(t) = hume_config.temperature {
+        s.push_str(&format!("{t:.4}"));
+    }
+    s.push('|');
+    if let Some(split) = hume_config.split_utterances {
+        s.push_str(if split { "1" } else { "0" });
+    }
+    s.push('|');
+    if let Some(strip) = hume_config.strip_headers {
+        s.push_str(if strip { "1" } else { "0" });
     }
 
     // Compute xxHash3-128 and format as hex
@@ -705,6 +752,121 @@ mod tests {
         assert_eq!(tts.hume_config().speed, Some(1.3));
     }
 
+    // WIRE-LEVEL: the stream_file features must reach the actual POST body at the correct JSON
+    // locations (voice.provider is per-utterance inside the voice object; the rest are top-level).
+    // We build the real HTTP request and parse its body — not just inspect the config struct.
+    #[test]
+    fn stream_file_features_reach_post_body() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("voice_provider".into(), serde_json::json!("HUME_AI"));
+        extras.insert("temperature".into(), serde_json::json!(0.7));
+        extras.insert("split_utterances".into(), serde_json::json!(false));
+        extras.insert("strip_headers".into(), serde_json::json!(true));
+
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                include_timestamp_types: Some(vec!["word".into(), "phoneme".into()]),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let tts = HumeTTS::from_standard(&std).unwrap();
+
+        let client = reqwest::Client::new();
+        let request = tts
+            .request_builder
+            .build_http_request(&client, "Hello world")
+            .build()
+            .unwrap();
+        let body = request.body().unwrap().as_bytes().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(body).unwrap();
+
+        // voice.provider is a sibling of voice.name inside the utterance's voice object.
+        assert_eq!(
+            v["utterances"][0]["voice"]["provider"], "HUME_AI",
+            "voice_provider must reach utterances[].voice.provider"
+        );
+        // The remaining four are top-level fields.
+        assert_eq!(
+            v["include_timestamp_types"],
+            serde_json::json!(["word", "phoneme"]),
+            "include_timestamp_types must reach the top-level request body"
+        );
+        assert_eq!(v["temperature"], 0.7, "temperature must reach the body");
+        assert_eq!(
+            v["split_utterances"], false,
+            "split_utterances must reach the body"
+        );
+        assert_eq!(
+            v["strip_headers"], true,
+            "strip_headers must reach the body"
+        );
+    }
+
+    // When none of the new features are set, none of the keys appear in the wire body — default
+    // behavior is unchanged (skip_serializing_if guard).
+    #[test]
+    fn stream_file_features_absent_by_default() {
+        let config = create_test_config();
+        let hume_config = HumeTTSConfig::from_base(config.clone());
+        let builder = HumeRequestBuilder::new(config, hume_config);
+
+        let client = reqwest::Client::new();
+        let request = builder
+            .build_http_request(&client, "Hi")
+            .build()
+            .unwrap();
+        let body = request.body().unwrap().as_bytes().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(body).unwrap();
+
+        assert!(v.get("include_timestamp_types").is_none());
+        assert!(v.get("temperature").is_none());
+        assert!(v.get("split_utterances").is_none());
+        assert!(v.get("strip_headers").is_none());
+        // The voice object carries no provider when unset.
+        assert!(v["utterances"][0]["voice"].get("provider").is_none());
+    }
+
+    // Cache-collision guard: each AUDIO-CHANGING field changes the cache hash so two configs that
+    // differ only in that field do NOT collide on a cached audio blob (prior-review bug class).
+    #[test]
+    fn audio_changing_features_change_cache_hash() {
+        let config = create_test_config();
+        let base = HumeTTSConfig::from_base(config.clone());
+        let base_hash = compute_hume_tts_config_hash(&config, &base);
+
+        let mut with_provider = base.clone();
+        with_provider.voice_provider = Some("CUSTOM_VOICE".into());
+        let mut with_temp = base.clone();
+        with_temp.temperature = Some(0.9);
+        let mut with_split = base.clone();
+        with_split.split_utterances = Some(false);
+        let mut with_strip = base.clone();
+        with_strip.strip_headers = Some(true);
+
+        assert_ne!(base_hash, compute_hume_tts_config_hash(&config, &with_provider));
+        assert_ne!(base_hash, compute_hume_tts_config_hash(&config, &with_temp));
+        assert_ne!(base_hash, compute_hume_tts_config_hash(&config, &with_split));
+        assert_ne!(base_hash, compute_hume_tts_config_hash(&config, &with_strip));
+    }
+
+    // include_timestamp_types is metadata-only: it must NOT fragment the audio cache.
+    #[test]
+    fn include_timestamp_types_does_not_change_cache_hash() {
+        let config = create_test_config();
+        let base = HumeTTSConfig::from_base(config.clone());
+        let mut with_ts = base.clone();
+        with_ts.include_timestamp_types = Some(vec!["word".into()]);
+        assert_eq!(
+            compute_hume_tts_config_hash(&config, &base),
+            compute_hume_tts_config_hash(&config, &with_ts),
+            "timestamp-type request is metadata-only and must not fragment the audio cache"
+        );
+    }
+
     #[test]
     fn test_hume_request_builder_new() {
         let config = create_test_config();
@@ -751,7 +913,7 @@ mod tests {
 
         let voice_spec = builder.build_voice_spec();
         match voice_spec {
-            HumeVoiceSpec::ByName { name } => assert_eq!(name, "Kora"),
+            HumeVoiceSpec::ByName { name, .. } => assert_eq!(name, "Kora"),
             _ => panic!("Expected ByName variant"),
         }
     }

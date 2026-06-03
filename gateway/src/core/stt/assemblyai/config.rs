@@ -222,6 +222,42 @@ pub struct AssemblyAISTTConfig {
     /// with the multilingual model; AssemblyAI ignores it for the English-only model.
     pub language_detection: bool,
 
+    /// Streaming speaker diarization (who-spoke-when).
+    ///
+    /// Maps the standardized typed `diarization` feature onto AssemblyAI v3 streaming's
+    /// `speaker_labels` connection query parameter. (Confirmed June 2026 against the v3
+    /// streaming AsyncAPI query-parameter schema: `speaker_labels` true/false.) Off by
+    /// default so the URL matches the provider default when unset.
+    pub speaker_labels: bool,
+
+    /// Hint for the maximum number of speakers to detect (1–10). Only meaningful when
+    /// `speaker_labels` is on. Maps to the `max_speakers` connection query parameter.
+    /// Carried via `ProviderExtras` (`max_speakers`) — no typed field on `SttFeatures`.
+    pub max_speakers: Option<u8>,
+
+    /// Maximum silence (ms) within a turn before AssemblyAI forces a turn boundary
+    /// (endpointing). Maps the standardized typed `endpointing_ms` feature onto the
+    /// `max_turn_silence` connection query parameter.
+    pub max_turn_silence: Option<u32>,
+
+    /// Minimum silence (ms) that must elapse before a turn can end. Maps to the
+    /// `min_turn_silence` connection query parameter. Carried via `ProviderExtras`
+    /// (`min_turn_silence`) — no typed field on `SttFeatures`.
+    pub min_turn_silence: Option<u32>,
+
+    /// Voice-activity-detection silence threshold (0.0–1.0). Maps to the `vad_threshold`
+    /// connection query parameter. Carried via `ProviderExtras` (`vad_threshold`).
+    pub vad_threshold: Option<f32>,
+
+    /// Inactivity timeout (seconds, 5–3600) after which AssemblyAI ends an idle session.
+    /// Maps to the `inactivity_timeout` connection query parameter. Carried via
+    /// `ProviderExtras` (`inactivity_timeout`).
+    pub inactivity_timeout: Option<u32>,
+
+    /// Domain-specific model selection (e.g. `medical-v1`). Maps to the `domain`
+    /// connection query parameter. Carried via `ProviderExtras` (`domain`).
+    pub domain: Option<String>,
+
     /// Override the WebSocket base endpoint (scheme://host[:port]) — e.g. `ws://127.0.0.1:PORT`
     /// for a local mock (W-T0 harness) or a proxy. When `None`, the regional production
     /// endpoint is used. Generalizes the OpenAI `OPENAI_BASE_URL` pattern; required so the
@@ -241,6 +277,13 @@ impl Default for AssemblyAISTTConfig {
             include_word_timestamps: true, // Always available in v3
             keyterms_prompt: Vec::new(),   // No boost terms by default
             language_detection: false,     // Off by default (multilingual model only)
+            speaker_labels: false,         // Off by default (provider default)
+            max_speakers: None,            // Provider default (no hint)
+            max_turn_silence: None,        // Provider default endpointing
+            min_turn_silence: None,        // Provider default endpointing
+            vad_threshold: None,           // Provider default VAD threshold
+            inactivity_timeout: None,      // Provider default session timeout
+            domain: None,                  // Provider default (no domain model)
             endpoint_override: None,
         }
     }
@@ -299,6 +342,53 @@ impl AssemblyAISTTConfig {
         // so the URL matches the provider default (`language_detection=false`) when off.
         if self.language_detection {
             url.push_str("&language_detection=true");
+        }
+
+        // Streaming speaker diarization (`speaker_labels`). Only emit when enabled so the URL
+        // matches the provider default (`speaker_labels=false`) when off — same omit-when-default
+        // discipline as `language_detection`.
+        if self.speaker_labels {
+            url.push_str("&speaker_labels=true");
+
+            // `max_speakers` is only meaningful alongside diarization; the server ignores it
+            // otherwise, so gate it behind `speaker_labels` to keep the URL faithful to intent.
+            if let Some(n) = self.max_speakers {
+                let n = n.clamp(1, 10);
+                url.push_str("&max_speakers=");
+                url.push_str(&n.to_string());
+            }
+        }
+
+        // Endpointing knobs (milliseconds). Emit only when explicitly set; otherwise the server
+        // uses its own defaults and the URL stays minimal.
+        if let Some(ms) = self.max_turn_silence {
+            url.push_str("&max_turn_silence=");
+            url.push_str(&ms.to_string());
+        }
+        if let Some(ms) = self.min_turn_silence {
+            url.push_str("&min_turn_silence=");
+            url.push_str(&ms.to_string());
+        }
+
+        // VAD silence threshold (0.0–1.0).
+        if let Some(t) = self.vad_threshold {
+            url.push_str("&vad_threshold=");
+            url.push_str(&format!("{:.2}", t.clamp(0.0, 1.0)));
+        }
+
+        // Inactivity timeout (seconds, clamped to the documented 5–3600 range).
+        if let Some(secs) = self.inactivity_timeout {
+            let secs = secs.clamp(5, 3600);
+            url.push_str("&inactivity_timeout=");
+            url.push_str(&secs.to_string());
+        }
+
+        // Domain-specific model (e.g. `medical-v1`). URL-encode in case of punctuation.
+        if let Some(domain) = &self.domain {
+            if !domain.is_empty() {
+                url.push_str("&domain=");
+                url.push_str(&encode_query_value(domain));
+            }
         }
 
         // Keyterm prompting: AssemblyAI v3 streaming's `keyterms_prompt`. The canonical
@@ -362,10 +452,50 @@ impl AssemblyAISTTConfig {
     pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
         let mut cfg = Self::from_base(std.base.clone());
         let f = &std.features;
+        let ex = &std.extras.0;
 
         if let Some(w) = f.word_timestamps {
             cfg.include_word_timestamps = w;
         }
+
+        // Streaming speaker diarization — typed `diarization` maps to the v3 streaming
+        // `speaker_labels` connection query parameter (confirmed June 2026 against the v3
+        // streaming AsyncAPI query-parameter schema). This is the STREAMING diarization knob,
+        // distinct from the batch `speaker_labels` request field.
+        if let Some(d) = f.diarization {
+            cfg.speaker_labels = d;
+        }
+        // Max-speakers hint (`max_speakers`, 1–10) — provider-specific, via extras passthrough.
+        cfg.max_speakers = ex
+            .get("max_speakers")
+            .and_then(|v| v.as_u64())
+            .map(|n| n.min(u8::MAX as u64) as u8);
+
+        // Endpointing: typed `endpointing_ms` → `max_turn_silence` (ms). `min_turn_silence` has
+        // no typed field, so it rides the extras passthrough.
+        cfg.max_turn_silence = f.endpointing_ms;
+        cfg.min_turn_silence = ex
+            .get("min_turn_silence")
+            .and_then(|v| v.as_u64())
+            .map(|n| n.min(u32::MAX as u64) as u32);
+
+        // VAD silence threshold (`vad_threshold`, 0.0–1.0) — provider-specific, via extras.
+        cfg.vad_threshold = ex
+            .get("vad_threshold")
+            .and_then(|v| v.as_f64())
+            .map(|t| t as f32);
+
+        // Inactivity timeout (`inactivity_timeout`, seconds) — provider-specific, via extras.
+        cfg.inactivity_timeout = ex
+            .get("inactivity_timeout")
+            .and_then(|v| v.as_u64())
+            .map(|n| n.min(u32::MAX as u64) as u32);
+
+        // Domain-specific model (`domain`, e.g. "medical-v1") — provider-specific, via extras.
+        cfg.domain = ex
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         // Keyterm prompting — AssemblyAI v3 streaming supports `keyterms_prompt` as a connection
         // query param (canonical: a URL-encoded JSON array; max 100 terms, ≤50 chars each). This
@@ -397,8 +527,9 @@ impl AssemblyAISTTConfig {
         //                               (mapped above from `keyterms`), so we never emit word_boost.
         //   - `f.sentiment`           → `sentiment_analysis` is batch-only; absent from streaming.
         //   - `f.entity_detection`    → `entity_detection` is batch-only; absent from streaming.
-        // Also unchanged from the prior gap notes: diarization is exposed differently here, and
-        // endpointing is a confidence threshold (not ms), so those stay at provider defaults too.
+        // (diarization and endpointing ARE now wired above: streaming exposes them as
+        // `speaker_labels` and `max_turn_silence` respectively — confirmed against the v3
+        // streaming AsyncAPI query-parameter schema, June 2026.)
         let _ = (f.sentiment, f.entity_detection); // referenced so intent is explicit, not wired.
 
         cfg
@@ -656,7 +787,7 @@ mod tests {
     // the struct.
     // =========================================================================
 
-    use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+    use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
 
     /// keyterms (standardized) → `keyterms_prompt` connection query param. AssemblyAI v3
     /// streaming uses `keyterms_prompt` (a URL-encoded JSON array), NOT the batch-only
@@ -811,5 +942,165 @@ mod tests {
         );
         // And `word_boost` is never emitted (streaming uses keyterms_prompt).
         assert!(!url.contains("word_boost"), "word_boost must not appear: {url}");
+    }
+
+    // =========================================================================
+    // Newly-wired streaming features (diarization + endpointing/VAD knobs).
+    // Each test asserts the api_param reaches the SERIALIZED WebSocket URL — the
+    // recurring "present on struct, never on wire" bug class.
+    // =========================================================================
+
+    fn base_cfg() -> AssemblyAISTTConfig {
+        AssemblyAISTTConfig {
+            base: STTConfig {
+                sample_rate: 16000,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// diarization (typed) → `speaker_labels=true`; off → param omitted (provider default).
+    #[test]
+    fn speaker_labels_reaches_the_wire() {
+        let mut config = base_cfg();
+        assert!(
+            !config.build_websocket_url().contains("speaker_labels"),
+            "speaker_labels must be omitted when off (provider default)"
+        );
+        config.speaker_labels = true;
+        assert!(
+            config.build_websocket_url().contains("speaker_labels=true"),
+            "speaker_labels=true missing from URL"
+        );
+    }
+
+    /// max_speakers (extras) → `max_speakers=N`, only alongside diarization, clamped 1..=10.
+    #[test]
+    fn max_speakers_reaches_the_wire_only_with_diarization() {
+        let mut config = base_cfg();
+        // Set without diarization → omitted (server ignores it without speaker_labels).
+        config.max_speakers = Some(4);
+        assert!(
+            !config.build_websocket_url().contains("max_speakers"),
+            "max_speakers must not appear without speaker_labels"
+        );
+        // With diarization → present.
+        config.speaker_labels = true;
+        assert!(
+            config.build_websocket_url().contains("max_speakers=4"),
+            "max_speakers=4 missing from URL"
+        );
+        // Clamp out-of-range.
+        config.max_speakers = Some(99);
+        assert!(config.build_websocket_url().contains("max_speakers=10"));
+    }
+
+    /// max_turn_silence (typed/endpointing_ms) → `max_turn_silence=MS`.
+    #[test]
+    fn max_turn_silence_reaches_the_wire() {
+        let mut config = base_cfg();
+        assert!(!config.build_websocket_url().contains("max_turn_silence"));
+        config.max_turn_silence = Some(700);
+        assert!(
+            config.build_websocket_url().contains("max_turn_silence=700"),
+            "max_turn_silence=700 missing from URL"
+        );
+    }
+
+    /// min_turn_silence (extras) → `min_turn_silence=MS`.
+    #[test]
+    fn min_turn_silence_reaches_the_wire() {
+        let mut config = base_cfg();
+        assert!(!config.build_websocket_url().contains("min_turn_silence"));
+        config.min_turn_silence = Some(160);
+        assert!(
+            config.build_websocket_url().contains("min_turn_silence=160"),
+            "min_turn_silence=160 missing from URL"
+        );
+    }
+
+    /// vad_threshold (extras) → `vad_threshold=0.NN`.
+    #[test]
+    fn vad_threshold_reaches_the_wire() {
+        let mut config = base_cfg();
+        assert!(!config.build_websocket_url().contains("vad_threshold"));
+        config.vad_threshold = Some(0.4);
+        assert!(
+            config.build_websocket_url().contains("vad_threshold=0.40"),
+            "vad_threshold=0.40 missing from URL"
+        );
+    }
+
+    /// inactivity_timeout (extras) → `inactivity_timeout=SECS`, clamped 5..=3600.
+    #[test]
+    fn inactivity_timeout_reaches_the_wire() {
+        let mut config = base_cfg();
+        assert!(!config.build_websocket_url().contains("inactivity_timeout"));
+        config.inactivity_timeout = Some(30);
+        assert!(
+            config.build_websocket_url().contains("inactivity_timeout=30"),
+            "inactivity_timeout=30 missing from URL"
+        );
+        config.inactivity_timeout = Some(1); // below min → clamp to 5
+        assert!(config.build_websocket_url().contains("inactivity_timeout=5"));
+    }
+
+    /// domain (extras) → `domain=...` (URL-encoded).
+    #[test]
+    fn domain_reaches_the_wire() {
+        let mut config = base_cfg();
+        assert!(!config.build_websocket_url().contains("domain="));
+        config.domain = Some("medical-v1".into());
+        assert!(
+            config.build_websocket_url().contains("domain=medical-v1"),
+            "domain=medical-v1 missing from URL"
+        );
+    }
+
+    /// KEYSTONE: standardized SttFeatures + extras → from_standard → URL, end-to-end.
+    /// This is the reachable production path and pins that typed fields AND extras both land.
+    #[test]
+    fn from_standard_streaming_features_reach_the_wire() {
+        let mut extras = serde_json::Map::new();
+        extras.insert("max_speakers".into(), serde_json::json!(6));
+        extras.insert("min_turn_silence".into(), serde_json::json!(120));
+        extras.insert("vad_threshold".into(), serde_json::json!(0.55));
+        extras.insert("inactivity_timeout".into(), serde_json::json!(45));
+        extras.insert("domain".into(), serde_json::json!("medical-v1"));
+
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "assemblyai".into(),
+                api_key: "k".into(),
+                sample_rate: 16000,
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),     // → speaker_labels=true
+                endpointing_ms: Some(640),   // → max_turn_silence=640
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = AssemblyAISTTConfig::from_standard(&std);
+        let url = cfg.build_websocket_url();
+
+        assert!(url.contains("speaker_labels=true"), "diarization not on wire: {url}");
+        assert!(url.contains("max_speakers=6"), "max_speakers not on wire: {url}");
+        assert!(
+            url.contains("max_turn_silence=640"),
+            "endpointing_ms not on wire: {url}"
+        );
+        assert!(
+            url.contains("min_turn_silence=120"),
+            "min_turn_silence not on wire: {url}"
+        );
+        assert!(url.contains("vad_threshold=0.55"), "vad_threshold not on wire: {url}");
+        assert!(
+            url.contains("inactivity_timeout=45"),
+            "inactivity_timeout not on wire: {url}"
+        );
+        assert!(url.contains("domain=medical-v1"), "domain not on wire: {url}");
     }
 }

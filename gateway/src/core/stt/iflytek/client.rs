@@ -337,6 +337,7 @@ impl IFlytekStt {
         let convert_numbers = self.config.convert_numbers;
         let audio_format = self.config.audio_format_string();
         let encoding = self.config.encoding.as_str().to_string();
+        let business_extras = self.config.business_extras.clone();
         let frame_count = self.frame_count.clone();
 
         // Start connection task
@@ -392,7 +393,7 @@ impl IFlytekStt {
 
                             let request = if is_first_frame {
                                 is_first_frame = false;
-                                SttRequest::first_frame(
+                                SttRequest::first_frame_with_extras(
                                     &app_id,
                                     &language,
                                     &domain,
@@ -404,6 +405,7 @@ impl IFlytekStt {
                                     &audio_format,
                                     &encoding,
                                     &frame_data,
+                                    &business_extras,
                                 )
                             } else {
                                 SttRequest::continue_frame(

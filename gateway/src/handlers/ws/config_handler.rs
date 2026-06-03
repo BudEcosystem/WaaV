@@ -519,8 +519,10 @@ async fn initialize_voice_manager(
     // standardized bases) for cache hashing and other flat consumers below.
     let standard_stt = stt_ws_config.to_standard_stt(stt_api_key);
     let standard_tts = tts_ws_config.to_standard_tts(tts_api_key);
-    // Flat TTS view kept for cache hashing (the standardized configs are moved into the manager).
-    let tts_config = standard_tts.base.clone();
+    // The TTS cache key is computed HERE from the FULL standardized config — base + advanced
+    // features + extras — before `standard_tts` is moved into the manager, so audio-changing
+    // features (voice settings, emotion, ssml, seed, …) are part of the key and cannot collide.
+    let tts_cfg_hash = compute_tts_config_hash(&standard_tts);
 
     // Create voice manager configuration with default speech final settings, routed through the
     // standardized keystone path, and attach the SHARED process-global resilience handles
@@ -548,10 +550,9 @@ async fn initialize_voice_manager(
         }
     };
 
-    // Set up TTS cache
-    let cfg_hash = compute_tts_config_hash(&tts_config);
+    // Set up TTS cache (hash computed above from the full standardized config, incl. features/extras)
     if let Err(e) = voice_manager
-        .set_tts_cache(app_state.cache(), Some(cfg_hash))
+        .set_tts_cache(app_state.cache(), Some(tts_cfg_hash))
         .await
     {
         error!("Failed to set TTS cache: {}", e);

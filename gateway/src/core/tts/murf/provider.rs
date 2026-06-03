@@ -336,6 +336,42 @@ mod tests {
         assert_eq!(tts.base_config.api_key, "test-key");
     }
 
+    // WIRE-LEVEL (recurring bug class: asserting the config struct, not the request body): the
+    // standardized `variation` extra must reach the JSON body POSTed to the regional
+    // /v1/speech/stream endpoint — the exact body `MurfStreamRequest::from_config` builds and
+    // `build_http_request` serializes. Goes through `from_standard` (the dispatch entry point) and
+    // re-serializes the request the live request builder sends, asserting `"variation":3` lands on
+    // the wire (Gen2 model, where `variation` is honored per Murf docs).
+    #[test]
+    fn from_standard_variation_reaches_stream_request_body() {
+        use crate::core::tts::murf::config::MurfStreamRequest;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("variation".into(), serde_json::json!(3));
+
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "murf".into(),
+                api_key: "test-key".into(),
+                voice_id: Some("en-US-natalie".into()),
+                model: "GEN2".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+
+        let tts = MurfTts::from_standard(&std).unwrap();
+        // Build the EXACT request body the live builder serializes to the stream endpoint.
+        let request = MurfStreamRequest::from_config(tts.murf_config(), "Hello world");
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(
+            json.contains("\"variation\":3"),
+            "variation extra must reach the /v1/speech/stream request body, got: {json}"
+        );
+    }
+
     #[test]
     fn test_murf_tts_creation() {
         // With API key

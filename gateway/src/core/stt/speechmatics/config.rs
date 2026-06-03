@@ -497,6 +497,43 @@ pub struct SpeechmaticsSTTConfig {
     pub additional_vocab: Vec<String>,
     /// Punctuation sensitivity (0.0-1.0)
     pub punctuation_sensitivity: Option<f32>,
+    // -------------------------------------------------------------------------
+    // Standardized advanced features emitted into `transcription_config`.
+    // `None`/empty => the corresponding `transcription_config` key is omitted (provider default).
+    // -------------------------------------------------------------------------
+    /// Diarization mode override ("speaker", "channel", "channel_and_speaker"). When set this takes
+    /// precedence over the legacy `enable_diarization` (which only ever requests "speaker").
+    /// Mapped from the typed `multichannel`/`diarization` features. Speechmatics
+    /// `transcription_config.diarization`.
+    pub diarization_mode: Option<String>,
+    /// End-of-utterance silence trigger in SECONDS (turn detection). Mapped from the typed
+    /// `utterance_end_ms` (ms -> seconds). Speechmatics
+    /// `transcription_config.conversation_config.end_of_utterance_silence_trigger`.
+    pub end_of_utterance_silence_trigger: Option<f32>,
+    /// Remove disfluencies. Mapped from the typed `filler_words` (inverted: keeping fillers means
+    /// NOT removing disfluencies). Speechmatics
+    /// `transcription_config.transcript_filtering_config.remove_disfluencies`.
+    pub remove_disfluencies: Option<bool>,
+    // --- the following are carried via the open `extras` passthrough ---
+    /// Speaker diarization sensitivity (0.0-1.0). `speaker_diarization_config.speaker_sensitivity`.
+    pub speaker_sensitivity: Option<f32>,
+    /// Prefer attributing ambiguous words to the current speaker.
+    /// `speaker_diarization_config.prefer_current_speaker`.
+    pub prefer_current_speaker: Option<bool>,
+    /// Punctuation permitted-marks override. `punctuation_overrides.permitted_marks`.
+    pub permitted_marks: Option<Vec<String>>,
+    /// Find-and-replace rules: `(from, to)` pairs.
+    /// `transcript_filtering_config.replacements`.
+    pub replacements: Option<Vec<(String, String)>>,
+    /// Output locale (regional variant). `transcription_config.output_locale`.
+    pub output_locale: Option<String>,
+    /// Domain language pack. `transcription_config.domain`.
+    pub domain: Option<String>,
+    /// Max-delay mode ("flexible" | "fixed"). `transcription_config.max_delay_mode`.
+    pub max_delay_mode: Option<String>,
+    /// Phonetic hints per vocabulary word: `word -> [sounds_like, ...]`.
+    /// `transcription_config.additional_vocab[].sounds_like`.
+    pub vocab_sounds_like: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl Default for SpeechmaticsSTTConfig {
@@ -515,6 +552,17 @@ impl Default for SpeechmaticsSTTConfig {
             enable_entities: false,
             additional_vocab: Vec::new(),
             punctuation_sensitivity: None,
+            diarization_mode: None,
+            end_of_utterance_silence_trigger: None,
+            remove_disfluencies: None,
+            speaker_sensitivity: None,
+            prefer_current_speaker: None,
+            permitted_marks: None,
+            replacements: None,
+            output_locale: None,
+            domain: None,
+            max_delay_mode: None,
+            vocab_sounds_like: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -582,6 +630,91 @@ impl SpeechmaticsSTTConfig {
         }
         if let Some(v) = &f.keyterms {
             cfg.additional_vocab = v.clone();
+        }
+        // Channel diarization mode (typed): `multichannel` requests per-channel transcription. If
+        // speaker diarization is ALSO requested, use the combined "channel_and_speaker" mode;
+        // otherwise plain "channel". When only `diarization` (speaker) is requested the existing
+        // `enable_diarization` path ("speaker") still applies.
+        if f.multichannel == Some(true) {
+            cfg.diarization_mode = Some(if f.diarization == Some(true) {
+                "channel_and_speaker".to_string()
+            } else {
+                "channel".to_string()
+            });
+        }
+        // End-of-utterance silence trigger (typed): `utterance_end_ms` is in ms; Speechmatics wants
+        // seconds.
+        if let Some(ms) = f.utterance_end_ms {
+            cfg.end_of_utterance_silence_trigger = Some(ms as f32 / 1000.0);
+        }
+        // Disfluency removal (typed): `filler_words` has inverted sense — keeping fillers (true)
+        // means NOT removing disfluencies.
+        if let Some(filler) = f.filler_words {
+            cfg.remove_disfluencies = Some(!filler);
+        }
+
+        // Provider extras → transcription_config knobs not modeled by the typed vocabulary.
+        let e = &std.extras.0;
+        if let Some(v) = e.get("speaker_sensitivity").and_then(|v| v.as_f64()) {
+            cfg.speaker_sensitivity = Some(v as f32);
+        }
+        if let Some(v) = e.get("prefer_current_speaker").and_then(|v| v.as_bool()) {
+            cfg.prefer_current_speaker = Some(v);
+        }
+        if let Some(arr) = e.get("permitted_marks").and_then(|v| v.as_array()) {
+            cfg.permitted_marks = Some(
+                arr.iter()
+                    .filter_map(|m| m.as_str().map(str::to_string))
+                    .collect(),
+            );
+        }
+        if let Some(v) = e.get("punctuation_sensitivity").and_then(|v| v.as_f64()) {
+            cfg.punctuation_sensitivity = Some(v as f32);
+        }
+        if let Some(arr) = e.get("replacements").and_then(|v| v.as_array()) {
+            // Each replacement is `{ "from": "...", "to": "..." }`.
+            let reps: Vec<(String, String)> = arr
+                .iter()
+                .filter_map(|r| {
+                    let from = r.get("from").and_then(|v| v.as_str())?;
+                    let to = r.get("to").and_then(|v| v.as_str())?;
+                    Some((from.to_string(), to.to_string()))
+                })
+                .collect();
+            if !reps.is_empty() {
+                cfg.replacements = Some(reps);
+            }
+        }
+        if let Some(v) = e.get("output_locale").and_then(|v| v.as_str()) {
+            cfg.output_locale = Some(v.to_string());
+        }
+        if let Some(v) = e.get("domain").and_then(|v| v.as_str()) {
+            cfg.domain = Some(v.to_string());
+        }
+        if let Some(v) = e.get("max_delay_mode").and_then(|v| v.as_str()) {
+            cfg.max_delay_mode = Some(v.to_string());
+        }
+        // Phonetic hints per vocab word: extras["additional_vocab"] = [{ "content": "...",
+        // "sounds_like": ["..."] }, ...]. The `content` words are also folded into the
+        // `additional_vocab` list (so a sounds_like-only vocab does not need a separate keyterms).
+        if let Some(arr) = e.get("additional_vocab").and_then(|v| v.as_array()) {
+            for entry in arr {
+                let Some(content) = entry.get("content").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if !cfg.additional_vocab.iter().any(|w| w == content) {
+                    cfg.additional_vocab.push(content.to_string());
+                }
+                if let Some(sl) = entry.get("sounds_like").and_then(|v| v.as_array()) {
+                    let hints: Vec<String> = sl
+                        .iter()
+                        .filter_map(|h| h.as_str().map(str::to_string))
+                        .collect();
+                    if !hints.is_empty() {
+                        cfg.vocab_sounds_like.insert(content.to_string(), hints);
+                    }
+                }
+            }
         }
         Ok(cfg)
     }

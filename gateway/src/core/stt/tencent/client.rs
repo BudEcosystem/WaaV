@@ -244,6 +244,16 @@ impl TencentStt {
             signature_builder = signature_builder.with_customization_id(customization_id);
         }
 
+        // Add optional noise filter threshold (extras passthrough)
+        if let Some(noise_threshold) = self.config.noise_threshold {
+            signature_builder = signature_builder.with_noise_threshold(noise_threshold);
+        }
+
+        // Add optional input sample rate (extras passthrough)
+        if let Some(input_sample_rate) = self.config.input_sample_rate {
+            signature_builder = signature_builder.with_input_sample_rate(input_sample_rate);
+        }
+
         signature_builder
             .build_url(TENCENT_ASR_WS_URL, &self.config.app_id)
             .map_err(|e| STTError::ConfigurationError(format!("Failed to build signature: {}", e)))
@@ -766,6 +776,45 @@ mod tests {
         let url = stt.build_ws_url().unwrap();
 
         assert!(url.contains("engine_model_type=16k_en"));
+    }
+
+    // WIRE-LEVEL: the two Tencent Real-Time ASR knobs carried via the standardized `extras`
+    // passthrough — `noise_threshold` (noise filter sensitivity, float -1.0..1.0) and
+    // `input_sample_rate` (rate of the *input* audio when it differs from the engine's) — must
+    // travel from `StandardSTTConfig::extras` all the way onto the signed WebSocket URL (they are
+    // signed params, so they must appear in the query string the server receives). Guards the
+    // recurring "set on the config struct but never emitted to the wire" gap class.
+    #[test]
+    fn extras_noise_threshold_and_input_sample_rate_reach_ws_url() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+        let mut extras = serde_json::Map::new();
+        extras.insert("noise_threshold".into(), serde_json::json!(0.5));
+        extras.insert("input_sample_rate".into(), serde_json::json!(8000));
+
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "tencent".into(),
+                api_key: "test_secret_id|test_secret_key|test_app_id".into(),
+                language: "zh".into(),
+                sample_rate: 16000,
+                encoding: "pcm".into(),
+                model: "16k_zh".into(),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: ProviderExtras(extras),
+        };
+        let stt = TencentStt::new_standard(&std).unwrap();
+        let url = stt.build_ws_url().unwrap();
+
+        assert!(
+            url.contains("noise_threshold=0.5"),
+            "noise_threshold missing from URL: {url}"
+        );
+        assert!(
+            url.contains("input_sample_rate=8000"),
+            "input_sample_rate missing from URL: {url}"
+        );
     }
 
     // =========================================================================

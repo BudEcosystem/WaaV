@@ -239,6 +239,9 @@ impl DashScopeStt {
             self.config.audio_format.as_format_str(),
             self.config.silence_duration_ms,
             turn_detection_type,
+            // Server-VAD speech-activation threshold (Qwen realtime), wired from the standardized
+            // extras passthrough; `None` keeps the API default.
+            self.config.turn_detection_threshold,
         );
 
         msg.to_json().unwrap_or_default()
@@ -253,6 +256,9 @@ impl DashScopeStt {
             self.config.language.as_code(),
             self.config.disfluency_removal,
             self.config.punctuation,
+            // VAD multi-threshold mode (Paraformer inference), wired from the standardized extras
+            // passthrough; `None` omits the field (server default).
+            self.config.multi_threshold_mode_enabled,
         );
 
         let task_id = msg.task_id().to_string();
@@ -778,6 +784,63 @@ mod tests {
         assert!(json.contains("run-task"));
         assert!(json.contains("paraformer-realtime-v2"));
         assert!(!task_id.is_empty());
+    }
+
+    // WIRE-LEVEL keystone: ProviderExtras -> from_standard -> config -> Paraformer run-task BODY.
+    // The VAD multi-threshold knob must round-trip from the standardized extras all the way into
+    // the serialized inference run-task `parameters` — proving it reaches the wire, not just the
+    // config struct (the recurring bug class).
+    #[test]
+    fn test_from_standard_multi_threshold_reaches_paraformer_body() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+        let mut base = create_test_config();
+        base.model = "paraformer-realtime-v2".to_string();
+        let extras = ProviderExtras(
+            serde_json::json!({ "multi_threshold_mode_enabled": true })
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let std = StandardSTTConfig {
+            base,
+            features: Default::default(),
+            extras,
+        };
+        let stt = DashScopeStt::new_standard(&std).unwrap();
+        assert_eq!(stt.config.multi_threshold_mode_enabled, Some(true));
+        let (json, _) = stt.create_paraformer_run_task();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v["payload"]["parameters"]["multi_threshold_mode_enabled"], true,
+            "multi_threshold not on the run-task wire body: {json}"
+        );
+    }
+
+    // WIRE-LEVEL keystone: ProviderExtras -> from_standard -> config -> Qwen session.update BODY.
+    // The server-VAD speech-activation threshold must round-trip into turn_detection.threshold.
+    #[test]
+    fn test_from_standard_threshold_reaches_qwen_session_update() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+        let extras = ProviderExtras(
+            serde_json::json!({ "turn_detection.threshold": 0.8 })
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let std = StandardSTTConfig {
+            base: create_test_config(), // qwen3-asr-flash-realtime
+            features: Default::default(),
+            extras,
+        };
+        let stt = DashScopeStt::new_standard(&std).unwrap();
+        assert_eq!(stt.config.turn_detection_threshold, Some(0.8));
+        let json = stt.create_qwen_session_update();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let thr = v["session"]["turn_detection"]["threshold"].as_f64().unwrap();
+        assert!(
+            (thr - 0.8).abs() < 1e-6,
+            "threshold not on the session.update wire body: {json}"
+        );
     }
 
     #[test]

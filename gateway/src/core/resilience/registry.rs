@@ -83,12 +83,18 @@ impl ResilienceRegistry {
         {
             return Arc::clone(b);
         }
-        // Slow path: insert under the write lock, re-checking in case of a race.
+        // Slow path: insert under the write lock, re-checking in case of a race. The breaker is
+        // stamped with the provider label so every state transition self-publishes the
+        // `waav_circuit_breaker_state{provider}` gauge (W-C1) — this is what makes the gauge
+        // truthful for the inline Deepgram/AssemblyAI reconnect loops (and every other provider),
+        // not just the ones routed through the ReconnectableStream supervisor.
         let mut map = self.breakers.write().expect("resilience breaker map poisoned");
-        Arc::clone(
-            map.entry(key)
-                .or_insert_with(|| Arc::new(CircuitBreaker::with_defaults())),
-        )
+        Arc::clone(map.entry(key.clone()).or_insert_with(|| {
+            Arc::new(CircuitBreaker::with_label(
+                super::CircuitBreakerConfig::default(),
+                key,
+            ))
+        }))
     }
 
     /// The bundled shared handles (governor + per-provider breaker) for `provider`, ready to be
@@ -151,6 +157,39 @@ mod tests {
         assert!(
             !session_b.breaker.allow_request(),
             "a trip in session A must be visible to session B (shared provider breaker)"
+        );
+    }
+
+    #[test]
+    fn registry_breaker_is_labelled_and_publishes_the_provider_gauge() {
+        // The breaker the registry hands out must self-publish the
+        // `waav_circuit_breaker_state{provider}` gauge on a trip — this is what closes the gap for
+        // the inline Deepgram/AssemblyAI reconnect loops, which grab the registry breaker but never
+        // emitted the gauge themselves.
+        use crate::core::metrics::bridge;
+        let _ = bridge::metrics_handle();
+
+        let reg = ResilienceRegistry::new(8);
+        let provider = "registry-gauge-probe";
+        let b = reg.breaker_for(provider);
+        // Drive it open (default config: min volume 5, threshold 0.5).
+        for _ in 0..10 {
+            b.record_failure();
+        }
+        assert_eq!(b.state(), crate::core::resilience::CircuitState::Open);
+
+        let exposition = bridge::render();
+        let needle = format!("provider=\"{provider}\"");
+        let sample = exposition
+            .lines()
+            .filter(|l| l.starts_with("waav_circuit_breaker_state") && l.contains(&needle))
+            .filter_map(|l| l.rsplit(' ').next())
+            .filter_map(|v| v.parse::<f64>().ok())
+            .next_back();
+        assert_eq!(
+            sample,
+            Some(2.0),
+            "registry-created breaker must publish state-code 2 (open) under its provider label"
         );
     }
 

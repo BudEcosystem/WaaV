@@ -371,5 +371,6 @@ fn create_test_google_config() -> GoogleSTTConfig {
         speech_start_timeout: None,
         speech_end_timeout: None,
         single_utterance: false,
+        ..Default::default()
     }
 }

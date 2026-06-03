@@ -293,6 +293,12 @@ pub struct SberTtsConfig {
     /// Request timeout in seconds
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
+
+    /// Treat synthesis input as SSML markup. When set, the synth request is sent with
+    /// `Content-Type: application/ssml` instead of `application/text`, so SaluteSpeech parses the
+    /// input as SSML (the documented SSML input mode for `/rest/v1/text:synthesize`).
+    #[serde(default)]
+    pub ssml_input: bool,
 }
 
 fn default_sample_rate() -> u32 {
@@ -318,6 +324,7 @@ impl Default for SberTtsConfig {
             sample_rate: default_sample_rate(),
             connection_timeout_secs: default_connection_timeout(),
             request_timeout_secs: default_request_timeout(),
+            ssml_input: false,
         }
     }
 }
@@ -393,17 +400,26 @@ impl SberTtsConfig {
             sample_rate,
             connection_timeout_secs: default_connection_timeout(),
             request_timeout_secs: default_request_timeout(),
+            ssml_input: false,
         })
     }
 
     /// Build from the standardized TTS config (W1 keystone). SberDevices SaluteSpeech exposes no
-    /// prosody knobs (the voice/format/scope come from base fields), so the only standardized
-    /// feature with a real field is `sample_rate` -> `sample_rate` (re-validated to the supported
-    /// 8000/24000 Hz set, exactly as `from_base` does). The non-standard `connection_timeout_secs`
-    /// and `request_timeout_secs` knobs are read from the `extras` passthrough. Features without a
-    /// SberDevices field (speed, pitch, volume, stability, similarity_boost, style,
-    /// use_speaker_boost, emotion, instructions, ssml, language, word_timestamps, streaming, seed)
-    /// are skipped.
+    /// prosody knobs (the voice/format/scope come from base fields). The standardized features with
+    /// a real wire effect are `sample_rate` -> `sample_rate` (re-validated to the supported
+    /// 8000/24000 Hz set, exactly as `from_base` does) and `ssml` -> `ssml_input` (which flips the
+    /// synth request `Content-Type` to `application/ssml`). The non-standard `connection_timeout_secs`
+    /// and `request_timeout_secs` knobs are read from the `extras` passthrough.
+    ///
+    /// `language` is intentionally NOT mapped: the SaluteSpeech REST `text:synthesize` endpoint has
+    /// no standalone language parameter (its query is only `voice`/`format`/`sample_rate`, and the
+    /// language is fixed by the chosen voice). On the gRPC streaming path the proto carries
+    /// `SynthesisRequest.language` (field 3), and for SSML input the language lives in the
+    /// `<speak xml:lang="...">` attribute the caller supplies — neither is reachable from this REST
+    /// synth without rewriting the URL contract or mutating user-supplied SSML, so it is left as a
+    /// capability gap rather than fabricated. Other unsupported features (speed, pitch, volume,
+    /// stability, similarity_boost, style, use_speaker_boost, emotion, instructions, word_timestamps,
+    /// streaming, seed) are likewise skipped.
     pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Result<Self, String> {
         let f = &std.features;
         let mut cfg = Self::from_base(std.base.clone())?;
@@ -418,6 +434,11 @@ impl SberTtsConfig {
             cfg.sample_rate = rate;
         }
 
+        // SSML input mode: flips the synth request Content-Type to `application/ssml`.
+        if let Some(true) = f.ssml {
+            cfg.ssml_input = true;
+        }
+
         // Provider-specific passthrough.
         if let Some(secs) = std.extras.0.get("connection_timeout_secs").and_then(|v| v.as_u64()) {
             cfg.connection_timeout_secs = secs;
@@ -427,6 +448,17 @@ impl SberTtsConfig {
         }
 
         Ok(cfg)
+    }
+
+    /// The `Content-Type` header value for the synth request: `application/ssml` when the input is
+    /// SSML markup, else `application/text`. This is the wire surface that puts SaluteSpeech into
+    /// SSML input mode for `/rest/v1/text:synthesize`.
+    pub fn synthesis_content_type(&self) -> &'static str {
+        if self.ssml_input {
+            "application/ssml"
+        } else {
+            "application/text"
+        }
     }
 
     /// Validate the configuration
@@ -478,10 +510,11 @@ impl SberTtsConfig {
 mod tests {
     use super::*;
 
-    // W1 keystone: the only standardized feature SberDevices can express is the output sample rate
-    // (re-validated to 8000/24000 Hz), and the non-standard timeout knobs flow through extras.
+    // W1 keystone: SberDevices can express the output sample rate (re-validated to 8000/24000 Hz)
+    // and SSML input mode (ssml -> ssml_input -> application/ssml Content-Type); the non-standard
+    // timeout knobs flow through extras.
     #[test]
-    fn from_standard_maps_sample_rate_and_extras() {
+    fn from_standard_maps_sample_rate_ssml_and_extras() {
         use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
         let mut extras = serde_json::Map::new();
         extras.insert("connection_timeout_secs".into(), serde_json::json!(15));
@@ -496,8 +529,8 @@ mod tests {
             },
             features: TtsFeatures {
                 sample_rate: Some(8000),
+                ssml: Some(true), // SSML input mode -> ssml_input (now wired)
                 speed: Some(1.2), // capability gap: SberDevices has no speed field, must be ignored
-                ssml: Some(true), // capability gap: must be ignored
                 ..Default::default()
             },
             extras: crate::core::stt::standard::ProviderExtras(extras),
@@ -505,6 +538,8 @@ mod tests {
         let cfg = SberTtsConfig::from_standard(&std).unwrap();
         assert_eq!(cfg.sample_rate, 8000); // feature override re-validated to supported set
         assert_eq!(cfg.voice, SberTtsVoice::Bys);
+        assert!(cfg.ssml_input); // ssml feature mapped
+        assert_eq!(cfg.synthesis_content_type(), "application/ssml");
         assert_eq!(cfg.connection_timeout_secs, 15); // extras passthrough
         assert_eq!(cfg.request_timeout_secs, 45); // extras passthrough
     }

@@ -219,6 +219,22 @@ pub struct SberSTTConfig {
     pub connection_timeout_secs: u64,
     /// Request timeout in seconds
     pub request_timeout_secs: u64,
+    // -------------------------------------------------------------------------
+    // Standardized recognition options emitted as `speech:recognize` query params.
+    // -------------------------------------------------------------------------
+    /// Enable profanity filtering/masking. SaluteSpeech `speech:recognize` `enable_profanity_filter`
+    /// query param. Mapped from the typed `SttFeatures::profanity_filter`.
+    pub enable_profanity_filter: bool,
+    /// Number of audio channels to transcribe independently (per-channel transcription).
+    /// SaluteSpeech `speech:recognize` `channels_count` query param. `None` => omitted (provider
+    /// default, mono). Driven by the typed `SttFeatures::multichannel` flag (count from the base
+    /// `channels`).
+    pub channels_count: Option<u16>,
+    /// Acoustic recognition model / domain (e.g. "general", "callcenter", "media"). SaluteSpeech
+    /// `speech:recognize` `model` query param. `None` => omitted (provider default). Carried via the
+    /// standardized `extras` passthrough (`extras["model"]`) — distinct from the OAuth `scope`
+    /// (which the flat `STTConfig::model` field already reuses).
+    pub recognition_model: Option<String>,
 }
 
 impl SberSTTConfig {
@@ -281,19 +297,72 @@ impl SberSTTConfig {
             enable_punctuation: config.punctuation,
             connection_timeout_secs: 30,
             request_timeout_secs: 60,
+            // Standardized recognition options are absent on the flat path (no features/extras).
+            enable_profanity_filter: false,
+            channels_count: None,
+            recognition_model: None,
         })
     }
 
     /// Build from the standardized config (W1 keystone). SberDevices SaluteSpeech is a synchronous
-    /// REST recognizer (`speech:recognize`) with a minimal surface — it exposes none of the
-    /// standardized advanced knobs (interim_results, diarization, word_timestamps, smart_format,
-    /// profanity_filter, filler_words, vad/endpointing, keyterms, redaction, entity/language
-    /// detection). So `from_standard` is a uniform standardized entry point that simply delegates
-    /// to `from_base`; all of those features are capability gaps and stay at provider defaults.
+    /// REST recognizer (`speech:recognize`); the options it accepts are emitted as query params on
+    /// the recognize URL. This maps the standardized features it can express:
+    /// - `profanity_filter` (typed) -> `enable_profanity_filter` query param,
+    /// - `multichannel` (typed) -> `channels_count` query param (per-channel transcription; the
+    ///   count is taken from the base `channels`),
+    /// - `extras["model"]` -> `model` query param (acoustic recognition domain — distinct from the
+    ///   OAuth `scope`, which the flat `STTConfig::model` field reuses).
+    ///
+    /// Streaming-only knobs (interim_results, diarization, vad/endpointing, etc.) are capability
+    /// gaps for this synchronous endpoint and stay at provider defaults.
     pub fn from_standard(
         std: &crate::core::stt::standard::StandardSTTConfig,
     ) -> Result<Self, STTError> {
-        Self::from_base(&std.base)
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+        if let Some(p) = f.profanity_filter {
+            cfg.enable_profanity_filter = p;
+        }
+        // Per-channel transcription: when `multichannel` is requested, emit the channel count from
+        // the base config (default to 1 if the base left it at 0). `None`/false -> mono default.
+        if f.multichannel == Some(true) {
+            let channels = if std.base.channels == 0 {
+                1
+            } else {
+                std.base.channels
+            };
+            cfg.channels_count = Some(channels);
+        }
+        // Acoustic recognition model/domain via the open passthrough (`extras["model"]`).
+        if let Some(m) = std.extras.0.get("model").and_then(|v| v.as_str()) {
+            cfg.recognition_model = Some(m.to_string());
+        }
+        Ok(cfg)
+    }
+
+    /// Build the `speech:recognize` request URL with the recognition options as query params.
+    ///
+    /// SaluteSpeech accepts recognition options as query parameters on the POST URL (the audio is
+    /// the request body). `language` and `sample_rate` are always emitted; the standardized
+    /// options (`enable_profanity_filter`, `channels_count`, `model`) are emitted only when set so
+    /// unset knobs fall back to the provider default. This is the URL that actually reaches Sber.
+    pub fn recognize_url(&self) -> String {
+        let mut url = format!(
+            "{}?language={}&sample_rate={}",
+            STT_RECOGNIZE_ENDPOINT,
+            self.language.as_code(),
+            self.sample_rate
+        );
+        if self.enable_profanity_filter {
+            url.push_str("&enable_profanity_filter=true");
+        }
+        if let Some(channels) = self.channels_count {
+            url.push_str(&format!("&channels_count={}", channels));
+        }
+        if let Some(ref model) = self.recognition_model {
+            url.push_str(&format!("&model={}", model));
+        }
+        url
     }
 
     /// Get the Authorization header for OAuth token request
@@ -315,9 +384,9 @@ impl SberSTTConfig {
 mod tests {
     use super::*;
 
-    // W1 keystone: SberDevices maps no standardized features (it is a minimal synchronous
-    // recognizer), so `from_standard` is a pure `from_base` passthrough — it succeeds and the
-    // base (credentials/language) carries through unchanged.
+    // W1 keystone: SberDevices maps the standardized features its synchronous `speech:recognize`
+    // endpoint can express (profanity filter, per-channel transcription, acoustic model). Streaming
+    // knobs (diarization, interim_results) remain capability gaps. The base still carries through.
     #[test]
     fn from_standard_passthrough_carries_base() {
         use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
@@ -328,7 +397,7 @@ mod tests {
                 language: "ru-RU".into(),
                 ..Default::default()
             },
-            // Advanced features are set but SberDevices cannot express them; they are ignored.
+            // Streaming-only features are set but SberDevices cannot express them; they are ignored.
             features: SttFeatures {
                 diarization: Some(true),
                 interim_results: Some(true),
@@ -342,6 +411,74 @@ mod tests {
         let expected = STANDARD.encode("test_client_id:test_client_secret".as_bytes());
         assert_eq!(cfg.client_credentials, expected);
         assert_eq!(cfg.language, SberSTTLanguage::Russian);
+        // Capability gaps: streaming knobs do not touch the recognize options.
+        assert!(!cfg.enable_profanity_filter);
+        assert_eq!(cfg.channels_count, None);
+        assert_eq!(cfg.recognition_model, None);
+    }
+
+    // WIRE-LEVEL: profanity filter (typed `profanity_filter`), per-channel transcription (typed
+    // `multichannel` -> `channels_count` from the base `channels`) and the acoustic recognition
+    // model (`extras["model"]`) must travel from the standardized config onto the actual
+    // `speech:recognize` request URL — the bytes that reach Sber — not merely the config struct.
+    // Guards the recurring "set on the struct but never emitted to the wire" gap class.
+    #[test]
+    fn standardized_options_reach_recognize_url() {
+        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        let mut extras = serde_json::Map::new();
+        extras.insert("model".into(), serde_json::json!("callcenter"));
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "sberdevices".into(),
+                api_key: "test_client_id:test_client_secret".into(),
+                language: "ru-RU".into(),
+                sample_rate: 16000,
+                channels: 2,
+                ..Default::default()
+            },
+            features: SttFeatures {
+                profanity_filter: Some(true),
+                multichannel: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = SberSTTConfig::from_standard(&std).unwrap();
+        // Config carried the mapping...
+        assert!(cfg.enable_profanity_filter);
+        assert_eq!(cfg.channels_count, Some(2));
+        assert_eq!(cfg.recognition_model, Some("callcenter".to_string()));
+        // ...and crucially the params reach the wire (recognize URL).
+        let url = cfg.recognize_url();
+        assert!(
+            url.starts_with("https://smartspeech.sber.ru/rest/v1/speech:recognize?"),
+            "url: {url}"
+        );
+        assert!(
+            url.contains("enable_profanity_filter=true"),
+            "profanity filter missing from URL: {url}"
+        );
+        assert!(
+            url.contains("channels_count=2"),
+            "channels_count missing from URL: {url}"
+        );
+        assert!(url.contains("model=callcenter"), "model missing from URL: {url}");
+        // Sanity: base language + sample_rate are always emitted.
+        assert!(url.contains("language=ru-RU"), "language missing: {url}");
+        assert!(url.contains("sample_rate=16000"), "sample_rate missing: {url}");
+
+        // And when the features are NOT requested, the optional params are omitted (defaults).
+        let bare = SberSTTConfig::from_standard(&StandardSTTConfig::from_base(STTConfig {
+            api_key: "c:s".into(),
+            language: "ru-RU".into(),
+            sample_rate: 16000,
+            ..Default::default()
+        }))
+        .unwrap()
+        .recognize_url();
+        assert!(!bare.contains("enable_profanity_filter"), "url: {bare}");
+        assert!(!bare.contains("channels_count"), "url: {bare}");
+        assert!(!bare.contains("model="), "url: {bare}");
     }
 
     #[test]

@@ -88,6 +88,20 @@ pub fn create_gnani_metadata(
         parse_header_value(&config.base.encoding, "encoding")?,
     );
 
+    // Optional per-request headers (omitted entirely when not set, so the default request is
+    // byte-for-byte unchanged). Both are documented Gnani request-config headers.
+    if let Some(sensitive) = config.sensitive {
+        metadata.insert(
+            "sensitive",
+            parse_header_value(if sensitive { "true" } else { "false" }, "sensitive")?,
+        );
+    }
+    if let Some(ref filename) = config.filename
+        && !filename.is_empty()
+    {
+        metadata.insert("filename", parse_header_value(filename, "filename")?);
+    }
+
     Ok(metadata)
 }
 
@@ -444,5 +458,83 @@ mod tests {
     fn test_parse_header_value() {
         assert!(parse_header_value("valid-token", "token").is_ok());
         assert!(parse_header_value("en-IN", "lang").is_ok());
+    }
+
+    // ===================== WIRE-LEVEL feature tests (gRPC request metadata) =====================
+    //
+    // Gnani sends per-request config as gRPC metadata headers (alongside token/lang/encoding),
+    // which is the actual request wire. These assert the newly-wired `sensitive` and `filename`
+    // features reach that MetadataMap — not just the config struct.
+
+    use super::super::config::GnaniSTTConfig;
+
+    fn base_cfg() -> GnaniSTTConfig {
+        GnaniSTTConfig {
+            token: "tok".into(),
+            access_key: "ak".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn wire_sensitive_header_reaches_metadata() {
+        let mut cfg = base_cfg();
+        cfg.sensitive = Some(true);
+        let md = create_gnani_metadata(&cfg).expect("metadata");
+        assert_eq!(
+            md.get("sensitive").map(|v| v.to_str().unwrap()),
+            Some("true"),
+            "sensitive header must reach the gRPC request metadata"
+        );
+    }
+
+    #[test]
+    fn wire_filename_header_reaches_metadata() {
+        let mut cfg = base_cfg();
+        cfg.filename = Some("call-123.wav".into());
+        let md = create_gnani_metadata(&cfg).expect("metadata");
+        assert_eq!(
+            md.get("filename").map(|v| v.to_str().unwrap()),
+            Some("call-123.wav"),
+            "filename header must reach the gRPC request metadata"
+        );
+    }
+
+    #[test]
+    fn wire_sensitive_and_filename_absent_by_default() {
+        // Defaults must NOT add the optional headers (no accidental always-on wiring).
+        let md = create_gnani_metadata(&base_cfg()).expect("metadata");
+        assert!(md.get("sensitive").is_none(), "sensitive must be omitted by default");
+        assert!(md.get("filename").is_none(), "filename must be omitted by default");
+    }
+
+    #[test]
+    fn wire_from_standard_extras_reach_metadata() {
+        use crate::core::stt::base::STTConfig;
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "gnani".into(),
+                language: "hi-IN".into(),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: ProviderExtras(
+                serde_json::json!({
+                    "token": "t", "access_key": "k",
+                    "sensitive": true, "filename": "debug.wav"
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        };
+        let cfg = GnaniSTTConfig::from_standard(&std).expect("from_standard");
+        let md = create_gnani_metadata(&cfg).expect("metadata");
+        assert_eq!(md.get("sensitive").map(|v| v.to_str().unwrap()), Some("true"));
+        assert_eq!(
+            md.get("filename").map(|v| v.to_str().unwrap()),
+            Some("debug.wav")
+        );
     }
 }

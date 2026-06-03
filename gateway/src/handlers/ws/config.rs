@@ -471,8 +471,14 @@ impl TTSWebSocketConfig {
     }
 }
 
-/// Compute TTS configuration hash for caching
-pub fn compute_tts_config_hash(tts_config: &TTSConfig) -> String {
+/// Compute TTS configuration hash for caching.
+///
+/// Hashes the base config AND the standardized advanced `features` + provider-specific `extras`,
+/// because those carry audio-changing parameters (voice settings, emotion, ssml, seed, latency, …)
+/// that live outside `base`. Omitting them caused cache collisions for the TTS providers that have
+/// no rich per-provider hash (Review Bug-class C).
+pub fn compute_tts_config_hash(standard: &crate::core::tts::standard::StandardTTSConfig) -> String {
+    let tts_config = &standard.base;
     let mut s = String::new();
     s.push_str(tts_config.provider.as_str());
     s.push('|');
@@ -489,12 +495,51 @@ pub fn compute_tts_config_hash(tts_config: &TTSConfig) -> String {
     if let Some(rate) = tts_config.speaking_rate {
         s.push_str(&format!("{rate:.3}"));
     }
+    s.push('|');
+    if let Ok(f) = serde_json::to_string(&standard.features) {
+        s.push_str(&f);
+    }
+    s.push('|');
+    if let Ok(e) = serde_json::to_string(&standard.extras) {
+        s.push_str(&e);
+    }
     format!("{:032x}", xxh3_128(s.as_bytes()))
 }
 
 #[cfg(test)]
 mod config_tests {
     use super::*;
+
+    #[test]
+    fn tts_cache_hash_includes_features_and_extras() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let base = StandardTTSConfig::from_base(crate::core::tts::TTSConfig {
+            provider: "elevenlabs".to_string(),
+            voice_id: Some("rachel".to_string()),
+            model: "eleven_multilingual_v2".to_string(),
+            ..Default::default()
+        });
+        let h0 = compute_tts_config_hash(&base);
+
+        // An audio-changing FEATURE (voice stability) must change the cache key (Review Bug-class C).
+        let mut with_feat = base.clone();
+        with_feat.features = TtsFeatures {
+            stability: Some(0.9),
+            ..Default::default()
+        };
+        assert_ne!(h0, compute_tts_config_hash(&with_feat), "features must affect the cache key");
+
+        // A provider-specific EXTRA must change the cache key too.
+        let mut with_extra = base.clone();
+        with_extra
+            .extras
+            .0
+            .insert("seed".to_string(), serde_json::json!(424242));
+        assert_ne!(h0, compute_tts_config_hash(&with_extra), "extras must affect the cache key");
+
+        // Identical configs hash equal (stable).
+        assert_eq!(h0, compute_tts_config_hash(&base.clone()));
+    }
 
     #[test]
     fn stt_config_defaults_encoding_and_model_when_omitted() {

@@ -266,6 +266,7 @@ impl IFlytekTts {
         let background_sound = self.config.background_sound;
         let english_pronunciation = self.config.english_pronunciation;
         let number_pronunciation = self.config.number_pronunciation;
+        let streaming_mp3_return = self.config.streaming_mp3_return;
         let format = self.config.encoding.content_type().to_string();
         let _bytes_counter = self.bytes_synthesized.clone();
 
@@ -307,6 +308,7 @@ impl IFlytekTts {
                             background_sound,
                             english_pronunciation,
                             number_pronunciation,
+                            streaming_mp3_return,
                             &text,
                         );
 
@@ -604,6 +606,68 @@ mod tests {
 
         let tts = result.unwrap();
         assert!(!tts.is_ready());
+    }
+
+    // WIRE-LEVEL: the `streaming_mp3_return` extra must reach the serialized WS request body as the
+    // business `sfl` param (not merely sit on the config struct — the recurring "config-only" bug).
+    // We reconstruct the exact `TtsRequest` the connection task sends (provider.rs `start_connection`
+    // builds it from these same config fields) and assert the wire JSON carries `"sfl":1`.
+    #[test]
+    fn streaming_mp3_return_reaches_ws_request_body_sfl() {
+        use super::super::messages::TtsRequest;
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("streaming_mp3_return".into(), serde_json::json!(true));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "iflytek".into(),
+                api_key: create_test_api_key(),
+                audio_format: Some("mp3".into()), // aue=lame, which `sfl` pairs with
+                sample_rate: Some(16000),         // iFlytek only allows 8000/16000
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+        let tts = IFlytekTts::from_standard(&std).unwrap();
+        // Sanity: the config carries it.
+        assert_eq!(tts.config.streaming_mp3_return, Some(1));
+
+        // Build the WS request body exactly as `start_connection` does and serialize it to the wire.
+        let request = TtsRequest::new(
+            &tts.config.auth.app_id,
+            tts.config.voice.as_code(),
+            tts.config.encoding.as_str(),
+            tts.config.sample_rate,
+            tts.config.text_encoding.as_str(),
+            tts.config.speed,
+            tts.config.volume,
+            tts.config.pitch,
+            tts.config.background_sound,
+            tts.config.english_pronunciation,
+            tts.config.number_pronunciation,
+            tts.config.streaming_mp3_return,
+            "你好",
+        );
+        let json = request.to_json().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // The wire body's business section MUST carry sfl=1 paired with aue=lame.
+        assert_eq!(v["business"]["sfl"], 1, "sfl must reach the WS request body");
+        assert_eq!(v["business"]["aue"], "lame");
+    }
+
+    // When `streaming_mp3_return` is absent, `sfl` must be omitted from the wire body entirely
+    // (skip_serializing_if), so the default behavior is unchanged.
+    #[test]
+    fn sfl_omitted_when_not_requested() {
+        use super::super::messages::TtsRequest;
+        let request = TtsRequest::simple("app", "xiaoyan", "hi");
+        let v: serde_json::Value = serde_json::from_str(&request.to_json().unwrap()).unwrap();
+        assert!(
+            v["business"].get("sfl").is_none(),
+            "sfl must be omitted when not requested"
+        );
     }
 
     // W1 keystone: the provider struct's `from_standard` maps prosody (speed/pitch/volume as

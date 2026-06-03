@@ -605,6 +605,13 @@ pub trait BaseRealtime: Send + Sync {
 
     /// Get provider information.
     fn get_provider_info(&self) -> serde_json::Value;
+
+    /// Inject the shared, process-global resilience handles (W-D2): the single reconnect governor
+    /// + this provider's shared circuit breaker. The realtime providers own a bespoke reconnect
+    /// loop; with the handles injected they *participate* in process-wide storm control + per-
+    /// provider breaker tripping and publish `waav_circuit_breaker_state{provider}` on transition.
+    /// Default is a no-op so providers that don't (yet) consume the handles compile unchanged.
+    fn set_resilience(&mut self, _resilience: crate::core::resilience::ResilienceHandles) {}
 }
 
 // =============================================================================

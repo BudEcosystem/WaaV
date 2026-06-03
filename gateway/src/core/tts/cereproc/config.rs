@@ -327,13 +327,40 @@ impl CereprocTtsConfig {
     /// custom SSML `<emotion>` tags, so [`TtsFeatures::emotion`] maps to the `emotion` field (using
     /// the same Happy/Sad/Calm/Cross vocabulary as `from_base`), and [`TtsFeatures::sample_rate`]
     /// overrides the output `sample_rate` (clamped to the supported range). The non-standard
-    /// `audio_3d` / `include_metadata` knobs are read from the `extras` passthrough. Features
-    /// CereProc has no field for (speed, pitch, volume, stability, similarity_boost, style,
-    /// use_speaker_boost, instructions, ssml, language, word_timestamps, streaming, seed) are
-    /// skipped.
+    /// `audio_3d` / `include_metadata` knobs are read from the `extras` passthrough.
+    ///
+    /// # Capability gaps on the v2 `/speak` synthesis endpoint
+    ///
+    /// The CereVoice Cloud **v2 REST** `/speak` endpoint this provider targets
+    /// (`https://api.cerevoice.com/v2/speak`) is controlled solely by the query parameters
+    /// `voice`, `audioFormat`, `sampleRate`, `audio3D`, `metadata` (see
+    /// [`build_query_params`]) plus the XML/SSML body. It has **no** `lang`/`language`,
+    /// `accent`, or `streaming` synthesis parameter:
+    ///
+    /// - **`language`** — not a `/speak` parameter. On the v2 REST API the spoken language is
+    ///   determined entirely by the chosen `voice`; `language` is a field only on the *voice
+    ///   metadata* (`VoiceInfo.language`) and on *lexicon/abbreviation uploads*
+    ///   (`LexiconInfo.language`), never on synthesis. Confirmed against the published CereVoice
+    ///   Cloud client surface (`SpeakExtendedInput` exposes only voice/text/audioFormat/sampleRate/
+    ///   audio3D/metadata). So [`TtsFeatures::language`] is a **capability gap** here and is left
+    ///   unwired rather than fabricated onto the wire.
+    /// - **`accent`** — not a `/speak` parameter either; the accent is implicit in the `voice`
+    ///   (e.g. "Stuart" is Scottish English). `accent` appears only on lexicon uploads
+    ///   (`LexiconInfo.accent`). The `extras["accent"]` value is therefore intentionally **not**
+    ///   forwarded to `/speak` (capability gap).
+    /// - **`streaming`** — the v2 `/speak` endpoint returns a `fileUrl` to a fully-rendered audio
+    ///   file (download model), not a chunked/streamed body, so there is no streaming flag to set
+    ///   ([`TtsFeatures::streaming`] is a capability gap).
+    ///
+    /// Other features CereProc has no field for (speed, pitch, volume, stability,
+    /// similarity_boost, style, use_speaker_boost, instructions, ssml, word_timestamps, seed) are
+    /// likewise skipped.
     ///
     /// [`TtsFeatures::emotion`]: crate::core::tts::standard::TtsFeatures::emotion
     /// [`TtsFeatures::sample_rate`]: crate::core::tts::standard::TtsFeatures::sample_rate
+    /// [`TtsFeatures::language`]: crate::core::tts::standard::TtsFeatures::language
+    /// [`TtsFeatures::streaming`]: crate::core::tts::standard::TtsFeatures::streaming
+    /// [`build_query_params`]: CereprocTtsConfig::build_query_params
     pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let f = &std.features;
         let mut cfg = Self::from_base(&std.base)?;
@@ -351,6 +378,12 @@ impl CereprocTtsConfig {
         if let Some(rate) = f.sample_rate {
             cfg.sample_rate = rate.clamp(super::MIN_SAMPLE_RATE, super::MAX_SAMPLE_RATE);
         }
+
+        // NOTE (capability gaps): `features.language`, `features.streaming`, and
+        // `extras["accent"]` are deliberately NOT mapped — the v2 `/speak` endpoint has no
+        // corresponding synthesis parameter (language/accent come from the voice; the endpoint
+        // returns a fileUrl, not a stream). See the doc comment above for the full citation. They
+        // are left unwired rather than fabricated onto the request.
 
         // Provider-specific passthrough.
         if let Some(audio_3d) = std.extras.0.get("audio_3d").and_then(|v| v.as_bool()) {

@@ -938,6 +938,15 @@ impl BaseSTT for AssemblyAISTT {
                 .as_ref()
                 .map(|c| c.language_detection)
                 .unwrap_or(false),
+            // Preserve advanced streaming knobs across a config update (they were set from the
+            // standardized features at session start and must survive a mid-session base swap).
+            speaker_labels: existing.as_ref().map(|c| c.speaker_labels).unwrap_or(false),
+            max_speakers: existing.as_ref().and_then(|c| c.max_speakers),
+            max_turn_silence: existing.as_ref().and_then(|c| c.max_turn_silence),
+            min_turn_silence: existing.as_ref().and_then(|c| c.min_turn_silence),
+            vad_threshold: existing.as_ref().and_then(|c| c.vad_threshold),
+            inactivity_timeout: existing.as_ref().and_then(|c| c.inactivity_timeout),
+            domain: existing.as_ref().and_then(|c| c.domain.clone()),
             endpoint_override: existing
                 .as_ref()
                 .and_then(|c| c.endpoint_override.clone()),

@@ -244,6 +244,21 @@ impl TencentTts {
             payload["EmotionIntensity"] = json!(intensity);
         }
 
+        // TextToVoice synthesis knobs (cited: Tencent Cloud TTS TextToVoice request, Version
+        // 2019-08-23 — ModelType / FastVoiceType / SegmentRate). All audio-changing; emitted only
+        // when set so the account default applies otherwise.
+        if let Some(model_type) = self.config.model_type {
+            payload["ModelType"] = json!(model_type);
+        }
+
+        if let Some(ref fast_voice_type) = self.config.fast_voice_type {
+            payload["FastVoiceType"] = json!(fast_voice_type);
+        }
+
+        if let Some(segment_rate) = self.config.segment_rate {
+            payload["SegmentRate"] = json!(segment_rate);
+        }
+
         payload
     }
 
@@ -668,6 +683,49 @@ mod tests {
         assert!(payload["SessionId"].is_string());
         assert!(payload["VoiceType"].is_number());
         assert!(payload["Codec"].is_string());
+    }
+
+    // WIRE-LEVEL: the TextToVoice synthesis knobs (ModelType / FastVoiceType / SegmentRate) sourced
+    // from `extras` must reach the actual request BODY (`build_payload`), not merely the config
+    // struct — the recurring "config set but never serialized" bug class. Asserts the JSON the
+    // signed request carries contains each param with the configured value.
+    #[test]
+    fn build_payload_emits_model_type_fast_voice_and_segment_rate_from_extras() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("ModelType".into(), serde_json::json!(1));
+        extras.insert("FastVoiceType".into(), serde_json::json!("clone-voice-42"));
+        extras.insert("SegmentRate".into(), serde_json::json!(2));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "tencent".into(),
+                api_key: "secret_id|secret_key".into(),
+                voice_id: Some("0".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        let tts = TencentTts::from_standard(&std).unwrap();
+
+        let payload = tts.build_payload("Hello world");
+        // The exact wire param names TextToVoice expects, with the exact configured values.
+        assert_eq!(payload["ModelType"], 1);
+        assert_eq!(payload["FastVoiceType"], "clone-voice-42");
+        assert_eq!(payload["SegmentRate"], 2);
+    }
+
+    // WIRE-LEVEL: when the knobs are unset, the request body must OMIT them entirely so the
+    // account default applies (no spurious zero/empty value on the wire).
+    #[test]
+    fn build_payload_omits_synthesis_knobs_when_unset() {
+        let config = create_test_config();
+        let tts = TencentTts::new(config).unwrap();
+
+        let payload = tts.build_payload("Hello world");
+        assert!(payload.get("ModelType").is_none());
+        assert!(payload.get("FastVoiceType").is_none());
+        assert!(payload.get("SegmentRate").is_none());
     }
 
     #[test]

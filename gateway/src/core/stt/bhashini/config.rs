@@ -465,6 +465,15 @@ pub struct BhashiniSttConfig {
     /// Custom callback URL (overrides pipeline config response).
     pub custom_callback_url: Option<String>,
 
+    /// Source script code (ULCA `sourceScriptCode`, ISO-15924). When set, the ASR
+    /// pipeline-config request asks for output transliterated into this script
+    /// (e.g. `"Latn"` for Latin script). Carried via the standardized extras passthrough.
+    pub source_script_code: Option<String>,
+
+    /// ASR post-processors (ULCA `postProcessors`, e.g. `["itn"]` for inverse text
+    /// normalization). Applied server-side to the recognized text. Carried via extras.
+    pub post_processors: Option<Vec<String>>,
+
     /// Maximum audio buffer size in bytes.
     pub max_buffer_size: usize,
 }
@@ -481,6 +490,8 @@ impl Default for BhashiniSttConfig {
             pipeline_provider: BhashiniPipelineProvider::default(),
             custom_service_id: None,
             custom_callback_url: None,
+            source_script_code: None,
+            post_processors: None,
             max_buffer_size: MAX_AUDIO_SIZE_BYTES,
         }
     }
@@ -549,6 +560,8 @@ impl BhashiniSttConfig {
             pipeline_provider,
             custom_service_id: None,
             custom_callback_url: None,
+            source_script_code: None,
+            post_processors: None,
             max_buffer_size: MAX_AUDIO_SIZE_BYTES,
         };
 
@@ -556,16 +569,48 @@ impl BhashiniSttConfig {
         Ok(config)
     }
 
-    /// Build from the standardized config (W1 keystone). Bhashini is a batch ULCA ASR provider
-    /// whose pipeline exposes no advanced-feature knobs — none of the standardized features
+    /// Build from the standardized config (W1 keystone). None of the *typed* `SttFeatures`
     /// (interim_results, diarization, word_timestamps, smart_format, profanity_filter,
     /// filler_words, vad_events, endpointing, utterance_end, keyterms, redaction,
-    /// entity_detection, language_detection) maps to a real field on this config. So this is a
-    /// pure passthrough: a uniform standardized entry point that simply delegates to `from_base`.
+    /// entity_detection, language_detection) maps to a real Bhashini knob — those stay at
+    /// provider defaults (capability gaps for a batch ULCA ASR pipeline).
+    ///
+    /// Two genuinely Bhashini-specific ULCA pipeline knobs that DO exist are carried through the
+    /// open [`ProviderExtras`] passthrough and reach `pipelineTasks[].config` on the wire:
+    /// - `sourceScriptCode` (ISO-15924) → `config.language.sourceScriptCode`
+    /// - `postProcessors` (e.g. `["itn"]`) → `config.postProcessors`
+    ///
+    /// snake_case aliases (`source_script_code`, `post_processors`) are also accepted.
     pub fn from_standard(
         std: &crate::core::stt::standard::StandardSTTConfig,
     ) -> Result<Self, String> {
-        Self::from_base(std.base.clone())
+        let mut cfg = Self::from_base(std.base.clone())?;
+        let extras = &std.extras.0;
+
+        if let Some(code) = extras
+            .get("sourceScriptCode")
+            .or_else(|| extras.get("source_script_code"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            cfg.source_script_code = Some(code.to_string());
+        }
+
+        if let Some(arr) = extras
+            .get("postProcessors")
+            .or_else(|| extras.get("post_processors"))
+            .and_then(|v| v.as_array())
+        {
+            let procs: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            if !procs.is_empty() {
+                cfg.post_processors = Some(procs);
+            }
+        }
+
+        Ok(cfg)
     }
 
     /// Validate the configuration.
@@ -641,6 +686,74 @@ mod tests {
         assert_eq!(cfg.user_id, "user123");
         assert_eq!(cfg.ulca_api_key, "apikey456");
         assert_eq!(cfg.language, BhashiniLanguage::Hindi);
+        // No extras -> advanced knobs stay unset.
+        assert!(cfg.source_script_code.is_none());
+        assert!(cfg.post_processors.is_none());
+    }
+
+    // WIRE-LEVEL (end-to-end): the standardized extras (`sourceScriptCode`, `postProcessors`)
+    // map onto the Bhashini config AND reach the serialized pipeline-config request body — the
+    // same `PipelineConfigRequest::new_asr_with` call the live `fetch_pipeline_config` makes.
+    #[test]
+    fn extras_reach_pipeline_config_request_body() {
+        use super::super::messages::PipelineConfigRequest;
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("sourceScriptCode".into(), serde_json::json!("Latn"));
+        extras.insert("postProcessors".into(), serde_json::json!(["itn"]));
+
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "bhashini".into(),
+                api_key: "user123|apikey456".into(),
+                language: "hi".into(),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: ProviderExtras(extras),
+        };
+        let cfg = BhashiniSttConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.source_script_code.as_deref(), Some("Latn"));
+        assert_eq!(cfg.post_processors, Some(vec!["itn".to_string()]));
+
+        // Build the actual request the client sends and assert the wire body.
+        let request = PipelineConfigRequest::new_asr_with(
+            cfg.language.as_code(),
+            cfg.pipeline_id(),
+            cfg.source_script_code.clone(),
+            cfg.post_processors.clone(),
+        );
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(
+            json.contains("\"sourceScriptCode\":\"Latn\""),
+            "sourceScriptCode missing from request body: {json}"
+        );
+        assert!(
+            json.contains("\"postProcessors\":[\"itn\"]"),
+            "postProcessors missing from request body: {json}"
+        );
+    }
+
+    // snake_case aliases are also accepted (ergonomic passthrough).
+    #[test]
+    fn from_standard_accepts_snake_case_extras() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+        let mut extras = serde_json::Map::new();
+        extras.insert("source_script_code".into(), serde_json::json!("Deva"));
+        extras.insert("post_processors".into(), serde_json::json!(["itn"]));
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                api_key: "u|k".into(),
+                language: "hi".into(),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: ProviderExtras(extras),
+        };
+        let cfg = BhashiniSttConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.source_script_code.as_deref(), Some("Deva"));
+        assert_eq!(cfg.post_processors, Some(vec!["itn".to_string()]));
     }
 
     #[test]

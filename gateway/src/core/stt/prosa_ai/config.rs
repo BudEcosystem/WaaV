@@ -401,6 +401,13 @@ pub struct ProsaSttStreamConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_partial: Option<bool>,
 
+    /// Include filler words ("um", "uh") in the streaming transcript rather than dropping them.
+    /// Mirrors the REST request's `include_filler`; Prosa.ai's streaming `config` message accepts
+    /// the same recognition toggles as the REST `config` object (Prosa.ai STT v2 streaming docs:
+    /// the WS session `config` is the streaming analogue of the REST `config`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_filler: Option<bool>,
+
     /// Audio configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio: Option<ProsaSttAudioConfig>,
@@ -907,6 +914,7 @@ mod tests {
             model: "stt-general-online".to_string(),
             label: Some("test".to_string()),
             include_partial: Some(true),
+            include_filler: Some(true),
             audio: Some(ProsaSttAudioConfig {
                 format: "wav".to_string(),
                 channels: Some(1),
@@ -918,5 +926,6 @@ mod tests {
         assert!(json.contains("stt-general-online"));
         assert!(json.contains("wav"));
         assert!(json.contains("16000"));
+        assert!(json.contains("include_filler"));
     }
 }
