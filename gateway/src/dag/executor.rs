@@ -783,18 +783,24 @@ impl DAGExecutor {
         // records branch metadata) are wrapped with a timeout. Split branch
         // fan-out is handled by `run_split_branches` in the topological sweep so
         // each node executes exactly once.
+        //
+        // Honor the PER-NODE `timeout_ms` (a slow node — e.g. a reasoning LLM — can be given more
+        // time than fast peers); fall back to the executor's `default_timeout` when unset.
+        let node_timeout = compiled_node
+            .definition
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(self.default_timeout);
         let _ = node_type; // retained for tracing above
-        let result = match timeout(self.default_timeout, node.execute(input, ctx)).await {
+        let result = match timeout(node_timeout, node.execute(input, ctx)).await {
             Ok(result) => result,
             Err(_) => {
                 warn!(
                     node_id = %node_id,
-                    timeout_ms = %self.default_timeout.as_millis(),
+                    timeout_ms = %node_timeout.as_millis(),
                     "Node execution timed out"
                 );
-                Err(DAGError::ExecutionTimeout(
-                    self.default_timeout.as_millis() as u64
-                ))
+                Err(DAGError::ExecutionTimeout(node_timeout.as_millis() as u64))
             }
         };
 

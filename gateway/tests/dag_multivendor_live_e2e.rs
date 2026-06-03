@@ -14,8 +14,6 @@
 
 #![cfg(feature = "dag-routing")]
 
-use std::time::Duration;
-
 use waav_gateway::dag::compiler::DAGCompiler;
 use waav_gateway::dag::context::DAGContext;
 use waav_gateway::dag::definition::{DAGDefinition, EdgeDefinition, NodeDefinition, NodeType};
@@ -128,7 +126,7 @@ async fn dag_sarvam_translates_en_to_hindi_live() {
     dag.add_exit("translate");
     let compiled = DAGCompiler::new().compile(dag).expect("compile");
 
-    let exec = DAGExecutor::new().with_timeout(Duration::from_secs(150));
+    let exec = DAGExecutor::new() /* per-node timeout_ms=120000 on the translate node is now honored (no executor override needed) */;
     let mut ctx = DAGContext::new("xlate-test");
     let out = exec
         .execute_from(&compiled, "translate", DAGData::Text(ENGLISH.to_string()), &mut ctx)
@@ -164,7 +162,7 @@ async fn dag_translate_then_elevenlabs_hindi_tts_live() {
     dag.add_exit("tts");
     let compiled = DAGCompiler::new().compile(dag).expect("compile");
 
-    let exec = DAGExecutor::new().with_timeout(Duration::from_secs(150));
+    let exec = DAGExecutor::new() /* per-node timeout_ms=120000 on the translate node is now honored (no executor override needed) */;
     let mut ctx = DAGContext::new("xlate-tts-test");
     let out = exec
         .execute_from(&compiled, "translate", DAGData::Text(ENGLISH.to_string()), &mut ctx)
@@ -243,7 +241,7 @@ async fn dag_streaming_emits_incremental_audio_live() {
         chunks
     });
 
-    let exec = DAGExecutor::new().with_timeout(Duration::from_secs(150));
+    let exec = DAGExecutor::new() /* per-node timeout_ms=120000 on the translate node is now honored (no executor override needed) */;
     let mut ctx = DAGContext::new("stream-test").with_output_tx(tx);
     exec.execute_streaming_from(&compiled, "translate", DAGData::Text(paragraph.to_string()), &mut ctx)
         .await
@@ -299,7 +297,7 @@ async fn dag_full_audio_pipeline_en_to_hindi_live() {
     dag.add_exit("tts");
     let compiled = DAGCompiler::new().compile(dag).expect("compile");
 
-    let exec = DAGExecutor::new().with_timeout(Duration::from_secs(150));
+    let exec = DAGExecutor::new() /* per-node timeout_ms=120000 on the translate node is now honored (no executor override needed) */;
     let mut ctx = DAGContext::new("full-pipeline-test");
     let out = exec
         .execute_from(&compiled, "stt", DAGData::Audio(bytes::Bytes::from(pcm)), &mut ctx)
