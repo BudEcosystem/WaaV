@@ -1023,6 +1023,7 @@ impl BaseSTT for AzureSTT {
                 .unwrap_or_default(),
             dictation_mode: existing.as_ref().is_some_and(|c| c.dictation_mode),
             sentiment_analysis: existing.as_ref().is_some_and(|c| c.sentiment_analysis),
+            endpoint_override: existing.as_ref().and_then(|c| c.endpoint_override.clone()),
         };
 
         self.config = Some(azure_config);

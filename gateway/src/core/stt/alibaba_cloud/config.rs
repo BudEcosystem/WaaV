@@ -506,6 +506,12 @@ pub struct DashScopeSttConfig {
     /// Paraformer inference models.
     #[serde(default)]
     pub turn_detection_threshold: Option<f32>,
+
+    /// Carried from the standardized `endpoint_override` — points the WS dial at the in-repo
+    /// mock/proxy (`ws://127.0.0.1:PORT`) instead of the production DashScope host. Swaps only
+    /// scheme://host; the `/api-ws/v1/{realtime,inference}` path (+ Qwen `?model=` query) is kept.
+    #[serde(default)]
+    pub endpoint_override: Option<String>,
 }
 
 fn default_sample_rate() -> u32 {
@@ -537,6 +543,7 @@ impl Default for DashScopeSttConfig {
             vocabulary_id: None,
             multi_threshold_mode_enabled: None,
             turn_detection_threshold: None,
+            endpoint_override: None,
         }
     }
 }
@@ -588,6 +595,7 @@ impl DashScopeSttConfig {
             vocabulary_id: None,
             multi_threshold_mode_enabled: None,
             turn_detection_threshold: None,
+            endpoint_override: None,
         })
     }
 
@@ -647,6 +655,7 @@ impl DashScopeSttConfig {
         {
             cfg.turn_detection_threshold = Some(t as f32);
         }
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
         Ok(cfg)
     }
 

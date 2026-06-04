@@ -490,3 +490,212 @@ async fn amivoice_full_integration_via_mock_endpoint() {
     println!("AmiVoice mock e2e surfaced transcript: {got:?}");
     assert_eq!(got, "hello world", "AmiVoice full integration broken");
 }
+
+/// Azure mock: USP protocol. connect() self-unblocks on its own handshake+config-send (no server
+/// ack needed), no WS subprotocol. Audio is USP Binary frames; reply on the first Binary with a USP
+/// `Path:speech.phrase` Text frame (CRLF header block + JSON) whose DisplayText surfaces the text.
+async fn spawn_azure_mock(transcript_value: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await
+            && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
+        {
+            let (mut write, mut read) = ws.split();
+            let final_msg = format!(
+                "X-RequestId:mockreq1\r\nPath:speech.phrase\r\nContent-Type:application/json\r\n\r\n{{\"RecognitionStatus\":\"Success\",\"Offset\":0,\"Duration\":10000000,\"DisplayText\":\"{transcript_value}\"}}"
+            );
+            let mut sent = false;
+            while let Some(Ok(frame)) = read.next().await {
+                if !sent && matches!(frame, Message::Binary(_)) {
+                    let _ = write.send(Message::Text(final_msg.clone().into())).await;
+                    sent = true;
+                }
+            }
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn azure_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    let port = spawn_azure_mock("hello world").await;
+    let endpoint = format!("ws://127.0.0.1:{port}");
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "azure".into(),
+        api_key: "test-key".into(),
+        language: "en-US".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".into(),
+        model: String::new(),
+    })
+    .with_endpoint_override(&endpoint);
+    let mut stt = create_stt_standard("azure", std).expect("build azure via keystone");
+    let got = drive_and_capture(stt.as_mut()).await;
+    println!("Azure mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "Azure full integration broken");
+}
+
+/// Alibaba DashScope (Paraformer) mock: plain accept (no subprotocol); audio is Binary; connect()
+/// does NOT block on a server ack. Reply with a `result-generated` event (sentence_end=true=final).
+async fn spawn_dashscope_mock(transcript_value: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await
+            && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
+        {
+            let (mut write, mut read) = ws.split();
+            let msg = format!(
+                r#"{{"header":{{"task_id":"mock-task-1","event":"result-generated"}},"payload":{{"output":{{"sentence":{{"begin_time":0,"end_time":1000,"text":"{transcript_value}","words":[],"sentence_end":true}}}}}}}}"#
+            );
+            let mut sent = false;
+            while let Some(Ok(frame)) = read.next().await {
+                if !sent && matches!(frame, Message::Binary(_)) {
+                    let _ = write.send(Message::Text(msg.clone().into())).await;
+                    sent = true;
+                }
+            }
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn dashscope_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    let port = spawn_dashscope_mock("hello world").await;
+    let endpoint = format!("ws://127.0.0.1:{port}");
+    // model="paraformer-realtime-v2" selects the simpler inference/run-task sub-protocol.
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "alibaba_cloud".into(),
+        api_key: "test-key".into(),
+        language: "en".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "pcm".into(),
+        model: "paraformer-realtime-v2".into(),
+    })
+    .with_endpoint_override(&endpoint);
+    let mut stt = create_stt_standard("alibaba_cloud", std).expect("build dashscope via keystone");
+    let got = drive_and_capture(stt.as_mut()).await;
+    println!("DashScope mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "DashScope full integration broken");
+}
+
+/// Baidu mock: realtime WS (OAuth is dead code on this path). Audio is Binary; connect() doesn't
+/// block on a server ack. Reply with a `FIN_TEXT` final result.
+async fn spawn_baidu_mock(transcript_value: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await
+            && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
+        {
+            let (mut write, mut read) = ws.split();
+            let msg = format!(
+                r#"{{"err_no":0,"err_msg":"success","type":"FIN_TEXT","result":"{transcript_value}","sn":"mock-1"}}"#
+            );
+            let mut sent = false;
+            while let Some(Ok(frame)) = read.next().await {
+                if !sent && matches!(frame, Message::Binary(_)) {
+                    let _ = write.send(Message::Text(msg.clone().into())).await;
+                    sent = true;
+                }
+            }
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn baidu_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    let port = spawn_baidu_mock("hello world").await;
+    let endpoint = format!("ws://127.0.0.1:{port}");
+    // Baidu packs api_key|secret_key into api_key; model "mandarin" → dev_pid 1537.
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "baidu".into(),
+        api_key: "test-app-id|test-app-key".into(),
+        language: "zh".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "pcm".into(),
+        model: "mandarin".into(),
+    })
+    .with_endpoint_override(&endpoint);
+    let mut stt = create_stt_standard("baidu", std).expect("build baidu via keystone");
+    let got = drive_and_capture(stt.as_mut()).await;
+    println!("Baidu mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "Baidu full integration broken");
+}
+
+/// NAVER CLOVA is a REST/batch provider (not WS): it buffers audio and POSTs it on disconnect().
+/// So the mock is an axum HTTP server returning `{"text":...}`, and the e2e triggers the POST via
+/// disconnect(), not a streamed frame.
+async fn spawn_naver_mock(transcript_value: &'static str) -> u16 {
+    use axum::{Router, http::header, routing::post};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = format!(r#"{{"text":"{transcript_value}"}}"#);
+    let app = Router::new().route(
+        "/recog/v1/stt",
+        post(move || {
+            let body = body.clone();
+            async move { ([(header::CONTENT_TYPE, "application/json")], body) }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    port
+}
+
+#[tokio::test]
+async fn naver_clova_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    let port = spawn_naver_mock("hello world").await;
+    let endpoint = format!("http://127.0.0.1:{port}"); // HTTP, not ws://
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "naver_clova".into(),
+        api_key: "test-client-id|test-client-secret".into(),
+        language: "ko".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".into(),
+        model: String::new(),
+    })
+    .with_endpoint_override(&endpoint);
+    let mut stt = create_stt_standard("naver_clova", std).expect("build naver via keystone");
+
+    let best = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let b2 = best.clone();
+    stt.on_result(Arc::new(move |r: STTResult| {
+        let b = b2.clone();
+        Box::pin(async move {
+            let t = r.transcript.trim().to_string();
+            if !t.is_empty() {
+                *b.lock().await = t;
+            }
+        })
+    }))
+    .await
+    .unwrap();
+
+    stt.connect().await.expect("connect (local, no I/O)");
+    for _ in 0..5 {
+        let _ = stt.send_audio(bytes::Bytes::from(vec![0u8; 640])).await;
+    }
+    // REST: the batch POST + on_result callback fire on disconnect().
+    stt.disconnect().await.ok();
+
+    let got = best.lock().await.clone();
+    println!("NAVER CLOVA mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "NAVER CLOVA full integration broken");
+}

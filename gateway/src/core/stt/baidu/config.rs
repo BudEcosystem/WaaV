@@ -251,6 +251,12 @@ pub struct BaiduSttConfig {
 
     /// Use real-time WebSocket API instead of REST.
     pub use_realtime: bool,
+
+    /// Carried from the standardized `endpoint_override` — points the realtime WS dial at the
+    /// in-repo mock/proxy (a local `ws://` server) for credential-free end-to-end tests; `None`
+    /// uses the production Baidu endpoint. Only scheme://host is swapped; the `?sn=` query is kept.
+    #[serde(skip)]
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for BaiduSttConfig {
@@ -267,6 +273,7 @@ impl Default for BaiduSttConfig {
             lm_id: None,
             use_https: true,
             use_realtime: true,
+            endpoint_override: None,
         }
     }
 }
@@ -381,9 +388,17 @@ impl BaiduSttConfig {
         }
     }
 
-    /// Get the WebSocket URL for real-time recognition.
+    /// Get the WebSocket URL for real-time recognition. Honors an `endpoint_override` (the in-repo
+    /// mock/proxy points this at a local `ws://` server) by swapping scheme://host while keeping the
+    /// `?sn=` session query; `None` uses the production Baidu realtime endpoint.
     pub fn get_realtime_url(&self, session_id: &str) -> String {
-        format!("{}?sn={}", BAIDU_REALTIME_ASR_URL, session_id)
+        // The override carries only scheme://host, so re-append the `/realtime_asr` path (a path-less
+        // URL fails the WS handshake).
+        let base = match self.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
+            Some(o) => format!("{}/realtime_asr", o.trim_end_matches('/')),
+            None => BAIDU_REALTIME_ASR_URL.to_string(),
+        };
+        format!("{}?sn={}", base, session_id)
     }
 
     /// Calculate the recommended chunk size for WebSocket streaming.
@@ -479,6 +494,7 @@ impl BaiduSttConfig {
         if let Some(lm_id) = std.extras.0.get("lm_id").and_then(|v| v.as_u64()) {
             cfg.lm_id = Some(lm_id as u32);
         }
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
         Ok(cfg)
     }
 }

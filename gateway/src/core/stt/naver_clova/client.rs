@@ -82,13 +82,16 @@ impl NaverClovaStt {
         self.config.sample_rate as usize * bytes_per_sample * channels * MAX_AUDIO_DURATION_SECONDS
     }
 
-    /// Build the API endpoint URL with language parameter.
+    /// Build the API endpoint URL with language parameter. When `endpoint_override` is set (the
+    /// standardized override, used by the credential-free mock harness), its scheme://host replaces
+    /// the production host while the `/recog/v1/stt` path and `?lang=` query are preserved.
     fn build_endpoint_url(&self) -> String {
-        format!(
-            "{}?lang={}",
-            NAVER_CSR_ENDPOINT,
-            self.config.language.code()
-        )
+        let base = if let Some(ref ov) = self.config.endpoint_override {
+            format!("{}/recog/v1/stt", ov.trim_end_matches('/'))
+        } else {
+            NAVER_CSR_ENDPOINT.to_string()
+        };
+        format!("{base}?lang={}", self.config.language.code())
     }
 
     /// Transcribe the buffered audio using the REST API.

@@ -588,7 +588,14 @@ impl BaseSTT for DashScopeStt {
         if let Some(tid) = &paraformer_task_id {
             *self.task_id.lock().await = Some(tid.clone());
         }
-        let url = self.config.get_websocket_url();
+        let mut url = self.config.get_websocket_url();
+        // Honor an `endpoint_override` for the in-repo mock/proxy: swap the dialed scheme://host
+        // while keeping the `/api-ws/v1/{realtime,inference}` path (+ Qwen `?model=` query).
+        if let Some(o) = self.config.endpoint_override.as_deref().filter(|o| !o.is_empty())
+            && let Some(idx) = url.find("/api-ws/")
+        {
+            url = format!("{}{}", o.trim_end_matches('/'), &url[idx..]);
+        }
 
         // Shared state the supervised transport re-uses across reconnect attempts: a single-
         // consumer audio receiver + shutdown oneshot (locked per `run`) and the one-shot connected

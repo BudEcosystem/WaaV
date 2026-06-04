@@ -199,6 +199,11 @@ pub struct AzureSTTConfig {
     /// Per-utterance sentiment analysis. Maps the typed `sentiment` feature onto
     /// `phraseDetection.sentimentAnalysis.enabled = true`.
     pub sentiment_analysis: bool,
+
+    /// Carried from the standardized `endpoint_override` — points the dial at an in-repo mock/proxy
+    /// (credential-free e2e) instead of `wss://{region}.stt.speech.microsoft.com`. Swaps only
+    /// scheme://host; the `/speech/.../v1?...` path+query (and USP auth) are unchanged.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for AzureSTTConfig {
@@ -220,6 +225,7 @@ impl Default for AzureSTTConfig {
             phrase_output_options: Vec::new(),
             dictation_mode: false,
             sentiment_analysis: false,
+            endpoint_override: None,
         }
     }
 }
@@ -246,7 +252,13 @@ impl AzureSTTConfig {
     ///     &profanity=masked
     /// ```
     pub fn build_websocket_url(&self) -> String {
-        let base_url = self.region.stt_websocket_base_url();
+        // Honor an `endpoint_override` (in-repo mock/proxy → local `ws://` server) for credential-free
+        // e2e: swap only the dialed scheme://host; the `/speech/recognition/.../v1?...` path+query
+        // (and USP auth) are kept verbatim.
+        let base_url = match self.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
+            Some(o) => o.trim_end_matches('/').to_string(),
+            None => self.region.stt_websocket_base_url().to_string(),
+        };
 
         // NOTE: language (a locale like "en-US"), endpoint_id (a GUID) and auto-detect locales are
         // constrained identifiers with no spaces/query-delimiters, so they are not percent-encoded
@@ -473,6 +485,9 @@ impl AzureSTTConfig {
             }
             _ => Vec::new(),
         };
+
+        // Credential-free e2e / proxy: point the dial at the override host (mock ignores auth).
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
 
         cfg
     }

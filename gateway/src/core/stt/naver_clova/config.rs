@@ -232,6 +232,10 @@ pub struct NaverClovaSttConfig {
 
     /// Custom endpoint URL (for enterprise deployments).
     pub custom_endpoint: Option<String>,
+
+    /// Base endpoint override (scheme://host) from the standardized `endpoint_override` — points the
+    /// batch POST at an in-repo mock/proxy for credential-free e2e; `None` uses the production host.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for NaverClovaSttConfig {
@@ -245,6 +249,7 @@ impl Default for NaverClovaSttConfig {
             connection_timeout_secs: 10,
             request_timeout_secs: 60,
             custom_endpoint: None,
+            endpoint_override: None,
         }
     }
 }
@@ -307,6 +312,7 @@ impl NaverClovaSttConfig {
             connection_timeout_secs: 10,
             request_timeout_secs: 60,
             custom_endpoint: None,
+            endpoint_override: None,
         })
     }
 
@@ -319,7 +325,9 @@ impl NaverClovaSttConfig {
     pub fn from_standard(
         std: &crate::core::stt::standard::StandardSTTConfig,
     ) -> Result<Self, STTError> {
-        Self::from_base(std.base.clone())
+        let mut cfg = Self::from_base(std.base.clone())?;
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        Ok(cfg)
     }
 
     /// Validate the configuration.
