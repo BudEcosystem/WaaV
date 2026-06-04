@@ -261,6 +261,10 @@ pub struct DashScopeTtsConfig {
     /// Embed an AIGC watermark tag in the audio (`enable_aigc_tag`).
     #[serde(default)]
     pub enable_aigc_tag: Option<bool>,
+
+    /// Override the DashScope WS endpoint host (credential-free mock/proxy harness, W-T0).
+    #[serde(default)]
+    pub endpoint_override: Option<String>,
 }
 
 fn default_voice() -> String {
@@ -304,6 +308,7 @@ impl Default for DashScopeTtsConfig {
             hot_fix: None,
             enable_markdown_filter: None,
             enable_aigc_tag: None,
+            endpoint_override: None,
         }
     }
 }
@@ -345,8 +350,12 @@ impl DashScopeTtsConfig {
     }
 
     /// Get the WebSocket URL for this configuration.
+    ///
+    /// Honors `endpoint_override` (credential-free mock/proxy harness, W-T0): the base's
+    /// scheme+host replace the DashScope host while the inference/realtime path+query are kept,
+    /// so a `ws://127.0.0.1:PORT` override yields `ws://127.0.0.1:PORT/api-ws/v1/inference`.
     pub fn get_websocket_url(&self) -> String {
-        if self.model.is_qwen_model() {
+        let url = if self.model.is_qwen_model() {
             format!(
                 "{}?model={}",
                 self.region.realtime_url(),
@@ -354,7 +363,8 @@ impl DashScopeTtsConfig {
             )
         } else {
             self.region.inference_url().to_string()
-        }
+        };
+        crate::core::tts::standard::override_rest_endpoint(&url, self.endpoint_override.as_deref())
     }
 
     /// Convert from base TTSConfig.
@@ -400,6 +410,7 @@ impl DashScopeTtsConfig {
             hot_fix: None,
             enable_markdown_filter: None,
             enable_aigc_tag: None,
+            endpoint_override: None,
         })
     }
 
@@ -478,6 +489,8 @@ impl DashScopeTtsConfig {
         if let Some(flag) = std.extras.0.get("enable_aigc_tag").and_then(|v| v.as_bool()) {
             cfg.enable_aigc_tag = Some(flag);
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         Ok(cfg)
     }

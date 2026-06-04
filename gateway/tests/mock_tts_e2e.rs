@@ -632,6 +632,66 @@ async fn lmnt_tts_full_integration_via_mock_endpoint() {
 }
 
 #[tokio::test]
+async fn alibaba_cloud_tts_full_integration_via_mock_endpoint() {
+    // Alibaba DashScope CosyVoice WS: client sends run-task -> mock replies task-started; client
+    // sends continue-task(text) -> mock streams the audio as a BINARY frame then task-finished.
+    // endpoint_override (ws:// base) swaps the wss DashScope host, keeping /api-ws/v1/inference.
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::protocol::Message;
+    ensure_crypto();
+    let audio = fake_audio();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await
+            && let Ok(ws) = accept_async(stream).await
+        {
+            let (mut write, mut read) = ws.split();
+            let mut task_id = String::from("task-1");
+            while let Some(Ok(msg)) = read.next().await {
+                if let Message::Text(t) = msg {
+                    let v: serde_json::Value = serde_json::from_str(&t).unwrap_or_default();
+                    if let Some(tid) = v["header"]["task_id"].as_str() {
+                        task_id = tid.to_string();
+                    }
+                    match v["header"]["action"].as_str().unwrap_or("") {
+                        "run-task" => {
+                            let started = serde_json::json!({
+                                "header": { "task_id": task_id, "event": "task-started" }
+                            });
+                            let _ = write.send(Message::Text(started.to_string().into())).await;
+                        }
+                        "continue-task" => {
+                            let _ = write.send(Message::Binary(audio.clone().into())).await;
+                            let finished = serde_json::json!({
+                                "header": { "task_id": task_id, "event": "task-finished" }
+                            });
+                            let _ = write.send(Message::Text(finished.to_string().into())).await;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    });
+
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "alibaba_cloud".into(),
+        api_key: "test-bearer-token".into(),
+        voice_id: Some("longxiaochun".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("ws://127.0.0.1:{port}"));
+    let mut tts =
+        create_tts_standard("alibaba_cloud", std).expect("build alibaba_cloud tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("alibaba_cloud TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "alibaba_cloud TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
 async fn iflytek_tts_full_integration_via_mock_endpoint() {
     // iFlytek TTS is a signed WebSocket: connect (signed URL), send a JSON request, receive JSON
     // Text frames carrying base64 audio under data.audio (status 2 = final chunk). endpoint_override
