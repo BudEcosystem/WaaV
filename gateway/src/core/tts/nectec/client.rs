@@ -128,7 +128,10 @@ impl NectecTts {
 
         let response = self
             .http_client
-            .post(self.config.endpoint())
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                self.config.endpoint(),
+                self.config.endpoint_override.as_deref(),
+            ))
             .header(API_KEY_HEADER, &self.config.api_key)
             .header(LIB_HEADER, LIB_VALUE)
             .header("Content-Type", "application/json")

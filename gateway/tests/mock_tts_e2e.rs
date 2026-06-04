@@ -677,6 +677,27 @@ async fn fpt_ai_tts_full_integration_via_mock_endpoint() {
 }
 
 #[tokio::test]
+async fn nectec_tts_full_integration_via_mock_endpoint() {
+    // NECTEC VAJA9 synth POST returns {"wav_url": <download_url>}; the provider then GETs it.
+    ensure_crypto();
+    let port = spawn_audio_url_then_download_mock(
+        |url| serde_json::json!({ "wav_url": url }),
+        fake_audio(),
+    )
+    .await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "nectec".into(),
+        api_key: "test-key".into(),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("nectec", std).expect("build nectec tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("nectec TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "nectec TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
 async fn zalo_ai_tts_full_integration_via_mock_endpoint() {
     // Zalo synth POST returns {"data":{"url": <download_url>}}; the provider then GETs it for audio.
     ensure_crypto();

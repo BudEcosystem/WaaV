@@ -131,6 +131,9 @@ pub struct NectecTtsConfig {
 
     /// Whether to automatically chunk long text.
     pub auto_chunk: bool,
+
+    /// Override base (scheme+host) for the synth POST endpoint (mock/test harness; None = production).
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for NectecTtsConfig {
@@ -142,6 +145,7 @@ impl Default for NectecTtsConfig {
             audiovisual: 0,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
             auto_chunk: true,
+            endpoint_override: None,
         }
     }
 }
@@ -169,6 +173,7 @@ impl NectecTtsConfig {
             audiovisual: 0,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
             auto_chunk: true,
+            endpoint_override: None,
         })
     }
 
@@ -191,6 +196,7 @@ impl NectecTtsConfig {
         if let Some(audiovisual) = std.extras.0.get("audiovisual").and_then(|v| v.as_i64()) {
             cfg.audiovisual = audiovisual as i32;
         }
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
         Ok(cfg)
     }
 
