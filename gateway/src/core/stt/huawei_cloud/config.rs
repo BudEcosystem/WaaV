@@ -470,6 +470,12 @@ pub struct HuaweiCloudSttConfig {
     #[serde(default)]
     pub max_seconds: Option<u32>,
 
+    /// Endpoint override (scheme+host) for the credential-free mock harness. When `Some(base)`, both
+    /// the IAM token POST and the ASR (WS/REST) connection are redirected to `base`, keeping the
+    /// original path+query (via `override_rest_endpoint`). `None` = production endpoints.
+    #[serde(default)]
+    pub endpoint_override: Option<String>,
+
     /// Cached IAM token.
     #[serde(skip)]
     pub token: Option<String>,
@@ -498,6 +504,7 @@ impl Default for HuaweiCloudSttConfig {
             vad_head: None,
             vad_tail: None,
             max_seconds: None,
+            endpoint_override: None,
             token: None,
             token_expires_at: None,
         }
@@ -653,22 +660,44 @@ impl HuaweiCloudSttConfig {
     }
 
     /// Get the short sentence recognition URL.
+    ///
+    /// Honors `endpoint_override` (scheme+host) when set, keeping the SIS REST path so the
+    /// credential-free mock harness can redirect the POST without losing the served path.
     pub fn get_short_asr_url(&self) -> String {
-        format!(
+        let url = format!(
             "{}{}",
             self.get_https_endpoint(),
             SHORT_ASR_PATH.replace("{project_id}", &self.project_id)
-        )
+        );
+        crate::core::tts::standard::override_rest_endpoint(&url, self.endpoint_override.as_deref())
     }
 
     /// Get the WebSocket URL for real-time recognition.
+    ///
+    /// Honors `endpoint_override` (scheme+host) when set, keeping the SIS RASR WS path so the
+    /// credential-free mock harness can redirect the handshake to a localhost mock (e.g. an
+    /// override base of `ws://127.0.0.1:PORT`) without losing the served path.
     pub fn get_realtime_url(&self) -> Option<String> {
         self.mode.ws_path().map(|path| {
-            format!(
+            let url = format!(
                 "{}{}",
                 self.get_wss_endpoint(),
                 path.replace("{project_id}", &self.project_id)
-            )
+            );
+            let swapped = crate::core::tts::standard::override_rest_endpoint(
+                &url,
+                self.endpoint_override.as_deref(),
+            );
+            // The override base is `http(s)://` (reqwest needs it for the IAM token POST), but the
+            // ASR dial is a WebSocket — normalize the scheme back to `ws(s)://` so `connect_async`
+            // accepts it (same host:port the mock's axum server listens on).
+            if let Some(rest) = swapped.strip_prefix("http://") {
+                format!("ws://{rest}")
+            } else if let Some(rest) = swapped.strip_prefix("https://") {
+                format!("wss://{rest}")
+            } else {
+                swapped
+            }
         })
     }
 
@@ -798,6 +827,7 @@ impl HuaweiCloudSttConfig {
         if let Some(max_s) = std.extras.0.get("max_seconds").and_then(|v| v.as_u64()) {
             cfg.max_seconds = Some(max_s as u32);
         }
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
         Ok(cfg)
     }
 }

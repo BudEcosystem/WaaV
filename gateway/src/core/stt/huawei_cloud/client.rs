@@ -399,13 +399,17 @@ impl HuaweiCloudStt {
     }
 
     /// Get the IAM token, fetching if necessary.
+    ///
+    /// Passes `endpoint_override` so the credential-free mock harness can redirect the IAM token
+    /// POST (scheme+host) to a localhost mock; `None` in production hits the real IAM endpoint.
     async fn get_token(&self) -> Result<String, STTError> {
         self.token_manager
-            .get_token(
+            .get_token_with_override(
                 &self.config.username,
                 &self.config.password,
                 &self.config.domain_name,
                 self.config.region,
+                self.config.endpoint_override.as_deref(),
             )
             .await
     }
@@ -454,6 +458,7 @@ impl HuaweiCloudStt {
         let domain_name = self.config.domain_name.clone();
         let region = self.config.region;
         let host = self.config.region.sis_endpoint();
+        let iam_override = self.config.endpoint_override.clone();
         let session_ready = self.session_ready.clone();
 
         // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor with
@@ -493,6 +498,7 @@ impl HuaweiCloudStt {
                     let username = username.clone();
                     let password = password.clone();
                     let domain_name = domain_name.clone();
+                    let iam_override = iam_override.clone();
                     let start_frame_json = start_frame_json.clone();
                     let audio_rx = Arc::clone(&audio_rx);
                     let shutdown_rx = Arc::clone(&shutdown_rx);
@@ -501,9 +507,16 @@ impl HuaweiCloudStt {
                     let result_tx = result_tx.clone();
                     let error_tx = error_tx.clone();
                     async move {
-                        // Re-fetch the IAM token (cached; re-authenticates on expiry).
+                        // Re-fetch the IAM token (cached; re-authenticates on expiry). Passes
+                        // `endpoint_override` so a reconnect's token POST honors the mock redirect.
                         let token = token_manager
-                            .get_token(&username, &password, &domain_name, region)
+                            .get_token_with_override(
+                                &username,
+                                &password,
+                                &domain_name,
+                                region,
+                                iam_override.as_deref(),
+                            )
                             .await
                             .map_err(|e| StreamError::new(format!("IAM token error: {e}")))?;
 

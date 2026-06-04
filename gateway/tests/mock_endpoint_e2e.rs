@@ -1317,3 +1317,166 @@ async fn gladia_full_integration_via_mock_endpoint() {
     println!("Gladia mock e2e surfaced transcript: {got:?}");
     assert_eq!(got, "hello world", "Gladia full integration broken");
 }
+
+// ============================================================================
+// STT 2-step REST (nectec, bhashini) + token-WS (huawei_cloud).
+// ============================================================================
+
+#[tokio::test]
+async fn nectec_full_integration_via_mock_endpoint() {
+    use axum::{Router, http::header, routing::post};
+    ensure_crypto();
+    // NECTEC is batch: buffer audio, POST once on flush()/disconnect(); partii5 returns {"content":...}.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().fallback(post(|| async {
+        (
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"content":"hello world"}"#,
+        )
+    }));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "nectec".into(),
+        api_key: "test-key".into(),
+        language: "th".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".into(),
+        model: "partii5".into(),
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut stt = create_stt_standard("nectec", std).expect("build nectec via keystone");
+    let got = drive_and_capture(stt.as_mut()).await;
+    println!("NECTEC mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "NECTEC full integration broken");
+}
+
+#[tokio::test]
+async fn bhashini_full_integration_via_mock_endpoint() {
+    use axum::{Router, http::header, routing::post};
+    ensure_crypto();
+    // Bhashini is 2-step: pipeline-config POST returns a callbackUrl + inference key; the compute
+    // POST to that callbackUrl returns the ASR text. One axum server serves both.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let config_body = format!(
+        r#"{{"pipelineInferenceAPIEndPoint":{{"callbackUrl":"http://127.0.0.1:{port}/compute","inferenceApiKey":{{"name":"Authorization","value":"infk"}}}},"pipelineResponseConfig":[{{"taskType":"asr","config":[{{"serviceId":"svc"}}]}}]}}"#
+    );
+    let app = Router::new()
+        .route(
+            "/ulca/apis/v0/model/getModelsPipeline",
+            post(move || {
+                let b = config_body.clone();
+                async move { ([(header::CONTENT_TYPE, "application/json")], b) }
+            }),
+        )
+        .route(
+            "/compute",
+            post(|| async {
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"pipelineResponse":[{"taskType":"asr","output":[{"source":"hello world"}],"audio":[]}]}"#,
+                )
+            }),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "bhashini".into(),
+        // userId|ulcaApiKey|inferenceApiKey packing.
+        api_key: "test-user|test-ulca|test-inference".into(),
+        language: "en".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".into(),
+        model: String::new(),
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut stt = create_stt_standard("bhashini", std).expect("build bhashini via keystone");
+    let got = drive_and_capture(stt.as_mut()).await;
+    println!("Bhashini mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "Bhashini full integration broken");
+}
+
+/// Huawei ASR WS handler: reply `STARTED` to the START control frame (unblocks connect), then emit
+/// the final `END` transcript on the first binary audio frame.
+async fn huawei_ws_handler(mut socket: axum::extract::ws::WebSocket, transcript: String) {
+    use axum::extract::ws::Message as Aws;
+    while let Some(Ok(msg)) = socket.recv().await {
+        match msg {
+            Aws::Text(_) => {
+                let _ = socket
+                    .send(Aws::Text(r#"{"resp_type":"STARTED","error_code":0}"#.into()))
+                    .await;
+            }
+            Aws::Binary(_) => {
+                let _ = socket.send(Aws::Text(transcript.clone().into())).await;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Huawei STT mock: connect() does an IAM token POST (token in the `X-Subject-Token` RESPONSE HEADER)
+/// THEN a WS dial. ONE axum server serves both (POST /v3/auth/tokens + a WS upgrade on the rasr path).
+async fn spawn_huawei_stt_mock(project_id: &str, transcript_value: &'static str) -> u16 {
+    use axum::extract::ws::WebSocketUpgrade;
+    use axum::http::HeaderName;
+    use axum::{
+        Router,
+        routing::{get, post},
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let transcript = format!(
+        r#"{{"resp_type":"END","error_code":0,"result":{{"text":"{transcript_value}","score":0.95,"is_final":true}}}}"#
+    );
+    let ws_path = format!("/v1/{project_id}/rasr/short-stream");
+    let app = Router::new()
+        .route(
+            "/v3/auth/tokens",
+            post(|| async {
+                ([(HeaderName::from_static("x-subject-token"), "mock-token")], "{}")
+            }),
+        )
+        .route(
+            &ws_path,
+            get(move |ws: WebSocketUpgrade| {
+                let t = transcript.clone();
+                async move { ws.on_upgrade(move |s| huawei_ws_handler(s, t)) }
+            }),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    port
+}
+
+#[tokio::test]
+async fn huawei_cloud_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    let port = spawn_huawei_stt_mock("proj1", "hello world").await;
+    // username|password|domain_name|project_id packing; override base is http:// (reqwest needs it
+    // for the IAM POST; get_realtime_url normalizes the WS dial back to ws://).
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "huawei_cloud".into(),
+        api_key: "test-user|test-pass|test-domain|proj1".into(),
+        language: "en".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".into(),
+        model: String::new(),
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut stt = create_stt_standard("huawei_cloud", std).expect("build huawei via keystone");
+    let got = drive_and_capture(stt.as_mut()).await;
+    println!("Huawei Cloud mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "Huawei Cloud full integration broken");
+}

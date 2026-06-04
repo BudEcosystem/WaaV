@@ -476,6 +476,9 @@ pub struct BhashiniSttConfig {
 
     /// Maximum audio buffer size in bytes.
     pub max_buffer_size: usize,
+
+    /// Test-only base-URL override for the pipeline CONFIG POST (scheme+host swap; path/query kept).
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for BhashiniSttConfig {
@@ -493,6 +496,7 @@ impl Default for BhashiniSttConfig {
             source_script_code: None,
             post_processors: None,
             max_buffer_size: MAX_AUDIO_SIZE_BYTES,
+            endpoint_override: None,
         }
     }
 }
@@ -563,6 +567,7 @@ impl BhashiniSttConfig {
             source_script_code: None,
             post_processors: None,
             max_buffer_size: MAX_AUDIO_SIZE_BYTES,
+            endpoint_override: None,
         };
 
         config.validate()?;
@@ -609,6 +614,8 @@ impl BhashiniSttConfig {
                 cfg.post_processors = Some(procs);
             }
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
 
         Ok(cfg)
     }

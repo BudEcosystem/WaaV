@@ -190,6 +190,9 @@ pub struct NectecSttConfig {
 
     /// Partii4 output format (only for Partii4).
     pub output_format: Partii4OutputFormat,
+
+    /// Optional endpoint base override (scheme+host) for test/mock redirection.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for NectecSttConfig {
@@ -202,6 +205,7 @@ impl Default for NectecSttConfig {
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
             output_level: Partii4OutputLevel::default(),
             output_format: Partii4OutputFormat::default(),
+            endpoint_override: None,
         }
     }
 }
@@ -244,6 +248,7 @@ impl NectecSttConfig {
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
             output_level: Partii4OutputLevel::default(),
             output_format: Partii4OutputFormat::default(),
+            endpoint_override: None,
         })
     }
 
@@ -259,7 +264,9 @@ impl NectecSttConfig {
     pub fn from_standard(
         std: &crate::core::stt::standard::StandardSTTConfig,
     ) -> Result<Self, STTError> {
-        Self::from_base(&std.base)
+        let mut cfg = Self::from_base(&std.base)?;
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        Ok(cfg)
     }
 
     /// Validate the configuration.
