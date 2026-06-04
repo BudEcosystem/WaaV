@@ -185,3 +185,80 @@ async fn reverie_full_integration_via_mock_endpoint() {
         "Reverie did not surface the mock transcript end-to-end (full integration broken)"
     );
 }
+
+/// Spawn a local mock Tencent ASR WS server: after the first audio frame, emit a Tencent ASR
+/// response (`{"code":0,...,"result":{"slice_type":2,...,"voice_text_str":..},"final":1}`) — its real
+/// wire shape — then drain audio.
+async fn spawn_tencent_mock(transcript_value: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await
+            && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
+        {
+            let (mut write, mut read) = ws.split();
+            let msg = format!(
+                r#"{{"code":0,"message":"success","voice_id":"v1","result":{{"slice_type":2,"index":0,"start_time":0,"end_time":1000,"voice_text_str":"{transcript_value}"}},"final":1}}"#
+            );
+            let mut sent = false;
+            while let Some(Ok(frame)) = read.next().await {
+                if !sent && matches!(frame, Message::Binary(_)) {
+                    let _ = write.send(Message::Text(msg.clone().into())).await;
+                    sent = true;
+                }
+            }
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn tencent_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    let port = spawn_tencent_mock("hello world").await;
+    let endpoint = format!("ws://127.0.0.1:{port}");
+
+    // Tencent packs its three credentials into api_key as `secret_id|secret_key|app_id`.
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "tencent".into(),
+        api_key: "test-sid|test-skey|test-appid".into(),
+        language: "en".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".into(),
+        model: String::new(),
+    })
+    .with_endpoint_override(&endpoint);
+
+    let mut stt = create_stt_standard("tencent", std).expect("build tencent via keystone");
+
+    let best = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let b2 = best.clone();
+    stt.on_result(Arc::new(move |r: STTResult| {
+        let b = b2.clone();
+        Box::pin(async move {
+            let t = r.transcript.trim().to_string();
+            if !t.is_empty() {
+                *b.lock().await = t;
+            }
+        })
+    }))
+    .await
+    .unwrap();
+
+    stt.connect().await.expect("connect to mock endpoint");
+    for _ in 0..5 {
+        let _ = stt.send_audio(bytes::Bytes::from(vec![0u8; 640])).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    stt.disconnect().await.ok();
+
+    let got = best.lock().await.clone();
+    println!("Tencent mock e2e surfaced transcript: {got:?}");
+    assert_eq!(
+        got, "hello world",
+        "Tencent did not surface the mock transcript end-to-end (full integration broken)"
+    );
+}

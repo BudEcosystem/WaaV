@@ -387,9 +387,19 @@ impl TencentStt {
             signature_builder = signature_builder.with_input_sample_rate(input_sample_rate);
         }
 
-        signature_builder
+        let url = signature_builder
             .build_url(TENCENT_ASR_WS_URL, &self.config.app_id)
-            .map_err(|e| STTError::ConfigurationError(format!("Failed to build signature: {}", e)))
+            .map_err(|e| {
+                STTError::ConfigurationError(format!("Failed to build signature: {}", e))
+            })?;
+        // Honor an `endpoint_override` for the in-repo mock/proxy: swap the dialed scheme://host while
+        // keeping the signed `/asr/v2/{app_id}?...` path+query (the mock ignores the HMAC signature).
+        if let Some(o) = self.config.endpoint_override.as_deref().filter(|o| !o.is_empty())
+            && let Some(idx) = url.find("/asr/v2")
+        {
+            return Ok(format!("{}{}", o.trim_end_matches('/'), &url[idx..]));
+        }
+        Ok(url)
     }
 
     /// Handle a WebSocket text message (JSON response).

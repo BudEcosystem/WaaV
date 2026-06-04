@@ -532,6 +532,12 @@ pub struct TencentSttConfig {
     /// Sample rate of the *input* audio (`input_sample_rate`) for engines that accept a different
     /// input rate than their nominal model rate. Tencent Real-Time ASR `input_sample_rate` param.
     pub input_sample_rate: Option<u32>,
+
+    /// Carried from the standardized `endpoint_override` — points the dial at the in-repo mock/proxy
+    /// (a local `ws://` server) for credential-free end-to-end integration tests; `None` uses the
+    /// production Tencent endpoint. The HMAC signature is still computed over the real host (the mock
+    /// ignores it); only the dialed scheme://host is swapped.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for TencentSttConfig {
@@ -557,6 +563,7 @@ impl Default for TencentSttConfig {
             filter_empty_result: false,
             noise_threshold: None,
             input_sample_rate: None,
+            endpoint_override: None,
         }
     }
 }
@@ -849,6 +856,8 @@ impl TencentSttConfig {
         if let Some(v) = e.get("input_sample_rate").and_then(|v| v.as_u64()) {
             cfg.input_sample_rate = Some(v as u32);
         }
+        // Standardized endpoint override (mock/proxy host) for credential-free integration tests.
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
         Ok(cfg)
     }
 }
