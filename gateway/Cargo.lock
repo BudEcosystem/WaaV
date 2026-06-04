@@ -7150,6 +7150,8 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-polly",
  "aws-sdk-transcribestreaming",
+ "aws-smithy-eventstream",
+ "aws-smithy-runtime-api",
  "aws-smithy-types",
  "aws-types",
  "axum 0.8.9",
