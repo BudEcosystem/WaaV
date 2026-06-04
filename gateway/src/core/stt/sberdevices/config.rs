@@ -235,6 +235,10 @@ pub struct SberSTTConfig {
     /// standardized `extras` passthrough (`extras["model"]`) — distinct from the OAuth `scope`
     /// (which the flat `STTConfig::model` field already reuses).
     pub recognition_model: Option<String>,
+    /// Base endpoint override (scheme://host) from the standardized `endpoint_override` — rewrites
+    /// BOTH the OAuth token host and the `speech:recognize` host to an in-repo mock/proxy for
+    /// credential-free e2e (paths preserved). `None` uses the production Sber hosts.
+    pub endpoint_override: Option<String>,
 }
 
 impl SberSTTConfig {
@@ -301,6 +305,7 @@ impl SberSTTConfig {
             enable_profanity_filter: false,
             channels_count: None,
             recognition_model: None,
+            endpoint_override: None,
         })
     }
 
@@ -337,6 +342,8 @@ impl SberSTTConfig {
         if let Some(m) = std.extras.0.get("model").and_then(|v| v.as_str()) {
             cfg.recognition_model = Some(m.to_string());
         }
+        // Standardized endpoint override → both Sber hosts (OAuth + recognize) for mock e2e.
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
         Ok(cfg)
     }
 
@@ -347,9 +354,14 @@ impl SberSTTConfig {
     /// options (`enable_profanity_filter`, `channels_count`, `model`) are emitted only when set so
     /// unset knobs fall back to the provider default. This is the URL that actually reaches Sber.
     pub fn recognize_url(&self) -> String {
+        // When overridden, keep the production path (`/rest/v1/speech:recognize`) but swap the host.
+        let base = match self.endpoint_override {
+            Some(ref ov) => format!("{}/rest/v1/speech:recognize", ov.trim_end_matches('/')),
+            None => STT_RECOGNIZE_ENDPOINT.to_string(),
+        };
         let mut url = format!(
             "{}?language={}&sample_rate={}",
-            STT_RECOGNIZE_ENDPOINT,
+            base,
             self.language.as_code(),
             self.sample_rate
         );
@@ -368,6 +380,16 @@ impl SberSTTConfig {
     /// Get the Authorization header for OAuth token request
     pub fn oauth_auth_header(&self) -> String {
         format!("Basic {}", self.client_credentials)
+    }
+
+    /// Build the OAuth token URL. When `endpoint_override` is set, the production OAuth path
+    /// (`/api/v2/oauth`) is preserved but the host is swapped to the override (mock e2e); otherwise
+    /// the production `OAUTH_ENDPOINT` is used.
+    pub fn oauth_url(&self) -> String {
+        match self.endpoint_override {
+            Some(ref ov) => format!("{}/api/v2/oauth", ov.trim_end_matches('/')),
+            None => OAUTH_ENDPOINT.to_string(),
+        }
     }
 
     /// Get the content-type for audio data

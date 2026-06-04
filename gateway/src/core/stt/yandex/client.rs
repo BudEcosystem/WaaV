@@ -153,7 +153,7 @@ impl YandexSTT {
         // Send request
         let response = self
             .client
-            .post(YANDEX_STT_RECOGNIZE_URL)
+            .post(self.yandex_config.recognize_url())
             .headers(headers)
             .query(&params)
             .body(audio_data.to_vec())
@@ -257,7 +257,7 @@ impl YandexSTT {
 
                 // Send request
                 let result = client
-                    .post(YANDEX_STT_RECOGNIZE_URL)
+                    .post(yandex_config.recognize_url())
                     .headers(headers)
                     .query(&params)
                     .body(audio_data)

@@ -231,6 +231,11 @@ pub struct YandexSTTConfig {
     /// ("25"). Maps from the canonical `numerals` feature (which requests digits) as
     /// `raw_results = !numerals`.
     pub raw_results: bool,
+
+    /// Base endpoint override (scheme://host) from the standardized `endpoint_override` — points the
+    /// recognize POST at a mock/proxy host while preserving the `/speech/v1/stt:recognize` path
+    /// (credential-free e2e); `None` uses the production Yandex host.
+    pub endpoint_override: Option<String>,
 }
 
 impl YandexSTTConfig {
@@ -297,7 +302,17 @@ impl YandexSTTConfig {
             max_alternatives: 1,
             hints: Vec::new(),
             raw_results: false,
+            endpoint_override: None,
         })
+    }
+
+    /// Resolve the recognize endpoint URL, honoring `endpoint_override` (mock host swap; the
+    /// `/speech/v1/stt:recognize` path + query are preserved).
+    pub fn recognize_url(&self) -> String {
+        match &self.endpoint_override {
+            Some(ov) => format!("{}/speech/v1/stt:recognize", ov.trim_end_matches('/')),
+            None => crate::core::stt::yandex::YANDEX_STT_RECOGNIZE_URL.to_string(),
+        }
     }
 
     /// Build from the standardized config (W1 keystone). Yandex exposes a modest feature
@@ -310,6 +325,7 @@ impl YandexSTTConfig {
     ) -> Result<Self, STTError> {
         let f = &std.features;
         let mut cfg = Self::from_base(&std.base)?;
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
         if let Some(d) = f.diarization {
             cfg.speaker_identification = d;
         }
@@ -609,6 +625,7 @@ mod tests {
             max_alternatives: 1,
             hints: Vec::new(),
             raw_results: false,
+            endpoint_override: None,
         };
 
         assert_eq!(config.auth_header_value(), "Api-Key test-key");
@@ -631,6 +648,7 @@ mod tests {
             max_alternatives: 3,
             hints: Vec::new(),
             raw_results: false,
+            endpoint_override: None,
         };
 
         let params = config.build_query_params();

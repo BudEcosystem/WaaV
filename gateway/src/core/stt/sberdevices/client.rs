@@ -12,9 +12,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::config::{
-    MAX_SYNC_AUDIO_SIZE, OAUTH_ENDPOINT, SberSTTConfig, TOKEN_REFRESH_THRESHOLD_SECS,
-};
+use super::config::{MAX_SYNC_AUDIO_SIZE, SberSTTConfig, TOKEN_REFRESH_THRESHOLD_SECS};
 use super::messages::{
     OAuthTokenRequest, OAuthTokenResponse, SberApiError, SberRecognitionResponse, SberStatusCode,
 };
@@ -46,15 +44,18 @@ struct TokenManager {
     credentials: String,
     /// OAuth scope
     scope: String,
+    /// Resolved OAuth token URL (production const or endpoint_override host).
+    oauth_url: String,
 }
 
 impl TokenManager {
-    fn new(credentials: String, scope: String) -> Self {
+    fn new(credentials: String, scope: String, oauth_url: String) -> Self {
         Self {
             token: None,
             client: reqwest::Client::new(),
             credentials,
             scope,
+            oauth_url,
         }
     }
 
@@ -82,7 +83,7 @@ impl TokenManager {
         // Build request
         let response = self
             .client
-            .post(OAUTH_ENDPOINT)
+            .post(&self.oauth_url)
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .header("Accept", "application/json")
             .header("RqUID", &rq_uid)
@@ -186,6 +187,7 @@ impl SberDevicesSTT {
         let token_manager = TokenManager::new(
             sber_config.client_credentials.clone(),
             sber_config.scope.as_str().to_string(),
+            sber_config.oauth_url(),
         );
 
         Ok(Self {
@@ -553,6 +555,7 @@ impl BaseSTT for SberDevicesSTT {
             *tm = TokenManager::new(
                 new_sber_config.client_credentials.clone(),
                 new_sber_config.scope.as_str().to_string(),
+                new_sber_config.oauth_url(),
             );
         }
 

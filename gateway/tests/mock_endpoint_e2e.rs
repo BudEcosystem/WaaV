@@ -842,3 +842,138 @@ async fn viettel_full_integration_via_mock_endpoint() {
     println!("Viettel mock e2e surfaced transcript: {got:?}");
     assert_eq!(got, "hello world", "Viettel full integration broken");
 }
+
+#[tokio::test]
+async fn yandex_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    let port = spawn_http_mock(
+        "/speech/v1/stt:recognize",
+        r#"{"result":"hello world"}"#.to_string(),
+    )
+    .await;
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "yandex".into(),
+        api_key: "test-key".into(),
+        language: "en".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "lpcm".into(),
+        model: String::new(),
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut stt = create_stt_standard("yandex", std).expect("build yandex via keystone");
+
+    let best = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let b2 = best.clone();
+    stt.on_result(Arc::new(move |r: STTResult| {
+        let b = b2.clone();
+        Box::pin(async move {
+            let t = r.transcript.trim().to_string();
+            if !t.is_empty() {
+                *b.lock().await = t;
+            }
+        })
+    }))
+    .await
+    .unwrap();
+
+    stt.connect().await.expect("connect");
+    for _ in 0..6 {
+        let _ = stt.send_audio(bytes::Bytes::from(vec![0u8; 1280])).await;
+    }
+    // Yandex POSTs from a background task (~500ms cadence once the buffer ≥ 1600 bytes), NOT on
+    // disconnect() — so poll for the callback before tearing the session down.
+    let mut got = String::new();
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        got = best.lock().await.clone();
+        if !got.is_empty() {
+            break;
+        }
+    }
+    stt.disconnect().await.ok();
+    println!("Yandex mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "Yandex full integration broken");
+}
+
+/// Sberdevices SaluteSpeech mock: TWO routes on one host — the OAuth token endpoint (hit on
+/// connect()) and the speech:recognize endpoint (hit by a background task). One axum router with two
+/// `.route(...)` entries serves both (the single endpoint_override rewrites both Sber hosts to here).
+async fn spawn_sber_mock(transcript_value: &'static str) -> u16 {
+    use axum::{Router, http::header, routing::post};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let recog = format!(r#"{{"result":["{transcript_value}"],"status":200}}"#);
+    let app = Router::new()
+        .route(
+            "/api/v2/oauth",
+            post(|| async {
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"access_token":"mock-access-token","expires_at":9999999999999}"#,
+                )
+            }),
+        )
+        .route(
+            "/rest/v1/speech:recognize",
+            post(move || {
+                let body = recog.clone();
+                async move { ([(header::CONTENT_TYPE, "application/json")], body) }
+            }),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    port
+}
+
+#[tokio::test]
+async fn sberdevices_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    let port = spawn_sber_mock("hello world").await;
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "sberdevices".into(),
+        api_key: "test_client:test_secret".into(),
+        language: "ru-RU".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "pcm".into(),
+        model: String::new(),
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut stt = create_stt_standard("sberdevices", std).expect("build sber via keystone");
+
+    let best = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let b2 = best.clone();
+    stt.on_result(Arc::new(move |r: STTResult| {
+        let b = b2.clone();
+        Box::pin(async move {
+            let t = r.transcript.trim().to_string();
+            if !t.is_empty() {
+                *b.lock().await = t;
+            }
+        })
+    }))
+    .await
+    .unwrap();
+
+    stt.connect().await.expect("connect (hits the OAuth route)");
+    for _ in 0..6 {
+        let _ = stt.send_audio(bytes::Bytes::from(vec![0u8; 1280])).await;
+    }
+    // Sber's recognize POST fires from a background task (~500ms cadence once buffer ≥ 3200 bytes),
+    // not on disconnect() — poll for the callback before tearing the session down.
+    let mut got = String::new();
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        got = best.lock().await.clone();
+        if !got.is_empty() {
+            break;
+        }
+    }
+    stt.disconnect().await.ok();
+    println!("Sberdevices mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "Sberdevices full integration broken");
+}
