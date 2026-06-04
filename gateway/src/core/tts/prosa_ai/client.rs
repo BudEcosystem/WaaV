@@ -125,7 +125,10 @@ impl ProsaTts {
         // Send request
         let response = self
             .http_client
-            .post(PROSA_TTS_BASE_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                PROSA_TTS_BASE_URL,
+                self.config.endpoint_override.as_deref(),
+            ))
             .header("Content-Type", "application/json")
             .header("x-api-key", &self.config.api_key)
             .json(&request_body)
@@ -191,7 +194,11 @@ impl ProsaTts {
 
     /// Poll for job result (async mode).
     async fn poll_job_result(&self, job_id: &str) -> TTSResult<Vec<u8>> {
-        let url = format!("{}/{}", PROSA_TTS_BASE_URL, job_id);
+        let base = crate::core::tts::standard::override_rest_endpoint(
+            PROSA_TTS_BASE_URL,
+            self.config.endpoint_override.as_deref(),
+        );
+        let url = format!("{}/{}", base, job_id);
         let max_attempts = 60;
         let poll_interval = std::time::Duration::from_secs(1);
 

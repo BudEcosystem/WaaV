@@ -308,6 +308,9 @@ pub struct ProsaTtsConfig {
 
     /// Optional label for the request.
     pub label: Option<String>,
+
+    /// Optional base-URL override for the synth endpoint (mock e2e redirect).
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for ProsaTtsConfig {
@@ -322,6 +325,7 @@ impl Default for ProsaTtsConfig {
             as_signed_url: false,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
             label: None,
+            endpoint_override: None,
         }
     }
 }
@@ -378,6 +382,7 @@ impl ProsaTtsConfig {
             as_signed_url: false,
             request_timeout_secs,
             label: None,
+            endpoint_override: None,
         })
     }
 
@@ -419,6 +424,8 @@ impl ProsaTtsConfig {
         if let Some(as_signed_url) = std.extras.0.get("as_signed_url").and_then(|v| v.as_bool()) {
             cfg.as_signed_url = as_signed_url;
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         Ok(cfg)
     }

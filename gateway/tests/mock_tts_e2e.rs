@@ -604,6 +604,29 @@ async fn lmnt_tts_full_integration_via_mock_endpoint() {
 }
 
 #[tokio::test]
+async fn prosa_ai_tts_full_integration_via_mock_endpoint() {
+    // Prosa with wait=true (default) returns base64 audio directly in the POST response under
+    // {status:"complete", result:{data: ...}} — no poll, no download.
+    ensure_crypto();
+    let body = serde_json::json!({
+        "job_id": "job-1",
+        "status": "complete",
+        "result": { "data": b64(&fake_audio()), "url": "", "duration": 1.0 }
+    });
+    let port = spawn_fixed_json_mock(body).await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "prosa_ai".into(),
+        api_key: "test-key".into(),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("prosa_ai", std).expect("build prosa_ai tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("prosa_ai TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "prosa_ai TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
 async fn ibm_watson_tts_full_integration_via_mock_endpoint() {
     // IBM Watson: IAM token POST /identity/token → {access_token}, then synth POST
     // /instances/{id}/v1/synthesize → raw audio bytes. instance_id is a provider extra.
