@@ -89,6 +89,26 @@ impl StandardTTSConfig {
             extras: ProviderExtras::default(),
         }
     }
+
+    /// Set the endpoint override (host/URL) the provider should connect to instead of its
+    /// production endpoint — the credential-free mock/proxy harness (W-T0). Mirrors
+    /// [`crate::core::stt::standard::StandardSTTConfig::with_endpoint_override`]; stored in the open
+    /// `extras` passthrough under [`crate::core::stt::standard::ENDPOINT_OVERRIDE_KEY`].
+    pub fn with_endpoint_override(mut self, endpoint: impl Into<String>) -> Self {
+        self.extras.0.insert(
+            crate::core::stt::standard::ENDPOINT_OVERRIDE_KEY.to_string(),
+            serde_json::Value::String(endpoint.into()),
+        );
+        self
+    }
+
+    /// The configured endpoint override, if any.
+    pub fn endpoint_override(&self) -> Option<&str> {
+        self.extras
+            .0
+            .get(crate::core::stt::standard::ENDPOINT_OVERRIDE_KEY)
+            .and_then(|v| v.as_str())
+    }
 }
 
 impl From<TTSConfig> for StandardTTSConfig {
