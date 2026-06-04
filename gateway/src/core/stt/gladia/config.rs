@@ -461,6 +461,8 @@ pub struct GladiaSTTConfig {
     pub post_processing: GladiaPostProcessing,
     /// Custom metadata for session tracking
     pub custom_metadata: Option<serde_json::Value>,
+    /// Base endpoint override (scheme://host) from the standardized `endpoint_override` — redirects the session-init POST at an in-repo mock; the WS dial follows the `url` the mock returns.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for GladiaSTTConfig {
@@ -481,6 +483,7 @@ impl Default for GladiaSTTConfig {
             realtime_processing: GladiaRealtimeProcessing::default(),
             post_processing: GladiaPostProcessing::default(),
             custom_metadata: None,
+            endpoint_override: None,
         }
     }
 }
@@ -644,6 +647,8 @@ impl GladiaSTTConfig {
             cfg.messages_config.receive_lifecycle_events = b;
         }
 
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+
         Ok(cfg)
     }
 
@@ -701,9 +706,15 @@ impl GladiaSTTConfig {
         Ok(())
     }
 
-    /// Get the API URL for session initialization
+    /// Get the API URL for session initialization. When `endpoint_override` (the standardized
+    /// base-url override, used by the credential-free mock e2e) is set, its scheme://host replaces
+    /// that of `GLADIA_LIVE_URL`; the `/v2/live` path and `?region=` query are preserved.
     pub fn api_url(&self) -> String {
-        format!("{}?region={}", super::GLADIA_LIVE_URL, self.region)
+        let base = match self.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
+            Some(o) => format!("{}/v2/live", o.trim_end_matches('/')),
+            None => super::GLADIA_LIVE_URL.to_string(),
+        };
+        format!("{}?region={}", base, self.region)
     }
 
     /// Set the region

@@ -32,6 +32,24 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 /// The concrete WebSocket stream type ElevenLabs dials.
 type ElevenLabsWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// Extract the `host[:port]` authority from a `ws://`/`wss://` (or `http(s)://`) base URL, used
+/// for the `Host` header when an `endpoint_override` redirects the connection (e.g. a localhost
+/// mock). Returns `None` for an empty/authority-less URL. Mirrors the Deepgram/AssemblyAI helpers.
+fn ws_authority(base: &str) -> Option<String> {
+    let rest = base
+        .strip_prefix("wss://")
+        .or_else(|| base.strip_prefix("ws://"))
+        .or_else(|| base.strip_prefix("https://"))
+        .or_else(|| base.strip_prefix("http://"))
+        .unwrap_or(base);
+    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+    if authority.is_empty() {
+        None
+    } else {
+        Some(authority.to_string())
+    }
+}
+
 /// A [`WsTransport`] that adapts ElevenLabs' streaming event loop to the generic
 /// [`ReconnectableStream`] supervisor (W-D1 production adoption). One is built per (re)connect by
 /// the supervisor's `connect` closure; its [`run`](WsTransport::run) IS the original `select!`
@@ -341,8 +359,13 @@ impl ElevenLabsSTT {
         // Pre-allocate with estimated capacity
         let mut url = String::with_capacity(512);
 
-        // Base URL from region
-        url.push_str(config.region.websocket_base_url());
+        // Base URL: a non-empty `endpoint_override` (e.g. a localhost mock `ws://127.0.0.1:PORT`)
+        // wins over the region's production endpoint, otherwise fall back to the region base.
+        let endpoint: &str = match config.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
+            Some(o) => o.trim_end_matches('/'),
+            None => config.region.websocket_base_url(),
+        };
+        url.push_str(endpoint);
         url.push_str("/v1/speech-to-text/realtime?");
 
         // Required: model_id (URL encoded for safety)
@@ -626,7 +649,19 @@ impl ElevenLabsSTT {
 
         // Clone necessary data for the connection task
         let api_key = config.base.api_key.clone();
-        let host = Self::get_host_from_region(&config.region).to_string();
+        // When an `endpoint_override` redirects the WS connection (e.g. a localhost mock), the
+        // `Host` header should reflect that authority rather than the production region host. The
+        // mock's `accept_async` ignores the value, so this is best-effort. `None`/empty/unparseable
+        // override -> region host.
+        let host = match config
+            .endpoint_override
+            .as_deref()
+            .filter(|o| !o.is_empty())
+            .and_then(ws_authority)
+        {
+            Some(authority) => authority,
+            None => Self::get_host_from_region(&config.region).to_string(),
+        };
 
         // Shared state the supervised transport re-uses across reconnect attempts: a single-
         // consumer audio receiver + shutdown oneshot (locked per `run`) and the one-shot
@@ -959,6 +994,7 @@ impl BaseSTT for ElevenLabsSTT {
                 .as_ref()
                 .and_then(|c| c.include_language_detection),
             no_verbatim: existing.as_ref().and_then(|c| c.no_verbatim),
+            endpoint_override: existing.as_ref().and_then(|c| c.endpoint_override.clone()),
         };
 
         self.config = Some(elevenlabs_config);

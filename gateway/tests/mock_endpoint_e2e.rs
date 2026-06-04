@@ -1060,3 +1060,260 @@ async fn ibm_watson_full_integration_via_mock_endpoint() {
     println!("IBM Watson mock e2e surfaced transcript: {got:?}");
     assert_eq!(got, "hello world", "IBM Watson full integration broken");
 }
+
+// ============================================================================
+// STT WS tail: assemblyai, cartesia, elevenlabs, sarvam, phonexia (parametric
+// WS mock) + gladia (2-step init-POST + WS, combined axum mock).
+// ============================================================================
+
+/// Parametric STT WS mock: optionally send `ack` first (handshake the client blocks on), then emit
+/// `transcript` once the first inbound frame of the matching kind arrives (`trigger_text` → the
+/// provider sends audio as JSON Text; otherwise Binary). Drains the rest so the client keeps streaming.
+async fn spawn_stt_ws_mock(ack: Option<&'static str>, transcript: String, trigger_text: bool) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await
+            && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
+        {
+            let (mut write, mut read) = ws.split();
+            if let Some(a) = ack {
+                let _ = write.send(Message::Text(a.into())).await;
+            }
+            // Emit the transcript once the client starts streaming (its first data frame, Text or
+            // Binary — providers vary; some send a Text control frame before audio). `trigger_text`
+            // is retained only to document the provider's audio frame type.
+            let _ = trigger_text;
+            let mut sent = false;
+            while let Some(Ok(frame)) = read.next().await {
+                let hit = matches!(frame, Message::Text(_) | Message::Binary(_));
+                if !sent && hit {
+                    let _ = write.send(Message::Text(transcript.clone().into())).await;
+                    sent = true;
+                }
+            }
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn assemblyai_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    // AssemblyAI v3: connect() blocks on a `Begin` ack, then a `Turn` with end_of_turn=true is final.
+    let port = spawn_stt_ws_mock(
+        Some(r#"{"type":"Begin","id":"s","expires_at":1704067200}"#),
+        r#"{"type":"Turn","turn_order":0,"transcript":"hello world","end_of_turn":true}"#.to_string(),
+        false,
+    )
+    .await;
+    let endpoint = format!("ws://127.0.0.1:{port}");
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "assemblyai".into(),
+        api_key: "test-key".into(),
+        language: "en".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".into(),
+        model: String::new(),
+    })
+    .with_endpoint_override(&endpoint);
+    let mut stt = create_stt_standard("assemblyai", std).expect("build assemblyai via keystone");
+    let got = drive_and_capture(stt.as_mut()).await;
+    println!("AssemblyAI mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "AssemblyAI full integration broken");
+}
+
+#[tokio::test]
+async fn cartesia_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    let port = spawn_stt_ws_mock(
+        None,
+        r#"{"type":"transcript","text":"hello world","is_final":true}"#.to_string(),
+        false,
+    )
+    .await;
+    let endpoint = format!("ws://127.0.0.1:{port}");
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "cartesia".into(),
+        api_key: "test-key".into(),
+        language: "en".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "pcm_s16le".into(),
+        model: "ink-whisper".into(),
+    })
+    .with_endpoint_override(&endpoint);
+    let mut stt = create_stt_standard("cartesia", std).expect("build cartesia via keystone");
+    let got = drive_and_capture(stt.as_mut()).await;
+    println!("Cartesia mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "Cartesia full integration broken");
+}
+
+#[tokio::test]
+async fn elevenlabs_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    // ElevenLabs blocks on `session_started`; audio is JSON Text; `committed_transcript` is final.
+    let port = spawn_stt_ws_mock(
+        Some(r#"{"message_type":"session_started","session_id":"s"}"#),
+        r#"{"message_type":"committed_transcript","text":"hello world"}"#.to_string(),
+        true,
+    )
+    .await;
+    let endpoint = format!("ws://127.0.0.1:{port}");
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "elevenlabs".into(),
+        api_key: "test-key".into(),
+        language: "en".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".into(),
+        model: String::new(),
+    })
+    .with_endpoint_override(&endpoint);
+    let mut stt = create_stt_standard("elevenlabs", std).expect("build elevenlabs via keystone");
+    let got = drive_and_capture(stt.as_mut()).await;
+    println!("ElevenLabs mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "ElevenLabs full integration broken");
+}
+
+#[tokio::test]
+async fn sarvam_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    // Sarvam: no ack; audio is JSON Text; `{"type":"data",...}` carries the transcript.
+    let port = spawn_stt_ws_mock(
+        None,
+        r#"{"type":"data","data":{"transcript":"hello world","is_final":true}}"#.to_string(),
+        true,
+    )
+    .await;
+    let endpoint = format!("ws://127.0.0.1:{port}");
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "sarvam".into(),
+        api_key: "test-key".into(),
+        language: "en-IN".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "pcm_s16le".into(),
+        model: String::new(),
+    })
+    .with_endpoint_override(&endpoint);
+    let mut stt = create_stt_standard("sarvam", std).expect("build sarvam via keystone");
+    let got = drive_and_capture(stt.as_mut()).await;
+    println!("Sarvam mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "Sarvam full integration broken");
+}
+
+#[tokio::test]
+async fn phonexia_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    // Phonexia STT is gated off by default (its WS protocol is not validated against the real
+    // vendor — PRODUCTION_PLAN W3). This e2e proves the IMPLEMENTED protocol's wire path
+    // (connect -> audio -> parse -> callback) end-to-end against a mock speaking that same protocol;
+    // it does NOT certify the protocol matches the real Phonexia server. The opt-in flag is required.
+    unsafe {
+        std::env::set_var("WAAV_PHONEXIA_ALLOW_UNVERIFIED", "1");
+    }
+    // Phonexia is on-prem: the SERVER URL is carried in `api_key` (no endpoint_override needed).
+    let port = spawn_stt_ws_mock(
+        None,
+        r#"{"is_last":true,"segments":[{"words":[{"text":"hello world","confidence":0.95}]}]}"#
+            .to_string(),
+        false,
+    )
+    .await;
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "phonexia".into(),
+        // The api_key field carries the Phonexia server URL; point it at the mock.
+        api_key: format!("http://127.0.0.1:{port}"),
+        language: "en".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".into(),
+        model: String::new(),
+    });
+    let mut stt = create_stt_standard("phonexia", std).expect("build phonexia via keystone");
+    let got = drive_and_capture(stt.as_mut()).await;
+    println!("Phonexia mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "Phonexia full integration broken");
+}
+
+/// Gladia WS handler: gladia sends audio as JSON Text (`{"type":"audio_chunk",...}`); emit the
+/// transcript on the first Text frame.
+async fn gladia_ws_handler(mut socket: axum::extract::ws::WebSocket, transcript: String) {
+    use axum::extract::ws::Message as Aws;
+    let mut sent = false;
+    while let Some(Ok(msg)) = socket.recv().await {
+        if let Aws::Text(_) = msg
+            && !sent
+        {
+            let _ = socket.send(Aws::Text(transcript.clone().into())).await;
+            sent = true;
+        }
+    }
+}
+
+/// Gladia mock: connect() does a session-init POST (`/v2/live`) that returns a WS `url`, then dials
+/// it. ONE axum server serves both (POST returns a `ws://this-port/ws` url + a WS upgrade on `/ws`).
+async fn spawn_gladia_mock(transcript_value: &'static str) -> u16 {
+    use axum::extract::ws::WebSocketUpgrade;
+    use axum::{
+        Router,
+        http::header,
+        routing::{get, post},
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let transcript = format!(
+        r#"{{"type":"transcript","session_id":"s","created_at":"2026-06-04T00:00:00.000Z","data":{{"id":"00-1","is_final":true,"utterance":{{"text":"{transcript_value}","language":"en","start":0.0,"end":1.5,"confidence":0.95,"channel":0}}}}}}"#
+    );
+    let init_body =
+        format!(r#"{{"id":"sess","created_at":"2026-06-04T00:00:00.000Z","url":"ws://127.0.0.1:{port}/ws"}}"#);
+    let app = Router::new()
+        .route(
+            "/v2/live",
+            post(move || {
+                let b = init_body.clone();
+                async move { ([(header::CONTENT_TYPE, "application/json")], b) }
+            }),
+        )
+        .route(
+            "/ws",
+            get(move |ws: WebSocketUpgrade| {
+                let t = transcript.clone();
+                async move { ws.on_upgrade(move |s| gladia_ws_handler(s, t)) }
+            }),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    port
+}
+
+#[tokio::test]
+async fn gladia_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    let port = spawn_gladia_mock("hello world").await;
+    // endpoint_override redirects the session-init POST; the init response's `url` (ws://this-port/ws)
+    // drives the WS dial back to the same mock.
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "gladia".into(),
+        api_key: "test-key".into(),
+        language: "en".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".into(),
+        model: String::new(),
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut stt = create_stt_standard("gladia", std).expect("build gladia via keystone");
+    let got = drive_and_capture(stt.as_mut()).await;
+    println!("Gladia mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "Gladia full integration broken");
+}

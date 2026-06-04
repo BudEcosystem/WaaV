@@ -91,6 +91,11 @@ pub struct SarvamSTTConfig {
     pub pre_speech_pad_frames: Option<u32>,
     /// VAD: number of initial frames to ignore at session start (warm-up).
     pub num_initial_ignored_frames: Option<u32>,
+    /// Test-only base-URL override (scheme+host); redirects the WS dial, keeping the path/query.
+    // NOTE: `#[serde(skip)]` is intentionally omitted — `SarvamSTTConfig` derives only
+    // `Debug, Clone` (no `Serialize`/`Deserialize`), so a bare serde attribute here would be an
+    // unregistered-attribute compile error. The field is non-serialized regardless.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for SarvamSTTConfig {
@@ -115,6 +120,7 @@ impl Default for SarvamSTTConfig {
             interrupt_min_speech_frames: None,
             pre_speech_pad_frames: None,
             num_initial_ignored_frames: None,
+            endpoint_override: None,
         }
     }
 }
@@ -209,6 +215,7 @@ impl SarvamSTTConfig {
         if let Some(v) = e.get("num_initial_ignored_frames").and_then(|v| v.as_u64()) {
             cfg.num_initial_ignored_frames = Some(v as u32);
         }
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
         cfg
     }
 
@@ -219,7 +226,15 @@ impl SarvamSTTConfig {
         // "saarika:v2.5", "en-IN", "pcm_s16le") — they never contain spaces or query delimiters, and
         // the `:` in model ids is valid in a query and must stay literal, so they are NOT
         // percent-encoded here (unlike genuinely free-text values such as Deepgram keyterms).
-        url.push_str(SARVAM_STT_WS_URL);
+        // Honor a base-URL override (scheme+host) for tests/regional dials, keeping the
+        // `/speech-to-text/ws` path and the query below unchanged. Empty override => production base.
+        match self.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
+            Some(o) => {
+                url.push_str(o.trim_end_matches('/'));
+                url.push_str("/speech-to-text/ws");
+            }
+            None => url.push_str(SARVAM_STT_WS_URL),
+        }
         url.push_str("?model=");
         url.push_str(&self.model);
         url.push_str("&language-code=");

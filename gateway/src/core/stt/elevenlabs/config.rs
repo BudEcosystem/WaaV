@@ -291,6 +291,14 @@ pub struct ElevenLabsSTTConfig {
     /// to *keep* filler words (`filler_words = true`) sets `no_verbatim = false`, and a caller
     /// asking to drop them (`filler_words = false`) sets `no_verbatim = true`.
     pub no_verbatim: Option<bool>,
+
+    /// Test/diagnostic WebSocket endpoint override.
+    ///
+    /// When set (and non-empty), this replaces the region-derived base URL in
+    /// [`ElevenLabsSTT::build_websocket_url`], so the connection can be redirected at a
+    /// localhost mock WebSocket server (e.g. `ws://127.0.0.1:PORT`). `None` uses the
+    /// region's production endpoint. Plumbed from `StandardSTTConfig::endpoint_override`.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for ElevenLabsSTTConfig {
@@ -318,6 +326,7 @@ impl Default for ElevenLabsSTTConfig {
             enable_phi_detection: None,
             include_language_detection: None,
             no_verbatim: None,
+            endpoint_override: None,
         }
     }
 }
@@ -547,6 +556,9 @@ impl ElevenLabsSTTConfig {
         if let Some(keep_fillers) = f.filler_words {
             cfg.no_verbatim = Some(!keep_fillers);
         }
+        // Plumb the test/diagnostic WS endpoint override (e.g. localhost mock) through from the
+        // standardized config so `build_websocket_url` can redirect the connection.
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
         cfg
     }
 
