@@ -250,7 +250,7 @@ impl BhashiniTts {
 
         let response = self
             .client
-            .post(BHASHINI_CONFIG_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(BHASHINI_CONFIG_URL, self.config.endpoint_override.as_deref()))
             .header("userID", &self.config.user_id)
             .header("ulcaApiKey", &self.config.ulca_api_key)
             .header("Content-Type", "application/json")

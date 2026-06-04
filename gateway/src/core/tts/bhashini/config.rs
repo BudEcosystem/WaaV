@@ -101,6 +101,8 @@ pub struct BhashiniTtsConfig {
     pub custom_callback_url: Option<String>,
     /// Custom service ID (if not using pipeline config).
     pub custom_service_id: Option<String>,
+    /// Test-only base-URL override for the pipeline CONFIG POST (scheme+host swap; path/query kept).
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for BhashiniTtsConfig {
@@ -116,6 +118,7 @@ impl Default for BhashiniTtsConfig {
             pipeline_provider: BhashiniPipelineProvider::default(),
             custom_callback_url: None,
             custom_service_id: None,
+            endpoint_override: None,
         }
     }
 }
@@ -199,6 +202,7 @@ impl BhashiniTtsConfig {
             pipeline_provider: BhashiniPipelineProvider::default(),
             custom_callback_url: None,
             custom_service_id: None,
+            endpoint_override: None,
         })
     }
 
@@ -241,6 +245,8 @@ impl BhashiniTtsConfig {
         {
             cfg.custom_service_id = Some(id.to_string());
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         Ok(cfg)
     }

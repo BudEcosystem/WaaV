@@ -604,6 +604,58 @@ async fn lmnt_tts_full_integration_via_mock_endpoint() {
 }
 
 #[tokio::test]
+async fn bhashini_tts_full_integration_via_mock_endpoint() {
+    // Bhashini is two-step: a pipeline-CONFIG POST then a COMPUTE POST. We override the config POST
+    // (which returns {} → the provider falls back to custom_callback_url for the compute hop and to
+    // the inference key from the api_key) and point custom_callback_url at the mock's /compute route
+    // (returns {pipelineResponse:[{taskType:tts, audio:[{audioContent: base64}]}]}).
+    use axum::{Json, Router, routing::post};
+    use tokio::net::TcpListener;
+    ensure_crypto();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let compute_body = serde_json::json!({
+        "pipelineResponse": [
+            { "taskType": "tts", "audio": [{ "audioContent": b64(&fake_audio()) }] }
+        ]
+    });
+    let app = Router::new()
+        .route(
+            "/compute",
+            post(move || {
+                let b = compute_body.clone();
+                async move { Json(b) }
+            }),
+        )
+        .fallback(|| async { Json(serde_json::json!({})) });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "bhashini".into(),
+        // userId|ulcaApiKey|inferenceApiKey packing.
+        api_key: "test-user|test-ulca|test-inference".into(),
+        // Bhashini parses voice_id as a BCP-47 language code.
+        voice_id: Some("hi".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    std.extras.0.insert(
+        "custom_callback_url".to_string(),
+        serde_json::Value::String(format!("http://127.0.0.1:{port}/compute")),
+    );
+    std.extras.0.insert(
+        "custom_service_id".to_string(),
+        serde_json::Value::String("ai4bharat/indic-tts".to_string()),
+    );
+    let mut tts = create_tts_standard("bhashini", std).expect("build bhashini tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("bhashini TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "bhashini TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
 async fn prosa_ai_tts_full_integration_via_mock_endpoint() {
     // Prosa with wait=true (default) returns base64 audio directly in the POST response under
     // {status:"complete", result:{data: ...}} — no poll, no download.
