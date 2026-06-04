@@ -65,7 +65,10 @@ impl ZaloTts {
         // Step 1: Request audio URL
         let response = self
             .http_client
-            .post(ZALO_TTS_ENDPOINT)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                ZALO_TTS_ENDPOINT,
+                self.config.endpoint_override.as_deref(),
+            ))
             .header("apikey", &self.config.api_key)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(request_body)

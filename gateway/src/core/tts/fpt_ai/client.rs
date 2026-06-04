@@ -111,7 +111,10 @@ impl FptTts {
         // Step 1: Request audio URL
         let mut request_builder = self
             .http_client
-            .post(FPT_TTS_ENDPOINT)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                FPT_TTS_ENDPOINT,
+                self.config.endpoint_override.as_deref(),
+            ))
             .header("api_key", &self.config.api_key)
             .header("voice", self.config.voice.voice_id())
             .header("speed", self.config.speed.to_string())

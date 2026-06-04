@@ -207,6 +207,9 @@ pub struct ZaloTtsConfig {
 
     /// Request timeout in seconds.
     pub request_timeout_secs: u64,
+
+    /// Optional base URL override for the synth POST (test/mock redirection); `None` in production.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for ZaloTtsConfig {
@@ -217,6 +220,7 @@ impl Default for ZaloTtsConfig {
             speed: DEFAULT_SPEED,
             encode_type: DEFAULT_ENCODE_TYPE,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
+            endpoint_override: None,
         }
     }
 }
@@ -259,6 +263,7 @@ impl ZaloTtsConfig {
             speed,
             encode_type: DEFAULT_ENCODE_TYPE,
             request_timeout_secs,
+            endpoint_override: None,
         })
     }
 
@@ -311,6 +316,8 @@ impl ZaloTtsConfig {
         {
             cfg.request_timeout_secs = timeout;
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         Ok(cfg)
     }

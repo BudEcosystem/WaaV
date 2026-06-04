@@ -155,6 +155,37 @@ async fn spawn_fixed_json_mock(body: serde_json::Value) -> u16 {
     port
 }
 
+/// Spawn a mock for providers whose synth POST returns a JSON envelope containing a *download URL*
+/// the provider then GETs for the audio (FPT.AI `{"async": url}`, Zalo `{"data":{"url": url}}`). The
+/// mock builds the response body via `build_body(download_url)` pointing the URL at its own
+/// `/download` route (which serves the audio bytes), so the second-hop GET lands back on the mock.
+async fn spawn_audio_url_then_download_mock(
+    build_body: fn(String) -> serde_json::Value,
+    audio_bytes: Vec<u8>,
+) -> u16 {
+    use axum::{Json, Router, http::header, routing::get};
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = build_body(format!("http://127.0.0.1:{port}/download"));
+    let app = Router::new()
+        .route(
+            "/download",
+            get(move || {
+                let bytes = audio_bytes.clone();
+                async move { ([(header::CONTENT_TYPE, "audio/mpeg")], bytes) }
+            }),
+        )
+        .fallback(move || {
+            let body = body.clone();
+            async move { Json(body) }
+        });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    port
+}
+
 /// Base64-encode a blob (for JSON-enveloped audio responses).
 fn b64(bytes: &[u8]) -> String {
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -570,6 +601,49 @@ async fn lmnt_tts_full_integration_via_mock_endpoint() {
         },
     )
     .await;
+}
+
+#[tokio::test]
+async fn fpt_ai_tts_full_integration_via_mock_endpoint() {
+    // FPT.AI synth POST returns {"async": <download_url>}; the provider then GETs the URL for audio.
+    ensure_crypto();
+    let port = spawn_audio_url_then_download_mock(
+        |url| serde_json::json!({ "async": url, "error": 0 }),
+        fake_audio(),
+    )
+    .await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "fpt_ai".into(),
+        api_key: "test-key".into(),
+        voice_id: Some("banmai".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("fpt_ai", std).expect("build fpt_ai tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("fpt_ai TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "fpt_ai TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn zalo_ai_tts_full_integration_via_mock_endpoint() {
+    // Zalo synth POST returns {"data":{"url": <download_url>}}; the provider then GETs it for audio.
+    ensure_crypto();
+    let port = spawn_audio_url_then_download_mock(
+        |url| serde_json::json!({ "error_code": 0, "data": { "url": url } }),
+        fake_audio(),
+    )
+    .await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "zalo_ai".into(),
+        api_key: "test-key".into(),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("zalo_ai", std).expect("build zalo_ai tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("zalo_ai TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "zalo_ai TTS surfaced no audio end-to-end");
 }
 
 #[tokio::test]

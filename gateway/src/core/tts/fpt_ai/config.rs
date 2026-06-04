@@ -237,6 +237,9 @@ pub struct FptTtsConfig {
 
     /// Optional callback URL for async notification.
     pub callback_url: Option<String>,
+
+    /// Optional base URL override for the synth endpoint (host/scheme swap; for tests/proxies).
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for FptTtsConfig {
@@ -248,6 +251,7 @@ impl Default for FptTtsConfig {
             format: FptAudioFormat::default(),
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
             callback_url: None,
+            endpoint_override: None,
         }
     }
 }
@@ -301,6 +305,7 @@ impl FptTtsConfig {
             format,
             request_timeout_secs,
             callback_url: None,
+            endpoint_override: None,
         })
     }
 
@@ -331,6 +336,8 @@ impl FptTtsConfig {
         if let Some(url) = std.extras.0.get("callback_url").and_then(|v| v.as_str()) {
             cfg.callback_url = Some(url.to_string());
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         Ok(cfg)
     }
