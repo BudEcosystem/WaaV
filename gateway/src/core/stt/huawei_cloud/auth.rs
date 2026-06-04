@@ -194,25 +194,49 @@ impl HuaweiTokenManager {
         domain_name: &str,
         region: HuaweiCloudRegion,
     ) -> Result<String, STTError> {
+        self.get_token_with_override(username, password, domain_name, region, None)
+            .await
+    }
+
+    /// Get or refresh the access token, optionally redirecting the IAM token POST to `iam_override`.
+    ///
+    /// Behaviorally identical to [`Self::get_token`] when `iam_override` is `None`. The override
+    /// (scheme+host) lets the credential-free mock harness redirect IAM without touching the cache
+    /// or token semantics.
+    pub async fn get_token_with_override(
+        &self,
+        username: &str,
+        password: &str,
+        domain_name: &str,
+        region: HuaweiCloudRegion,
+        iam_override: Option<&str>,
+    ) -> Result<String, STTError> {
         // Check if we have a valid cached token
         if let Some(token) = self.get_cached_token().await {
             return Ok(token);
         }
 
         // Fetch new token
-        self.fetch_token(username, password, domain_name, region)
+        self.fetch_token(username, password, domain_name, region, iam_override)
             .await
     }
 
     /// Fetch a new token from IAM.
+    ///
+    /// `iam_override`, when `Some(base)`, redirects the IAM token POST to that base (scheme+host),
+    /// keeping the IAM path+query — used by the credential-free mock harness. `None` is production.
     pub async fn fetch_token(
         &self,
         username: &str,
         password: &str,
         domain_name: &str,
         region: HuaweiCloudRegion,
+        iam_override: Option<&str>,
     ) -> Result<String, STTError> {
-        let url = region.iam_endpoint();
+        let url = crate::core::tts::standard::override_rest_endpoint(
+            &region.iam_endpoint(),
+            iam_override,
+        );
         let request = IamTokenRequest::new(username, password, domain_name, region);
 
         let request_json = request.to_json().map_err(|e| {
@@ -291,7 +315,7 @@ impl HuaweiTokenManager {
         region: HuaweiCloudRegion,
     ) -> Result<String, STTError> {
         self.clear().await;
-        self.fetch_token(username, password, domain_name, region)
+        self.fetch_token(username, password, domain_name, region, None)
             .await
     }
 }

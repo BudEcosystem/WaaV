@@ -385,6 +385,10 @@ pub struct HuaweiCloudTtsConfig {
     /// TTS operation mode.
     #[serde(default)]
     pub mode: HuaweiTtsMode,
+
+    /// Optional endpoint base (scheme+host) redirecting the IAM token + synth POSTs to a mock/proxy.
+    #[serde(default)]
+    pub endpoint_override: Option<String>,
 }
 
 fn default_sample_rate() -> u32 {
@@ -411,6 +415,7 @@ impl Default for HuaweiCloudTtsConfig {
             volume: DEFAULT_VOLUME,
             subtitle: false,
             mode: HuaweiTtsMode::default(),
+            endpoint_override: None,
         }
     }
 }
@@ -563,6 +568,7 @@ impl HuaweiCloudTtsConfig {
             volume: DEFAULT_VOLUME,
             subtitle: false,
             mode: HuaweiTtsMode::default(),
+            endpoint_override: None,
         })
     }
 
@@ -606,16 +612,23 @@ impl HuaweiCloudTtsConfig {
             cfg.region = HuaweiCloudRegion::from_str(region).unwrap_or(cfg.region);
         }
 
+        // Endpoint override (W-T0 mock harness): redirects IAM token + synth POSTs to a mock/proxy.
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+
         Ok(cfg)
     }
 
     /// Get the standard TTS endpoint URL.
+    ///
+    /// Honors `endpoint_override` (scheme+host) when set, keeping the SIS path+query so the synth
+    /// POST can be redirected to a mock/proxy.
     pub fn get_tts_url(&self) -> String {
-        format!(
+        let url = format!(
             "https://{}/v1/{}/tts",
             self.region.sis_endpoint(),
             self.project_id
-        )
+        );
+        crate::core::tts::standard::override_rest_endpoint(&url, self.endpoint_override.as_deref())
     }
 
     /// Get the real-time TTS WebSocket URL.

@@ -604,6 +604,48 @@ async fn lmnt_tts_full_integration_via_mock_endpoint() {
 }
 
 #[tokio::test]
+async fn huawei_cloud_tts_full_integration_via_mock_endpoint() {
+    // Huawei: IAM POST /v3/auth/tokens returns the token in the X-Subject-Token RESPONSE HEADER;
+    // synth POST /v1/{project}/tts returns {"result":{"data": base64}}. Both hosts are swapped to
+    // the mock by endpoint_override (the shared token manager honors it via get_token_with_override).
+    use axum::{Json, Router, http::HeaderName, routing::post};
+    use tokio::net::TcpListener;
+    ensure_crypto();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let synth_body = serde_json::json!({ "result": { "data": b64(&fake_audio()) } });
+    let app = Router::new()
+        .route(
+            "/v3/auth/tokens",
+            post(|| async {
+                ([(HeaderName::from_static("x-subject-token"), "mock-token")], "{}")
+            }),
+        )
+        .fallback(move || {
+            let b = synth_body.clone();
+            async move { Json(b) }
+        });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "huawei_cloud".into(),
+        // username|password|domain_name|project_id packing.
+        api_key: "test-user|test-pass|test-domain|proj-123".into(),
+        // Huawei TTS only supports 8000/16000 (default config carries 24000).
+        sample_rate: Some(16000),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts =
+        create_tts_standard("huawei_cloud", std).expect("build huawei_cloud tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("huawei_cloud TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "huawei_cloud TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
 async fn aws_polly_tts_full_integration_via_mock_endpoint() {
     // AWS Polly via the SDK: endpoint_override sets the SDK's endpoint_url (raw base); the SDK
     // appends /v1/speech and SynthesizeSpeech returns the audio in the response body. Credentials

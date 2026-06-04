@@ -147,7 +147,7 @@ impl HuaweiCloudTts {
     /// Get the IAM token, fetching if necessary.
     async fn get_token(&self) -> Result<String, TTSError> {
         self.token_manager
-            .get_token(
+            .get_token_with_override(
                 &self.config.username,
                 &self.config.password,
                 &self.config.domain_name,
@@ -156,6 +156,8 @@ impl HuaweiCloudTts {
                     self.config.region.code(),
                 )
                 .unwrap_or_default(),
+                // Redirect the IAM token POST to the mock/proxy when an override is configured.
+                self.config.endpoint_override.as_deref(),
             )
             .await
             .map_err(|e| TTSError::AuthenticationFailed(e.to_string()))
