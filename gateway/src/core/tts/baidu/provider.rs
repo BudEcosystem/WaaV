@@ -75,17 +75,25 @@ struct TokenManager {
     secret_key: String,
     /// HTTP client.
     client: Client,
+    /// Test-only base URL override for the OAuth token-fetch endpoint.
+    endpoint_override: Option<String>,
 }
 
 impl TokenManager {
     /// Create a new token manager.
-    fn new(api_key: String, secret_key: String, client: Client) -> Self {
+    fn new(
+        api_key: String,
+        secret_key: String,
+        client: Client,
+        endpoint_override: Option<String>,
+    ) -> Self {
         Self {
             access_token: RwLock::new(None),
             expires_at: RwLock::new(None),
             api_key,
             secret_key,
             client,
+            endpoint_override,
         }
     }
 
@@ -110,9 +118,13 @@ impl TokenManager {
     async fn refresh_token(&self) -> Result<String, TTSError> {
         debug!("Refreshing Baidu OAuth access token...");
 
+        let oauth_base = crate::core::tts::standard::override_rest_endpoint(
+            BAIDU_OAUTH_URL,
+            self.endpoint_override.as_deref(),
+        );
         let url = format!(
             "{}?grant_type=client_credentials&client_id={}&client_secret={}",
-            BAIDU_OAUTH_URL, self.api_key, self.secret_key
+            oauth_base, self.api_key, self.secret_key
         );
 
         let response = self
@@ -258,6 +270,7 @@ impl BaiduTts {
             baidu_config.api_key.clone(),
             baidu_config.secret_key.clone(),
             client.clone(),
+            baidu_config.endpoint_override.clone(),
         ));
 
         Ok(Self {
@@ -336,7 +349,10 @@ impl BaiduTts {
 
         // Build request form data
         let prepared_text = Self::prepare_text(text);
-        let endpoint = self.config.get_endpoint_url();
+        let endpoint = crate::core::tts::standard::override_rest_endpoint(
+            self.config.get_endpoint_url(),
+            self.config.endpoint_override.as_deref(),
+        );
 
         let form_data = [
             ("tex", prepared_text.as_str()),

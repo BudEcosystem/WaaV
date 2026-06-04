@@ -299,6 +299,10 @@ pub struct SberTtsConfig {
     /// input as SSML (the documented SSML input mode for `/rest/v1/text:synthesize`).
     #[serde(default)]
     pub ssml_input: bool,
+
+    /// Optional base URL override (scheme+host) for the OAuth token and synth REST calls; used by the mock e2e harness to redirect to localhost.
+    #[serde(skip)]
+    pub endpoint_override: Option<String>,
 }
 
 fn default_sample_rate() -> u32 {
@@ -325,6 +329,7 @@ impl Default for SberTtsConfig {
             connection_timeout_secs: default_connection_timeout(),
             request_timeout_secs: default_request_timeout(),
             ssml_input: false,
+            endpoint_override: None,
         }
     }
 }
@@ -401,6 +406,7 @@ impl SberTtsConfig {
             connection_timeout_secs: default_connection_timeout(),
             request_timeout_secs: default_request_timeout(),
             ssml_input: false,
+            endpoint_override: None,
         })
     }
 
@@ -447,6 +453,8 @@ impl SberTtsConfig {
             cfg.request_timeout_secs = secs;
         }
 
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+
         Ok(cfg)
     }
 
@@ -490,14 +498,25 @@ impl SberTtsConfig {
         self.voice.voice_id(self.sample_rate)
     }
 
-    /// Build synthesis URL with query parameters
+    /// Build synthesis URL with query parameters. Honors `endpoint_override` (scheme+host swap,
+    /// path+query preserved) so the mock e2e harness can redirect the synth POST to localhost.
     pub fn synthesis_url(&self) -> String {
-        format!(
+        let url = format!(
             "{}?voice={}&format={}&sample_rate={}",
             SBER_TTS_SYNTHESIZE_URL,
             self.voice_id(),
             self.audio_format.as_str(),
             self.sample_rate
+        );
+        crate::core::tts::standard::override_rest_endpoint(&url, self.endpoint_override.as_deref())
+    }
+
+    /// OAuth token endpoint, honoring `endpoint_override` (scheme+host swap, path preserved) so the
+    /// mock e2e harness can redirect the token POST to localhost.
+    pub fn oauth_url(&self) -> String {
+        crate::core::tts::standard::override_rest_endpoint(
+            OAUTH_ENDPOINT,
+            self.endpoint_override.as_deref(),
         )
     }
 }

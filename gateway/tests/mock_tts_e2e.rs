@@ -106,17 +106,17 @@ async fn spawn_json_audio_mock(key: &'static str, audio_bytes: Vec<u8>) -> u16 {
     port
 }
 
-/// Spawn a mock for a two-step auth+synth TTS provider: `auth_path` returns a JSON token envelope
-/// `{ token_key: "mock-token" }`; every other path returns raw audio bytes. Used by providers that
-/// log in for a Bearer token before synthesizing (e.g. CereProc `/v2/auth` → `/v2/speak`).
+/// Spawn a mock for a two-step auth+synth TTS provider: `auth_path` returns the JSON token envelope
+/// `token_body` (shape varies per vendor — CereProc `{token}`, Baidu `{access_token,expires_in}`,
+/// Sber `{access_token,expires_at}`); every other path returns raw audio bytes. Used by providers
+/// that fetch a Bearer/OAuth token before synthesizing.
 async fn spawn_auth_then_audio_mock(
     auth_path: &'static str,
-    token_key: &'static str,
+    token_body: serde_json::Value,
     audio_bytes: Vec<u8>,
 ) -> u16 {
     use axum::{Json, Router, http::header, routing::post};
     use tokio::net::TcpListener;
-    let token_body = serde_json::json!({ token_key: "mock-token" });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let app = Router::new()
@@ -407,7 +407,12 @@ async fn cereproc_tts_full_integration_via_mock_endpoint() {
     // CereProc is two-step: connect() logs in (POST /v2/auth → {"token":...}) then speak() POSTs
     // /v2/speak → audio bytes. The auth mock serves the token; the fallback serves the audio.
     ensure_crypto();
-    let port = spawn_auth_then_audio_mock("/v2/auth", "token", fake_audio()).await;
+    let port = spawn_auth_then_audio_mock(
+        "/v2/auth",
+        serde_json::json!({ "token": "mock-token" }),
+        fake_audio(),
+    )
+    .await;
     let std = StandardTTSConfig::from_base(TTSConfig {
         provider: "cereproc".into(),
         // email:password packing for HTTP Basic auth.
@@ -420,4 +425,80 @@ async fn cereproc_tts_full_integration_via_mock_endpoint() {
     let bytes = drive_tts(tts.as_mut()).await;
     println!("cereproc TTS mock e2e surfaced {bytes} audio bytes");
     assert!(bytes > 0, "cereproc TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn acapela_tts_full_integration_via_mock_endpoint() {
+    // Acapela: connect() logs in (POST /api/login/ → {"token":...}) then speak() GETs /api/command/
+    // → audio bytes. Auth route serves the token; the fallback serves the audio (GET included).
+    ensure_crypto();
+    let port = spawn_auth_then_audio_mock(
+        "/api/login/",
+        serde_json::json!({ "token": "mock-token" }),
+        fake_audio(),
+    )
+    .await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "acapela".into(),
+        // email:password packing for the Acapela login.
+        api_key: "user@example.com:password".into(),
+        voice_id: Some("alice".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("acapela", std).expect("build acapela tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("acapela TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "acapela TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn baidu_tts_full_integration_via_mock_endpoint() {
+    // Baidu: OAuth (POST /oauth/2.0/token → {access_token,expires_in}) then synth (POST /text2audio
+    // → raw audio bytes). connect() fetches the token; the fallback serves the synth audio.
+    ensure_crypto();
+    let port = spawn_auth_then_audio_mock(
+        "/oauth/2.0/token",
+        serde_json::json!({ "access_token": "mock-token", "expires_in": 2_592_000 }),
+        fake_audio(),
+    )
+    .await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "baidu".into(),
+        // api_key|secret_key packing (Baidu fetches an OAuth token from these).
+        api_key: "test-key|test-secret".into(),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("baidu", std).expect("build baidu tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("baidu TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "baidu TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn sberdevices_tts_full_integration_via_mock_endpoint() {
+    // SberDevices: OAuth (POST /api/v2/oauth → {access_token,expires_at_ms}) then synth (POST
+    // /rest/v1/text:synthesize → raw audio bytes). `expires_at` is ms-since-epoch and must be well
+    // in the future so the token is cached past the refresh threshold.
+    ensure_crypto();
+    let port = spawn_auth_then_audio_mock(
+        "/api/v2/oauth",
+        serde_json::json!({ "access_token": "mock-token", "expires_at": 9_999_999_999_000u64 }),
+        fake_audio(),
+    )
+    .await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "sberdevices".into(),
+        // client_id:client_secret packing (base64-encoded for HTTP Basic to the OAuth endpoint).
+        api_key: "test-client-id:test-client-secret".into(),
+        voice_id: Some("Nec_24000".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts =
+        create_tts_standard("sberdevices", std).expect("build sberdevices tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("sberdevices TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "sberdevices TTS surfaced no audio end-to-end");
 }

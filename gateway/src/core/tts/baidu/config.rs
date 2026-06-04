@@ -355,6 +355,10 @@ pub struct BaiduTtsConfig {
     /// Use HTTPS endpoint.
     #[serde(default = "default_use_https")]
     pub use_https: bool,
+
+    /// Test-only base URL override; redirects token-fetch and synth HTTP calls to a mock.
+    #[serde(default)]
+    pub endpoint_override: Option<String>,
 }
 
 fn default_speed() -> u8 {
@@ -392,6 +396,7 @@ impl Default for BaiduTtsConfig {
             volume: DEFAULT_VOLUME,
             cuid: default_cuid(),
             use_https: true,
+            endpoint_override: None,
         }
     }
 }
@@ -506,6 +511,7 @@ impl BaiduTtsConfig {
             volume: DEFAULT_VOLUME,
             cuid: default_cuid(),
             use_https: true,
+            endpoint_override: None,
         })
     }
 
@@ -540,6 +546,8 @@ impl BaiduTtsConfig {
         if let Some(use_https) = std.extras.0.get("use_https").and_then(|v| v.as_bool()) {
             cfg.use_https = use_https;
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         Ok(cfg)
     }

@@ -11,7 +11,7 @@ use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use super::config::{MAX_TEXT_LENGTH, OAUTH_ENDPOINT, SberTtsConfig, TOKEN_REFRESH_THRESHOLD_SECS};
+use super::config::{MAX_TEXT_LENGTH, SberTtsConfig, TOKEN_REFRESH_THRESHOLD_SECS};
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
 };
@@ -146,7 +146,7 @@ impl SberDevicesTts {
 
         let response = self
             .client
-            .post(OAUTH_ENDPOINT)
+            .post(config.oauth_url())
             .header("Authorization", config.oauth_auth_header())
             .header("RqUID", &rq_uid)
             .header("Content-Type", "application/x-www-form-urlencoded")

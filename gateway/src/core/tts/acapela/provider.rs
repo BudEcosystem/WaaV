@@ -119,7 +119,10 @@ impl TTSRequestBuilder for AcapelaRequestBuilder {
 
         // Build and return the request with query parameters
         client
-            .get(self.command_url())
+            .get(crate::core::tts::standard::override_rest_endpoint(
+                self.command_url(),
+                self.config.endpoint_override.as_deref(),
+            ))
             .headers(headers)
             .query(&params)
     }
@@ -198,7 +201,10 @@ impl AcapelaTts {
 
         let response = self
             .auth_client
-            .post(super::ACAPELA_LOGIN_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                super::ACAPELA_LOGIN_URL,
+                self.acapela_config.endpoint_override.as_deref(),
+            ))
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .form(&[
                 ("email", &login_request.email),
@@ -445,7 +451,13 @@ impl BaseTTS for AcapelaTts {
 
         // Initialize HTTP connection pool
         self.provider
-            .generic_connect_with_config(super::ACAPELA_COMMAND_URL, &self.base_config)
+            .generic_connect_with_config(
+                &crate::core::tts::standard::override_rest_endpoint(
+                    super::ACAPELA_COMMAND_URL,
+                    self.acapela_config.endpoint_override.as_deref(),
+                ),
+                &self.base_config,
+            )
             .await
     }
 

@@ -360,6 +360,9 @@ pub struct AcapelaTtsConfig {
     /// pass is suppressed (regex word substitution would otherwise corrupt the SSML tags). There is
     /// no boolean flag to emit on the wire; the markup itself is the wire signal.
     pub ssml_input: bool,
+
+    /// Optional base-URL override (scheme+host) for the REST login/synth endpoints; used by mock e2e tests.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for AcapelaTtsConfig {
@@ -383,6 +386,7 @@ impl Default for AcapelaTtsConfig {
             dictionaries: None,
             application: None,
             ssml_input: false,
+            endpoint_override: None,
         }
     }
 }
@@ -449,6 +453,7 @@ impl AcapelaTtsConfig {
             dictionaries: None,
             application: None,
             ssml_input: false,
+            endpoint_override: None,
         })
     }
 
@@ -501,6 +506,8 @@ impl AcapelaTtsConfig {
         if let Some(app) = std.extras.0.get("application").and_then(|v| v.as_str()) {
             cfg.application = Some(app.to_string());
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         Ok(cfg)
     }
@@ -755,6 +762,7 @@ impl AcapelaTtsConfigBuilder {
             dictionaries: self.dictionaries,
             application: self.application,
             ssml_input: false,
+            endpoint_override: None,
         };
 
         config.validate()?;
