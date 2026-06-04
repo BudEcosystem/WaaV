@@ -977,3 +977,86 @@ async fn sberdevices_full_integration_via_mock_endpoint() {
     println!("Sberdevices mock e2e surfaced transcript: {got:?}");
     assert_eq!(got, "hello world", "Sberdevices full integration broken");
 }
+
+/// IBM Watson axum WS handler: reply to the client's `start` text frame with `{"state":"listening"}`
+/// (its connect() blocks on it), then emit a final results message on the first audio (Binary) frame.
+async fn ibm_ws_handler(mut socket: axum::extract::ws::WebSocket, results: String) {
+    use axum::extract::ws::Message as Aws;
+    while let Some(Ok(msg)) = socket.recv().await {
+        match msg {
+            Aws::Text(_) => {
+                let _ = socket
+                    .send(Aws::Text(r#"{"state":"listening"}"#.into()))
+                    .await;
+            }
+            Aws::Binary(_) => {
+                let _ = socket.send(Aws::Text(results.clone().into())).await;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// IBM Watson mock: connect() does an IAM HTTP token POST THEN a WS dial — so ONE axum server serves
+/// BOTH (POST /identity/token + a WS upgrade on the recognize path). The single endpoint_override
+/// rewrites both hosts to here; the config re-applies http:// for IAM and ws:// for the WS dial.
+async fn spawn_ibm_mock(transcript_value: &'static str) -> u16 {
+    use axum::extract::ws::WebSocketUpgrade;
+    use axum::{
+        Router,
+        http::header,
+        routing::{get, post},
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let results = format!(
+        r#"{{"results":[{{"alternatives":[{{"transcript":"{transcript_value}","confidence":0.95}}],"final":true}}],"result_index":0}}"#
+    );
+    let app = Router::new()
+        .route(
+            "/identity/token",
+            post(|| async {
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"access_token":"mock-token","expires_in":3600}"#,
+                )
+            }),
+        )
+        .route(
+            "/instances/{id}/v1/recognize",
+            get(move |ws: WebSocketUpgrade| {
+                let results = results.clone();
+                async move { ws.on_upgrade(move |socket| ibm_ws_handler(socket, results)) }
+            }),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    port
+}
+
+#[tokio::test]
+async fn ibm_watson_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    let port = spawn_ibm_mock("hello world").await;
+    // IBM reads instance_id from extras; the override (authority only) drives both the IAM POST and
+    // the WS dial against this one mock.
+    let mut std = StandardSTTConfig::from_base(STTConfig {
+        provider: "ibm_watson".into(),
+        api_key: "test-key".into(),
+        language: "en-US".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".into(),
+        model: String::new(),
+    })
+    .with_endpoint_override(format!("127.0.0.1:{port}"));
+    std.extras
+        .0
+        .insert("instance_id".into(), serde_json::json!("inst-test"));
+    let mut stt = create_stt_standard("ibm_watson", std).expect("build ibm via keystone");
+    let got = drive_and_capture(stt.as_mut()).await;
+    println!("IBM Watson mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "IBM Watson full integration broken");
+}

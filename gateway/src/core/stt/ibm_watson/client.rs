@@ -40,7 +40,7 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
 use url::form_urlencoded;
 
-use super::config::{IBM_IAM_URL, IbmWatsonSTTConfig};
+use super::config::IbmWatsonSTTConfig;
 use super::messages::{IbmWatsonMessage, StopMessage};
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
@@ -297,7 +297,7 @@ struct IamTokenResponse {
 }
 
 /// Fetch IAM access token from IBM Cloud using API key.
-async fn fetch_iam_token(api_key: &str) -> Result<IamToken, STTError> {
+async fn fetch_iam_token(api_key: &str, iam_url: &str) -> Result<IamToken, STTError> {
     // Create client with explicit timeouts to prevent indefinite hangs
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -313,7 +313,7 @@ async fn fetch_iam_token(api_key: &str) -> Result<IamToken, STTError> {
     let encoded_api_key: String = form_urlencoded::byte_serialize(api_key.as_bytes()).collect();
 
     let response = client
-        .post(IBM_IAM_URL)
+        .post(iam_url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(format!(
             "grant_type=urn:ibm:params:oauth:grant-type:apikey&apikey={}",
@@ -559,10 +559,10 @@ impl IbmWatsonSTT {
 
     /// Get the current IAM token, refreshing if necessary.
     async fn get_access_token(&self) -> Result<String, STTError> {
-        let api_key = self
+        let (api_key, iam_url) = self
             .config
             .as_ref()
-            .map(|c| c.base.api_key.clone())
+            .map(|c| (c.base.api_key.clone(), c.iam_url()))
             .ok_or_else(|| {
                 STTError::ConfigurationError("No configuration available".to_string())
             })?;
@@ -577,7 +577,7 @@ impl IbmWatsonSTT {
         }
 
         // Need to fetch a new token
-        let new_token = fetch_iam_token(&api_key).await?;
+        let new_token = fetch_iam_token(&api_key, &iam_url).await?;
         let access_token = new_token.access_token.clone();
 
         // Cache the new token
@@ -1122,6 +1122,7 @@ impl BaseSTT for IbmWatsonSTT {
                 .and_then(|c| c.processing_metrics_interval),
             smart_formatting_version: existing.as_ref().and_then(|c| c.smart_formatting_version),
             speech_begin_event: existing.as_ref().is_some_and(|c| c.speech_begin_event),
+            endpoint_override: existing.as_ref().and_then(|c| c.endpoint_override.clone()),
         };
 
         self.config = Some(ibm_config);

@@ -17,6 +17,14 @@ pub const DEFAULT_MODEL: &str = "en-US_Multimedia";
 /// IBM Watson IAM authentication endpoint.
 pub const IBM_IAM_URL: &str = "https://iam.cloud.ibm.com/identity/token";
 
+/// Strip any scheme prefix and trailing slash from an `endpoint_override`, returning the bare
+/// `host[:port]` authority. IBM's override drives BOTH an HTTP IAM POST and a `ws://` recognize dial
+/// against the same mock host, so each builder re-applies its own scheme to this authority.
+fn override_authority(ov: &str) -> &str {
+    let ov = ov.trim_end_matches('/');
+    ov.split_once("://").map(|(_, h)| h).unwrap_or(ov)
+}
+
 /// Default inactivity timeout in seconds (30 seconds).
 pub const DEFAULT_INACTIVITY_TIMEOUT: i32 = 30;
 
@@ -300,6 +308,12 @@ pub struct IbmWatsonSTTConfig {
     /// Found in IBM Cloud service credentials.
     pub instance_id: String,
 
+    /// Carried from the standardized `endpoint_override` — rewrites BOTH the IAM token host and the
+    /// WS recognize host to an in-repo mock/proxy for credential-free e2e (paths preserved). `None`
+    /// uses the production IBM hosts.
+    #[serde(default)]
+    pub endpoint_override: Option<String>,
+
     /// Speech recognition model to use.
     #[serde(default)]
     pub model: IbmModel,
@@ -463,6 +477,7 @@ impl Default for IbmWatsonSTTConfig {
             processing_metrics_interval: None,
             smart_formatting_version: None,
             speech_begin_event: false,
+            endpoint_override: None,
         }
     }
 }
@@ -541,6 +556,7 @@ impl IbmWatsonSTTConfig {
         if let Some(v) = e.get("smart_formatting_version").and_then(|v| v.as_u64()) {
             cfg.smart_formatting_version = Some(v as u32);
         }
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
         cfg
     }
 
@@ -624,16 +640,38 @@ impl IbmWatsonSTTConfig {
             processing_metrics_interval: None,
             smart_formatting_version: None,
             speech_begin_event: false,
+            endpoint_override: None,
+        }
+    }
+
+    /// Build the IAM token URL, honoring `endpoint_override` (mock host + `/identity/token`). The
+    /// override carries only an authority (any scheme prefix is stripped) and the IAM endpoint is an
+    /// HTTP POST, so `http://` is forced — distinct from the `ws://` the recognize dial needs against
+    /// the SAME mock host.
+    pub fn iam_url(&self) -> String {
+        match self.endpoint_override {
+            Some(ref ov) => format!("http://{}/identity/token", override_authority(ov)),
+            None => IBM_IAM_URL.to_string(),
         }
     }
 
     /// Build the WebSocket URL for connecting to IBM Watson STT.
     pub fn build_websocket_url(&self, access_token: &str) -> String {
-        let base_url = format!(
-            "wss://{}/instances/{}/v1/recognize",
-            self.region.stt_hostname(),
-            self.instance_id
-        );
+        // Honor an `endpoint_override` (in-repo mock/proxy): swap the dialed scheme://host while
+        // preserving the `/instances/{id}/v1/recognize` path + query. The override is an authority
+        // (scheme stripped) and `connect_async` needs a `ws://` URL.
+        let base_url = match self.endpoint_override {
+            Some(ref ov) => format!(
+                "ws://{}/instances/{}/v1/recognize",
+                override_authority(ov),
+                self.instance_id
+            ),
+            None => format!(
+                "wss://{}/instances/{}/v1/recognize",
+                self.region.stt_hostname(),
+                self.instance_id
+            ),
+        };
 
         // URL-encode helper using form_urlencoded
         fn encode(s: &str) -> String {
