@@ -604,6 +604,34 @@ async fn lmnt_tts_full_integration_via_mock_endpoint() {
 }
 
 #[tokio::test]
+async fn ibm_watson_tts_full_integration_via_mock_endpoint() {
+    // IBM Watson: IAM token POST /identity/token → {access_token}, then synth POST
+    // /instances/{id}/v1/synthesize → raw audio bytes. instance_id is a provider extra.
+    ensure_crypto();
+    let port = spawn_auth_then_audio_mock(
+        "/identity/token",
+        serde_json::json!({ "access_token": "mock-token", "token_type": "Bearer", "expires_in": 3600 }),
+        fake_audio(),
+    )
+    .await;
+    let mut std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "ibm_watson".into(),
+        api_key: "test-key".into(),
+        voice_id: Some("en-US_AllisonV3Voice".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    std.extras.0.insert(
+        "instance_id".to_string(),
+        serde_json::Value::String("inst-1".into()),
+    );
+    let mut tts = create_tts_standard("ibm_watson", std).expect("build ibm_watson tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("ibm_watson TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "ibm_watson TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
 async fn fpt_ai_tts_full_integration_via_mock_endpoint() {
     // FPT.AI synth POST returns {"async": <download_url>}; the provider then GETs the URL for audio.
     ensure_crypto();

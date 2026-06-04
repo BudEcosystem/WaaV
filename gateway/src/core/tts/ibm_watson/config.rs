@@ -608,6 +608,10 @@ pub struct IbmWatsonTTSConfig {
     /// Enable spell out mode (spell words letter by letter).
     #[serde(default)]
     pub spell_out_mode: Option<String>,
+
+    /// Mock-harness endpoint override: redirects the IAM token POST and synth POST to a localhost mock.
+    #[serde(default)]
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for IbmWatsonTTSConfig {
@@ -635,6 +639,7 @@ impl Default for IbmWatsonTTSConfig {
             pitch_percentage: None,
             customization_ids: Vec::new(),
             spell_out_mode: None,
+            endpoint_override: None,
         }
     }
 }
@@ -684,6 +689,7 @@ impl IbmWatsonTTSConfig {
         if let Some(rate) = f.sample_rate {
             cfg.base.sample_rate = Some(rate);
         }
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
         cfg
     }
 
@@ -734,12 +740,16 @@ impl IbmWatsonTTSConfig {
     }
 
     /// Build the synthesis URL for the TTS API.
+    ///
+    /// Honors `endpoint_override` (mock harness): swaps scheme+host while keeping the
+    /// `/instances/{id}/v1/synthesize` path so a localhost mock can serve the synth POST.
     pub fn build_synthesis_url(&self) -> String {
-        format!(
+        let url = format!(
             "https://{}/instances/{}/v1/synthesize",
             self.region.tts_hostname(),
             self.instance_id
-        )
+        );
+        crate::core::tts::standard::override_rest_endpoint(&url, self.endpoint_override.as_deref())
     }
 
     /// Build query parameters for the synthesis request.

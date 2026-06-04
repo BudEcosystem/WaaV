@@ -93,14 +93,17 @@ struct IamTokenResponse {
 }
 
 /// Fetch IAM token from IBM Cloud.
-async fn fetch_iam_token(api_key: &str) -> TTSResult<IamToken> {
+///
+/// `iam_url` is the (possibly override-rewritten) IAM token endpoint; callers pass
+/// `IBM_IAM_URL` for production or a mock-rewritten URL via `override_rest_endpoint`.
+async fn fetch_iam_token(api_key: &str, iam_url: &str) -> TTSResult<IamToken> {
     let client = Client::new();
 
     // URL-encode the API key
     let encoded_api_key: String = form_urlencoded::byte_serialize(api_key.as_bytes()).collect();
 
     let response = client
-        .post(IBM_IAM_URL)
+        .post(iam_url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(format!(
             "grant_type=urn:ibm:params:oauth:grant-type:apikey&apikey={}",
@@ -206,6 +209,7 @@ impl IbmWatsonTTS {
             pitch_percentage: None,
             customization_ids: Vec::new(),
             spell_out_mode: None,
+            endpoint_override: None,
         };
 
         Ok(Self {
@@ -300,7 +304,11 @@ impl IbmWatsonTTS {
 
         // Fetch new token
         debug!("Fetching new IAM token...");
-        let new_token = fetch_iam_token(&self.config.base.api_key).await?;
+        let iam_url = crate::core::tts::standard::override_rest_endpoint(
+            IBM_IAM_URL,
+            self.config.endpoint_override.as_deref(),
+        );
+        let new_token = fetch_iam_token(&self.config.base.api_key, &iam_url).await?;
         let access_token = new_token.access_token.clone();
 
         // Cache the token
