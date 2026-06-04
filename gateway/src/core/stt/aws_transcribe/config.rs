@@ -535,6 +535,12 @@ pub struct AwsTranscribeSTTConfig {
     /// Audio chunk duration in milliseconds (50-200 recommended)
     #[serde(default = "default_chunk_duration")]
     pub chunk_duration_ms: u32,
+
+    /// Override the AWS Transcribe Streaming endpoint base URL (e.g. a localhost mock for e2e
+    /// tests). When set, the AWS SDK config loader is pointed at this URL via `.endpoint_url(..)`
+    /// instead of the resolved regional endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_override: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -586,6 +592,7 @@ impl Default for AwsTranscribeSTTConfig {
             pii_entity_types: Vec::new(),
             session_id: None,
             chunk_duration_ms: DEFAULT_CHUNK_DURATION_MS,
+            endpoint_override: None,
         }
     }
 }
@@ -666,6 +673,25 @@ impl AwsTranscribeSTTConfig {
             Some(serde_json::Value::String(s)) => s.eq_ignore_ascii_case("pii"),
             _ => false,
         };
+
+        // Endpoint override (mock harness): point the AWS SDK Transcribe client at a localhost mock.
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        // AWS credentials + region flow through the standardized path via the `extras` passthrough;
+        // without this the standard path could never authenticate against an explicit-credential
+        // endpoint (the explicit-credential branch in `start_connection` is otherwise unreachable
+        // from `from_standard`). Mirrors aws_polly TTS.
+        if let Some(k) = ex.get("aws_access_key_id").and_then(|v| v.as_str()) {
+            cfg.aws_access_key_id = Some(k.to_string());
+        }
+        if let Some(k) = ex.get("aws_secret_access_key").and_then(|v| v.as_str()) {
+            cfg.aws_secret_access_key = Some(k.to_string());
+        }
+        if let Some(k) = ex.get("aws_session_token").and_then(|v| v.as_str()) {
+            cfg.aws_session_token = Some(k.to_string());
+        }
+        if let Some(r) = ex.get("region").and_then(|v| v.as_str()) {
+            cfg.region = AwsRegion::from_str_or_default(r);
+        }
 
         cfg
     }

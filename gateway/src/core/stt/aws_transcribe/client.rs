@@ -556,6 +556,9 @@ impl AwsTranscribeSTT {
         let aws_access_key_id = config.aws_access_key_id.clone();
         let aws_secret_access_key = config.aws_secret_access_key.clone();
         let aws_session_token = config.aws_session_token.clone();
+        // Raw endpoint base (e.g. https://127.0.0.1:PORT for a mock e2e harness). The SDK appends
+        // the operation path; honored on BOTH the explicit-creds and default-chain loader branches.
+        let endpoint_override = config.endpoint_override.clone();
         // The full provider config drives request-parameter wiring via `apply_request_params`
         // (the single source of truth shared with the wire-level tests).
         let request_config = config.clone();
@@ -572,28 +575,31 @@ impl AwsTranscribeSTT {
         // audio receiver (channel-swap — see `audio_tx_slot` doc).
         let connection_handle = tokio::spawn(async move {
             // Build AWS config + client ONCE (async cred load); reused across reconnect attempts.
-            let aws_config = if aws_access_key_id.is_some() && aws_secret_access_key.is_some() {
-                // Use explicit credentials
-                let credentials = aws_credential_types::Credentials::new(
-                    aws_access_key_id.as_deref().unwrap_or_default(),
-                    aws_secret_access_key.as_deref().unwrap_or_default(),
-                    aws_session_token,
-                    None, // Expiration
-                    "waav-gateway",
-                );
+            // Compute the explicit credentials (if any) first, then a SINGLE loader so the endpoint
+            // override is honored uniformly whether credentials are explicit or come from the
+            // default chain (env vars, IAM roles, etc.).
+            let explicit_credentials =
+                if aws_access_key_id.is_some() && aws_secret_access_key.is_some() {
+                    Some(aws_credential_types::Credentials::new(
+                        aws_access_key_id.as_deref().unwrap_or_default(),
+                        aws_secret_access_key.as_deref().unwrap_or_default(),
+                        aws_session_token,
+                        None, // Expiration
+                        "waav-gateway",
+                    ))
+                } else {
+                    None
+                };
 
-                aws_config::defaults(BehaviorVersion::latest())
-                    .region(aws_config::Region::new(region_str))
-                    .credentials_provider(credentials)
-                    .load()
-                    .await
-            } else {
-                // Use default credential chain (env vars, IAM roles, etc.)
-                aws_config::defaults(BehaviorVersion::latest())
-                    .region(aws_config::Region::new(region_str))
-                    .load()
-                    .await
-            };
+            let mut loader = aws_config::defaults(BehaviorVersion::latest())
+                .region(aws_config::Region::new(region_str));
+            if let Some(creds) = explicit_credentials {
+                loader = loader.credentials_provider(creds);
+            }
+            if let Some(ep) = endpoint_override.as_deref() {
+                loader = loader.endpoint_url(ep);
+            }
+            let aws_config = loader.load().await;
 
             let client = TranscribeClient::new(&aws_config);
 
@@ -828,6 +834,7 @@ impl BaseSTT for AwsTranscribeSTT {
             pii_entity_types: Vec::new(),
             session_id: None,
             chunk_duration_ms: DEFAULT_CHUNK_DURATION_MS,
+            endpoint_override: None,
         };
 
         Self::new_with_config(aws_config)
