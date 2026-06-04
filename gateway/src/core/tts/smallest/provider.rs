@@ -148,7 +148,10 @@ impl TTSRequestBuilder for SmallestRequestBuilder {
 
         // Build and return the request
         client
-            .post(self.rest_url())
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                self.rest_url(),
+                self.config.endpoint_override.as_deref(),
+            ))
             .headers(headers)
             .json(&request_body)
     }

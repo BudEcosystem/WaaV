@@ -369,6 +369,8 @@ pub struct ResembleTtsConfig {
     pub use_hd: bool,
     /// Apply the project's custom pronunciation rules during synthesis.
     pub apply_custom_pronunciations: bool,
+    /// Optional base URL override (scheme+host) for the synth/connect endpoint; used by tests/mocks.
+    pub endpoint_override: Option<String>,
 }
 
 impl ResembleTtsConfig {
@@ -384,6 +386,7 @@ impl ResembleTtsConfig {
             sample_rate: DEFAULT_SAMPLE_RATE,
             use_hd: false,
             apply_custom_pronunciations: false,
+            endpoint_override: None,
         }
     }
 
@@ -464,6 +467,7 @@ impl ResembleTtsConfig {
         {
             cfg.apply_custom_pronunciations = apply;
         }
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
         Ok(cfg)
     }
 
@@ -522,6 +526,7 @@ impl ResembleTtsConfig {
             sample_rate,
             use_hd: false,
             apply_custom_pronunciations: false,
+            endpoint_override: None,
         };
 
         // Validate
@@ -581,6 +586,7 @@ impl Default for ResembleTtsConfig {
             sample_rate: DEFAULT_SAMPLE_RATE,
             use_hd: false,
             apply_custom_pronunciations: false,
+            endpoint_override: None,
         }
     }
 }

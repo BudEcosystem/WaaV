@@ -189,7 +189,10 @@ impl TTSRequestBuilder for LmntRequestBuilder {
 
         // Build the HTTP request with all required headers
         client
-            .post(LMNT_TTS_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                LMNT_TTS_URL,
+                self.lmnt_config.endpoint_override.as_deref(),
+            ))
             .header("X-API-Key", &self.config.api_key)
             .header("Content-Type", "application/json")
             .header("Accept", self.lmnt_config.output_format.content_type())
@@ -536,7 +539,13 @@ impl BaseTTS for LmntTts {
     /// Connect to the TTS provider.
     async fn connect(&mut self) -> TTSResult<()> {
         self.provider
-            .generic_connect_with_config(LMNT_TTS_URL, &self.request_builder.config)
+            .generic_connect_with_config(
+                &crate::core::tts::standard::override_rest_endpoint(
+                    LMNT_TTS_URL,
+                    self.request_builder.lmnt_config.endpoint_override.as_deref(),
+                ),
+                &self.request_builder.config,
+            )
             .await?;
 
         info!("LMNT TTS provider connected and ready");

@@ -384,6 +384,9 @@ pub struct PlayHtTtsConfig {
 
     /// Number of candidates for ranking (PlayDialog)
     pub num_candidates: Option<u32>,
+
+    /// Test/e2e hook: override base URL (scheme+host) for the synth/connect REST endpoint.
+    pub endpoint_override: Option<String>,
 }
 
 impl PlayHtTtsConfig {
@@ -444,6 +447,7 @@ impl PlayHtTtsConfig {
         {
             cfg.voice_conditioning_seconds_2 = Some(vcs2 as f32);
         }
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
         cfg
     }
 
@@ -488,6 +492,7 @@ impl PlayHtTtsConfig {
             voice_conditioning_seconds: None,
             voice_conditioning_seconds_2: None,
             num_candidates: None,
+            endpoint_override: None,
         }
     }
 

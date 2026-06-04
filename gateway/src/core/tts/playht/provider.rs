@@ -214,7 +214,10 @@ impl TTSRequestBuilder for PlayHtRequestBuilder {
 
         // Build the HTTP request with all required headers
         client
-            .post(PLAYHT_TTS_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                PLAYHT_TTS_URL,
+                self.playht_config.endpoint_override.as_deref(),
+            ))
             .header("X-USER-ID", &self.playht_config.user_id)
             .header("AUTHORIZATION", &self.config.api_key)
             .header("Content-Type", "application/json")
@@ -771,7 +774,13 @@ impl BaseTTS for PlayHtTts {
     /// Connect to the TTS provider.
     async fn connect(&mut self) -> TTSResult<()> {
         self.provider
-            .generic_connect_with_config(PLAYHT_TTS_URL, &self.request_builder.config)
+            .generic_connect_with_config(
+                &crate::core::tts::standard::override_rest_endpoint(
+                    PLAYHT_TTS_URL,
+                    self.request_builder.playht_config.endpoint_override.as_deref(),
+                ),
+                &self.request_builder.config,
+            )
             .await?;
 
         info!("Play.ht TTS provider connected and ready");

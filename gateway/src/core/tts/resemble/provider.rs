@@ -77,7 +77,10 @@ impl TTSRequestBuilder for ResembleRequestBuilder {
 
         // Build and return the request
         client
-            .post(RESEMBLE_TTS_STREAM_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                RESEMBLE_TTS_STREAM_URL,
+                self.config.endpoint_override.as_deref(),
+            ))
             .headers(headers)
             .json(&request_body)
     }
@@ -247,7 +250,13 @@ impl BaseTTS for ResembleTts {
     async fn connect(&mut self) -> TTSResult<()> {
         debug!("Connecting Resemble AI TTS provider");
         self.provider
-            .generic_connect_with_config(RESEMBLE_TTS_STREAM_URL, &self.base_config)
+            .generic_connect_with_config(
+                &crate::core::tts::standard::override_rest_endpoint(
+                    RESEMBLE_TTS_STREAM_URL,
+                    self.resemble_config.endpoint_override.as_deref(),
+                ),
+                &self.base_config,
+            )
             .await
     }
 

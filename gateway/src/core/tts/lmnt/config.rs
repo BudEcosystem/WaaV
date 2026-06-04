@@ -263,6 +263,9 @@ pub struct LmntTtsConfig {
 
     /// Save output to LMNT clip library for debugging
     pub debug: bool,
+
+    /// Optional override for the synth HTTP endpoint base (host/scheme) — used by the mock e2e harness.
+    pub endpoint_override: Option<String>,
 }
 
 impl LmntTtsConfig {
@@ -301,6 +304,7 @@ impl LmntTtsConfig {
             speed,
             seed: None,
             debug: false,
+            endpoint_override: None,
         }
     }
 
@@ -337,6 +341,7 @@ impl LmntTtsConfig {
         if let Some(debug) = std.extras.0.get("debug").and_then(|v| v.as_bool()) {
             cfg.debug = debug;
         }
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
         cfg
     }
 

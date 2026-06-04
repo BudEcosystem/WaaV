@@ -502,3 +502,71 @@ async fn sberdevices_tts_full_integration_via_mock_endpoint() {
     println!("sberdevices TTS mock e2e surfaced {bytes} audio bytes");
     assert!(bytes > 0, "sberdevices TTS surfaced no audio end-to-end");
 }
+
+#[tokio::test]
+async fn smallest_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "smallest",
+        "/api/v1/lightning/get_speech",
+        TTSConfig {
+            provider: "smallest".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("emily".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn resemble_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "resemble",
+        "/stream",
+        TTSConfig {
+            provider: "resemble".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("55592656".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn lmnt_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "lmnt",
+        "/v1/ai/speech/bytes",
+        TTSConfig {
+            provider: "lmnt".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("lily".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn playht_tts_full_integration_via_mock_endpoint() {
+    // PlayHT authenticates with both an api_key (Authorization) and a user_id (X-USER-ID); the
+    // user_id is a provider-specific extra, not part of the flat config.
+    ensure_crypto();
+    let port = spawn_audio_mock("/api/v2/tts/stream", fake_audio()).await;
+    let mut std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "playht".into(),
+        api_key: "test-key".into(),
+        voice_id: Some("s3://voice/manifest.json".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    std.extras.0.insert(
+        "user_id".to_string(),
+        serde_json::Value::String("test-user".into()),
+    );
+    let mut tts = create_tts_standard("playht", std).expect("build playht tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("playht TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "playht TTS surfaced no audio end-to-end");
+}

@@ -383,6 +383,9 @@ pub struct SmallestTtsConfig {
 
     /// Request timeout in seconds.
     pub request_timeout: u64,
+
+    /// Optional base URL override for the synth REST endpoint (test/mock redirection).
+    pub endpoint_override: Option<String>,
 }
 
 impl SmallestTtsConfig {
@@ -442,6 +445,7 @@ impl SmallestTtsConfig {
             max_buffer_flush_ms: None,
             connection_timeout,
             request_timeout,
+            endpoint_override: None,
         })
     }
 
@@ -494,6 +498,8 @@ impl SmallestTtsConfig {
         {
             cfg.max_buffer_flush_ms = Some((ms.min(1000)) as u32);
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         Ok(cfg)
     }
