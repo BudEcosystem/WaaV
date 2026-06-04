@@ -570,10 +570,14 @@ impl ProsaStt {
             ));
         }
 
-        let url = format!(
-            "{}?x-api-key={}",
-            PROSA_STT_WS_ENDPOINT, self.config.api_key
-        );
+        // Honor an `endpoint_override` (scheme://host[:port]) for the in-repo mock/proxy: swap the
+        // dialed base while re-appending Prosa.ai's WS path (a path-less URL fails the handshake),
+        // keeping the `?x-api-key=` query. `None` uses the production endpoint.
+        let base = match self.config.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
+            Some(o) => format!("{}/v2/speech/stt", o.trim_end_matches('/')),
+            None => PROSA_STT_WS_ENDPOINT.to_string(),
+        };
+        let url = format!("{}?x-api-key={}", base, self.config.api_key);
 
         debug!(
             "Connecting to Prosa.ai WebSocket: {}",

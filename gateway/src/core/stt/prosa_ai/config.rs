@@ -219,6 +219,11 @@ pub struct ProsaSttConfig {
 
     /// Optional job label.
     pub label: Option<String>,
+
+    /// Carried from the standardized `endpoint_override` — points the dial at the in-repo mock/proxy
+    /// (a local `ws://` server) for credential-free end-to-end integration tests; `None` uses the
+    /// production Prosa.ai endpoint.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for ProsaSttConfig {
@@ -237,6 +242,7 @@ impl Default for ProsaSttConfig {
             enable_spoken_numerals: true,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
             label: None,
+            endpoint_override: None,
         }
     }
 }
@@ -285,6 +291,7 @@ impl ProsaSttConfig {
             enable_spoken_numerals: true,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
             label: None,
+            endpoint_override: None,
         })
     }
 
@@ -309,6 +316,7 @@ impl ProsaSttConfig {
         if let Some(s) = f.smart_format {
             cfg.auto_punctuation = s;
         }
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
         Ok(cfg)
     }
 

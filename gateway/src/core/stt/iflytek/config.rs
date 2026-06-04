@@ -364,6 +364,11 @@ pub struct IFlytekSttConfig {
     /// Advanced `business` parameters (`vinfo`/`nbest`/`wbest`/`pd`/`rlang`) wired from the
     /// standardized features + provider extras. Sent on the first frame.
     pub business_extras: super::messages::IFlytekBusinessExtras,
+    /// Carried from the standardized `endpoint_override` — points the dial at the in-repo mock/proxy
+    /// (a local `ws://` server) for credential-free end-to-end integration tests; `None` uses the
+    /// production iFlytek endpoint. The HMAC signature is still computed over the real host (the mock
+    /// ignores it); only the dialed scheme://host is swapped.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for IFlytekSttConfig {
@@ -381,6 +386,7 @@ impl Default for IFlytekSttConfig {
             punctuation: true,
             convert_numbers: true,
             business_extras: super::messages::IFlytekBusinessExtras::default(),
+            endpoint_override: None,
         }
     }
 }
@@ -426,6 +432,7 @@ impl IFlytekSttConfig {
             punctuation: config.punctuation,
             convert_numbers: true,
             business_extras: super::messages::IFlytekBusinessExtras::default(),
+            endpoint_override: None,
         })
     }
 
@@ -471,6 +478,8 @@ impl IFlytekSttConfig {
         if let Some(v) = e.get("result_character_set").and_then(|v| v.as_str()) {
             cfg.business_extras.rlang = Some(v.to_string());
         }
+        // Standardized endpoint override (mock/proxy host) for credential-free integration tests.
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
         Ok(cfg)
     }
 

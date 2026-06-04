@@ -534,6 +534,11 @@ pub struct SpeechmaticsSTTConfig {
     /// Phonetic hints per vocabulary word: `word -> [sounds_like, ...]`.
     /// `transcription_config.additional_vocab[].sounds_like`.
     pub vocab_sounds_like: std::collections::BTreeMap<String, Vec<String>>,
+    /// Carried from the standardized `endpoint_override` — points the dial at the in-repo mock/proxy
+    /// (a local `ws://` server) for credential-free end-to-end integration tests; `None` uses the
+    /// region endpoint from `ws_url()`. Only the dialed scheme://host is swapped; the `/v2` path is
+    /// preserved (a path-less URL fails the WS handshake).
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for SpeechmaticsSTTConfig {
@@ -563,6 +568,7 @@ impl Default for SpeechmaticsSTTConfig {
             domain: None,
             max_delay_mode: None,
             vocab_sounds_like: std::collections::BTreeMap::new(),
+            endpoint_override: None,
         }
     }
 }
@@ -716,6 +722,8 @@ impl SpeechmaticsSTTConfig {
                 }
             }
         }
+        // Standardized endpoint override (mock/proxy host) for credential-free integration tests.
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
         Ok(cfg)
     }
 

@@ -536,13 +536,27 @@ impl IFlytekStt {
     /// Start the WebSocket connection task.
     async fn start_connection(&mut self) -> Result<(), STTError> {
         // Build signed WebSocket URL
-        let ws_url = self
+        let signed_url = self
             .config
             .auth
             .build_signed_url(self.config.host(), self.config.path())
             .map_err(|e| {
                 STTError::ConnectionFailed(format!("Failed to build signed URL: {}", e))
             })?;
+
+        // Honor an `endpoint_override` for the in-repo mock/proxy: swap the dialed scheme://host while
+        // keeping the signed `/v2/{iat,ist}?authorization=...` path+query (the mock ignores the HMAC
+        // signature). `/v2/` is the stable path marker shared by IAT and IST and precedes the query.
+        let ws_url = match self
+            .config
+            .endpoint_override
+            .as_deref()
+            .filter(|o| !o.is_empty())
+            .and_then(|o| signed_url.find("/v2/").map(|idx| (o, idx)))
+        {
+            Some((o, idx)) => format!("{}{}", o.trim_end_matches('/'), &signed_url[idx..]),
+            None => signed_url,
+        };
 
         debug!("Connecting to iFlytek: {}", ws_url);
 

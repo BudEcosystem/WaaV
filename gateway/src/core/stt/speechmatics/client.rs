@@ -329,7 +329,13 @@ impl SpeechmaticsSTT {
 
     /// Build the WebSocket URL with authentication
     fn build_ws_url(&self) -> String {
-        self.config.ws_url().to_string()
+        // Honor an `endpoint_override` for the in-repo mock/proxy: swap the dialed scheme://host
+        // while keeping the `/v2` path (a path-less URL fails the WS handshake). Otherwise dial the
+        // region endpoint from `ws_url()`.
+        match self.config.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
+            Some(o) => format!("{}/v2", o.trim_end_matches('/')),
+            None => self.config.ws_url().to_string(),
+        }
     }
 
     /// Build the StartRecognition message
