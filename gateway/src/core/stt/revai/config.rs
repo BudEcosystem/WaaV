@@ -218,6 +218,12 @@ pub struct RevAISTTConfig {
     /// see docs/providers/rev_ai.md). Carried via the standardized `extras` passthrough.
     #[serde(default)]
     pub max_connection_wait_seconds: Option<u32>,
+
+    /// Carried from the standardized `endpoint_override` — points the dial at the in-repo mock/proxy
+    /// (a local `ws://` server) for credential-free end-to-end integration tests; `None` uses the
+    /// production Rev AI endpoint.
+    #[serde(default)]
+    pub endpoint_override: Option<String>,
 }
 
 fn default_language() -> String {
@@ -254,6 +260,7 @@ impl Default for RevAISTTConfig {
             skip_postprocessing: false,
             priority: None,
             max_connection_wait_seconds: None,
+            endpoint_override: None,
         }
     }
 }
@@ -396,9 +403,17 @@ impl RevAISTTConfig {
         let encode =
             |s: &str| -> String { form_urlencoded::byte_serialize(s.as_bytes()).collect() };
 
+        // Base endpoint: honor an `endpoint_override` (the in-repo mock/proxy points this at a local
+        // ws:// server) for credential-free integration; otherwise the production Rev AI endpoint.
+        // The override carries only `scheme://host[:port]`, so the Rev AI stream path is re-appended
+        // (a path-less URL would fail the WS handshake), mirroring the Cartesia override handling.
+        let base = match self.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
+            Some(o) => format!("{}/speechtotext/v1/stream", o.trim_end_matches('/')),
+            None => REVAI_STREAM_URL.to_string(),
+        };
         let mut url = format!(
             "{}?access_token={}&content_type={}",
-            REVAI_STREAM_URL,
+            base,
             encode(&self.api_key),
             encode(&self.build_content_type())
         );
@@ -526,6 +541,8 @@ impl RevAISTTConfig {
         if let Some(w) = e.get("max_connection_wait_seconds").and_then(|v| v.as_u64()) {
             cfg.max_connection_wait_seconds = Some(w as u32);
         }
+        // Standardized endpoint override (mock/proxy host) for credential-free integration tests.
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
         Ok(cfg)
     }
 }
