@@ -241,6 +241,12 @@ impl IFlytekTts {
             .map_err(|e| {
                 TTSError::ConnectionFailed(format!("Failed to build signed URL: {}", e))
             })?;
+        // W-T0: redirect the signed WS connect to a localhost mock host when overridden,
+        // preserving the signed path+query (passthrough when no override is set).
+        let ws_url = crate::core::tts::standard::override_rest_endpoint(
+            &ws_url,
+            self.config.endpoint_override.as_deref(),
+        );
 
         debug!("Connecting to iFlytek TTS: {}", ws_url);
 

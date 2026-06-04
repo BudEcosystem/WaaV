@@ -265,6 +265,8 @@ pub struct IFlytekTtsConfig {
     /// of MP3-format audio. iFlytek only defines the value `1` (enabled); `None` omits the field.
     /// See <https://global.xfyun.cn/doc/tts/online_tts/API.html> (business param `sfl`).
     pub streaming_mp3_return: Option<u32>,
+    /// Override base (scheme+host) redirecting the signed WS connect to a mock; `None` = production.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for IFlytekTtsConfig {
@@ -282,6 +284,7 @@ impl Default for IFlytekTtsConfig {
             english_pronunciation: 0,
             number_pronunciation: 0,
             streaming_mp3_return: None,
+            endpoint_override: None,
         }
     }
 }
@@ -339,6 +342,7 @@ impl IFlytekTtsConfig {
             english_pronunciation: 0,
             number_pronunciation: 0,
             streaming_mp3_return: None,
+            endpoint_override: None,
         })
     }
 
@@ -391,6 +395,8 @@ impl IFlytekTtsConfig {
                 .map(|n| n as u32)
                 .or_else(|| v.as_bool().map(|b| if b { 1 } else { 0 }));
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         Ok(cfg)
     }

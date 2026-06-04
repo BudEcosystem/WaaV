@@ -186,6 +186,34 @@ async fn spawn_audio_url_then_download_mock(
     port
 }
 
+/// Spawn a WebSocket mock for streaming TTS providers: accept the connection, wait for the client's
+/// synthesis-request frame, then send each JSON `frames` entry as a Text message (the provider's
+/// read loop decodes base64 audio out of them). For iFlytek-style providers that deliver audio as
+/// base64 inside JSON Text frames rather than binary.
+async fn spawn_ws_audio_mock(frames: Vec<serde_json::Value>) -> u16 {
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::protocol::Message;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let frames: Vec<String> = frames.iter().map(|v| v.to_string()).collect();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await
+            && let Ok(ws) = accept_async(stream).await
+        {
+            let (mut write, mut read) = ws.split();
+            // Wait for the synthesis request, then stream the audio frames back.
+            if let Some(Ok(_req)) = read.next().await {
+                for f in &frames {
+                    let _ = write.send(Message::Text(f.clone().into())).await;
+                }
+            }
+        }
+    });
+    port
+}
+
 /// Base64-encode a blob (for JSON-enveloped audio responses).
 fn b64(bytes: &[u8]) -> String {
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -601,6 +629,35 @@ async fn lmnt_tts_full_integration_via_mock_endpoint() {
         },
     )
     .await;
+}
+
+#[tokio::test]
+async fn iflytek_tts_full_integration_via_mock_endpoint() {
+    // iFlytek TTS is a signed WebSocket: connect (signed URL), send a JSON request, receive JSON
+    // Text frames carrying base64 audio under data.audio (status 2 = final chunk). endpoint_override
+    // (a ws:// base) swaps the signed URL's host while keeping the /v2/tts path + auth query.
+    ensure_crypto();
+    let frame = serde_json::json!({
+        "code": 0,
+        "message": "success",
+        "sid": "mock-sid",
+        "data": { "audio": b64(&fake_audio()), "status": 2 }
+    });
+    let port = spawn_ws_audio_mock(vec![frame]).await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "iflytek".into(),
+        // app_id|api_key|api_secret packing for the signed-URL auth.
+        api_key: "test-app|test-key-xxxxxxxx|test-secret-xxxxxx".into(),
+        voice_id: Some("xiaoyan".to_string()),
+        // iFlytek TTS only supports 8000/16000 (default config carries 24000).
+        sample_rate: Some(16000),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("ws://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("iflytek", std).expect("build iflytek tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("iflytek TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "iflytek TTS surfaced no audio end-to-end");
 }
 
 #[tokio::test]
