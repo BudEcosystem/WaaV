@@ -319,10 +319,19 @@ impl AwsPollyTTS {
                     Credentials::new(access_key, secret_key, None, None, "waav")
                 };
 
-                let polly_config = PollyConfigBuilder::new()
+                let mut builder = PollyConfigBuilder::new()
+                    // A behavior major version is mandatory; without it the SDK panics at request
+                    // time. The default-credential branch sets it via `aws_config::defaults`, but
+                    // this explicit-credential `Builder::new()` path must set it itself.
+                    .behavior_version(BehaviorVersion::latest())
                     .region(region)
-                    .credentials_provider(credentials)
-                    .build();
+                    .credentials_provider(credentials);
+                // Honor the raw endpoint base (e.g. http://127.0.0.1:PORT for a mock e2e harness);
+                // the SDK appends the operation path, so this is NOT override_rest_endpoint.
+                if let Some(ep) = self.config.endpoint_override.as_deref() {
+                    builder = builder.endpoint_url(ep);
+                }
+                let polly_config = builder.build();
 
                 return Ok(PollyClient::from_conf(polly_config));
             } else {

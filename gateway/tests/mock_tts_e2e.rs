@@ -604,6 +604,39 @@ async fn lmnt_tts_full_integration_via_mock_endpoint() {
 }
 
 #[tokio::test]
+async fn aws_polly_tts_full_integration_via_mock_endpoint() {
+    // AWS Polly via the SDK: endpoint_override sets the SDK's endpoint_url (raw base); the SDK
+    // appends /v1/speech and SynthesizeSpeech returns the audio in the response body. Credentials
+    // flow through the standardized extras passthrough.
+    ensure_crypto();
+    let port = spawn_audio_mock("/v1/speech", fake_audio()).await;
+    let mut std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "aws_polly".into(),
+        voice_id: Some("Joanna".to_string()),
+        // Polly's default pcm output only supports 8000/16000 (default config carries 24000).
+        sample_rate: Some(16000),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    std.extras.0.insert(
+        "aws_access_key_id".to_string(),
+        serde_json::Value::String("AKIAIOSFODNN7EXAMPLE".to_string()),
+    );
+    std.extras.0.insert(
+        "aws_secret_access_key".to_string(),
+        serde_json::Value::String("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+    );
+    std.extras.0.insert(
+        "region".to_string(),
+        serde_json::Value::String("us-east-1".to_string()),
+    );
+    let mut tts = create_tts_standard("aws_polly", std).expect("build aws_polly tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("aws_polly TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "aws_polly TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
 async fn bhashini_tts_full_integration_via_mock_endpoint() {
     // Bhashini is two-step: a pipeline-CONFIG POST then a COMPUTE POST. We override the config POST
     // (which returns {} → the provider falls back to custom_callback_url for the compute hop and to

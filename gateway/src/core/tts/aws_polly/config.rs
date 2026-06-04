@@ -560,6 +560,10 @@ pub struct AwsPollyTTSConfig {
     /// Ref: <https://docs.aws.amazon.com/polly/latest/dg/API_SynthesizeSpeech.html#polly-SynthesizeSpeech-request-SpeechMarkTypes>
     #[serde(default)]
     pub speech_mark_types: Vec<String>,
+
+    /// Override the AWS Polly endpoint base URL (e.g. a localhost mock for e2e tests).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for AwsPollyTTSConfig {
@@ -590,6 +594,7 @@ impl Default for AwsPollyTTSConfig {
             language_code: None,
             lexicon_names: Vec::new(),
             speech_mark_types: Vec::new(),
+            endpoint_override: None,
         }
     }
 }
@@ -643,6 +648,20 @@ impl AwsPollyTTSConfig {
                 .map(|s| s.to_ascii_lowercase())
                 .filter(|s| VALID_SPEECH_MARK_TYPES.contains(&s.as_str()))
                 .collect();
+        }
+        // Endpoint override (mock harness): point the AWS SDK Polly client at a localhost mock.
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+        // AWS credentials flow through the standardized path via the `extras` passthrough; without
+        // this the standard path could never authenticate (the explicit-credential branch in
+        // `init_client` was unreachable from `from_standard`).
+        if let Some(k) = std.extras.0.get("aws_access_key_id").and_then(|v| v.as_str()) {
+            cfg.aws_access_key_id = Some(k.to_string());
+        }
+        if let Some(k) = std.extras.0.get("aws_secret_access_key").and_then(|v| v.as_str()) {
+            cfg.aws_secret_access_key = Some(k.to_string());
+        }
+        if let Some(k) = std.extras.0.get("aws_session_token").and_then(|v| v.as_str()) {
+            cfg.aws_session_token = Some(k.to_string());
         }
         cfg
     }
