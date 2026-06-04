@@ -21,6 +21,10 @@ pub struct TinkoffSttConfig {
     #[serde(default, skip_serializing)]
     pub secret_key: String,
 
+    /// Override gRPC endpoint (plaintext, no TLS) — used by mock e2e tests.
+    #[serde(default, skip_serializing)]
+    pub endpoint_override: Option<String>,
+
     /// Audio encoding format
     #[serde(default)]
     pub encoding: TinkoffAudioEncoding,
@@ -135,6 +139,7 @@ impl Default for TinkoffSttConfig {
             },
             api_key: String::new(),
             secret_key: String::new(),
+            endpoint_override: None,
             encoding: TinkoffAudioEncoding::default(),
             max_alternatives: default_max_alternatives(),
             enable_punctuation: default_punctuation(),
@@ -240,6 +245,8 @@ impl TinkoffSttConfig {
             cfg.vad_config = Some(vad);
         }
 
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+
         Ok(cfg)
     }
 
@@ -248,14 +255,18 @@ impl TinkoffSttConfig {
     /// Extracts Tinkoff-specific credentials from environment variables if not
     /// provided in the base config.
     pub fn from_base(base: STTConfig) -> Result<Self, String> {
-        // Try to get credentials from environment if not in config
-        let api_key = if base.api_key.is_empty() {
+        // The standardized `api_key` may carry both credentials as `api_key|secret_key` (Tinkoff
+        // needs both to sign the JWT, but the keystone exposes a single field); env vars win.
+        let (base_api_key, base_secret_key) = match base.api_key.split_once('|') {
+            Some((a, s)) => (a.to_string(), s.to_string()),
+            None => (base.api_key.clone(), String::new()),
+        };
+        let api_key = if base_api_key.is_empty() {
             std::env::var("TINKOFF_API_KEY").unwrap_or_default()
         } else {
-            base.api_key.clone()
+            base_api_key
         };
-
-        let secret_key = std::env::var("TINKOFF_SECRET_KEY").unwrap_or_default();
+        let secret_key = std::env::var("TINKOFF_SECRET_KEY").unwrap_or(base_secret_key);
 
         // Parse audio encoding
         let encoding = TinkoffAudioEncoding::from_str(&base.encoding)?;
@@ -271,6 +282,7 @@ impl TinkoffSttConfig {
             base: STTConfig { language, ..base },
             api_key,
             secret_key,
+            endpoint_override: None,
             encoding,
             max_alternatives: default_max_alternatives(),
             enable_punctuation: default_punctuation(),

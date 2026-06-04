@@ -34,13 +34,20 @@ use crate::core::stt::base::STTError;
 ///
 /// This establishes a secure TLS connection to Tinkoff's STT service.
 pub async fn create_tinkoff_channel(config: &TinkoffSttConfig) -> Result<Channel, STTError> {
-    // Create TLS configuration
-    let tls_config = ClientTlsConfig::new().domain_name("api.tinkoff.ai");
+    // A mock e2e override points the channel at a plaintext localhost endpoint (no TLS); otherwise
+    // the production TLS endpoint is used unchanged.
+    let endpoint = if let Some(ep) = config.endpoint_override.as_deref() {
+        Endpoint::from_shared(ep.to_string())
+            .map_err(|e| STTError::ConfigurationError(format!("Invalid endpoint override: {}", e)))?
+    } else {
+        let tls_config = ClientTlsConfig::new().domain_name("api.tinkoff.ai");
+        Endpoint::from_static(TINKOFF_GRPC_ENDPOINT)
+            .tls_config(tls_config)
+            .map_err(|e| STTError::ConfigurationError(format!("TLS config error: {}", e)))?
+    };
 
     // Build and connect the channel
-    let channel = Endpoint::from_static(TINKOFF_GRPC_ENDPOINT)
-        .tls_config(tls_config)
-        .map_err(|e| STTError::ConfigurationError(format!("TLS config error: {}", e)))?
+    let channel = endpoint
         .connect_timeout(Duration::from_secs(config.connection_timeout_secs))
         .timeout(Duration::from_secs(config.request_timeout_secs))
         .connect()
