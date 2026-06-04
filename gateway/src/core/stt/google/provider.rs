@@ -343,7 +343,15 @@ impl GoogleSTT {
     pub fn new_standard(
         std: &crate::core::stt::standard::StandardSTTConfig,
     ) -> Result<Self, STTError> {
-        if std.base.api_key.is_empty() {
+        // A caller-supplied static access token (bring-your-own-token / mock path) makes the
+        // service-account credential optional, since the OAuth fetch is bypassed.
+        let has_static_token = std
+            .extras
+            .0
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| !t.is_empty());
+        if std.base.api_key.is_empty() && !has_static_token {
             return Err(STTError::AuthenticationFailed(
                 "API key is required".to_string(),
             ));
@@ -411,6 +419,16 @@ impl GoogleSTT {
         let recognizer_path = config.recognizer_path();
         let initial_config = build_config_request(&config);
 
+        // Endpoint + auth overrides (mirrors GoogleTTS): an `endpoint_override` (e.g. an `http://`
+        // localhost tonic mock) replaces the production Speech endpoint, and a `static_access_token`
+        // (a pre-minted bearer) bypasses the network OAuth fetch — together letting a mock e2e test
+        // point this gRPC channel at a PLAINTEXT mock with no Google network round-trip.
+        let grpc_endpoint = config
+            .endpoint_override
+            .clone()
+            .unwrap_or_else(|| GOOGLE_SPEECH_ENDPOINT.to_string());
+        let static_token = config.static_access_token.clone();
+
         // Get sample rate and channels for keep-alive audio generation
         let sample_rate = config.base.sample_rate;
         let channels = config.base.channels as u32;
@@ -452,6 +470,8 @@ impl GoogleSTT {
                     let auth_client = auth_client.clone();
                     let initial_config = initial_config.clone();
                     let recognizer_path = recognizer_path.clone();
+                    let grpc_endpoint = grpc_endpoint.clone();
+                    let static_token = static_token.clone();
                     let audio_rx = Arc::clone(&audio_rx);
                     let shutdown_rx = Arc::clone(&shutdown_rx);
                     let connected_tx = Arc::clone(&connected_tx);
@@ -460,14 +480,19 @@ impl GoogleSTT {
                     let error_tx = error_tx.clone();
                     async move {
                         let authenticated_channel =
-                            create_authenticated_channel(GOOGLE_SPEECH_ENDPOINT, auth_client.clone())
+                            create_authenticated_channel(&grpc_endpoint, auth_client.clone())
                                 .await
                                 .map_err(|e| StreamError::new(google_error_to_stt(e).to_string()))?;
 
-                        let auth_header = authenticated_channel
-                            .get_authorization_header()
-                            .await
-                            .map_err(|e| StreamError::new(google_error_to_stt(e).to_string()))?;
+                        // A pre-minted static token authenticates with NO network OAuth fetch (mock
+                        // e2e); otherwise fetch a fresh bearer so a long-lived reconnect re-auths.
+                        let auth_header = match &static_token {
+                            Some(t) => format!("Bearer {t}"),
+                            None => authenticated_channel
+                                .get_authorization_header()
+                                .await
+                                .map_err(|e| StreamError::new(google_error_to_stt(e).to_string()))?,
+                        };
 
                         let auth_metadata_value: tonic::metadata::MetadataValue<_> =
                             auth_header.parse().map_err(|_| {

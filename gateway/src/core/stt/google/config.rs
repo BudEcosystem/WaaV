@@ -75,6 +75,16 @@ pub struct GoogleSTTConfig {
     /// Transcript normalization replacement entries (`config.transcript_normalization`).
     #[serde(default)]
     pub transcript_normalization: Vec<TranscriptNormEntry>,
+
+    // --- Test/operational endpoint + auth overrides (mirrors GoogleTTSConfig) -------------------
+    /// Override the gRPC endpoint the provider connects to instead of the production Speech
+    /// endpoint. An `http://` value selects a PLAINTEXT channel (a localhost tonic mock for e2e).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_override: Option<String>,
+    /// A pre-minted OAuth access token to use verbatim as the bearer credential, bypassing the
+    /// network OAuth fetch. Lets a mock e2e test authenticate with no Google network round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_access_token: Option<String>,
 }
 
 impl Default for GoogleSTTConfig {
@@ -104,6 +114,8 @@ impl Default for GoogleSTTConfig {
             diarization_max_speakers: 0,
             adaptation_phrases: Vec::new(),
             transcript_normalization: Vec::new(),
+            endpoint_override: None,
+            static_access_token: None,
         }
     }
 }
@@ -126,6 +138,16 @@ impl GoogleSTTConfig {
             .unwrap_or_default();
         let mut cfg =
             crate::core::stt::google::GoogleSTT::create_google_config(std.base.clone(), project_id);
+        // Endpoint + static-token overrides (mirrors GoogleTTSConfig::from_standard): the endpoint
+        // override rides the open `endpoint_override` passthrough; the static access token comes
+        // from `extras["access_token"]` (a pre-minted bearer that bypasses the OAuth network fetch).
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        cfg.static_access_token = std
+            .extras
+            .0
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         if let Some(i) = f.interim_results {
             cfg.interim_results = i;
         }

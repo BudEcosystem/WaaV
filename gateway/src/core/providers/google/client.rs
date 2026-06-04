@@ -59,22 +59,27 @@ use super::error::GoogleError;
 /// }
 /// ```
 pub async fn create_grpc_channel(endpoint: &str) -> Result<tonic::transport::Channel, GoogleError> {
-    let channel = tonic::transport::Channel::from_shared(endpoint.to_string())
-        .map_err(|e| {
-            error!(error = %e, endpoint = %endpoint, "Invalid endpoint URL");
-            GoogleError::ConfigurationError(format!("Invalid endpoint URL '{endpoint}': {e}"))
-        })?
-        .tls_config(tonic::transport::ClientTlsConfig::new())
-        .map_err(|e| {
-            error!(error = %e, "Failed to configure TLS");
-            GoogleError::ConnectionFailed(format!("Failed to configure TLS: {e}"))
-        })?
-        .connect()
-        .await
-        .map_err(|e| {
-            error!(error = %e, endpoint = %endpoint, "Failed to connect to Google API");
-            GoogleError::ConnectionFailed(format!("Failed to connect to '{endpoint}': {e}"))
-        })?;
+    let mut builder = tonic::transport::Channel::from_shared(endpoint.to_string()).map_err(|e| {
+        error!(error = %e, endpoint = %endpoint, "Invalid endpoint URL");
+        GoogleError::ConfigurationError(format!("Invalid endpoint URL '{endpoint}': {e}"))
+    })?;
+
+    // TLS is required for production `https://` endpoints; skip it for plaintext `http://`
+    // endpoints (a localhost tonic mock used by e2e tests). Production endpoints are always
+    // `https://`, so only mocks take the plaintext path.
+    if !endpoint.starts_with("http://") {
+        builder = builder
+            .tls_config(tonic::transport::ClientTlsConfig::new())
+            .map_err(|e| {
+                error!(error = %e, "Failed to configure TLS");
+                GoogleError::ConnectionFailed(format!("Failed to configure TLS: {e}"))
+            })?;
+    }
+
+    let channel = builder.connect().await.map_err(|e| {
+        error!(error = %e, endpoint = %endpoint, "Failed to connect to Google API");
+        GoogleError::ConnectionFailed(format!("Failed to connect to '{endpoint}': {e}"))
+    })?;
 
     debug!(endpoint = %endpoint, "Connected to Google Cloud API");
 

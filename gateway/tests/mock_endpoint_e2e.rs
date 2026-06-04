@@ -1839,3 +1839,182 @@ async fn gnani_full_integration_via_mock_endpoint() {
     println!("Gnani mock e2e surfaced transcript: {got:?}");
     assert_eq!(got, "hello world", "Gnani full integration broken");
 }
+
+// ============================================================================
+// STT gRPC: google (bidi google.cloud.speech.v2 StreamingRecognize) — prost
+// response + plaintext channel + static-token bypass.
+// ============================================================================
+
+/// Build a prost-encoded google.cloud.speech.v2 `StreamingRecognizeResponse` with one final result.
+fn encode_google_stt_response(transcript: &str) -> Vec<u8> {
+    use google_api_proto::google::cloud::speech::v2::{
+        SpeechRecognitionAlternative, StreamingRecognitionResult, StreamingRecognizeResponse,
+    };
+    let resp = StreamingRecognizeResponse {
+        results: vec![StreamingRecognitionResult {
+            alternatives: vec![SpeechRecognitionAlternative {
+                transcript: transcript.to_string(),
+                confidence: 0.95,
+                words: vec![],
+            }],
+            is_final: true,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut buf = Vec::new();
+    prost::Message::encode(&resp, &mut buf).expect("encode google StreamingRecognizeResponse");
+    buf
+}
+
+/// Plaintext tonic bidi-streaming gRPC mock for Google STT `/google.cloud.speech.v2.Speech/StreamingRecognize`.
+async fn spawn_google_stt_grpc_mock(response: Vec<u8>) -> u16 {
+    use bytes::{Buf, BufMut, Bytes};
+    use futures::Stream;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+    use tonic::codegen::{Body, BoxFuture, Context, Poll, Service, StdError, http};
+    use tonic::server::StreamingService;
+    use tonic::{Request, Response, Status, Streaming};
+
+    #[derive(Clone, Default)]
+    struct ByteCodec;
+    impl Codec for ByteCodec {
+        type Encode = Vec<u8>;
+        type Decode = Bytes;
+        type Encoder = ByteEnc;
+        type Decoder = ByteDec;
+        fn encoder(&mut self) -> ByteEnc {
+            ByteEnc
+        }
+        fn decoder(&mut self) -> ByteDec {
+            ByteDec
+        }
+    }
+    struct ByteEnc;
+    impl Encoder for ByteEnc {
+        type Item = Vec<u8>;
+        type Error = Status;
+        fn encode(&mut self, item: Vec<u8>, dst: &mut EncodeBuf<'_>) -> Result<(), Status> {
+            dst.put_slice(&item);
+            Ok(())
+        }
+    }
+    struct ByteDec;
+    impl Decoder for ByteDec {
+        type Item = Bytes;
+        type Error = Status;
+        fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Bytes>, Status> {
+            let n = src.remaining();
+            if n == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(src.copy_to_bytes(n)))
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct Mock {
+        resp: Arc<Vec<u8>>,
+    }
+    impl tonic::server::NamedService for Mock {
+        const NAME: &'static str = "google.cloud.speech.v2.Speech";
+    }
+    impl<B> Service<http::Request<B>> for Mock
+    where
+        B: Body + Send + 'static,
+        B::Error: Into<StdError> + Send + 'static,
+    {
+        type Response = http::Response<tonic::body::BoxBody>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            if req.uri().path().ends_with("/StreamingRecognize") {
+                let resp = self.resp.clone();
+                Box::pin(async move {
+                    struct Svc(Arc<Vec<u8>>);
+                    impl StreamingService<Bytes> for Svc {
+                        type Response = Vec<u8>;
+                        type ResponseStream =
+                            Pin<Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send>>;
+                        type Future = BoxFuture<Response<Self::ResponseStream>, Status>;
+                        fn call(&mut self, req: Request<Streaming<Bytes>>) -> Self::Future {
+                            let chunk = (*self.0).clone();
+                            Box::pin(async move {
+                                let mut inbound = req.into_inner();
+                                tokio::spawn(async move {
+                                    use futures::StreamExt;
+                                    while inbound.next().await.is_some() {}
+                                });
+                                let s = futures::stream::iter(vec![Ok(chunk)]);
+                                Ok(Response::new(Box::pin(s) as Self::ResponseStream))
+                            })
+                        }
+                    }
+                    let mut grpc = tonic::server::Grpc::new(ByteCodec);
+                    Ok(grpc.streaming(Svc(resp), req).await)
+                })
+            } else {
+                Box::pin(async move {
+                    Ok(http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .header("grpc-status", "12")
+                        .body(tonic::body::empty_body())
+                        .unwrap())
+                })
+            }
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let incoming = futures::stream::unfold(listener, |l| async move {
+        let res = l.accept().await.map(|(s, _)| s);
+        Some((res, l))
+    });
+    let svc = Mock {
+        resp: Arc::new(response),
+    };
+    tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(incoming)
+            .await;
+    });
+    port
+}
+
+#[tokio::test]
+async fn google_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    let port = spawn_google_stt_grpc_mock(encode_google_stt_response("hello world")).await;
+    let mut std = StandardSTTConfig::from_base(STTConfig {
+        provider: "google".into(),
+        api_key: String::new(), // ApplicationDefault; the static token bypasses the OAuth fetch.
+        language: "en-US".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".into(),
+        model: String::new(),
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    std.extras.0.insert(
+        "access_token".to_string(),
+        serde_json::Value::String("mock-oauth-token".into()),
+    );
+    std.extras.0.insert(
+        "project_id".to_string(),
+        serde_json::Value::String("test-project".into()),
+    );
+    let mut stt = create_stt_standard("google", std).expect("build google via keystone");
+    let got = drive_and_capture(stt.as_mut()).await;
+    println!("Google mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "Google full integration broken");
+}
