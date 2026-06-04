@@ -507,6 +507,12 @@ pub struct AmiVoiceSTTConfig {
 
     /// Recognition timeout in milliseconds (`recognitionTimeout`): hard cap on recognition time.
     pub recognition_timeout: Option<u32>,
+
+    /// Carried from the standardized `endpoint_override` — points the dial at the in-repo mock/proxy
+    /// (a local `ws://` server) for credential-free end-to-end integration tests; `None` uses the
+    /// production AmiVoice endpoint. The featured `s` start command is unchanged (auth is in-band);
+    /// only the dialed scheme://host is swapped, with the AmiVoice `/v1/` path re-appended.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for AmiVoiceSTTConfig {
@@ -535,6 +541,7 @@ impl Default for AmiVoiceSTTConfig {
             target_response_time: None,
             target_decoding_rate: None,
             recognition_timeout: None,
+            endpoint_override: None,
         }
     }
 }
@@ -578,6 +585,7 @@ impl AmiVoiceSTTConfig {
             target_response_time: None,
             target_decoding_rate: None,
             recognition_timeout: None,
+            endpoint_override: None,
         }
     }
 
@@ -638,15 +646,21 @@ impl AmiVoiceSTTConfig {
             .get("recognition_timeout")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
+        // Standardized endpoint override (mock/proxy host) for credential-free integration tests.
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
         cfg
     }
 
-    /// Get the WebSocket URL.
-    pub fn get_websocket_url(&self) -> &'static str {
-        if self.no_logging {
-            AMIVOICE_WS_NOLOG_URL
-        } else {
-            AMIVOICE_WS_URL
+    /// Get the WebSocket URL. Honors an `endpoint_override` (the in-repo mock/proxy points this at a
+    /// local ws:// server) for credential-free integration; otherwise the production AmiVoice
+    /// endpoint. The override carries only `scheme://host[:port]`, so the AmiVoice `/v1/` (or
+    /// `/v1/nolog/`) path is re-appended — a path-less URL would fail the WS handshake.
+    pub fn get_websocket_url(&self) -> String {
+        let path = if self.no_logging { "/v1/nolog/" } else { "/v1/" };
+        match self.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
+            Some(o) => format!("{}{}", o.trim_end_matches('/'), path),
+            None if self.no_logging => AMIVOICE_WS_NOLOG_URL.to_string(),
+            None => AMIVOICE_WS_URL.to_string(),
         }
     }
 

@@ -440,3 +440,53 @@ async fn speechmatics_full_integration_via_mock_endpoint() {
     println!("Speechmatics mock e2e surfaced transcript: {got:?}");
     assert_eq!(got, "hello world", "Speechmatics full integration broken");
 }
+
+/// AmiVoice mock: connect() blocks on the session-start ack, so the mock sends a bare `s`
+/// (SessionStartOk) IMMEDIATELY on connect (not gated on audio, or connect deadlocks); then on the
+/// first audio frame it emits a final result `A <json>` (AmiVoice's real `A `+JSON wire shape).
+async fn spawn_amivoice_mock(transcript_value: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await
+            && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
+        {
+            let (mut write, mut read) = ws.split();
+            let _ = write.send(Message::Text("s".into())).await;
+            let final_msg = format!(
+                r#"A {{"results":[{{"text":"{transcript_value}","tokens":[{{"written":"{transcript_value}","confidence":0.99}}]}}],"text":"{transcript_value}","code":"0","message":"success"}}"#
+            );
+            let mut sent = false;
+            while let Some(Ok(frame)) = read.next().await {
+                if !sent && matches!(frame, Message::Binary(_)) {
+                    let _ = write.send(Message::Text(final_msg.clone().into())).await;
+                    sent = true;
+                }
+            }
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn amivoice_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    let port = spawn_amivoice_mock("hello world").await;
+    let endpoint = format!("ws://127.0.0.1:{port}");
+    // AmiVoice reads its APPKEY from api_key (emitted as `authorization=` on the `s` start command).
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "amivoice".into(),
+        api_key: "test-key".into(),
+        language: "ja".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".into(),
+        model: String::new(),
+    })
+    .with_endpoint_override(&endpoint);
+    let mut stt = create_stt_standard("amivoice", std).expect("build amivoice via keystone");
+    let got = drive_and_capture(stt.as_mut()).await;
+    println!("AmiVoice mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "AmiVoice full integration broken");
+}

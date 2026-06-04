@@ -678,7 +678,9 @@ impl AmiVoiceSTT {
         let connection_handle = tokio::spawn(async move {
             let exit = supervisor
                 .run(|| {
-                    // `ws_url` is `&'static str` (Copy) — captured by copy into the async block.
+                    // `ws_url` is now an owned `String` (may carry an endpoint_override host) — clone
+                    // it per attempt so the dial closure owns its copy across reconnects.
+                    let ws_url = ws_url.clone();
                     let start_command = start_command.clone();
                     let audio_rx = Arc::clone(&audio_rx);
                     let shutdown_rx = Arc::clone(&shutdown_rx);
@@ -1052,6 +1054,7 @@ impl BaseSTT for AmiVoiceSTT {
             target_response_time: existing.as_ref().and_then(|c| c.target_response_time),
             target_decoding_rate: existing.as_ref().and_then(|c| c.target_decoding_rate),
             recognition_timeout: existing.as_ref().and_then(|c| c.recognition_timeout),
+            endpoint_override: existing.as_ref().and_then(|c| c.endpoint_override.clone()),
         };
 
         self.config = Some(amivoice_config);
