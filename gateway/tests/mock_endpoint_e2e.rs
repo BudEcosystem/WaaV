@@ -2018,3 +2018,104 @@ async fn google_full_integration_via_mock_endpoint() {
     println!("Google mock e2e surfaced transcript: {got:?}");
     assert_eq!(got, "hello world", "Google full integration broken");
 }
+
+// ============================================================================
+// STT AWS SDK: aws_transcribe — a custom in-process aws-smithy HttpConnector that
+// returns a canned vnd.amazon.eventstream TranscriptEvent (sidesteps the SDK's
+// HTTP/2-over-TLS-ALPN requirement that no plaintext mock can satisfy).
+// ============================================================================
+
+#[tokio::test]
+async fn aws_transcribe_full_integration_via_mock_endpoint() {
+    use aws_smithy_eventstream::frame::write_message_to;
+    use aws_smithy_runtime_api::client::http::{
+        HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpClient,
+        SharedHttpConnector,
+    };
+    use aws_smithy_runtime_api::client::orchestrator::HttpRequest as AwsHttpRequest;
+    use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+    use aws_smithy_runtime_api::http::{Response as AwsResponse, StatusCode};
+    use aws_smithy_types::body::SdkBody;
+    use aws_smithy_types::event_stream::{Header, HeaderValue, Message};
+    use std::sync::Arc;
+    use waav_gateway::core::stt::aws_transcribe::AwsTranscribeSTT;
+
+    ensure_crypto();
+    // Skip the EC2 IMDS credential probe (169.254.169.254) so the explicit creds are used and the
+    // mock connector only ever sees the transcribe request.
+    unsafe {
+        std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
+    }
+
+    // Build the response: one vnd.amazon.eventstream frame carrying a TranscriptEvent.
+    let payload =
+        br#"{"Transcript":{"Results":[{"Alternatives":[{"Transcript":"hello world"}],"IsPartial":false}]}}"#
+            .to_vec();
+    let msg = Message::new(payload)
+        .add_header(Header::new(":message-type", HeaderValue::String("event".into())))
+        .add_header(Header::new(":event-type", HeaderValue::String("TranscriptEvent".into())))
+        .add_header(Header::new(":content-type", HeaderValue::String("application/json".into())));
+    let mut frame = Vec::new();
+    write_message_to(&msg, &mut frame).expect("encode event-stream frame");
+
+    #[derive(Debug, Clone)]
+    struct MockAwsClient {
+        body: Arc<Vec<u8>>,
+    }
+    impl HttpConnector for MockAwsClient {
+        fn call(&self, _req: AwsHttpRequest) -> HttpConnectorFuture {
+            let body = (*self.body).clone();
+            HttpConnectorFuture::new(async move {
+                let mut resp =
+                    AwsResponse::new(StatusCode::try_from(200u16).unwrap(), SdkBody::from(body));
+                resp.headers_mut()
+                    .insert("content-type", "application/vnd.amazon.eventstream");
+                Ok(resp)
+            })
+        }
+    }
+    impl HttpClient for MockAwsClient {
+        fn http_connector(
+            &self,
+            _s: &HttpConnectorSettings,
+            _c: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(self.clone())
+        }
+    }
+
+    let mut std = StandardSTTConfig::from_base(STTConfig {
+        provider: "aws_transcribe".into(),
+        api_key: String::new(),
+        language: "en-US".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "pcm".into(),
+        model: String::new(),
+    });
+    // Explicit AWS creds via extras so the SDK config builds without ADC (the AKIA value is the
+    // public AWS-docs placeholder; the mock connector never validates the SigV4 signature).
+    std.extras.0.insert(
+        "aws_access_key_id".to_string(),
+        serde_json::Value::String("AKIAIOSFODNN7EXAMPLE".into()),
+    );
+    std.extras.0.insert(
+        "aws_secret_access_key".to_string(),
+        serde_json::Value::String("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into()),
+    );
+    std.extras.0.insert(
+        "region".to_string(),
+        serde_json::Value::String("us-east-1".into()),
+    );
+
+    let client = SharedHttpClient::new(MockAwsClient {
+        body: Arc::new(frame),
+    });
+    let mut stt = AwsTranscribeSTT::new_standard(&std)
+        .expect("build aws_transcribe via keystone")
+        .with_http_client(client);
+    let got = drive_and_capture(&mut stt).await;
+    println!("AWS Transcribe mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "AWS Transcribe full integration broken");
+}

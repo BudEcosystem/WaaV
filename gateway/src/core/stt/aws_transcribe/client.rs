@@ -320,6 +320,11 @@ pub struct AwsTranscribeSTT {
     /// `None` before `set_resilience` (a direct unit-test construction) → the supervisor uses its
     /// own per-session governor/breaker default.
     resilience: Option<crate::core::resilience::ResilienceHandles>,
+
+    /// Optional injected AWS `HttpClient` (proxy / custom TLS / in-process test connector). When
+    /// `Some`, it overrides the default hyper client used for the transcribe-streaming connection
+    /// (applied to the `aws_config` loader in `start_connection`). `None` → SDK default hyper client.
+    http_client: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
 }
 
 impl AwsTranscribeSTT {
@@ -347,6 +352,7 @@ impl AwsTranscribeSTT {
             is_connected: Arc::new(AtomicBool::new(false)),
             session_id: Arc::new(RwLock::new(None)),
             resilience: None,
+            http_client: None,
         })
     }
 
@@ -362,15 +368,21 @@ impl AwsTranscribeSTT {
         std: &crate::core::stt::standard::StandardSTTConfig,
     ) -> Result<Self, STTError> {
         let mut aws_config = AwsTranscribeSTTConfig::from_standard(std);
-        // Resolve credentials/region from the environment (parity with `BaseSTT::new`).
-        aws_config.region = AwsRegion::from_str_or_default(
-            std::env::var("AWS_REGION")
-                .unwrap_or_else(|_| "us-east-1".to_string())
-                .as_str(),
-        );
-        aws_config.aws_access_key_id = std::env::var("AWS_ACCESS_KEY_ID").ok();
-        aws_config.aws_secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
-        aws_config.aws_session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+        // Resolve credentials/region from the environment, but ONLY when the env var is actually set
+        // — otherwise keep what `from_standard` already pulled from the standardized config/extras
+        // (env was clobbering explicit extras credentials with `None`).
+        if let Ok(region) = std::env::var("AWS_REGION") {
+            aws_config.region = AwsRegion::from_str_or_default(&region);
+        }
+        if let Ok(k) = std::env::var("AWS_ACCESS_KEY_ID") {
+            aws_config.aws_access_key_id = Some(k);
+        }
+        if let Ok(k) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+            aws_config.aws_secret_access_key = Some(k);
+        }
+        if let Ok(k) = std::env::var("AWS_SESSION_TOKEN") {
+            aws_config.aws_session_token = Some(k);
+        }
         aws_config.media_encoding = MediaEncoding::from_str_or_default(&std.base.encoding);
         Self::new_with_config(aws_config)
     }
@@ -378,6 +390,16 @@ impl AwsTranscribeSTT {
     /// Get the current session ID.
     pub async fn get_session_id(&self) -> Option<String> {
         self.session_id.read().await.clone()
+    }
+
+    /// Inject a custom AWS `HttpClient` (proxy / custom TLS / in-process test connector).
+    /// When set, it overrides the default hyper client used for the transcribe-streaming connection.
+    pub fn with_http_client(
+        mut self,
+        http_client: aws_smithy_runtime_api::client::http::SharedHttpClient,
+    ) -> Self {
+        self.http_client = Some(http_client);
+        self
     }
 
     /// Convert WaaV MediaEncoding to AWS SDK MediaEncoding.
@@ -559,6 +581,9 @@ impl AwsTranscribeSTT {
         // Raw endpoint base (e.g. https://127.0.0.1:PORT for a mock e2e harness). The SDK appends
         // the operation path; honored on BOTH the explicit-creds and default-chain loader branches.
         let endpoint_override = config.endpoint_override.clone();
+        // Optional injected HttpClient (proxy / custom TLS / in-process test connector). When set,
+        // applied to the loader below so it overrides the SDK default hyper client.
+        let http_client = self.http_client.clone();
         // The full provider config drives request-parameter wiring via `apply_request_params`
         // (the single source of truth shared with the wire-level tests).
         let request_config = config.clone();
@@ -598,6 +623,9 @@ impl AwsTranscribeSTT {
             }
             if let Some(ep) = endpoint_override.as_deref() {
                 loader = loader.endpoint_url(ep);
+            }
+            if let Some(c) = http_client.clone() {
+                loader = loader.http_client(c);
             }
             let aws_config = loader.load().await;
 
@@ -784,6 +812,7 @@ impl Default for AwsTranscribeSTT {
             is_connected: Arc::new(AtomicBool::new(false)),
             session_id: Arc::new(RwLock::new(None)),
             resilience: None,
+            http_client: None,
         }
     }
 }

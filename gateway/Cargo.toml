@@ -239,6 +239,7 @@ aws-sdk-polly = "1.61"
 aws-credential-types = "1.2"
 aws-types = "1.3"
 aws-smithy-types = "1.3"
+aws-smithy-runtime-api = "1"
 dashmap = "6.1.0"
 
 # Plugin system dependencies
@@ -271,6 +272,7 @@ num = { version = "0.4", optional = true }  # Complex number support for FFT
 pulp = "0.18"
 
 [dev-dependencies]
+aws-smithy-eventstream = "0.60"
 tower = { version = "0.5.2", features = ["util"] }
 tempfile = "3.8"
 serial_test = "3.2"
