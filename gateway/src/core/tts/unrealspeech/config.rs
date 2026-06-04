@@ -420,6 +420,9 @@ pub struct UnrealSpeechTtsConfig {
     /// Optional sampling temperature (V8 `Temperature`, ~0.1..=1.0). `None` lets the API default
     /// apply. Sourced from the standardized `extras` passthrough (UnrealSpeech-specific knob).
     pub temperature: Option<f32>,
+
+    /// Optional base URL override (scheme+host) for redirecting synth HTTP POSTs to a mock in tests.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for UnrealSpeechTtsConfig {
@@ -432,6 +435,7 @@ impl Default for UnrealSpeechTtsConfig {
             pitch: super::DEFAULT_PITCH,
             codec: UnrealSpeechCodec::default(),
             temperature: None,
+            endpoint_override: None,
         }
     }
 }
@@ -483,6 +487,7 @@ impl UnrealSpeechTtsConfig {
             pitch: super::DEFAULT_PITCH,
             codec,
             temperature: None,
+            endpoint_override: None,
         })
     }
 
@@ -528,6 +533,8 @@ impl UnrealSpeechTtsConfig {
         if let Some(temperature) = std.extras.0.get("temperature").and_then(|v| v.as_f64()) {
             cfg.temperature = Some(temperature as f32);
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         Ok(cfg)
     }
@@ -655,6 +662,7 @@ impl UnrealSpeechTtsConfigBuilder {
             pitch: self.pitch.unwrap_or(super::DEFAULT_PITCH),
             codec: self.codec.unwrap_or_default(),
             temperature: None,
+            endpoint_override: None,
         };
 
         config.validate()?;
@@ -996,6 +1004,7 @@ mod tests {
             pitch: 1.0,
             codec: UnrealSpeechCodec::Mp3,
             temperature: None,
+            endpoint_override: None,
         };
 
         let request = UnrealSpeechStreamRequest::from_config(&config, "Hello world");
@@ -1018,6 +1027,7 @@ mod tests {
             pitch: 0.92,
             codec: UnrealSpeechCodec::Mp3,
             temperature: None,
+            endpoint_override: None,
         };
 
         let request = UnrealSpeechStreamRequest::from_config(&config, "Test text");

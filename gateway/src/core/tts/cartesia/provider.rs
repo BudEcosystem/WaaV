@@ -240,7 +240,10 @@ impl TTSRequestBuilder for CartesiaRequestBuilder {
 
         // Build the HTTP request with all required headers
         client
-            .post(CARTESIA_TTS_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                CARTESIA_TTS_URL,
+                self.cartesia_config.endpoint_override.as_deref(),
+            ))
             .header("Authorization", format!("Bearer {}", self.config.api_key))
             .header("Cartesia-Version", &self.cartesia_config.api_version)
             .header("Content-Type", "application/json")

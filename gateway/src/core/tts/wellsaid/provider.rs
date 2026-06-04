@@ -84,7 +84,10 @@ impl TTSRequestBuilder for WellSaidRequestBuilder {
 
         // Build and return the request
         client
-            .post(super::WELLSAID_TTS_STREAM_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                super::WELLSAID_TTS_STREAM_URL,
+                self.config.endpoint_override.as_deref(),
+            ))
             .headers(headers)
             .json(&request_body)
     }

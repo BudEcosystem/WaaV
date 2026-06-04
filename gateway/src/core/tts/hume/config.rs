@@ -356,6 +356,9 @@ pub struct HumeTTSConfig {
     /// Strip per-chunk audio headers on concatenation (top-level `strip_headers`).
     /// Changes the returned byte framing, so it is part of the cache key.
     pub strip_headers: Option<bool>,
+
+    /// Optional base URL override (scheme+host) for the synth HTTP endpoint; used by mock e2e tests.
+    pub endpoint_override: Option<String>,
 }
 
 impl HumeTTSConfig {
@@ -397,6 +400,7 @@ impl HumeTTSConfig {
             temperature: None,
             split_utterances: None,
             strip_headers: None,
+            endpoint_override: None,
         }
     }
 
@@ -462,6 +466,8 @@ impl HumeTTSConfig {
         if let Some(s) = std.extras.0.get("strip_headers").and_then(|v| v.as_bool()) {
             cfg.strip_headers = Some(s);
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         cfg
     }
@@ -593,6 +599,7 @@ impl Default for HumeTTSConfig {
             temperature: None,
             split_utterances: None,
             strip_headers: None,
+            endpoint_override: None,
         }
     }
 }

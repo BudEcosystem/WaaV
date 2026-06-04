@@ -84,6 +84,22 @@ fn fake_audio() -> Vec<u8> {
     v
 }
 
+/// Build a REST TTS provider via the keystone with an `endpoint_override`, drive it against a
+/// localhost mock serving `path`, and assert audio bytes surfaced end-to-end. This is the dual of
+/// the STT mock-e2e `drive_rest_and_capture`: it proves the provider's synth POST reaches the wire
+/// (host swapped, path preserved) and the response audio flows back through `on_audio`, with no key.
+async fn assert_rest_tts_surfaces_audio(provider: &str, path: &'static str, base: TTSConfig) {
+    ensure_crypto();
+    let port = spawn_audio_mock(path, fake_audio()).await;
+    let std = StandardTTSConfig::from_base(base)
+        .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts =
+        create_tts_standard(provider, std).unwrap_or_else(|e| panic!("build {provider} tts: {e:?}"));
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("{provider} TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "{provider} TTS surfaced no audio end-to-end");
+}
+
 #[tokio::test]
 async fn openai_tts_full_integration_via_mock_endpoint() {
     ensure_crypto();
@@ -106,4 +122,110 @@ async fn openai_tts_full_integration_via_mock_endpoint() {
     }
     println!("OpenAI TTS mock e2e surfaced {bytes} audio bytes");
     assert!(bytes > 0, "OpenAI TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn cartesia_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "cartesia",
+        "/tts/bytes",
+        TTSConfig {
+            provider: "cartesia".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("a0e99841-438c-4a64-b679-ae501e7d6091".to_string()),
+            model: "sonic-3".to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn hume_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "hume",
+        "/v0/tts/stream/file",
+        TTSConfig {
+            provider: "hume".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("Kora".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn speechify_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "speechify",
+        "/v1/audio/stream",
+        TTSConfig {
+            provider: "speechify".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("george".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn murf_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "murf",
+        "/v1/speech/stream",
+        TTSConfig {
+            provider: "murf".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("en-US-natalie".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn unrealspeech_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "unrealspeech",
+        "/stream",
+        TTSConfig {
+            provider: "unrealspeech".into(),
+            api_key: "test-key".into(),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn reverie_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "reverie",
+        "/",
+        TTSConfig {
+            provider: "reverie".into(),
+            api_key: "test-key".into(),
+            model: "test-app-id".to_string(),
+            voice_id: Some("hi_female".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn wellsaid_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "wellsaid",
+        "/v1/tts/stream",
+        TTSConfig {
+            provider: "wellsaid".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("3".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
 }

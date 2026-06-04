@@ -309,6 +309,9 @@ pub struct SpeechifyTtsConfig {
 
     /// Whether to normalize text (numbers, dates to words)
     pub text_normalization: bool,
+
+    /// Optional base URL override (scheme+host) for the synth HTTP endpoint; used by mock e2e tests.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for SpeechifyTtsConfig {
@@ -321,6 +324,7 @@ impl Default for SpeechifyTtsConfig {
             language: None,
             loudness_normalization: false,
             text_normalization: false,
+            endpoint_override: None,
         }
     }
 }
@@ -383,6 +387,7 @@ impl SpeechifyTtsConfig {
             language,
             loudness_normalization: false,
             text_normalization: false,
+            endpoint_override: None,
         })
     }
 
@@ -421,6 +426,8 @@ impl SpeechifyTtsConfig {
         {
             cfg.text_normalization = norm;
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         Ok(cfg)
     }
@@ -526,6 +533,7 @@ impl SpeechifyTtsConfigBuilder {
             language: self.language,
             loudness_normalization: self.loudness_normalization,
             text_normalization: self.text_normalization,
+            endpoint_override: None,
         };
 
         config.validate()?;
@@ -786,6 +794,7 @@ mod tests {
             language: None,
             loudness_normalization: false,
             text_normalization: false,
+            endpoint_override: None,
         };
 
         let request = SpeechifyStreamRequest::from_config(&config, "Hello world");
@@ -809,6 +818,7 @@ mod tests {
             language: Some("fr-FR".to_string()),
             loudness_normalization: true,
             text_normalization: true,
+            endpoint_override: None,
         };
 
         let request = SpeechifyStreamRequest::from_config(&config, "Bonjour");
@@ -832,6 +842,7 @@ mod tests {
             language: Some("en-US".to_string()),
             loudness_normalization: true,
             text_normalization: false,
+            endpoint_override: None,
         };
 
         let request = SpeechifyStreamRequest::from_config(&config, "Test text");

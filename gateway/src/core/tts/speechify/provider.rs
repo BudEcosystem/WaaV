@@ -86,7 +86,10 @@ impl TTSRequestBuilder for SpeechifyRequestBuilder {
 
         // Build and return the request
         client
-            .post(self.streaming_url())
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                self.streaming_url(),
+                self.config.endpoint_override.as_deref(),
+            ))
             .headers(headers)
             .json(&request_body)
     }

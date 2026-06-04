@@ -297,6 +297,8 @@ pub struct ReverieTtsConfig {
     /// Treat the synthesis input as SSML markup. When set, the request body carries the input under
     /// the `ssml` key instead of the plain-text `text` array (Reverie's documented SSML input mode).
     pub ssml_input: bool,
+    /// Optional scheme+host override for the synth HTTP endpoint (path+query preserved); test-only redirect.
+    pub endpoint_override: Option<String>,
 }
 
 impl ReverieTtsConfig {
@@ -365,6 +367,7 @@ impl ReverieTtsConfig {
             sample_rate,
             format,
             ssml_input: false,
+            endpoint_override: None,
         })
     }
 
@@ -413,6 +416,7 @@ impl ReverieTtsConfig {
         if let Some(fmt) = std.extras.0.get("format").and_then(|v| v.as_str()) {
             cfg.format = fmt.parse().unwrap_or(cfg.format);
         }
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         Ok(cfg)
     }

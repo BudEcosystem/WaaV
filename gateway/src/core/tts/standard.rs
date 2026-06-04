@@ -111,6 +111,35 @@ impl StandardTTSConfig {
     }
 }
 
+/// Rewrite a REST endpoint to honor an `endpoint_override` base, keeping the original path+query.
+///
+/// REST TTS providers POST to a fixed production URL (e.g. `https://api.cartesia.ai/tts/bytes`).
+/// The credential-free mock harness (W-T0) needs to point that POST at a localhost mock without
+/// losing the path the mock serves on. Given `default_url` and an override base like
+/// `http://127.0.0.1:PORT`, this swaps scheme+host and re-appends the default URL's path+query
+/// (a path-less override would 404 the mock). With no override the default URL passes through.
+pub fn override_rest_endpoint(default_url: &str, override_base: Option<&str>) -> String {
+    let Some(base) = override_base else {
+        return default_url.to_string();
+    };
+    let base = base.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return default_url.to_string();
+    }
+    match url::Url::parse(default_url) {
+        Ok(u) => {
+            let mut tail = u.path().to_string();
+            if let Some(q) = u.query() {
+                tail.push('?');
+                tail.push_str(q);
+            }
+            format!("{base}{tail}")
+        }
+        // Default URL isn't absolute (already a path, or a builder fragment): append as-is.
+        Err(_) => format!("{base}/{}", default_url.trim_start_matches('/')),
+    }
+}
+
 impl From<TTSConfig> for StandardTTSConfig {
     fn from(base: TTSConfig) -> Self {
         Self::from_base(base)
@@ -222,6 +251,35 @@ mod tests {
         let cfg = StandardTTSConfig::from_base(TTSConfig::default());
         assert_eq!(cfg.features, TtsFeatures::default());
         assert!(cfg.extras.is_empty());
+    }
+
+    #[test]
+    fn override_rest_endpoint_swaps_host_keeps_path() {
+        // No override: passthrough.
+        assert_eq!(
+            override_rest_endpoint("https://api.cartesia.ai/tts/bytes", None),
+            "https://api.cartesia.ai/tts/bytes"
+        );
+        // Override: scheme+host swapped, path retained.
+        assert_eq!(
+            override_rest_endpoint("https://api.cartesia.ai/tts/bytes", Some("http://127.0.0.1:9000")),
+            "http://127.0.0.1:9000/tts/bytes"
+        );
+        // Trailing slash on the override base is normalized.
+        assert_eq!(
+            override_rest_endpoint("https://api.openai.com/v1/audio/speech", Some("http://127.0.0.1:9000/")),
+            "http://127.0.0.1:9000/v1/audio/speech"
+        );
+        // Query string is preserved.
+        assert_eq!(
+            override_rest_endpoint("https://host/synth?fmt=mp3", Some("http://127.0.0.1:1")),
+            "http://127.0.0.1:1/synth?fmt=mp3"
+        );
+        // Empty override falls back to default.
+        assert_eq!(
+            override_rest_endpoint("https://host/p", Some("   ")),
+            "https://host/p"
+        );
     }
 
     #[test]

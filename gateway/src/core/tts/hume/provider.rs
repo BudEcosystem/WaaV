@@ -220,7 +220,10 @@ impl TTSRequestBuilder for HumeRequestBuilder {
 
         // Build the HTTP request with all required headers
         client
-            .post(HUME_TTS_STREAM_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                HUME_TTS_STREAM_URL,
+                self.hume_config.endpoint_override.as_deref(),
+            ))
             .header("X-Hume-Api-Key", &self.config.api_key)
             .header("Content-Type", "application/json")
             .header(
@@ -251,7 +254,10 @@ impl TTSRequestBuilder for HumeRequestBuilder {
         );
 
         client
-            .post(HUME_TTS_STREAM_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                HUME_TTS_STREAM_URL,
+                self.hume_config.endpoint_override.as_deref(),
+            ))
             .header("X-Hume-Api-Key", &self.config.api_key)
             .header("Content-Type", "application/json")
             .header(

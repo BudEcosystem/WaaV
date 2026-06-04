@@ -216,6 +216,8 @@ pub struct WellSaidTtsConfig {
     /// Treat the input text as SSML. When `true` the request sends the `X-Enable-SSML: true` header
     /// so WellSaid parses the body's `text` as SSML markup.
     pub ssml: bool,
+    /// Optional base URL (scheme+host) override for the synth HTTP endpoint; used to redirect to a mock in tests.
+    pub endpoint_override: Option<String>,
 }
 
 impl WellSaidTtsConfig {
@@ -228,6 +230,7 @@ impl WellSaidTtsConfig {
             audio_configs: WellSaidAudioConfigs::default(),
             library_ids: Vec::new(),
             ssml: false,
+            endpoint_override: None,
         }
     }
 
@@ -281,6 +284,7 @@ impl WellSaidTtsConfig {
             audio_configs: WellSaidAudioConfigs::default(),
             library_ids: Vec::new(),
             ssml: false,
+            endpoint_override: None,
         };
 
         // Validate
@@ -333,6 +337,8 @@ impl WellSaidTtsConfig {
                 .collect();
         }
 
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+
         Ok(cfg)
     }
 
@@ -375,6 +381,7 @@ impl Default for WellSaidTtsConfig {
             audio_configs: WellSaidAudioConfigs::default(),
             library_ids: Vec::new(),
             ssml: false,
+            endpoint_override: None,
         }
     }
 }

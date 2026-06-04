@@ -557,6 +557,14 @@ impl MurfTtsConfig {
         {
             cfg = cfg.with_variation(variation as u8);
         }
+        // Credential-free mock harness (W-T0): redirect the synth POST at a localhost mock, keeping
+        // the streaming path. Takes priority over the regional endpoint via `streaming_url()`.
+        if let Some(ep) = std.endpoint_override() {
+            cfg.custom_endpoint = Some(crate::core::tts::standard::override_rest_endpoint(
+                super::MURF_TTS_STREAM_URL,
+                Some(ep),
+            ));
+        }
         cfg.validate()?;
         Ok(cfg)
     }

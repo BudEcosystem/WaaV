@@ -638,6 +638,9 @@ pub struct CartesiaTTSConfig {
     /// audio-changing field folded into the cache-key hash. Populated from the
     /// `provider_extras` passthrough (`pronunciation_dict_id`).
     pub pronunciation_dict_id: Option<String>,
+
+    /// Optional base-URL override (scheme+host) for the synth HTTP endpoint (test harness only).
+    pub endpoint_override: Option<String>,
 }
 
 impl CartesiaTTSConfig {
@@ -699,6 +702,7 @@ impl CartesiaTTSConfig {
         {
             cfg.pronunciation_dict_id = Some(dict_id.to_string());
         }
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
         cfg
     }
 
@@ -754,6 +758,7 @@ impl CartesiaTTSConfig {
             language: None,
             volume: None,
             pronunciation_dict_id: None,
+            endpoint_override: None,
         }
     }
 
@@ -858,6 +863,7 @@ impl Default for CartesiaTTSConfig {
             language: None,
             volume: None,
             pronunciation_dict_id: None,
+            endpoint_override: None,
         }
     }
 }

@@ -150,7 +150,10 @@ impl TTSRequestBuilder for ReverieRequestBuilder {
 
         // Build the HTTP request with all required headers
         client
-            .post(REVERIE_TTS_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                REVERIE_TTS_URL,
+                self.reverie_config.endpoint_override.as_deref(),
+            ))
             .header("REV-API-KEY", &self.config.api_key)
             .header("REV-APP-ID", &self.reverie_config.app_id)
             .header("REV-APPNAME", TTS_APP_NAME)
