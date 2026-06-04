@@ -136,9 +136,13 @@ impl TTSRequestBuilder for AzureRequestBuilder {
         // Get the output format header value
         let output_format = self.azure_config.output_format.as_str();
 
-        // Build the request with Azure-specific headers and SSML body.
+        // Build the request with Azure-specific headers and SSML body. The synth POST honors an
+        // endpoint override (W-T0 mock/proxy), keeping the `cognitiveservices/v1` path+query.
         let mut request = client
-            .post(&url)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                &url,
+                self.azure_config.endpoint_override.as_deref(),
+            ))
             .header("Content-Type", "application/ssml+xml")
             .header(AZURE_OUTPUT_FORMAT_HEADER, output_format)
             .header("User-Agent", USER_AGENT)

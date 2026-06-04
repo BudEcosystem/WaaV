@@ -180,6 +180,8 @@ pub struct SpeechmaticsTtsConfig {
     pub voice: SpeechmaticsVoice,
     /// Output audio format
     pub output_format: SpeechmaticsOutputFormat,
+    /// Override base (scheme+host) for the synth POST, used to redirect to a mock in tests.
+    pub endpoint_override: Option<String>,
 }
 
 impl SpeechmaticsTtsConfig {
@@ -189,6 +191,7 @@ impl SpeechmaticsTtsConfig {
             api_key: api_key.into(),
             voice: SpeechmaticsVoice::default(),
             output_format: SpeechmaticsOutputFormat::default(),
+            endpoint_override: None,
         }
     }
 
@@ -271,6 +274,7 @@ impl SpeechmaticsTtsConfig {
             api_key,
             voice,
             output_format,
+            endpoint_override: None,
         };
 
         cfg.validate()?;
@@ -288,7 +292,9 @@ impl SpeechmaticsTtsConfig {
     /// [`from_base`]: Self::from_base
     /// [`TtsFeatures`]: crate::core::tts::standard::TtsFeatures
     pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
-        Self::from_base(&std.base)
+        let mut cfg = Self::from_base(&std.base)?;
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+        Ok(cfg)
     }
 
     /// Validate text length for synthesis

@@ -79,7 +79,10 @@ impl ViettelTts {
         // Send request
         let response = self
             .http_client
-            .post(VIETTEL_TTS_ENDPOINT)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                VIETTEL_TTS_ENDPOINT,
+                self.config.endpoint_override.as_deref(),
+            ))
             .header("Content-Type", "application/json")
             .header("token", &self.config.api_key)
             .json(&request_body)

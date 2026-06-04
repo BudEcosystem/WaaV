@@ -56,19 +56,50 @@ async fn drive_tts(tts: &mut dyn BaseTTS) -> usize {
     total.load(Ordering::SeqCst)
 }
 
-/// Spawn an axum HTTP mock that returns `audio_bytes` (Content-Type `audio/mpeg`) on `path`.
+/// Spawn an axum HTTP mock that returns `audio_bytes` (Content-Type `audio/mpeg`) on `path` AND on
+/// any other path via a fallback. The fallback frees each provider's synth POST from needing an
+/// exact route — some embed dynamic segments (Speechmatics `/generate/<voice>`) or punctuation
+/// (Yandex `/speech/v1/tts:synthesize`) that are awkward to register literally.
 async fn spawn_audio_mock(path: &'static str, audio_bytes: Vec<u8>) -> u16 {
     use axum::{Router, http::header, routing::post};
     use tokio::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let app = Router::new().route(
-        path,
-        post(move || {
-            let bytes = audio_bytes.clone();
+    let primary = audio_bytes.clone();
+    let fallback = audio_bytes.clone();
+    let app = Router::new()
+        .route(
+            path,
+            post(move || {
+                let bytes = primary.clone();
+                async move { ([(header::CONTENT_TYPE, "audio/mpeg")], bytes) }
+            }),
+        )
+        .fallback(move || {
+            let bytes = fallback.clone();
             async move { ([(header::CONTENT_TYPE, "audio/mpeg")], bytes) }
-        }),
-    );
+        });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    port
+}
+
+/// Spawn a mock that returns a JSON body with base64-encoded audio under `key`, for providers that
+/// wrap synthesized audio in a JSON envelope (e.g. Gnani's `audioContent`) rather than streaming
+/// raw bytes. Served on every path via a fallback.
+async fn spawn_json_audio_mock(key: &'static str, audio_bytes: Vec<u8>) -> u16 {
+    use axum::{Json, Router};
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use tokio::net::TcpListener;
+    let b64 = STANDARD.encode(&audio_bytes);
+    let body = serde_json::json!({ key: b64 });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().fallback(move || {
+        let body = body.clone();
+        async move { Json(body) }
+    });
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -224,6 +255,101 @@ async fn wellsaid_tts_full_integration_via_mock_endpoint() {
             provider: "wellsaid".into(),
             api_key: "test-key".into(),
             voice_id: Some("3".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn yandex_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "yandex",
+        "/speech/v1/tts_synthesize",
+        TTSConfig {
+            provider: "yandex".into(),
+            // folder_id|api_key packing (no dot → not treated as an IAM token).
+            api_key: "folder123:test-key".into(),
+            voice_id: Some("alena".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn viettel_ai_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "viettel_ai",
+        "/voice/api/tts/v1/rest/syn",
+        TTSConfig {
+            provider: "viettel_ai".into(),
+            api_key: "test-token".into(),
+            voice_id: Some("hn-quynhanh".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn gnani_tts_full_integration_via_mock_endpoint() {
+    // Gnani wraps audio in a JSON envelope (`audioContent`, base64) rather than streaming raw bytes.
+    ensure_crypto();
+    let port = spawn_json_audio_mock("audioContent", fake_audio()).await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "gnani".into(),
+        // token|access_key packing (Gnani requires both credentials).
+        api_key: "test-token|test-access".into(),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("gnani", std).expect("build gnani tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("gnani TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "gnani TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn naver_clova_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "naver_clova",
+        "/tts-premium/v1/tts",
+        TTSConfig {
+            provider: "naver_clova".into(),
+            // client_id|client_secret packing for the X-NCP headers.
+            api_key: "test-id|test-secret".into(),
+            voice_id: Some("nara".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn speechmatics_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "speechmatics",
+        "/generate/sarah",
+        TTSConfig {
+            provider: "speechmatics".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("sarah".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn azure_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "azure",
+        "/cognitiveservices/v1",
+        TTSConfig {
+            provider: "azure".into(),
+            api_key: "test-subscription-key".into(),
+            voice_id: Some("en-US-JennyNeural".to_string()),
             ..Default::default()
         },
     )

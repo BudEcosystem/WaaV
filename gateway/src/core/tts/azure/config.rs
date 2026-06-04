@@ -808,6 +808,9 @@ pub struct AzureTTSConfig {
     ///
     /// [`language_code`]: AzureTTSConfig::language_code
     pub language_override: Option<String>,
+
+    /// Optional endpoint base override redirecting the synthesis POST to a mock/proxy (W-T0).
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for AzureTTSConfig {
@@ -822,6 +825,7 @@ impl Default for AzureTTSConfig {
             deployment_id: None,
             auth_token: None,
             language_override: None,
+            endpoint_override: None,
         }
     }
 }
@@ -868,6 +872,7 @@ impl AzureTTSConfig {
             deployment_id: None,
             auth_token: None,
             language_override: None,
+            endpoint_override: None,
         }
     }
 
@@ -986,6 +991,9 @@ impl AzureTTSConfig {
         // rather than wrap a single plain-text string, so they are not auto-emitted from a flat
         // text input here (Azure SSML reference, doc ms.date 2026-01-30). They remain reachable by
         // sending a full SSML body directly.
+
+        // Endpoint override redirecting the synthesis POST to a mock/proxy (W-T0).
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         cfg
     }

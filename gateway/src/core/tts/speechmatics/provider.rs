@@ -83,7 +83,13 @@ impl TTSRequestBuilder for SpeechmaticsRequestBuilder {
         );
 
         // Build and return the request
-        client.post(&url).headers(headers).json(&request_body)
+        client
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                &url,
+                self.config.endpoint_override.as_deref(),
+            ))
+            .headers(headers)
+            .json(&request_body)
     }
 
     fn get_config(&self) -> &TTSConfig {

@@ -327,6 +327,9 @@ pub struct NaverClovaTtsConfig {
 
     /// Custom endpoint URL (for enterprise deployments).
     pub custom_endpoint: Option<String>,
+
+    /// Standardized endpoint base override (scheme+host) for the synth POST; e.g. redirect to a mock.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for NaverClovaTtsConfig {
@@ -346,6 +349,7 @@ impl Default for NaverClovaTtsConfig {
             end_pitch: 0,
             request_timeout_secs: 30,
             custom_endpoint: None,
+            endpoint_override: None,
         }
     }
 }
@@ -426,6 +430,7 @@ impl NaverClovaTtsConfig {
             end_pitch: 0,
             request_timeout_secs,
             custom_endpoint: None,
+            endpoint_override: None,
         })
     }
 
@@ -479,6 +484,8 @@ impl NaverClovaTtsConfig {
         if let Some(endpoint) = std.extras.0.get("custom_endpoint").and_then(|v| v.as_str()) {
             cfg.custom_endpoint = Some(endpoint.to_string());
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         Ok(cfg)
     }

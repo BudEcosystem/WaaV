@@ -45,6 +45,10 @@ pub struct GnaniTTSConfig {
     /// Request timeout in seconds
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
+
+    /// Test-only override base (scheme+host) for the synth endpoint; passthrough when None.
+    #[serde(default, skip_serializing)]
+    pub endpoint_override: Option<String>,
 }
 
 fn default_sample_rate() -> u32 {
@@ -80,6 +84,7 @@ impl Default for GnaniTTSConfig {
             ssml_gender: GnaniGender::default(),
             output_sample_rate: default_sample_rate(),
             request_timeout_secs: default_request_timeout(),
+            endpoint_override: None,
         }
     }
 }
@@ -87,9 +92,23 @@ impl Default for GnaniTTSConfig {
 impl GnaniTTSConfig {
     /// Create GnaniTTSConfig from base TTSConfig
     pub fn from_base(base: TTSConfig) -> Result<Self, String> {
-        // Get credentials from environment
-        let token = std::env::var("GNANI_TOKEN").unwrap_or_default();
-        let access_key = std::env::var("GNANI_ACCESS_KEY").unwrap_or_default();
+        // Credentials come through the standardized `api_key` (the keystone channel every provider
+        // shares) as `token|access_key`; either half may be omitted to fall back to the GNANI_TOKEN
+        // / GNANI_ACCESS_KEY env vars for env-configured deployments.
+        let (token, access_key) = if !base.api_key.is_empty() {
+            match base.api_key.split_once('|') {
+                Some((t, a)) => (t.to_string(), a.to_string()),
+                None => (
+                    base.api_key.clone(),
+                    std::env::var("GNANI_ACCESS_KEY").unwrap_or_default(),
+                ),
+            }
+        } else {
+            (
+                std::env::var("GNANI_TOKEN").unwrap_or_default(),
+                std::env::var("GNANI_ACCESS_KEY").unwrap_or_default(),
+            )
+        };
         let certificate_path = std::env::var("GNANI_CERTIFICATE_PATH")
             .ok()
             .map(PathBuf::from);
@@ -120,6 +139,7 @@ impl GnaniTTSConfig {
             ssml_gender,
             output_sample_rate,
             request_timeout_secs: default_request_timeout(),
+            endpoint_override: None,
         })
     }
 
@@ -148,6 +168,8 @@ impl GnaniTTSConfig {
         if let Some(voice_name) = std.extras.0.get("voice_name").and_then(|v| v.as_str()) {
             cfg.voice_name = Some(voice_name.to_string());
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         Ok(cfg)
     }

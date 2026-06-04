@@ -135,7 +135,10 @@ impl GnaniTTS {
         );
 
         let response = client
-            .post(config.endpoint())
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                config.endpoint(),
+                config.endpoint_override.as_deref(),
+            ))
             .header("token", &config.token)
             .header("accesskey", &config.access_key)
             .header("lang", config.language_code.as_str())

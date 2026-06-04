@@ -261,6 +261,9 @@ pub struct ViettelTtsConfig {
 
     /// Request timeout in seconds.
     pub request_timeout_secs: u64,
+
+    /// Optional base URL override (scheme+host) for the synth endpoint; used by mock e2e tests.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for ViettelTtsConfig {
@@ -272,6 +275,7 @@ impl Default for ViettelTtsConfig {
             without_filter: false,
             tts_return_option: DEFAULT_TTS_RETURN_OPTION,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
+            endpoint_override: None,
         }
     }
 }
@@ -309,6 +313,7 @@ impl ViettelTtsConfig {
             without_filter: false,
             tts_return_option: DEFAULT_TTS_RETURN_OPTION,
             request_timeout_secs,
+            endpoint_override: None,
         })
     }
 
@@ -348,6 +353,8 @@ impl ViettelTtsConfig {
         {
             cfg.tts_return_option = opt as u8;
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         Ok(cfg)
     }

@@ -79,7 +79,10 @@ impl TTSRequestBuilder for YandexRequestBuilder {
 
         // Build and return the request
         client
-            .post(super::YANDEX_TTS_SYNTHESIZE_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                super::YANDEX_TTS_SYNTHESIZE_URL,
+                self.yandex_config.endpoint_override.as_deref(),
+            ))
             .headers(headers)
             .form(&form_params)
     }
@@ -222,6 +225,13 @@ impl BaseTTS for YandexTts {
         Self: Sized,
     {
         Self::create(config)
+    }
+
+    /// Expose the inner generic provider so the default `on_audio`/`remove_audio_callback`
+    /// trait methods operate on it. Without this override `get_provider` defaults to `None`, so
+    /// audio-callback registration silently fails and synthesized audio is never delivered.
+    fn get_provider(&mut self) -> Option<&mut TTSProvider> {
+        Some(&mut self.provider)
     }
 
     /// Connect to the Yandex SpeechKit API

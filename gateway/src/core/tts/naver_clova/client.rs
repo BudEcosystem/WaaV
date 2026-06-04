@@ -93,7 +93,10 @@ impl NaverClovaTts {
 
         let response = self
             .http_client
-            .post(endpoint)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                endpoint,
+                self.config.endpoint_override.as_deref(),
+            ))
             .header("X-NCP-APIGW-API-KEY-ID", &self.config.client_id)
             .header("X-NCP-APIGW-API-KEY", &self.config.client_secret)
             .header("Content-Type", "application/x-www-form-urlencoded")

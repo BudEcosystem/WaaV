@@ -408,6 +408,8 @@ pub struct YandexTtsConfig {
     /// `:synthesize` request's `ssml` form field instead of `text` (the two are mutually exclusive
     /// per the Yandex v1 REST API — see docs/providers/yandex.md "SSML Support").
     pub ssml: bool,
+    /// Override base (scheme+host) for the synth HTTP POST; used by the mock e2e harness.
+    pub endpoint_override: Option<String>,
 }
 
 impl YandexTtsConfig {
@@ -513,6 +515,7 @@ impl YandexTtsConfig {
             audio_format,
             sample_rate,
             ssml: false,
+            endpoint_override: None,
         })
     }
 
@@ -579,6 +582,8 @@ impl YandexTtsConfig {
         if let Some(is_iam_token) = std.extras.0.get("is_iam_token").and_then(|v| v.as_bool()) {
             cfg.is_iam_token = is_iam_token;
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         Ok(cfg)
     }
