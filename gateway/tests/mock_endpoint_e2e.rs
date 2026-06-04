@@ -699,3 +699,146 @@ async fn naver_clova_full_integration_via_mock_endpoint() {
     println!("NAVER CLOVA mock e2e surfaced transcript: {got:?}");
     assert_eq!(got, "hello world", "NAVER CLOVA full integration broken");
 }
+
+/// Shared REST driver: connect (local, no I/O), buffer some audio, then disconnect() — which is
+/// what triggers the batch POST + on_result callback for the disconnect-flush REST providers.
+async fn drive_rest_and_capture(stt: &mut dyn waav_gateway::core::stt::BaseSTT) -> String {
+    let best = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let b2 = best.clone();
+    stt.on_result(Arc::new(move |r: STTResult| {
+        let b = b2.clone();
+        Box::pin(async move {
+            let t = r.transcript.trim().to_string();
+            if !t.is_empty() {
+                *b.lock().await = t;
+            }
+        })
+    }))
+    .await
+    .unwrap();
+    stt.connect().await.expect("connect (local, no I/O)");
+    for _ in 0..6 {
+        let _ = stt.send_audio(bytes::Bytes::from(vec![0u8; 1280])).await;
+    }
+    stt.disconnect().await.ok();
+    let g = best.lock().await.clone();
+    g
+}
+
+/// Generic axum HTTP mock: serve `body` on `path` (one POST route). Returns the bound port.
+async fn spawn_http_mock(path: &'static str, body: String) -> u16 {
+    use axum::{Router, http::header, routing::post};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().route(
+        path,
+        post(move || {
+            let body = body.clone();
+            async move { ([(header::CONTENT_TYPE, "application/json")], body) }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    port
+}
+
+#[tokio::test]
+async fn groq_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    let port = spawn_http_mock(
+        "/openai/v1/audio/transcriptions",
+        r#"{"text":"hello world"}"#.to_string(),
+    )
+    .await;
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "groq".into(),
+        api_key: "test-key".into(),
+        language: "en".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".into(),
+        model: String::new(),
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut stt = create_stt_standard("groq", std).expect("build groq via keystone");
+    let got = drive_rest_and_capture(stt.as_mut()).await;
+    println!("Groq mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "Groq full integration broken");
+}
+
+#[tokio::test]
+async fn openai_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    let port = spawn_http_mock(
+        "/v1/audio/transcriptions",
+        r#"{"text":"hello world"}"#.to_string(),
+    )
+    .await;
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "openai".into(),
+        api_key: "test-openai-key".into(),
+        language: "en".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".into(),
+        model: "whisper-1".into(),
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut stt = create_stt_standard("openai", std).expect("build openai via keystone");
+    let got = drive_rest_and_capture(stt.as_mut()).await;
+    println!("OpenAI mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "OpenAI full integration broken");
+}
+
+#[tokio::test]
+async fn fpt_ai_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    let port = spawn_http_mock(
+        "/hmi/asr/general",
+        r#"{"status":0,"hypotheses":[{"utterance":"hello world"}],"id":"mock-1"}"#.to_string(),
+    )
+    .await;
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "fpt_ai".into(),
+        api_key: "test-key".into(),
+        language: "vi".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".into(),
+        model: String::new(),
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut stt = create_stt_standard("fpt_ai", std).expect("build fpt via keystone");
+    let got = drive_rest_and_capture(stt.as_mut()).await;
+    println!("FPT.AI mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "FPT.AI full integration broken");
+}
+
+#[tokio::test]
+async fn viettel_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    let port = spawn_http_mock(
+        "/voice/api/asr/v1/rest/decode_file",
+        r#"{"status":0,"result":"hello world"}"#.to_string(),
+    )
+    .await;
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "viettel_ai".into(),
+        api_key: "test-token".into(),
+        language: "vi".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".into(),
+        model: String::new(),
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut stt = create_stt_standard("viettel_ai", std).expect("build viettel via keystone");
+    let got = drive_rest_and_capture(stt.as_mut()).await;
+    println!("Viettel mock e2e surfaced transcript: {got:?}");
+    assert_eq!(got, "hello world", "Viettel full integration broken");
+}

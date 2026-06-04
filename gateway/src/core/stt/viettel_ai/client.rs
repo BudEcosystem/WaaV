@@ -122,10 +122,15 @@ impl ViettelStt {
 
         let form = Form::new().part("file", part);
 
-        // Build request with headers
+        // Build request with headers. When `endpoint_override` is set (credential-free mock harness),
+        // its scheme://host replaces the production host; the decode_file path is preserved.
+        let url = match &self.config.endpoint_override {
+            Some(ov) => format!("{}/voice/api/asr/v1/rest/decode_file", ov.trim_end_matches('/')),
+            None => VIETTEL_STT_ENDPOINT.to_string(),
+        };
         let mut request_builder = self
             .http_client
-            .post(VIETTEL_STT_ENDPOINT)
+            .post(&url)
             .header("token", &self.config.api_key);
 
         // Add PCM format headers if needed

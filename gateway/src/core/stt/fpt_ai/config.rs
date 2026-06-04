@@ -46,6 +46,10 @@ pub struct FptSttConfig {
 
     /// Request timeout in seconds.
     pub request_timeout_secs: u64,
+
+    /// Base endpoint override (scheme://host) from the standardized `endpoint_override` — points the
+    /// batch POST at an in-repo mock/proxy for credential-free e2e; `None` uses the production host.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for FptSttConfig {
@@ -55,6 +59,7 @@ impl Default for FptSttConfig {
             sample_rate: DEFAULT_SAMPLE_RATE,
             channels: DEFAULT_CHANNELS,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
+            endpoint_override: None,
         }
     }
 }
@@ -87,6 +92,7 @@ impl FptSttConfig {
             sample_rate,
             channels,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
+            endpoint_override: None,
         })
     }
 
@@ -101,7 +107,9 @@ impl FptSttConfig {
     pub fn from_standard(
         std: &crate::core::stt::standard::StandardSTTConfig,
     ) -> Result<Self, STTError> {
-        Self::from_base(&std.base)
+        let mut cfg = Self::from_base(&std.base)?;
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        Ok(cfg)
     }
 
     /// Validate the configuration.

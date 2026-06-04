@@ -72,6 +72,10 @@ pub struct ViettelSttConfig {
 
     /// Request timeout in seconds.
     pub request_timeout_secs: u64,
+
+    /// Base endpoint override (scheme://host) from the standardized `endpoint_override` — points the
+    /// batch multipart POST at an in-repo mock/proxy for credential-free e2e; `None` uses production.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for ViettelSttConfig {
@@ -83,6 +87,7 @@ impl Default for ViettelSttConfig {
             channels: DEFAULT_CHANNELS,
             asr_model: None,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
+            endpoint_override: None,
         }
     }
 }
@@ -118,6 +123,7 @@ impl ViettelSttConfig {
             // Honor an explicitly configured ASR model; previously `config.model` was dropped.
             asr_model: (!config.model.is_empty()).then(|| config.model.clone()),
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
+            endpoint_override: None,
         })
     }
 
@@ -132,7 +138,9 @@ impl ViettelSttConfig {
     pub fn from_standard(
         std: &crate::core::stt::standard::StandardSTTConfig,
     ) -> Result<Self, STTError> {
-        Self::from_base(&std.base)
+        let mut cfg = Self::from_base(&std.base)?;
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        Ok(cfg)
     }
 
     /// Validate the configuration.

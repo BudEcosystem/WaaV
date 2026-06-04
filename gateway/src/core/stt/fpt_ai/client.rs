@@ -76,10 +76,15 @@ impl FptStt {
         // Build WAV header for raw PCM data
         let wav_data = self.wrap_in_wav(&audio_data);
 
-        // Send to FPT.AI
+        // Send to FPT.AI. When `endpoint_override` is set (credential-free mock harness), its
+        // scheme://host replaces the production host while the `/hmi/asr/general` path is preserved.
+        let url = match &self.config.endpoint_override {
+            Some(ov) => format!("{}/hmi/asr/general", ov.trim_end_matches('/')),
+            None => FPT_STT_ENDPOINT.to_string(),
+        };
         let response = self
             .http_client
-            .post(FPT_STT_ENDPOINT)
+            .post(url)
             .header("api_key", &self.config.api_key)
             .header("Content-Type", "audio/wav")
             .body(wav_data)

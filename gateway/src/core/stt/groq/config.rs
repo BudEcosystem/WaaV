@@ -451,6 +451,10 @@ pub struct GroqSTTConfig {
     /// Custom API endpoint URL (for enterprise or custom deployments).
     pub custom_endpoint: Option<String>,
 
+    /// Base endpoint override (scheme://host) from the standardized `endpoint_override` — points the
+    /// REST POST at a mock/proxy host while preserving the `/openai/v1/...` path (credential-free e2e).
+    pub endpoint_override: Option<String>,
+
     /// Remote audio source URL (Groq/OpenAI-Whisper REST `url` form field).
     ///
     /// When set, the request transcribes audio fetched from this URL instead of an uploaded
@@ -477,6 +481,7 @@ impl Default for GroqSTTConfig {
             silence_detection: SilenceDetectionConfig::default(),
             translate_to_english: false,
             custom_endpoint: None,
+            endpoint_override: None,
             audio_url: None,
         }
     }
@@ -510,6 +515,7 @@ impl GroqSTTConfig {
     pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
         let f = &std.features;
         let mut cfg = Self::from_base(std.base.clone());
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
         if let Some(true) = f.word_timestamps {
             cfg.response_format = GroqResponseFormat::VerboseJson;
             if !cfg
@@ -573,17 +579,23 @@ impl GroqSTTConfig {
         fields
     }
 
-    /// Get the API endpoint URL.
-    #[inline]
-    pub fn api_url(&self) -> &str {
+    /// Get the API endpoint URL. When `endpoint_override` (the standardized base-url override, used
+    /// by the credential-free mock harness) is set, its scheme://host replaces `api.groq.com` while
+    /// the production `/openai/v1/audio/{transcriptions,translations}` path is preserved.
+    pub fn api_url(&self) -> String {
         if let Some(ref custom) = self.custom_endpoint {
-            return custom;
+            return custom.clone();
         }
-
-        if self.translate_to_english {
+        let prod = if self.translate_to_english {
             GROQ_TRANSLATION_URL
         } else {
             GROQ_STT_URL
+        };
+        if let Some(ref ov) = self.endpoint_override {
+            let path = prod.trim_start_matches("https://api.groq.com");
+            format!("{}{}", ov.trim_end_matches('/'), path)
+        } else {
+            prod.to_string()
         }
     }
 

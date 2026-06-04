@@ -515,6 +515,11 @@ pub struct OpenAISTTConfig {
     /// `gpt-4o-transcribe`/`gpt-4o-mini-transcribe` models (`whisper-1` ignores it). Ref: OpenAI
     /// `POST /v1/audio/transcriptions` `stream` field.
     pub stream: bool,
+
+    /// Base endpoint override (scheme://host) from the standardized `endpoint_override` — points the
+    /// transcription POST at a mock/proxy host (credential-free e2e), taking precedence over the
+    /// `OPENAI_BASE_URL` env var. `None` falls back to the env var, then the production host.
+    pub endpoint_override: Option<String>,
 }
 
 /// Configuration for silence detection.
@@ -563,6 +568,7 @@ impl Default for OpenAISTTConfig {
             silence_detection: SilenceDetectionConfig::default(),
             diarization: DiarizationConfig::default(),
             stream: false,
+            endpoint_override: None,
         }
     }
 }
@@ -603,6 +609,7 @@ impl OpenAISTTConfig {
     pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
         let f = &std.features;
         let mut cfg = Self::from_base(std.base.clone());
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
         if let Some(true) = f.diarization {
             cfg.response_format = ResponseFormat::DiarizedJson;
         }
@@ -733,6 +740,13 @@ impl OpenAISTTConfig {
     /// transcription server, or a proxy) — and enables credential-free contract/e2e testing.
     #[inline]
     pub fn api_url(&self) -> String {
+        // The standardized `endpoint_override` (mock harness) takes precedence over the env var.
+        if let Some(ov) = self.endpoint_override.as_deref() {
+            let ov = ov.trim().trim_end_matches('/');
+            if !ov.is_empty() {
+                return format!("{ov}/v1/audio/transcriptions");
+            }
+        }
         if let Ok(base) = std::env::var("OPENAI_BASE_URL") {
             let base = base.trim().trim_end_matches('/');
             if !base.is_empty() {
