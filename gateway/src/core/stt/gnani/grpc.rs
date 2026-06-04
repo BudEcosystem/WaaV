@@ -37,20 +37,23 @@ const GRPC_SERVICE_PATH: &str = "/Listener/DoSpeechToText";
 /// This establishes a secure connection to Gnani's ASR service using the
 /// provided SSL certificate for server verification.
 pub async fn create_gnani_channel(config: &GnaniSTTConfig) -> Result<Channel, STTError> {
-    // Load the certificate
-    let cert_pem = config
-        .load_certificate()
-        .map_err(STTError::ConfigurationError)?;
-
-    // Create TLS configuration with the CA certificate
-    let tls_config = ClientTlsConfig::new()
-        .ca_certificate(Certificate::from_pem(&cert_pem))
-        .domain_name("asr.gnani.ai");
+    // With an endpoint override set (mock e2e), connect PLAINTEXT — no cert is loaded, no TLS.
+    // Otherwise use the production cert + TLS path.
+    let endpoint = if let Some(ep) = config.endpoint_override.as_deref() {
+        Endpoint::from_shared(ep.to_string())
+            .map_err(|e| STTError::ConfigurationError(format!("Invalid endpoint override: {}", e)))?
+    } else {
+        let cert_pem = config.load_certificate().map_err(STTError::ConfigurationError)?;
+        let tls_config = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(&cert_pem))
+            .domain_name("asr.gnani.ai");
+        Endpoint::from_static(GNANI_GRPC_ENDPOINT)
+            .tls_config(tls_config)
+            .map_err(|e| STTError::ConfigurationError(format!("TLS config error: {}", e)))?
+    };
 
     // Build and connect the channel
-    let channel = Endpoint::from_static(GNANI_GRPC_ENDPOINT)
-        .tls_config(tls_config)
-        .map_err(|e| STTError::ConfigurationError(format!("TLS config error: {}", e)))?
+    let channel = endpoint
         .connect_timeout(Duration::from_secs(config.connection_timeout_secs))
         .timeout(Duration::from_secs(config.request_timeout_secs))
         .connect()

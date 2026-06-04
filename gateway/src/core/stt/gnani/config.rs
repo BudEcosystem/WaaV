@@ -22,6 +22,10 @@ pub struct GnaniSTTConfig {
     #[serde(default, skip_serializing)]
     pub access_key: String,
 
+    /// Override gRPC endpoint (plaintext, no TLS/cert) — used by mock e2e tests.
+    #[serde(default, skip_serializing)]
+    pub endpoint_override: Option<String>,
+
     /// Path to SSL certificate file (cert.pem)
     /// Required for gRPC connection authentication
     #[serde(default)]
@@ -88,6 +92,7 @@ impl Default for GnaniSTTConfig {
             },
             token: String::new(),
             access_key: String::new(),
+            endpoint_override: None,
             certificate_path: None,
             certificate_content: None,
             audio_format: GnaniAudioFormat::default(),
@@ -129,6 +134,7 @@ impl GnaniSTTConfig {
         if let Some(fname) = std.extras.0.get("filename").and_then(|v| v.as_str()) {
             cfg.filename = Some(fname.to_string());
         }
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
         Ok(cfg)
     }
 
@@ -160,6 +166,7 @@ impl GnaniSTTConfig {
             base: STTConfig { language, ..base },
             token,
             access_key,
+            endpoint_override: None,
             certificate_path,
             certificate_content,
             audio_format,
@@ -186,7 +193,12 @@ impl GnaniSTTConfig {
             );
         }
 
-        if self.certificate_path.is_none() && self.certificate_content.is_none() {
+        // The TLS CA certificate is only needed for the production endpoint; a plaintext
+        // `endpoint_override` (mock/proxy) skips TLS entirely, so don't require a cert there.
+        if self.endpoint_override.is_none()
+            && self.certificate_path.is_none()
+            && self.certificate_content.is_none()
+        {
             return Err(
                 "Gnani certificate is required. Set GNANI_CERTIFICATE_PATH or GNANI_CERTIFICATE_CONTENT environment variable.".to_string()
             );
