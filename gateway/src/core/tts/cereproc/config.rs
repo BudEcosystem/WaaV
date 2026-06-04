@@ -256,6 +256,8 @@ pub struct CereprocTtsConfig {
     pub include_metadata: bool,
     /// Default emotion for the voice (if supported)
     pub emotion: Option<CereprocEmotion>,
+    /// Optional REST endpoint base (scheme+host) override for auth/synth POSTs (test redirection).
+    pub endpoint_override: Option<String>,
 }
 
 impl CereprocTtsConfig {
@@ -320,6 +322,7 @@ impl CereprocTtsConfig {
             audio_3d,
             include_metadata,
             emotion,
+            endpoint_override: None,
         })
     }
 
@@ -397,6 +400,8 @@ impl CereprocTtsConfig {
         {
             cfg.include_metadata = include_metadata;
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         Ok(cfg)
     }

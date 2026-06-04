@@ -120,7 +120,10 @@ impl TTSRequestBuilder for CereprocRequestBuilder {
 
         // Build and return the request
         client
-            .post(super::CEREVOICE_SPEAK_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                super::CEREVOICE_SPEAK_URL,
+                self.cereproc_config.endpoint_override.as_deref(),
+            ))
             .headers(headers)
             .query(&query_params)
             .body(body)
@@ -212,7 +215,10 @@ impl CereprocTts {
 
         let response = self
             .auth_client
-            .post(super::CEREVOICE_AUTH_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                super::CEREVOICE_AUTH_URL,
+                self.cereproc_config.endpoint_override.as_deref(),
+            ))
             .header(
                 AUTHORIZATION,
                 self.cereproc_config.credentials.basic_auth_value(),
@@ -326,6 +332,12 @@ impl BaseTTS for CereprocTts {
         Self::create(config)
     }
 
+    /// Expose the inner generic provider so callback registration (e.g. `on_audio`) reaches the
+    /// `TTSProvider` that actually emits synthesized audio via `generic_speak`.
+    fn get_provider(&mut self) -> Option<&mut TTSProvider> {
+        Some(&mut self.provider)
+    }
+
     /// Connect to the CereVoice Cloud API
     async fn connect(&mut self) -> TTSResult<()> {
         debug!("Connecting to CereVoice Cloud API");
@@ -339,7 +351,13 @@ impl BaseTTS for CereprocTts {
 
         // Initialize HTTP connection pool
         self.provider
-            .generic_connect_with_config(super::CEREVOICE_SPEAK_URL, &self.base_config)
+            .generic_connect_with_config(
+                &crate::core::tts::standard::override_rest_endpoint(
+                    super::CEREVOICE_SPEAK_URL,
+                    self.cereproc_config.endpoint_override.as_deref(),
+                ),
+                &self.base_config,
+            )
             .await
     }
 

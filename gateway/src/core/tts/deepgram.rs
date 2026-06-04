@@ -33,13 +33,20 @@ struct DeepgramSpeakParams {
     callback: Option<String>,
     /// Callback HTTP method (`callback_method`, POST|PUT). Delivery-only → NOT part of cache key.
     callback_method: Option<String>,
+    /// Endpoint override base (scheme+host) for the credential-free mock harness (W-T0); keeps the
+    /// `/v1/speak` path + query. Not part of the cache key (it never changes the audio).
+    endpoint_override: Option<String>,
 }
 
 impl TTSRequestBuilder for DeepgramRequestBuilder {
     /// Build the Deepgram-specific HTTP request with URL, headers and body
     fn build_http_request(&self, client: &reqwest::Client, text: &str) -> reqwest::RequestBuilder {
-        // Build the URL with query parameters
-        let mut url = String::from(DEEPGRAM_TTS_URL);
+        // Build the URL with query parameters (honoring the W-T0 endpoint override, which swaps
+        // scheme+host while keeping the `/v1/speak` path the mock serves on).
+        let mut url = crate::core::tts::standard::override_rest_endpoint(
+            DEEPGRAM_TTS_URL,
+            self.speak.endpoint_override.as_deref(),
+        );
         let mut params = Vec::new();
 
         // Use model field if provided, otherwise fall back to voice_id
@@ -235,6 +242,7 @@ impl DeepgramTTS {
                 .get("callback_method")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
+            endpoint_override: std.endpoint_override().map(String::from),
         };
         if let Some(speed) = f.speed {
             base.speaking_rate = Some(speed);

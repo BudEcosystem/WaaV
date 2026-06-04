@@ -106,6 +106,37 @@ async fn spawn_json_audio_mock(key: &'static str, audio_bytes: Vec<u8>) -> u16 {
     port
 }
 
+/// Spawn a mock for a two-step auth+synth TTS provider: `auth_path` returns a JSON token envelope
+/// `{ token_key: "mock-token" }`; every other path returns raw audio bytes. Used by providers that
+/// log in for a Bearer token before synthesizing (e.g. CereProc `/v2/auth` → `/v2/speak`).
+async fn spawn_auth_then_audio_mock(
+    auth_path: &'static str,
+    token_key: &'static str,
+    audio_bytes: Vec<u8>,
+) -> u16 {
+    use axum::{Json, Router, http::header, routing::post};
+    use tokio::net::TcpListener;
+    let token_body = serde_json::json!({ token_key: "mock-token" });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new()
+        .route(
+            auth_path,
+            post(move || {
+                let b = token_body.clone();
+                async move { Json(b) }
+            }),
+        )
+        .fallback(move || {
+            let bytes = audio_bytes.clone();
+            async move { ([(header::CONTENT_TYPE, "audio/mpeg")], bytes) }
+        });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    port
+}
+
 /// A small blob of fake "audio" bytes the mock returns; the provider passes raw response bytes
 /// through to `on_audio` for the formats these REST TTS endpoints emit.
 fn fake_audio() -> Vec<u8> {
@@ -354,4 +385,39 @@ async fn azure_tts_full_integration_via_mock_endpoint() {
         },
     )
     .await;
+}
+
+#[tokio::test]
+async fn deepgram_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "deepgram",
+        "/v1/speak",
+        TTSConfig {
+            provider: "deepgram".into(),
+            api_key: "test-key".into(),
+            model: "aura-2-thalia-en".to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn cereproc_tts_full_integration_via_mock_endpoint() {
+    // CereProc is two-step: connect() logs in (POST /v2/auth → {"token":...}) then speak() POSTs
+    // /v2/speak → audio bytes. The auth mock serves the token; the fallback serves the audio.
+    ensure_crypto();
+    let port = spawn_auth_then_audio_mock("/v2/auth", "token", fake_audio()).await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "cereproc".into(),
+        // email:password packing for HTTP Basic auth.
+        api_key: "user@example.com:password".into(),
+        voice_id: Some("Heather".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("cereproc", std).expect("build cereproc tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("cereproc TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "cereproc TTS surfaced no audio end-to-end");
 }
