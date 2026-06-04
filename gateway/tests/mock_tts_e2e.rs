@@ -137,6 +137,30 @@ async fn spawn_auth_then_audio_mock(
     port
 }
 
+/// Spawn a mock that returns a fixed JSON `body` on every path. For providers whose synth response
+/// is a JSON envelope with base64 audio nested under vendor-specific keys (e.g. Tencent's
+/// `{"Response":{"Audio": ...}}`); build the body with the base64 audio embedded.
+async fn spawn_fixed_json_mock(body: serde_json::Value) -> u16 {
+    use axum::{Json, Router};
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().fallback(move || {
+        let body = body.clone();
+        async move { Json(body) }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    port
+}
+
+/// Base64-encode a blob (for JSON-enveloped audio responses).
+fn b64(bytes: &[u8]) -> String {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    STANDARD.encode(bytes)
+}
+
 /// A small blob of fake "audio" bytes the mock returns; the provider passes raw response bytes
 /// through to `on_audio` for the formats these REST TTS endpoints emit.
 fn fake_audio() -> Vec<u8> {
@@ -546,6 +570,26 @@ async fn lmnt_tts_full_integration_via_mock_endpoint() {
         },
     )
     .await;
+}
+
+#[tokio::test]
+async fn tencent_tts_full_integration_via_mock_endpoint() {
+    // Tencent returns audio base64 nested under {"Response":{"Audio": ...}}.
+    ensure_crypto();
+    let body = serde_json::json!({ "Response": { "Audio": b64(&fake_audio()) } });
+    let port = spawn_fixed_json_mock(body).await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "tencent".into(),
+        // secret_id|secret_key packing.
+        api_key: "test-secret-id|test-secret-key".into(),
+        voice_id: Some("101001".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("tencent", std).expect("build tencent tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("tencent TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "tencent TTS surfaced no audio end-to-end");
 }
 
 #[tokio::test]

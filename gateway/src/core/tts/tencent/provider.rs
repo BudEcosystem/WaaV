@@ -277,7 +277,10 @@ impl TencentTts {
 
         let response = self
             .client
-            .post(endpoint)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                endpoint,
+                self.config.endpoint_override.as_deref(),
+            ))
             .header("Content-Type", "application/json")
             .header("Host", host)
             .header("Authorization", authorization)

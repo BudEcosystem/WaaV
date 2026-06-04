@@ -461,6 +461,9 @@ pub struct TencentTtsConfig {
     /// Speech segmentation sensitivity (`SegmentRate` in the TextToVoice request; 0 = off,
     /// 1 = light, 2 = aggressive per the docs). `None` omits the field.
     pub segment_rate: Option<i64>,
+
+    /// Override base (scheme+host) for the synth HTTP POST; used by the mock e2e harness.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for TencentTtsConfig {
@@ -483,6 +486,7 @@ impl Default for TencentTtsConfig {
             model_type: None,
             fast_voice_type: None,
             segment_rate: None,
+            endpoint_override: None,
         }
     }
 }
@@ -755,6 +759,8 @@ impl TencentTtsConfig {
         if let Some(segment_rate) = std.extras.0.get("SegmentRate").and_then(|v| v.as_i64()) {
             cfg.segment_rate = Some(segment_rate);
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         Ok(cfg)
     }
