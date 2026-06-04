@@ -58,6 +58,10 @@ pub struct TinkoffTtsConfig {
     /// Request timeout in seconds
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
+
+    /// Override gRPC endpoint (plaintext, no TLS) — used by mock e2e tests.
+    #[serde(default, skip_serializing)]
+    pub endpoint_override: Option<String>,
 }
 
 fn default_sample_rate() -> u32 {
@@ -91,6 +95,7 @@ impl Default for TinkoffTtsConfig {
             ssml: false,
             connection_timeout_secs: default_connection_timeout(),
             request_timeout_secs: default_request_timeout(),
+            endpoint_override: None,
         }
     }
 }
@@ -98,13 +103,19 @@ impl Default for TinkoffTtsConfig {
 impl TinkoffTtsConfig {
     /// Create TinkoffTtsConfig from base TTSConfig
     pub fn from_base(base: TTSConfig) -> Result<Self, String> {
-        // Get credentials from environment
+        // Credentials: env vars take priority; otherwise the standardized `api_key` carries both as
+        // `api_key|secret_key` (Tinkoff needs both to sign the JWT, but the keystone exposes a single
+        // credential field). A bare `api_key` (no `|`) leaves `secret_key` to the env vars.
+        let (base_api_key, base_secret_key) = match base.api_key.split_once('|') {
+            Some((a, s)) => (a.to_string(), s.to_string()),
+            None => (base.api_key.clone(), String::new()),
+        };
         let api_key = std::env::var("TINKOFF_API_KEY")
             .or_else(|_| std::env::var("TINKOFF_VOICEKIT_API_KEY"))
-            .unwrap_or_else(|_| base.api_key.clone());
+            .unwrap_or(base_api_key);
         let secret_key = std::env::var("TINKOFF_SECRET_KEY")
             .or_else(|_| std::env::var("TINKOFF_VOICEKIT_SECRET_KEY"))
-            .unwrap_or_default();
+            .unwrap_or(base_secret_key);
 
         // Parse voice
         let voice = base
@@ -144,6 +155,7 @@ impl TinkoffTtsConfig {
             ssml: false,
             connection_timeout_secs: default_connection_timeout(),
             request_timeout_secs: default_request_timeout(),
+            endpoint_override: None,
         })
     }
 
@@ -201,6 +213,8 @@ impl TinkoffTtsConfig {
         {
             cfg.request_timeout_secs = secs;
         }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
 
         Ok(cfg)
     }

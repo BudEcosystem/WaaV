@@ -214,6 +214,166 @@ async fn spawn_ws_audio_mock(frames: Vec<serde_json::Value>) -> u16 {
     port
 }
 
+/// Hand-encode a Tinkoff `SynthesizeSpeechResponse` (protobuf field 1 = `audio_content`, bytes) so
+/// the gRPC mock can return decodable audio without the prost-generated message type.
+fn encode_protobuf_bytes_field1(audio: &[u8]) -> Vec<u8> {
+    let mut buf = vec![0x0Au8]; // field 1, wire type 2 (length-delimited)
+    let mut n = audio.len();
+    loop {
+        let mut b = (n & 0x7f) as u8;
+        n >>= 7;
+        if n != 0 {
+            b |= 0x80;
+        }
+        buf.push(b);
+        if n == 0 {
+            break;
+        }
+    }
+    buf.extend_from_slice(audio);
+    buf
+}
+
+/// Spawn a minimal tonic gRPC mock server (plaintext) that answers the Tinkoff TTS unary
+/// `Synthesize` RPC with `response` (a pre-encoded `SynthesizeSpeechResponse`). Uses a raw-bytes
+/// codec mirroring the provider's `TinkoffTtsCodec`, so no `.proto` codegen is needed. This is the
+/// 6th harness type (gRPC) and is reusable for the STT gRPC tail.
+async fn spawn_tinkoff_grpc_mock(response: Vec<u8>) -> u16 {
+    use bytes::{Buf, BufMut, Bytes};
+    use futures::Stream;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+    use tonic::codegen::{Body, BoxFuture, Context, Poll, Service, StdError, http};
+    use tonic::server::{ServerStreamingService, UnaryService};
+    use tonic::{Request, Response, Status};
+
+    #[derive(Clone, Default)]
+    struct ByteCodec;
+    impl Codec for ByteCodec {
+        type Encode = Vec<u8>;
+        type Decode = Bytes;
+        type Encoder = ByteEnc;
+        type Decoder = ByteDec;
+        fn encoder(&mut self) -> ByteEnc {
+            ByteEnc
+        }
+        fn decoder(&mut self) -> ByteDec {
+            ByteDec
+        }
+    }
+    struct ByteEnc;
+    impl Encoder for ByteEnc {
+        type Item = Vec<u8>;
+        type Error = Status;
+        fn encode(&mut self, item: Vec<u8>, dst: &mut EncodeBuf<'_>) -> Result<(), Status> {
+            dst.put_slice(&item);
+            Ok(())
+        }
+    }
+    struct ByteDec;
+    impl Decoder for ByteDec {
+        type Item = Bytes;
+        type Error = Status;
+        fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Bytes>, Status> {
+            let n = src.remaining();
+            if n == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(src.copy_to_bytes(n)))
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct Mock {
+        resp: Arc<Vec<u8>>,
+    }
+    impl tonic::server::NamedService for Mock {
+        const NAME: &'static str = "tinkoff.cloud.tts.v1.TextToSpeech";
+    }
+    impl<B> Service<http::Request<B>> for Mock
+    where
+        B: Body + Send + 'static,
+        B::Error: Into<StdError> + Send + 'static,
+    {
+        type Response = http::Response<tonic::body::BoxBody>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            // The `Routes` router dispatches `/{service}/{method}` here; match by method suffix. The
+            // provider uses server-streaming `StreamingSynthesize` when a callback is registered, and
+            // unary `Synthesize` otherwise — handle both. Each response message carries the audio in
+            // protobuf field 1 (audio_content / audio_chunk).
+            let path = req.uri().path().to_string();
+            let resp = self.resp.clone();
+            if path.ends_with("/StreamingSynthesize") {
+                Box::pin(async move {
+                    struct StreamSvc(Arc<Vec<u8>>);
+                    impl ServerStreamingService<Bytes> for StreamSvc {
+                        type Response = Vec<u8>;
+                        type ResponseStream =
+                            Pin<Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send>>;
+                        type Future = BoxFuture<Response<Self::ResponseStream>, Status>;
+                        fn call(&mut self, _req: Request<Bytes>) -> Self::Future {
+                            let chunk = (*self.0).clone();
+                            Box::pin(async move {
+                                let s = futures::stream::iter(vec![Ok(chunk)]);
+                                Ok(Response::new(Box::pin(s) as Self::ResponseStream))
+                            })
+                        }
+                    }
+                    let mut grpc = tonic::server::Grpc::new(ByteCodec);
+                    Ok(grpc.server_streaming(StreamSvc(resp), req).await)
+                })
+            } else if path.ends_with("/Synthesize") {
+                Box::pin(async move {
+                    struct Svc(Arc<Vec<u8>>);
+                    impl UnaryService<Bytes> for Svc {
+                        type Response = Vec<u8>;
+                        type Future = BoxFuture<Response<Vec<u8>>, Status>;
+                        fn call(&mut self, _req: Request<Bytes>) -> Self::Future {
+                            let r = (*self.0).clone();
+                            Box::pin(async move { Ok(Response::new(r)) })
+                        }
+                    }
+                    let mut grpc = tonic::server::Grpc::new(ByteCodec);
+                    Ok(grpc.unary(Svc(resp), req).await)
+                })
+            } else {
+                Box::pin(async move {
+                    Ok(http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .header("grpc-status", "12")
+                        .body(tonic::body::empty_body())
+                        .unwrap())
+                })
+            }
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let incoming = futures::stream::unfold(listener, |l| async move {
+        let res = l.accept().await.map(|(s, _)| s);
+        Some((res, l))
+    });
+    let svc = Mock {
+        resp: Arc::new(response),
+    };
+    tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(incoming)
+            .await;
+    });
+    port
+}
+
 /// Base64-encode a blob (for JSON-enveloped audio responses).
 fn b64(bytes: &[u8]) -> String {
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -629,6 +789,26 @@ async fn lmnt_tts_full_integration_via_mock_endpoint() {
         },
     )
     .await;
+}
+
+#[tokio::test]
+async fn tinkoff_tts_full_integration_via_mock_endpoint() {
+    // Tinkoff is genuine tonic gRPC (unary Synthesize). endpoint_override points the channel at a
+    // plaintext localhost tonic mock that returns a SynthesizeSpeechResponse (audio in field 1).
+    ensure_crypto();
+    let port = spawn_tinkoff_grpc_mock(encode_protobuf_bytes_field1(&fake_audio())).await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "tinkoff".into(),
+        // api_key|secret_key packing (both needed to sign the JWT; the mock ignores the signature).
+        api_key: "test-api-key|dGVzdC1zZWNyZXQta2V5".into(),
+        voice_id: Some("alyona".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("tinkoff", std).expect("build tinkoff tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("tinkoff TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "tinkoff TTS surfaced no audio end-to-end");
 }
 
 #[tokio::test]

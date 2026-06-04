@@ -39,11 +39,17 @@ type HmacSha256 = Hmac<Sha256>;
 ///
 /// Establishes a secure TLS connection to Tinkoff's TTS service.
 pub async fn create_tinkoff_tts_channel(config: &TinkoffTtsConfig) -> Result<Channel, TTSError> {
-    let tls_config = ClientTlsConfig::new().domain_name("api.tinkoff.ai");
+    let endpoint = if let Some(ep) = config.endpoint_override.as_deref() {
+        Endpoint::from_shared(ep.to_string())
+            .map_err(|e| TTSError::InvalidConfiguration(format!("Invalid endpoint override: {}", e)))?
+    } else {
+        let tls_config = ClientTlsConfig::new().domain_name("api.tinkoff.ai");
+        Endpoint::from_static(TINKOFF_GRPC_ENDPOINT)
+            .tls_config(tls_config)
+            .map_err(|e| TTSError::InvalidConfiguration(format!("TLS config error: {}", e)))?
+    };
 
-    let channel = Endpoint::from_static(TINKOFF_GRPC_ENDPOINT)
-        .tls_config(tls_config)
-        .map_err(|e| TTSError::InvalidConfiguration(format!("TLS config error: {}", e)))?
+    let channel = endpoint
         .connect_timeout(Duration::from_secs(config.connection_timeout_secs))
         .timeout(Duration::from_secs(config.request_timeout_secs))
         .connect()
