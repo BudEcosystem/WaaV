@@ -459,7 +459,10 @@ impl TTSRequestBuilder for GoogleRequestBuilder {
         let body = self.build_request_body(text);
 
         client
-            .post(GOOGLE_TTS_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                GOOGLE_TTS_URL,
+                self.google_config.endpoint_override.as_deref(),
+            ))
             .header("Authorization", format!("Bearer {}", self.auth_token))
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
@@ -704,15 +707,25 @@ impl GoogleTTS {
             config.sample_rate = Some(sr);
         }
 
-        // Extract project_id from credentials (mirrors `new`).
+        // Resolve project_id: prefer a caller-supplied `extras["project_id"]` (bring-your-own-token
+        // path — no service-account JSON needed), else extract it from the Google Cloud credentials
+        // (mirrors `new`), else surface the existing error.
         let credential_source = CredentialSource::from_api_key(&config.api_key);
-        let project_id = credential_source.extract_project_id().ok_or_else(|| {
-            TTSError::InvalidConfiguration(
-                "Failed to extract project_id from Google Cloud credentials. \
-                 Ensure the credentials file contains a valid project_id field."
-                    .to_string(),
-            )
-        })?;
+        let project_id = match std
+            .extras
+            .0
+            .get("project_id")
+            .and_then(|v| v.as_str())
+        {
+            Some(p) => p.to_string(),
+            None => credential_source.extract_project_id().ok_or_else(|| {
+                TTSError::InvalidConfiguration(
+                    "Failed to extract project_id from Google Cloud credentials. \
+                     Ensure the credentials file contains a valid project_id field."
+                        .to_string(),
+                )
+            })?,
+        };
         let auth_client = TTSGoogleAuthClient::new(credential_source)?;
 
         // Build the Google-specific config, then apply the Google-expressible feature overrides.
@@ -732,6 +745,17 @@ impl GoogleTTS {
         // dispatch-constructed path and `GoogleTTSConfig::from_standard` wire identically. These flow
         // into the config BEFORE the cache hash below, so audio-changing ones are in the cache key.
         google_config.apply_standard_synthesis_features(std);
+
+        // Standardized endpoint override (scheme+host swap for the synth POST) and the optional
+        // caller-supplied static OAuth access token (bring-your-own-token; also enables
+        // credential-free mock e2e).
+        google_config.endpoint_override = std.endpoint_override().map(String::from);
+        google_config.static_access_token = std
+            .extras
+            .0
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         let pronunciation_replacer = if !config.pronunciations.is_empty() {
             Some(PronunciationReplacer::new(&config.pronunciations))
@@ -962,12 +986,16 @@ impl BaseTTS for GoogleTTS {
             }
         }
 
-        // Phase 4: Authentication - get fresh OAuth2 token
-        let token = self
-            .auth_client
-            .get_token()
-            .await
-            .map_err(google_error_to_tts)?;
+        // Phase 4: Authentication - use the caller-supplied static OAuth token when present
+        // (bring-your-own-token), otherwise fetch a fresh one from the auth client.
+        let token = match self.google_config.static_access_token.clone() {
+            Some(t) => t,
+            None => self
+                .auth_client
+                .get_token()
+                .await
+                .map_err(google_error_to_tts)?,
+        };
 
         // Phase 5: Build and Send Request
         let request_builder =

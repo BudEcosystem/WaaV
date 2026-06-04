@@ -185,6 +185,13 @@ pub struct GoogleTTSConfig {
     /// (bool). (extras)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub low_latency_journey_synthesis: Option<bool>,
+
+    /// Override base (scheme+host) for the `v1/text:synthesize` POST; passthrough when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_override: Option<String>,
+    /// Caller-supplied static OAuth access token (bring-your-own-token); bypasses the auth client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_access_token: Option<String>,
 }
 
 impl Default for GoogleTTSConfig {
@@ -206,6 +213,8 @@ impl Default for GoogleTTSConfig {
             markup: None,
             multi_speaker_markup: None,
             low_latency_journey_synthesis: None,
+            endpoint_override: None,
+            static_access_token: None,
         }
     }
 }
@@ -265,6 +274,8 @@ impl GoogleTTSConfig {
             markup: None,
             multi_speaker_markup: None,
             low_latency_journey_synthesis: None,
+            endpoint_override: None,
+            static_access_token: None,
         }
     }
 

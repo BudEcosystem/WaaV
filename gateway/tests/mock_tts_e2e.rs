@@ -632,6 +632,35 @@ async fn lmnt_tts_full_integration_via_mock_endpoint() {
 }
 
 #[tokio::test]
+async fn google_tts_full_integration_via_mock_endpoint() {
+    // Google TTS is REST (POST /v1/text:synthesize -> {audioContent: base64}). Its auth normally
+    // does an OAuth-JWT network exchange; here we use the bring-your-own-token path (a static
+    // access_token + project_id via extras), so no service-account/network is needed.
+    ensure_crypto();
+    let port = spawn_json_audio_mock("audioContent", fake_audio()).await;
+    let mut std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "google".into(),
+        // Empty api_key => ApplicationDefault credential source (never invoked: static token wins).
+        api_key: String::new(),
+        voice_id: Some("en-US-Standard-A".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    std.extras.0.insert(
+        "access_token".to_string(),
+        serde_json::Value::String("mock-oauth-token".to_string()),
+    );
+    std.extras.0.insert(
+        "project_id".to_string(),
+        serde_json::Value::String("test-project".to_string()),
+    );
+    let mut tts = create_tts_standard("google", std).expect("build google tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("google TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "google TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
 async fn alibaba_cloud_tts_full_integration_via_mock_endpoint() {
     // Alibaba DashScope CosyVoice WS: client sends run-task -> mock replies task-started; client
     // sends continue-task(text) -> mock streams the audio as a BINARY frame then task-finished.
