@@ -109,3 +109,79 @@ async fn revai_full_integration_via_mock_endpoint() {
         "Rev AI did not surface the mock transcript end-to-end (full integration broken)"
     );
 }
+
+/// Spawn a local mock Reverie WS server: after the first audio frame, emit a Reverie transcript
+/// message (`{"id":..,"text":..,"final":true}`) — its real wire shape — then drain audio.
+async fn spawn_reverie_mock(transcript_value: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await
+            && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
+        {
+            let (mut write, mut read) = ws.split();
+            let msg = format!(
+                r#"{{"id":"mock-session-1","text":"{transcript_value}","final":true,"cause":"silence"}}"#
+            );
+            let mut sent = false;
+            while let Some(Ok(frame)) = read.next().await {
+                if !sent && matches!(frame, Message::Binary(_)) {
+                    let _ = write.send(Message::Text(msg.clone().into())).await;
+                    sent = true;
+                }
+            }
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn reverie_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    let port = spawn_reverie_mock("hello world").await;
+    let endpoint = format!("ws://127.0.0.1:{port}");
+
+    // Reverie reads its required `app_id` from the `model` field of the base config.
+    let std = StandardSTTConfig::from_base(STTConfig {
+        provider: "reverie".into(),
+        api_key: "test-key".into(),
+        language: "en".into(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".into(),
+        model: "test-app-id".into(),
+    })
+    .with_endpoint_override(&endpoint);
+
+    let mut stt = create_stt_standard("reverie", std).expect("build reverie via keystone");
+
+    let best = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let b2 = best.clone();
+    stt.on_result(Arc::new(move |r: STTResult| {
+        let b = b2.clone();
+        Box::pin(async move {
+            let t = r.transcript.trim().to_string();
+            if !t.is_empty() {
+                *b.lock().await = t;
+            }
+        })
+    }))
+    .await
+    .unwrap();
+
+    stt.connect().await.expect("connect to mock endpoint");
+    for _ in 0..5 {
+        let _ = stt.send_audio(bytes::Bytes::from(vec![0u8; 640])).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    stt.disconnect().await.ok();
+
+    let got = best.lock().await.clone();
+    println!("Reverie mock e2e surfaced transcript: {got:?}");
+    assert_eq!(
+        got, "hello world",
+        "Reverie did not surface the mock transcript end-to-end (full integration broken)"
+    );
+}

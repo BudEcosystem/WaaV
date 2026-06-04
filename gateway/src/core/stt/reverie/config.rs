@@ -309,6 +309,12 @@ pub struct ReverieSTTConfig {
     /// Extra query parameters
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_params: Vec<(String, String)>,
+
+    /// Carried from the standardized `endpoint_override` — points the dial at the in-repo mock/proxy
+    /// (a local `ws://` server) for credential-free end-to-end integration tests; `None` uses the
+    /// production Reverie endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_override: Option<String>,
 }
 
 fn default_domain() -> String {
@@ -348,6 +354,7 @@ impl ReverieSTTConfig {
             continuous: false,
             sample_rate: None,
             extra_params: Vec::new(),
+            endpoint_override: None,
         }
     }
 
@@ -446,7 +453,13 @@ impl ReverieSTTConfig {
             .collect::<Vec<_>>()
             .join("&");
 
-        format!("{}?{}", REVERIE_STREAM_URL, query)
+        // Base endpoint: honor an `endpoint_override` (scheme://host[:port]) for the in-repo
+        // mock/proxy; the Reverie stream path is re-appended (a path-less URL fails the WS handshake).
+        let base = match self.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
+            Some(o) => format!("{}/stream", o.trim_end_matches('/')),
+            None => REVERIE_STREAM_URL.to_string(),
+        };
+        format!("{}?{}", base, query)
     }
 
     /// Validate the configuration
@@ -529,7 +542,10 @@ impl ReverieSTTConfig {
     pub fn from_standard(
         std: &crate::core::stt::standard::StandardSTTConfig,
     ) -> Result<Self, String> {
-        Self::from_base(&std.base)
+        let mut cfg = Self::from_base(&std.base)?;
+        // Standardized endpoint override (mock/proxy host) for credential-free integration tests.
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        Ok(cfg)
     }
 }
 
@@ -548,6 +564,7 @@ impl Default for ReverieSTTConfig {
             continuous: false,
             sample_rate: None,
             extra_params: Vec::new(),
+            endpoint_override: None,
         }
     }
 }
