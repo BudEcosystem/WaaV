@@ -352,6 +352,85 @@ pub enum MessageRoute {
     Close,
 }
 
+/// Prometheus counter: outbound WS messages dropped by the per-class send
+/// policy (RC8), labelled `class` (`audio` / `transcript`). Non-zero means a
+/// slow client filled the egress channel and droppable traffic was shed to
+/// keep the realtime path (STT intake, control frames) from stalling.
+pub const WS_DROPPED_FRAMES_TOTAL: &str = "waav_ws_dropped_frames_total";
+
+/// How long a [`MessageClass::Transcript`] send may wait for egress-channel
+/// capacity before the message is shed (RC8 per-class send policy).
+pub const TRANSCRIPT_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Delivery class for outbound WebSocket messages (RC8 per-class send policy).
+///
+/// A slow WebSocket reader fills the bounded egress channel; what happens next
+/// must depend on what is being sent:
+/// - stale realtime audio is worthless → shed it immediately,
+/// - transcripts tolerate brief backpressure but must never stall the session,
+/// - errors/control frames must be delivered even if it means waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageClass {
+    /// Realtime audio egress (e.g. TTS frames). `try_send`: on a full channel
+    /// the frame is dropped, counted in [`WS_DROPPED_FRAMES_TOTAL`], and the
+    /// session carries on.
+    DroppableAudio,
+    /// Transcript-bearing messages. Bounded-patience send
+    /// ([`TRANSCRIPT_SEND_TIMEOUT`]); on timeout the message is dropped with a
+    /// warning + counter rather than wedging the STT path.
+    Transcript,
+    /// Errors, lifecycle and control messages. Plain awaited send — applies
+    /// backpressure until the channel has capacity (or is closed).
+    Critical,
+}
+
+/// Send `route` on the session egress channel under the per-class delivery
+/// policy (RC8). See [`MessageClass`] for the semantics of each class.
+///
+/// Never returns an error: every failure mode (full channel, closed channel,
+/// timeout) is resolved by the class policy and recorded via logs/metrics, so
+/// hot-path call sites cannot accidentally stall on a slow client.
+pub async fn send_with_policy(
+    tx: &tokio::sync::mpsc::Sender<MessageRoute>,
+    route: MessageRoute,
+    class: MessageClass,
+) {
+    use tokio::sync::mpsc::error::{SendTimeoutError, TrySendError};
+
+    match class {
+        MessageClass::DroppableAudio => match tx.try_send(route) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                metrics::counter!(WS_DROPPED_FRAMES_TOTAL, "class" => "audio").increment(1);
+                tracing::debug!(
+                    "WS egress channel full; dropped droppable audio frame (slow client)"
+                );
+            }
+            Err(TrySendError::Closed(_)) => {
+                tracing::debug!("WS egress channel closed; dropped droppable audio frame");
+            }
+        },
+        MessageClass::Transcript => match tx.send_timeout(route, TRANSCRIPT_SEND_TIMEOUT).await {
+            Ok(()) => {}
+            Err(SendTimeoutError::Timeout(_)) => {
+                metrics::counter!(WS_DROPPED_FRAMES_TOTAL, "class" => "transcript").increment(1);
+                tracing::warn!(
+                    timeout_ms = TRANSCRIPT_SEND_TIMEOUT.as_millis() as u64,
+                    "WS egress channel full beyond transcript timeout; dropped transcript message"
+                );
+            }
+            Err(SendTimeoutError::Closed(_)) => {
+                tracing::debug!("WS egress channel closed; dropped transcript message");
+            }
+        },
+        MessageClass::Critical => {
+            if tx.send(route).await.is_err() {
+                tracing::warn!("WS egress channel closed; critical message not delivered");
+            }
+        }
+    }
+}
+
 /// Error type for message validation failures
 #[derive(Debug, Clone)]
 pub enum MessageValidationError {
@@ -818,5 +897,194 @@ mod tests {
         assert!(display.contains("150000"));
         assert!(display.contains("102400"));
         assert!(display.contains("Speak text too large"));
+    }
+
+    // ============== Per-class send policy tests (RC8) ==============
+
+    use tokio::sync::mpsc;
+
+    /// Build a capacity-1 channel that is already full (slow-client simulation).
+    fn full_channel() -> (mpsc::Sender<MessageRoute>, mpsc::Receiver<MessageRoute>) {
+        let (tx, rx) = mpsc::channel::<MessageRoute>(1);
+        tx.try_send(MessageRoute::Binary(Bytes::from_static(b"prefill")))
+            .expect("capacity-1 channel accepts the first message");
+        (tx, rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_send_policy_droppable_audio_drops_on_full_channel() {
+        // Install (or reuse) the process-global Prometheus recorder so the drop
+        // counter assertion below is real, not vacuous.
+        let metrics_handle = crate::core::metrics::bridge::metrics_handle();
+
+        let (tx, mut rx) = full_channel();
+
+        // Must return immediately (no awaitable timer involved): with the runtime
+        // paused, a hidden `.send().await` against a full channel would hang the
+        // test and a timer-based path would need auto-advance. Bound it anyway.
+        tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            send_with_policy(
+                &tx,
+                MessageRoute::Binary(Bytes::from_static(b"dropped")),
+                MessageClass::DroppableAudio,
+            ),
+        )
+        .await
+        .expect("droppable audio send must not block on a full channel");
+
+        // Only the prefill frame is delivered; the new frame was shed.
+        match rx.try_recv().expect("prefill frame present") {
+            MessageRoute::Binary(b) => assert_eq!(b.as_ref(), b"prefill"),
+            _ => panic!("expected prefill binary frame"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "dropped audio frame must not be delivered"
+        );
+
+        // The drop is observable on /metrics.
+        if let Some(handle) = metrics_handle {
+            assert!(
+                handle.render().contains(WS_DROPPED_FRAMES_TOTAL),
+                "drop counter must appear in the Prometheus exposition"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_send_policy_droppable_audio_delivers_with_capacity() {
+        let (tx, mut rx) = mpsc::channel::<MessageRoute>(1);
+        send_with_policy(
+            &tx,
+            MessageRoute::Binary(Bytes::from_static(b"audio")),
+            MessageClass::DroppableAudio,
+        )
+        .await;
+        match rx.try_recv().expect("frame delivered when channel has capacity") {
+            MessageRoute::Binary(b) => assert_eq!(b.as_ref(), b"audio"),
+            _ => panic!("expected binary frame"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_send_policy_transcript_times_out_and_drops_on_full_channel() {
+        let (tx, mut rx) = full_channel();
+
+        let start = tokio::time::Instant::now();
+        send_with_policy(
+            &tx,
+            MessageRoute::Outgoing(OutgoingMessage::STTResult {
+                transcript: "hello".to_string(),
+                is_final: true,
+                is_speech_final: true,
+                confidence: 0.9,
+            }),
+            MessageClass::Transcript,
+        )
+        .await;
+
+        // Paused-clock auto-advance jumps straight to the 500 ms deadline: the send
+        // waited the bounded window, then shed the message instead of stalling.
+        assert!(
+            start.elapsed() >= TRANSCRIPT_SEND_TIMEOUT,
+            "transcript send must wait the full bounded window before dropping"
+        );
+
+        match rx.try_recv().expect("prefill frame present") {
+            MessageRoute::Binary(b) => assert_eq!(b.as_ref(), b"prefill"),
+            _ => panic!("expected prefill binary frame"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "timed-out transcript must be dropped, not delivered late"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_send_policy_transcript_delivers_within_window() {
+        let (tx, mut rx) = full_channel();
+
+        // Reader frees capacity 100 ms in (well inside the 500 ms window).
+        let reader = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let first = rx.recv().await;
+            (rx, first)
+        });
+
+        send_with_policy(
+            &tx,
+            MessageRoute::Outgoing(OutgoingMessage::STTResult {
+                transcript: "in-window".to_string(),
+                is_final: false,
+                is_speech_final: false,
+                confidence: 0.5,
+            }),
+            MessageClass::Transcript,
+        )
+        .await;
+
+        let (mut rx, first) = reader.await.expect("reader task");
+        assert!(matches!(first, Some(MessageRoute::Binary(_))));
+        match rx.recv().await.expect("transcript delivered within window") {
+            MessageRoute::Outgoing(OutgoingMessage::STTResult { transcript, .. }) => {
+                assert_eq!(transcript, "in-window");
+            }
+            _ => panic!("expected STT result"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_send_policy_critical_waits_out_backpressure_on_full_channel() {
+        let (tx, mut rx) = full_channel();
+
+        // Reader is slower than the transcript window (2 s > 500 ms): a critical
+        // message must still be delivered — it applies backpressure, never drops.
+        let reader = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let first = rx.recv().await;
+            (rx, first)
+        });
+
+        send_with_policy(
+            &tx,
+            MessageRoute::Outgoing(OutgoingMessage::Error {
+                message: "critical".to_string(),
+            }),
+            MessageClass::Critical,
+        )
+        .await;
+
+        let (mut rx, first) = reader.await.expect("reader task");
+        assert!(matches!(first, Some(MessageRoute::Binary(_))));
+        match rx.recv().await.expect("critical message delivered") {
+            MessageRoute::Outgoing(OutgoingMessage::Error { message }) => {
+                assert_eq!(message, "critical");
+            }
+            _ => panic!("expected error message"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_send_policy_all_classes_survive_closed_channel() {
+        // A closed channel (client gone) must never panic or hang any class.
+        let (tx, rx) = mpsc::channel::<MessageRoute>(1);
+        drop(rx);
+
+        send_with_policy(
+            &tx,
+            MessageRoute::Binary(Bytes::from_static(b"a")),
+            MessageClass::DroppableAudio,
+        )
+        .await;
+        send_with_policy(
+            &tx,
+            MessageRoute::Outgoing(OutgoingMessage::Error {
+                message: "t".to_string(),
+            }),
+            MessageClass::Transcript,
+        )
+        .await;
+        send_with_policy(&tx, MessageRoute::Close, MessageClass::Critical).await;
     }
 }

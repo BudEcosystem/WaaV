@@ -338,6 +338,12 @@ async fn main() -> anyhow::Result<()> {
             http::HeaderValue::from_static("DENY"),
         ));
 
+    // RC6 SIGTERM session drain: clone the app-wide shutdown token before `app_state`
+    // moves into the router. On SIGTERM/SIGINT it is cancelled *before* axum's graceful
+    // drain begins, so every live WebSocket session loop (which selects on this token)
+    // can send a final protocol notice and tear down its providers within the drain window.
+    let shutdown_token = app_state.shutdown.clone();
+
     // Combine all routes: public + webhook + protected + websocket + realtime
     let app = public_routes
         .merge(webhook_routes)
@@ -384,6 +390,10 @@ async fn main() -> anyhow::Result<()> {
         // Spawn a task to handle shutdown signals
         tokio::spawn(async move {
             shutdown_signal().await;
+            // RC6: signal in-flight WS sessions to drain BEFORE the HTTP-level drain
+            // begins, so each session sends its shutdown notice and closes providers
+            // within the 30-second window below.
+            shutdown_token.cancel();
             // Trigger graceful shutdown - wait up to 30 seconds for connections to drain
             handle_clone.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
         });
@@ -404,7 +414,12 @@ async fn main() -> anyhow::Result<()> {
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            // RC6: cancel the session-drain token BEFORE this future resolves (which is
+            // what starts axum's graceful drain), so WS sessions observe shutdown first.
+            shutdown_token.cancel();
+        })
         .await?;
     }
 

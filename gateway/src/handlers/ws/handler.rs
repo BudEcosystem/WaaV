@@ -16,6 +16,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tokio::{select, time::Duration};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::auth::Auth;
@@ -24,7 +25,7 @@ use crate::state::AppState;
 
 use super::{
     audio_handler::handle_audio_message,
-    messages::{IncomingMessage, MessageRoute, OutgoingMessage},
+    messages::{IncomingMessage, MessageClass, MessageRoute, OutgoingMessage, send_with_policy},
     processor::handle_incoming_message,
     state::ConnectionState,
 };
@@ -269,64 +270,34 @@ async fn run_voice_socket_session(
     let idle_secs = (base_idle_secs as i64 + jitter_offset).max(1) as u64;
     let idle_timeout = Duration::from_secs(idle_secs);
 
-    // Track last activity time for idle connection detection
-    let mut last_activity = std::time::Instant::now();
-
-    loop {
-        select! {
-            msg_result = receiver.next() => {
-                // Update activity time on any message
-                last_activity = std::time::Instant::now();
-
-                match msg_result {
-                    Some(Ok(msg)) => {
-                        let continue_processing = process_message(
-                            msg,
-                            &state,
-                            &message_tx,
-                            &app_state
-                        ).await;
-
-                        if !continue_processing {
-                            break;
-                        }
-                    }
-                    Some(Err(e)) => {
-                        warn!("WebSocket error: {}", e);
-                        if message_tx.send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                            message: format!("WebSocket error: {e}"),
-                        })).await.is_err() {
-                            warn!("Failed to send error message to WebSocket handler: channel closed");
-                        }
-                        break;
-                    }
-                    None => {
-                        info!("WebSocket connection closed by client");
-                        break;
-                    }
-                }
+    // Drive the receive loop until the client disconnects, the connection goes
+    // idle, or app-wide shutdown is signalled (RC6 SIGTERM drain). Extracted
+    // into `run_session_loop` so the lifecycle is unit-testable.
+    //
+    // The processor closure clones its Arc/Sender handles per call (cheap:
+    // refcount bumps) so the returned future owns its captures — a lending
+    // (borrowing) closure here trips rustc's "`Send` is not general enough"
+    // HRTB limitation once this future flows into `on_upgrade`.
+    let exit = run_session_loop(
+        &mut receiver,
+        &message_tx,
+        &app_state.shutdown,
+        processing_timeout,
+        idle_timeout,
+        {
+            let state = state.clone();
+            let message_tx = message_tx.clone();
+            let app_state = app_state.clone();
+            move |msg| {
+                let state = state.clone();
+                let message_tx = message_tx.clone();
+                let app_state = app_state.clone();
+                async move { process_message(msg, &state, &message_tx, &app_state).await }
             }
-            _ = tokio::time::sleep(processing_timeout) => {
-                // Check if connection has been idle too long
-                if last_activity.elapsed() > idle_timeout {
-                    warn!(
-                        "WebSocket connection idle for {}s, closing stale connection",
-                        last_activity.elapsed().as_secs()
-                    );
-                    if message_tx.send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                        message: "Connection closed due to inactivity".to_string(),
-                    })).await.is_err() {
-                        warn!("Failed to send idle timeout error to WebSocket handler: channel closed");
-                    }
-                    break;
-                }
-                debug!(
-                    "WebSocket connection alive, idle for {}s",
-                    last_activity.elapsed().as_secs()
-                );
-            }
-        }
-    }
+        },
+    )
+    .await;
+    debug!(exit = ?exit, "WebSocket session receive loop exited");
 
     // Clean up resources - graceful shutdown with timeout fallback
     // Signal shutdown to sender task
@@ -400,6 +371,118 @@ async fn run_voice_socket_session(
     info!("WebSocket voice connection terminated");
 }
 
+/// Why [`run_session_loop`] returned. Drives only logging today, but gives the
+/// drain path (RC6) an explicit, testable outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionLoopExit {
+    /// Client closed the socket, the socket errored, or a handler requested close.
+    Closed,
+    /// The connection exceeded the idle timeout.
+    IdleTimeout,
+    /// App-wide shutdown was signalled (RC6 SIGTERM session drain).
+    Shutdown,
+}
+
+/// Drive a session's receive loop until the client disconnects, the connection
+/// goes idle, or server shutdown is signalled.
+///
+/// Extracted from [`run_voice_socket_session`] — and made generic over the
+/// inbound stream and the message processor — so the session lifecycle (in
+/// particular the RC6 SIGTERM-drain branch) is unit-testable without a real
+/// WebSocket. Production passes the split socket stream and a closure invoking
+/// [`process_message`].
+///
+/// On shutdown the loop sends a final `{"type":"error"}` protocol notice
+/// (Critical class — must not be shed) and returns cleanly, so the caller's
+/// normal teardown (sender drain + close frame, LiveKit disconnect, voice
+/// manager stop) runs within the drain window.
+async fn run_session_loop<R, F, Fut>(
+    receiver: &mut R,
+    message_tx: &mpsc::Sender<MessageRoute>,
+    shutdown: &CancellationToken,
+    processing_timeout: Duration,
+    idle_timeout: Duration,
+    mut on_message: F,
+) -> SessionLoopExit
+where
+    R: futures::Stream<Item = Result<Message, axum::Error>> + Unpin,
+    F: FnMut(Message) -> Fut,
+    Fut: Future<Output = bool>,
+{
+    // Track last activity time for idle connection detection
+    let mut last_activity = std::time::Instant::now();
+
+    loop {
+        select! {
+            msg_result = receiver.next() => {
+                // Update activity time on any message
+                last_activity = std::time::Instant::now();
+
+                match msg_result {
+                    Some(Ok(msg)) => {
+                        if !on_message(msg).await {
+                            return SessionLoopExit::Closed;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        warn!("WebSocket error: {}", e);
+                        send_with_policy(
+                            message_tx,
+                            MessageRoute::Outgoing(OutgoingMessage::Error {
+                                message: format!("WebSocket error: {e}"),
+                            }),
+                            MessageClass::Critical,
+                        )
+                        .await;
+                        return SessionLoopExit::Closed;
+                    }
+                    None => {
+                        info!("WebSocket connection closed by client");
+                        return SessionLoopExit::Closed;
+                    }
+                }
+            }
+            _ = tokio::time::sleep(processing_timeout) => {
+                // Check if connection has been idle too long
+                if last_activity.elapsed() > idle_timeout {
+                    warn!(
+                        "WebSocket connection idle for {}s, closing stale connection",
+                        last_activity.elapsed().as_secs()
+                    );
+                    send_with_policy(
+                        message_tx,
+                        MessageRoute::Outgoing(OutgoingMessage::Error {
+                            message: "Connection closed due to inactivity".to_string(),
+                        }),
+                        MessageClass::Critical,
+                    )
+                    .await;
+                    return SessionLoopExit::IdleTimeout;
+                }
+                debug!(
+                    "WebSocket connection alive, idle for {}s",
+                    last_activity.elapsed().as_secs()
+                );
+            }
+            _ = shutdown.cancelled() => {
+                // RC6 SIGTERM drain: main() cancelled the app-wide token before
+                // axum's graceful drain started. Tell the client this close is
+                // server-initiated, then exit cleanly so provider teardown runs.
+                info!("Server shutdown signalled; draining WebSocket session");
+                send_with_policy(
+                    message_tx,
+                    MessageRoute::Outgoing(OutgoingMessage::Error {
+                        message: "server shutting down".to_string(),
+                    }),
+                    MessageClass::Critical,
+                )
+                .await;
+                return SessionLoopExit::Shutdown;
+            }
+        }
+    }
+}
+
 /// Process incoming WebSocket message with optimizations
 ///
 /// Routes different message types to appropriate handlers and manages
@@ -447,15 +530,18 @@ async fn process_message(
                     max = MAX_TEXT_MESSAGE_SIZE,
                     "Text message exceeds maximum size before deserialization"
                 );
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
+                send_with_policy(
+                    message_tx,
+                    MessageRoute::Outgoing(OutgoingMessage::Error {
                         message: format!(
                             "Message too large: {} bytes (max {} bytes)",
                             text.len(),
                             MAX_TEXT_MESSAGE_SIZE
                         ),
-                    }))
-                    .await;
+                    }),
+                    MessageClass::Critical,
+                )
+                .await;
                 return true;
             }
 
@@ -464,11 +550,14 @@ async fn process_message(
                 Ok(msg) => msg,
                 Err(e) => {
                     error!("Failed to parse incoming message: {}", e);
-                    let _ = message_tx
-                        .send(MessageRoute::Outgoing(OutgoingMessage::Error {
+                    send_with_policy(
+                        message_tx,
+                        MessageRoute::Outgoing(OutgoingMessage::Error {
                             message: format!("Invalid message format: {e}"),
-                        }))
-                        .await;
+                        }),
+                        MessageClass::Critical,
+                    )
+                    .await;
                     return true;
                 }
             };
@@ -476,11 +565,14 @@ async fn process_message(
             // Validate message field sizes to prevent resource exhaustion
             if let Err(e) = incoming_msg.validate_size() {
                 warn!("Message validation failed: {}", e);
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
+                send_with_policy(
+                    message_tx,
+                    MessageRoute::Outgoing(OutgoingMessage::Error {
                         message: e.to_string(),
-                    }))
-                    .await;
+                    }),
+                    MessageClass::Critical,
+                )
+                .await;
                 return true;
             }
 
@@ -521,5 +613,141 @@ impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         debug!(ip = %self.ip, "Releasing connection slot");
         self.app_state.release_connection(self.ip);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+
+    /// Generous defaults that keep the idle branch out of the way of the
+    /// scenario under test.
+    const TEST_PROCESSING_TIMEOUT: Duration = Duration::from_secs(10);
+    const TEST_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+    /// RC6: a cancelled shutdown token makes the session loop exit with
+    /// `Shutdown` and emit a final protocol notice (even with a socket that
+    /// never yields a message — the drain must not wait on client traffic).
+    #[tokio::test]
+    async fn shutdown_cancellation_exits_session_loop_with_goodbye() {
+        let mut receiver = stream::pending::<Result<Message, axum::Error>>();
+        let (tx, mut rx) = mpsc::channel::<MessageRoute>(8);
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_session_loop(
+                &mut receiver,
+                &tx,
+                &shutdown,
+                TEST_PROCESSING_TIMEOUT,
+                TEST_IDLE_TIMEOUT,
+                |_msg| async move { true },
+            ),
+        )
+        .await
+        .expect("session loop must exit promptly once the shutdown token is cancelled");
+
+        assert_eq!(exit, SessionLoopExit::Shutdown);
+
+        match rx.try_recv().expect("a final protocol message must be queued") {
+            MessageRoute::Outgoing(OutgoingMessage::Error { message }) => {
+                assert_eq!(message, "server shutting down");
+            }
+            _ => panic!("expected the shutdown notice as an error protocol message"),
+        }
+    }
+
+    /// RC6: cancellation arriving mid-session (the realistic SIGTERM case —
+    /// the loop is already parked in select!) still drains the session.
+    #[tokio::test]
+    async fn shutdown_mid_session_exits_running_loop() {
+        let (tx, mut rx) = mpsc::channel::<MessageRoute>(8);
+        let shutdown = CancellationToken::new();
+        let task_token = shutdown.clone();
+
+        let session = tokio::spawn(async move {
+            let mut receiver = stream::pending::<Result<Message, axum::Error>>();
+            run_session_loop(
+                &mut receiver,
+                &tx,
+                &task_token,
+                TEST_PROCESSING_TIMEOUT,
+                TEST_IDLE_TIMEOUT,
+                |_msg| async move { true },
+            )
+            .await
+        });
+
+        // Let the loop start and park in select! before signalling shutdown.
+        tokio::task::yield_now().await;
+        shutdown.cancel();
+
+        let exit = tokio::time::timeout(Duration::from_secs(5), session)
+            .await
+            .expect("session loop must observe mid-session cancellation")
+            .expect("session loop task must not panic");
+        assert_eq!(exit, SessionLoopExit::Shutdown);
+
+        assert!(
+            matches!(
+                rx.recv().await,
+                Some(MessageRoute::Outgoing(OutgoingMessage::Error { .. }))
+            ),
+            "shutdown notice must be sent before the loop exits"
+        );
+    }
+
+    /// Sanity: without shutdown, a client-side close (stream end) still exits
+    /// the loop via the normal path — the new select branch must not capture
+    /// ordinary disconnects.
+    #[tokio::test]
+    async fn client_disconnect_exits_loop_as_closed() {
+        let mut receiver = stream::iter(Vec::<Result<Message, axum::Error>>::new());
+        let (tx, _rx) = mpsc::channel::<MessageRoute>(8);
+        let shutdown = CancellationToken::new();
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_session_loop(
+                &mut receiver,
+                &tx,
+                &shutdown,
+                TEST_PROCESSING_TIMEOUT,
+                TEST_IDLE_TIMEOUT,
+                |_msg| async move { true },
+            ),
+        )
+        .await
+        .expect("loop must exit when the inbound stream ends");
+
+        assert_eq!(exit, SessionLoopExit::Closed);
+    }
+
+    /// Sanity: a handler that requests close (process_message returning false,
+    /// e.g. on a Close frame) exits the loop as Closed.
+    #[tokio::test]
+    async fn handler_requested_close_exits_loop_as_closed() {
+        let mut receiver = stream::iter(vec![Ok::<Message, axum::Error>(Message::Close(None))]);
+        let (tx, _rx) = mpsc::channel::<MessageRoute>(8);
+        let shutdown = CancellationToken::new();
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_session_loop(
+                &mut receiver,
+                &tx,
+                &shutdown,
+                TEST_PROCESSING_TIMEOUT,
+                TEST_IDLE_TIMEOUT,
+                |msg| async move { !matches!(msg, Message::Close(_)) },
+            ),
+        )
+        .await
+        .expect("loop must exit when the handler requests close");
+
+        assert_eq!(exit, SessionLoopExit::Closed);
     }
 }

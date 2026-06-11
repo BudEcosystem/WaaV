@@ -888,9 +888,16 @@ async fn register_early_tts_callback(
                     audio_data.data.len()
                 );
 
-                // Send audio as binary data to WebSocket
+                // Send audio as binary data to WebSocket. DroppableAudio
+                // policy (RC8): a slow client sheds stale frames instead of
+                // stalling the voice path; drops are counted.
                 let audio_bytes = Bytes::from(audio_data.data);
-                let _ = message_tx.send(MessageRoute::Binary(audio_bytes)).await;
+                crate::handlers::ws::messages::send_with_policy(
+                    &message_tx,
+                    MessageRoute::Binary(audio_bytes),
+                    crate::handlers::ws::messages::MessageClass::DroppableAudio,
+                )
+                .await;
             })
         })
         .await
@@ -979,9 +986,12 @@ async fn deliver_tts_audio(
     if !sent_to_livekit {
         debug!("Sending TTS audio to WebSocket client: {} bytes", audio.len());
         let audio_bytes = Bytes::from(audio);
-        if let Err(e) = message_tx.send(MessageRoute::Binary(audio_bytes)).await {
-            error!("Failed to send TTS audio to WebSocket: {:?}", e);
-        }
+        crate::handlers::ws::messages::send_with_policy(
+            message_tx,
+            MessageRoute::Binary(audio_bytes),
+            crate::handlers::ws::messages::MessageClass::DroppableAudio,
+        )
+        .await;
     }
 }
 
