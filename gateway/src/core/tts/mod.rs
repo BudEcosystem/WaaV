@@ -4,6 +4,8 @@ pub mod aws_polly;
 pub mod azure;
 pub mod baidu;
 mod base;
+/// Magic-byte container sniffing — format truth at every audio boundary (P0.1).
+pub mod sniff;
 /// Standardized capability-rich TTS config (W1 keystone, additive).
 pub mod standard;
 pub mod bhashini;

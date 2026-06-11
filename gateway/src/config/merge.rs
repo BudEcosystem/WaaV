@@ -43,6 +43,29 @@ pub fn merge_config(
         };
     }
 
+    // Helper macro for CREDENTIALS: same YAML > ENV precedence, but a
+    // placeholder YAML value (the shipped "your-…-api-key" style) is treated as
+    // UNSET so the `# ENV:` fallback documented in config.yaml actually applies.
+    // Real YAML values keep their existing precedence over env untouched.
+    macro_rules! get_credential {
+        ($env_var:expr, $yaml_value:expr) => {
+            $yaml_value
+                .filter(|v: &String| {
+                    if super::utils::is_placeholder_credential(v) {
+                        tracing::warn!(
+                            field = $env_var,
+                            "config credential is a placeholder — ignoring it ({} env var applies if set)",
+                            $env_var
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .or_else(|| env::var($env_var).ok())
+        };
+    }
+
     // Server configuration
     let host = get_value!(
         "HOST",
@@ -109,25 +132,25 @@ pub fn merge_config(
         "http://localhost:7880"
     );
 
-    let livekit_api_key = get_optional!(
+    let livekit_api_key = get_credential!(
         "LIVEKIT_API_KEY",
         yaml.livekit.as_ref().and_then(|l| l.api_key.clone())
     );
 
-    let livekit_api_secret = get_optional!(
+    let livekit_api_secret = get_credential!(
         "LIVEKIT_API_SECRET",
         yaml.livekit.as_ref().and_then(|l| l.api_secret.clone())
     );
 
     // Provider API keys
-    let deepgram_api_key = get_optional!(
+    let deepgram_api_key = get_credential!(
         "DEEPGRAM_API_KEY",
         yaml.providers
             .as_ref()
             .and_then(|p| p.deepgram_api_key.clone())
     );
 
-    let elevenlabs_api_key = get_optional!(
+    let elevenlabs_api_key = get_credential!(
         "ELEVENLABS_API_KEY",
         yaml.providers
             .as_ref()
@@ -135,7 +158,7 @@ pub fn merge_config(
     );
 
     // Google Cloud credentials (can be path, JSON content, or empty for ADC)
-    let google_credentials = get_optional!(
+    let google_credentials = get_credential!(
         "GOOGLE_APPLICATION_CREDENTIALS",
         yaml.providers
             .as_ref()
@@ -143,7 +166,7 @@ pub fn merge_config(
     );
 
     // Azure Speech Services configuration
-    let azure_speech_subscription_key = get_optional!(
+    let azure_speech_subscription_key = get_credential!(
         "AZURE_SPEECH_SUBSCRIPTION_KEY",
         yaml.providers
             .as_ref()
@@ -158,7 +181,7 @@ pub fn merge_config(
     );
 
     // Cartesia STT API key
-    let cartesia_api_key = get_optional!(
+    let cartesia_api_key = get_credential!(
         "CARTESIA_API_KEY",
         yaml.providers
             .as_ref()
@@ -166,7 +189,7 @@ pub fn merge_config(
     );
 
     // OpenAI API key (STT, TTS, and Realtime API)
-    let openai_api_key = get_optional!(
+    let openai_api_key = get_credential!(
         "OPENAI_API_KEY",
         yaml.providers
             .as_ref()
@@ -174,7 +197,7 @@ pub fn merge_config(
     );
 
     // AssemblyAI API key (streaming STT)
-    let assemblyai_api_key = get_optional!(
+    let assemblyai_api_key = get_credential!(
         "ASSEMBLYAI_API_KEY",
         yaml.providers
             .as_ref()
@@ -182,31 +205,31 @@ pub fn merge_config(
     );
 
     // Hume AI API key (TTS and EVI)
-    let hume_api_key = get_optional!(
+    let hume_api_key = get_credential!(
         "HUME_API_KEY",
         yaml.providers.as_ref().and_then(|p| p.hume_api_key.clone())
     );
 
     // LMNT API key (TTS and voice cloning)
-    let lmnt_api_key = get_optional!(
+    let lmnt_api_key = get_credential!(
         "LMNT_API_KEY",
         yaml.providers.as_ref().and_then(|p| p.lmnt_api_key.clone())
     );
 
     // Groq API key (ultra-fast Whisper STT)
-    let groq_api_key = get_optional!(
+    let groq_api_key = get_credential!(
         "GROQ_API_KEY",
         yaml.providers.as_ref().and_then(|p| p.groq_api_key.clone())
     );
 
     // Play.ht credentials (TTS with voice cloning)
-    let playht_api_key = get_optional!(
+    let playht_api_key = get_credential!(
         "PLAYHT_API_KEY",
         yaml.providers
             .as_ref()
             .and_then(|p| p.playht_api_key.clone())
     );
-    let playht_user_id = get_optional!(
+    let playht_user_id = get_credential!(
         "PLAYHT_USER_ID",
         yaml.providers
             .as_ref()
@@ -214,13 +237,13 @@ pub fn merge_config(
     );
 
     // IBM Watson credentials (STT/TTS)
-    let ibm_watson_api_key = get_optional!(
+    let ibm_watson_api_key = get_credential!(
         "IBM_WATSON_API_KEY",
         yaml.providers
             .as_ref()
             .and_then(|p| p.ibm_watson_api_key.clone())
     );
-    let ibm_watson_instance_id = get_optional!(
+    let ibm_watson_instance_id = get_credential!(
         "IBM_WATSON_INSTANCE_ID",
         yaml.providers
             .as_ref()
@@ -240,7 +263,7 @@ pub fn merge_config(
             .as_ref()
             .and_then(|p| p.aws_access_key_id.clone())
     );
-    let aws_secret_access_key = get_optional!(
+    let aws_secret_access_key = get_credential!(
         "AWS_SECRET_ACCESS_KEY",
         yaml.providers
             .as_ref()
@@ -252,11 +275,11 @@ pub fn merge_config(
     );
 
     // Gnani.ai credentials
-    let gnani_token = get_optional!(
+    let gnani_token = get_credential!(
         "GNANI_TOKEN",
         yaml.providers.as_ref().and_then(|p| p.gnani_token.clone())
     );
-    let gnani_access_key = get_optional!(
+    let gnani_access_key = get_credential!(
         "GNANI_ACCESS_KEY",
         yaml.providers
             .as_ref()

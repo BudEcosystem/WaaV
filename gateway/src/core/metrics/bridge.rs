@@ -82,6 +82,10 @@ pub const FRAME_TOTAL: &str = "waav_frame_total";
 pub const QUEUE_DEPTH: &str = "waav_queue_depth";
 /// Egress queue latency in ms (gauge), labelled `queue`.
 pub const QUEUE_LATENCY_MS: &str = "waav_queue_latency_ms";
+/// TTS payload format ≠ declared format (counter), labelled `provider` +
+/// `source` (`http`/`cache`). Non-zero means a provider config is wrong or a
+/// pre-sniffing cache entry was healed (P0.1).
+pub const TTS_FORMAT_MISMATCH_TOTAL: &str = "waav_tts_format_mismatch_total";
 
 /// Histogram buckets (milliseconds) for TTFB. Chosen to straddle realtime voice TTFBs
 /// (a good streaming STT/TTS first byte is tens-to-hundreds of ms; the long tail captures
@@ -393,6 +397,13 @@ pub fn record_turn_outcome(path: &'static str, outcome: &'static str) {
 /// Increment `waav_turn_bottleneck_total` for the dominant stage of a completed turn.
 pub fn record_turn_bottleneck(stage: &'static str) {
     counter!(TURN_BOTTLENECK_TOTAL, "stage" => stage).increment(1);
+}
+
+/// Count a TTS payload whose sniffed format differs from the declared one
+/// (`source` ∈ http|cache). Provider label is bounded by the provider fleet.
+pub fn record_tts_format_mismatch(provider: &str, source: &'static str) {
+    counter!(TTS_FORMAT_MISMATCH_TOTAL, "provider" => provider.to_string(), "source" => source)
+        .increment(1);
 }
 
 /// Observe a per-DAG-node wall time (ms) on `waav_dag_node_ms`.

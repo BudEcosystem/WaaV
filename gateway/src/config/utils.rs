@@ -1,3 +1,22 @@
+/// True when a configured credential value is a PLACEHOLDER, not a real secret.
+///
+/// The shipped `config.yaml` uses values like `"your-deepgram-api-key"`; before
+/// this check they were returned verbatim by `get_api_key` and sent to the
+/// provider (observed live: Deepgram 401 with the literal placeholder string).
+/// A placeholder is treated as UNSET so the documented `# ENV:` fallback
+/// actually applies. Scope: credentials only — never general config strings.
+pub(crate) fn is_placeholder_credential(value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() {
+        return true;
+    }
+    let lower = v.to_ascii_lowercase();
+    lower.starts_with("your-")
+        || lower.starts_with("your_")
+        || matches!(lower.as_str(), "changeme" | "change-me" | "change_me" | "placeholder" | "todo")
+        || (lower.len() >= 3 && lower.bytes().all(|b| b == b'x'))
+}
+
 /// Parse a boolean value from a string, supporting multiple formats
 ///
 /// Accepts: "true", "false", "1", "0", "yes", "no" (case insensitive)

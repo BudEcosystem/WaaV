@@ -578,21 +578,12 @@ async fn initialize_voice_manager(
         error!("Failed to set TTS cache: {}", e);
     }
 
-    // Start voice manager
-    if let Err(e) = voice_manager.start().await {
-        error!("Failed to start voice manager: {}", e);
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: format!("Failed to start voice manager: {e}"),
-            }))
-            .await;
-        return None;
-    }
-
-    // Set up STT result callback
-    if !register_stt_callback(&voice_manager, message_tx).await {
-        return None;
-    }
+    // ORDERING CONTRACT (P0.5 / RC6): error callbacks are registered BEFORE
+    // start() so a connect-time provider failure (e.g. a 401 during the STT
+    // WebSocket handshake) reaches the client as its real cause instead of the
+    // generic "Connection channel closed". Result/complete callbacks are also
+    // registered up-front — providers must tolerate callbacks before connect
+    // (they all store them; nothing fires until the stream runs).
 
     // Set up STT error callback - critical for propagating streaming errors
     if !register_stt_error_callback(&voice_manager, message_tx).await {
@@ -604,8 +595,24 @@ async fn initialize_voice_manager(
         return None;
     }
 
+    // Set up STT result callback
+    if !register_stt_callback(&voice_manager, message_tx).await {
+        return None;
+    }
+
     // Set up TTS completion callback
     if !register_tts_complete_callback(&voice_manager, message_tx).await {
+        return None;
+    }
+
+    // Start voice manager (callbacks above are live for any connect-time error)
+    if let Err(e) = voice_manager.start().await {
+        error!("Failed to start voice manager: {}", e);
+        let _ = message_tx
+            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
+                message: format!("Failed to start voice manager: {e}"),
+            }))
+            .await;
         return None;
     }
 

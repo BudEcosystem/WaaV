@@ -15,9 +15,15 @@ use regex::Regex;
 use std::time::Duration;
 use xxhash_rust::xxh3::xxh3_128;
 
+/// A delivered audio payload: raw bytes plus an optional FORMAT OVERRIDE set
+/// when boundary sniffing (P0.1) proved the bytes are a container that differs
+/// from the declared format — the dispatcher then labels `AudioData` with the
+/// truth instead of the declaration.
+type AudioPayload = (Vec<u8>, Option<&'static str>);
+
 /// Request entry for ordered processing
 struct RequestEntry {
-    receiver: mpsc::Receiver<Result<Vec<u8>, TTSError>>,
+    receiver: mpsc::Receiver<Result<AudioPayload, TTSError>>,
     /// Audio format for this specific request
     format: String,
     /// Sample rate for this specific request
@@ -31,7 +37,7 @@ struct SpeakJob {
     /// The HTTP request builder (boxed trait object)
     request_builder: Box<dyn TTSRequestBuilderDyn>,
     /// The channel sender for streaming audio chunks
-    sender: mpsc::Sender<Result<Vec<u8>, TTSError>>,
+    sender: mpsc::Sender<Result<AudioPayload, TTSError>>,
     /// The cancellation token for this request
     cancel_token: CancellationToken,
     /// The request manager for HTTP client pooling
@@ -218,7 +224,7 @@ impl TTSProvider {
         request_builder: &dyn TTSRequestBuilderDyn,
         req_manager: Arc<ReqManager>,
         text: String,
-        sender: mpsc::Sender<Result<Vec<u8>, TTSError>>,
+        sender: mpsc::Sender<Result<AudioPayload, TTSError>>,
         token: CancellationToken,
         cache_and_key: Option<(Arc<CacheStore>, String)>,
         previous_text_store: Arc<RwLock<Option<String>>>,
@@ -244,28 +250,49 @@ impl TTSProvider {
         if let Some((cache, key)) = cache_and_key.as_ref() {
             match cache.get(key).await {
                 Ok(Some(bytes)) => {
-                    debug!(
-                        "Cache HIT - Sending cached audio for text: '{}', {} bytes",
-                        processed_text,
-                        bytes.len()
-                    );
-                    // Send cached audio as a single chunk
-                    debug!(
-                        "Sending cached audio through channel (will block until receiver reads)..."
-                    );
-                    if let Err(e) = sender.send(Ok(bytes.clone().to_vec())).await {
-                        error!("Failed to send cached audio through channel: {:?}", e);
+                    // P0.1: never trust a cached blob's declared format. Entries
+                    // written before sniffing existed can hold container bytes
+                    // under a PCM-declared key — evict and refetch (self-healing)
+                    // instead of replaying corruption forever.
+                    let declared = request_builder
+                        .get_config()
+                        .audio_format
+                        .as_deref()
+                        .unwrap_or("linear16")
+                        .to_string();
+                    let sniffed = crate::core::tts::sniff::sniff_container(&bytes);
+                    if crate::core::tts::sniff::is_pcm_family(&declared)
+                        && let Some(container) = sniffed
+                    {
+                        error!(
+                            declared,
+                            actual = container.as_format_str(),
+                            "cached TTS audio is a container mislabeled as PCM — evicting and refetching"
+                        );
+                        crate::core::metrics::bridge::record_tts_format_mismatch(
+                            &request_builder.get_config().provider,
+                            "cache",
+                        );
+                        if let Err(e) = cache.delete(key).await {
+                            error!("Failed to evict mismatched cache entry: {e:?}");
+                        }
+                        // fall through to the HTTP path below
                     } else {
                         debug!(
-                            "Successfully sent cached audio through channel for text: '{}' (receiver has read it)",
-                            processed_text
+                            "Cache HIT - Sending cached audio for text: '{}', {} bytes",
+                            processed_text,
+                            bytes.len()
                         );
-                        // Update previous_text for context continuity even on cache hit
-                        // This ensures next TTS request has proper context (e.g., for ElevenLabs)
-                        *previous_text_store.write().await = Some(processed_text.clone());
-                        debug!("Updated previous_text on cache hit: '{}'", processed_text);
+                        if let Err(e) = sender.send(Ok((bytes.clone().to_vec(), None))).await {
+                            error!("Failed to send cached audio through channel: {:?}", e);
+                        } else {
+                            // Update previous_text for context continuity even on cache hit
+                            // This ensures next TTS request has proper context (e.g., for ElevenLabs)
+                            *previous_text_store.write().await = Some(processed_text.clone());
+                            debug!("Updated previous_text on cache hit: '{}'", processed_text);
+                        }
+                        return;
                     }
-                    return;
                 }
                 Ok(None) => {
                     debug!("Cache miss for text: '{}'", processed_text);
@@ -374,6 +401,12 @@ impl TTSProvider {
                 };
 
                 let mut stream = response.bytes_stream();
+                // P0.1: sniff the FIRST payload. If the provider returned a
+                // container (WAV/MP3/OGG/FLAC) while a PCM family is declared,
+                // slicing it into "PCM" frames corrupts the audio — switch the
+                // whole stream to passthrough and label chunks with the truth.
+                let mut format_override: Option<&'static str> = None;
+                let mut first_payload = true;
                 while let Some(item) = stream.next().await {
                     if token.is_cancelled() {
                         break;
@@ -382,6 +415,27 @@ impl TTSProvider {
                     match item {
                         Ok(bytes) => {
                             let mut incoming = bytes.as_ref();
+
+                            if first_payload && !incoming.is_empty() {
+                                first_payload = false;
+                                if chunk_target_bytes > 0
+                                    && let Some(container) =
+                                        crate::core::tts::sniff::sniff_container(incoming)
+                                {
+                                    error!(
+                                        declared = encoding,
+                                        actual = container.as_format_str(),
+                                        "TTS provider returned a container mislabeled as PCM — \
+                                         passing through unsliced with the sniffed format"
+                                    );
+                                    crate::core::metrics::bridge::record_tts_format_mismatch(
+                                        &config.provider,
+                                        "http",
+                                    );
+                                    chunk_target_bytes = 0; // passthrough for the whole stream
+                                    format_override = Some(container.as_format_str());
+                                }
+                            }
 
                             if chunk_target_bytes == 0 {
                                 // Non-PCM/containerized formats: forward chunks as-is
@@ -394,7 +448,7 @@ impl TTSProvider {
                                     "Sending audio chunk ({} bytes) - will wait for receiver...",
                                     chunk_vec.len()
                                 );
-                                let _ = sender.send(Ok(chunk_vec)).await;
+                                let _ = sender.send(Ok((chunk_vec, format_override))).await;
                                 debug!("Audio chunk sent and received");
                                 continue;
                             }
@@ -418,7 +472,7 @@ impl TTSProvider {
                                         "Sending PCM chunk ({} bytes) - will wait for receiver...",
                                         chunk.len()
                                     );
-                                    let _ = sender.send(Ok(chunk)).await;
+                                    let _ = sender.send(Ok((chunk, None))).await;
                                     debug!("PCM chunk sent and received");
                                 }
                             }
@@ -445,15 +499,24 @@ impl TTSProvider {
                         "Sending final buffer ({} bytes) - will wait for receiver...",
                         buffer.len()
                     );
-                    let _ = sender.send(Ok(buffer)).await;
+                    let _ = sender.send(Ok((buffer, format_override))).await;
                     debug!("Final buffer sent and received");
                 }
 
-                // Store the full audio in cache if provided
+                // Store the full audio in cache if provided. NEVER cache a
+                // format-mismatched payload — the cache key encodes the
+                // DECLARED format, so storing the container would poison the
+                // entry for every future hit (P0.1).
                 if let Some(((cache, key), full_audio)) = cache_and_key.zip(full_audio) {
-                    match cache.put(key, full_audio).await {
-                        Ok(_) => {}
-                        Err(e) => error!("Failed to cache TTS audio: {:?}", e),
+                    if format_override.is_some() {
+                        tracing::warn!(
+                            "skipping TTS cache write: payload format differs from the declared key format"
+                        );
+                    } else {
+                        match cache.put(key, full_audio).await {
+                            Ok(_) => {}
+                            Err(e) => error!("Failed to cache TTS audio: {:?}", e),
+                        }
                     }
                 }
 
@@ -572,15 +635,19 @@ impl TTSProvider {
                         let mut chunk_count = 0;
                         while let Some(result) = entry.receiver.recv().await {
                             match result {
-                                Ok(bytes) => {
+                                Ok((bytes, format_override)) => {
                                     chunk_count += 1;
                                     debug!("TTS dispatcher received chunk #{}: {} bytes", chunk_count, bytes.len());
                                     if let Some(cb) = cb_opt.as_ref() {
-                                        let duration_ms = if matches!(
-                                            format.as_str(),
-                                            "linear16" | "pcm" | "mulaw" | "ulaw" | "alaw"
+                                        // P0.1: a sniff override means the bytes are a
+                                        // container — label with the truth and skip the
+                                        // PCM duration math (meaningless for containers).
+                                        let effective_format: &str =
+                                            format_override.unwrap_or(format.as_str());
+                                        let duration_ms = if crate::core::tts::sniff::is_pcm_family(
+                                            effective_format,
                                         ) {
-                                            let bytes_per_sample = if matches!(format.as_str(), "linear16" | "pcm") { 2 } else { 1 };
+                                            let bytes_per_sample = if matches!(effective_format, "linear16" | "pcm" | "pcm16") { 2 } else { 1 };
                                             let samples = (bytes.len() / bytes_per_sample) as u32;
                                             Some((samples * 1000) / sample_rate)
                                         } else {
@@ -590,7 +657,7 @@ impl TTSProvider {
                                         let audio_data = AudioData {
                                             data: bytes,
                                             sample_rate,
-                                            format: format.to_string(),
+                                            format: effective_format.to_string(),
                                             duration_ms,
                                         };
                                         debug!("TTS dispatcher calling audio callback with {} bytes", audio_data.data.len());
@@ -867,7 +934,7 @@ impl TTSProvider {
         let text_hash = format!("{:032x}", xxh3_128(text_trimmed.as_bytes()));
 
         // Create channel for this request with buffer size of 1
-        let (sender, receiver) = mpsc::channel::<Result<Vec<u8>, TTSError>>(1);
+        let (sender, receiver) = mpsc::channel::<Result<AudioPayload, TTSError>>(1);
 
         // Get format and sample rate from current config
         let format = request_builder

@@ -491,6 +491,22 @@ impl ServerConfig {
     /// # }
     /// ```
     pub fn get_api_key(&self, provider: &str) -> Result<String, String> {
+        let key = self.get_api_key_inner(provider)?;
+        // Defense in depth: merge-time filtering already drops placeholder YAML
+        // values, but a placeholder can still arrive via env/direct construction.
+        // Never hand a placeholder to a provider (observed live: Deepgram 401
+        // with the literal "your-deepgram-api-key"). Google is exempt — empty
+        // means Application Default Credentials there.
+        if provider.to_lowercase() != "google" && utils::is_placeholder_credential(&key) {
+            return Err(format!(
+                "{provider} API key is a placeholder/empty — set the real key \
+                 (see the # ENV comments in config.yaml)"
+            ));
+        }
+        Ok(key)
+    }
+
+    fn get_api_key_inner(&self, provider: &str) -> Result<String, String> {
         match provider.to_lowercase().as_str() {
             "deepgram" => {
                 self.deepgram_api_key.as_ref().cloned().ok_or_else(|| {
@@ -1970,6 +1986,78 @@ providers:
         // YAML value
         assert_eq!(config.port, 8080);
 
+        cleanup_env_vars();
+    }
+
+    /// P0.2: a PLACEHOLDER credential in YAML (the shipped config style) must
+    /// fall through to the env var — previously the placeholder was returned
+    /// verbatim and sent to the provider (observed live as a Deepgram 401).
+    #[test]
+    #[serial]
+    fn test_yaml_placeholder_credential_falls_through_to_env() {
+        cleanup_env_vars();
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.yaml");
+        fs::write(
+            &config_path,
+            "providers:\n  deepgram_api_key: \"your-deepgram-api-key\"\n",
+        )
+        .unwrap();
+        unsafe {
+            env::set_var("DEEPGRAM_API_KEY", "env-real-key");
+        }
+
+        let config = ServerConfig::from_file(&config_path).unwrap();
+        assert_eq!(
+            config.deepgram_api_key,
+            Some("env-real-key".to_string()),
+            "placeholder YAML credential must be treated as unset so env applies"
+        );
+        assert_eq!(config.get_api_key("deepgram").unwrap(), "env-real-key");
+
+        cleanup_env_vars();
+    }
+
+    /// P0.2: a placeholder with NO env var is "not configured" — a clear error,
+    /// never a credential handed to a provider.
+    #[test]
+    #[serial]
+    fn test_placeholder_credential_alone_is_not_configured() {
+        cleanup_env_vars();
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.yaml");
+        fs::write(
+            &config_path,
+            "providers:\n  deepgram_api_key: \"your-deepgram-api-key\"\n",
+        )
+        .unwrap();
+
+        let config = ServerConfig::from_file(&config_path).unwrap();
+        assert_eq!(
+            config.deepgram_api_key, None,
+            "placeholder must not survive the merge as a configured credential"
+        );
+        let err = config.get_api_key("deepgram").unwrap_err();
+        assert!(
+            err.contains("not configured") || err.contains("placeholder"),
+            "error must say the key is missing/placeholder, got: {err}"
+        );
+
+        cleanup_env_vars();
+    }
+
+    /// P0.2 defense-in-depth: the env path does NOT merge-filter, so a
+    /// placeholder arriving via env must still be rejected by get_api_key.
+    #[test]
+    #[serial]
+    fn test_get_api_key_rejects_placeholder_value() {
+        cleanup_env_vars();
+        unsafe {
+            env::set_var("DEEPGRAM_API_KEY", "your-deepgram-api-key");
+        }
+        let config = ServerConfig::from_env().unwrap();
+        let err = config.get_api_key("deepgram").unwrap_err();
+        assert!(err.contains("placeholder"), "got: {err}");
         cleanup_env_vars();
     }
 
