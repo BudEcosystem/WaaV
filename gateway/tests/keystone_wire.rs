@@ -32,6 +32,7 @@ fn ws_stt_features_reach_deepgram_diarize_through_keystone() {
             ..Default::default()
         },
         extras: Default::default(),
+        turn_detection: None,
     };
 
     // 2. The SAME conversion the live handler uses to cross the dispatch boundary.
@@ -74,6 +75,7 @@ fn ws_stt_to_standard_uses_provided_key_and_carries_features() {
             ..Default::default()
         },
         extras: Default::default(),
+        turn_detection: None,
     };
 
     let std = ws.to_standard_stt("resolved-server-key".to_string());

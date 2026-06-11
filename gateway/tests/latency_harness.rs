@@ -308,6 +308,7 @@ fn conv_config(base_url: String, streaming: bool) -> ConversationConfig {
         streaming,
         max_history: 8,
         allow_interruption: true,
+        eager_eot: false,
     }
 }
 
