@@ -642,14 +642,33 @@ impl LlmClient {
         request
     }
 
-    /// Append the user message to the session history (inserting the system
-    /// prompt first when the history is empty) and return the full message list
-    /// to send.
-    async fn prepare_messages(&self, session_id: &str, input: &str) -> Vec<ChatMessage> {
+    /// Build the message list to send. `staged = false` (classic): the user
+    /// message is appended to stored history at REQUEST time. `staged = true`
+    /// (P1.2b eager/speculative turns): stored history is NOT mutated — the
+    /// user+assistant pair lands only on confirmation via [`Self::commit_turn`],
+    /// so a cancelled speculative turn (user kept talking) leaves no
+    /// partial-utterance orphan polluting the conversation.
+    async fn prepare_messages(
+        &self,
+        session_id: &str,
+        input: &str,
+        staged: bool,
+    ) -> Vec<ChatMessage> {
         let mut histories = self.histories.write().await;
         let history = histories
             .entry(session_id.to_string())
             .or_insert_with(|| ConversationHistory::new(self.config.max_history));
+
+        if staged {
+            let mut messages = history.messages().to_vec();
+            if messages.is_empty()
+                && let Some(system_prompt) = &self.config.system_prompt
+            {
+                messages.push(ChatMessage::system(system_prompt));
+            }
+            messages.push(ChatMessage::user(input));
+            return messages;
+        }
 
         if history.messages().is_empty()
             && let Some(system_prompt) = &self.config.system_prompt {
@@ -664,6 +683,22 @@ impl LlmClient {
         if let Some(history) = histories.get_mut(session_id) {
             history.add(message);
         }
+    }
+
+    /// Commit a CONFIRMED staged turn: system prompt (if first), user message,
+    /// and assistant reply land in stored history together, atomically.
+    pub async fn commit_turn(&self, session_id: &str, input: &str, assistant_content: &str) {
+        let mut histories = self.histories.write().await;
+        let history = histories
+            .entry(session_id.to_string())
+            .or_insert_with(|| ConversationHistory::new(self.config.max_history));
+        if history.messages().is_empty()
+            && let Some(system_prompt) = &self.config.system_prompt
+        {
+            history.add(ChatMessage::system(system_prompt));
+        }
+        history.add(ChatMessage::user(input));
+        history.add(ChatMessage::assistant(assistant_content));
     }
 
     fn apply_headers(&self, mut req: reqwest::RequestBuilder, api_key: Option<&str>) -> reqwest::RequestBuilder {
@@ -701,10 +736,31 @@ impl LlmClient {
         let resolved = self.resolve_api_key(api_key);
         let api_key = resolved.as_deref();
         if self.config.streaming {
-            self.complete_streaming(session_id, input, api_key, cancel, on_token)
+            self.complete_streaming(session_id, input, api_key, cancel, on_token, false)
                 .await
         } else {
-            self.complete_sync(session_id, input, api_key, cancel).await
+            self.complete_sync(session_id, input, api_key, cancel, false).await
+        }
+    }
+
+    /// STAGED completion (P1.2b eager turns): identical to [`Self::complete`]
+    /// but stored history is untouched — confirm with [`Self::commit_turn`],
+    /// or simply drop the result to cancel with zero history pollution.
+    pub async fn complete_staged(
+        &self,
+        session_id: &str,
+        input: &str,
+        api_key: Option<&str>,
+        cancel: &CancellationToken,
+        on_token: Option<TokenCallback>,
+    ) -> LlmResult<LlmResponse> {
+        let resolved = self.resolve_api_key(api_key);
+        let api_key = resolved.as_deref();
+        if self.config.streaming {
+            self.complete_streaming(session_id, input, api_key, cancel, on_token, true)
+                .await
+        } else {
+            self.complete_sync(session_id, input, api_key, cancel, true).await
         }
     }
 
@@ -715,8 +771,9 @@ impl LlmClient {
         input: &str,
         api_key: Option<&str>,
         cancel: &CancellationToken,
+        staged: bool,
     ) -> LlmResult<LlmResponse> {
-        let messages = self.prepare_messages(session_id, input).await;
+        let messages = self.prepare_messages(session_id, input, staged).await;
         let request = self.build_request(messages, false);
 
         let http_request = self.apply_headers(
@@ -750,8 +807,10 @@ impl LlmClient {
             .map(|c| c.message.clone())
             .ok_or_else(|| self.endpoint_err("No choices in response".to_string()))?;
 
-        self.record_assistant(session_id, assistant_message.clone())
-            .await;
+        if !staged {
+            self.record_assistant(session_id, assistant_message.clone())
+                .await;
+        }
 
         Ok(LlmResponse {
             id: completion.id,
@@ -771,8 +830,9 @@ impl LlmClient {
         api_key: Option<&str>,
         cancel: &CancellationToken,
         on_token: Option<TokenCallback>,
+        staged: bool,
     ) -> LlmResult<LlmResponse> {
-        let messages = self.prepare_messages(session_id, input).await;
+        let messages = self.prepare_messages(session_id, input, staged).await;
         let request = self.build_request(messages, true);
 
         let http_request = self.apply_headers(
@@ -952,7 +1012,9 @@ impl LlmClient {
             tool_call_id: None,
             function_call: None,
         };
-        self.record_assistant(session_id, assistant_message).await;
+        if !staged {
+            self.record_assistant(session_id, assistant_message).await;
+        }
 
         Ok(LlmResponse {
             id: completion_id,

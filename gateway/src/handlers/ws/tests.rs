@@ -20,6 +20,7 @@ fn test_ws_config_serialization() {
         model: "nova-3".to_string(),
         features: Default::default(),
         extras: Default::default(),
+            turn_detection: None,
     };
 
     let json = serde_json::to_string(&stt_ws_config).unwrap();
@@ -71,6 +72,7 @@ fn test_incoming_message_serialization() {
             model: "nova-3".to_string(),
             features: Default::default(),
             extras: Default::default(),
+            turn_detection: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -369,6 +371,7 @@ fn test_stt_ws_config_conversion() {
         model: "nova-3".to_string(),
         features: Default::default(),
         extras: Default::default(),
+            turn_detection: None,
     };
 
     let api_key = "test_api_key".to_string();
@@ -695,6 +698,7 @@ fn test_incoming_message_config_with_livekit() {
             model: "nova-3".to_string(),
             features: Default::default(),
             extras: Default::default(),
+            turn_detection: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -748,6 +752,7 @@ fn test_incoming_message_config_without_livekit() {
             model: "nova-3".to_string(),
             features: Default::default(),
             extras: Default::default(),
+            turn_detection: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -1066,6 +1071,7 @@ fn test_config_message_without_livekit_routing() {
             model: "nova-3".to_string(),
             features: Default::default(),
             extras: Default::default(),
+            turn_detection: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -1124,6 +1130,7 @@ fn test_config_message_with_livekit_routing() {
             model: "nova-3".to_string(),
             features: Default::default(),
             extras: Default::default(),
+            turn_detection: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -1391,6 +1398,7 @@ fn test_config_message_audio_default() {
             model: "nova-3".to_string(),
             features: Default::default(),
             extras: Default::default(),
+            turn_detection: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,

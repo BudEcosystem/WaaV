@@ -77,6 +77,12 @@ pub struct ConversationConfig {
     pub max_history: usize,
     /// Whether the bot's speech is interruptible (barge-in). Default true.
     pub allow_interruption: bool,
+    /// Eager end-of-turn (P1.2b): when a turn-complete prediction arrives
+    /// BEFORE the provider's speech_final, start the LLM speculatively with a
+    /// STAGED history (no mutation). Confirmed by a matching final → commit +
+    /// speak; user kept talking → cancel with zero history pollution. Opt-in:
+    /// raises LLM call volume on resumed turns. Default false.
+    pub eager_eot: bool,
 }
 
 impl Default for ConversationConfig {
@@ -91,6 +97,7 @@ impl Default for ConversationConfig {
             streaming: true,
             max_history: 20,
             allow_interruption: true,
+            eager_eot: false,
         }
     }
 }
@@ -125,6 +132,18 @@ pub struct ConversationOrchestrator {
     turn: Arc<SyncMutex<Option<(u64, CancellationToken)>>>,
     /// Monotonic turn id allocator.
     next_turn_id: Arc<std::sync::atomic::AtomicU64>,
+    /// In-flight EAGER (speculative) turn, if any (P1.2b).
+    eager: Arc<SyncMutex<Option<EagerTurn>>>,
+}
+
+/// A speculative LLM turn started on a turn-complete PREDICTION, before the
+/// provider's speech_final. History is staged (never mutated); the reply is
+/// held (no TTS) until the final confirms the transcript.
+struct EagerTurn {
+    transcript: String,
+    token: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+    response: Arc<SyncMutex<Option<Result<String, ()>>>>,
 }
 
 impl std::fmt::Debug for ConversationOrchestrator {
@@ -158,6 +177,7 @@ impl ConversationOrchestrator {
             config: Arc::new(config),
             turn: Arc::new(SyncMutex::new(None)),
             next_turn_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            eager: Arc::new(SyncMutex::new(None)),
         })
     }
 
@@ -177,6 +197,7 @@ impl ConversationOrchestrator {
             config: Arc::new(config),
             turn: Arc::new(SyncMutex::new(None)),
             next_turn_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            eager: Arc::new(SyncMutex::new(None)),
         }
     }
 
@@ -230,6 +251,10 @@ impl ConversationOrchestrator {
             return;
         }
         let had_turn = self.cancel_current_turn();
+        if let Some(eager) = self.eager.lock().take() {
+            eager.token.cancel();
+            debug!(session = %self.session_id, "barge-in cancelled eager speculative turn");
+        }
         // Clear any queued/in-flight TTS so the bot stops talking immediately.
         if let Err(e) = self.voice_manager.clear_tts().await {
             warn!(session = %self.session_id, error = %e, "clear_tts during barge-in failed");
@@ -428,15 +453,67 @@ impl ConversationOrchestrator {
         }
     }
 
+    /// Start an EAGER (speculative) LLM turn on a turn-complete PREDICTION
+    /// (e.g. smart-turn firing before the provider's speech_final). P1.2b.
+    ///
+    /// History is STAGED (never mutated) and the reply is HELD — nothing is
+    /// spoken and nothing committed until [`Self::on_stt_result`] receives a
+    /// confirming final. If the user keeps talking, the speculation cancels
+    /// with zero history pollution. One speculative turn at a time.
+    pub fn trigger_eager_turn(&self, transcript: &str) {
+        if !self.config.eager_eot {
+            return;
+        }
+        let text = transcript.trim();
+        if text.is_empty() {
+            return;
+        }
+        let mut guard = self.eager.lock();
+        if guard.is_some() {
+            return; // one in-flight speculation at a time
+        }
+        let token = CancellationToken::new();
+        let response: Arc<SyncMutex<Option<Result<String, ()>>>> =
+            Arc::new(SyncMutex::new(None));
+        let llm = self.llm.clone();
+        let session_id = self.session_id.clone();
+        let api_key = self.config.api_key.clone();
+        let text_owned = text.to_string();
+        let response_store = response.clone();
+        let task_token = token.clone();
+        debug!(session = %self.session_id, "eager speculative turn started");
+        let task = tokio::spawn(async move {
+            let result = llm
+                .complete_staged(&session_id, &text_owned, api_key.as_deref(), &task_token, None)
+                .await;
+            *response_store.lock() = Some(result.map(|r| r.content).map_err(|_| ()));
+        });
+        *guard = Some(EagerTurn {
+            transcript: text.to_string(),
+            token,
+            task,
+            response,
+        });
+    }
+
     /// Drive the orchestrator from a single STT result.
     ///
     /// - Any non-empty user speech (interim or final) is treated as a potential
     ///   barge-in: if the bot is mid-utterance and interruptible, cancel its turn
     ///   and clear TTS.
     /// - A **finalized** turn (`is_speech_final`) with content runs a new LLM
-    ///   turn whose reply streams to TTS.
+    ///   turn whose reply streams to TTS — unless a CONFIRMED eager speculation
+    ///   already holds the reply, which is committed and spoken instead.
     pub async fn on_stt_result(&self, result: &STTResult) {
         let has_text = !result.transcript.trim().is_empty();
+
+        // Take the speculation BEFORE barge-in handling (which cancels eager
+        // turns) when this is the potentially-confirming final.
+        let eager = if result.is_speech_final && has_text {
+            self.eager.lock().take()
+        } else {
+            None
+        };
 
         // Barge-in: new user speech arrives while the bot may be talking. Only
         // meaningful when there is text (avoid clearing on empty interims).
@@ -446,7 +523,42 @@ impl ConversationOrchestrator {
 
         // Only fire the LLM→TTS pipeline on a finalized turn with real content.
         if result.is_speech_final && has_text {
-            let transcript = result.transcript.clone();
+            let transcript = result.transcript.trim().to_string();
+
+            // Eager confirmation: prediction matched the final transcript →
+            // the held speculative reply IS the turn. Commit + speak.
+            if let Some(eager) = eager {
+                if eager.transcript == transcript {
+                    let _ = eager.task.await;
+                    let held = eager.response.lock().take();
+                    if let Some(Ok(content)) = held
+                        && !content.trim().is_empty()
+                    {
+                        self.llm
+                            .commit_turn(&self.session_id, &transcript, &content)
+                            .await;
+                        let speak_res = if self.config.allow_interruption {
+                            self.voice_manager.speak(&content, true).await
+                        } else {
+                            self.voice_manager
+                                .speak_with_interruption(&content, true, false)
+                                .await
+                        };
+                        if let Err(e) = speak_res {
+                            warn!(session = %self.session_id, error = %e,
+                                  "speaking confirmed eager reply failed");
+                        }
+                        debug!(session = %self.session_id, "eager turn confirmed and spoken");
+                        return;
+                    }
+                    // staged call failed/empty → fall through to a normal turn
+                } else {
+                    eager.token.cancel();
+                    debug!(session = %self.session_id,
+                           "eager speculation discarded (transcript diverged)");
+                }
+            }
+
             if let Err(e) = self.run_turn(&transcript).await {
                 warn!(session = %self.session_id, error = %e, "conversation turn failed");
             }

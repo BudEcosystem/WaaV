@@ -235,6 +235,7 @@ pub async fn handle_config_message(
             livekit_client.as_ref(),
             dag_operation_queue.as_ref(),
             message_tx,
+            app_state.core_state.profiler.clone(),
         )
         .await
         {
@@ -359,6 +360,31 @@ async fn initialize_conversation_loop(
     .map_err(|e| e.to_string())?;
 
     let orchestrator = Arc::new(orchestrator);
+
+    // P1.2b eager end-of-turn: a smart-turn PREDICTION (turn-complete before
+    // the provider's speech_final) starts a held+staged speculative LLM turn.
+    // No-op unless the conversation config opted in (eager_eot) — the gate
+    // lives in trigger_eager_turn. Provider-agnostic by construction.
+    #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+    {
+        let orch_eager = orchestrator.clone();
+        let vm_eager = voice_manager.clone();
+        if let Err(e) = voice_manager
+            .on_smart_turn(move |result| {
+                let orch = orch_eager.clone();
+                let vm = vm_eager.clone();
+                Box::pin(async move {
+                    if result.is_turn_complete {
+                        let text = vm.current_turn_text();
+                        orch.trigger_eager_turn(&text);
+                    }
+                })
+            })
+            .await
+        {
+            warn!("failed to register eager smart-turn callback: {e}");
+        }
+    }
 
     // Store on the connection so teardown can cancel any in-flight turn.
     // (Reuses the STT-callback slot in the VoiceManager; the orchestrator both
@@ -531,8 +557,42 @@ async fn initialize_voice_manager(
     // cross-session — every session of a provider now trips the same breaker and draws from the
     // one process-wide reconnect cap.
     let stt_provider = standard_stt.base.provider.clone();
-    let voice_config = VoiceManagerConfig::from_standard(standard_stt, standard_tts)
+    #[allow(unused_mut)]
+    let mut voice_config = VoiceManagerConfig::from_standard(standard_stt, standard_tts)
         .with_resilience(app_state.core_state.resilience().handles_for(&stt_provider));
+
+    // P1.2: ML turn detection, surfaced via the STANDARDIZED WS config —
+    // provider-agnostic (runs on the gateway's frame path for every STT
+    // provider). When the build lacks the features: LOUD degradation (RC5).
+    if let Some(td) = &stt_ws_config.turn_detection
+        && td.enabled
+    {
+        #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+        {
+            let mut st_cfg = crate::core::smart_turn::SmartTurnProcessorConfig::new()
+                .with_sample_rate(stt_ws_config.sample_rate);
+            if let Some(threshold) = td.threshold {
+                st_cfg = st_cfg.with_threshold(threshold);
+            }
+            voice_config.smart_turn_config = Some(st_cfg);
+            info!(
+                threshold = ?td.threshold,
+                eager = td.eager,
+                "ML turn detection enabled for session"
+            );
+        }
+        #[cfg(not(any(feature = "silero-vad", feature = "smart-turn")))]
+        {
+            tracing::warn!(
+                "turn_detection requested but this build lacks the smart-turn/\
+                 silero-vad features — session degrades to timer fallback"
+            );
+            crate::core::metrics::bridge::record_degraded(
+                "turn_detection",
+                "feature_not_built",
+            );
+        }
+    }
 
     let turn_detector = app_state.core_state.get_turn_detector();
 
@@ -1378,6 +1438,7 @@ async fn initialize_dag_routing(
     livekit_client: Option<&Arc<RwLock<LiveKitClient>>>,
     operation_queue: Option<&crate::livekit::OperationQueue>,
     message_tx: &mpsc::Sender<MessageRoute>,
+    profiler: Arc<crate::core::observability::LatencyProfiler>,
 ) -> Result<bool, String> {
     // Get DAG definition from template or inline
     let dag_definition: DAGDefinition = if let Some(ref def) = dag_config.definition {
@@ -1504,6 +1565,7 @@ async fn initialize_dag_routing(
             dag_context,
             post_stt_node_id,
             message_tx,
+            profiler,
         )
         .await;
     } else {
@@ -1554,8 +1616,12 @@ async fn register_dag_stream_driver(
     ctx_template: DAGContext,
     post_stt_node_id: String,
     message_tx: &mpsc::Sender<MessageRoute>,
+    profiler: Arc<crate::core::observability::LatencyProfiler>,
 ) {
     let message_tx = message_tx.clone();
+    // P1.3: DAG turns get the same per-turn latency trace as conversation
+    // turns (path="dag"), with the per-node breakdown from ctx.timing.
+    let dag_turn_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let result = voice_manager
         .on_stt_result(move |stt: STTResult| {
             let compiled_dag = compiled_dag.clone();
@@ -1563,6 +1629,8 @@ async fn register_dag_stream_driver(
             let ctx_template = ctx_template.clone();
             let post_stt_node_id = post_stt_node_id.clone();
             let message_tx = message_tx.clone();
+            let profiler = profiler.clone();
+            let dag_turn_seq = dag_turn_seq.clone();
 
             Box::pin(async move {
                 // Transcript egress: the DAG path REPLACES the simple-path STT callback
@@ -1594,6 +1662,15 @@ async fn register_dag_stream_driver(
                 // Fresh per-turn context (shares stream_id/auth/deadline/output sink).
                 let mut ctx = ctx_template.clone_for_branch();
 
+                use crate::core::observability::{TurnOutcome, TurnPath, TurnSink, TurnTrace};
+                let turn_id = dag_turn_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut trace = TurnTrace::open(
+                    turn_id,
+                    Arc::from(ctx.stream_id.as_str()),
+                    TurnPath::Dag,
+                    crate::core::observability::now_monotonic_ns(),
+                );
+
                 let input = crate::dag::nodes::DAGData::STTResult(STTResultData {
                     transcript: stt.transcript.clone(),
                     is_final: stt.is_final,
@@ -1603,10 +1680,24 @@ async fn register_dag_stream_driver(
                     ..Default::default()
                 });
 
-                match executor
+                let exec_result = executor
                     .execute_from(&compiled_dag, &post_stt_node_id, input, &mut ctx)
-                    .await
-                {
+                    .await;
+                trace.audio_out_ns = crate::core::observability::now_monotonic_ns();
+                trace.node_durations_us = ctx
+                    .timing
+                    .node_durations
+                    .iter()
+                    .map(|(node, dur)| (Arc::from(node.as_str()), dur.as_micros() as u64))
+                    .collect();
+                trace.outcome = if exec_result.is_ok() {
+                    TurnOutcome::Completed
+                } else {
+                    TurnOutcome::Aborted
+                };
+                trace.bottleneck = trace.compute_bottleneck();
+                profiler.record_turn(trace);
+                match exec_result {
                     Ok(_) => {
                         debug!("StreamDriver: DAG turn completed");
                     }

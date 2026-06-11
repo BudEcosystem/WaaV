@@ -86,6 +86,12 @@ pub struct ConversationWebSocketConfig {
     /// Whether the bot's speech is interruptible / barge-in (default true).
     #[serde(default = "default_conversation_allow_interruption")]
     pub allow_interruption: bool,
+
+    /// Eager end-of-turn (P1.2b): start the LLM speculatively on a
+    /// turn-complete prediction, confirm/cancel on the provider final.
+    /// Opt-in — raises LLM call volume on resumed turns (default false).
+    #[serde(default)]
+    pub eager_eot: bool,
 }
 
 fn default_conversation_streaming() -> bool {
@@ -113,6 +119,7 @@ impl ConversationWebSocketConfig {
             streaming: self.streaming,
             max_history: self.max_history,
             allow_interruption: self.allow_interruption,
+            eager_eot: self.eager_eot,
         }
     }
 }
@@ -174,6 +181,31 @@ pub struct STTWebSocketConfig {
     /// Open, typed passthrough for provider-specific parameters not modeled by `features`.
     #[serde(default)]
     pub extras: crate::core::stt::standard::ProviderExtras,
+
+    /// ML turn detection for this session (P1.2): runs the audio-based
+    /// smart-turn detector on the live frame path so end-of-turn is PREDICTED
+    /// instead of waiting out the provider's silence endpointing. Standardized
+    /// — provider-agnostic, applies to every STT provider. Requires a build
+    /// with the `smart-turn`/`silero-vad` features; otherwise the session
+    /// degrades LOUDLY (warn + waav_degraded_total) to timer fallback.
+    #[serde(default)]
+    pub turn_detection: Option<TurnDetectionWsConfig>,
+}
+
+/// Per-session ML turn-detection knobs (provider-agnostic).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct TurnDetectionWsConfig {
+    /// Master switch.
+    pub enabled: bool,
+    /// Decision threshold (model-calibrated default when omitted).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f32>,
+    /// Eager end-of-turn: on a turn-complete prediction, start the LLM
+    /// speculatively (held + staged; see conversation_config.eager_eot which
+    /// must also be enabled). Default false.
+    #[serde(default)]
+    pub eager: bool,
 }
 
 impl STTWebSocketConfig {

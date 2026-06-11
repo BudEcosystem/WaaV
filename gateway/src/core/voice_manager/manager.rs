@@ -1132,6 +1132,13 @@ impl VoiceManager {
         guard.is_some()
     }
 
+    /// The CURRENT turn's buffered partial transcript (the speech-final text
+    /// buffer). Used by eager end-of-turn (P1.2b): a turn-complete prediction
+    /// speculates on what the user has said SO FAR.
+    pub fn current_turn_text(&self) -> String {
+        self.speech_final_state.read().text_buffer.clone()
+    }
+
     /// Returns the current speech state from smart turn processor.
     ///
     /// Returns `None` if smart turn is not enabled.

@@ -535,3 +535,123 @@ async fn llm_client_streams_tokens_to_callback() {
     assert_eq!(resp.content, "Hello world");
     assert_eq!(*collected.lock(), "Hello world");
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// P1.2b — EAGER end-of-turn: speculative LLM start with STAGED history.
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn eager_config(base_url: String) -> ConversationConfig {
+    ConversationConfig {
+        eager_eot: true,
+        ..conv_config(base_url, false)
+    }
+}
+
+/// Confirmed speculation: the held reply is committed + spoken; the LLM is
+/// called exactly ONCE; history carries the turn exactly once.
+#[tokio::test]
+#[serial_test::serial]
+async fn eager_confirmed_speaks_and_commits_once() {
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let llm_state = LlmMockState::default();
+    *llm_state.reply.lock() = "The capital is Paris.".to_string();
+    llm_state.delay_ms.store(150, Ordering::SeqCst); // speculation in flight at confirm
+    let base_url = start_llm_mock(llm_state.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let saw_audio = wire_audio_egress(&vm).await;
+
+    let orch = ConversationOrchestrator::new("eager-1", eager_config(base_url), vm).expect("orch");
+
+    // Prediction fires before the provider final…
+    orch.trigger_eager_turn("what is the capital");
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    // …and the provider final CONFIRMS the same transcript.
+    orch.on_stt_result(&final_result("what is the capital")).await;
+
+    assert_eq!(
+        llm_state.requests.lock().len(),
+        1,
+        "confirmed eager turn must reuse the speculative call (exactly one LLM request)"
+    );
+    let spoken = TTS_STATS.spoken.lock().clone();
+    assert!(
+        spoken.iter().any(|s| s.contains("Paris")),
+        "held eager reply must be spoken on confirmation, got {spoken:?}"
+    );
+    assert!(saw_audio.load(Ordering::SeqCst), "audio must egress");
+
+    // History committed exactly once: turn 2's request carries turn 1 user+assistant once.
+    *llm_state.reply.lock() = "Second reply.".to_string();
+    llm_state.delay_ms.store(0, Ordering::SeqCst);
+    orch.on_stt_result(&final_result("and italy?")).await;
+    let requests = llm_state.requests.lock().clone();
+    let second = &requests[1];
+    let contents: Vec<String> = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["content"].as_str().map(String::from))
+        .collect();
+    assert_eq!(
+        contents.iter().filter(|c| c.contains("what is the capital")).count(),
+        1,
+        "confirmed turn committed exactly once, got {contents:?}"
+    );
+    assert_eq!(
+        contents.iter().filter(|c| c.contains("The capital is Paris.")).count(),
+        1,
+        "assistant reply committed exactly once, got {contents:?}"
+    );
+}
+
+/// Divergent final (user kept talking): speculation is DISCARDED with zero
+/// history pollution; the real turn runs with the full transcript.
+#[tokio::test]
+#[serial_test::serial]
+async fn eager_divergent_transcript_discards_without_history_pollution() {
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let llm_state = LlmMockState::default();
+    *llm_state.reply.lock() = "Full answer.".to_string();
+    let base_url = start_llm_mock(llm_state.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+
+    let orch = ConversationOrchestrator::new("eager-2", eager_config(base_url), vm).expect("orch");
+
+    orch.trigger_eager_turn("tell me about");
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    // The user kept talking — the final transcript is longer.
+    orch.on_stt_result(&final_result("tell me about France please")).await;
+
+    let requests = llm_state.requests.lock().clone();
+    assert_eq!(requests.len(), 2, "speculative + real call");
+    // The REAL turn's request must contain only the full transcript — the
+    // discarded speculation's prefix must NOT appear as a separate user msg.
+    let real = &requests[1];
+    let contents: Vec<String> = real["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .filter_map(|m| m["content"].as_str().map(String::from))
+        .collect();
+    assert_eq!(
+        contents,
+        vec!["tell me about France please".to_string()],
+        "staged speculation must leave NO orphan user message"
+    );
+}
