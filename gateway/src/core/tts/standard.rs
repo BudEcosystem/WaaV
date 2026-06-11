@@ -158,7 +158,25 @@ pub fn create_tts_standard(
     provider: &str,
     config: StandardTTSConfig,
 ) -> super::base::TTSResult<Box<dyn super::base::BaseTTS>> {
-    match provider.to_lowercase().as_str() {
+    let provider_key = provider.to_lowercase();
+
+    // P1.1: `features.streaming == Some(true)` selects a provider's WebSocket
+    // streaming variant where one exists. Providers without a WS variant degrade
+    // gracefully to their HTTP path with a warning (RC5) — never an error.
+    let streaming_requested = config.features.streaming == Some(true);
+    let has_ws_variant = matches!(provider_key.as_str(), "deepgram");
+    if streaming_requested && !has_ws_variant {
+        tracing::warn!(
+            provider = %provider,
+            "features.streaming=true requested but this provider has no WebSocket \
+             streaming TTS variant; falling back to HTTP synthesis"
+        );
+    }
+
+    match provider_key.as_str() {
+        "deepgram" if streaming_requested => Ok(Box::new(
+            super::deepgram_aura::DeepgramAuraTTS::from_standard(&config)?,
+        )),
         "deepgram" => Ok(Box::new(super::deepgram::DeepgramTTS::from_standard(&config)?)),
         "acapela" => Ok(Box::new(super::acapela::AcapelaTts::from_standard(&config)?)),
         "alibaba_cloud" | "alibaba-cloud" => {
@@ -361,6 +379,37 @@ mod tests {
         let v = serde_json::to_value(&cfg).unwrap();
         assert_eq!(v["provider"], "elevenlabs");
         assert_eq!(v["features"]["stability"], 0.5);
+    }
+
+    #[test]
+    fn create_tts_standard_streaming_dispatch() {
+        let mk = |streaming: Option<bool>| StandardTTSConfig {
+            base: TTSConfig {
+                provider: "deepgram".into(),
+                api_key: "k".into(),
+                voice_id: Some("aura-asteria-en".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                streaming,
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+        };
+        // streaming=Some(true) → Aura WS variant.
+        let ws = create_tts_standard("deepgram", mk(Some(true))).unwrap();
+        assert_eq!(ws.get_provider_info()["api_type"], "WebSocket");
+        // streaming=None / Some(false) → existing HTTP provider.
+        let http = create_tts_standard("deepgram", mk(None)).unwrap();
+        assert_eq!(http.get_provider_info()["api_type"], "HTTP REST");
+        let http = create_tts_standard("deepgram", mk(Some(false))).unwrap();
+        assert_eq!(http.get_provider_info()["api_type"], "HTTP REST");
+        // streaming requested for a provider without a WS variant → graceful HTTP
+        // fallback (warn, not error).
+        let mut cfg = mk(Some(true));
+        cfg.base.provider = "elevenlabs".into();
+        cfg.base.voice_id = Some("21m00Tcm4TlvDq8ikWAM".into());
+        assert!(create_tts_standard("elevenlabs", cfg).is_ok());
     }
 
     #[test]

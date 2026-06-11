@@ -315,6 +315,30 @@ pub trait BaseTTS: Send + Sync {
     /// * `TTSResult<()>` - Success or failure of the synthesis request
     async fn speak(&mut self, text: &str, flush: bool) -> TTSResult<()>;
 
+    /// Send text for synthesis with an optional per-utterance context id (P1.1).
+    ///
+    /// Streaming (WebSocket) providers override this to key in-flight utterances by
+    /// `context_id` so barge-in `clear()` can cancel a specific synthesis mid-stream and
+    /// TTFB can be stamped per utterance. The default implementation delegates to
+    /// [`speak`](Self::speak), ignoring the context id — existing HTTP providers and the
+    /// ~135 existing `.speak(` call sites need zero changes.
+    ///
+    /// # Arguments
+    /// * `text` - The text to synthesize
+    /// * `flush` - Whether to immediately flush and start processing the text
+    /// * `_context_id` - Optional caller-supplied utterance id (e.g. the turn id)
+    ///
+    /// # Returns
+    /// * `TTSResult<()>` - Success or failure of the synthesis request
+    async fn speak_with_context(
+        &mut self,
+        text: &str,
+        flush: bool,
+        _context_id: Option<&str>,
+    ) -> TTSResult<()> {
+        self.speak(text, flush).await
+    }
+
     /// Clear any queued text from the TTS provider
     ///
     /// This method sends a clear command to the target provider to remove any
