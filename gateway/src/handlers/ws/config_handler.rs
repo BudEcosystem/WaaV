@@ -97,6 +97,25 @@ pub async fn handle_config_message(
     message_tx: &mpsc::Sender<MessageRoute>,
     app_state: &Arc<AppState>,
 ) -> bool {
+    // P2 (RC6): one config per session. A second config used to silently
+    // REPLACE the VoiceManager without tearing the old one down — provider
+    // streams and callback tasks leaked. Reject explicitly; reconfiguration
+    // is a session restart.
+    {
+        let state_guard = state.read().await;
+        if state_guard.voice_manager.is_some() || state_guard.stream_id.is_some() {
+            warn!("Rejecting second config message on an already-configured session");
+            let _ = message_tx
+                .send(MessageRoute::Outgoing(OutgoingMessage::Error {
+                    message: "Session already configured — open a new connection to \
+                              reconfigure (one config message per session)"
+                        .to_string(),
+                }))
+                .await;
+            return true;
+        }
+    }
+
     // Generate stream_id if not provided by client
     let stream_id = resolve_stream_id(stream_id);
     info!("Session stream_id: {}", stream_id);

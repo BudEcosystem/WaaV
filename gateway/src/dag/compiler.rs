@@ -611,14 +611,23 @@ impl CompiledDAG {
             return Some(*idx);
         }
 
-        // Try prefix match
-        for (pattern, idx) in &self.api_key_routes {
-            if api_key_id.starts_with(pattern) {
-                return Some(*idx);
-            }
-        }
+        // Prefix match. `api_key_routes` is a HashMap whose iteration order is
+        // randomized per instance, so when multiple patterns match (e.g. "team-"
+        // and "team-eu-" for key "team-eu-7") a bare iteration would pick an
+        // arbitrary one — nondeterministic routing across restarts. Sort the
+        // candidates by (pattern length DESC, then lexicographic) so the MOST
+        // SPECIFIC pattern always wins, deterministically.
+        let mut patterns: Vec<(&str, NodeIndex)> = self
+            .api_key_routes
+            .iter()
+            .map(|(pattern, idx)| (pattern.as_str(), *idx))
+            .collect();
+        patterns.sort_by(|(a, _), (b, _)| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
 
-        None
+        patterns
+            .into_iter()
+            .find(|(pattern, _)| api_key_id.starts_with(pattern))
+            .map(|(_, idx)| idx)
     }
 }
 
@@ -723,6 +732,58 @@ mod tests {
 
         assert!(compiled.get_api_key_route("tenant_a").is_some());
         assert!(compiled.get_api_key_route("tenant_b").is_none());
+    }
+
+    /// MASTER_PLAN §5 (router determinism): with OVERLAPPING prefix patterns the
+    /// MOST SPECIFIC (longest) one must win, and the choice must be deterministic.
+    /// Each iteration compiles a FRESH DAG — and thus a fresh `HashMap` with its
+    /// own randomized iteration order — so pre-fix this flips routes between
+    /// iterations; post-fix all 50 iterations must agree.
+    #[test]
+    fn test_api_key_route_most_specific_pattern_wins_deterministically() {
+        for i in 0..50 {
+            let compiler = DAGCompiler::new();
+            let mut dag = DAGDefinition::new("route-dag", "Route DAG");
+            dag.add_node(NodeDefinition::new("input", NodeType::TextInput));
+            dag.add_node(NodeDefinition::new("generic", NodeType::Passthrough));
+            dag.add_node(NodeDefinition::new("eu", NodeType::Passthrough));
+            dag.add_node(NodeDefinition::new(
+                "output",
+                NodeType::TextOutput {
+                    destination: OutputDestination::WebSocket,
+                },
+            ));
+            dag.add_edge(EdgeDefinition::new("input", "generic"));
+            dag.add_edge(EdgeDefinition::new("input", "eu"));
+            dag.add_edge(EdgeDefinition::new("generic", "output"));
+            dag.add_edge(EdgeDefinition::new("eu", "output"));
+            dag.with_entry("input");
+            dag.add_exit("output");
+            // Two overlapping prefix patterns: "team-eu-" is more specific.
+            dag.api_key_routes
+                .insert("team-".to_string(), "generic".to_string());
+            dag.api_key_routes
+                .insert("team-eu-".to_string(), "eu".to_string());
+
+            let compiled = compiler.compile(dag).unwrap();
+            let eu_idx = compiled.get_node_index("eu").unwrap();
+            let generic_idx = compiled.get_node_index("generic").unwrap();
+
+            // Both patterns match "team-eu-7"; the longer one must win — always.
+            assert_eq!(
+                compiled.get_api_key_route("team-eu-7"),
+                Some(eu_idx),
+                "iteration {i}: longest pattern must win for 'team-eu-7'"
+            );
+            // Only the short pattern matches here.
+            assert_eq!(
+                compiled.get_api_key_route("team-us-1"),
+                Some(generic_idx),
+                "iteration {i}: 'team-us-1' must route via 'team-'"
+            );
+            // No pattern matches.
+            assert_eq!(compiled.get_api_key_route("acme-1"), None);
+        }
     }
 
     // ── W-O3 bug #3: SSRF closure on LLM base_url and gRPC address ──────────

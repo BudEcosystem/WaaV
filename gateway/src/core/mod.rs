@@ -5,6 +5,10 @@ pub mod emotion;
 pub mod llm;
 pub mod metrics;
 pub mod observability;
+// Hardware execution-provider policy (MASTER_PLAN §7 H). Available exactly when
+// `ort` is pulled in, i.e. whenever any of the three ONNX consumers is enabled.
+#[cfg(any(feature = "turn-detect", feature = "smart-turn", feature = "silero-vad"))]
+pub mod onnx;
 pub mod pipeline;
 pub mod providers;
 pub mod readiness;

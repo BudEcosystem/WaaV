@@ -367,10 +367,14 @@ impl SmartTurnDetector {
 
     /// Creates an ONNX session for the model.
     fn create_session(model_path: &Path, num_threads: usize) -> Result<Session> {
-        let session = SessionBuilder::new()?
+        let builder = SessionBuilder::new()?
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
             .with_intra_threads(num_threads)?
-            .with_inter_threads(1)?
+            .with_inter_threads(1)?;
+
+        // Hardware EP policy (MASTER_PLAN §7 H): single policy point, honors
+        // WAAV_ORT_EP, CPU is the guaranteed fallback.
+        let session = crate::core::onnx::apply_execution_providers(builder)?
             .commit_from_file(model_path)
             .context("Failed to load Smart Turn model")?;
 

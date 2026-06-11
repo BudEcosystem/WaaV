@@ -61,6 +61,10 @@ impl ModelManager {
                 .with_inter_threads(1)?;
         }
 
+        // Hardware EP policy (MASTER_PLAN §7 H): single policy point, honors
+        // WAAV_ORT_EP, CPU is the guaranteed fallback.
+        let builder = crate::core::onnx::apply_execution_providers(builder)?;
+
         let session = builder.commit_from_file(model_path)?;
 
         Self::validate_model_inputs(&session)?;

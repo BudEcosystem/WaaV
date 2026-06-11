@@ -192,6 +192,13 @@ impl DAGExecutor {
         };
 
         const CHAN_BUF: usize = 64;
+
+        // Execution-scoped cancellation: a CHILD of the shared session token, so (a) barge-in /
+        // session cancellation still propagates into every task spawned here, and (b) on a node
+        // failure we can cancel ALL of this run's tasks — including forwarders blocked on a full
+        // bounded channel — without poisoning the caller's token for subsequent turns.
+        let cancel = ctx.cancel_token.child_token();
+
         // One input channel per node. Edge A→B means A's forwarder sends to B's input sender.
         let mut in_tx: HashMap<NodeIndex, mpsc::Sender<DAGData>> = HashMap::new();
         let mut in_rx: HashMap<NodeIndex, mpsc::Receiver<DAGData>> = HashMap::new();
@@ -201,7 +208,8 @@ impl DAGExecutor {
             in_rx.insert(n, rx);
         }
 
-        let mut node_handles = Vec::with_capacity(nodes.len());
+        let mut node_tasks: tokio::task::JoinSet<Result<(), (String, DAGError)>> =
+            tokio::task::JoinSet::new();
         let mut fwd_handles = Vec::with_capacity(nodes.len());
         for &n in &nodes {
             let node = Arc::clone(&dag.graph[n].node);
@@ -210,15 +218,16 @@ impl DAGExecutor {
             let (out_tx, mut out_rx) = mpsc::channel::<DAGData>(CHAN_BUF);
 
             // The node task: stream this node's outputs onto `out_tx`. Own context per node; the
-            // client sink is cleared (only the terminal forwarder below delivers) but the cancel
-            // token is shared for barge-in.
+            // client sink is cleared (only the terminal forwarder below delivers) and the cancel
+            // token is the execution-scoped child (barge-in still propagates through the parent).
             let mut node_ctx = ctx.clone_for_branch();
             node_ctx.output_tx = None;
-            node_handles.push(tokio::spawn(async move {
+            node_ctx.cancel_token = cancel.clone();
+            node_tasks.spawn(async move {
                 node.execute_streaming(rx, &mut node_ctx, out_tx)
                     .await
                     .map_err(|e| (node_id, e))
-            }));
+            });
 
             // The forwarder task: route this node's stream to its downstream inputs (per-chunk
             // condition eval for routers; broadcast for splits) or to the client sink if terminal.
@@ -232,8 +241,20 @@ impl DAGExecutor {
             let evaluator = Arc::clone(&dag.evaluator);
             let fwd_ctx = ctx.clone_for_branch();
             let sink = ctx.output_tx.clone();
+            let fwd_cancel = cancel.clone();
+            // Every await in the forwarder selects on `fwd_cancel` so a forwarder blocked on a
+            // full channel (downstream stalled or sink reader gone) terminates on cancellation
+            // instead of leaking.
             fwd_handles.push(tokio::spawn(async move {
-                while let Some(chunk) = out_rx.recv().await {
+                'fwd: loop {
+                    let chunk = tokio::select! {
+                        biased;
+                        _ = fwd_cancel.cancelled() => break 'fwd,
+                        chunk = out_rx.recv() => match chunk {
+                            Some(c) => c,
+                            None => break 'fwd,
+                        },
+                    };
                     if downstream.is_empty() {
                         // Terminal node → deliver to the client as produced.
                         if let Some(s) = &sink {
@@ -243,7 +264,11 @@ impl DAGExecutor {
                                 _ => None,
                             };
                             if let Some(o) = out {
-                                let _ = s.send(o).await;
+                                tokio::select! {
+                                    biased;
+                                    _ = fwd_cancel.cancelled() => break 'fwd,
+                                    res = s.send(o) => { let _ = res; }
+                                }
                             }
                         }
                         continue;
@@ -255,7 +280,11 @@ impl DAGExecutor {
                             None => true,
                         };
                         if pass {
-                            let _ = tx.send(chunk.clone()).await;
+                            tokio::select! {
+                                biased;
+                                _ = fwd_cancel.cancelled() => break 'fwd,
+                                res = tx.send(chunk.clone()) => { let _ = res; }
+                            }
                         }
                     }
                 }
@@ -270,28 +299,37 @@ impl DAGExecutor {
         }
         drop(in_tx);
 
-        // Forwarders finish first (they end when their node's output closes); then the node tasks.
+        // Await node tasks in COMPLETION order. On the FIRST failure (error return or panic),
+        // cancel the execution-scoped token so every remaining task — upstream nodes still
+        // producing and forwarders blocked on bounded channels — terminates promptly instead of
+        // leaking, then keep draining so nothing outlives this call (MASTER_PLAN §5:
+        // streaming-forwarder leak).
+        let mut first_err: Option<DAGError> = None;
+        while let Some(res) = node_tasks.join_next().await {
+            let err = match res {
+                Ok(Ok(())) => None,
+                Ok(Err((node_id, e))) => Some(DAGError::NodeExecutionError {
+                    node_id,
+                    error: e.to_string(),
+                }),
+                Err(join) => Some(DAGError::NodeExecutionError {
+                    node_id: "<join>".into(),
+                    error: format!("streaming node task failed: {join}"),
+                }),
+            };
+            if let Some(e) = err {
+                cancel.cancel();
+                first_err.get_or_insert(e);
+            }
+        }
+        // Forwarders end when their node's output closes — or via `cancel` on the failure path.
         for h in fwd_handles {
             let _ = h.await;
         }
-        for h in node_handles {
-            match h.await {
-                Ok(Ok(())) => {}
-                Ok(Err((node_id, e))) => {
-                    return Err(DAGError::NodeExecutionError {
-                        node_id,
-                        error: e.to_string(),
-                    });
-                }
-                Err(join) => {
-                    return Err(DAGError::NodeExecutionError {
-                        node_id: "<join>".into(),
-                        error: format!("streaming node task failed: {join}"),
-                    });
-                }
-            }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// Record success/failure/cancellation metrics + tracing for a finished run.
@@ -1534,5 +1572,293 @@ mod tests {
             par
         );
         assert_eq!(par, seq, "parallel result must equal sequential result");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Streaming task cleanup (MASTER_PLAN §5: streaming-forwarder leak)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// RAII guard tracking live `execute_streaming` tasks: +1 on construction,
+    /// −1 on drop — so the counter is exact even on early return / error paths.
+    struct TaskGuard(Arc<AtomicUsize>);
+    impl TaskGuard {
+        fn enter(counter: &Arc<AtomicUsize>) -> Self {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Self(counter.clone())
+        }
+    }
+    impl Drop for TaskGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Streams ticks indefinitely after consuming its seed input — like a live
+    /// STT/LLM provider mid-generation. Only cancellation or downstream closure
+    /// stops it; its INPUT channel closing does not.
+    struct InfiniteSourceNode {
+        id: String,
+        live: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl DAGNode for InfiniteSourceNode {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn node_type(&self) -> &str {
+            "infinite_source"
+        }
+        fn capabilities(&self) -> Vec<NodeCapability> {
+            vec![NodeCapability::TextInput, NodeCapability::TextOutput]
+        }
+        async fn execute(&self, _input: DAGData, _ctx: &mut DAGContext) -> DAGResult<DAGData> {
+            Ok(DAGData::Text("tick".into()))
+        }
+        async fn execute_streaming(
+            &self,
+            mut inputs: mpsc::Receiver<DAGData>,
+            ctx: &mut DAGContext,
+            outputs: mpsc::Sender<DAGData>,
+        ) -> DAGResult<()> {
+            let _live = TaskGuard::enter(&self.live);
+            let _ = inputs.recv().await; // consume the seed
+            loop {
+                tokio::select! {
+                    _ = ctx.cancel_token.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(2)) => {
+                        if outputs.send(DAGData::Text("tick".into())).await.is_err() {
+                            break; // downstream gone
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        fn clone_boxed(&self) -> Arc<dyn DAGNode> {
+            Arc::new(Self {
+                id: self.id.clone(),
+                live: self.live.clone(),
+            })
+        }
+    }
+
+    /// Fails on the first chunk it receives — the "middle node errors" case.
+    struct FailingMidNode {
+        id: String,
+        live: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl DAGNode for FailingMidNode {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn node_type(&self) -> &str {
+            "failing_mid"
+        }
+        fn capabilities(&self) -> Vec<NodeCapability> {
+            vec![NodeCapability::TextInput, NodeCapability::TextOutput]
+        }
+        async fn execute(&self, _input: DAGData, _ctx: &mut DAGContext) -> DAGResult<DAGData> {
+            Err(DAGError::NodeExecutionError {
+                node_id: self.id.clone(),
+                error: "boom".into(),
+            })
+        }
+        async fn execute_streaming(
+            &self,
+            mut inputs: mpsc::Receiver<DAGData>,
+            _ctx: &mut DAGContext,
+            _outputs: mpsc::Sender<DAGData>,
+        ) -> DAGResult<()> {
+            let _live = TaskGuard::enter(&self.live);
+            let _ = inputs.recv().await; // wait for the first chunk, then fail
+            Err(DAGError::NodeExecutionError {
+                node_id: self.id.clone(),
+                error: "boom".into(),
+            })
+        }
+        fn clone_boxed(&self) -> Arc<dyn DAGNode> {
+            Arc::new(Self {
+                id: self.id.clone(),
+                live: self.live.clone(),
+            })
+        }
+    }
+
+    /// Passthrough that tracks task liveness.
+    struct GuardedPassthroughNode {
+        id: String,
+        live: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl DAGNode for GuardedPassthroughNode {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn node_type(&self) -> &str {
+            "guarded_passthrough"
+        }
+        fn capabilities(&self) -> Vec<NodeCapability> {
+            vec![NodeCapability::TextInput, NodeCapability::TextOutput]
+        }
+        async fn execute(&self, input: DAGData, _ctx: &mut DAGContext) -> DAGResult<DAGData> {
+            Ok(input)
+        }
+        async fn execute_streaming(
+            &self,
+            mut inputs: mpsc::Receiver<DAGData>,
+            _ctx: &mut DAGContext,
+            outputs: mpsc::Sender<DAGData>,
+        ) -> DAGResult<()> {
+            let _live = TaskGuard::enter(&self.live);
+            while let Some(item) = inputs.recv().await {
+                if outputs.send(item).await.is_err() {
+                    break; // downstream gone
+                }
+            }
+            Ok(())
+        }
+        fn clone_boxed(&self) -> Arc<dyn DAGNode> {
+            Arc::new(Self {
+                id: self.id.clone(),
+                live: self.live.clone(),
+            })
+        }
+    }
+
+    /// Build a linear src → mid → sink streaming DAG with the given node impls.
+    fn build_streaming_chain(
+        src: Arc<dyn DAGNode>,
+        mid: Arc<dyn DAGNode>,
+        sink: Arc<dyn DAGNode>,
+    ) -> CompiledDAG {
+        let compiler = DAGCompiler::new();
+        let mut def = DAGDefinition::new("stream-chain", "Streaming chain DAG");
+        def.add_node(NodeDefinition::new("src", NodeType::Passthrough));
+        def.add_node(NodeDefinition::new("mid", NodeType::Passthrough));
+        def.add_node(NodeDefinition::new("sink", NodeType::Passthrough));
+        def.add_edge(EdgeDefinition::new("src", "mid"));
+        def.add_edge(EdgeDefinition::new("mid", "sink"));
+        def.with_entry("src");
+        def.add_exit("sink");
+        let mut dag = compiler.compile(def).unwrap();
+
+        let idx_src = dag.get_node_index("src").unwrap();
+        let idx_mid = dag.get_node_index("mid").unwrap();
+        let idx_sink = dag.get_node_index("sink").unwrap();
+        dag.graph[idx_src].node = src;
+        dag.graph[idx_mid].node = mid;
+        dag.graph[idx_sink].node = sink;
+        dag
+    }
+
+    /// MASTER_PLAN §5 (streaming-forwarder leak): when the MIDDLE node of a
+    /// 3-node streaming pipeline errors, the executor must surface that error
+    /// AND tear down every spawned task — including the infinite upstream
+    /// producer and its forwarder. Pre-fix the executor blocked forever on the
+    /// source's forwarder (the source never stops on its own), so the 500 ms
+    /// deadline IS the leak assertion; the guard counter then proves every
+    /// node task actually exited.
+    #[tokio::test]
+    async fn test_streaming_mid_node_error_terminates_all_tasks() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let dag = build_streaming_chain(
+            Arc::new(InfiniteSourceNode {
+                id: "src".into(),
+                live: live.clone(),
+            }),
+            Arc::new(FailingMidNode {
+                id: "mid".into(),
+                live: live.clone(),
+            }),
+            Arc::new(GuardedPassthroughNode {
+                id: "sink".into(),
+                live: live.clone(),
+            }),
+        );
+
+        let executor = DAGExecutor::new();
+        let mut ctx = DAGContext::new("leak-test");
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            executor.execute_streaming_from(&dag, "src", DAGData::Text("go".into()), &mut ctx),
+        )
+        .await
+        .expect("streaming execution must terminate within 500ms after a node error");
+
+        match result {
+            Err(DAGError::NodeExecutionError { node_id, .. }) => {
+                assert_eq!(node_id, "mid", "error must come from the failing middle node");
+            }
+            other => panic!("expected mid-node execution error, got {:?}", other),
+        }
+
+        // Every node task must have exited (its guard dropped). The executor
+        // joins all tasks before returning, so this is already 0; poll briefly
+        // anyway so the assertion is about "within 500ms", not instantaneity.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while live.load(Ordering::SeqCst) != 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            live.load(Ordering::SeqCst),
+            0,
+            "all streaming node tasks must terminate after a node error"
+        );
+
+        // The failure must cancel only the execution-scoped CHILD token, never
+        // the caller's session token (or barge-in state would be poisoned for
+        // subsequent turns).
+        assert!(
+            !ctx.cancel_token.is_cancelled(),
+            "session cancel token must not be poisoned by a node failure"
+        );
+    }
+
+    /// Happy path regression for the cleanup rework: a 3-node passthrough chain
+    /// still streams its input through to the client sink and all tasks exit.
+    #[tokio::test]
+    async fn test_streaming_happy_path_delivers_and_cleans_up() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let dag = build_streaming_chain(
+            Arc::new(GuardedPassthroughNode {
+                id: "src".into(),
+                live: live.clone(),
+            }),
+            Arc::new(GuardedPassthroughNode {
+                id: "mid".into(),
+                live: live.clone(),
+            }),
+            Arc::new(GuardedPassthroughNode {
+                id: "sink".into(),
+                live: live.clone(),
+            }),
+        );
+
+        let executor = DAGExecutor::new();
+        let (out_tx, mut out_rx) = mpsc::channel::<DagOutput>(16);
+        let mut ctx = DAGContext::new("happy-test");
+        ctx.output_tx = Some(out_tx);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            executor.execute_streaming_from(&dag, "src", DAGData::Text("go".into()), &mut ctx),
+        )
+        .await
+        .expect("streaming execution must terminate");
+        assert!(result.is_ok(), "happy path must succeed, got {:?}", result);
+
+        // The terminal forwarder delivered the chunk to the client sink before
+        // the executor returned (all tasks are joined first).
+        match out_rx.try_recv() {
+            Ok(DagOutput::Text(t)) => assert_eq!(t, "go"),
+            other => panic!("expected DagOutput::Text(\"go\"), got {:?}", other),
+        }
+        assert_eq!(live.load(Ordering::SeqCst), 0, "all tasks must have exited");
+        assert!(!ctx.cancel_token.is_cancelled());
     }
 }
