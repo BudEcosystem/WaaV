@@ -379,16 +379,16 @@ impl TTSProvider {
                 let encoding = config.audio_format.as_deref().unwrap_or("linear16");
                 let sample_rate = config.sample_rate.unwrap_or(24000) as usize;
                 let (mut chunk_target_bytes, bytes_per_sample) = match encoding {
-                    // Assume mono
-                    "linear16" | "pcm" => ((sample_rate / 100) * 2, 2usize), // ~10ms
+                    // Assume mono. Keep this family in lockstep with
+                    // sniff::is_pcm_family (review-found: "pcm16" was missing,
+                    // bypassing both 10ms framing and container detection).
+                    "linear16" | "pcm" | "pcm16" => ((sample_rate / 100) * 2, 2usize), // ~10ms
                     "mulaw" | "ulaw" | "alaw" => ((sample_rate / 100), 1usize),
                     _ => (0usize, 0usize),
                 };
 
                 // Guard against tiny sample rates
-                if chunk_target_bytes == 0
-                    && matches!(encoding, "linear16" | "pcm" | "mulaw" | "ulaw" | "alaw")
-                {
+                if chunk_target_bytes == 0 && crate::core::tts::sniff::is_pcm_family(encoding) {
                     chunk_target_bytes = (sample_rate.max(100) / 100) * bytes_per_sample.max(1);
                 }
 
@@ -401,12 +401,17 @@ impl TTSProvider {
                 };
 
                 let mut stream = response.bytes_stream();
-                // P0.1: sniff the FIRST payload. If the provider returned a
+                // P0.1: sniff the stream PRELUDE. If the provider returned a
                 // container (WAV/MP3/OGG/FLAC) while a PCM family is declared,
                 // slicing it into "PCM" frames corrupts the audio — switch the
                 // whole stream to passthrough and label chunks with the truth.
+                // Review-found: a container header can be SPLIT across HTTP
+                // chunks (RIFF needs 12 bytes), so buffer a small prelude until
+                // the verdict is provable instead of deciding on chunk #1 alone.
+                const SNIFF_PRELUDE_BYTES: usize = 16;
                 let mut format_override: Option<&'static str> = None;
-                let mut first_payload = true;
+                let mut sniff_pending = chunk_target_bytes > 0;
+                let mut prelude: Vec<u8> = Vec::new();
                 while let Some(item) = stream.next().await {
                     if token.is_cancelled() {
                         break;
@@ -416,11 +421,16 @@ impl TTSProvider {
                         Ok(bytes) => {
                             let mut incoming = bytes.as_ref();
 
-                            if first_payload && !incoming.is_empty() {
-                                first_payload = false;
-                                if chunk_target_bytes > 0
-                                    && let Some(container) =
-                                        crate::core::tts::sniff::sniff_container(incoming)
+                            if sniff_pending && !incoming.is_empty() {
+                                prelude.extend_from_slice(incoming);
+                                if prelude.len() < SNIFF_PRELUDE_BYTES {
+                                    // Hold judgement until the magic is provable
+                                    // (or the stream ends — flushed below).
+                                    continue;
+                                }
+                                sniff_pending = false;
+                                if let Some(container) =
+                                    crate::core::tts::sniff::sniff_container(&prelude)
                                 {
                                     error!(
                                         declared = encoding,
@@ -435,6 +445,21 @@ impl TTSProvider {
                                     chunk_target_bytes = 0; // passthrough for the whole stream
                                     format_override = Some(container.as_format_str());
                                 }
+                                // Process the buffered prelude through whichever
+                                // path the verdict selected.
+                                let buffered = std::mem::take(&mut prelude);
+                                if chunk_target_bytes == 0 {
+                                    if let Some(ref mut full) = full_audio {
+                                        full.extend_from_slice(&buffered);
+                                    }
+                                    let _ = sender.send(Ok((buffered, format_override))).await;
+                                    continue;
+                                }
+                                // PCM verdict: run the prelude through the
+                                // aggregation loop below by treating it as the
+                                // incoming slice for this iteration.
+                                prelude = buffered;
+                                incoming = prelude.as_slice();
                             }
 
                             if chunk_target_bytes == 0 {
@@ -487,6 +512,22 @@ impl TTSProvider {
                             return;
                         }
                     }
+                }
+
+                // Flush an undecided prelude (stream ended before 16 bytes —
+                // sniff on what we have, then deliver it).
+                if sniff_pending && !prelude.is_empty() && !token.is_cancelled() {
+                    if let Some(container) = crate::core::tts::sniff::sniff_container(&prelude) {
+                        crate::core::metrics::bridge::record_tts_format_mismatch(
+                            &config.provider,
+                            "http",
+                        );
+                        format_override = Some(container.as_format_str());
+                    }
+                    if let Some(ref mut full) = full_audio {
+                        full.extend_from_slice(&prelude);
+                    }
+                    let _ = sender.send(Ok((prelude, format_override))).await;
                 }
 
                 // Flush remainder

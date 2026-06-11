@@ -45,10 +45,22 @@ pub fn sniff_container(bytes: &[u8]) -> Option<SniffedContainer> {
     if bytes.len() >= 3 && &bytes[0..3] == b"ID3" {
         return Some(SniffedContainer::Mp3);
     }
-    // Bare MPEG audio frame sync: 11 set bits + valid version/layer nibble.
-    // 0xFF 0xFB/0xFA/0xF3/0xF2/0xE3… — accept 0xFF then 0b111xxxxx with the
-    // layer bits not "00" (reserved). Conservative: requires version bits too.
-    if bytes.len() >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0 && (bytes[1] & 0x06) != 0 {
+    // Bare MPEG audio frame sync. CRITICAL false-positive guard (found by the
+    // adversarial review): raw PCM whose first sample is -1 is 0xFF 0xFF and
+    // matches a naive sync check. Validate the full header nibble set:
+    //   byte1: 11-bit sync + version not reserved (0b01) + layer not reserved
+    //   byte2: bitrate nibble not invalid (0xF) + sample-rate bits not
+    //          reserved (0b11)
+    // An all-0xFF PCM run fails on bitrate=0xF; real MP3 frames pass.
+    if bytes.len() >= 4
+        && bytes[0] == 0xFF
+        && (bytes[1] & 0xE0) == 0xE0
+        && (bytes[1] & 0x18) != 0x08 // version: reserved
+        && (bytes[1] & 0x06) != 0x00 // layer: reserved
+        && (bytes[2] & 0xF0) != 0xF0 // bitrate: invalid
+        && (bytes[2] & 0xF0) != 0x00 // bitrate: "free" — legal but unused by real encoders; PCM noise hits it
+        && (bytes[2] & 0x0C) != 0x0C // sample rate: reserved
+    {
         return Some(SniffedContainer::Mp3);
     }
     // Ogg
@@ -89,6 +101,19 @@ mod tests {
         assert_eq!(sniff_container(b"ID3\x04\x00rest"), Some(SniffedContainer::Mp3));
         assert_eq!(sniff_container(&[0xFF, 0xFB, 0x90, 0x00]), Some(SniffedContainer::Mp3));
         assert_eq!(sniff_container(&[0xFF, 0xF3, 0x18, 0xC4]), Some(SniffedContainer::Mp3));
+    }
+
+    /// Adversarial-review regression: PCM whose first samples are -1 (all
+    /// 0xFF bytes) must NOT be sniffed as MP3 — bitrate nibble 0xF is invalid.
+    #[test]
+    fn pcm_negative_one_samples_are_not_mp3() {
+        assert_eq!(sniff_container(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]), None);
+        // full-scale click then normal audio
+        assert_eq!(sniff_container(&[0xFF, 0xFF, 0x00, 0x01, 0x12, 0x00]), None);
+        // reserved version / reserved layer / reserved sample-rate variants
+        assert_eq!(sniff_container(&[0xFF, 0xEB, 0x90, 0x00]), None); // version reserved
+        assert_eq!(sniff_container(&[0xFF, 0xF9, 0x9C, 0x00]), None); // layer reserved
+        assert_eq!(sniff_container(&[0xFF, 0xFB, 0x9C, 0x00]), None); // samplerate reserved
     }
 
     #[test]
