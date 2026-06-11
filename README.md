@@ -43,8 +43,10 @@ WaaV eliminates the complexity of integrating with multiple voice AI providers b
 
 ## Table of Contents
 
+- [Latest Updates](#latest-updates)
 - [Quick Start](#quick-start)
 - [Audio Processing Pipeline](#audio-processing-pipeline)
+- [Realtime & Latency](#realtime--latency)
 - [Features](#features)
 - [DAG Pipeline Engine](#dag-pipeline-engine)
 - [Providers](#providers)
@@ -54,8 +56,32 @@ WaaV eliminates the complexity of integrating with multiple voice AI providers b
 - [API Reference](#api-reference)
 - [Configuration](#configuration)
 - [Performance](#performance)
+- [Roadmap & TODO](#roadmap--todo)
 - [Contributing](#contributing)
 - [License](#license)
+
+---
+
+## Latest Updates
+
+**June 2026 — Realtime & production-hardening release.** A full brutal audit + measured-latency rebuild landed across the gateway. Every change below ships with extreme-TDD coverage and was validated **live against real providers** (lib suite ~5,820 tests, 0 failing). Detailed reports live alongside this README: [`AUDIT_REPORT.md`](AUDIT_REPORT.md), [`LATENCY_ANALYSIS.md`](LATENCY_ANALYSIS.md), [`REALTIME_ROADMAP.md`](REALTIME_ROADMAP.md), [`MASTER_PLAN.md`](MASTER_PLAN.md).
+
+**Realtime**
+- **Streaming WebSocket TTS** — Deepgram Aura over `wss://…/v1/speak` with per-utterance cancellation. Live-measured **first-audio ~510 ms vs ~1,510 ms** for the batch/HTTP path. Selected via the standardized `tts_config.features.streaming` flag; HTTP providers keep working unchanged.
+- **Eager end-of-turn** — on a turn-complete *prediction*, the LLM starts speculatively with **staged history** (never mutated); a confirming final commits + speaks, a divergent one cancels with zero history pollution. Opt-in via `conversation_config.eager_eot`.
+- **ML turn detection, standardized** — `stt_config.turn_detection { enabled, threshold, eager }` runs the smart-turn detector on the live frame path for *every* STT provider; feature-less builds degrade loudly.
+- **Live latency profiler** — per-turn timeline (`audio_in → stt_final → llm_first_token → tts_first_audio → audio_out`) with bottleneck attribution, on Prometheus (`waav_turn_*`, `waav_frame_*`) + an auth-gated `GET /debug/profile` (JSON snapshot) and `/debug/profile/stream` (SSE), enabled with `WAAV_DEBUG_PROFILE=1`.
+
+**Correctness & production-readiness**
+- **Audio format truth** — magic-byte container sniffing (WAV/MP3/OGG/FLAC) at every audio boundary (HTTP stream, cache write, cache hit, and the universal egress point) so a container can never be sliced as PCM. Fixes the silent-corruption class fleet-wide.
+- **Credential precedence** — placeholder values in `config.yaml` (e.g. `your-…-api-key`) are treated as unset so the documented `# ENV:` fallback applies; placeholders are never sent to a provider.
+- **Speech-final state machine** — race-free generation-counter fire claims + deadline-rereading hard timeout; all turn-timing decisions use a monotonic clock (immune to NTP/VM clock steps).
+- **Supervised reconnect** — circuit-breaker + storm-controlled reconnect governor across the streaming STT fleet (AssemblyAI migrated this release).
+- **Hardware portability** — single ONNX execution-provider policy (`WAAV_ORT_EP=auto|cpu|cuda|tensorrt|coreml|directml|xnnpack`) with a guaranteed CPU fallback and per-EP availability probing.
+- **Chaos lifecycle** — graceful SIGTERM session drain, per-message-class WebSocket backpressure (audio sheds stale frames, transcripts/errors never dropped), one-config-per-session, and a cached/optionally-token-gated `/metrics`.
+- **Consolidated SSRF guard** — one canonical validator (`core::net`) for all client-supplied URLs (DAG endpoints, LLM base URLs, TTS endpoint overrides), closing IPv6-multicast / decimal-IP / CGNAT gaps.
+
+> ⚠️ Some provider integrations beyond the live-validated set remain protocol-flagged; see [Roadmap & TODO](#roadmap--todo) and `AUDIT_REPORT.md` for the exact status per provider.
 
 ---
 
@@ -177,6 +203,29 @@ Intelligent end-of-turn detection using ONNX Runtime with LiveKit's turn-detecto
 
 ---
 
+## Realtime & Latency
+
+WaaV is built for **natural-conversation latency** — the user-perceived metric is *end-of-speech → first response audio*. The gateway's own orchestration overhead is **~12 ms** (measured); the budget is dominated by provider/network cost, which WaaV minimizes through streaming overlap and turn prediction.
+
+**The budget (measured, this host → provider):**
+
+| Stage | Cost | Lever |
+|-------|------|-------|
+| STT finalization | ~250–700 ms (endpointing) | ML turn detection (`turn_detection.enabled`) predicts end-of-turn early |
+| Gateway glue | **~12 ms** | n/a — not the bottleneck |
+| LLM time-to-first-token | provider-dependent | use a fast, **non-reasoning** model (reasoning models stream thoughts, not the answer) |
+| TTS first-audio | **~510 ms streaming** / ~1,510 ms batch | `tts_config.features.streaming` |
+
+**Make it realtime:**
+1. `tts_config.features.streaming: true` — WebSocket TTS (Deepgram Aura today).
+2. A low-TTFT, non-reasoning LLM in `conversation_config` (or DAG `llm` node).
+3. `stt_config.turn_detection.enabled: true` (+ `eager: true` and `conversation_config.eager_eot: true` for speculative starts).
+4. Watch it live: `WAAV_DEBUG_PROFILE=1` then `GET /debug/profile` — per-turn p50/p90/p99 per stage, bottleneck histogram, and a `realtime_blockers` block.
+
+See [`LATENCY_ANALYSIS.md`](LATENCY_ANALYSIS.md) for the full measured breakdown and [`REALTIME_ROADMAP.md`](REALTIME_ROADMAP.md) for the SOTA-researched path to sub-300 ms.
+
+---
+
 ## Features
 
 ### Core Capabilities
@@ -221,7 +270,7 @@ cargo build --release --features dag-routing,turn-detect,noise-filter,openapi
 
 WaaV Gateway supports **27 STT providers**, **32 TTS providers**, and **2 Realtime providers** with global coverage including specialized regional providers.
 
-### Speech-to-Text (STT) - 27 Providers
+### Speech-to-Text (STT) - 31 Providers
 
 | Category | Providers |
 |----------|-----------|
@@ -233,7 +282,7 @@ WaaV Gateway supports **27 STT providers**, **32 TTS providers**, and **2 Realti
 | **East Asia** | NAVER CLOVA (Korea), AmiVoice (Japan) |
 | **Southeast Asia** | Zalo AI, FPT.AI, Viettel AI (Vietnam), Prosa.ai (Indonesia), NECTEC (Thailand) |
 
-### Text-to-Speech (TTS) - 32 Providers
+### Text-to-Speech (TTS) - 36 Providers
 
 | Category | Providers |
 |----------|-----------|
@@ -759,8 +808,33 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
-panic = "abort"
+panic = "unwind"   # per-session panic isolation: a bad frame kills one
+                   # connection (caught by catch_unwind), never the process
 ```
+
+---
+
+## Roadmap & TODO
+
+Tracked, well-scoped follow-ups from the production-hardening audit (full detail in [`MASTER_PLAN.md`](MASTER_PLAN.md) §8 and [`AUDIT_REPORT.md`](AUDIT_REPORT.md)):
+
+**Realtime**
+- [ ] Sub-sentence token streaming to WS TTS (`flush=false` deltas) to recover the full overlap window
+- [ ] WebSocket TTS for more providers (Cartesia, ElevenLabs streaming) behind the same `features.streaming` flag
+- [ ] Supervised reconnect for WebSocket TTS (currently lazy reconnect-on-next-speak)
+- [ ] Speech-to-speech (S2S) DAG node — native audio-in/audio-out models (gpt-realtime / Gemini Live / Nova Sonic / self-hosted Moshi)
+- [ ] Smart Turn v3 model swap pending the accuracy gate + GPU execution-provider numbers
+
+**Standardization & accuracy**
+- [ ] Canonical `is_final` / `is_speech_final` semantics + a fleet conformance test (fix ElevenLabs interim flags, Google `SpeechActivityEnd`)
+- [ ] Warn-on-unknown for WebSocket config fields (surface typo'd keys instead of silently ignoring them)
+- [ ] OpenAI realtime STT WebSocket path (currently batch-only)
+- [ ] Provider long-tail verification — several integrations remain protocol-flagged (see `AUDIT_REPORT.md` per-provider table)
+
+**Chaos & ops**
+- [ ] LiveKit operation-queue shutdown handshake + depth wiring into the profiler
+- [ ] Migrate the Deepgram STT client off its legacy reconnect loop onto `ReconnectableStream`
+- [ ] Re-bless `docs/openapi.yaml` when the wire enums next change
 
 ---
 
