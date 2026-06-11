@@ -13,6 +13,7 @@
 
 pub mod api;
 pub mod dag;
+pub mod debug_profile;
 pub mod livekit;
 pub mod realtime;
 pub mod recording;

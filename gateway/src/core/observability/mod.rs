@@ -25,11 +25,20 @@
 
 pub mod latency;
 pub mod observer;
+pub mod profiler;
 pub mod speaking;
+pub mod turn_profile;
 
-pub use latency::{LatencyMetrics, UserBotLatencyObserver};
+pub use latency::{LatencyMetrics, UserBotLatencyObserver, now_monotonic_ns};
 pub use observer::{ObserverRegistry, VoiceObserver};
+pub use profiler::{
+    FrameProfiler, LatencyProfiler, ProfileSnapshot, ProfilingConfig, RealtimeBlockers,
+    RollingWindow, SubscriberGuard, WindowStats,
+};
 pub use speaking::{BotSpeakingStarted, BotSpeakingState, BotSpeakingStopped};
+pub use turn_profile::{
+    QueueSnapshot, Stage, TurnOutcome, TurnPath, TurnProfiler, TurnSink, TurnSummary, TurnTrace,
+};
 
 #[cfg(test)]
 mod tests {

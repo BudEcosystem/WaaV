@@ -11,6 +11,7 @@ use tokio::time::Duration;
 use tracing::debug;
 
 use crate::core::cache::store::CacheStore;
+use crate::core::observability::ObserverRegistry;
 use crate::core::{
     create_stt_provider, create_tts_provider,
     stt::{
@@ -81,6 +82,11 @@ pub struct VoiceManager {
 
     // Notification for audio clear completion instead of sleep
     clear_notify: Arc<Notify>,
+
+    // Per-session observer registry (latency profiling / instrumentation).
+    // None ⇒ a single relaxed read per call site, zero work. Set once at
+    // session setup via `set_observers`; read-mostly thereafter.
+    observers: Arc<SyncRwLock<Option<Arc<ObserverRegistry>>>>,
 }
 
 impl VoiceManager {
@@ -185,7 +191,20 @@ impl VoiceManager {
             }),
             config,
             clear_notify: Arc::new(Notify::new()),
+            observers: Arc::new(SyncRwLock::new(None)),
         })
+    }
+
+    /// Attach a per-session observer registry (latency profiling, custom
+    /// instrumentation). Hooks fire on the audio/STT/TTS paths; with no
+    /// registry attached every hook site is a single cheap read.
+    pub fn set_observers(&self, registry: Arc<ObserverRegistry>) {
+        *self.observers.write() = Some(registry);
+    }
+
+    /// The attached observer registry, if any (cloned `Arc`).
+    pub fn observers(&self) -> Option<Arc<ObserverRegistry>> {
+        self.observers.read().clone()
     }
 
     /// Set the TTS cache store and optionally the precomputed TTS config hash
@@ -407,6 +426,12 @@ impl VoiceManager {
         // CRITICAL: Audio MUST always reach STT provider for real-time guarantees.
         // Smart turn processing is optional - skip if lock is busy to avoid blocking.
 
+        // Per-frame profiling anchor (None ⇒ one cheap read, no work).
+        let frame_observers = self.observers.read().clone();
+        if let Some(obs) = &frame_observers {
+            obs.notify_audio_in(crate::core::observability::now_monotonic_ns());
+        }
+
         // Process audio through Smart Turn Processor if enabled AND lock is available
         #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
         {
@@ -422,6 +447,13 @@ impl VoiceManager {
                         // Process through smart turn detector
                         match processor.process_audio(&samples).await {
                             Ok(result) => {
+                                if let Some(obs) = &frame_observers {
+                                    obs.notify_smart_turn(
+                                        result.latency_us,
+                                        result.is_turn_complete,
+                                        crate::core::observability::now_monotonic_ns(),
+                                    );
+                                }
                                 // If turn was detected, call the callback
                                 if result.is_turn_complete {
                                     debug!(
@@ -448,6 +480,9 @@ impl VoiceManager {
                     // This is expected under high load. Log at trace level to enable monitoring
                     // without flooding logs. Audio will still be sent to STT below.
                     // Turn detection may be slightly delayed but audio latency is preserved.
+                    if let Some(obs) = &frame_observers {
+                        obs.notify_frame_skipped();
+                    }
                     tracing::trace!(
                         "Smart turn lock contended, skipping frame. Audio forwarding continues."
                     );
@@ -513,6 +548,11 @@ impl VoiceManager {
     /// # }
     /// ```
     pub async fn speak(&self, text: &str, flush: bool) -> VoiceManagerResult<()> {
+        // Per-turn profiling anchor: TTS synthesis requested (first-of-turn
+        // dedup happens inside the profiler).
+        if let Some(obs) = self.observers.read().clone() {
+            obs.notify_tts_request(crate::core::observability::now_monotonic_ns());
+        }
         // Send text to TTS provider
         {
             let mut tts = self.tts.write().await;
@@ -698,6 +738,7 @@ impl VoiceManager {
         let speech_final_state_clone = self.speech_final_state.clone();
         let interruption_state_clone = self.interruption_state.clone();
         let turn_detector_clone = self.turn_detector.clone();
+        let observers_clone = self.observers.clone();
 
         // Create STT processor with configured timeouts from VoiceManagerConfig
         let processing_config = STTProcessingConfig::new(
@@ -717,6 +758,7 @@ impl VoiceManager {
             let interruption_state = interruption_state_clone.clone();
             let turn_detector = turn_detector_clone.clone();
             let stt_processor = stt_processor.clone();
+            let observers = observers_clone.read().clone();
 
             Box::pin(async move {
                 // Fast synchronous check for interruption - execute before any async ops
@@ -731,6 +773,17 @@ impl VoiceManager {
                     .await;
 
                 if let Some(processed_result) = processed_result {
+                    // Per-turn profiling anchors: partials stamp the lock-free
+                    // pre-EOS slot; the finalized result opens the turn.
+                    if let Some(obs) = &observers {
+                        if processed_result.is_final || processed_result.is_speech_final {
+                            obs.notify_stt_result(&processed_result, 0);
+                        } else {
+                            obs.notify_stt_partial(
+                                crate::core::observability::now_monotonic_ns(),
+                            );
+                        }
+                    }
                     // Call user callback with processed result
                     callback(processed_result).await;
                 }
@@ -842,11 +895,13 @@ impl VoiceManager {
     {
         let user_callback = Arc::new(callback);
         let interruption_state_clone = self.interruption_state.clone();
+        let observers_clone = self.observers.clone();
 
         // Create wrapper that checks clearing state and updates interruption timing
         let wrapper_callback = Arc::new(move |audio_data: AudioData| {
             let user_cb = user_callback.clone();
             let int_state = interruption_state_clone.clone();
+            let observers = observers_clone.read().clone();
 
             Box::pin(async move {
                 // Check if this is new audio after completion
@@ -889,6 +944,14 @@ impl VoiceManager {
                     int_state
                         .non_interruptible_until_ms
                         .store(current_until + chunk_duration_ms, Ordering::Release);
+                }
+
+                // Per-turn profiling anchors: TTS produced audio, and this
+                // delivery to the registered egress callback is the moment the
+                // response becomes audible (first-of-turn dedup in profiler).
+                if let Some(obs) = &observers {
+                    obs.notify_tts_chunk(&audio_data, None);
+                    obs.notify_audio_out(crate::core::observability::now_monotonic_ns());
                 }
 
                 // Call the user's callback

@@ -524,7 +524,12 @@ impl AssemblyAISTT {
                             "Failed to create WebSocket request: {e}"
                         ));
                         error!("{}", stt_error);
-                        let _ = error_tx.try_send(stt_error);
+                        if error_tx.try_send(stt_error).is_err() {
+                            error!(
+                                "AssemblyAI error channel full/closed — fatal connection \
+                                 error NOT delivered to caller (session will appear silent)"
+                            );
+                        }
                         break 'reconnect; // malformed request: fatal
                     }
                 };

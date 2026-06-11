@@ -197,6 +197,27 @@ async fn main() -> anyhow::Result<()> {
             connection_limit_middleware,
         ));
 
+    // Live latency-profile debug surface (`WAAV_DEBUG_PROFILE=1`): JSON snapshot
+    // + per-turn SSE. Auth-gated exactly like the protected API; without the env
+    // flag the routes are not mounted at all (double lock, never public).
+    let debug_profile_routes = if app_state.core_state.profiling.debug_routes {
+        Router::new()
+            .route(
+                "/debug/profile",
+                axum::routing::get(waav_gateway::handlers::debug_profile::profile_snapshot),
+            )
+            .route(
+                "/debug/profile/stream",
+                axum::routing::get(waav_gateway::handlers::debug_profile::profile_stream),
+            )
+            .layer(middleware::from_fn_with_state(
+                app_state.clone(),
+                auth_middleware,
+            ))
+    } else {
+        Router::new()
+    };
+
     // Create webhook routes (no auth - uses LiveKit signature verification)
     let webhook_routes = routes::webhooks::create_webhook_router();
 
@@ -323,6 +344,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(protected_routes)
         .merge(ws_routes)
         .merge(realtime_routes)
+        .merge(debug_profile_routes)
         .with_state(app_state)
         .layer(cors_layer)
         .layer(tower::util::option_layer(governor_layer))

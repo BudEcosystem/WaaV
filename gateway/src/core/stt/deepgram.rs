@@ -436,8 +436,16 @@ impl DeepgramSTT {
         };
 
         url.push_str(endpoint);
+        // An omitted/empty model maps to Deepgram's recommended default (the
+        // WS-config contract: "each provider maps an empty model to its
+        // recommended default"). Emitting a literal `model=` empty param makes
+        // Deepgram reject the handshake with a misleading 401.
         url.push_str("/v1/listen?model=");
-        url.push_str(&config.base.model);
+        if config.base.model.is_empty() {
+            url.push_str("nova-2");
+        } else {
+            url.push_str(&config.base.model);
+        }
         url.push_str("&language=");
         url.push_str(&config.base.language);
         url.push_str("&sample_rate=");

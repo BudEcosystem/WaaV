@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 use crate::config::ServerConfig;
 use crate::core::cache::store::{CacheConfig, CacheStore};
 use crate::core::metrics::MetricsRegistry;
+use crate::core::observability::{LatencyProfiler, ProfilingConfig};
 use crate::core::resilience::ResilienceRegistry;
 use crate::core::tts::get_tts_provider_urls;
 #[cfg(not(feature = "turn-detect"))]
@@ -45,6 +46,12 @@ pub struct CoreState {
     /// startup and threaded into each streaming provider's connect path — replacing the prior
     /// per-session `new()` that defeated both behaviours.
     pub resilience: Arc<ResilienceRegistry>,
+    /// Process-wide live latency profiler (per-turn timeline + per-frame budget hub). Every
+    /// per-session `TurnProfiler`/`FrameProfiler` feeds here; owns the Prometheus emission,
+    /// rolling percentiles, bottleneck tally, and the live SSE broadcast.
+    pub profiler: Arc<LatencyProfiler>,
+    /// Profiling runtime config (env-driven gates for the system + the `/debug/profile*` routes).
+    pub profiling: ProfilingConfig,
 }
 
 impl CoreState {
@@ -135,6 +142,11 @@ impl CoreState {
             .filter(|&n| n > 0)
             .unwrap_or(16);
 
+        // Live latency profiling (per-turn timeline + per-frame budget). Env-gated; the hub is
+        // always constructed (cheap) but is a no-op when disabled.
+        let profiling = ProfilingConfig::from_env();
+        let profiler = Arc::new(LatencyProfiler::from_config(&profiling));
+
         Arc::new(Self {
             tts_req_managers: Arc::new(RwLock::new(tts_req_managers)),
             cache,
@@ -142,6 +154,8 @@ impl CoreState {
             sip_hooks_state,
             metrics: Arc::new(MetricsRegistry::new()),
             resilience: Arc::new(ResilienceRegistry::new(reconnect_cap)),
+            profiler,
+            profiling,
         })
     }
 

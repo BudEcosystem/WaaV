@@ -197,6 +197,38 @@ impl SileroVAD {
             .await
             .context("Failed to read model bytes")?;
 
+        // Supply-chain integrity: the downloaded ONNX blob is executed by the
+        // runtime, so verify it against the pinned SHA-256 of the official
+        // snakers4/silero-vad v5 model (same fail-closed policy as
+        // turn_detect/assets.rs). `WAAV_SKIP_MODEL_HASH_CHECK=1` opts out for
+        // intentionally-updated models.
+        const SILERO_VAD_MODEL_SHA256: &str =
+            "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3";
+        let skip_check = std::env::var("WAAV_SKIP_MODEL_HASH_CHECK")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let actual = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&bytes);
+            format!("{:x}", h.finalize())
+        };
+        if actual != SILERO_VAD_MODEL_SHA256 {
+            if skip_check {
+                tracing::warn!(
+                    expected = SILERO_VAD_MODEL_SHA256,
+                    actual = %actual,
+                    "Silero VAD model hash mismatch — loading anyway (WAAV_SKIP_MODEL_HASH_CHECK set)"
+                );
+            } else {
+                anyhow::bail!(
+                    "Silero VAD model hash mismatch (expected {SILERO_VAD_MODEL_SHA256}, got \
+                     {actual}); refusing to load an unverified ONNX model. Set \
+                     WAAV_SKIP_MODEL_HASH_CHECK=1 to override for an intentional update."
+                );
+            }
+        }
+
         tokio::fs::write(&model_path, &bytes)
             .await
             .context("Failed to write model file")?;

@@ -246,24 +246,86 @@ impl ConversationOrchestrator {
     pub async fn run_turn(&self, transcript: &str) -> Result<(), ConversationOrchestratorError> {
         let (id, token) = self.begin_turn();
 
-        // Stream tokens straight to TTS as they arrive. We buffer into sentence-ish
-        // flushes to avoid a `speak()` call per character while keeping latency low.
+        // Stream tokens to TTS aggregated at SENTENCE boundaries. Per-token
+        // `speak()` is pathological: for HTTP TTS providers it is one synthesis
+        // request per token; for WebSocket providers per-token flushes ruin
+        // prosody. Aggregation keeps latency (first sentence speaks while the
+        // LLM still generates) without either failure mode.
         let vm = self.voice_manager.clone();
         let allow_interruption = self.config.allow_interruption;
         let streaming = self.config.streaming;
+        let observers = self.voice_manager.observers();
 
-        let on_token = if streaming {
+        // Per-turn latency anchor: LLM request starts now.
+        if let Some(obs) = &observers {
+            obs.notify_llm_request(crate::core::observability::now_monotonic_ns());
+        }
+
+        // True once the pump actually delivered any text to TTS (guards the
+        // reasoning-model empty-stream failure mode).
+        let spoke = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let (on_token, pump) = if streaming {
             let token_for_cb = token.clone();
             // Channel from the (sync) token callback to an async pump that calls speak().
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let first_token_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let obs_cb = observers.clone();
             let cb: crate::core::llm::TokenCallback = Arc::new(move |delta: &str| {
+                if !delta.is_empty()
+                    && !first_token_seen.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    && let Some(obs) = &obs_cb
+                {
+                    obs.notify_llm_first_token(crate::core::observability::now_monotonic_ns());
+                }
                 let _ = tx.send(delta.to_string());
             });
 
-            // Pump task: forward token chunks to TTS until the channel closes or
-            // the turn is cancelled.
+            // Pump task: aggregate deltas into sentence-ish chunks, speak each.
             let vm_pump = vm.clone();
-            tokio::spawn(async move {
+            let spoke_pump = spoke.clone();
+            let obs_pump = observers.clone();
+            let handle = tokio::spawn(async move {
+                /// Longest unpunctuated run we hold before flushing anyway —
+                /// bounds added latency for list-y / unpunctuated LLM output.
+                const MAX_HOLD_CHARS: usize = 160;
+                let mut buf = String::new();
+
+                /// Sentence-ish boundary: western + CJK + Devanagari terminators.
+                fn boundary(c: char) -> bool {
+                    matches!(c, '.' | '!' | '?' | '\n' | '।' | '。' | '！' | '？' | '…')
+                }
+
+                async fn flush(
+                    vm: &VoiceManager,
+                    buf: &mut String,
+                    allow_interruption: bool,
+                    spoke: &std::sync::atomic::AtomicBool,
+                    obs: &Option<Arc<crate::core::observability::ObserverRegistry>>,
+                ) -> bool {
+                    let text = std::mem::take(buf);
+                    if text.trim().is_empty() {
+                        return true;
+                    }
+                    if !spoke.swap(true, std::sync::atomic::Ordering::Relaxed)
+                        && let Some(obs) = obs
+                    {
+                        obs.notify_llm_first_sentence(
+                            crate::core::observability::now_monotonic_ns(),
+                        );
+                    }
+                    let res = if allow_interruption {
+                        vm.speak(&text, true).await
+                    } else {
+                        vm.speak_with_interruption(&text, true, false).await
+                    };
+                    if let Err(e) = res {
+                        warn!(error = %e, "speak() during streamed turn failed");
+                        return false;
+                    }
+                    true
+                }
+
                 loop {
                     tokio::select! {
                         biased;
@@ -271,24 +333,26 @@ impl ConversationOrchestrator {
                         maybe = rx.recv() => match maybe {
                             Some(chunk) => {
                                 if chunk.is_empty() { continue; }
-                                let res = if allow_interruption {
-                                    vm_pump.speak(&chunk, true).await
-                                } else {
-                                    vm_pump.speak_with_interruption(&chunk, true, false).await
-                                };
-                                if let Err(e) = res {
-                                    warn!(error = %e, "speak() during streamed turn failed");
+                                buf.push_str(&chunk);
+                                let at_boundary = buf.trim_end().chars().last().is_some_and(boundary);
+                                if (at_boundary || buf.chars().count() >= MAX_HOLD_CHARS)
+                                    && !flush(&vm_pump, &mut buf, allow_interruption, &spoke_pump, &obs_pump).await
+                                {
                                     break;
                                 }
                             }
-                            None => break,
+                            None => {
+                                // Stream ended: speak whatever remains.
+                                let _ = flush(&vm_pump, &mut buf, allow_interruption, &spoke_pump, &obs_pump).await;
+                                break;
+                            }
                         }
                     }
                 }
             });
-            Some(cb)
+            (Some(cb), Some(handle))
         } else {
-            None
+            (None, None)
         };
 
         let result = self
@@ -302,13 +366,43 @@ impl ConversationOrchestrator {
             )
             .await;
 
+        // `complete()` returning drops the token callback → channel closes → the
+        // pump flushes its remainder and exits. Await it so `spoke` is final and
+        // tail text is delivered before we evaluate the empty-content guard.
+        if let Some(handle) = pump {
+            let _ = handle.await;
+        }
+
         self.end_turn(id);
 
         match result {
             Ok(response) => {
-                // Non-streaming: speak the whole reply now. Streaming already
-                // spoke tokens via the pump above.
-                if !streaming && !response.content.trim().is_empty() {
+                let content_empty = response.content.trim().is_empty();
+                if streaming {
+                    // Reasoning-model guard: some models stream only reasoning
+                    // deltas and deliver the answer (or nothing) at the end. If
+                    // the pump spoke nothing, fall back to the final content; if
+                    // that is empty too, say so loudly instead of going silent.
+                    if !spoke.load(std::sync::atomic::Ordering::Relaxed) {
+                        if !content_empty {
+                            if allow_interruption {
+                                self.voice_manager.speak(&response.content, true).await?;
+                            } else {
+                                self.voice_manager
+                                    .speak_with_interruption(&response.content, true, false)
+                                    .await?;
+                            }
+                        } else if !token.is_cancelled() {
+                            warn!(
+                                session = %self.session_id,
+                                "LLM turn produced NO speakable content (reasoning-only \
+                                 model or empty completion) — bot stays silent; check the \
+                                 configured model/max_tokens"
+                            );
+                        }
+                    }
+                } else if !content_empty {
+                    // Non-streaming: speak the whole reply now.
                     if allow_interruption {
                         self.voice_manager.speak(&response.content, true).await?;
                     } else {
@@ -316,6 +410,13 @@ impl ConversationOrchestrator {
                             .speak_with_interruption(&response.content, true, false)
                             .await?;
                     }
+                } else if !token.is_cancelled() {
+                    warn!(
+                        session = %self.session_id,
+                        "LLM turn produced NO speakable content (reasoning-only model or \
+                         empty completion) — bot stays silent; check the configured \
+                         model/max_tokens"
+                    );
                 }
                 Ok(())
             }

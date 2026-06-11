@@ -550,6 +550,26 @@ async fn initialize_voice_manager(
         }
     };
 
+    // Live latency profiling: attach a per-session observer registry feeding the
+    // process-wide LatencyProfiler hub (Prometheus waav_turn_*/waav_frame_* +
+    // /debug/profile). Env-gated by WAAV_TURN_PROFILING (default on); when off,
+    // no registry is attached and every hook site is a single cheap read.
+    if app_state.core_state.profiler.is_enabled() {
+        use crate::core::observability::{
+            FrameProfiler, ObserverRegistry, TurnProfiler, TurnSink, UserBotLatencyObserver,
+        };
+        let hub = app_state.core_state.profiler.clone();
+        let registry = Arc::new(ObserverRegistry::new());
+        registry.register(Arc::new(TurnProfiler::new(
+            uuid::Uuid::new_v4().to_string(),
+            hub.clone() as Arc<dyn TurnSink>,
+        )));
+        registry.register(Arc::new(FrameProfiler::new(hub)));
+        // Finally activates the long-dormant user↔bot latency observer too.
+        registry.register(Arc::new(UserBotLatencyObserver::new(256)));
+        voice_manager.set_observers(registry);
+    }
+
     // Set up TTS cache (hash computed above from the full standardized config, incl. features/extras)
     if let Err(e) = voice_manager
         .set_tts_cache(app_state.cache(), Some(tts_cfg_hash))
