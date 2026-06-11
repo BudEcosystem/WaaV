@@ -279,6 +279,27 @@ impl VoiceManager {
             }
         }
 
+        // LOUD degradation (RC5): a session running without ANY ML end-of-turn
+        // signal falls back to fixed timers — the single largest silent latency
+        // regression a deployment can hit. Say so, once, at session start.
+        {
+            #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+            let has_smart_turn = self.config.smart_turn_config.is_some();
+            #[cfg(not(any(feature = "silero-vad", feature = "smart-turn")))]
+            let has_smart_turn = false;
+            if !has_smart_turn && self.turn_detector.is_none() {
+                tracing::warn!(
+                    "TURN DETECTION DEGRADED: no smart-turn processor and no text \
+                     turn-detector — end-of-turn falls back to fixed timers \
+                     ({}ms provider wait / {}ms hard ceiling). Enable the \
+                     turn-detect/smart-turn features or accept the added latency.",
+                    self.config.speech_final_config.stt_speech_final_wait_ms,
+                    self.config.speech_final_config.speech_final_hard_timeout_ms
+                );
+                crate::core::metrics::bridge::record_degraded("turn_detection", "timer_fallback");
+            }
+        }
+
         // Set up internal TTS callback - using parking_lot for faster access
         {
             let mut tts = self.tts.write().await;

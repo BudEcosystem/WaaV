@@ -406,6 +406,13 @@ pub fn record_tts_format_mismatch(provider: &str, source: &'static str) {
         .increment(1);
 }
 
+/// Degraded-mode counter (RC5 "no silent degradation"): every fallback path —
+/// timer-only turn detection, stubbed VAD, failed model load — must emit here
+/// so operators see capability loss instead of just slower turns.
+pub fn record_degraded(component: &'static str, reason: &'static str) {
+    counter!("waav_degraded_total", "component" => component, "reason" => reason).increment(1);
+}
+
 /// Observe a per-DAG-node wall time (ms) on `waav_dag_node_ms`.
 ///
 /// Cardinality guard: node ids are operator-authored but still free-form
