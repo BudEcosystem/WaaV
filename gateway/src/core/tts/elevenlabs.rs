@@ -270,7 +270,11 @@ impl TTSRequestBuilder for ElevenLabsRequestBuilder {
         if !self.config.model.is_empty() {
             body["model_id"] = json!(self.config.model);
         } else {
-            body["model_id"] = json!("eleven_v3");
+            // Default to eleven_flash_v2_5: ElevenLabs' low-latency realtime model
+            // (~75ms model inference), suited to this gateway's streaming voice pipeline.
+            // The previous default (eleven_v3) is a high-latency, non-realtime model.
+            // Callers that pass an explicit model are unaffected.
+            body["model_id"] = json!("eleven_flash_v2_5");
         }
 
         // Build the request with ElevenLabs-specific headers
@@ -699,6 +703,42 @@ mod tests {
         assert_eq!(headers.get("xi-api-key").unwrap(), "test_key");
         assert_eq!(headers.get("content-type").unwrap(), "application/json");
         assert_eq!(headers.get("accept").unwrap(), "audio/pcm");
+    }
+
+    // When the caller provides no model, the request must default to eleven_flash_v2_5
+    // (ElevenLabs' realtime low-latency model), not a non-realtime model. Explicit models
+    // are passed through unchanged (covered by the wire tests that set a model above/below).
+    #[tokio::test]
+    async fn test_default_model_is_realtime_flash() {
+        let config = TTSConfig {
+            voice_id: Some("test_voice_id".to_string()),
+            audio_format: Some("linear16".to_string()),
+            sample_rate: Some(24000),
+            api_key: "test_key".to_string(),
+            model: String::new(), // no model supplied by the caller
+            ..Default::default()
+        };
+
+        let builder = ElevenLabsRequestBuilder {
+            config,
+            voice_settings: VoiceSettings::default(),
+            seed: None,
+            optimize_streaming_latency: None,
+            language_code: None,
+            next_text: None,
+            previous_request_ids: None,
+            next_request_ids: None,
+            apply_text_normalization: None,
+            apply_language_text_normalization: None,
+            use_pvc_as_ivc: None,
+            enable_logging: None,
+        };
+        let client = reqwest::Client::new();
+        let built_request = builder.build_http_request(&client, "Test text").build().unwrap();
+
+        let body_bytes = built_request.body().and_then(|b| b.as_bytes()).unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(body_bytes).unwrap();
+        assert_eq!(body_json["model_id"], "eleven_flash_v2_5");
     }
 
     #[tokio::test]

@@ -918,7 +918,7 @@ impl VoiceManager {
         let observers_clone = self.observers.clone();
 
         // Create wrapper that checks clearing state and updates interruption timing
-        let wrapper_callback = Arc::new(move |audio_data: AudioData| {
+        let wrapper_callback = Arc::new(move |mut audio_data: AudioData| {
             let user_cb = user_callback.clone();
             let int_state = interruption_state_clone.clone();
             let observers = observers_clone.read().clone();
@@ -928,6 +928,28 @@ impl VoiceManager {
                 if int_state.is_completed.load(Ordering::Acquire) {
                     // New audio starting after completion
                     int_state.is_completed.store(false, Ordering::SeqCst);
+
+                    // P0.1 universal boundary (RC1): EVERY provider's audio
+                    // crosses here — including the ~18 with custom speak()
+                    // paths that bypass the shared chunker. Sniff the first
+                    // chunk of each utterance: a container labeled as PCM gets
+                    // relabeled with the truth + counted, fleet-wide.
+                    if crate::core::tts::sniff::is_pcm_family(&audio_data.format)
+                        && let Some(container) =
+                            crate::core::tts::sniff::sniff_container(&audio_data.data)
+                    {
+                        tracing::error!(
+                            declared = %audio_data.format,
+                            actual = container.as_format_str(),
+                            "TTS audio at egress is a container mislabeled as PCM — relabeling"
+                        );
+                        crate::core::metrics::bridge::record_tts_format_mismatch(
+                            "egress-boundary",
+                            "egress",
+                        );
+                        audio_data.format = container.as_format_str().to_string();
+                        audio_data.duration_ms = None;
+                    }
 
                     // Reset the non_interruptible_until_ms to current time if we're in non-interruptible mode
                     if !int_state.allow_interruption.load(Ordering::Acquire) {

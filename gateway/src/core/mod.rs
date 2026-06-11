@@ -4,6 +4,9 @@ pub mod conversation;
 pub mod emotion;
 pub mod llm;
 pub mod metrics;
+// Canonical SSRF/URL validation shared by the DAG endpoint nodes, the
+// streaming-TTS endpoint override, and the conversation LLM URL check.
+pub mod net;
 pub mod observability;
 // Hardware execution-provider policy (MASTER_PLAN §7 H). Available exactly when
 // `ort` is pulled in, i.e. whenever any of the three ONNX consumers is enabled.

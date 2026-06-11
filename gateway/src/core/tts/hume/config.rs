@@ -645,6 +645,30 @@ mod tests {
         assert_eq!(cfg.num_generations, Some(2));
     }
 
+    // Clamp parity: from_standard's instructions -> description mapping must truncate to
+    // MAX_DESCRIPTION_LENGTH (100) exactly like `HumeTTS::set_description` does, so an
+    // over-long instruction can't reach the wire and get rejected by the Hume API.
+    #[test]
+    fn from_standard_clamps_instructions_to_max_description_length() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "hume".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                instructions: Some("a".repeat(150)),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let cfg = HumeTTSConfig::from_standard(&std);
+        let desc = cfg.description.expect("instructions must map to description");
+        assert_eq!(desc.len(), MAX_DESCRIPTION_LENGTH); // 150 chars -> clamped to 100
+        assert_eq!(desc, "a".repeat(MAX_DESCRIPTION_LENGTH));
+    }
+
     // =========================================================================
     // HumeAudioFormat Tests
     // =========================================================================

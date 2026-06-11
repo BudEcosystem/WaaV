@@ -649,7 +649,8 @@ impl IbmWatsonTTSConfig {
     /// `rate_percentage`/`pitch_percentage` `/v1/synthesize` query params, so this maps the typed
     /// `rate_percentage`/`pitch_percentage` features 1:1 (or, as a fallback, derives them from the
     /// provider-agnostic `speed`/`pitch` multipliers), plus `sample_rate` -> `base.sample_rate`.
-    /// IBM's `instance_id` (not a standard field) is read from the `extras` passthrough. Features
+    /// IBM's `instance_id` (not a standard field) is read from the `extras` passthrough, falling
+    /// back to the `IBM_WATSON_INSTANCE_ID` env var (precedence: extras > env). Features
     /// without an IBM field (stability, similarity_boost, style, use_speaker_boost, emotion,
     /// instructions, ssml, language, word_timestamps, streaming, seed, volume) are skipped.
     pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
@@ -659,7 +660,13 @@ impl IbmWatsonTTSConfig {
             .0
             .get("instance_id")
             .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
+            .or_else(|| {
+                std::env::var("IBM_WATSON_INSTANCE_ID")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            })
             .unwrap_or_default();
         let mut cfg = Self {
             base: std.base.clone(),
@@ -831,6 +838,45 @@ mod tests {
         assert_eq!(cfg.pitch_percentage, Some(25));
         assert_eq!(cfg.base.sample_rate, Some(16000));
         assert_eq!(cfg.instance_id, "inst-abc"); // from extras passthrough
+    }
+
+    // instance_id falls back to the IBM_WATSON_INSTANCE_ID env var when extras don't carry it,
+    // and an explicit extras value takes precedence over the env var (extras > env).
+    #[test]
+    fn from_standard_instance_id_env_fallback_and_extras_precedence() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        // SAFETY: Test-only, no concurrent access to this env var.
+        unsafe {
+            std::env::set_var("IBM_WATSON_INSTANCE_ID", "inst-from-env");
+        }
+
+        // No extras -> env var fills instance_id.
+        let std_no_extras = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "ibm-watson".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: Default::default(),
+        };
+        let cfg = IbmWatsonTTSConfig::from_standard(&std_no_extras);
+        assert_eq!(cfg.instance_id, "inst-from-env"); // env fallback
+
+        // Extras present -> extras win over the env var.
+        let mut extras = serde_json::Map::new();
+        extras.insert("instance_id".into(), serde_json::json!("inst-extras"));
+        let std_extras = StandardTTSConfig {
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+            ..std_no_extras
+        };
+        let cfg = IbmWatsonTTSConfig::from_standard(&std_extras);
+        assert_eq!(cfg.instance_id, "inst-extras"); // extras > env
+
+        // SAFETY: Test-only, no concurrent access to this env var.
+        unsafe {
+            std::env::remove_var("IBM_WATSON_INSTANCE_ID");
+        }
     }
 
     // The native typed `rate_percentage`/`pitch_percentage` features reach the config 1:1 and take

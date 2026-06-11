@@ -23,10 +23,10 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_tungstenite::accept_hdr_async;
-use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
-use waav_gateway::core::stt::standard::{SttFeatures, StandardSTTConfig, create_stt_standard};
+use waav_gateway::core::stt::standard::{StandardSTTConfig, SttFeatures, create_stt_standard};
 use waav_gateway::core::stt::{STTConfig, STTResult, STTResultCallback};
 use waav_gateway::core::websocket::ReconnectionConfig;
 use waav_gateway::core::websocket::reconnectable_stream::{
@@ -535,5 +535,223 @@ async fn cartesia_recovers_after_midstream_kill() {
     assert_eq!(
         got, expected,
         "finals lost across the Cartesia reconnect: got {got:?}, expected {expected:?}"
+    );
+}
+
+// =============================================================================
+// Part D — REAL AssemblyAISTT through a mock WS server (W-D1 fleet migration)
+// =============================================================================
+
+/// A mock AssemblyAI v3-style WS server that:
+///   1. captures every connection's request URI (so we can assert the featured `/v3/ws` query —
+///      AssemblyAI carries the featured session in the URL, so the re-dial IS the restore),
+///   2. opens every session with a `Begin` frame (the client blocks on the first Begin, and a
+///      restored session only becomes writable after its Begin re-arms readiness),
+///   3. on the FIRST connection emits final Turns `0..split` then **drops the socket** mid-stream,
+///   4. on the SECOND connection emits `split..total` then keeps the socket open.
+/// AssemblyAI speaks raw binary audio in and `{"type":"Turn",...}` out; `{"type":"Terminate"}` is
+/// the client's graceful shutdown.
+async fn spawn_dropping_assemblyai_mock(
+    split: usize,
+    total: usize,
+) -> (u16, Arc<Mutex<MockObservations>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let obs = Arc::new(Mutex::new(MockObservations::default()));
+    let obs_ret = Arc::clone(&obs);
+    let conn_count = Arc::new(AtomicUsize::new(0));
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let obs = Arc::clone(&obs);
+            let conn_count = Arc::clone(&conn_count);
+            tokio::spawn(async move {
+                let captured_uri = Arc::new(std::sync::Mutex::new(String::new()));
+                let cap = Arc::clone(&captured_uri);
+                let callback = move |req: &Request, resp: Response| {
+                    *cap.lock().unwrap() = req.uri().to_string();
+                    Ok(resp)
+                };
+                let ws = match accept_hdr_async(stream, callback).await {
+                    Ok(ws) => ws,
+                    Err(_) => return,
+                };
+                let uri = captured_uri.lock().unwrap().clone();
+                let which = conn_count.fetch_add(1, Ordering::AcqRel);
+                obs.lock().await.connect_uris.push(uri);
+
+                let (mut write, mut read) = ws.split();
+
+                // Every AssemblyAI session opens with a Begin frame; the restored session needs
+                // one too (it re-arms the client's readiness after the reconnect).
+                let begin =
+                    format!(r#"{{"type":"Begin","id":"sess-{which}","expires_at":1704067200}}"#);
+                if write.send(Message::Text(begin.into())).await.is_err() {
+                    return;
+                }
+
+                let (lo, hi, drop_after) = if which == 0 {
+                    (0, split, true)
+                } else {
+                    (split, total, false)
+                };
+
+                let mut idx = lo;
+                let mut ticker = tokio::time::interval(Duration::from_millis(15));
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {
+                            if idx < hi {
+                                let turn = format!(
+                                    r#"{{"type":"Turn","turn_order":{idx},"transcript":"final {idx}","end_of_turn":true,"words":[]}}"#
+                                );
+                                if write.send(Message::Text(turn.into())).await.is_err() {
+                                    return;
+                                }
+                                idx += 1;
+                            } else if drop_after {
+                                // First connection: emitted our half — drop abruptly (no close
+                                // frame) to simulate a mid-stream kill.
+                                return;
+                            }
+                        }
+                        msg = read.next() => {
+                            match msg {
+                                Some(Ok(Message::Close(_))) | None => return,
+                                Some(Ok(Message::Text(t))) => {
+                                    // AssemblyAI's graceful shutdown is `{"type":"Terminate"}`.
+                                    if t.contains("Terminate") { return; }
+                                }
+                                Some(Ok(_)) => {} // raw binary audio / ping etc.
+                                Some(Err(_)) => return,
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    (port, obs_ret)
+}
+
+/// Drives the REAL `AssemblyAISTT` provider (migrated off its hand-rolled reconnect loop onto the
+/// generic [`ReconnectableStream`] supervisor) through the mock that kills the socket mid-stream.
+/// Asserts: it reconnects (>=2 connections), the reconnect re-dials the *featured* `/v3/ws` URL
+/// (speech model + keyterms — AssemblyAI's session restore IS the URL), the restored session is
+/// writable again after its Begin, recovery is timely, and NO final turns are lost.
+#[tokio::test]
+async fn assemblyai_recovers_after_midstream_kill() {
+    const SPLIT: usize = 5;
+    const TOTAL: usize = 10;
+
+    let (port, obs) = spawn_dropping_assemblyai_mock(SPLIT, TOTAL).await;
+    let endpoint = format!("ws://127.0.0.1:{port}");
+
+    // Featured config: keyterms prompting rides the /v3/ws connect query (`keyterms_prompt`),
+    // so the reconnect must re-send it — a bare re-dial would lose the biasing.
+    let std_cfg = StandardSTTConfig {
+        base: STTConfig {
+            provider: "assemblyai".into(),
+            api_key: "test-key".into(),
+            model: String::new(),
+            language: "en".into(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "linear16".into(),
+        },
+        features: SttFeatures {
+            keyterms: Some(vec!["WaaV".into()]),
+            ..Default::default()
+        },
+        extras: Default::default(),
+    }
+    .with_endpoint_override(&endpoint);
+
+    let mut provider = create_stt_standard("assemblyai", std_cfg).expect("build assemblyai");
+
+    let collected: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&collected);
+    let cb: STTResultCallback = Arc::new(move |r: STTResult| {
+        let sink = Arc::clone(&sink);
+        Box::pin(async move {
+            if r.is_final {
+                if let Some(n) = r.transcript.rsplit(' ').next().and_then(|s| s.parse().ok()) {
+                    sink.lock().await.push(n);
+                }
+            }
+        })
+    });
+    provider.on_result(cb).await.unwrap();
+
+    let start = Instant::now();
+    provider.connect().await.expect("initial connect");
+
+    let audio = bytes::Bytes::from(vec![0u8; 640]);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let _ = provider.send_audio(audio.clone()).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        if collected.lock().await.len() >= TOTAL {
+            break;
+        }
+        if Instant::now() > deadline {
+            break;
+        }
+    }
+    let elapsed_to_full = start.elapsed();
+
+    // After the reconnect's Begin, the restored session must be writable again (is_ready was
+    // re-armed) — the legacy hand-rolled loop left the client unready forever after a reconnect.
+    let send_after_reconnect = provider.send_audio(audio.clone()).await;
+    let _ = provider.disconnect().await;
+
+    // 1. The session reconnected: the mock saw (at least) two connections.
+    let uris = obs.lock().await.connect_uris.clone();
+    assert!(
+        uris.len() >= 2,
+        "expected a reconnect (>=2 connections), saw {}: {uris:?}",
+        uris.len()
+    );
+
+    // 2. The reconnect re-dialed the FEATURED /v3/ws URL (AssemblyAI carries the featured
+    //    session in the URL): v3 path + speech model + the keyterm on the SECOND connection.
+    let restore_uri = &uris[1];
+    assert!(
+        restore_uri.contains("/v3/ws"),
+        "restore did not target the v3 streaming endpoint: {restore_uri}"
+    );
+    assert!(
+        restore_uri.contains("speech_model=universal-streaming-english"),
+        "restore did not re-send the speech model: {restore_uri}"
+    );
+    assert!(
+        restore_uri.contains("keyterms_prompt=") && restore_uri.contains("WaaV"),
+        "restore did not re-send the keyterms prompt: {restore_uri}"
+    );
+
+    // 3. The restored session accepts audio again (readiness re-armed by the new Begin).
+    assert!(
+        send_after_reconnect.is_ok(),
+        "restored session rejected audio: {send_after_reconnect:?}"
+    );
+
+    // 4. Recovery was timely (aggressive preset caps backoff at 5s; full set well under 8s).
+    assert!(
+        elapsed_to_full < Duration::from_secs(8),
+        "recovery to full set took too long: {elapsed_to_full:?}"
+    );
+
+    // 5. No final turns lost: union of pre-drop + post-reconnect == the full numbered set.
+    let got: HashSet<usize> = collected.lock().await.iter().copied().collect();
+    let expected: HashSet<usize> = (0..TOTAL).collect();
+    assert_eq!(
+        got, expected,
+        "finals lost across the AssemblyAI reconnect: got {got:?}, expected {expected:?}"
     );
 }

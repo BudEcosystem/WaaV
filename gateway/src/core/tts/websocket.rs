@@ -36,7 +36,6 @@
 //! [`BaseTTS`]: super::base::BaseTTS
 
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -755,145 +754,19 @@ impl Drop for WebSocketTtsClient {
 // SSRF validation for client-supplied WS endpoint overrides
 // ---------------------------------------------------------------------------
 
-/// Validate a client-supplied streaming-TTS endpoint with the SAME rules the DAG
-/// uses for its endpoint nodes (`src/dag/nodes/endpoint.rs::validate_url_for_ssrf`):
-/// http/https/ws/wss schemes only; loopback/private/metadata targets rejected unless
-/// `WAAV_ALLOW_LOOPBACK_ENDPOINTS=1`; DNS names resolve-then-validate (rebind/TOCTOU).
-///
-/// The DAG function itself is module-private to `dag::nodes` (and the whole `dag`
-/// tree is behind the `dag-routing` feature, while this client must also protect
-/// non-DAG builds), so the rules are mirrored below rule-for-rule rather than
-/// called through. Keep the two in lockstep; do not weaken either path.
+/// Validate a client-supplied streaming-TTS endpoint with the canonical SSRF
+/// rules shared with the DAG endpoint nodes and the conversation LLM URL check
+/// ([`crate::core::net::validate_url_for_ssrf`]): http/https/ws/wss schemes
+/// only; loopback/private/metadata targets rejected unless
+/// `WAAV_ALLOW_LOOPBACK_ENDPOINTS=1`; DNS names resolve-then-validate
+/// (rebind/TOCTOU). `core::net` is feature-free, so non-DAG builds get the
+/// identical protection. `ssrf_blocklist_matrix` locks the matrix.
 pub fn validate_ws_endpoint_for_ssrf(url: &str) -> TTSResult<()> {
-    validate_ws_url_for_ssrf_standalone(url)
-}
-
-/// Whether loopback/private endpoint targets are explicitly permitted.
-/// Mirrors `crate::dag::nodes::endpoint::loopback_endpoints_allowed` exactly.
-fn loopback_endpoints_allowed() -> bool {
-    matches!(
-        std::env::var("WAAV_ALLOW_LOOPBACK_ENDPOINTS").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE")
-    )
-}
-
-/// Rule-for-rule mirror of `src/dag/nodes/endpoint.rs::validate_url_for_ssrf`
-/// (the canonical rule set; see [`validate_ws_endpoint_for_ssrf`] for why it is
-/// mirrored instead of called). `ssrf_blocklist_matches_dag_rules` locks the matrix.
-fn validate_ws_url_for_ssrf_standalone(url: &str) -> TTSResult<()> {
-    let reject = |msg: String| {
-        Err(TTSError::InvalidConfiguration(format!(
+    crate::core::net::validate_url_for_ssrf(url, &["http", "https", "ws", "wss"]).map_err(|msg| {
+        TTSError::InvalidConfiguration(format!(
             "endpoint_override rejected (SSRF protection): {msg}"
-        )))
-    };
-
-    let parsed = match url::Url::parse(url) {
-        Ok(p) => p,
-        Err(e) => return reject(format!("invalid URL '{url}': {e}")),
-    };
-
-    let scheme = parsed.scheme().to_lowercase();
-    if !["http", "https", "ws", "wss"].contains(&scheme.as_str()) {
-        return reject(format!(
-            "URL scheme '{scheme}' not allowed. Use http, https, ws, or wss"
-        ));
-    }
-
-    // Test/local-mock escape hatch (opt-in, OFF by default) — same as the DAG.
-    if loopback_endpoints_allowed() {
-        return Ok(());
-    }
-
-    let Some(host) = parsed.host_str() else {
-        return reject(format!("URL '{url}' has no host"));
-    };
-
-    let host_lower = host.to_lowercase();
-    let blocked_hostnames = [
-        "localhost",
-        "localhost.localdomain",
-        "127.0.0.1",
-        "::1",
-        "0.0.0.0",
-        "[::1]",
-        "[::ffff:127.0.0.1]",
-        "169.254.169.254",
-        "metadata.google.internal",
-        "metadata.gcp.internal",
-        "internal",
-        "intranet",
-    ];
-    if blocked_hostnames.contains(&host_lower.as_str()) {
-        return reject(format!("URL host '{host}' is blocked"));
-    }
-
-    if let Ok(ip) = host.parse::<IpAddr>()
-        && is_private_ip(&ip)
-    {
-        return reject(format!("URL points to private IP '{ip}'"));
-    }
-
-    if host.starts_with('[')
-        && host.ends_with(']')
-        && let Ok(ip) = host[1..host.len() - 1].parse::<Ipv6Addr>()
-        && is_private_ipv6(&ip)
-    {
-        return reject(format!("URL points to private IPv6 '{ip}'"));
-    }
-
-    // Resolve-then-validate (DNS-rebind / TOCTOU): a public-looking hostname must
-    // not currently resolve to a private/metadata address. Unresolvable hosts pass
-    // (they may resolve later; the transport applies its own checks) — same policy
-    // as the DAG validator.
-    let is_ip_literal =
-        host.parse::<IpAddr>().is_ok() || (host.starts_with('[') && host.ends_with(']'));
-    if !is_ip_literal {
-        use std::net::ToSocketAddrs;
-        if let Ok(resolved) = (host, 0u16).to_socket_addrs() {
-            for addr in resolved {
-                if is_private_ip(&addr.ip()) {
-                    return reject(format!(
-                        "host '{host}' resolves to private/internal IP '{}'",
-                        addr.ip()
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Mirror of the DAG's `is_private_ip`.
-fn is_private_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_private_ipv4(v4),
-        IpAddr::V6(v6) => is_private_ipv6(v6),
-    }
-}
-
-/// Mirror of the DAG's `is_private_ipv4`.
-fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
-    if ip.is_loopback() || ip.is_link_local() || ip.is_broadcast() {
-        return true;
-    }
-    let octets = ip.octets();
-    octets[0] == 10
-        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
-        || (octets[0] == 192 && octets[1] == 168)
-        || octets[0] == 0
-}
-
-/// Mirror of the DAG's `is_private_ipv6`.
-fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
-    if ip.is_loopback() || ip.is_unspecified() {
-        return true;
-    }
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return is_private_ipv4(&v4);
-    }
-    let segments = ip.segments();
-    (0xfe80..=0xfebf).contains(&segments[0]) || (0xfc00..=0xfdff).contains(&segments[0])
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -986,13 +859,12 @@ mod tests {
         assert!(map.order.is_empty() && map.by_context.is_empty());
     }
 
-    // ---- SSRF: standalone mirror behaves like the DAG validator ----
+    // ---- SSRF: the endpoint-override gate delegates to core::net ----
 
     /// Env-var-dependent tests share one lock: `WAAV_ALLOW_LOOPBACK_ENDPOINTS` is
-    /// process-global state.
+    /// process-global state (lock shared with core::net / conversation tests).
     fn env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        crate::core::net::test_env_lock()
     }
 
     #[test]
@@ -1018,18 +890,17 @@ mod tests {
     }
 
     // NOTE: the allow-path (loopback permitted under WAAV_ALLOW_LOOPBACK_ENDPOINTS=1)
-    // is intentionally NOT unit-tested here: it would make this lib binary's only
-    // env SETTER for that var, racing the unsynchronized removers in other modules'
-    // tests (e.g. conversation::tests). It is wire-covered by the
-    // `deepgram_aura_ws_e2e` suite, which connects through a loopback override with
-    // the flag set under a shared env lock.
+    // is intentionally NOT unit-tested here via the env var: a setter would race the
+    // unsynchronized env READERS in other modules' tests (dag compiler/webhook SSRF
+    // tests). The gate logic is unit-tested in `core::net` through an injected flag,
+    // and wire-covered by the `deepgram_aura_ws_e2e` suite, which connects through a
+    // loopback override with the flag set in its own process.
 
-    /// Matrix tripwire mirroring the DAG validator's decisions (the canonical rule
-    /// set in `src/dag/nodes/endpoint.rs`): blocked targets stay blocked, public
-    /// IP-literal targets stay allowed. If the DAG rules ever change, change the
-    /// mirror AND this matrix together.
+    /// Matrix tripwire over the canonical rule set (`core::net`): blocked targets
+    /// stay blocked, public IP-literal targets stay allowed. If the shared rules
+    /// ever change, this matrix must be revisited together with them.
     #[test]
-    fn ssrf_blocklist_matches_dag_rules() {
+    fn ssrf_blocklist_matrix() {
         let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
         // SAFETY: test-only env mutation, serialized by env_lock.
         unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
@@ -1047,14 +918,14 @@ mod tests {
         ];
         for url in blocked {
             assert!(
-                validate_ws_url_for_ssrf_standalone(url).is_err(),
+                validate_ws_endpoint_for_ssrf(url).is_err(),
                 "{url} must be blocked"
             );
         }
         // Public IP literals pass (no DNS resolution involved).
         for url in ["ws://8.8.8.8/x", "wss://8.8.4.4/v1/speak"] {
             assert!(
-                validate_ws_url_for_ssrf_standalone(url).is_ok(),
+                validate_ws_endpoint_for_ssrf(url).is_ok(),
                 "{url} must be allowed"
             );
         }

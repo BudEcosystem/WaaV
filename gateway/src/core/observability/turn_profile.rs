@@ -560,8 +560,9 @@ mod tests {
         // gap: no first_sentence/tts → those stages skipped
         t.audio_out_ns = 1_900;
         let deltas = t.stage_deltas();
-        // Only stt_to_llm(10) and llm_ttft(240) are computable here.
-        assert!(deltas.iter().all(|&(_, d)| d > 0 || true));
+        // Only stt_to_llm(10) and llm_ttft(240) are computable here (deltas are
+        // u64, so non-negativity is guaranteed by the type).
+        assert_eq!(deltas.len(), 2, "exactly the two computable stages: {deltas:?}");
         let ttft = deltas.iter().find(|(s, _)| *s == Stage::LlmTtft).unwrap().1;
         assert_eq!(ttft, 240);
         assert!(deltas.iter().any(|(s, _)| *s == Stage::SttToLlm));

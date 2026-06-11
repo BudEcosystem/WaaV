@@ -574,69 +574,12 @@ impl ConversationOrchestrator {
 
 /// Validate a client-supplied LLM base URL for SSRF.
 ///
-/// Uses a self-contained resolve-then-validate check (no `dag` dependency) with
+/// Thin wrapper over the canonical [`crate::core::net::validate_url_for_ssrf`]
+/// (http/https only; resolve-then-validate; no `dag` dependency), which carries
 /// the same `WAAV_ALLOW_LOOPBACK_ENDPOINTS=1` test escape hatch used elsewhere,
 /// so the in-process mock LLM in the conversation tests can target `127.0.0.1`.
 fn validate_llm_url(url: &str) -> Result<(), String> {
-    use crate::utils::url_validation::is_private_ip;
-    use std::net::{IpAddr, ToSocketAddrs};
-
-    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL '{}': {}", url, e))?;
-    let scheme = parsed.scheme().to_lowercase();
-    if !["http", "https"].contains(&scheme.as_str()) {
-        return Err(format!("scheme '{}' not allowed (use http/https)", scheme));
-    }
-
-    if loopback_endpoints_allowed() {
-        return Ok(());
-    }
-
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| format!("URL '{}' has no host", url))?;
-
-    let blocked = [
-        "localhost",
-        "127.0.0.1",
-        "::1",
-        "0.0.0.0",
-        "169.254.169.254",
-        "metadata.google.internal",
-        "metadata.gcp.internal",
-    ];
-    let host_lower = host.to_lowercase();
-    if blocked.contains(&host_lower.as_str()) {
-        return Err(format!("host '{}' is blocked (SSRF protection)", host));
-    }
-
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_private_ip(&ip) {
-            return Err(format!("URL points to private IP '{}' (SSRF)", ip));
-        }
-        return Ok(());
-    }
-
-    // Resolve-then-validate DNS names (kills DNS-rebind/TOCTOU).
-    if let Ok(addrs) = (host, 0u16).to_socket_addrs() {
-        for addr in addrs {
-            if is_private_ip(&addr.ip()) {
-                return Err(format!(
-                    "host '{}' resolves to private IP '{}' (SSRF)",
-                    host,
-                    addr.ip()
-                ));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn loopback_endpoints_allowed() -> bool {
-    matches!(
-        std::env::var("WAAV_ALLOW_LOOPBACK_ENDPOINTS").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE")
-    )
+    crate::core::net::validate_url_for_ssrf(url, &["http", "https"])
 }
 
 #[cfg(test)]
@@ -669,7 +612,13 @@ mod tests {
 
     #[test]
     fn test_validate_llm_url_rejects_loopback_by_default() {
-        // Ensure the escape hatch is OFF for this assertion.
+        // Ensure the escape hatch is OFF for this assertion. The env var is
+        // process-global state: serialize with every other mutator in this test
+        // binary via the shared core::net lock.
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test-only env mutation, serialized by test_env_lock.
         unsafe {
             std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
         }

@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use xxhash_rust::xxh3::xxh3_128;
 
 use super::config::{CARTESIA_TTS_URL, CartesiaTTSConfig};
@@ -189,6 +189,21 @@ impl TTSRequestBuilder for CartesiaRequestBuilder {
 
         // Pass speaking_rate as speed (Cartesia API parameter)
         if let Some(rate) = self.config.speaking_rate {
+            // sonic-3 / sonic-turbo only accept generation_config.speed in [0.6, 2.0];
+            // out-of-range values are rejected by the API, so clamp (with a warning)
+            // rather than failing the synth request.
+            let model = &self.cartesia_config.model;
+            let rate = if model.contains("sonic-3") || model.contains("sonic-turbo") {
+                let clamped = rate.clamp(0.6, 2.0);
+                if clamped != rate {
+                    warn!(
+                        "Cartesia speed {rate} out of range for model {model}; clamped to {clamped} (allowed 0.6..=2.0)"
+                    );
+                }
+                clamped
+            } else {
+                rate
+            };
             generation_config.insert("speed".to_string(), json!(rate));
         }
 
@@ -808,6 +823,77 @@ mod tests {
         assert_eq!(
             body_json["language"], "fr",
             "language not on the wire: {body_json}"
+        );
+    }
+
+    // WIRE-LEVEL: language supplied via the extras passthrough (no typed `features.language`)
+    // must also reach the serialized request body as the top-level `language` field.
+    #[test]
+    fn from_standard_extras_language_reaches_request_body() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("language".into(), serde_json::json!("hi"));
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+        let tts = CartesiaTTS::from_standard(&std).unwrap();
+        assert_eq!(tts.cartesia_config().language.as_deref(), Some("hi"));
+
+        let client = reqwest::Client::new();
+        let request = tts
+            .request_builder
+            .build_http_request(&client, "Namaste")
+            .build()
+            .unwrap();
+        let body = request.body().unwrap().as_bytes().unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(
+            body_json["language"], "hi",
+            "extras language not on the wire: {body_json}"
+        );
+    }
+
+    // WIRE-LEVEL: sonic-3 / sonic-turbo only accept generation_config.speed in [0.6, 2.0], so an
+    // out-of-range speaking_rate must be clamped (exercising the warn! path) instead of being
+    // sent verbatim and rejected by the API.
+    #[test]
+    fn build_http_request_clamps_speed_for_sonic_models() {
+        let mut config = create_test_config();
+        config.speaking_rate = Some(0.2); // below sonic-3's minimum of 0.6
+        let cartesia_config = CartesiaTTSConfig::from_base(config.clone());
+        assert_eq!(cartesia_config.model, "sonic-3"); // default model triggers the clamp
+        let builder = CartesiaRequestBuilder::new(config, cartesia_config);
+
+        let client = reqwest::Client::new();
+        let request = builder.build_http_request(&client, "Hi").build().unwrap();
+        let body = request.body().unwrap().as_bytes().unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let speed = body_json["generation_config"]["speed"].as_f64().unwrap();
+        assert!(
+            (speed - 0.6).abs() < 0.001,
+            "speed not clamped to 0.6: {body_json}"
+        );
+    }
+
+    // Non-sonic-3/turbo models keep the caller's speed untouched (no clamp applied).
+    #[test]
+    fn build_http_request_keeps_speed_for_other_models() {
+        let mut config = create_test_config();
+        config.speaking_rate = Some(0.2);
+        let mut cartesia_config = CartesiaTTSConfig::from_base(config.clone());
+        cartesia_config.model = "sonic-2".to_string();
+        let builder = CartesiaRequestBuilder::new(config, cartesia_config);
+
+        let client = reqwest::Client::new();
+        let request = builder.build_http_request(&client, "Hi").build().unwrap();
+        let body = request.body().unwrap().as_bytes().unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let speed = body_json["generation_config"]["speed"].as_f64().unwrap();
+        assert!(
+            (speed - 0.2).abs() < 0.001,
+            "speed unexpectedly altered: {body_json}"
         );
     }
 

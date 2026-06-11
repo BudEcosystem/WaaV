@@ -18,20 +18,6 @@ use crate::dag::definition::HttpMethod;
 use crate::dag::error::{DAGError, DAGResult};
 use crate::livekit::LiveKitClient;
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
-/// Whether loopback/private endpoint targets are explicitly permitted.
-///
-/// OFF by default. Opt-in via `WAAV_ALLOW_LOOPBACK_ENDPOINTS=1` so in-process mock
-/// servers (DAG data-plane e2e / `endpoint_override` harness) can target `127.0.0.1`
-/// without weakening production SSRF protection. Never set in production.
-fn loopback_endpoints_allowed() -> bool {
-    matches!(
-        std::env::var("WAAV_ALLOW_LOOPBACK_ENDPOINTS").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE")
-    )
-}
-
 /// Validate a URL for SSRF (Server-Side Request Forgery) protection
 ///
 /// This function checks that the URL:
@@ -40,126 +26,23 @@ fn loopback_endpoints_allowed() -> bool {
 /// - Does not point to private IP ranges
 /// - Does not use blocked cloud metadata endpoints
 ///
-/// Returns the validated URL or an error if validation fails.
+/// Thin wrapper over the canonical [`crate::core::net::validate_url_for_ssrf`]
+/// (which also carries the `WAAV_ALLOW_LOOPBACK_ENDPOINTS=1` test escape hatch
+/// for in-process mock servers — DAG data-plane e2e, W-O1/W-T0).
 pub fn validate_url_for_ssrf(url: &str) -> DAGResult<()> {
-    // Parse URL
-    let parsed = url::Url::parse(url)
-        .map_err(|e| DAGError::ConfigError(format!("Invalid URL '{}': {}", url, e)))?;
-
-    // Check scheme
-    let scheme = parsed.scheme().to_lowercase();
-    if !["http", "https", "ws", "wss"].contains(&scheme.as_str()) {
-        return Err(DAGError::ConfigError(format!(
-            "URL scheme '{}' not allowed. Use http, https, ws, or wss",
-            scheme
-        )));
-    }
-
-    // Test/local-mock escape hatch (opt-in, OFF by default): when
-    // `WAAV_ALLOW_LOOPBACK_ENDPOINTS=1` is set, loopback/private targets are
-    // permitted so in-process mock servers (DAG data-plane e2e, W-O1/W-T0) can be
-    // pointed at `127.0.0.1`. The scheme check above still applies. This mirrors the
-    // `OPENAI_BASE_URL` endpoint-override pattern and is never set in production.
-    if loopback_endpoints_allowed() {
-        return Ok(());
-    }
-
-    // Get host
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| DAGError::ConfigError(format!("URL '{}' has no host", url)))?;
-
-    // Check for blocked hostnames (case-insensitive)
-    let host_lower = host.to_lowercase();
-    let blocked_hostnames = [
-        "localhost",
-        "localhost.localdomain",
-        "127.0.0.1",
-        "::1",
-        "0.0.0.0",
-        "[::1]",
-        "[::ffff:127.0.0.1]",
-        // AWS metadata endpoints
-        "169.254.169.254",
-        "metadata.google.internal",
-        "metadata.gcp.internal",
-        // Azure metadata endpoint
-        "169.254.169.254",
-        // Common internal hostnames
-        "internal",
-        "intranet",
-    ];
-
-    for blocked in blocked_hostnames.iter() {
-        if host_lower == *blocked {
-            return Err(DAGError::ConfigError(format!(
-                "URL host '{}' is blocked (SSRF protection)",
-                host
-            )));
-        }
-    }
-
-    // Try to parse as IP address
-    if let Ok(ip) = host.parse::<IpAddr>()
-        && is_private_ip(&ip) {
-            return Err(DAGError::ConfigError(format!(
-                "URL points to private IP '{}' (SSRF protection)",
-                ip
-            )));
-        }
-
-    // Check for IPv6 addresses in brackets
-    if host.starts_with('[') && host.ends_with(']') {
-        let ip_str = &host[1..host.len() - 1];
-        if let Ok(ip) = ip_str.parse::<Ipv6Addr>()
-            && is_private_ipv6(&ip) {
-                return Err(DAGError::ConfigError(format!(
-                    "URL points to private IPv6 '{}' (SSRF protection)",
-                    ip
-                )));
-            }
-    }
-
-    // Resolve-then-validate: when the host is a DNS name (not an IP literal),
-    // resolve it and reject if ANY resolved address is private/internal. This
-    // closes DNS-rebinding / TOCTOU holes where a public-looking hostname
-    // resolves to a private/metadata address.
-    let is_ip_literal = host.parse::<IpAddr>().is_ok()
-        || (host.starts_with('[') && host.ends_with(']'));
-    if !is_ip_literal {
-        validate_resolved_host_for_ssrf(host)?;
-    }
-
-    Ok(())
+    crate::core::net::validate_url_for_ssrf(url, &["http", "https", "ws", "wss"])
+        .map_err(DAGError::ConfigError)
 }
 
 /// Resolve a DNS hostname and reject if any resolved IP is private/internal.
 ///
-/// Uses a synchronous resolver (`ToSocketAddrs`) so it can run inside the
-/// (synchronous) DAG compile path. A host that fails to resolve is allowed
-/// through (it may resolve later, at request time the transport applies its own
-/// checks); the goal here is to reject hosts that *currently* resolve to a
-/// blocked range, which is the DNS-rebind vector for client-supplied DAGs.
+/// Thin wrapper over [`crate::core::net::validate_resolved_host_for_ssrf`]:
+/// synchronous resolve-then-validate (usable from the synchronous DAG compile
+/// path); a host that fails to resolve is allowed through, the goal is to
+/// reject hosts that *currently* resolve to a blocked range, which is the
+/// DNS-rebind vector for client-supplied DAGs.
 pub fn validate_resolved_host_for_ssrf(host: &str) -> DAGResult<()> {
-    use std::net::ToSocketAddrs;
-
-    // Port is irrelevant for the IP check; use a dummy port for resolution.
-    let resolved = match (host, 0u16).to_socket_addrs() {
-        Ok(addrs) => addrs,
-        Err(_) => return Ok(()), // unresolvable now; nothing to block
-    };
-
-    for addr in resolved {
-        let ip = addr.ip();
-        if is_private_ip(&ip) {
-            return Err(DAGError::ConfigError(format!(
-                "Host '{}' resolves to private/internal IP '{}' (SSRF protection)",
-                host, ip
-            )));
-        }
-    }
-
-    Ok(())
+    crate::core::net::validate_resolved_host_for_ssrf(host).map_err(DAGError::ConfigError)
 }
 
 /// Validate a gRPC target address for SSRF.
@@ -184,88 +67,6 @@ pub fn validate_grpc_address_for_ssrf(address: &str) -> DAGResult<()> {
     };
 
     validate_url_for_ssrf(&normalized)
-}
-
-/// Check if an IP address is private/internal
-fn is_private_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_private_ipv4(v4),
-        IpAddr::V6(v6) => is_private_ipv6(v6),
-    }
-}
-
-/// Check if an IPv4 address is private/internal
-fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
-    // Loopback: 127.0.0.0/8
-    if ip.is_loopback() {
-        return true;
-    }
-
-    // Link-local: 169.254.0.0/16 (includes AWS metadata endpoint)
-    if ip.is_link_local() {
-        return true;
-    }
-
-    // Private ranges
-    // 10.0.0.0/8
-    if ip.octets()[0] == 10 {
-        return true;
-    }
-
-    // 172.16.0.0/12
-    let first = ip.octets()[0];
-    let second = ip.octets()[1];
-    if first == 172 && (16..=31).contains(&second) {
-        return true;
-    }
-
-    // 192.168.0.0/16
-    if first == 192 && second == 168 {
-        return true;
-    }
-
-    // 0.0.0.0/8 (current network)
-    if first == 0 {
-        return true;
-    }
-
-    // Broadcast
-    if ip.is_broadcast() {
-        return true;
-    }
-
-    false
-}
-
-/// Check if an IPv6 address is private/internal
-fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
-    // Loopback: ::1
-    if ip.is_loopback() {
-        return true;
-    }
-
-    // Unspecified: ::
-    if ip.is_unspecified() {
-        return true;
-    }
-
-    // IPv4-mapped addresses (check the embedded IPv4)
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return is_private_ipv4(&v4);
-    }
-
-    // Link-local: fe80::/10
-    let segments = ip.segments();
-    if segments[0] >= 0xfe80 && segments[0] <= 0xfebf {
-        return true;
-    }
-
-    // Unique local: fc00::/7
-    if segments[0] >= 0xfc00 && segments[0] <= 0xfdff {
-        return true;
-    }
-
-    false
 }
 
 /// Generic bytes codec for gRPC calls without proto definitions.

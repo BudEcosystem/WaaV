@@ -688,8 +688,17 @@ impl CartesiaTTSConfig {
             cfg.volume = Some(volume);
         }
         // Language → top-level `language` (replaces the request builder's hardcoded "en").
+        // Precedence: typed `features.language` > extras["language"] > builder default "en".
         if let Some(language) = f.language.as_ref().filter(|s| !s.is_empty()) {
             cfg.language = Some(language.clone());
+        } else if let Some(language) = std
+            .extras
+            .0
+            .get("language")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            cfg.language = Some(language.to_string());
         }
         // pronunciation_dict_id → top-level `pronunciation_dict_id` (extras passthrough;
         // audio-changing, so folded into the cache hash).
