@@ -134,6 +134,7 @@ async fn test_speech_final_timing_control() {
             last_forced_text: String::with_capacity(1024),
             segment_start_ms: AtomicUsize::new(0),
             hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
         }));
 
         // Reset state first
@@ -149,6 +150,7 @@ async fn test_speech_final_timing_control() {
                 last_forced_text: String::with_capacity(1024),
                 segment_start_ms: AtomicUsize::new(0),
                 hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
             };
         }
 
@@ -185,6 +187,7 @@ async fn test_speech_final_timing_control() {
             last_forced_text: String::with_capacity(1024),
             segment_start_ms: AtomicUsize::new(0),
             hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
         }));
 
         // Reset state first
@@ -200,6 +203,7 @@ async fn test_speech_final_timing_control() {
                 last_forced_text: String::with_capacity(1024),
                 segment_start_ms: AtomicUsize::new(0),
                 hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
             };
         }
 
@@ -236,6 +240,7 @@ async fn test_speech_final_timing_control() {
             last_forced_text: String::with_capacity(1024),
             segment_start_ms: AtomicUsize::new(0),
             hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
         }));
 
         // Reset state first
@@ -251,6 +256,7 @@ async fn test_speech_final_timing_control() {
                 last_forced_text: String::with_capacity(1024),
                 segment_start_ms: AtomicUsize::new(0),
                 hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
             };
         }
 
@@ -303,6 +309,7 @@ async fn test_speech_final_timing_control() {
             last_forced_text: String::with_capacity(1024),
             segment_start_ms: AtomicUsize::new(0),
             hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
         }));
 
         // Reset state first
@@ -318,6 +325,7 @@ async fn test_speech_final_timing_control() {
                 last_forced_text: String::with_capacity(1024),
                 segment_start_ms: AtomicUsize::new(0),
                 hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
             };
         }
 
@@ -357,6 +365,7 @@ async fn test_duplicate_speech_final_prevention() {
             last_forced_text: String::with_capacity(1024),
             segment_start_ms: AtomicUsize::new(0),
             hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
         }));
 
         // Simulate the scenario:
@@ -416,6 +425,7 @@ async fn test_duplicate_speech_final_prevention() {
             last_forced_text: String::with_capacity(1024),
             segment_start_ms: AtomicUsize::new(0),
             hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
         }));
 
         // 1. First is_final=true
@@ -475,6 +485,7 @@ async fn test_duplicate_speech_final_prevention() {
             last_forced_text: String::with_capacity(1024),
             segment_start_ms: AtomicUsize::new(0),
             hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
         }));
 
         // First sequence: is_final=true starts timer
@@ -582,6 +593,7 @@ async fn test_hard_timeout_fallback_without_turn_detector() {
         last_forced_text: String::new(),
         segment_start_ms: AtomicUsize::new(0),
         hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
     }));
 
     // Send is_final result without speech_final (simulating Deepgram behavior)
@@ -679,6 +691,7 @@ async fn test_hard_timeout_with_turn_detector_failure() {
         last_forced_text: String::new(),
         segment_start_ms: AtomicUsize::new(0),
         hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
     }));
 
     // Send is_final result
@@ -735,6 +748,7 @@ async fn test_cancellation_cleanup_on_real_speech_final() {
         last_forced_text: String::new(),
         segment_start_ms: AtomicUsize::new(0),
         hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
     }));
 
     // Send is_final to start both timers
@@ -829,6 +843,7 @@ async fn test_continuous_speech_hard_timeout_not_restarted() {
         last_forced_text: String::new(),
         segment_start_ms: AtomicUsize::new(0),
         hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
     }));
 
     // Send first is_final at t=0
@@ -923,6 +938,7 @@ async fn test_hard_timeout_observability() {
         last_forced_text: String::new(),
         segment_start_ms: AtomicUsize::new(0),
         hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
     }));
 
     // Send is_final result

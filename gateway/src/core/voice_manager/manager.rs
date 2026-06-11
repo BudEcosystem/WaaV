@@ -177,6 +177,7 @@ impl VoiceManager {
                 last_forced_text: String::with_capacity(1024),
                 segment_start_ms: AtomicUsize::new(0),
                 hard_timeout_deadline_ms: AtomicUsize::new(0),
+                fire_generation: AtomicUsize::new(0),
             })),
             turn_detector,
             #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
@@ -592,11 +593,9 @@ impl VoiceManager {
                     .store(sample_rate, Ordering::Release);
             }
 
-            // Get current timestamp in milliseconds
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as usize;
+            // Monotonic clock (P0.4): interruption windows are relative
+            // intervals; wall-clock breaks them under NTP/VM-restore skew.
+            let now = super::state::now_monotonic_ms();
 
             // Initialize non_interruptible_until_ms to current time
             // The actual duration will be calculated as TTS chunks arrive
@@ -911,10 +910,8 @@ impl VoiceManager {
 
                     // Reset the non_interruptible_until_ms to current time if we're in non-interruptible mode
                     if !int_state.allow_interruption.load(Ordering::Acquire) {
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as usize;
+                        // Monotonic (P0.4): same clock as can_interrupt().
+                        let now_ms = crate::core::voice_manager::state::now_monotonic_ms();
                         int_state
                             .non_interruptible_until_ms
                             .store(now_ms, Ordering::Release);

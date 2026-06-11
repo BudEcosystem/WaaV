@@ -116,8 +116,12 @@ impl STTResultProcessor {
         speech_final_state: Arc<SyncRwLock<SpeechFinalState>>,
         turn_detector: Option<Arc<RwLock<TurnDetector>>>,
     ) {
-        // Update text buffer and cancel any existing task (person still talking)
-        let (buffered_text, is_new_segment) = {
+        // Update text buffer, arm the segment, and capture the fire GENERATION —
+        // all under ONE write lock so the snapshot the spawned tasks observe is
+        // consistent (P0.3 / RC4). The tasks may only claim a fire while the
+        // generation is unchanged; a fire/reset bumps it, so stale tasks are
+        // structurally unable to double-fire or fire with another segment's text.
+        let (buffered_text, is_new_segment, segment_generation) = {
             let mut state = speech_final_state.write();
 
             // CRITICAL: Cancel old task when new is_final arrives (person still talking)
@@ -131,50 +135,68 @@ impl STTResultProcessor {
             // Use push_str for O(1) amortized append instead of format!() which allocates a new string
             state.text_buffer.push_str(&result.transcript);
 
+            // Bound the per-turn buffer (RC8): a pathological provider sending
+            // endless is_finals must not grow memory without limit — keep the
+            // most recent tail (what end-of-turn detection actually needs).
+            const MAX_TURN_BUFFER_BYTES: usize = 32 * 1024;
+            if state.text_buffer.len() > MAX_TURN_BUFFER_BYTES {
+                let excess = state.text_buffer.len() - MAX_TURN_BUFFER_BYTES;
+                let cut = state
+                    .text_buffer
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .find(|&i| i >= excess)
+                    .unwrap_or(0);
+                state.text_buffer.drain(..cut);
+            }
+
             // Check if this is the first is_final for a new segment
             let is_new = state.segment_start_ms.load(Ordering::Acquire) == 0;
 
-            (state.text_buffer.clone(), is_new)
+            state
+                .waiting_for_speech_final
+                .store(true, Ordering::Release);
+
+            if is_new {
+                let now_ms = self.get_current_time_ms();
+                state.segment_start_ms.store(now_ms, Ordering::Release);
+                let deadline_ms = now_ms + self.config.speech_final_hard_timeout_ms as usize;
+                state
+                    .hard_timeout_deadline_ms
+                    .store(deadline_ms, Ordering::Release);
+                debug!(
+                    "Starting new speech segment - hard timeout will fire in {}ms at {}",
+                    self.config.speech_final_hard_timeout_ms, deadline_ms
+                );
+                if let Some(old_handle) = state.hard_timeout_handle.take() {
+                    debug!("Cancelling previous hard timeout task");
+                    old_handle.abort();
+                }
+            }
+
+            (
+                state.text_buffer.clone(),
+                is_new,
+                state.fire_generation.load(Ordering::Relaxed),
+            )
         };
 
-        // Create and store NEW detection task handle
+        // Spawn tasks OUTSIDE the lock (they only ever act through the
+        // generation-checked claim, so a racing real final between the lock
+        // release and the handle store is harmless).
         let detection_handle = self.create_detection_task(
             result,
             buffered_text,
             speech_final_state.clone(),
             turn_detector,
+            segment_generation,
         );
 
         let mut state = speech_final_state.write();
         state.turn_detection_handle = Some(detection_handle);
-        state
-            .waiting_for_speech_final
-            .store(true, Ordering::Release);
-
-        // Schedule hard-timeout task if this is a new segment
         if is_new_segment {
-            let now_ms = self.get_current_time_ms();
-            state.segment_start_ms.store(now_ms, Ordering::Release);
-
-            let deadline_ms = now_ms + self.config.speech_final_hard_timeout_ms as usize;
-            state
-                .hard_timeout_deadline_ms
-                .store(deadline_ms, Ordering::Release);
-
-            debug!(
-                "Starting new speech segment - hard timeout will fire in {}ms at {}",
-                self.config.speech_final_hard_timeout_ms, deadline_ms
-            );
-
-            // Cancel any existing hard timeout task
-            if let Some(old_handle) = state.hard_timeout_handle.take() {
-                debug!("Cancelling previous hard timeout task");
-                old_handle.abort();
-            }
-
-            // Spawn hard timeout task
             let hard_timeout_handle =
-                self.create_hard_timeout_task(speech_final_state.clone(), now_ms);
+                self.create_hard_timeout_task(speech_final_state.clone(), segment_generation);
             state.hard_timeout_handle = Some(hard_timeout_handle);
         }
     }
@@ -218,59 +240,46 @@ impl STTResultProcessor {
     fn create_hard_timeout_task(
         &self,
         speech_final_state: Arc<SyncRwLock<SpeechFinalState>>,
-        segment_start_ms: usize,
+        segment_generation: usize,
     ) -> JoinHandle<()> {
-        let hard_timeout_ms = self.config.speech_final_hard_timeout_ms;
-
         tokio::spawn(async move {
-            // Calculate remaining time until hard timeout
-            let now_ms = Self::get_current_time_ms_static();
-            let elapsed_ms = now_ms.saturating_sub(segment_start_ms);
-            let remaining_ms = hard_timeout_ms.saturating_sub(elapsed_ms as u64);
+            // Deadline-rereading loop (P0.3/H5): the task sleeps TOWARD the
+            // deadline atomic and re-validates it on every wake. A moved or
+            // cleared deadline, a bumped generation, or a completed fire all
+            // make this task exit without firing — an orphaned timer can never
+            // force a stale speech_final.
+            loop {
+                let (deadline_ms, generation_now, waiting) = {
+                    let state = speech_final_state.read();
+                    (
+                        state.hard_timeout_deadline_ms.load(Ordering::Acquire),
+                        state.fire_generation.load(Ordering::Relaxed),
+                        state.waiting_for_speech_final.load(Ordering::Acquire),
+                    )
+                };
 
-            debug!(
-                "Hard timeout scheduled: will fire in {}ms (total timeout: {}ms, elapsed: {}ms)",
-                remaining_ms, hard_timeout_ms, elapsed_ms
-            );
+                if deadline_ms == 0 || generation_now != segment_generation || !waiting {
+                    debug!("Hard timeout cancelled - segment fired/reset/moved on");
+                    return;
+                }
 
-            // Sleep for the remaining time
-            tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
+                let now_ms = Self::get_current_time_ms_static();
+                if now_ms >= deadline_ms {
+                    tracing::warn!(
+                        "Hard timeout fired - forcing speech_final (no real speech_final \
+                         or turn detection confirmation received)"
+                    );
+                    Self::fire_forced_speech_final(
+                        speech_final_state,
+                        segment_generation,
+                        "hard_timeout_fallback",
+                    )
+                    .await;
+                    return;
+                }
 
-            // Check if we should still fire (not cancelled by real speech_final)
-            let should_fire = {
-                let state = speech_final_state.read();
-                state.waiting_for_speech_final.load(Ordering::Acquire)
-            };
-
-            if !should_fire {
-                debug!("Hard timeout cancelled - speech_final already fired");
-                return;
+                tokio::time::sleep(Duration::from_millis((deadline_ms - now_ms) as u64)).await;
             }
-
-            // Hard timeout has fired - force speech_final
-            let total_wait_ms = Self::get_current_time_ms_static().saturating_sub(segment_start_ms);
-
-            // Get the buffered text before firing
-            let buffered_text = {
-                let state = speech_final_state.read();
-                state.text_buffer.clone()
-            };
-
-            tracing::warn!(
-                "Hard timeout fired after {}ms - forcing speech_final (no real speech_final or turn detection confirmation received)",
-                total_wait_ms
-            );
-
-            // Fire speech_final with empty result (we'll use buffered text)
-            let forced_result = STTResult::new(String::new(), true, false, 1.0);
-
-            Self::fire_speech_final(
-                forced_result,
-                buffered_text,
-                speech_final_state,
-                "hard_timeout_fallback",
-            )
-            .await;
         })
     }
 
@@ -286,6 +295,7 @@ impl STTResultProcessor {
         buffered_text: String,
         speech_final_state: Arc<SyncRwLock<SpeechFinalState>>,
         turn_detector: Option<Arc<RwLock<TurnDetector>>>,
+        segment_generation: usize,
     ) -> JoinHandle<()> {
         let stt_wait_ms = self.config.stt_speech_final_wait_ms;
         let inference_timeout_ms = self.config.turn_detection_inference_timeout_ms;
@@ -374,56 +384,65 @@ impl STTResultProcessor {
                 "no_detector_timeout"
             };
 
-            // PHASE 3: Fire artificial speech_final
-            Self::fire_speech_final(result, buffered_text, speech_final_state, detection_method)
-                .await;
+            // PHASE 3: Fire artificial speech_final (generation-checked claim)
+            let _ = result; // original interim result not delivered again
+            let _ = buffered_text; // claim takes the live buffer under the lock
+            Self::fire_forced_speech_final(
+                speech_final_state,
+                segment_generation,
+                detection_method,
+            )
+            .await;
         })
     }
 
-    /// Fire a forced speech_final event
-    async fn fire_speech_final(
-        _result: STTResult,
-        buffered_text: String,
+    /// Fire a forced speech_final event via an ATOMIC CLAIM (P0.3 / RC4).
+    ///
+    /// Every check and every mutation happens under ONE write lock with no
+    /// awaits inside: generation match + waiting flag → claim (bump generation,
+    /// take buffer, drop timers, clear deadlines) → release → fire the callback
+    /// from THIS task (the caller-fires-callback contract is unchanged). Two
+    /// racing forced paths can never both claim; a real speech_final that beat
+    /// us bumped the generation, so our claim refuses.
+    async fn fire_forced_speech_final(
         speech_final_state: Arc<SyncRwLock<SpeechFinalState>>,
+        segment_generation: usize,
         detection_method: &str,
     ) {
-        let callback_opt = {
-            let state = speech_final_state.read();
-            if state.waiting_for_speech_final.load(Ordering::Acquire) {
-                state.user_callback.clone()
-            } else {
+        let claimed = {
+            let mut state = speech_final_state.write();
+            let generation_ok =
+                state.fire_generation.load(Ordering::Relaxed) == segment_generation;
+            let still_waiting = state.waiting_for_speech_final.load(Ordering::Acquire);
+            if !generation_ok || !still_waiting {
+                debug!(
+                    generation_ok,
+                    still_waiting, "forced speech_final claim refused (lost the race)"
+                );
                 None
-            }
-        };
-
-        if let Some(callback) = callback_opt {
-            let fire_time_ms = Self::get_current_time_ms_static();
-
-            // Update state before firing callback
-            {
-                let mut state = speech_final_state.write();
+            } else {
+                state.fire_generation.fetch_add(1, Ordering::Relaxed);
+                let fire_time_ms = Self::get_current_time_ms_static();
                 state
                     .turn_detection_last_fired_ms
                     .store(fire_time_ms, Ordering::Release);
-                state.last_forced_text = buffered_text.clone();
+                let text = std::mem::take(&mut state.text_buffer);
+                state.last_forced_text = text;
                 state
                     .waiting_for_speech_final
                     .store(false, Ordering::Release);
                 state.turn_detection_handle = None;
-                state.text_buffer.clear();
-
-                // Cancel and clear hard timeout handle
                 if let Some(handle) = state.hard_timeout_handle.take() {
                     handle.abort();
                 }
-
-                // Clear segment timing for next utterance
                 state.segment_start_ms.store(0, Ordering::Release);
                 state.hard_timeout_deadline_ms.store(0, Ordering::Release);
+                state.user_callback.clone()
             }
+        };
 
+        if let Some(callback) = claimed {
             let forced_result = STTResult::new(String::new(), true, true, 1.0);
-
             info!("Forcing speech_final via {}", detection_method);
             callback(forced_result).await;
         }
@@ -462,6 +481,9 @@ impl STTResultProcessor {
 
     /// Reset speech state for next segment
     fn reset_speech_state(&self, state: &mut SpeechFinalState) {
+        // Invalidate every in-flight timer/turn-detect claim for this segment
+        // (P0.3): a task that observed the old generation can no longer fire.
+        state.fire_generation.fetch_add(1, Ordering::Relaxed);
         state.text_buffer.clear();
         state.last_forced_text.clear();
         state
@@ -484,12 +506,14 @@ impl STTResultProcessor {
         Self::get_current_time_ms_static()
     }
 
-    /// Static helper to get current time in milliseconds
+    /// Static helper to get current time in milliseconds.
+    ///
+    /// MONOTONIC, process-relative (P0.4 / RC3): all speech-final deadlines and
+    /// dedup windows are relative intervals; wall-clock here broke them under
+    /// NTP steps / VM restore (epoch-0 on `duration_since` failure flooded
+    /// hard-timeout logs and mis-armed deadlines).
     fn get_current_time_ms_static() -> usize {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as usize
+        super::state::now_monotonic_ms()
     }
 }
 
@@ -544,6 +568,7 @@ mod tests {
             last_forced_text: String::new(),
             segment_start_ms: AtomicUsize::new(0),
             hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
         }));
 
         // Send an is_final result (no speech_final)
@@ -607,6 +632,7 @@ mod tests {
             last_forced_text: String::new(),
             segment_start_ms: AtomicUsize::new(0),
             hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
         }));
 
         // Send an is_final result
@@ -671,6 +697,7 @@ mod tests {
             last_forced_text: String::new(),
             segment_start_ms: AtomicUsize::new(0),
             hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
         }));
 
         // Send first is_final at t=0
@@ -725,6 +752,7 @@ mod tests {
             last_forced_text: String::new(),
             segment_start_ms: AtomicUsize::new(0),
             hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
         }));
 
         // Send is_final
@@ -764,5 +792,121 @@ mod tests {
             assert_ne!(s.segment_start_ms.load(Ordering::Acquire), 0);
             assert_ne!(s.hard_timeout_deadline_ms.load(Ordering::Acquire), 0);
         }
+    }
+
+    /// Build an armed state (waiting=true) with a counting speech_final callback.
+    fn armed_state_with_counter() -> (Arc<SyncRwLock<SpeechFinalState>>, Arc<AtomicUsize>) {
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let callback_count_clone = callback_count.clone();
+        let callback: STTCallback = Arc::new(move |result: STTResult| {
+            let count = callback_count_clone.clone();
+            Box::pin(async move {
+                if result.is_speech_final {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>
+        });
+        let state = Arc::new(SyncRwLock::new(SpeechFinalState {
+            text_buffer: "hello".to_string(),
+            turn_detection_handle: None,
+            hard_timeout_handle: None,
+            waiting_for_speech_final: AtomicBool::new(true),
+            user_callback: Some(callback),
+            turn_detection_last_fired_ms: AtomicUsize::new(0),
+            last_forced_text: String::new(),
+            segment_start_ms: AtomicUsize::new(1),
+            hard_timeout_deadline_ms: AtomicUsize::new(1),
+            fire_generation: AtomicUsize::new(7),
+        }));
+        (state, callback_count)
+    }
+
+    /// P0.3 (C4): N racing forced fires for the SAME generation — the claim is
+    /// a single-lock atomic transition, so exactly one wins.
+    #[tokio::test]
+    async fn racing_forced_fires_claim_exactly_once() {
+        let (state, count) = armed_state_with_counter();
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let st = state.clone();
+            handles.push(tokio::spawn(async move {
+                STTResultProcessor::fire_forced_speech_final(st, 7, "race-test").await;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "exactly ONE of the racing forced fires may claim"
+        );
+        assert_eq!(state.read().fire_generation.load(Ordering::Relaxed), 8);
+    }
+
+    /// P0.3 (H5): a task that observed an OLDER generation (its segment was
+    /// already closed by a real speech_final) must refuse to fire.
+    #[tokio::test]
+    async fn stale_generation_cannot_fire() {
+        let (state, count) = armed_state_with_counter();
+        // A real speech_final closed the segment: generation bumped.
+        state.read().fire_generation.fetch_add(1, Ordering::Relaxed);
+        STTResultProcessor::fire_forced_speech_final(state.clone(), 7, "stale-timer").await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "a stale-generation timer must never force a speech_final"
+        );
+    }
+
+    /// P0.3/P0.4 (H5): the hard-timeout task re-reads the deadline on wake —
+    /// a cleared deadline (segment closed) means no fire, even though the task
+    /// was already sleeping toward it.
+    #[tokio::test]
+    async fn cleared_deadline_disarms_inflight_hard_timeout() {
+        let (state, count) = armed_state_with_counter();
+        let now = super::super::state::now_monotonic_ms();
+        state
+            .read()
+            .hard_timeout_deadline_ms
+            .store(now + 150, Ordering::Release);
+
+        let processor = STTResultProcessor::new(STTProcessingConfig {
+            stt_speech_final_wait_ms: 5_000,
+            turn_detection_inference_timeout_ms: 50,
+            speech_final_hard_timeout_ms: 150,
+            duplicate_window_ms: 100,
+        });
+        let handle = processor.create_hard_timeout_task(state.clone(), 7);
+
+        // Segment closes (real final): deadline cleared + generation bumped,
+        // but the timer task is ALREADY sleeping toward the old deadline.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        {
+            let s = state.read();
+            s.hard_timeout_deadline_ms.store(0, Ordering::Release);
+            s.fire_generation.fetch_add(1, Ordering::Relaxed);
+            s.waiting_for_speech_final.store(false, Ordering::Release);
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(handle.is_finished(), "timer task must exit once disarmed");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "a disarmed hard timeout must never fire"
+        );
+    }
+
+    /// P0.4 (C5): timing decisions use the monotonic process clock — two reads
+    /// straddling a sleep are ordered and proportional, by construction
+    /// independent of wall-clock (which can step backwards under NTP).
+    #[tokio::test]
+    async fn monotonic_clock_orders_and_measures() {
+        let t0 = super::super::state::now_monotonic_ms();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let t1 = super::super::state::now_monotonic_ms();
+        assert!(t1 > t0, "monotonic clock must advance");
+        assert!(t1 - t0 >= 20, "interval must reflect elapsed time");
     }
 }
