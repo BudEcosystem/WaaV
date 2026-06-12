@@ -904,12 +904,22 @@ impl LlmClient {
                 }
             }
 
+            let mut stream_done = false;
             while let Some(newline_pos) = buffer.find('\n') {
                 let line = buffer[..newline_pos].trim().to_string();
                 buffer = buffer[newline_pos + 1..].to_string();
 
-                if line.is_empty() || line == "data: [DONE]" {
+                if line.is_empty() {
                     continue;
+                }
+                if line == "data: [DONE]" {
+                    // The protocol end marker: stop reading the body NOW.
+                    // Waiting for the server/proxy to close the connection
+                    // (keep-alive linger) would hold the final sentence —
+                    // often the whole reply — out of TTS for the duration
+                    // (brutal-review finding, wf_0cc69d62).
+                    stream_done = true;
+                    break;
                 }
 
                 if let Some(data) = line.strip_prefix("data: ") {
@@ -978,6 +988,9 @@ impl LlmClient {
                         }
                     }
                 }
+            }
+            if stream_done {
+                break;
             }
         }
 

@@ -268,6 +268,10 @@ pub struct DeepgramResponse {
     pub metadata: Option<DeepgramMetadata>,
     pub is_final: Option<bool>,
     pub speech_final: Option<bool>,
+    /// Set by Deepgram on results emitted in response to a `Finalize`
+    /// message — the provider has nothing more to send for this segment
+    /// (maps to [`STTResult::is_finalized`]).
+    pub from_finalize: Option<bool>,
     pub duration: Option<f64>,
     pub start: Option<f64>,
     pub channel_index: Option<Vec<u32>>,
@@ -620,12 +624,19 @@ impl DeepgramSTT {
                                 if let Some(channel) = response.channel
                                     && let Some(alternative) = channel.alternatives.first()
                                 {
-                                    let stt_result = STTResult::new(
+                                    let is_final = response.is_final.unwrap_or(false);
+                                    let mut stt_result = STTResult::new(
                                         alternative.transcript.clone(),
-                                        response.is_final.unwrap_or(false),
+                                        is_final,
                                         response.speech_final.unwrap_or(false),
                                         alternative.confidence,
                                     );
+                                    // A Finalize-ack means Deepgram has nothing
+                                    // more for this segment (A-G1): downstream
+                                    // EoT logic may stop waiting on STT.
+                                    if is_final && response.from_finalize == Some(true) {
+                                        stt_result = stt_result.finalized();
+                                    }
 
                                     // Send result (non-blocking with bounded channel)
                                     if let Err(e) = result_tx.try_send(stt_result) {
@@ -1320,6 +1331,35 @@ impl Drop for DeepgramSTT {
 mod tests {
     use super::*;
     use tokio::time::Duration;
+
+    /// A-G1: a Finalize-ack result (`from_finalize: true`) maps to
+    /// `STTResult::is_finalized` through the real message handler; ordinary
+    /// finals stay un-finalized.
+    #[tokio::test]
+    async fn from_finalize_maps_to_is_finalized() {
+        let (tx, mut rx) = mpsc::channel::<STTResult>(4);
+
+        let finalize_ack = r#"{"type":"Results","is_final":true,"speech_final":true,"from_finalize":true,
+            "channel":{"alternatives":[{"transcript":"all done","confidence":0.98}]}}"#;
+        DeepgramSTT::handle_websocket_message(Message::Text(finalize_ack.into()), &tx).unwrap();
+        let r = rx.recv().await.unwrap();
+        assert!(r.is_finalized, "Finalize ack must set is_finalized");
+        assert!(r.is_final);
+
+        let ordinary_final = r#"{"type":"Results","is_final":true,"speech_final":false,
+            "channel":{"alternatives":[{"transcript":"hello","confidence":0.9}]}}"#;
+        DeepgramSTT::handle_websocket_message(Message::Text(ordinary_final.into()), &tx).unwrap();
+        let r = rx.recv().await.unwrap();
+        assert!(!r.is_finalized, "ordinary finals are not finalized");
+
+        // A malformed pairing (from_finalize on an interim) must NOT mark
+        // finalized — the invariant is enforced at the mapping site.
+        let weird_interim = r#"{"type":"Results","is_final":false,"from_finalize":true,
+            "channel":{"alternatives":[{"transcript":"par","confidence":0.5}]}}"#;
+        DeepgramSTT::handle_websocket_message(Message::Text(weird_interim.into()), &tx).unwrap();
+        let r = rx.recv().await.unwrap();
+        assert!(!r.is_finalized, "interim can never be finalized");
+    }
 
     #[tokio::test]
     async fn test_deepgram_stt_creation() {

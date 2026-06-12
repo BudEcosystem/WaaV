@@ -102,6 +102,14 @@ impl Default for ConversationConfig {
     }
 }
 
+/// Default `max_tokens` cap for the VOICE path when the operator doesn't set
+/// one (X-G1). A spoken reply of ~30s is ~75 words (~100 tokens); 256 leaves
+/// headroom for multilingual scripts and longer answers while preventing a
+/// verbose model from generating essays the user must sit through (and pay
+/// for). Explicit `max_tokens` always wins. Non-voice paths (DAG JSON flows)
+/// are unaffected — this cap lives in the conversation config only.
+pub const VOICE_DEFAULT_MAX_TOKENS: u32 = 256;
+
 impl ConversationConfig {
     fn to_client_config(&self) -> LlmClientConfig {
         LlmClientConfig {
@@ -110,7 +118,8 @@ impl ConversationConfig {
             api_key: self.api_key.clone(),
             system_prompt: self.system_prompt.clone(),
             temperature: self.temperature,
-            max_tokens: self.max_tokens,
+            // X-G1: cap completion length for voice unless explicitly set.
+            max_tokens: self.max_tokens.or(Some(VOICE_DEFAULT_MAX_TOKENS)),
             streaming: self.streaming,
             max_history: self.max_history,
             ..Default::default()
@@ -306,29 +315,23 @@ impl ConversationOrchestrator {
                 let _ = tx.send(delta.to_string());
             });
 
-            // Pump task: aggregate deltas into sentence-ish chunks, speak each.
+            // Pump task: aggregate deltas into sentences via the shared
+            // aggregator (lookahead + decimal/abbrev disambiguation + 160-char
+            // cap — core::text::SentenceAggregator, PIPECAT_FIX_PLAN C-G1+2),
+            // speaking each completed sentence as soon as it is confirmed.
             let vm_pump = vm.clone();
             let spoke_pump = spoke.clone();
             let obs_pump = observers.clone();
             let handle = tokio::spawn(async move {
-                /// Longest unpunctuated run we hold before flushing anyway —
-                /// bounds added latency for list-y / unpunctuated LLM output.
-                const MAX_HOLD_CHARS: usize = 160;
-                let mut buf = String::new();
+                let mut agg = crate::core::text::SentenceAggregator::default();
 
-                /// Sentence-ish boundary: western + CJK + Devanagari terminators.
-                fn boundary(c: char) -> bool {
-                    matches!(c, '.' | '!' | '?' | '\n' | '।' | '。' | '！' | '？' | '…')
-                }
-
-                async fn flush(
+                async fn speak_sentence(
                     vm: &VoiceManager,
-                    buf: &mut String,
+                    text: String,
                     allow_interruption: bool,
                     spoke: &std::sync::atomic::AtomicBool,
                     obs: &Option<Arc<crate::core::observability::ObserverRegistry>>,
                 ) -> bool {
-                    let text = std::mem::take(buf);
                     if text.trim().is_empty() {
                         return true;
                     }
@@ -351,24 +354,35 @@ impl ConversationOrchestrator {
                     true
                 }
 
-                loop {
+                'pump: loop {
                     tokio::select! {
                         biased;
                         _ = token_for_cb.cancelled() => break,
                         maybe = rx.recv() => match maybe {
                             Some(chunk) => {
                                 if chunk.is_empty() { continue; }
-                                buf.push_str(&chunk);
-                                let at_boundary = buf.trim_end().chars().last().is_some_and(boundary);
-                                if (at_boundary || buf.chars().count() >= MAX_HOLD_CHARS)
-                                    && !flush(&vm_pump, &mut buf, allow_interruption, &spoke_pump, &obs_pump).await
-                                {
-                                    break;
+                                for sentence in agg.push_str(&chunk) {
+                                    // Re-check cancellation BETWEEN sentences:
+                                    // barge-in landing mid-loop must not speak
+                                    // the remaining (stale) sentences into the
+                                    // freshly cleared TTS queue.
+                                    if token_for_cb.is_cancelled() {
+                                        break 'pump;
+                                    }
+                                    if !speak_sentence(&vm_pump, sentence, allow_interruption, &spoke_pump, &obs_pump).await {
+                                        break 'pump;
+                                    }
                                 }
                             }
                             None => {
-                                // Stream ended: speak whatever remains.
-                                let _ = flush(&vm_pump, &mut buf, allow_interruption, &spoke_pump, &obs_pump).await;
+                                // Stream ended: speak the held remainder (a
+                                // boundary awaiting lookahead must still fire)
+                                // — unless the turn was cancelled.
+                                if !token_for_cb.is_cancelled()
+                                    && let Some(tail) = agg.flush()
+                                {
+                                    let _ = speak_sentence(&vm_pump, tail, allow_interruption, &spoke_pump, &obs_pump).await;
+                                }
                                 break;
                             }
                         }
@@ -537,16 +551,28 @@ impl ConversationOrchestrator {
                         self.llm
                             .commit_turn(&self.session_id, &transcript, &content)
                             .await;
-                        let speak_res = if self.config.allow_interruption {
-                            self.voice_manager.speak(&content, true).await
-                        } else {
-                            self.voice_manager
-                                .speak_with_interruption(&content, true, false)
-                                .await
-                        };
-                        if let Err(e) = speak_res {
-                            warn!(session = %self.session_id, error = %e,
-                                  "speaking confirmed eager reply failed");
+                        // Speak through the SAME sentence aggregator as the
+                        // streaming pump: per-sentence chunks + the 160-char
+                        // cap apply to eager replies too (a single monolithic
+                        // speak() of a multi-sentence reply has worse first-
+                        // audio latency and one giant interruption window —
+                        // brutal-review finding, wf_0cc69d62).
+                        let mut agg = crate::core::text::SentenceAggregator::default();
+                        let mut sentences = agg.push_str(&content);
+                        sentences.extend(agg.flush());
+                        for sentence in sentences {
+                            let speak_res = if self.config.allow_interruption {
+                                self.voice_manager.speak(&sentence, true).await
+                            } else {
+                                self.voice_manager
+                                    .speak_with_interruption(&sentence, true, false)
+                                    .await
+                            };
+                            if let Err(e) = speak_res {
+                                warn!(session = %self.session_id, error = %e,
+                                      "speaking confirmed eager reply failed");
+                                break;
+                            }
                         }
                         debug!(session = %self.session_id, "eager turn confirmed and spoken");
                         return;
@@ -592,6 +618,37 @@ mod tests {
         assert!(c.streaming);
         assert!(c.allow_interruption);
         assert_eq!(c.base_url, "https://api.openai.com/v1");
+    }
+
+    // --- X-G1: voice-path fast-LLM defaults ---
+
+    #[test]
+    fn voice_max_tokens_cap_applied_when_unset() {
+        let c = ConversationConfig::default();
+        assert_eq!(c.max_tokens, None, "operator did not set a cap");
+        let client_cfg = c.to_client_config();
+        assert_eq!(
+            client_cfg.max_tokens,
+            Some(VOICE_DEFAULT_MAX_TOKENS),
+            "voice path must cap completion length by default (X-G1)"
+        );
+    }
+
+    #[test]
+    fn explicit_max_tokens_respected() {
+        let c = ConversationConfig { max_tokens: Some(1024), ..Default::default() };
+        assert_eq!(c.to_client_config().max_tokens, Some(1024));
+    }
+
+    #[test]
+    fn voice_default_model_is_non_reasoning_fast_tier() {
+        // The default voice model must stay a fast NON-reasoning tier: a
+        // reasoning default would burn seconds of llm_ttft (the measured
+        // 79%-of-turn failure mode, AUDIT_REPORT §1). This test is the
+        // tripwire against someone "upgrading" the default to a reasoning
+        // model.
+        let c = ConversationConfig::default();
+        assert_eq!(c.model, "gpt-4o-mini");
     }
 
     #[test]

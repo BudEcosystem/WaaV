@@ -21,6 +21,7 @@ pub mod silero_vad;
 pub mod smart_turn;
 pub mod state;
 pub mod stt;
+pub mod text;
 pub mod tts;
 pub mod turn_decision;
 pub mod turn_detect;

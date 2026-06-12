@@ -25,21 +25,12 @@ use crate::core::llm::{LlmClient, LlmClientConfig, LlmError, TokenCallback};
 use crate::dag::context::DAGContext;
 use crate::dag::error::{DAGError, DAGResult};
 
-/// Drain and return all COMPLETE sentences from `buf` (everything up to and including the LAST
-/// sentence terminator), leaving the trailing partial sentence behind. Terminators cover ASCII
-/// `.!?`, the Devanagari danda `।`, and a newline — so the LLM streaming path can flush a sentence
-/// to TTS the moment it finishes rather than waiting for the whole completion.
-fn drain_complete_sentences(buf: &mut String) -> Option<String> {
-    const TERMS: &[char] = &['.', '!', '?', '।', '\n'];
-    let mut last_end: Option<usize> = None;
-    for (i, c) in buf.char_indices() {
-        if TERMS.contains(&c) {
-            last_end = Some(i + c.len_utf8());
-        }
-    }
-    let end = last_end?;
-    Some(buf.drain(..end).collect())
-}
+// Sentence chunking for the streaming path lives in the SHARED aggregator
+// (`core::text::SentenceAggregator`) — lookahead + decimal/abbreviation
+// disambiguation + multilingual terminators + the 160-char latency cap — so
+// the DAG path and the conversation pump can never diverge again
+// (PIPECAT_FIX_PLAN C-G1+2).
+use crate::core::text::SentenceAggregator;
 
 // Re-export the OpenAI-compatible wire types from the shared core so the DAG's
 // public surface (`nodes::llm::{ChatMessage, ResponseFormat, ToolDefinition, ...}`)
@@ -395,7 +386,8 @@ impl DAGNode for LlmEndpointNode {
                 let _ = tok_tx.send(t.to_string());
             });
 
-            let mut buf = String::new();
+            let mut agg = SentenceAggregator::default();
+            let mut emitted_any = false;
             let completion = self.client.complete(
                 &ctx.stream_id,
                 &input_text,
@@ -410,11 +402,14 @@ impl DAGNode for LlmEndpointNode {
                 tokio::select! {
                     res = &mut completion => break res,
                     Some(tok) = tok_rx.recv() => {
-                        buf.push_str(&tok);
-                        if let Some(sentence) = drain_complete_sentences(&mut buf) {
-                            if !sentence.trim().is_empty()
-                                && outputs.send(DAGData::Text(sentence)).await.is_err()
-                            {
+                        for sentence in agg.push_str(&tok) {
+                            // Barge-in/teardown mid-burst: stop emitting stale
+                            // sentences downstream.
+                            if ctx.cancel_token.is_cancelled() {
+                                return Ok(());
+                            }
+                            emitted_any = true;
+                            if outputs.send(DAGData::Text(sentence)).await.is_err() {
                                 return Ok(()); // downstream gone
                             }
                         }
@@ -423,20 +418,31 @@ impl DAGNode for LlmEndpointNode {
             };
             // Catch any tokens that landed between the last poll and completion.
             while let Ok(tok) = tok_rx.try_recv() {
-                buf.push_str(&tok);
+                for sentence in agg.push_str(&tok) {
+                    if ctx.cancel_token.is_cancelled() {
+                        return Ok(());
+                    }
+                    emitted_any = true;
+                    if outputs.send(DAGData::Text(sentence)).await.is_err() {
+                        return Ok(());
+                    }
+                }
             }
+            let mut tail = agg.flush();
             match completion_result {
                 Ok(response) => {
                     // Non-streaming providers deliver content only in the final response, not as
                     // deltas — fall back to the full content so the chain still produces output.
-                    if buf.trim().is_empty() && !response.content.is_empty() {
-                        buf = response.content;
+                    if !emitted_any && tail.is_none() && !response.content.is_empty() {
+                        tail = Some(response.content);
                     }
                 }
                 Err(e) => return Err(map_llm_error(e)),
             }
-            if !buf.trim().is_empty() {
-                let _ = outputs.send(DAGData::Text(buf)).await;
+            if let Some(tail) = tail
+                && !tail.trim().is_empty()
+            {
+                let _ = outputs.send(DAGData::Text(tail)).await;
             }
         }
         Ok(())
@@ -465,26 +471,33 @@ mod tests {
     }
 
     #[test]
-    fn drain_complete_sentences_flushes_finished_only() {
-        // No terminator yet → nothing to flush, buffer untouched.
-        let mut b = "the quick brown".to_string();
-        assert_eq!(super::drain_complete_sentences(&mut b), None);
-        assert_eq!(b, "the quick brown");
+    fn streaming_sentence_chunking_via_shared_aggregator() {
+        // The DAG path now uses the SAME aggregator as the conversation pump.
+        // Assert the streaming-relevant semantics at this call site.
+        let mut agg = SentenceAggregator::default();
 
-        // One finished sentence + a partial: flush the finished, keep the partial.
-        let mut b = "Hello there. How are y".to_string();
-        assert_eq!(super::drain_complete_sentences(&mut b).as_deref(), Some("Hello there."));
-        assert_eq!(b, " How are y");
+        // No terminator yet → nothing emitted, text retained for later.
+        assert!(agg.push_str("the quick brown").is_empty());
+        assert_eq!(agg.flush().as_deref(), Some("the quick brown"));
 
-        // Devanagari danda terminator (Hindi).
-        let mut b = "नमस्ते। आप".to_string();
-        assert_eq!(super::drain_complete_sentences(&mut b).as_deref(), Some("नमस्ते।"));
-        assert_eq!(b, " आप");
+        // Finished sentence emits on lookahead; the partial stays buffered.
+        let mut agg = SentenceAggregator::default();
+        let out = agg.push_str("Hello there. How are y");
+        assert_eq!(out, vec!["Hello there."]);
+        assert_eq!(agg.flush().as_deref(), Some("How are y"));
 
-        // Multiple finished sentences flush together (up to the LAST terminator).
-        let mut b = "One. Two! Three? tail".to_string();
-        assert_eq!(super::drain_complete_sentences(&mut b).as_deref(), Some("One. Two! Three?"));
-        assert_eq!(b, " tail");
+        // Devanagari danda flushes immediately (unambiguous, no lookahead).
+        let mut agg = SentenceAggregator::default();
+        assert_eq!(agg.push_str("नमस्ते। आप"), vec!["नमस्ते।"]);
+
+        // Each finished sentence emits separately (per-sentence TTS chunks).
+        let mut agg = SentenceAggregator::default();
+        assert_eq!(agg.push_str("One. Two! Three? tail"), vec!["One.", "Two!", "Three?"]);
+        assert_eq!(agg.flush().as_deref(), Some("tail"));
+
+        // The lookahead guards: decimals/abbreviations never split mid-token.
+        let mut agg = SentenceAggregator::default();
+        assert_eq!(agg.push_str("Pi is 3.14. Mr. Tau wins. End"), vec!["Pi is 3.14.", "Mr. Tau wins."]);
     }
 
     #[test]

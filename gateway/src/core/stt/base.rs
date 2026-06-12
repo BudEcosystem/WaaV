@@ -234,6 +234,16 @@ pub struct STTResult {
     pub is_final: bool,
     /// Whether this marks the end of a speech segment.
     pub is_speech_final: bool,
+    /// Whether the provider has explicitly FINALIZED this segment — i.e. it
+    /// has nothing more to send for it (e.g. Deepgram's `from_finalize` ack
+    /// to a `Finalize` message). Distinct from [`is_final`](Self::is_final)
+    /// ("this chunk is immutable, more may follow") and
+    /// [`is_speech_final`](Self::is_speech_final) ("end of utterance").
+    /// Downstream end-of-turn logic may short-circuit its STT-latency safety
+    /// wait when this is `true` (PIPECAT_FIX_PLAN A-G1/A-G2). Invariant:
+    /// `is_finalized ⇒ is_final`. Defaults to `false`; providers without a
+    /// finalize handshake never set it.
+    pub is_finalized: bool,
     /// Confidence score of the transcription (0.0 to 1.0).
     pub confidence: f32,
 
@@ -308,6 +318,7 @@ impl STTResult {
             transcript,
             is_final,
             is_speech_final,
+            is_finalized: false,
             confidence: confidence.clamp(0.0, 1.0),
             // Initialize all optional metadata fields to None for backward compatibility
             words: None,
@@ -319,6 +330,19 @@ impl STTResult {
             detected_language: None,
             audio_duration: None,
         }
+    }
+
+    /// Marks this result as provider-FINALIZED (the provider has nothing more
+    /// to send for this segment). Builder-style so the ~33 provider call
+    /// sites stay untouched; only providers with a real finalize handshake
+    /// call this on the terminal transcript.
+    ///
+    /// Invariant: a finalized result is always final (`is_finalized ⇒
+    /// is_final`) — enforced here rather than at every consumer.
+    pub fn finalized(mut self) -> Self {
+        debug_assert!(self.is_final, "is_finalized requires is_final (finalized ⇒ final)");
+        self.is_finalized = true;
+        self
     }
 
     /// Creates a new STTResult with all fields specified.
@@ -343,6 +367,7 @@ impl STTResult {
             transcript,
             is_final,
             is_speech_final,
+            is_finalized: false,
             confidence: confidence.clamp(0.0, 1.0),
             words,
             speakers,
@@ -630,6 +655,43 @@ impl STTStats {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    // --- A-G1: is_finalized fleet flag ---
+
+    #[test]
+    fn stt_result_finalized_defaults_false() {
+        let r = STTResult::new("hi".into(), true, true, 0.9);
+        assert!(!r.is_finalized);
+        let m = STTResult::with_metadata(
+            "hi".into(),
+            true,
+            true,
+            0.9,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!m.is_finalized);
+    }
+
+    #[test]
+    fn finalized_builder_sets_flag_and_implies_final() {
+        let r = STTResult::new("done".into(), true, true, 1.0).finalized();
+        assert!(r.is_finalized);
+        assert!(r.is_final, "finalized ⇒ final invariant");
+    }
+
+    #[test]
+    #[should_panic(expected = "finalized ⇒ final")]
+    #[cfg(debug_assertions)]
+    fn finalized_on_interim_panics_in_debug() {
+        let _ = STTResult::new("part".into(), false, false, 0.5).finalized();
+    }
 
     // Mock implementation for testing
     struct MockSTT {
