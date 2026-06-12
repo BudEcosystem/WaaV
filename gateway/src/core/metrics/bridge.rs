@@ -47,6 +47,9 @@ pub const CIRCUIT_BREAKER_STATE: &str = "waav_circuit_breaker_state";
 /// `circuit_open`=breaker rejected the attempt). Makes the reconnect path observable (W-C1).
 pub const RECONNECTS_TOTAL: &str = "waav_reconnects_total";
 
+/// D-G4: session teardowns that exceeded the bounded budget.
+pub const SESSION_TEARDOWN_TIMEOUTS_TOTAL: &str = "waav_session_teardown_timeouts_total";
+
 /// D-G9: characters submitted to TTS synthesis, per provider (cost proxy).
 pub const TTS_CHARS_TOTAL: &str = "waav_tts_chars_total";
 
@@ -285,6 +288,10 @@ fn describe_series() {
     );
     metrics::describe_counter!(TURNS_TOTAL, "Total turns by path and outcome");
     metrics::describe_counter!(
+        SESSION_TEARDOWN_TIMEOUTS_TOTAL,
+        "Session teardowns that exceeded the bounded budget (D-G4)"
+    );
+    metrics::describe_counter!(
         TTS_CHARS_TOTAL,
         "Characters submitted to TTS synthesis, per provider (D-G9)"
     );
@@ -361,6 +368,11 @@ pub fn set_circuit_breaker_state(provider: &str, state_code: u8) {
 /// Record a reconnect attempt outcome on `waav_reconnects_total`. `outcome` is one of
 /// `success` / `failure` / `exhausted` / `circuit_open`. Emitted from the streaming reconnect
 /// path so reconnects are observable (W-C1).
+/// D-G4: a session teardown exceeded its budget ("blocked somewhere?").
+pub fn record_session_teardown_timeout() {
+    counter!(SESSION_TEARDOWN_TIMEOUTS_TOTAL).increment(1);
+}
+
 /// D-G9: count TTS characters (call with `text.len()` at submit time).
 pub fn count_tts_chars(provider: &str, chars: usize) {
     counter!(TTS_CHARS_TOTAL, "provider" => provider.to_string()).increment(chars as u64);
@@ -519,6 +531,7 @@ mod tests {
         count_llm_tokens("unit-llm", "prompt", 100);
         count_llm_tokens("unit-llm", "completion", 40);
         count_llm_tokens("unit-llm", "reasoning", 7);
+        record_session_teardown_timeout();
 
         let text = render();
         let chars_line = text
@@ -538,6 +551,10 @@ mod tests {
                 && l.contains("unit-llm")
                 && l.contains("kind=\"cache_read\"")),
             "kinds the wire never reported must not appear"
+        );
+        assert!(
+            text.contains(SESSION_TEARDOWN_TIMEOUTS_TOTAL),
+            "D-G4 teardown-timeout counter present"
         );
     }
 

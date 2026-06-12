@@ -338,11 +338,23 @@ async fn run_voice_socket_session(
         }
     }
 
-    // Now stop the voice manager after audio sources are quiet
+    // Now stop the voice manager after audio sources are quiet.
+    // BOUNDED (D-G4, Pipecat CANCEL_TIMEOUT parity): a provider disconnect
+    // wedged in native/network code must not hang session teardown — warn
+    // loudly and move on; the session's spawned tasks are detached and the
+    // process-level drain (RC6) remains the backstop.
     if let Some(voice_manager) = voice_manager {
-        match voice_manager.stop().await {
-            Ok(_) => {}
-            Err(e) => error!("Failed to stop voice manager: {}", e),
+        const SESSION_TEARDOWN_BUDGET: Duration = Duration::from_secs(10);
+        match tokio::time::timeout(SESSION_TEARDOWN_BUDGET, voice_manager.stop()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => error!("Failed to stop voice manager: {}", e),
+            Err(_) => {
+                warn!(
+                    budget_secs = SESSION_TEARDOWN_BUDGET.as_secs(),
+                    "voice manager stop exceeded the teardown budget — being                      blocked somewhere? continuing teardown"
+                );
+                crate::core::metrics::bridge::record_session_teardown_timeout();
+            }
         }
     }
 
