@@ -1060,6 +1060,12 @@ impl DeepgramSTT {
                 {
                     manager.reset();
                 }
+                // D-G2: feed the lifetime to the quick-fail detector. NOTE:
+                // only NON-intentional closes count — a client hangup after
+                // 2s is not a credentials signature.
+                if !intentional_disconnect.load(Ordering::Acquire) {
+                    breaker.record_connection_closed(connected_since.elapsed());
+                }
 
                 // W-D1: if the client asked to disconnect while the inner loop was running, a
                 // server-close that won the unbiased select may have classified this as Reconnect.

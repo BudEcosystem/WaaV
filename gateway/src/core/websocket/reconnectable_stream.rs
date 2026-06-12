@@ -111,6 +111,10 @@ impl ReconnectableStreamConfig {
 /// How a supervised run ended (the supervisor's own terminal status).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupervisorExit {
+    /// D-G2: the breaker went credentials-fatal (3 consecutive sub-stable
+    /// connections) — retrying cannot help; the session should surface a
+    /// configuration error.
+    CredentialsFatal,
     /// Inner loop completed normally (or an intentional disconnect was requested).
     Completed,
     /// A fatal, non-retryable error ended the session.
@@ -257,6 +261,15 @@ impl ReconnectableStream {
 
             // Honor the circuit breaker before spending a governed slot or dialing.
             if !self.breaker.allow_request() {
+                // D-G2: credentials-fatal is STICKY — no cooldown will ever
+                // open it; exit immediately instead of burning the budget.
+                if self.breaker.is_permanently_failed() {
+                    tracing::error!(
+                        provider = %self.config.provider,
+                        "breaker is credentials-fatal; stopping reconnection permanently"
+                    );
+                    return SupervisorExit::CredentialsFatal;
+                }
                 // Breaker is open (or its single half-open probe is already outstanding).
                 // We must still have reconnection budget left, otherwise give up. Wait out
                 // the breaker cooldown (approximated by the current backoff delay) and
@@ -346,6 +359,11 @@ impl ReconnectableStream {
             if was_stable {
                 self.manager.reset();
             }
+            // D-G2: feed the connection lifetime to the breaker's quick-fail
+            // detector — 3 consecutive handshake-then-die connections (bad
+            // credentials' signature) trip it PERMANENTLY instead of
+            // backoff-looping forever.
+            self.breaker.record_connection_closed(stable_for);
             match outcome {
                 ReconnectOutcome::Completed => {
                     return SupervisorExit::Completed;

@@ -84,6 +84,13 @@ pub struct CircuitBreakerConfig {
     pub window_size: u32,
     /// How long the breaker stays Open before allowing a half-open probe. Default 5s.
     pub cooldown: Duration,
+    /// D-G2: a connection that survived LESS than this is a "quick failure"
+    /// (bad credentials pass the TLS handshake, then the server closes —
+    /// rate-based tripping never converges on that shape). Default 5s.
+    pub min_stable_duration: Duration,
+    /// D-G2: consecutive quick failures at which the breaker goes
+    /// PERMANENTLY failed (sticky open — no half-open probe). Default 3.
+    pub max_quick_failures: u32,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -93,6 +100,8 @@ impl Default for CircuitBreakerConfig {
             min_request_volume: 5,
             window_size: 20,
             cooldown: Duration::from_secs(5),
+            min_stable_duration: Duration::from_secs(5),
+            max_quick_failures: 3,
         }
     }
 }
@@ -105,6 +114,8 @@ impl CircuitBreakerConfig {
             min_request_volume: 3,
             window_size: 10,
             cooldown: Duration::from_secs(2),
+            min_stable_duration: Duration::from_secs(5),
+            max_quick_failures: 3,
         }
     }
 
@@ -115,6 +126,8 @@ impl CircuitBreakerConfig {
             min_request_volume: 10,
             window_size: 50,
             cooldown: Duration::from_secs(15),
+            min_stable_duration: Duration::from_secs(5),
+            max_quick_failures: 3,
         }
     }
 }
@@ -153,6 +166,11 @@ pub struct CircuitBreaker {
     opened_at_ns: AtomicU64,
     /// Total number of times the breaker has tripped to Open (cumulative).
     total_trips: AtomicU64,
+    /// D-G2: consecutive connections that died before `min_stable_duration`.
+    quick_failures: AtomicU32,
+    /// D-G2: sticky credentials-fatal flag — once set, `allow_request` is
+    /// false FOREVER (no half-open probe; backoff cannot fix bad creds).
+    permanently_failed: std::sync::atomic::AtomicBool,
     /// Optional metrics label (the provider name). When set, every state transition publishes
     /// `waav_circuit_breaker_state{provider=<label>}` so the gauge tracks the breaker in
     /// near-real-time. `None` for anonymous breakers (e.g. unit-test fixtures) which stay silent.
@@ -169,6 +187,8 @@ impl CircuitBreaker {
             failures: AtomicU32::new(0),
             opened_at_ns: AtomicU64::new(0),
             total_trips: AtomicU64::new(0),
+            quick_failures: AtomicU32::new(0),
+            permanently_failed: std::sync::atomic::AtomicBool::new(false),
             label: None,
         }
     }
@@ -213,6 +233,11 @@ impl CircuitBreaker {
     ///   probe via a CAS; losers see HalfOpen and are denied.
     /// - HalfOpen → `false` (the single probe is already outstanding).
     pub fn allow_request(&self) -> bool {
+        // D-G2: a credentials-fatal breaker never half-opens — retrying a
+        // bad key forever is the failure shape this exists to stop.
+        if self.permanently_failed.load(Ordering::Acquire) {
+            return false;
+        }
         match self.state.load(Ordering::Acquire) {
             STATE_CLOSED => true,
             STATE_HALF_OPEN => false,
@@ -267,6 +292,34 @@ impl CircuitBreaker {
         self.failures.fetch_add(1, Ordering::AcqRel);
         self.maybe_decay_window();
         self.maybe_trip();
+    }
+
+    /// D-G2: record a connection's lifetime at close. Sub-stable lifetimes
+    /// (a handshake that succeeds then dies — bad credentials' signature)
+    /// count consecutively; at `max_quick_failures` the breaker goes
+    /// PERMANENTLY failed. A stable connection resets the count.
+    pub fn record_connection_closed(&self, stable_for: Duration) {
+        if stable_for >= self.config.min_stable_duration {
+            self.quick_failures.store(0, Ordering::Release);
+            return;
+        }
+        let n = self.quick_failures.fetch_add(1, Ordering::AcqRel) + 1;
+        if n >= self.config.max_quick_failures {
+            tracing::error!(
+                provider = self.label.as_deref().unwrap_or("unknown"),
+                quick_failures = n,
+                "circuit breaker PERMANENTLY failed: {} consecutive sub-{}s                  connections (credentials/config fatal — backoff cannot fix this)",
+                n,
+                self.config.min_stable_duration.as_secs(),
+            );
+            self.permanently_failed.store(true, Ordering::Release);
+            self.trip();
+        }
+    }
+
+    /// D-G2: whether the breaker is credentials-fatal (sticky).
+    pub fn is_permanently_failed(&self) -> bool {
+        self.permanently_failed.load(Ordering::Acquire)
     }
 
     /// Current failure rate over the window, `0.0` if there are no samples.
@@ -376,6 +429,7 @@ mod tests {
             min_request_volume: 4,
             window_size: 20,
             cooldown: Duration::from_millis(30),
+            ..Default::default()
         }
     }
 
@@ -396,6 +450,62 @@ mod tests {
         }
         assert_eq!(cb.state(), CircuitState::Closed, "must not trip below min volume");
         assert!(cb.allow_request());
+    }
+
+    #[test]
+    fn breaker_trips_fatal_after_3_substable_connections() {
+        // D-G2: bad credentials pass the handshake then die fast — the
+        // rate-based breaker never converges; the quick-fail detector must
+        // go PERMANENTLY open (no half-open probe, ever).
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            cooldown: Duration::from_millis(1),
+            ..Default::default()
+        });
+        for _ in 0..2 {
+            cb.record_connection_closed(Duration::from_millis(300));
+            assert!(!cb.is_permanently_failed());
+        }
+        cb.record_connection_closed(Duration::from_millis(300));
+        assert!(cb.is_permanently_failed(), "3rd quick failure = fatal");
+        // Past ANY cooldown, allow_request stays false (sticky — distinct
+        // from a rate trip's half-open).
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(!cb.allow_request(), "credentials-fatal never half-opens");
+        assert!(!cb.allow_request());
+    }
+
+    #[test]
+    fn stable_connection_resets_quick_failure_count() {
+        let cb = CircuitBreaker::with_defaults();
+        cb.record_connection_closed(Duration::from_millis(100));
+        cb.record_connection_closed(Duration::from_millis(100));
+        // A stable connection (≥ min_stable_duration) resets the streak.
+        cb.record_connection_closed(Duration::from_secs(60));
+        cb.record_connection_closed(Duration::from_millis(100));
+        cb.record_connection_closed(Duration::from_millis(100));
+        assert!(
+            !cb.is_permanently_failed(),
+            "streak must reset on a stable connection (flaky ≠ fatal)"
+        );
+    }
+
+    #[test]
+    fn rate_trip_still_half_opens() {
+        // Regression: the ordinary rate trip keeps its half-open recovery.
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            error_rate_threshold: 0.5,
+            min_request_volume: 2,
+            window_size: 10,
+            cooldown: Duration::from_millis(1),
+            ..Default::default()
+        });
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(cb.allow_request(), "rate trip half-opens after cooldown");
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed, "probe success closes");
     }
 
     #[test]
@@ -505,6 +615,7 @@ mod tests {
             min_request_volume: 4,
             window_size: 10,
             cooldown: Duration::from_millis(50),
+            ..Default::default()
         });
         // Seed some old failures but stay under the trip threshold by interleaving success.
         cb.record_failure();
