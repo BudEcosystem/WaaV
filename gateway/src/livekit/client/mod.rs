@@ -81,7 +81,12 @@ pub struct LiveKitClient {
     pub(crate) audio_callback: Option<AudioCallback>,
     pub(crate) data_callback: Option<DataCallback>,
     pub(crate) participant_disconnect_callback: Option<ParticipantDisconnectCallback>,
-    pub(crate) active_streams: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// E-G3: per-PARTICIPANT audio-stream tasks. Keyed so a resubscribe
+    /// (mute/unmute storms re-drive subscription) aborts the OLD task
+    /// before registering the new one — exactly one producer per
+    /// participant, never an accumulating Vec.
+    pub(crate) active_streams:
+        Arc<Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub(crate) is_connected: Arc<Mutex<bool>>,
     // Atomic flags for fast status queries
     pub(crate) is_connected_atomic: Arc<AtomicBool>,
@@ -141,7 +146,7 @@ impl LiveKitClient {
             audio_callback: None,
             data_callback: None,
             participant_disconnect_callback: None,
-            active_streams: Arc::new(Mutex::new(Vec::new())),
+            active_streams: Arc::new(Mutex::new(std::collections::HashMap::new())),
             is_connected: Arc::new(Mutex::new(false)),
             is_connected_atomic: Arc::new(AtomicBool::new(false)),
             has_audio_source_atomic: Arc::new(AtomicBool::new(false)),
@@ -204,7 +209,7 @@ impl Drop for LiveKitClient {
     fn drop(&mut self) {
         // Abort all active stream handles synchronously
         if let Ok(mut streams) = self.active_streams.try_lock() {
-            for handle in streams.drain(..) {
+            for (_participant, handle) in streams.drain() {
                 handle.abort();
             }
         }

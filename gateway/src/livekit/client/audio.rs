@@ -124,8 +124,17 @@ impl LiveKitClient {
                     }
                 });
 
-                // Track the spawn handle for lifecycle management
-                self.active_streams.lock().await.push(handle);
+                // Track the spawn handle for lifecycle management (the
+                // egress publisher is keyed under a reserved name — it is
+                // not a participant stream).
+                if let Some(old) = self
+                    .active_streams
+                    .lock()
+                    .await
+                    .insert("__egress_publisher".to_string(), handle)
+                {
+                    old.abort();
+                }
 
                 info!("Audio source, track, and publication are now set");
             }
@@ -566,7 +575,13 @@ impl LiveKitClient {
                         });
 
                         // Track the spawn handle for lifecycle management
-                        active_streams_clone.lock().await.push(handle);
+                        if let Some(old) = active_streams_clone
+                            .lock()
+                            .await
+                            .insert("__egress_publisher".to_string(), handle)
+                        {
+                            old.abort();
+                        }
 
                         info!("Successfully reconnected and re-published audio track");
 

@@ -60,7 +60,7 @@ impl LiveKitClient {
         audio_callback: &Option<AudioCallback>,
         data_callback: &Option<DataCallback>,
         participant_disconnect_callback: &Option<ParticipantDisconnectCallback>,
-        active_streams: &Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+        active_streams: &Arc<Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>>,
         is_connected: &Arc<Mutex<bool>>,
         config: &LiveKitConfig,
     ) {
@@ -97,7 +97,7 @@ impl LiveKitClient {
         audio_callback: &Option<AudioCallback>,
         data_callback: &Option<DataCallback>,
         participant_disconnect_callback: &Option<ParticipantDisconnectCallback>,
-        active_streams: &Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+        active_streams: &Arc<Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>>,
         is_connected: &Arc<Mutex<bool>>,
         config: &LiveKitConfig,
     ) -> Result<(), AppError> {
@@ -214,10 +214,23 @@ impl LiveKitClient {
                                 info!("Audio stream ended for participant: {}", participant_id);
                             });
 
-                            // Clean up completed handles before adding new one
+                            // E-G3: exactly ONE producer per participant —
+                            // a resubscribe (mute/unmute re-drives
+                            // subscription) aborts the old stream task
+                            // BEFORE registering the new one (Pipecat
+                            // close-old-before-register).
                             let mut streams = active_streams.lock().await;
-                            streams.retain(|h| !h.is_finished());
-                            streams.push(handle);
+                            let key = participant.identity().to_string();
+                            if let Some(old) = streams.insert(key.clone(), handle) {
+                                if !old.is_finished() {
+                                    info!(
+                                        participant = %key,
+                                        "resubscribe: aborting the previous audio stream task"
+                                    );
+                                }
+                                old.abort();
+                            }
+                            streams.retain(|_, h| !h.is_finished());
                         } else {
                             warn!("No audio callback set, ignoring audio track");
                         }
@@ -240,6 +253,16 @@ impl LiveKitClient {
                     publication.sid(),
                     participant.identity()
                 );
+                // E-G3: stop the participant's stream task NOW — relying on
+                // the SDK to close the underlying stream leaked tasks under
+                // resubscribe storms.
+                if let Some(handle) = active_streams
+                    .lock()
+                    .await
+                    .remove(participant.identity().as_str())
+                {
+                    handle.abort();
+                }
             }
             RoomEvent::ParticipantConnected(participant) => {
                 info!("Participant connected: {}", participant.identity());

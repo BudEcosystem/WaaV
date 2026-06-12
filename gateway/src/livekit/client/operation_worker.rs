@@ -25,7 +25,7 @@ pub(super) struct OperationContext {
     pub(super) is_connected: Arc<Mutex<bool>>,
     pub(super) config: LiveKitConfig,
     pub(super) local_track_publication: Arc<Mutex<Option<LocalTrackPublication>>>,
-    pub(super) active_streams: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    pub(super) active_streams: Arc<Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub(super) audio_callback: Option<AudioCallback>,
     pub(super) data_callback: Option<DataCallback>,
     pub(super) participant_disconnect_callback: Option<ParticipantDisconnectCallback>,

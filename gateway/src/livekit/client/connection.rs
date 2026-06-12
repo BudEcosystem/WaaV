@@ -82,7 +82,7 @@ impl LiveKitClient {
 
         // Abort active streams
         let mut streams = self.active_streams.lock().await;
-        for handle in streams.drain(..) {
+        for (_participant, handle) in streams.drain() {
             handle.abort();
         }
 
