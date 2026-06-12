@@ -609,6 +609,12 @@ impl MelExtractor {
         self.mel_frames.clear();
         self.audio_buffer.clear();
         self.resample_input_buffer.clear();
+        // Drop the sinc delay line too (C-G5 stale-tail fix): without this,
+        // the next utterance inherits the previous one's filter tail — a
+        // click/energy-leak source at utterance boundaries.
+        if let Some(r) = self.resampler.as_mut() {
+            r.reset();
+        }
     }
 
     /// Resets the extractor to initial state.
@@ -616,6 +622,9 @@ impl MelExtractor {
         self.mel_frames.clear();
         self.audio_buffer.clear();
         self.resample_input_buffer.clear();
+        if let Some(r) = self.resampler.as_mut() {
+            r.reset();
+        }
         self.total_samples = 0;
         self.total_extraction_time_us = 0;
     }

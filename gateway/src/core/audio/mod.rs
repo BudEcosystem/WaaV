@@ -7,7 +7,13 @@
 //! - [`AudioRingBuffer`] - Pre-allocated ring buffer for audio samples
 
 pub mod ring_buffer;
+// The single streaming resampler (C-G5) — available exactly when `rubato`
+// is pulled in (same gating pattern as `core::onnx`).
+#[cfg(any(feature = "silero-vad", feature = "smart-turn", feature = "noise-filter"))]
+pub mod resampler;
 pub mod vad;
 
 pub use ring_buffer::AudioRingBuffer;
+#[cfg(any(feature = "silero-vad", feature = "smart-turn", feature = "noise-filter"))]
+pub use resampler::{StreamResampler, resample_pcm16};
 pub use vad::{VADAnalyzer, VADParams, VADState, VADTransition};
