@@ -176,6 +176,10 @@ pub struct ConversationOrchestrator {
     /// only fires while its captured generation is current (any activity
     /// disarms stale timers structurally — no cancellation plumbing).
     idle_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// D-G3: invoked (once) when a turn error classifies FATAL — the
+    /// embedder surfaces it to the client / ends the session. None = log
+    /// only (tests, direct embedding).
+    fatal_handler: Arc<SyncMutex<Option<Arc<dyn Fn(String) + Send + Sync>>>>,
 }
 
 /// A speculative LLM turn started on a turn-complete PREDICTION, before the
@@ -221,6 +225,7 @@ impl ConversationOrchestrator {
             next_turn_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             eager: Arc::new(SyncMutex::new(None)),
             idle_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fatal_handler: Arc::new(SyncMutex::new(None)),
         })
     }
 
@@ -242,6 +247,7 @@ impl ConversationOrchestrator {
             next_turn_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             eager: Arc::new(SyncMutex::new(None)),
             idle_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fatal_handler: Arc::new(SyncMutex::new(None)),
         }
     }
 
@@ -831,8 +837,37 @@ impl ConversationOrchestrator {
         }
 
         if let Err(e) = self.run_turn(transcript).await {
-            warn!(session = %self.session_id, error = %e, "conversation turn failed");
+            // D-G3: a RECOVERABLE error degrades this turn only (the call
+            // stays up — the next utterance runs normally). A FATAL one
+            // (auth/config) is surfaced once: every further turn would fail
+            // identically, burning latency and money on silence.
+            let class = match &e {
+                ConversationOrchestratorError::Llm(le) => classify_llm_error(le),
+                _ => StageErrorClass::Recoverable,
+            };
+            crate::core::metrics::bridge::count_turn_error(match class {
+                StageErrorClass::Fatal => "fatal",
+                StageErrorClass::Recoverable => "recoverable",
+            });
+            match class {
+                StageErrorClass::Recoverable => {
+                    warn!(session = %self.session_id, error = %e, "conversation turn failed (recoverable; call continues)");
+                }
+                StageErrorClass::Fatal => {
+                    tracing::error!(session = %self.session_id, error = %e,
+                        "FATAL turn error (auth/config) — surfacing to the session");
+                    let handler = self.fatal_handler.lock().take();
+                    if let Some(handler) = handler {
+                        handler(e.to_string());
+                    }
+                }
+            }
         }
+    }
+
+    /// D-G3: install the fatal-error handler (invoked once per fatal).
+    pub fn set_fatal_handler(&self, handler: Arc<dyn Fn(String) + Send + Sync>) {
+        *self.fatal_handler.lock() = Some(handler);
     }
 
     /// A-G7: register activity (user speech, bot turn) and re-arm the idle
@@ -889,6 +924,41 @@ impl ConversationOrchestrator {
     pub async fn shutdown(&self) {
         self.cancel_current_turn();
         self.llm.remove_history(&self.session_id).await;
+    }
+}
+
+/// D-G3: the fatal/recoverable tier for TURN-level errors (Pipecat
+/// `ErrorFrame.fatal`). Recoverable = this turn degrades, the CALL stays
+/// up. Fatal = retrying every turn against the same failure (bad key,
+/// rejected model) only burns money and silence — surface it and let the
+/// session end cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageErrorClass {
+    Recoverable,
+    Fatal,
+}
+
+/// Classify an LLM error. Auth/authz/config shapes are FATAL; transient
+/// transport/server shapes are RECOVERABLE. Conservative default:
+/// recoverable (a wrong fatal kills a call that might have healed).
+pub fn classify_llm_error(error: &LlmError) -> StageErrorClass {
+    match error {
+        LlmError::Cancelled => StageErrorClass::Recoverable,
+        LlmError::Endpoint { error, .. } => {
+            let e = error.to_lowercase();
+            let auth_status = e.contains("http 401") || e.contains("http 403");
+            let auth_text = e.contains("invalid api key")
+                || e.contains("invalid_api_key")
+                || e.contains("incorrect api key")
+                || e.contains("authentication")
+                || e.contains("unauthorized");
+            let config = e.contains("model_not_found") || e.contains("does not exist");
+            if auth_status || auth_text || config {
+                StageErrorClass::Fatal
+            } else {
+                StageErrorClass::Recoverable
+            }
+        }
     }
 }
 
@@ -982,5 +1052,55 @@ mod tests {
     fn test_validate_llm_url_rejects_bad_scheme() {
         assert!(validate_llm_url("ftp://example.com/v1").is_err());
         assert!(validate_llm_url("not a url").is_err());
+    }
+}
+
+#[cfg(test)]
+mod stage_error_tests {
+    use super::*;
+
+    fn endpoint_err(msg: &str) -> LlmError {
+        LlmError::Endpoint {
+            provider: "test".into(),
+            model: "m".into(),
+            error: msg.into(),
+        }
+    }
+
+    /// D-G3 tripwire: the classification matrix. A new failure shape lands
+    /// RECOVERABLE by default (conservative — a wrong fatal kills a call
+    /// that might have healed).
+    #[test]
+    fn error_classification_matrix() {
+        // FATAL: auth / authz / config.
+        for msg in [
+            "HTTP 401 - {\"error\":\"bad key\"}",
+            "HTTP 403 - forbidden",
+            "HTTP 400 - Incorrect API key provided",
+            "HTTP 400 - invalid_api_key",
+            "HTTP 404 - The model `gpt-9` does not exist",
+            "HTTP 400 - authentication failed",
+        ] {
+            assert_eq!(
+                classify_llm_error(&endpoint_err(msg)),
+                StageErrorClass::Fatal,
+                "{msg} must classify FATAL"
+            );
+        }
+        // RECOVERABLE: transient transport/server shapes.
+        for msg in [
+            "HTTP 500 - internal server error",
+            "HTTP 503 - overloaded",
+            "HTTP 429 - rate limited",
+            "Request failed: connection reset by peer",
+            "Request failed: operation timed out",
+        ] {
+            assert_eq!(
+                classify_llm_error(&endpoint_err(msg)),
+                StageErrorClass::Recoverable,
+                "{msg} must classify RECOVERABLE"
+            );
+        }
+        assert_eq!(classify_llm_error(&LlmError::Cancelled), StageErrorClass::Recoverable);
     }
 }

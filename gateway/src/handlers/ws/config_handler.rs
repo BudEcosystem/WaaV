@@ -413,6 +413,24 @@ async fn initialize_conversation_loop(
             }
             _ => Box::new(crate::core::turn::strategies::AnySpeechStart),
         };
+    // D-G3: a FATAL turn error (auth/config — every turn would fail
+    // identically) surfaces to the client as a Critical error message.
+    {
+        let message_tx = message_tx.clone();
+        orchestrator.set_fatal_handler(Arc::new(move |error: String| {
+            let message_tx = message_tx.clone();
+            tokio::spawn(async move {
+                let _ = message_tx
+                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
+                        message: format!(
+                            "fatal provider error (session cannot recover): {error}"
+                        ),
+                    }))
+                    .await;
+            });
+        }));
+    }
+
     // A-G5: optional user-mute strategy (OR-combined in the controller;
     // user input drops while active, lifecycle signals always flow).
     let mute_strategies: Vec<Box<dyn crate::core::turn::UserMuteStrategy>> =

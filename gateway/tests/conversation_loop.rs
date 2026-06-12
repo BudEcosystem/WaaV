@@ -1066,3 +1066,113 @@ async fn idle_suppressed_mid_turn_and_disabled_when_zero() {
     );
     let _ = tokio::time::timeout(Duration::from_secs(2), turn).await;
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// D-G3 — fatal vs recoverable turn errors.
+// ──────────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+#[serial_test::serial]
+async fn recoverable_stage_error_aborts_turn_not_session() {
+    use axum::http::StatusCode;
+
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    // Mock that 500s once, then answers.
+    #[derive(Clone, Default)]
+    struct FlakyState {
+        hits: Arc<AtomicUsize>,
+    }
+    async fn chat(
+        State(st): State<FlakyState>,
+        Json(_req): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        if st.hits.fetch_add(1, Ordering::SeqCst) == 0 {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"boom"})));
+        }
+        (
+            StatusCode::OK,
+            Json(json!({
+                "id":"r","object":"chat.completion","created":0,"model":"m",
+                "choices":[{"index":0,"message":{"role":"assistant","content":"recovered"},"finish_reason":"stop"}]
+            })),
+        )
+    }
+    let st = FlakyState::default();
+    let app = Router::new().route("/chat/completions", post(chat)).with_state(st.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base_url = format!("http://127.0.0.1:{}", addr.port());
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+    let orch = Arc::new(
+        ConversationOrchestrator::new("session-flaky", conv_config(base_url, false), vm.clone())
+            .expect("orchestrator"),
+    );
+    let fatal_fired = Arc::new(AtomicUsize::new(0));
+    let ff = Arc::clone(&fatal_fired);
+    orch.set_fatal_handler(Arc::new(move |_e| {
+        ff.fetch_add(1, Ordering::SeqCst);
+    }));
+
+    // Turn 1: 500 → recoverable, no fatal, session continues.
+    orch.on_stt_result(&final_result("first question")).await;
+    assert_eq!(fatal_fired.load(Ordering::SeqCst), 0, "a 500 is RECOVERABLE");
+    // Turn 2 on the SAME session: works.
+    orch.on_stt_result(&final_result("second question")).await;
+    let spoken = TTS_STATS.spoken.lock().clone();
+    assert!(
+        spoken.iter().any(|s| s.contains("recovered")),
+        "the session must survive a transient turn error: {spoken:?}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn fatal_stage_error_fires_handler_once() {
+    use axum::http::StatusCode;
+
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    async fn chat(Json(_req): Json<Value>) -> (StatusCode, Json<Value>) {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":{"message":"Incorrect API key provided"}})),
+        )
+    }
+    let app = Router::new().route("/chat/completions", post(chat));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base_url = format!("http://127.0.0.1:{}", addr.port());
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+    let orch = Arc::new(
+        ConversationOrchestrator::new("session-fatal", conv_config(base_url, false), vm.clone())
+            .expect("orchestrator"),
+    );
+    let fatal_fired = Arc::new(AtomicUsize::new(0));
+    let ff = Arc::clone(&fatal_fired);
+    orch.set_fatal_handler(Arc::new(move |e| {
+        assert!(e.to_lowercase().contains("401") || e.contains("Incorrect API key"));
+        ff.fetch_add(1, Ordering::SeqCst);
+    }));
+
+    orch.on_stt_result(&final_result("hello?")).await;
+    assert_eq!(fatal_fired.load(Ordering::SeqCst), 1, "401 fires the fatal handler");
+    // A second failing turn does NOT re-fire (handler taken once).
+    orch.on_stt_result(&final_result("still there?")).await;
+    assert_eq!(fatal_fired.load(Ordering::SeqCst), 1, "fatal fires exactly once");
+}

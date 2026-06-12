@@ -47,6 +47,10 @@ pub const CIRCUIT_BREAKER_STATE: &str = "waav_circuit_breaker_state";
 /// `circuit_open`=breaker rejected the attempt). Makes the reconnect path observable (W-C1).
 pub const RECONNECTS_TOTAL: &str = "waav_reconnects_total";
 
+/// D-G3: turn-level errors by class (`recoverable` degrades one turn;
+/// `fatal` = auth/config — surfaced to the session).
+pub const TURN_ERRORS_TOTAL: &str = "waav_turn_errors_total";
+
 /// D-G4: session teardowns that exceeded the bounded budget.
 pub const SESSION_TEARDOWN_TIMEOUTS_TOTAL: &str = "waav_session_teardown_timeouts_total";
 
@@ -288,6 +292,10 @@ fn describe_series() {
     );
     metrics::describe_counter!(TURNS_TOTAL, "Total turns by path and outcome");
     metrics::describe_counter!(
+        TURN_ERRORS_TOTAL,
+        "Turn-level errors by class: recoverable (turn degrades) vs fatal (auth/config) (D-G3)"
+    );
+    metrics::describe_counter!(
         SESSION_TEARDOWN_TIMEOUTS_TOTAL,
         "Session teardowns that exceeded the bounded budget (D-G4)"
     );
@@ -368,6 +376,11 @@ pub fn set_circuit_breaker_state(provider: &str, state_code: u8) {
 /// Record a reconnect attempt outcome on `waav_reconnects_total`. `outcome` is one of
 /// `success` / `failure` / `exhausted` / `circuit_open`. Emitted from the streaming reconnect
 /// path so reconnects are observable (W-C1).
+/// D-G3: count a turn-level error by class.
+pub fn count_turn_error(class: &'static str) {
+    counter!(TURN_ERRORS_TOTAL, "class" => class).increment(1);
+}
+
 /// D-G4: a session teardown exceeded its budget ("blocked somewhere?").
 pub fn record_session_teardown_timeout() {
     counter!(SESSION_TEARDOWN_TIMEOUTS_TOTAL).increment(1);
