@@ -100,27 +100,36 @@ impl AudioData {
     /// the STANDARDIZED math every consumer (interruption window, playout
     /// estimate) must share. Best source first:
     /// 1. the provider's own `duration_ms` (exact, format-independent);
-    /// 2. PCM16-mono byte math at the CHUNK's declared sample rate
-    ///    (falling back to `fallback_rate`, then 24 kHz, when undeclared);
-    /// 3. compressed container with no duration → a flat 250 ms
-    ///    OVER-estimate. Over is the safe direction for bot-speaking truth:
-    ///    compressed bytes are 5–20× smaller than the PCM they decode to, so
-    ///    byte math would mark the bot silent while it is clearly talking.
+    /// 2. raw-PCM byte math at the CHUNK's declared sample rate (falling
+    ///    back to `fallback_rate`, then 24 kHz): 2 bytes/sample for
+    ///    linear16, 1 byte/sample for G.711 mulaw/alaw (review wf_85659e16
+    ///    #10 — PCM16 math halved telephony durations);
+    /// 3. compressed container with no duration → BITRATE estimate at an
+    ///    assumed 128 kbps (review wf_85659e16 #7/#10: a flat 250 ms was
+    ///    wrong in both directions — burst trains of small chunks booked
+    ///    tens of phantom seconds, single large HTTP bodies under-counted).
+    ///    128 kbps over-estimates low-bitrate voice codecs (the safe
+    ///    direction for bot-speaking truth) while staying within ~2.5x of
+    ///    high-bitrate mp3.
     pub fn playback_ms(&self, fallback_rate: u32) -> usize {
         if let Some(d) = self.duration_ms {
             return d as usize;
         }
-        if crate::core::tts::sniff::is_pcm_family(&self.format) {
-            let rate = if self.sample_rate != 0 {
-                self.sample_rate
-            } else if fallback_rate != 0 {
-                fallback_rate
-            } else {
-                24_000
-            };
+        let rate = if self.sample_rate != 0 {
+            self.sample_rate
+        } else if fallback_rate != 0 {
+            fallback_rate
+        } else {
+            24_000
+        };
+        if crate::core::tts::sniff::is_linear_pcm16(&self.format) {
             return (self.data.len() as f32 / (rate as f32 * 2.0) * 1000.0) as usize;
         }
-        250
+        if crate::core::tts::sniff::is_g711(&self.format) {
+            return (self.data.len() as f32 / rate as f32 * 1000.0) as usize;
+        }
+        const ASSUMED_COMPRESSED_BPS: usize = 128_000;
+        self.data.len() * 8 * 1000 / ASSUMED_COMPRESSED_BPS
     }
 }
 
@@ -654,11 +663,23 @@ mod tests {
     }
 
     #[test]
-    fn playback_ms_overestimates_compressed_without_duration() {
-        // Byte math on mp3 would say ~83ms for 4000 bytes — wildly short of
-        // the real decoded playback; the flat floor OVER-estimates instead
-        // (the safe direction for the bot-speaking truth).
-        let a = chunk(4_000, 24_000, "mp3", None);
-        assert_eq!(a.playback_ms(24_000), 250);
+    fn playback_ms_estimates_compressed_by_bitrate() {
+        // 128 kbps assumption: 1600 bytes = 100ms, 32000 bytes = 2000ms —
+        // scales with chunk size in BOTH directions (a flat floor booked
+        // 250ms for every chunk: burst trains of tiny chunks accumulated
+        // phantom seconds, large HTTP bodies under-counted).
+        let small = chunk(1_600, 24_000, "mp3", None);
+        assert_eq!(small.playback_ms(24_000), 100);
+        let large = chunk(32_000, 24_000, "mp3", None);
+        assert_eq!(large.playback_ms(24_000), 2000);
+    }
+
+    #[test]
+    fn playback_ms_g711_is_one_byte_per_sample() {
+        // 8000 bytes of mulaw @8kHz = exactly 1s (PCM16 math would halve it).
+        let a = chunk(8_000, 8_000, "mulaw", None);
+        assert_eq!(a.playback_ms(8_000), 1000);
+        let b = chunk(8_000, 8_000, "alaw", None);
+        assert_eq!(b.playback_ms(8_000), 1000);
     }
 }

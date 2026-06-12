@@ -282,6 +282,14 @@ pub enum OutgoingMessage {
         is_speech_final: bool,
         /// Confidence score (0.0 to 1.0)
         confidence: f32,
+        /// The FULL accumulated segment text, present only on a
+        /// `speech_final` whose segment spans multiple finals (or a
+        /// forced/timer fire, where `transcript` stays empty for
+        /// fragment-concatenating clients). Clients that DISPLAY per-final
+        /// text should prefer this when present (review wf_85659e16 — the
+        /// segment truth was previously not exposed on the wire at all).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        segment_transcript: Option<String>,
     },
     #[serde(rename = "message")]
     Message {
@@ -979,6 +987,7 @@ mod tests {
                 is_final: true,
                 is_speech_final: true,
                 confidence: 0.9,
+            segment_transcript: None,
             }),
             MessageClass::Transcript,
         )
@@ -1019,6 +1028,7 @@ mod tests {
                 is_final: false,
                 is_speech_final: false,
                 confidence: 0.5,
+            segment_transcript: None,
             }),
             MessageClass::Transcript,
         )

@@ -41,6 +41,16 @@ fn normalize_words(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// Clamp the process-relative monotonic clock away from the RESERVED 0
+/// sentinel ("unset") used by `segment_start_ms` / `last_fired_ms` /
+/// `hard_timeout_deadline_ms`. In the process's first millisecond the raw
+/// clock IS 0 — a segment armed then would read as "no active segment" on
+/// the next is_final and silently RESTART the hard-timeout backstop.
+#[inline]
+fn clamp_clock(raw_ms: usize) -> usize {
+    raw_ms.max(1)
+}
+
 /// Configuration for STT result processing
 #[derive(Clone, Copy)]
 pub struct STTProcessingConfig {
@@ -658,7 +668,7 @@ impl STTResultProcessor {
     /// (restart!) the hard-timeout backstop, deferring the forced fire
     /// indefinitely while fragments keep arriving.
     fn get_current_time_ms_static() -> usize {
-        super::state::now_monotonic_ms().max(1)
+        clamp_clock(super::state::now_monotonic_ms())
     }
 }
 
@@ -722,9 +732,22 @@ mod tests {
         // last_fired_ms / hard_timeout_deadline_ms. The process-relative
         // monotonic clock RETURNS 0 in the process's first millisecond — a
         // segment armed then would read as "no active segment" on the next
-        // is_final, silently RESTARTING the hard-timeout backstop. The clock
-        // accessor must clamp to >=1.
+        // is_final, silently RESTARTING the hard-timeout backstop. The pin
+        // is on the PURE clamp (a warm process can't reproduce raw 0).
+        assert_eq!(clamp_clock(0), 1, "first-millisecond clock must not store the sentinel");
+        assert_eq!(clamp_clock(1), 1);
+        assert_eq!(clamp_clock(123_456), 123_456);
         assert!(STTResultProcessor::get_current_time_ms_static() >= 1);
+    }
+
+    #[test]
+    fn slow_ttfs_below_large_floor_keeps_floor() {
+        // The (ttfs < floor && floor > 2/3*hard) cell of the wait matrix
+        // (review wf_85659e16): the extension branch must not even engage —
+        // the floor passes through verbatim.
+        let c = STTProcessingConfig::new(2000, 100, 2500, 500).with_stt_ttfs_p99_ms(Some(900));
+        assert_eq!(c.effective_wait_ms(false), 2000);
+        assert_eq!(c.effective_wait_ms(true), 2000);
     }
 
     #[test]
@@ -891,6 +914,50 @@ mod tests {
         assert!(delivered.is_speech_final);
         // Buffer consumed: the next segment starts clean.
         assert!(state.read().text_buffer.is_empty());
+    }
+
+    /// BOTH forced-fire claimers (detection task AND hard-timeout task)
+    /// must run the user callback to COMPLETION through a pending await —
+    /// whichever wins under any future wait-clamp semantics (review
+    /// wf_85659e16: the original pin only held while the hard-timeout task
+    /// happened to be the claimer).
+    #[tokio::test]
+    async fn detection_claimer_survives_pending_await_in_callback() {
+        let config = STTProcessingConfig {
+            // Detection wait SHORTER than the hard timeout: the detection
+            // task is the claimer.
+            stt_speech_final_wait_ms: 40,
+            turn_detection_inference_timeout_ms: 30,
+            speech_final_hard_timeout_ms: 5_000,
+            duplicate_window_ms: 100,
+            stt_ttfs_p99_ms: None,
+        };
+        let processor = STTResultProcessor::new(config);
+        let completed = Arc::new(AtomicUsize::new(0));
+        let completed_cb = completed.clone();
+        let callback: STTCallback = Arc::new(move |result: STTResult| {
+            let completed = completed_cb.clone();
+            Box::pin(async move {
+                if result.is_speech_final {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>
+        });
+        let state = fresh_state(callback);
+        let _ = processor
+            .process_result(
+                STTResult::new("don't kill me either".into(), true, false, 0.9),
+                state.clone(),
+                None,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            1,
+            "detection-claimer fire must run the callback to completion"
+        );
     }
 
     /// CRITICAL (review wf_5772cd64 #1): when the HARD-TIMEOUT task itself

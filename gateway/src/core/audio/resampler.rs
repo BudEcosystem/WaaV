@@ -30,8 +30,13 @@ use tracing::{debug, warn};
 /// chunk (Pipecat `CLEAR_STREAM_AFTER_SECS` parity).
 const CLEAR_AFTER: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// Fixed input chunk the resampler consumes per process call.
-const CHUNK_FRAMES: usize = 1024;
+/// Input chunk the resampler consumes per process call: ~20ms at the input
+/// rate (review wf_85659e16 #9 — a fixed 1024 frames meant 8 kHz telephony
+/// ingress gathered 128ms before the VAD/smart-turn models saw ANY of it;
+/// 20ms keeps decision latency in line with the 12ms inference budget).
+fn chunk_frames_for(in_rate: u32) -> usize {
+    ((in_rate as usize) / 50).clamp(64, 1024)
+}
 
 /// Streaming mono f32 resampler. See the module docs for the contract.
 pub struct StreamResampler {
@@ -77,7 +82,11 @@ impl StreamResampler {
         self.maybe_clear_stale();
         self.last_call = Some(Instant::now());
 
-        let resampler = self.inner.as_mut().expect("ensured above");
+        let Some(resampler) = self.inner.as_mut() else {
+            // ensure() failed to build (absurd rate pair): degrade to
+            // passthrough instead of panicking — never drop audio.
+            return Some(input.to_vec());
+        };
         self.pending_in.extend_from_slice(input);
 
         let mut out: Vec<f32> = Vec::new();
@@ -98,6 +107,34 @@ impl StreamResampler {
             }
         }
         Some(out)
+    }
+
+    /// Flush the buffered tail at an utterance boundary (review wf_85659e16
+    /// #8/#11): the fixed-input-chunk resampler holds up to one chunk of
+    /// input it has not emitted — without this, the END of every utterance
+    /// (final stop consonants) is silently dropped. Pads the pending tail
+    /// with zeros, runs it through (so the real audio clears the filter
+    /// delay line), resets, and returns the emitted samples. `None` when
+    /// nothing is pending.
+    pub fn flush(&mut self) -> Option<Vec<f32>> {
+        let resampler = self.inner.as_mut()?;
+        if self.pending_in.is_empty() {
+            return None;
+        }
+        let chunk = resampler.input_frames_next().max(1);
+        let mut tail = std::mem::take(&mut self.pending_in);
+        tail.resize(chunk, 0.0);
+        let out = match resampler.process(&[tail], None) {
+            Ok(mut resampled) => resampled.pop().unwrap_or_default(),
+            Err(e) => {
+                warn!(error = %e, "stream resampler flush failed; tail dropped");
+                Vec::new()
+            }
+        };
+        // The utterance is over: a fresh start for the next one.
+        resampler.reset();
+        self.last_call = None;
+        if out.is_empty() { None } else { Some(out) }
     }
 
     /// Explicit utterance boundary (barge-in / context end): drop the filter
@@ -126,7 +163,13 @@ impl StreamResampler {
         // FftFixedIn: FFT-based polyphase — the same engine the smart-turn
         // mel extractor uses (Send-friendly, unlike SincFixedIn's boxed
         // interpolator), with quality well above voice requirements.
-        match FftFixedIn::<f32>::new(in_rate as usize, out_rate as usize, CHUNK_FRAMES, 2, 1) {
+        match FftFixedIn::<f32>::new(
+            in_rate as usize,
+            out_rate as usize,
+            chunk_frames_for(in_rate),
+            2,
+            1,
+        ) {
             Ok(r) => {
                 self.inner = Some(r);
                 self.in_rate = in_rate;
@@ -192,14 +235,29 @@ pub fn egress_to_client_rate(
     configured_provider_rate: u32,
     target_rate: u32,
 ) -> Option<Vec<u8>> {
-    if !crate::core::tts::sniff::is_pcm_family(format) {
-        debug!(format, "egress resample skipped: non-PCM format passes through");
+    if !crate::core::tts::sniff::is_linear_pcm16(format) {
+        // Compressed containers AND G.711 companded telephony formats pass
+        // through untouched: mulaw/alaw bytes are 8-bit companded samples —
+        // PCM16 byte math would deliver full-scale static (review
+        // wf_85659e16 #6/#12). A real G.711 transcode is a separate feature.
+        debug!(format, "egress resample skipped: non-linear-PCM16 passes through");
         return None;
     }
     // The chunk's own declared rate wins; the session's configured provider
     // rate is the fallback for providers that don't stamp chunks.
     let in_rate = if chunk_rate != 0 { chunk_rate } else { configured_provider_rate };
     resample_pcm16(r, data, in_rate, target_rate)
+}
+
+/// Flush the egress seam's buffered tail as PCM16 bytes (utterance end).
+pub fn flush_pcm16(r: &mut StreamResampler) -> Option<Vec<u8>> {
+    let out = r.flush()?;
+    let mut bytes = Vec::with_capacity(out.len() * 2);
+    for &s in &out {
+        let v = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    Some(bytes)
 }
 
 #[cfg(test)]
@@ -303,6 +361,47 @@ mod tests {
             egress_to_client_rate(&mut r, &bytes, "mp3", 24_000, 24_000, 48_000).is_none(),
             "compressed formats pass through untouched"
         );
+    }
+
+    #[test]
+    fn egress_passthrough_for_g711_companded() {
+        // mulaw/alaw bytes are 8-bit COMPANDED samples: PCM16 byte math
+        // would deliver full-scale static (review wf_85659e16 #6/#12).
+        let mut r = StreamResampler::new();
+        let bytes = vec![0x7Fu8; 1600];
+        for fmt in ["mulaw", "ulaw", "alaw"] {
+            assert!(
+                egress_to_client_rate(&mut r, &bytes, fmt, 8_000, 8_000, 16_000).is_none(),
+                "{fmt} must pass through untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn flush_recovers_the_buffered_tail() {
+        // Feed less than one chunk: nothing emitted; flush returns it.
+        let mut r = StreamResampler::new();
+        let input = sine(300, 0.05); // < 480-frame chunk @24k
+        let out = r.resample(&input, 24_000, 48_000).unwrap();
+        assert!(out.is_empty(), "sub-chunk input is buffered, not emitted");
+        let tail = r.flush().expect("flush must emit the buffered tail");
+        assert!(
+            tail.len() >= 500,
+            "tail must cover the ~600 output frames of real audio, got {}",
+            tail.len()
+        );
+        // Flushed and reset: nothing pending.
+        assert!(r.flush().is_none());
+    }
+
+    #[test]
+    fn chunk_size_tracks_input_rate() {
+        // ~20ms gather at every rate (8k telephony must not wait 128ms).
+        assert_eq!(chunk_frames_for(8_000), 160);
+        assert_eq!(chunk_frames_for(16_000), 320);
+        assert_eq!(chunk_frames_for(48_000), 960);
+        assert_eq!(chunk_frames_for(1_000), 64, "floor");
+        assert_eq!(chunk_frames_for(96_000), 1024, "cap");
     }
 
     #[test]

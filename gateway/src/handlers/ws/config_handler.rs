@@ -198,6 +198,9 @@ pub async fn handle_config_message(
             match initialize_livekit_client(
                 livekit_ws_config,
                 tts_ws_config.as_ref(),
+                // INGRESS: deliver remote-participant audio at the rate the
+                // STT pipeline declares downstream (16k default).
+                stt_ws_config.as_ref().map(|s| s.sample_rate).unwrap_or(16_000),
                 &app_state.config.livekit_url,
                 voice_manager.as_ref(),
                 message_tx,
@@ -239,6 +242,16 @@ pub async fn handle_config_message(
             egress_audio.clone(),
         )
         .await;
+        if let Some(egress) = egress_audio.clone() {
+            register_tts_complete_with_flush(
+                vm,
+                livekit_client.as_ref(),
+                operation_queue.as_ref(),
+                message_tx,
+                egress,
+            )
+            .await;
+        }
     }
 
     // Initialize DAG routing if configured
@@ -468,6 +481,7 @@ async fn initialize_conversation_loop(
                         is_final: stt.is_final,
                         is_speech_final: stt.is_speech_final,
                         confidence: stt.confidence,
+                        segment_transcript: stt.segment_transcript.clone(),
                     }))
                     .await;
 
@@ -784,6 +798,7 @@ async fn register_stt_callback(
                     is_final: result.is_final,
                     is_speech_final: result.is_speech_final,
                     confidence: result.confidence,
+                    segment_transcript: result.segment_transcript,
                 };
                 let _ = message_tx.send(MessageRoute::Outgoing(msg)).await;
             })
@@ -956,13 +971,17 @@ async fn register_early_tts_callback(
                     audio_data.data.len()
                 );
 
-                // C-G5: client playback rate (passthrough when unset).
+                // C-G5: client playback rate (passthrough when unset);
+                // 0-byte frames (sub-chunk buffering) are never sent.
                 let data = match &egress_audio {
                     Some(e) => {
                         e.convert(audio_data.data, &audio_data.format, audio_data.sample_rate)
                     }
                     None => audio_data.data,
                 };
+                if data.is_empty() {
+                    return;
+                }
 
                 // Send audio as binary data to WebSocket. DroppableAudio
                 // policy (RC8): a slow client sheds stale frames instead of
@@ -992,16 +1011,39 @@ pub(crate) struct EgressAudio {
     resampler: parking_lot::Mutex<crate::core::audio::StreamResampler>,
 }
 
+/// Sanity bounds for a client-requested playback rate: 0 would configure a
+/// 0 Hz LiveKit track; absurd rates build pathological resamplers (review
+/// wf_85659e16 — zero validation). 8 kHz (telephony) to 192 kHz (hi-res).
+pub(crate) fn valid_playback_rate(rate: u32) -> bool {
+    (8_000..=192_000).contains(&rate)
+}
+
 impl EgressAudio {
-    /// `None` unless the session asked for a client playback rate.
+    /// `None` unless the session asked for a VALID client playback rate
+    /// (invalid values are rejected loudly, not half-honored).
     pub(crate) fn from_tts_config(tts: Option<&TTSWebSocketConfig>) -> Option<Arc<Self>> {
         let tts = tts?;
         let target_rate = tts.client_playback_rate?;
+        if !valid_playback_rate(target_rate) {
+            warn!(
+                target_rate,
+                "client_playback_rate outside the sane range (8000-192000 Hz);                  egress resampling DISABLED for this session"
+            );
+            return None;
+        }
         Some(Arc::new(Self {
             target_rate,
             provider_rate: tts.sample_rate.unwrap_or(24000),
             resampler: parking_lot::Mutex::new(crate::core::audio::StreamResampler::new()),
         }))
+    }
+
+    /// Flush the buffered resampler tail at an utterance boundary (TTS
+    /// complete). Empty when nothing is pending (review wf_85659e16 #8/#11:
+    /// without this the END of every bot utterance was dropped).
+    pub(crate) fn flush(&self) -> Vec<u8> {
+        let mut r = self.resampler.lock();
+        crate::core::audio::resampler::flush_pcm16(&mut r).unwrap_or_default()
     }
 
     /// Convert one chunk to the client rate; passthrough whenever the
@@ -1110,6 +1152,56 @@ async fn deliver_tts_audio(
     }
 }
 
+/// Re-register the TTS completion callback with egress-flush semantics
+/// (C-G5 + review wf_85659e16 #8/#11): at utterance end the resampler holds
+/// up to one chunk of un-emitted tail — deliver it BEFORE the completion
+/// event, through the same delivery path as every other chunk. Replaces the
+/// early plain registration (single callback slot) only when egress
+/// resampling is active.
+async fn register_tts_complete_with_flush(
+    voice_manager: &Arc<VoiceManager>,
+    livekit_client: Option<&Arc<RwLock<LiveKitClient>>>,
+    operation_queue: Option<&crate::livekit::OperationQueue>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+    egress_audio: Arc<EgressAudio>,
+) {
+    let message_tx = message_tx.clone();
+    let livekit_client = livekit_client.cloned();
+    let operation_queue = operation_queue.cloned();
+    if let Err(e) = voice_manager
+        .on_tts_complete(move || {
+            let message_tx = message_tx.clone();
+            let livekit_client = livekit_client.clone();
+            let operation_queue = operation_queue.clone();
+            let egress_audio = egress_audio.clone();
+            Box::pin(async move {
+                let tail = egress_audio.flush();
+                if !tail.is_empty() {
+                    deliver_tts_audio(
+                        tail,
+                        livekit_client.as_ref(),
+                        operation_queue.as_ref(),
+                        &message_tx,
+                    )
+                    .await;
+                }
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let _ = message_tx
+                    .send(MessageRoute::Outgoing(OutgoingMessage::TTSPlaybackComplete {
+                        timestamp,
+                    }))
+                    .await;
+            })
+        })
+        .await
+    {
+        error!("Failed to re-register flush-aware TTS completion callback: {e}");
+    }
+}
+
 /// Register final TTS audio callback with LiveKit routing
 async fn register_final_tts_callback(
     voice_manager: &Arc<VoiceManager>,
@@ -1130,13 +1222,19 @@ async fn register_final_tts_callback(
             let egress_audio = egress_audio.clone();
 
             Box::pin(async move {
-                // C-G5: client playback rate (passthrough when unset).
+                // C-G5: client playback rate (passthrough when unset). A
+                // sub-chunk input may convert to NOTHING yet (buffered in
+                // the resampler; emitted with a later chunk or the
+                // utterance-end flush) — never deliver a 0-byte frame.
                 let data = match &egress_audio {
                     Some(e) => {
                         e.convert(audio_data.data, &audio_data.format, audio_data.sample_rate)
                     }
                     None => audio_data.data,
                 };
+                if data.is_empty() {
+                    return;
+                }
                 deliver_tts_audio(
                     data,
                     livekit_client.as_ref(),
@@ -1162,6 +1260,7 @@ async fn register_final_tts_callback(
 async fn initialize_livekit_client(
     livekit_ws_config: LiveKitWebSocketConfig,
     tts_config: Option<&TTSWebSocketConfig>,
+    ingress_sample_rate: u32,
     livekit_url: &str,
     voice_manager: Option<&Arc<VoiceManager>>,
     message_tx: &mpsc::Sender<MessageRoute>,
@@ -1289,7 +1388,12 @@ async fn initialize_livekit_client(
 
     let tts_config_for_livekit = tts_config.unwrap_or(&default_tts_config);
     let livekit_config =
-        livekit_ws_config.to_livekit_config(agent_token, tts_config_for_livekit, livekit_url);
+        livekit_ws_config.to_livekit_config(
+            agent_token,
+            tts_config_for_livekit,
+            ingress_sample_rate,
+            livekit_url,
+        );
     let mut livekit_client = LiveKitClient::new(livekit_config);
 
     // Set up audio callback to forward to STT processing
@@ -1338,25 +1442,29 @@ async fn initialize_livekit_client(
     ))
 }
 
-/// Set up LiveKit audio callback to forward audio to STT
+/// Set up LiveKit audio callback to forward audio to STT.
+///
+/// ORDERED single-consumer design (review wf_85659e16 #4): a spawned task
+/// PER FRAME ran `receive_audio` concurrently on different workers — frames
+/// could reorder or interleave, scrambling the ingress resampler's filter
+/// state (time-swapped audio into VAD/smart-turn) and even the STT byte
+/// stream itself. One bounded channel + one forwarder task preserves frame
+/// order while keeping the LiveKit callback non-blocking; when the consumer
+/// can't keep up the OLDEST frames drop (stale audio is the right thing to
+/// shed on a voice path) with a rate-limited warning.
 fn setup_livekit_audio_callback(
     livekit_client: &mut LiveKitClient,
     voice_manager: &Arc<VoiceManager>,
     message_tx: &mpsc::Sender<MessageRoute>,
 ) {
-    let voice_manager_clone = voice_manager.clone();
-    let message_tx_clone = message_tx.clone();
+    let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(64);
 
-    livekit_client.set_audio_callback(move |audio_data: Vec<u8>| {
-        let voice_manager = voice_manager_clone.clone();
-        let message_tx = message_tx_clone.clone();
-
-        // Direct processing - spawn lightweight task for async processing
-        tokio::spawn(async move {
+    let voice_manager = voice_manager.clone();
+    let message_tx = message_tx.clone();
+    tokio::spawn(async move {
+        let mut dropped_logged = 0usize;
+        while let Some(audio_data) = frame_rx.recv().await {
             debug!("Received LiveKit audio: {} bytes", audio_data.len());
-
-            // Forward LiveKit audio to the same STT processing pipeline
-            // Convert Vec<u8> to Bytes - O(1) ownership transfer, no copy
             if let Err(e) = voice_manager.receive_audio(audio_data.into()).await {
                 error!("Failed to process LiveKit audio: {:?}", e);
                 let _ = message_tx
@@ -1365,7 +1473,17 @@ fn setup_livekit_audio_callback(
                     }))
                     .await;
             }
-        });
+            dropped_logged = dropped_logged.saturating_sub(1);
+        }
+    });
+
+    livekit_client.set_audio_callback(move |audio_data: Vec<u8>| {
+        if let Err(mpsc::error::TrySendError::Full(_)) = frame_tx.try_send(audio_data) {
+            // Consumer behind by >64 frames (~640ms at 10ms frames): shed
+            // the NEW frame (the channel already holds older, more
+            // contiguous audio) and let the pipeline catch up.
+            warn!("LiveKit ingress queue full; dropping audio frame");
+        }
     });
 }
 
@@ -1673,6 +1791,9 @@ async fn initialize_dag_routing(
                             ),
                             None => audio.data.to_vec(),
                         };
+                        if data.is_empty() {
+                            continue;
+                        }
                         deliver_tts_audio(
                             data,
                             livekit_client.as_ref(),
@@ -1816,6 +1937,7 @@ async fn register_dag_stream_driver(
                         is_final: stt.is_final,
                         is_speech_final: stt.is_speech_final,
                         confidence: stt.confidence,
+                        segment_transcript: stt.segment_transcript.clone(),
                     }))
                     .await;
 

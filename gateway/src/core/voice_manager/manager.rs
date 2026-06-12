@@ -88,6 +88,15 @@ pub struct VoiceManager {
     // Notification for audio clear completion instead of sleep
     clear_notify: Arc<Notify>,
 
+    /// Barge-in CLEAR EPOCH (review wf_85659e16 #5): bumped under the TTS
+    /// write lock by every clear. A speak gated on a captured epoch
+    /// ([`Self::speak_if_epoch`]) re-checks it under the SAME lock, so a
+    /// sentence pump that passed its cancellation check but lost the lock
+    /// race to a barge-in clear can never enqueue stale audio AFTER the
+    /// clear — the leak the BargeInMopUp event couldn't cover when the
+    /// user goes silent.
+    clear_epoch: Arc<AtomicUsize>,
+
     // Per-session observer registry (latency profiling / instrumentation).
     // None ⇒ a single relaxed read per call site, zero work. Set once at
     // session setup via `set_observers`; read-mostly thereafter.
@@ -202,6 +211,7 @@ impl VoiceManager {
             }),
             config,
             clear_notify: Arc::new(Notify::new()),
+            clear_epoch: Arc::new(AtomicUsize::new(0)),
             observers: Arc::new(SyncRwLock::new(None)),
         })
     }
@@ -591,6 +601,42 @@ impl VoiceManager {
     /// # Ok(())
     /// # }
     /// ```
+    /// The current barge-in clear epoch. Capture at TURN start and pass to
+    /// [`Self::speak_if_epoch`]: a clear during the turn invalidates every
+    /// later sentence of that turn.
+    pub fn clear_epoch(&self) -> usize {
+        self.clear_epoch.load(Ordering::Acquire)
+    }
+
+    /// Epoch-gated speak: enqueue ONLY if no TTS clear happened since
+    /// `epoch` was captured (checked under the TTS write lock — race-free
+    /// against a concurrent barge-in clear). Returns `false` when skipped.
+    pub async fn speak_if_epoch(
+        &self,
+        text: &str,
+        flush: bool,
+        allow_interruption: bool,
+        epoch: usize,
+    ) -> VoiceManagerResult<bool> {
+        if !allow_interruption {
+            // Non-interruptible utterances keep the time-window semantics.
+            self.speak_with_interruption(text, flush, false).await?;
+            return Ok(true);
+        }
+        if let Some(obs) = self.observers.read().clone() {
+            obs.notify_tts_request(crate::core::observability::now_monotonic_ns());
+        }
+        let mut tts = self.tts.write().await;
+        if self.clear_epoch.load(Ordering::Acquire) != epoch {
+            debug!("speak_if_epoch: clear happened since capture; sentence dropped");
+            return Ok(false);
+        }
+        tts.speak(text, flush)
+            .await
+            .map_err(VoiceManagerError::TTSError)?;
+        Ok(true)
+    }
+
     pub async fn speak(&self, text: &str, flush: bool) -> VoiceManagerResult<()> {
         // Per-turn profiling anchor: TTS synthesis requested (first-of-turn
         // dedup happens inside the profiler).
@@ -697,6 +743,10 @@ impl VoiceManager {
         if let Err(e) = tts.clear().await {
             warn!(error = %e, "TTS provider clear failed; continuing barge-in cleanup");
         }
+        // Invalidate epoch-gated speaks WHILE holding the TTS lock: any
+        // speak_if_epoch already waiting on this lock observes the bump the
+        // moment it acquires it, and skips (no post-clear stale enqueue).
+        self.clear_epoch.fetch_add(1, Ordering::Release);
         drop(tts); // Release the lock
 
         // Call audio clear callback to clear any audio buffers (e.g., LiveKit)
@@ -1002,13 +1052,16 @@ impl VoiceManager {
                 // bot-speaking truth for turn policy (MinWords gating, A-G3).
                 int_state.extend_playout(chunk_duration_ms);
 
-                // Update non_interruptible_until_ms (non-interruptible mode only)
+                // Update non_interruptible_until_ms (non-interruptible mode
+                // only). CAS for the same reason as extend_playout (review
+                // wf_5772cd64 #3 / wf_85659e16 follow-up): a plain
+                // load→store racing a reset could resurrect a stale window.
                 if !int_state.allow_interruption.load(Ordering::Acquire) {
-                    let current_until =
-                        int_state.non_interruptible_until_ms.load(Ordering::Acquire);
-                    int_state
-                        .non_interruptible_until_ms
-                        .store(current_until + chunk_duration_ms, Ordering::Release);
+                    let _ = int_state.non_interruptible_until_ms.fetch_update(
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                        |cur| Some(cur + chunk_duration_ms),
+                    );
                 }
 
                 // Per-turn profiling anchors: TTS produced audio, and this

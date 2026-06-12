@@ -138,13 +138,15 @@ impl LiveKitClient {
                             let rtc_track = audio_track.rtc_track();
                             let mut audio_stream = NativeAudioStream::new(
                                 rtc_track,
-                                config.sample_rate as i32,
+                                // INGRESS rate: what STT/VAD expect — never
+                                // the egress/publish rate.
+                                config.ingress_sample_rate as i32,
                                 config.channels as i32,
                             );
 
                             let enable_noise_filter = config.enable_noise_filter;
                             #[cfg(feature = "noise-filter")]
-                            let sample_rate = config.sample_rate;
+                            let sample_rate = config.ingress_sample_rate;
                             let participant_id = participant.identity().to_string();
 
                             // Create a local buffer pool for this audio stream

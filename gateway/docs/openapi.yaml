@@ -632,10 +632,26 @@ components:
           - string
           - 'null'
           description: API key (literal or `${ENV_VAR}`); falls back to `OPENAI_API_KEY`.
+        barge_in_min_words:
+          type:
+          - integer
+          - 'null'
+          description: |-
+            MinWords barge-in gate (A-G3): while the bot is audibly speaking,
+            require ≥ N words to interrupt it (a single word suffices when the
+            bot is silent). Omitted/0 = legacy any-speech barge-in; values < 2
+            are clamped to 2.
+          minimum: 0
         base_url:
           type: string
           description: OpenAI-compatible base URL for the LLM (e.g. `https://api.openai.com/v1`).
           example: https://api.openai.com/v1
+        eager_eot:
+          type: boolean
+          description: |-
+            Eager end-of-turn (P1.2b): start the LLM speculatively on a
+            turn-complete prediction, confirm/cancel on the provider final.
+            Opt-in — raises LLM call volume on resumed turns (default false).
         max_history:
           type: integer
           description: Max retained history messages (default 20).
@@ -651,6 +667,14 @@ components:
           type: string
           description: Model identifier.
           example: gpt-4o-mini
+        provider_kind:
+          type:
+          - string
+          - 'null'
+          description: |-
+            LLM vendor wire format (B-G1): `"openai"` (default) | `"anthropic"` |
+            `"gemini"`. Omitted = OpenAI-compatible, with canonical-host inference.
+          example: anthropic
         streaming:
           type: boolean
           description: Stream tokens to TTS as they arrive (default true).
@@ -1353,6 +1377,17 @@ components:
           is_speech_final:
             type: boolean
             description: Whether speech has ended
+          segment_transcript:
+            type:
+            - string
+            - 'null'
+            description: |-
+              The FULL accumulated segment text, present only on a
+              `speech_final` whose segment spans multiple finals (or a
+              forced/timer fire, where `transcript` stays empty for
+              fragment-concatenating clients). Clients that DISPLAY per-final
+              text should prefer this when present (review wf_85659e16 — the
+              segment truth was previously not exposed on the wire at all).
           transcript:
             type: string
             description: Transcribed text
@@ -1977,6 +2012,17 @@ components:
           description: Sample rate of the audio in Hz
           example: 16000
           minimum: 0
+        turn_detection:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/TurnDetectionWsConfig'
+            description: |-
+              ML turn detection for this session (P1.2): runs the audio-based
+              smart-turn detector on the live frame path so end-of-turn is PREDICTED
+              instead of waiting out the provider's silence endpointing. Standardized
+              — provider-agnostic, applies to every STT provider. Requires a build
+              with the `smart-turn`/`silero-vad` features; otherwise the session
+              degrades LOUDLY (warn + waav_degraded_total) to timer fallback.
     SipHookEntry:
       type: object
       description: A single SIP hook entry.
@@ -2173,6 +2219,19 @@ components:
           - 'null'
           description: Audio format preference
           example: linear16
+        client_playback_rate:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            Client playback rate (C-G5): when set, the gateway resamples PCM TTS
+            egress from the provider's rate to THIS rate before delivery (WS
+            binary and LiveKit), so clients with a fixed-rate audio sink never
+            resample provider-side or client-side. Identity (provider already at
+            this rate) is zero-cost; non-PCM formats pass through unchanged.
+          example: 48000
+          minimum: 0
         connection_timeout:
           type:
           - integer
@@ -2472,6 +2531,27 @@ components:
           - boolean
           - 'null'
           description: Request word-level timestamps in the response.
+    TurnDetectionWsConfig:
+      type: object
+      description: Per-session ML turn-detection knobs (provider-agnostic).
+      required:
+      - enabled
+      properties:
+        eager:
+          type: boolean
+          description: |-
+            Eager end-of-turn: on a turn-complete prediction, start the LLM
+            speculatively (held + staged; see conversation_config.eager_eot which
+            must also be enabled). Default false.
+        enabled:
+          type: boolean
+          description: Master switch.
+        threshold:
+          type:
+          - number
+          - 'null'
+          format: float
+          description: Decision threshold (model-calibrated default when omitted).
     UnifiedMessage:
       type: object
       description: Unified message structure for all incoming messages from various sources

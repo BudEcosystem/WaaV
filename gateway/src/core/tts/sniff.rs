@@ -79,6 +79,20 @@ pub fn is_pcm_family(declared: &str) -> bool {
     matches!(declared, "linear16" | "pcm" | "pcm16" | "mulaw" | "ulaw" | "alaw")
 }
 
+/// True ONLY for 16-bit linear PCM — the formats whose bytes ARE i16 LE
+/// samples. G.711 (mulaw/ulaw/alaw) is in the PCM *family* (headerless,
+/// sliceable) but its bytes are 8-bit COMPANDED samples: feeding them to
+/// PCM16 byte math (resampling, duration) produces noise/2x errors
+/// (review wf_85659e16 #6/#12).
+pub fn is_linear_pcm16(declared: &str) -> bool {
+    matches!(declared, "linear16" | "pcm" | "pcm16")
+}
+
+/// True for 8-bit G.711 companded formats (1 byte per sample).
+pub fn is_g711(declared: &str) -> bool {
+    matches!(declared, "mulaw" | "ulaw" | "alaw")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

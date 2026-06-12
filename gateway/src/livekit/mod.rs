@@ -108,6 +108,7 @@ mod tests {
             token: "test-token".to_string(),
             room_name: "test-room".to_string(),
             sample_rate: 24000,
+            ingress_sample_rate: 16000,
             channels: 1,
             enable_noise_filter: cfg!(feature = "noise-filter"),
             listen_participants: vec![],

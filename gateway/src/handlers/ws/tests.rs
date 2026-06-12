@@ -330,6 +330,7 @@ fn test_outgoing_message_serialization() {
         is_final: true,
         is_speech_final: true,
         confidence: 0.95,
+            segment_transcript: None,
     };
 
     let json = serde_json::to_string(&stt_msg).unwrap();
@@ -511,7 +512,7 @@ fn test_livekit_ws_config_conversion() {
     let livekit_url = "wss://test-livekit.com".to_string();
     let test_token = "test-jwt-token".to_string();
     let livekit_config =
-        livekit_ws_config.to_livekit_config(test_token.clone(), &tts_ws_config, &livekit_url);
+        livekit_ws_config.to_livekit_config(test_token.clone(), &tts_ws_config, 16_000, &livekit_url);
     assert_eq!(livekit_config.url, "wss://test-livekit.com");
     assert_eq!(livekit_config.token, test_token);
     assert_eq!(livekit_config.room_name, "test-room");
@@ -556,6 +557,7 @@ fn test_livekit_config_with_empty_listen_participants() {
     let livekit_config = livekit_ws_config.to_livekit_config(
         "test-token".to_string(),
         &tts_ws_config,
+        16_000,
         "wss://test.com",
     );
 
@@ -598,6 +600,7 @@ fn test_livekit_config_with_listen_participants() {
     let livekit_config = livekit_ws_config.to_livekit_config(
         "test-token".to_string(),
         &tts_ws_config,
+        16_000,
         "wss://test.com",
     );
 
@@ -1595,12 +1598,67 @@ fn livekit_track_rate_matches_delivered_bytes() {
         listen_participants: vec![],
     };
     // No client rate → provider rate.
-    let cfg = lk.to_livekit_config("t".into(), &tts_cfg(Some(22050), None), "ws://x");
+    let cfg = lk.to_livekit_config("t".into(), &tts_cfg(Some(22050), None), 16_000, "ws://x");
     assert_eq!(cfg.sample_rate, 22050);
     // Client rate set → the track must run at the rate of the RESAMPLED bytes.
-    let cfg = lk.to_livekit_config("t".into(), &tts_cfg(Some(24000), Some(48000)), "ws://x");
+    let cfg = lk.to_livekit_config("t".into(), &tts_cfg(Some(24000), Some(48000)), 16_000, "ws://x");
     assert_eq!(cfg.sample_rate, 48000);
     // Nothing configured → 24k default.
-    let cfg = lk.to_livekit_config("t".into(), &tts_cfg(None, None), "ws://x");
+    let cfg = lk.to_livekit_config("t".into(), &tts_cfg(None, None), 16_000, "ws://x");
     assert_eq!(cfg.sample_rate, 24000);
+}
+
+#[test]
+fn invalid_client_playback_rate_disables_egress_resampling() {
+    use super::config_handler::EgressAudio;
+    // 0 Hz would configure a 0 Hz LiveKit track; absurd rates build
+    // pathological resamplers — both rejected loudly (review wf_85659e16).
+    assert!(EgressAudio::from_tts_config(Some(&tts_cfg(Some(24000), Some(0)))).is_none());
+    assert!(EgressAudio::from_tts_config(Some(&tts_cfg(Some(24000), Some(4)))).is_none());
+    assert!(
+        EgressAudio::from_tts_config(Some(&tts_cfg(Some(24000), Some(700_000)))).is_none()
+    );
+    assert!(EgressAudio::from_tts_config(Some(&tts_cfg(Some(24000), Some(8_000)))).is_some());
+}
+
+#[test]
+fn egress_flush_recovers_the_utterance_tail() {
+    use super::config_handler::EgressAudio;
+    let egress = EgressAudio::from_tts_config(Some(&tts_cfg(Some(24000), Some(48000)))).unwrap();
+    // A sub-chunk final piece converts to NOTHING (buffered)...
+    let tail_in: Vec<u8> = vec![0x10; 600]; // 300 samples < 480-frame chunk
+    let out = egress.convert(tail_in, "linear16", 24_000);
+    assert!(out.is_empty(), "sub-chunk piece is buffered, not emitted");
+    // ...until the utterance-end flush delivers it (review wf_85659e16 #8/#11).
+    let tail = egress.flush();
+    assert!(
+        tail.len() >= 1000,
+        "flush must emit the ~600 buffered output frames, got {} bytes",
+        tail.len()
+    );
+    assert!(egress.flush().is_empty(), "second flush has nothing pending");
+}
+
+#[test]
+fn livekit_ingress_rate_is_stt_derived_not_client_rate() {
+    // Review wf_85659e16 CRITICAL #1: the egress-only client_playback_rate
+    // must NEVER re-rate the user's microphone (ingress). Ingress follows
+    // the STT pipeline's declared rate; egress follows the client rate.
+    let lk = LiveKitWebSocketConfig {
+        room_name: "room".to_string(),
+        enable_recording: false,
+        waav_participant_identity: None,
+        waav_participant_name: None,
+        listen_participants: vec![],
+    };
+    let cfg =
+        lk.to_livekit_config("t".into(), &tts_cfg(Some(24000), Some(48000)), 16_000, "ws://x");
+    assert_eq!(cfg.sample_rate, 48000, "egress track follows the client rate");
+    assert_eq!(
+        cfg.ingress_sample_rate, 16_000,
+        "ingress (user mic -> STT/VAD) follows the STT rate, untouched by the knob"
+    );
+    // An INVALID client rate must not poison the egress track either.
+    let cfg = lk.to_livekit_config("t".into(), &tts_cfg(Some(24000), Some(0)), 16_000, "ws://x");
+    assert_eq!(cfg.sample_rate, 24000, "invalid client rate falls back to provider rate");
 }

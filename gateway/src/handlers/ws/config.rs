@@ -306,19 +306,23 @@ impl LiveKitWebSocketConfig {
         &self,
         token: String,
         tts_config: &TTSWebSocketConfig,
+        ingress_sample_rate: u32,
         livekit_url: &str,
     ) -> LiveKitConfig {
         LiveKitConfig {
             url: livekit_url.to_string(),
             token,
             room_name: self.room_name.clone(),
-            // The LiveKit track rate must match the BYTES we feed it: the
-            // client playback rate when egress resampling is on (C-G5),
-            // else the provider rate, defaulting to 24000.
+            // EGRESS track rate must match the BYTES we feed it: the client
+            // playback rate when egress resampling is on (C-G5), else the
+            // provider rate, defaulting to 24000.
             sample_rate: tts_config
                 .client_playback_rate
+                .filter(|r| crate::handlers::ws::config_handler::valid_playback_rate(*r))
                 .or(tts_config.sample_rate)
                 .unwrap_or(24000),
+            // INGRESS delivery rate = the STT pipeline's declared rate.
+            ingress_sample_rate,
             // Assume mono audio for TTS (1 channel)
             channels: 1,
             // Enable noise filter by default when compiled with the optional feature

@@ -290,6 +290,11 @@ impl ConversationOrchestrator {
     /// once. Cancellation (barge-in/teardown) aborts promptly.
     pub async fn run_turn(&self, transcript: &str) -> Result<(), ConversationOrchestratorError> {
         let (id, token) = self.begin_turn();
+        // Barge-in clear epoch (review wf_85659e16 #5): captured ONCE at
+        // turn start; any clear during the turn invalidates every later
+        // sentence enqueue of this turn — checked under the TTS lock, so a
+        // pump that lost the lock race to the clear can never leak audio.
+        let epoch = self.voice_manager.clear_epoch();
 
         // Stream tokens to TTS aggregated at SENTENCE boundaries. Per-token
         // `speak()` is pathological: for HTTP TTS providers it is one synthesis
@@ -340,6 +345,7 @@ impl ConversationOrchestrator {
                     vm: &VoiceManager,
                     text: String,
                     allow_interruption: bool,
+                    epoch: usize,
                     spoke: &std::sync::atomic::AtomicBool,
                     obs: &Option<Arc<crate::core::observability::ObserverRegistry>>,
                 ) -> bool {
@@ -353,16 +359,19 @@ impl ConversationOrchestrator {
                             crate::core::observability::now_monotonic_ns(),
                         );
                     }
-                    let res = if allow_interruption {
-                        vm.speak(&text, true).await
-                    } else {
-                        vm.speak_with_interruption(&text, true, false).await
-                    };
-                    if let Err(e) = res {
-                        warn!(error = %e, "speak() during streamed turn failed");
-                        return false;
+                    match vm.speak_if_epoch(&text, true, allow_interruption, epoch).await {
+                        Ok(true) => true,
+                        Ok(false) => {
+                            // A barge-in cleared TTS since this turn started:
+                            // the rest of this turn's sentences are stale.
+                            debug!("sentence dropped: barge-in cleared since turn start");
+                            false
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "speak() during streamed turn failed");
+                            false
+                        }
                     }
-                    true
                 }
 
                 'pump: loop {
@@ -380,7 +389,7 @@ impl ConversationOrchestrator {
                                     if token_for_cb.is_cancelled() {
                                         break 'pump;
                                     }
-                                    if !speak_sentence(&vm_pump, sentence, allow_interruption, &spoke_pump, &obs_pump).await {
+                                    if !speak_sentence(&vm_pump, sentence, allow_interruption, epoch, &spoke_pump, &obs_pump).await {
                                         break 'pump;
                                     }
                                 }
@@ -392,7 +401,7 @@ impl ConversationOrchestrator {
                                 if !token_for_cb.is_cancelled()
                                     && let Some(tail) = agg.flush()
                                 {
-                                    let _ = speak_sentence(&vm_pump, tail, allow_interruption, &spoke_pump, &obs_pump).await;
+                                    let _ = speak_sentence(&vm_pump, tail, allow_interruption, epoch, &spoke_pump, &obs_pump).await;
                                 }
                                 break;
                             }
@@ -450,59 +459,59 @@ impl ConversationOrchestrator {
             other => other,
         };
 
-        self.end_turn(id);
-
-        match result {
+        // The turn stays ACTIVE through the fallback speak below — ending it
+        // first re-opened the one-word-backchannel window between LLM
+        // completion and TTS enqueue (review wf_85659e16, has_active_turn
+        // gap #2).
+        // NOTE: no `?` inside this block — every path must reach end_turn()
+        // below or has_active_turn() sticks true and the MinWords gate jams.
+        let outcome: Result<(), ConversationOrchestratorError> = match result {
             Ok(response) => {
                 let content_empty = response.content.trim().is_empty();
-                if streaming {
+                let need_fallback_speak = if streaming {
                     // Reasoning-model guard: some models stream only reasoning
                     // deltas and deliver the answer (or nothing) at the end. If
                     // the pump spoke nothing, fall back to the final content; if
                     // that is empty too, say so loudly instead of going silent.
-                    if !spoke.load(std::sync::atomic::Ordering::Relaxed) {
-                        if !content_empty {
-                            if allow_interruption {
-                                self.voice_manager.speak(&response.content, true).await?;
-                            } else {
-                                self.voice_manager
-                                    .speak_with_interruption(&response.content, true, false)
-                                    .await?;
-                            }
-                        } else if !token.is_cancelled() {
-                            warn!(
-                                session = %self.session_id,
-                                "LLM turn produced NO speakable content (reasoning-only \
-                                 model or empty completion) — bot stays silent; check the \
-                                 configured model/max_tokens"
-                            );
+                    !spoke.load(std::sync::atomic::Ordering::Relaxed)
+                } else {
+                    true
+                };
+                if need_fallback_speak && !content_empty {
+                    match self
+                        .voice_manager
+                        .speak_if_epoch(&response.content, true, allow_interruption, epoch)
+                        .await
+                    {
+                        Ok(true) => Ok(()),
+                        Ok(false) => {
+                            debug!(session = %self.session_id,
+                                   "speak skipped: barge-in cleared since turn start");
+                            Ok(())
                         }
+                        Err(e) => Err(e.into()),
                     }
-                } else if !content_empty {
-                    // Non-streaming: speak the whole reply now.
-                    if allow_interruption {
-                        self.voice_manager.speak(&response.content, true).await?;
-                    } else {
-                        self.voice_manager
-                            .speak_with_interruption(&response.content, true, false)
-                            .await?;
+                } else {
+                    if need_fallback_speak && content_empty && !token.is_cancelled() {
+                        warn!(
+                            session = %self.session_id,
+                            "LLM turn produced NO speakable content (reasoning-only \
+                             model or empty completion) — bot stays silent; check the \
+                             configured model/max_tokens"
+                        );
                     }
-                } else if !token.is_cancelled() {
-                    warn!(
-                        session = %self.session_id,
-                        "LLM turn produced NO speakable content (reasoning-only model or \
-                         empty completion) — bot stays silent; check the configured \
-                         model/max_tokens"
-                    );
+                    Ok(())
                 }
-                Ok(())
             }
             Err(LlmError::Cancelled) => {
                 debug!(session = %self.session_id, "LLM turn cancelled (barge-in/teardown)");
                 Ok(())
             }
             Err(e) => Err(e.into()),
-        }
+        };
+
+        self.end_turn(id);
+        outcome
     }
 
     /// Start an EAGER (speculative) LLM turn on a turn-complete PREDICTION
@@ -662,6 +671,13 @@ impl ConversationOrchestrator {
                 if let Some(Ok(content)) = held
                     && !content.trim().is_empty()
                 {
+                    // The confirmed eager reply IS a bot turn: register it so
+                    // has_active_turn() keeps the MinWords gate up while it
+                    // speaks (review wf_85659e16 — eager turns were invisible
+                    // to the bot-busy probe), and epoch-gate each sentence so
+                    // a barge-in mid-confirm stops the rest.
+                    let (turn_id, _confirm_token) = self.begin_turn();
+                    let epoch = self.voice_manager.clear_epoch();
                     self.llm
                         .commit_turn(&self.session_id, transcript, &content)
                         .await;
@@ -675,19 +691,30 @@ impl ConversationOrchestrator {
                     let mut sentences = agg.push_str(&content);
                     sentences.extend(agg.flush());
                     for sentence in sentences {
-                        let speak_res = if self.config.allow_interruption {
-                            self.voice_manager.speak(&sentence, true).await
-                        } else {
-                            self.voice_manager
-                                .speak_with_interruption(&sentence, true, false)
-                                .await
-                        };
-                        if let Err(e) = speak_res {
-                            warn!(session = %self.session_id, error = %e,
-                                  "speaking confirmed eager reply failed");
-                            break;
+                        match self
+                            .voice_manager
+                            .speak_if_epoch(
+                                &sentence,
+                                true,
+                                self.config.allow_interruption,
+                                epoch,
+                            )
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                debug!(session = %self.session_id,
+                                       "eager reply truncated: barge-in cleared mid-confirm");
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(session = %self.session_id, error = %e,
+                                      "speaking confirmed eager reply failed");
+                                break;
+                            }
                         }
                     }
+                    self.end_turn(turn_id);
                     debug!(session = %self.session_id, "eager turn confirmed and spoken");
                     return;
                 }
