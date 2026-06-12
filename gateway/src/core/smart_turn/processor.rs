@@ -392,7 +392,12 @@ pub struct SmartTurnProcessor {
     total_samples: u64,
 
     /// Last VAD result.
-    last_vad_is_speech: bool,
+last_vad_is_speech: bool,
+    /// C-G6 dual-gate: the revived `VADAnalyzer` (confidence AND volume) —
+    /// a quiet desk-tap that clears the NN threshold no longer reads as
+    /// speech. Fed (silero_prob, normalized RMS) per VAD chunk.
+    dual_gate: crate::core::audio::VADAnalyzer,
+    
 
     /// Last VAD silence duration.
     last_vad_silence_ms: f32,
@@ -474,6 +479,19 @@ impl SmartTurnProcessor {
             frames_since_inference: 0,
             total_samples: 0,
             last_vad_is_speech: false,
+            dual_gate: crate::core::audio::VADAnalyzer::new(
+                // RMS-calibrated dual-gate (NOT the perceptual-loudness
+                // defaults): min_volume on raw normalized RMS — speech runs
+                // ~0.02-0.3, digital silence/quiet taps < 0.005. Debounce 1
+                // = pure confidence∧volume semantics; the silero detector's
+                // own state machine keeps owning the timing.
+                crate::core::audio::VADParams {
+                    confidence_threshold: 0.5,
+                    start_debounce_frames: 1,
+                    stop_debounce_frames: 1,
+                    min_volume: 0.008,
+                },
+            ),
             last_vad_silence_ms: 0.0,
         })
     }
@@ -519,6 +537,19 @@ impl SmartTurnProcessor {
             frames_since_inference: 0,
             total_samples: 0,
             last_vad_is_speech: false,
+            dual_gate: crate::core::audio::VADAnalyzer::new(
+                // RMS-calibrated dual-gate (NOT the perceptual-loudness
+                // defaults): min_volume on raw normalized RMS — speech runs
+                // ~0.02-0.3, digital silence/quiet taps < 0.005. Debounce 1
+                // = pure confidence∧volume semantics; the silero detector's
+                // own state machine keeps owning the timing.
+                crate::core::audio::VADParams {
+                    confidence_threshold: 0.5,
+                    start_debounce_frames: 1,
+                    stop_debounce_frames: 1,
+                    min_volume: 0.008,
+                },
+            ),
             last_vad_silence_ms: 0.0,
         })
     }
@@ -566,6 +597,19 @@ impl SmartTurnProcessor {
             frames_since_inference: 0,
             total_samples: 0,
             last_vad_is_speech: false,
+            dual_gate: crate::core::audio::VADAnalyzer::new(
+                // RMS-calibrated dual-gate (NOT the perceptual-loudness
+                // defaults): min_volume on raw normalized RMS — speech runs
+                // ~0.02-0.3, digital silence/quiet taps < 0.005. Debounce 1
+                // = pure confidence∧volume semantics; the silero detector's
+                // own state machine keeps owning the timing.
+                crate::core::audio::VADParams {
+                    confidence_threshold: 0.5,
+                    start_debounce_frames: 1,
+                    stop_debounce_frames: 1,
+                    min_volume: 0.008,
+                },
+            ),
             last_vad_silence_ms: 0.0,
         })
     }
@@ -605,7 +649,21 @@ impl SmartTurnProcessor {
                 let chunk: Vec<f32> = self.vad_buffer.drain(..chunk_size).collect();
                 let vad_result = vad.process(&chunk)?;
 
-                self.last_vad_is_speech = vad_result.is_speech;
+                // C-G6 dual-gate: speech requires BOTH the NN confidence AND
+                // audible volume (normalized RMS — cheaper than EBU-R128;
+                // the divergence is documented on VADParams::min_volume).
+                // Quiet noise that clears the NN threshold is gated out.
+                let rms = {
+                    let sum_sq: f32 = chunk.iter().map(|s| s * s).sum();
+                    (sum_sq / chunk.len() as f32).sqrt().min(1.0)
+                };
+                let (state, _transition) = self.dual_gate.analyze(vad_result.probability, rms);
+                self.last_vad_is_speech = vad_result.is_speech
+                    && matches!(
+                        state,
+                        crate::core::audio::VADState::Speaking
+                            | crate::core::audio::VADState::Stopping
+                    );
                 self.last_vad_silence_ms = vad.silence_duration_ms();
             }
 
@@ -1147,5 +1205,31 @@ mod tests {
         assert_eq!(default_vad_threshold(), 0.5);
         assert_eq!(default_vad_chunk_size(), 512);
         assert_eq!(default_vad_sample_rate(), 16000);
+    }
+}
+
+#[cfg(all(test, feature = "silero-vad"))]
+mod dual_gate_tests {
+    use crate::core::audio::{VADAnalyzer, VADParams, VADState};
+
+    /// C-G6: the dual-gate's win — high NN confidence with NO audible
+    /// volume (a quiet desk-tap that clears the model threshold) is gated
+    /// out; the same confidence WITH volume passes.
+    #[test]
+    fn quiet_noise_is_gated_audible_speech_passes() {
+        let params = VADParams {
+            confidence_threshold: 0.5,
+            start_debounce_frames: 1,
+            stop_debounce_frames: 1,
+            min_volume: 0.008,
+        };
+        let mut v = VADAnalyzer::new(params.clone());
+        let (state, _) = v.analyze(0.9, 0.001); // confident but silent
+        assert_eq!(state, VADState::Quiet, "quiet noise must NOT read as speech");
+
+        let mut v = VADAnalyzer::new(params);
+        let (state, transition) = v.analyze(0.9, 0.1); // confident and audible
+        assert_eq!(state, VADState::Speaking);
+        assert!(transition.is_some());
     }
 }
