@@ -36,6 +36,12 @@ pub enum TurnEvent {
     Stopped { turn_id: u64, transcript: String },
     /// Discard the partial aggregation (sub-threshold input).
     ResetAggregation,
+    /// User speech continued while the bot is STILL audibly speaking after
+    /// the turn already started: re-run the (idempotent) barge-in mop-up so
+    /// audio that landed AFTER the first clear (an in-flight speak resolving
+    /// post-cancel) is cleared too — the legacy continuous-clear behavior,
+    /// emitted only when actually needed (review wf_5772cd64 #5).
+    BargeInMopUp,
     /// The mute state flipped.
     MuteChanged { muted: bool },
 }
@@ -183,6 +189,11 @@ impl TurnController {
                     self.current_turn_id.store(id, Ordering::Release);
                     self.reset_strategies();
                     out.push(TurnEvent::Started { turn_id: id, interrupt });
+                } else if interrupt && ctx.bot_speaking {
+                    // Turn already active but the bot is STILL audible
+                    // (e.g. an in-flight speak resolved after the first
+                    // clear): mop up.
+                    out.push(TurnEvent::BargeInMopUp);
                 }
             }
         }
@@ -286,6 +297,30 @@ mod tests {
         // More speech while the turn is open: no second Started.
         assert!(c.feed(&interim("hello there")).is_empty());
         assert!(c.feed(&final_sig("hello there", false)).is_empty());
+    }
+
+    #[test]
+    fn mop_up_while_bot_still_audible_silent_otherwise() {
+        // review wf_5772cd64 #5: after Started{interrupt} clears the bot, an
+        // in-flight speak can resolve and make it audible AGAIN. Continued
+        // user speech must re-run the (idempotent) mop-up — but only while
+        // the bot is actually audible.
+        let audible = std::sync::Arc::new(AtomicBool::new(true));
+        let probe = audible.clone();
+        let c = TurnController::new(
+            vec![Box::new(AnySpeechStart)],
+            vec![Box::new(LegacySpeechFinalStop)],
+            vec![],
+        )
+        .with_bot_speaking_probe(move || probe.load(Ordering::Relaxed));
+
+        let e1 = c.feed(&interim("stop"));
+        assert!(matches!(e1.as_slice(), [TurnEvent::Started { interrupt: true, .. }]));
+        // Bot still audible mid-turn → mop-up, NOT a second Started.
+        assert_eq!(c.feed(&interim("stop talking")), vec![TurnEvent::BargeInMopUp]);
+        // Bot went silent → continued speech is just aggregation, no events.
+        audible.store(false, Ordering::Relaxed);
+        assert!(c.feed(&interim("stop talking please")).is_empty());
     }
 
     #[test]

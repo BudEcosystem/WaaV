@@ -282,14 +282,17 @@ async fn test_speech_final_timing_control() {
             .process_result(result2, speech_final_state.clone(), None)
             .await;
 
-        // Should return the FULL segment (buffered fragments + this one) —
-        // the old pass-through dropped "Hello world" and ran turns with
-        // truncated input (segment-transcript-truth fix).
+        // Turn policy must see the FULL segment (buffered fragments + this
+        // one) via turn_transcript() — the old pass-through dropped "Hello
+        // world" and ran turns with truncated input. The RAW transcript stays
+        // the provider's last fragment so client egress (which already saw
+        // "Hello world") gets no duplicate (review wf_5772cd64 #6).
         assert!(processed2.is_some());
         let final_result = processed2.unwrap();
         assert!(final_result.is_speech_final);
         assert!(final_result.is_final);
-        assert_eq!(final_result.transcript, "Hello world final result");
+        assert_eq!(final_result.transcript, "final result");
+        assert_eq!(final_result.turn_transcript(), "Hello world final result");
         assert_eq!(final_result.confidence, 0.95);
 
         // State should be reset

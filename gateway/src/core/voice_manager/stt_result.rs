@@ -28,6 +28,19 @@ fn append_with_space(buf: &mut String, fragment: &str) {
 
 use super::state::SpeechFinalState;
 
+/// Case-folded, punctuation-stripped word tokens (dedup normalization).
+fn normalize_words(s: &str) -> Vec<String> {
+    s.split_whitespace()
+        .map(|w| {
+            w.chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+        })
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
 /// Configuration for STT result processing
 #[derive(Clone, Copy)]
 pub struct STTProcessingConfig {
@@ -94,12 +107,17 @@ impl STTProcessingConfig {
     /// never crowd out the hard-timeout backstop.
     pub fn effective_wait_ms(&self, finalized: bool) -> u64 {
         let floor = self.stt_speech_final_wait_ms;
-        let wait = match (self.stt_ttfs_p99_ms, finalized) {
-            (Some(ttfs), false) => floor.max(ttfs),
+        match (self.stt_ttfs_p99_ms, finalized) {
+            // Only the TTFS EXTENSION is clamped (the hard-timeout backstop
+            // must keep room to act). The configured floor itself keeps its
+            // pre-existing semantics verbatim — A-G2 must never silently
+            // shrink an operator's explicit wait (review wf_5772cd64 #11).
+            (Some(ttfs), false) if ttfs > floor => {
+                let clamp = ((self.speech_final_hard_timeout_ms * 2) / 3).max(floor);
+                ttfs.min(clamp)
+            }
             _ => floor,
-        };
-        // Leave the hard timeout room to act as the absolute backstop.
-        wait.min((self.speech_final_hard_timeout_ms * 2) / 3)
+        }
     }
 }
 
@@ -273,14 +291,16 @@ impl STTResultProcessor {
 
         // SEGMENT TRANSCRIPT TRUTH: earlier is_final fragments of this segment
         // were accumulated in text_buffer; the provider's speech_final result
-        // carries only the LAST fragment. Consumers fire the LLM turn with the
-        // delivered transcript, so a multi-final utterance ("Hello there." +
-        // "How are you") would otherwise run the turn with just "How are you"
-        // — truncated LLM input. Deliver the full segment text.
+        // carries only the LAST fragment. Turn policy must see the FULL
+        // segment ("Hello there." + "How are you") or multi-final utterances
+        // run the LLM truncated. The full text rides `segment_transcript`;
+        // `transcript` keeps the raw fragment so CLIENT EGRESS is unchanged
+        // (clients that assemble finals by concatenation would otherwise see
+        // every earlier fragment duplicated — review wf_5772cd64 #6).
         if !state.text_buffer.is_empty() {
             let mut full = std::mem::take(&mut state.text_buffer);
             append_with_space(&mut full, &result.transcript);
-            result.transcript = full;
+            result.segment_transcript = Some(full);
         }
 
         // Reset state for next speech segment
@@ -334,6 +354,7 @@ impl STTResultProcessor {
                         speech_final_state,
                         segment_generation,
                         "hard_timeout_fallback",
+                        true,
                     )
                     .await;
                     return;
@@ -456,6 +477,7 @@ impl STTResultProcessor {
                 speech_final_state,
                 segment_generation,
                 detection_method,
+                false,
             )
             .await;
         })
@@ -473,6 +495,7 @@ impl STTResultProcessor {
         speech_final_state: Arc<SyncRwLock<SpeechFinalState>>,
         segment_generation: usize,
         detection_method: &str,
+        claimer_is_hard_timeout: bool,
     ) {
         let claimed = {
             let mut state = speech_final_state.write();
@@ -499,7 +522,17 @@ impl STTResultProcessor {
                     .waiting_for_speech_final
                     .store(false, Ordering::Release);
                 state.turn_detection_handle = None;
-                if let Some(handle) = state.hard_timeout_handle.take() {
+                // CRITICAL (review wf_5772cd64): when the CLAIMER IS the
+                // hard-timeout task, aborting this handle aborts OURSELVES —
+                // the user callback chain below (egress → controller →
+                // run_turn → LLM) would be killed at its first pending await
+                // with the buffer already consumed (turn lost, no retry).
+                // Mirror the detection-task discipline one line above: the
+                // claimer's own handle is dropped WITHOUT abort; only the
+                // OTHER task is aborted.
+                if let Some(handle) = state.hard_timeout_handle.take()
+                    && !claimer_is_hard_timeout
+                {
                     handle.abort();
                 }
                 state.segment_start_ms.store(0, Ordering::Release);
@@ -516,7 +549,11 @@ impl STTResultProcessor {
             // turn-detector fallback path was dead (found during A-G0 contract
             // verification; the buffer was captured into last_forced_text and
             // only ever read by tests).
-            let forced_result = STTResult::new(text, true, true, 1.0);
+            // Egress keeps the legacy EMPTY transcript (clients assembling
+            // finals by concatenation never see duplication); turn policy
+            // reads the full segment from `segment_transcript`.
+            let mut forced_result = STTResult::new(String::new(), true, true, 1.0);
+            forced_result.segment_transcript = Some(text);
             info!("Forcing speech_final via {}", detection_method);
             callback(forced_result).await;
         }
@@ -547,13 +584,20 @@ impl STTResultProcessor {
         }
         // Within the window: the forced fire delivered the FULL buffered
         // segment, while a late provider speech_final carries only its last
-        // FRAGMENT — containment (not equality) catches that. An empty
-        // fragment inside the window is also a dup (a bare provider
-        // speech_final marker trailing the forced fire). The window is short
-        // (duplicate_window_ms); a genuinely new utterance with provider
-        // endpointing cannot complete inside it.
-        let t = transcript.trim();
-        t.is_empty() || state.last_forced_text.contains(t)
+        // FRAGMENT. Compare NORMALIZED WORDS (case-folded, punctuation
+        // stripped) because providers re-format late finals (smart_format:
+        // "how are you" → "How are you?") — byte containment misses those
+        // (review wf_5772cd64 #4). An empty fragment inside the window is
+        // also a dup (a bare speech_final marker trailing the forced fire).
+        // A late final carrying genuinely NEW words is NOT deduped — it
+        // delivers (the user really said more).
+        let late = normalize_words(transcript);
+        if late.is_empty() {
+            return true;
+        }
+        let forced: std::collections::HashSet<String> =
+            normalize_words(&state.last_forced_text).into_iter().collect();
+        late.iter().all(|w| forced.contains(w))
     }
 
     /// Cancel any existing detection task
@@ -606,8 +650,15 @@ impl STTResultProcessor {
     /// dedup windows are relative intervals; wall-clock here broke them under
     /// NTP steps / VM restore (epoch-0 on `duration_since` failure flooded
     /// hard-timeout logs and mis-armed deadlines).
+    /// Clamped to ≥1: `0` is the RESERVED sentinel for "unset" in
+    /// `segment_start_ms` / `turn_detection_last_fired_ms` /
+    /// `hard_timeout_deadline_ms`. The monotonic clock is process-relative,
+    /// so a segment armed in the process's first millisecond would store 0 —
+    /// making the NEXT is_final read it as "no active segment" and re-arm
+    /// (restart!) the hard-timeout backstop, deferring the forced fire
+    /// indefinitely while fragments keep arriving.
     fn get_current_time_ms_static() -> usize {
-        super::state::now_monotonic_ms()
+        super::state::now_monotonic_ms().max(1)
     }
 }
 
@@ -663,6 +714,34 @@ mod tests {
         // backstop still acts.
         let c = STTProcessingConfig::new(600, 100, 1500, 500).with_stt_ttfs_p99_ms(Some(5000));
         assert_eq!(c.effective_wait_ms(false), 1000);
+    }
+
+    #[test]
+    fn clock_never_collides_with_unset_sentinel() {
+        // 0 is the reserved "unset" sentinel for segment_start_ms /
+        // last_fired_ms / hard_timeout_deadline_ms. The process-relative
+        // monotonic clock RETURNS 0 in the process's first millisecond — a
+        // segment armed then would read as "no active segment" on the next
+        // is_final, silently RESTARTING the hard-timeout backstop. The clock
+        // accessor must clamp to >=1.
+        assert!(STTResultProcessor::get_current_time_ms_static() >= 1);
+    }
+
+    #[test]
+    fn clamp_never_shrinks_configured_floor() {
+        // Operator set floor > ⅔×hard-timeout (their prerogative — the
+        // pre-A-G2 semantics honored it verbatim). The clamp applies to the
+        // TTFS EXTENSION only; it must never cut the explicit floor (review
+        // wf_5772cd64 #11).
+        let no_ttfs = STTProcessingConfig::new(2000, 100, 2500, 500);
+        assert_eq!(no_ttfs.effective_wait_ms(false), 2000);
+        let with_ttfs =
+            STTProcessingConfig::new(2000, 100, 2500, 500).with_stt_ttfs_p99_ms(Some(9000));
+        assert_eq!(
+            with_ttfs.effective_wait_ms(false),
+            2000,
+            "extension clamp bottoms out at the floor, never below it"
+        );
     }
 
     /// Behavioral: a finalized final shortens the live detection wait — the
@@ -727,14 +806,17 @@ mod tests {
         };
         let processor = STTResultProcessor::new(config);
 
-        let forced_texts: Arc<parking_lot::Mutex<Vec<String>>> =
+        // Capture (turn_transcript, raw transcript): policy must get the full
+        // segment while the raw fragment stays what clients always saw.
+        let forced_texts: Arc<parking_lot::Mutex<Vec<(String, String)>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
         let sink = forced_texts.clone();
         let callback: STTCallback = Arc::new(move |result: STTResult| {
             let sink = sink.clone();
             Box::pin(async move {
                 if result.is_speech_final {
-                    sink.lock().push(result.transcript);
+                    sink.lock()
+                        .push((result.turn_transcript().to_string(), result.transcript));
                 }
             }) as Pin<Box<dyn Future<Output = ()> + Send>>
         });
@@ -761,8 +843,13 @@ mod tests {
         let texts = forced_texts.lock();
         assert_eq!(texts.len(), 1, "exactly one forced speech_final");
         assert_eq!(
-            texts[0], "Hello there. How are you",
-            "forced final must carry the FULL space-joined segment text"
+            texts[0].0, "Hello there. How are you",
+            "forced final must carry the FULL space-joined segment text for turn policy"
+        );
+        assert!(
+            texts[0].1.is_empty(),
+            "the forced final's RAW transcript stays empty — client egress already \
+             received every fragment; re-sending the joined text would duplicate them"
         );
     }
 
@@ -797,10 +884,106 @@ mod tests {
             )
             .await
             .expect("real speech_final must be delivered");
-        assert_eq!(delivered.transcript, "Hello there. How are you");
+        // Turn policy sees the full segment; the raw fragment is untouched so
+        // client egress (which already saw "Hello there.") gets no duplicate.
+        assert_eq!(delivered.turn_transcript(), "Hello there. How are you");
+        assert_eq!(delivered.transcript, "How are you");
         assert!(delivered.is_speech_final);
         // Buffer consumed: the next segment starts clean.
         assert!(state.read().text_buffer.is_empty());
+    }
+
+    /// CRITICAL (review wf_5772cd64 #1): when the HARD-TIMEOUT task itself
+    /// claims the fire, it must not abort its own JoinHandle — pre-fix it
+    /// did, killing itself at the next await INSIDE the user callback, so
+    /// any callback with a real pending await never completed (no turn ran).
+    #[tokio::test]
+    async fn hard_timeout_fire_survives_pending_await_in_callback() {
+        let config = STTProcessingConfig {
+            // Detection wait LONGER than the hard timeout: the hard-timeout
+            // task is the claimer.
+            stt_speech_final_wait_ms: 5_000,
+            turn_detection_inference_timeout_ms: 50,
+            speech_final_hard_timeout_ms: 100,
+            duplicate_window_ms: 100,
+            stt_ttfs_p99_ms: None,
+        };
+        let processor = STTResultProcessor::new(config);
+        let completed = Arc::new(AtomicUsize::new(0));
+        let completed_cb = completed.clone();
+        let callback: STTCallback = Arc::new(move |result: STTResult| {
+            let completed = completed_cb.clone();
+            Box::pin(async move {
+                if result.is_speech_final {
+                    // The pending await the self-abort used to die on.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>
+        });
+        let state = fresh_state(callback);
+
+        let _ = processor
+            .process_result(
+                STTResult::new("don't kill me".into(), true, false, 0.9),
+                state.clone(),
+                None,
+            )
+            .await;
+        // 100ms hard timeout + 50ms callback await + slack.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            1,
+            "hard-timeout fire must run the callback to completion (no self-abort)"
+        );
+    }
+
+    /// Dedup must survive provider FORMATTING differences (review wf_5772cd64
+    /// #4): the late real speech_final often arrives punctuated/capitalized
+    /// while the forced text was raw — exact substring matching missed it and
+    /// ran a second turn.
+    #[tokio::test]
+    async fn forced_dedup_survives_formatting_differences() {
+        let config = STTProcessingConfig {
+            stt_speech_final_wait_ms: 30,
+            turn_detection_inference_timeout_ms: 30,
+            speech_final_hard_timeout_ms: 120,
+            duplicate_window_ms: 5_000,
+            stt_ttfs_p99_ms: None,
+        };
+        let processor = STTResultProcessor::new(config);
+        let noop: STTCallback = Arc::new(|_| Box::pin(async {}));
+        let state = fresh_state(noop);
+
+        let _ = processor
+            .process_result(
+                STTResult::new("book a flight to paris".into(), true, false, 0.9),
+                state.clone(),
+                None,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Punctuated + capitalized fragment of the just-forced text.
+        let dup = processor
+            .process_result(
+                STTResult::new("To Paris.".into(), true, true, 0.9),
+                state.clone(),
+                None,
+            )
+            .await;
+        assert!(dup.is_none(), "formatting-only differences are still duplicates");
+
+        // But genuinely NEW words within the window are NOT a duplicate.
+        let fresh = processor
+            .process_result(
+                STTResult::new("and a hotel too".into(), true, true, 0.9),
+                state.clone(),
+                None,
+            )
+            .await;
+        assert!(fresh.is_some(), "new content within the window must pass");
     }
 
     /// A late provider speech_final carrying a FRAGMENT of the just-forced
@@ -1162,7 +1345,7 @@ mod tests {
         for _ in 0..16 {
             let st = state.clone();
             handles.push(tokio::spawn(async move {
-                STTResultProcessor::fire_forced_speech_final(st, 7, "race-test").await;
+                STTResultProcessor::fire_forced_speech_final(st, 7, "race-test", false).await;
             }));
         }
         for h in handles {
@@ -1183,7 +1366,7 @@ mod tests {
         let (state, count) = armed_state_with_counter();
         // A real speech_final closed the segment: generation bumped.
         state.read().fire_generation.fetch_add(1, Ordering::Relaxed);
-        STTResultProcessor::fire_forced_speech_final(state.clone(), 7, "stale-timer").await;
+        STTResultProcessor::fire_forced_speech_final(state.clone(), 7, "stale-timer", false).await;
         assert_eq!(
             count.load(Ordering::SeqCst),
             0,

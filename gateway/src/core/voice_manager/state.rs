@@ -100,10 +100,15 @@ impl InterruptionState {
     /// `now` (gap between utterances) and the previous deadline (continuous
     /// playback).
     pub fn extend_playout(&self, chunk_duration_ms: usize) {
+        // CAS loop: a plain load→store could resurrect a pre-clear deadline
+        // when racing reset() from a concurrent barge-in clear (review
+        // wf_5772cd64 #3a).
         let now = now_monotonic_ms();
-        let prev = self.playout_end_ms.load(Ordering::Acquire);
-        let base = prev.max(now);
-        self.playout_end_ms.store(base + chunk_duration_ms, Ordering::Release);
+        let _ = self.playout_end_ms.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |prev| Some(prev.max(now) + chunk_duration_ms),
+        );
     }
 
     /// Whether the bot is (estimated to be) audibly speaking right now.

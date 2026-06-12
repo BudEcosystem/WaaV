@@ -533,7 +533,8 @@ impl ConversationOrchestrator {
         // Derive the same events the legacy policy produces and route them
         // through the SINGLE event handler (A-G0): any non-empty speech is a
         // potential barge-in; a finalized turn with content runs the LLM.
-        let has_text = !result.transcript.trim().is_empty();
+        let turn_text = result.turn_transcript();
+        let has_text = !turn_text.trim().is_empty();
         let mut events = Vec::new();
         if has_text {
             events.push(crate::core::turn::TurnEvent::Started { turn_id: 0, interrupt: true });
@@ -541,7 +542,7 @@ impl ConversationOrchestrator {
         if result.is_speech_final && has_text {
             events.push(crate::core::turn::TurnEvent::Stopped {
                 turn_id: 0,
-                transcript: result.transcript.trim().to_string(),
+                transcript: turn_text.trim().to_string(),
             });
         }
         self.handle_turn_events(&events).await;
@@ -579,11 +580,21 @@ impl ConversationOrchestrator {
                     }
                 }
                 TurnEvent::ResetAggregation => {
-                    // Sub-threshold input (a cough below the MinWords gate):
-                    // discard the partial segment via the generation-bumping
-                    // reset so it neither fires timers nor leaks into the
-                    // next turn's buffer (A-G3).
-                    self.voice_manager.reset_turn_aggregation();
+                    // Deliberately NO VoiceManager action (review wf_5772cd64
+                    // #2): MinWords emits this only at a sub-threshold
+                    // speech_final, and BOTH speech_final paths (forced fire
+                    // + provider real) already reset the segment in the
+                    // processor BEFORE delivery — an unscoped reset here
+                    // executes after awaits and can wipe a NEW segment armed
+                    // in between. The cough is already discarded; the event
+                    // remains for observability/consumers that need it.
+                }
+                TurnEvent::BargeInMopUp => {
+                    // The bot is STILL audible after the turn started (an
+                    // in-flight speak resolved post-clear): re-run the
+                    // idempotent barge-in (review wf_5772cd64 #5 — the legacy
+                    // continuous-clear behavior, emitted only when needed).
+                    self.handle_barge_in().await;
                 }
                 // MuteChanged lands with the mute strategies (A-G5).
                 TurnEvent::MuteChanged { .. } => {}
@@ -648,6 +659,15 @@ impl ConversationOrchestrator {
         if let Err(e) = self.run_turn(transcript).await {
             warn!(session = %self.session_id, error = %e, "conversation turn failed");
         }
+    }
+
+    /// Whether a bot LLM turn is currently in flight (thinking or speaking).
+    /// Combined with the audio playout estimate this forms the bot-busy truth
+    /// for MinWords gating — the LLM TTFT window (measured 1-6s) is exactly
+    /// when a backchannel must not cancel the in-flight turn (review
+    /// wf_5772cd64 #9).
+    pub fn has_active_turn(&self) -> bool {
+        self.turn.lock().is_some()
     }
 
     /// Tear down the session: cancel any in-flight turn and drop its history.

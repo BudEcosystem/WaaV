@@ -395,6 +395,7 @@ async fn initialize_conversation_loop(
             _ => Box::new(crate::core::turn::strategies::AnySpeechStart),
         };
     let vm_probe = voice_manager.clone();
+    let orch_probe = orchestrator.clone();
     let turn_controller = Arc::new(
         crate::core::turn::TurnController::new(
             vec![start_strategy],
@@ -404,7 +405,12 @@ async fn initialize_conversation_loop(
             ],
             vec![],
         )
-        .with_bot_speaking_probe(move || vm_probe.is_bot_speaking()),
+        // Bot-BUSY truth: audibly speaking OR an LLM turn in flight — the
+        // TTFT thinking window must keep the MinWords gate up (a backchannel
+        // canceling the in-flight turn is the exact failure A-G3 prevents).
+        .with_bot_speaking_probe(move || {
+            vm_probe.is_bot_speaking() || orch_probe.has_active_turn()
+        }),
     );
 
     // Smart-turn verdicts feed the controller as an OPAQUE complete signal
@@ -463,7 +469,9 @@ async fn initialize_conversation_loop(
                 // events from THIS task (caller-fires-callback preserved).
                 let signal = if stt.is_final || stt.is_speech_final {
                     crate::core::turn::ControllerSignal::SttFinal {
-                        text: stt.transcript.clone(),
+                        // Turn policy sees the FULL segment; client egress
+                        // above kept the raw fragment.
+                        text: stt.turn_transcript().to_string(),
                         is_speech_final: stt.is_speech_final,
                         is_finalized: stt.is_finalized,
                     }
@@ -1740,7 +1748,9 @@ async fn register_dag_stream_driver(
                 // the Stopped event, keyed by the controller's turn_id.
                 let signal = if stt.is_final || stt.is_speech_final {
                     crate::core::turn::ControllerSignal::SttFinal {
-                        text: stt.transcript.clone(),
+                        // Turn policy sees the FULL segment; client egress
+                        // above kept the raw fragment.
+                        text: stt.turn_transcript().to_string(),
                         is_speech_final: stt.is_speech_final,
                         is_finalized: stt.is_finalized,
                     }

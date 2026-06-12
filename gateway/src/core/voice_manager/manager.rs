@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use tokio::sync::{Notify, RwLock};
 use tokio::time::Duration;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::core::cache::store::CacheStore;
 use crate::core::observability::ObserverRegistry;
@@ -690,9 +690,13 @@ impl VoiceManager {
 
         debug!("Starting audio clearing process");
 
-        // Clear TTS text queue
+        // Clear TTS text queue — BEST EFFORT: a provider error must not skip
+        // the audio-buffer clear or the state reset below, or the stale
+        // playout deadline survives the barge-in (review wf_5772cd64 #10).
         let mut tts = self.tts.write().await;
-        tts.clear().await.map_err(VoiceManagerError::TTSError)?;
+        if let Err(e) = tts.clear().await {
+            warn!(error = %e, "TTS provider clear failed; continuing barge-in cleanup");
+        }
         drop(tts); // Release the lock
 
         // Call audio clear callback to clear any audio buffers (e.g., LiveKit)
@@ -987,19 +991,12 @@ impl VoiceManager {
                     }
                 }
 
-                // Calculate this chunk's PCM duration once (assumes 16-bit
-                // mono — pre-existing limitation for compressed formats,
-                // AUDIT MED).
-                let chunk_duration_ms = {
-                    let bytes_per_sample = 2;
-                    let channels = 1;
-                    let sample_rate = int_state.current_sample_rate.load(Ordering::Acquire);
-                    // Guard against division by zero - use default sample rate if zero
-                    let safe_sample_rate = if sample_rate == 0 { 24000 } else { sample_rate };
-                    let chunk_duration_seconds = audio_data.data.len() as f32
-                        / (safe_sample_rate as f32 * bytes_per_sample as f32 * channels as f32);
-                    (chunk_duration_seconds * 1000.0) as usize
-                };
+                // This chunk's playback duration via the STANDARDIZED
+                // AudioData math (review wf_5772cd64 #7/#8): provider
+                // duration_ms → PCM16 byte math at the CHUNK's rate (not the
+                // stale session atomic) → 250ms compressed over-estimate.
+                let chunk_duration_ms = audio_data
+                    .playback_ms(int_state.current_sample_rate.load(Ordering::Acquire));
 
                 // Estimated bot playout deadline (EVERY chunk): the
                 // bot-speaking truth for turn policy (MinWords gating, A-G3).
@@ -1197,26 +1194,7 @@ impl VoiceManager {
         self.interruption_state.is_audibly_speaking()
     }
 
-    /// Discard the current turn's partial aggregation (TurnEvent::
-    /// ResetAggregation — sub-threshold input like a cough must never reach
-    /// the LLM). Routes through the GENERATION-BUMPING segment reset so any
-    /// armed detection/hard-timeout task for the discarded segment is
-    /// structurally unable to fire with its text (P0.3 claim discipline —
-    /// a raw buffer clear would reintroduce the stale-fire race).
-    pub fn reset_turn_aggregation(&self) {
-        // The processor is a thin config wrapper; rebuild it from the same
-        // config the STT wrapper uses (no per-call state).
-        let processor = STTResultProcessor::new(STTProcessingConfig::new(
-            self.config.speech_final_config.stt_speech_final_wait_ms,
-            self.config
-                .speech_final_config
-                .turn_detection_inference_timeout_ms,
-            self.config.speech_final_config.speech_final_hard_timeout_ms,
-            self.config.speech_final_config.duplicate_window_ms,
-        ));
-        let mut state = self.speech_final_state.write();
-        processor.reset_segment(&mut state);
-    }
+
 
     /// Returns the current speech state from smart turn processor.
     ///

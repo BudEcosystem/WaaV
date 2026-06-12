@@ -95,6 +95,35 @@ pub struct AudioData {
     pub duration_ms: Option<u32>,
 }
 
+impl AudioData {
+    /// Estimated playback duration of this chunk in milliseconds —
+    /// the STANDARDIZED math every consumer (interruption window, playout
+    /// estimate) must share. Best source first:
+    /// 1. the provider's own `duration_ms` (exact, format-independent);
+    /// 2. PCM16-mono byte math at the CHUNK's declared sample rate
+    ///    (falling back to `fallback_rate`, then 24 kHz, when undeclared);
+    /// 3. compressed container with no duration → a flat 250 ms
+    ///    OVER-estimate. Over is the safe direction for bot-speaking truth:
+    ///    compressed bytes are 5–20× smaller than the PCM they decode to, so
+    ///    byte math would mark the bot silent while it is clearly talking.
+    pub fn playback_ms(&self, fallback_rate: u32) -> usize {
+        if let Some(d) = self.duration_ms {
+            return d as usize;
+        }
+        if crate::core::tts::sniff::is_pcm_family(&self.format) {
+            let rate = if self.sample_rate != 0 {
+                self.sample_rate
+            } else if fallback_rate != 0 {
+                fallback_rate
+            } else {
+                24_000
+            };
+            return (self.data.len() as f32 / (rate as f32 * 2.0) * 1000.0) as usize;
+        }
+        250
+    }
+}
+
 /// TTS-specific error types
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum TTSError {
@@ -586,5 +615,50 @@ mod tests {
         let result = tts.speak("Hello", false).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), TTSError::ProviderNotReady(_)));
+    }
+
+    // --- AudioData::playback_ms: the standardized chunk-duration math
+    //     (review wf_5772cd64 #7/#8) ---
+
+    fn chunk(data_len: usize, rate: u32, format: &str, duration_ms: Option<u32>) -> AudioData {
+        AudioData {
+            data: vec![0u8; data_len],
+            sample_rate: rate,
+            format: format.into(),
+            duration_ms,
+        }
+    }
+
+    #[test]
+    fn playback_ms_prefers_provider_duration() {
+        // Provider-declared duration wins over any byte math.
+        let a = chunk(48_000, 24_000, "pcm", Some(123));
+        assert_eq!(a.playback_ms(16_000), 123);
+        // Even for compressed formats.
+        let b = chunk(4_000, 0, "mp3", Some(800));
+        assert_eq!(b.playback_ms(0), 800);
+    }
+
+    #[test]
+    fn playback_ms_uses_the_chunks_own_rate_for_pcm() {
+        // 48000 bytes of PCM16 mono @ 24kHz = 1000ms — and the CHUNK's rate
+        // must win over the (possibly stale) session fallback.
+        let a = chunk(48_000, 24_000, "pcm", None);
+        assert_eq!(a.playback_ms(8_000), 1000);
+        // Undeclared chunk rate → session fallback (16kHz → 1500ms).
+        let b = chunk(48_000, 0, "linear16", None);
+        assert_eq!(b.playback_ms(16_000), 1500);
+        // Nothing declared anywhere → 24kHz default.
+        let c = chunk(48_000, 0, "pcm", None);
+        assert_eq!(c.playback_ms(0), 1000);
+    }
+
+    #[test]
+    fn playback_ms_overestimates_compressed_without_duration() {
+        // Byte math on mp3 would say ~83ms for 4000 bytes — wildly short of
+        // the real decoded playback; the flat floor OVER-estimates instead
+        // (the safe direction for the bot-speaking truth).
+        let a = chunk(4_000, 24_000, "mp3", None);
+        assert_eq!(a.playback_ms(24_000), 250);
     }
 }

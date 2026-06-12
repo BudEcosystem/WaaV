@@ -246,6 +246,12 @@ pub struct STTResult {
     pub is_finalized: bool,
     /// Confidence score of the transcription (0.0 to 1.0).
     pub confidence: f32,
+    /// The FULL accumulated segment text on a `speech_final` result, when it
+    /// differs from `transcript` (which keeps the provider's raw last
+    /// fragment for client egress). Turn policy reads
+    /// [`turn_transcript`](Self::turn_transcript); clients keep seeing
+    /// exactly the per-fragment stream they always did.
+    pub segment_transcript: Option<String>,
 
     // =========================================================================
     // Rich Metadata Fields (Optional for backward compatibility)
@@ -320,6 +326,7 @@ impl STTResult {
             is_speech_final,
             is_finalized: false,
             confidence: confidence.clamp(0.0, 1.0),
+            segment_transcript: None,
             // Initialize all optional metadata fields to None for backward compatibility
             words: None,
             speakers: None,
@@ -339,6 +346,13 @@ impl STTResult {
     ///
     /// Invariant: a finalized result is always final (`is_finalized ⇒
     /// is_final`) — enforced here rather than at every consumer.
+    /// The transcript TURN POLICY should act on: the full accumulated
+    /// segment when present, else the raw fragment. Client egress always
+    /// uses [`transcript`](Self::transcript) directly.
+    pub fn turn_transcript(&self) -> &str {
+        self.segment_transcript.as_deref().unwrap_or(&self.transcript)
+    }
+
     pub fn finalized(mut self) -> Self {
         debug_assert!(self.is_final, "is_finalized requires is_final (finalized ⇒ final)");
         self.is_finalized = true;
@@ -369,6 +383,7 @@ impl STTResult {
             is_speech_final,
             is_finalized: false,
             confidence: confidence.clamp(0.0, 1.0),
+            segment_transcript: None,
             words,
             speakers,
             entities,
