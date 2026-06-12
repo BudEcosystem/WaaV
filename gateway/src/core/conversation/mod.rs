@@ -87,6 +87,10 @@ pub struct ConversationConfig {
     /// (with canonical-host inference); `Some(Anthropic|Gemini)` speaks the
     /// native Messages / generateContent APIs.
     pub provider_kind: Option<crate::core::llm::AdapterKind>,
+    /// MinWords barge-in gate (A-G3): while the bot is audibly speaking,
+    /// require ≥ N words to interrupt (1 word when silent). `None`/`0` keeps
+    /// the legacy any-speech barge-in. Values < 2 are clamped to 2.
+    pub barge_in_min_words: Option<usize>,
 }
 
 impl Default for ConversationConfig {
@@ -103,6 +107,7 @@ impl Default for ConversationConfig {
             allow_interruption: true,
             eager_eot: false,
             provider_kind: None,
+            barge_in_min_words: None,
         }
     }
 }
@@ -573,10 +578,15 @@ impl ConversationOrchestrator {
                         self.run_finalized_turn(&transcript, eager.take()).await;
                     }
                 }
-                // No legacy consumers yet: ResetAggregation lands with the
-                // MinWords gate (A-G3), MuteChanged with the mute strategies
-                // (A-G5).
-                TurnEvent::ResetAggregation | TurnEvent::MuteChanged { .. } => {}
+                TurnEvent::ResetAggregation => {
+                    // Sub-threshold input (a cough below the MinWords gate):
+                    // discard the partial segment via the generation-bumping
+                    // reset so it neither fires timers nor leaks into the
+                    // next turn's buffer (A-G3).
+                    self.voice_manager.reset_turn_aggregation();
+                }
+                // MuteChanged lands with the mute strategies (A-G5).
+                TurnEvent::MuteChanged { .. } => {}
             }
         }
         // A speculation taken for a batch whose Stopped carried no usable

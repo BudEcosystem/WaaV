@@ -55,6 +55,14 @@ pub struct InterruptionState {
     pub current_sample_rate: AtomicU32,
     /// Whether TTS has completed playing all audio - atomic for lock-free reads
     pub is_completed: AtomicBool,
+    /// ESTIMATED end of bot audio playout (MONOTONIC ms): advanced by each
+    /// egress chunk's PCM duration, snapped to `now` on clear/reset. There is
+    /// no transport playback-drain signal at this layer (PIPECAT_FIX_PLAN
+    /// §6.2 A7), so this conservative estimate — derived from the same
+    /// duration math as the interruption window — is the bot-speaking truth
+    /// used by turn policy (MinWords barge-in gating). Over-estimating is the
+    /// safe direction: it can only RAISE the barge-in word threshold briefly.
+    pub playout_end_ms: AtomicUsize,
 }
 
 impl InterruptionState {
@@ -83,5 +91,23 @@ impl InterruptionState {
         self.allow_interruption.store(true, Ordering::Release);
         self.non_interruptible_until_ms.store(0, Ordering::Release);
         self.is_completed.store(true, Ordering::Release);
+        // Audio was cleared / utterance concluded: the bot is silent NOW.
+        self.playout_end_ms.store(now_monotonic_ms(), Ordering::Release);
+    }
+
+    /// Advance the estimated playout deadline by one egress chunk's duration.
+    /// Chunks queue back-to-back: the new deadline extends from the LATER of
+    /// `now` (gap between utterances) and the previous deadline (continuous
+    /// playback).
+    pub fn extend_playout(&self, chunk_duration_ms: usize) {
+        let now = now_monotonic_ms();
+        let prev = self.playout_end_ms.load(Ordering::Acquire);
+        let base = prev.max(now);
+        self.playout_end_ms.store(base + chunk_duration_ms, Ordering::Release);
+    }
+
+    /// Whether the bot is (estimated to be) audibly speaking right now.
+    pub fn is_audibly_speaking(&self) -> bool {
+        now_monotonic_ms() < self.playout_end_ms.load(Ordering::Acquire)
     }
 }

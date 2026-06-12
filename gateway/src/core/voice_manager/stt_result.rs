@@ -487,6 +487,16 @@ impl STTResultProcessor {
         }
     }
 
+    /// Discard the current segment entirely (TurnEvent::ResetAggregation,
+    /// A-G3): cancels any armed detection task and runs the GENERATION-
+    /// BUMPING reset, so a sub-threshold segment (a cough below the
+    /// MinWords gate) can neither fire its timers nor leak its text into
+    /// the next real turn's buffer.
+    pub fn reset_segment(&self, state: &mut SpeechFinalState) {
+        self.cancel_detection_task(state);
+        self.reset_speech_state(state);
+    }
+
     /// Check if this is a duplicate speech_final event
     fn is_duplicate_speech_final(
         &self,

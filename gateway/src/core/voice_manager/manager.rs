@@ -189,6 +189,7 @@ impl VoiceManager {
                 non_interruptible_until_ms: AtomicUsize::new(0),
                 current_sample_rate: AtomicU32::new(24000),
                 is_completed: AtomicBool::new(true), // Start as completed
+                playout_end_ms: AtomicUsize::new(0), // Silent at start
             }),
             config,
             clear_notify: Arc::new(Notify::new()),
@@ -961,24 +962,26 @@ impl VoiceManager {
                     }
                 }
 
-                // Calculate audio duration and update non_interruptible_until_ms
-                if !int_state.allow_interruption.load(Ordering::Acquire) {
-                    // Calculate actual audio duration from audio data
-                    // For PCM/linear16: bytes / (sample_rate * bytes_per_sample * channels)
-                    // Assuming 16-bit audio (2 bytes per sample) and mono (1 channel)
+                // Calculate this chunk's PCM duration once (assumes 16-bit
+                // mono — pre-existing limitation for compressed formats,
+                // AUDIT MED).
+                let chunk_duration_ms = {
                     let bytes_per_sample = 2;
                     let channels = 1;
                     let sample_rate = int_state.current_sample_rate.load(Ordering::Acquire);
-
                     // Guard against division by zero - use default sample rate if zero
                     let safe_sample_rate = if sample_rate == 0 { 24000 } else { sample_rate };
-
                     let chunk_duration_seconds = audio_data.data.len() as f32
                         / (safe_sample_rate as f32 * bytes_per_sample as f32 * channels as f32);
+                    (chunk_duration_seconds * 1000.0) as usize
+                };
 
-                    let chunk_duration_ms = (chunk_duration_seconds * 1000.0) as usize;
+                // Estimated bot playout deadline (EVERY chunk): the
+                // bot-speaking truth for turn policy (MinWords gating, A-G3).
+                int_state.extend_playout(chunk_duration_ms);
 
-                    // Add duration to non_interruptible_until_ms
+                // Update non_interruptible_until_ms (non-interruptible mode only)
+                if !int_state.allow_interruption.load(Ordering::Acquire) {
                     let current_until =
                         int_state.non_interruptible_until_ms.load(Ordering::Acquire);
                     int_state
@@ -1159,6 +1162,35 @@ impl VoiceManager {
     /// speculates on what the user has said SO FAR.
     pub fn current_turn_text(&self) -> String {
         self.speech_final_state.read().text_buffer.clone()
+    }
+
+    /// Whether the bot is (estimated to be) audibly speaking right now —
+    /// the bot-speaking truth for turn policy (MinWords barge-in gating,
+    /// A-G3). Derived from the per-chunk playout estimate; cleared audio
+    /// (barge-in) snaps it to silent.
+    pub fn is_bot_speaking(&self) -> bool {
+        self.interruption_state.is_audibly_speaking()
+    }
+
+    /// Discard the current turn's partial aggregation (TurnEvent::
+    /// ResetAggregation — sub-threshold input like a cough must never reach
+    /// the LLM). Routes through the GENERATION-BUMPING segment reset so any
+    /// armed detection/hard-timeout task for the discarded segment is
+    /// structurally unable to fire with its text (P0.3 claim discipline —
+    /// a raw buffer clear would reintroduce the stale-fire race).
+    pub fn reset_turn_aggregation(&self) {
+        // The processor is a thin config wrapper; rebuild it from the same
+        // config the STT wrapper uses (no per-call state).
+        let processor = STTResultProcessor::new(STTProcessingConfig::new(
+            self.config.speech_final_config.stt_speech_final_wait_ms,
+            self.config
+                .speech_final_config
+                .turn_detection_inference_timeout_ms,
+            self.config.speech_final_config.speech_final_hard_timeout_ms,
+            self.config.speech_final_config.duplicate_window_ms,
+        ));
+        let mut state = self.speech_final_state.write();
+        processor.reset_segment(&mut state);
     }
 
     /// Returns the current speech state from smart turn processor.

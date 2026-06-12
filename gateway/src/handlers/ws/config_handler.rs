@@ -382,20 +382,30 @@ async fn initialize_conversation_loop(
 
     // P1.2b eager end-of-turn: a smart-turn PREDICTION (turn-complete before
     // the provider's speech_final) starts a held+staged speculative LLM turn.
-    // A-G0: the per-session turn-policy controller. The LEGACY strategy set
-    // replicates the previously hardcoded policy exactly (any non-empty
-    // speech = barge-in; speech_final with content = run the turn; smart-turn
-    // complete = eager speculation). Policy improvements (MinWords gate,
-    // TTFS-aware floor, mutes) land as strategy swaps here — never as new
-    // hardcoded branches.
-    let turn_controller = Arc::new(crate::core::turn::TurnController::new(
-        vec![Box::new(crate::core::turn::strategies::AnySpeechStart)],
-        vec![
-            Box::new(crate::core::turn::strategies::EagerSmartTurnSpeculate),
-            Box::new(crate::core::turn::strategies::LegacySpeechFinalStop),
-        ],
-        vec![],
-    ));
+    // A-G0: the per-session turn-policy controller. Policy improvements land
+    // as strategy swaps here — never as new hardcoded branches. Start
+    // strategy: the MinWords barge-in gate (A-G3) when configured, else the
+    // legacy any-speech behavior. The bot-speaking truth comes from the
+    // VoiceManager's live playout estimate (probe), not a stale flag.
+    let start_strategy: Box<dyn crate::core::turn::UserTurnStartStrategy> =
+        match conv_config.barge_in_min_words {
+            Some(n) if n >= 1 => {
+                Box::new(crate::core::turn::strategies::MinWordsStart::new(n))
+            }
+            _ => Box::new(crate::core::turn::strategies::AnySpeechStart),
+        };
+    let vm_probe = voice_manager.clone();
+    let turn_controller = Arc::new(
+        crate::core::turn::TurnController::new(
+            vec![start_strategy],
+            vec![
+                Box::new(crate::core::turn::strategies::EagerSmartTurnSpeculate),
+                Box::new(crate::core::turn::strategies::LegacySpeechFinalStop),
+            ],
+            vec![],
+        )
+        .with_bot_speaking_probe(move || vm_probe.is_bot_speaking()),
+    );
 
     // Smart-turn verdicts feed the controller as an OPAQUE complete signal
     // (the TurnDecisionEngine stays the detector); a Speculate event drives

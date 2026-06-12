@@ -98,6 +98,13 @@ pub struct ConversationWebSocketConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, example = "anthropic"))]
     pub provider_kind: Option<crate::core::llm::AdapterKind>,
+
+    /// MinWords barge-in gate (A-G3): while the bot is audibly speaking,
+    /// require ≥ N words to interrupt it (a single word suffices when the
+    /// bot is silent). Omitted/0 = legacy any-speech barge-in; values < 2
+    /// are clamped to 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub barge_in_min_words: Option<usize>,
 }
 
 fn default_conversation_streaming() -> bool {
@@ -127,6 +134,7 @@ impl ConversationWebSocketConfig {
             allow_interruption: self.allow_interruption,
             eager_eot: self.eager_eot,
             provider_kind: self.provider_kind,
+            barge_in_min_words: self.barge_in_min_words,
         }
     }
 }

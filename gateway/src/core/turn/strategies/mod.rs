@@ -3,5 +3,7 @@
 //! (A-G2) land as siblings.
 
 pub mod legacy;
+pub mod min_words;
 
 pub use legacy::{AnySpeechStart, EagerSmartTurnSpeculate, LegacySpeechFinalStop};
+pub use min_words::MinWordsStart;

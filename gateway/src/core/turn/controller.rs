@@ -52,6 +52,11 @@ pub struct TurnController {
     user_muted: AtomicBool,
     /// 0 = unknown (no SttMetadata seen).
     stt_ttfs_p99_ms: AtomicU64,
+    /// Optional live probe for the bot-speaking truth (the VoiceManager's
+    /// playout estimate, A-G3/A7). When set it OVERRIDES the signal-driven
+    /// flag — it is exactly as fresh as the moment a signal is evaluated,
+    /// with no BotStopped timer task needed.
+    bot_speaking_probe: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl std::fmt::Debug for TurnController {
@@ -80,7 +85,17 @@ impl TurnController {
             bot_speaking: AtomicBool::new(false),
             user_muted: AtomicBool::new(false),
             stt_ttfs_p99_ms: AtomicU64::new(0),
+            bot_speaking_probe: None,
         }
+    }
+
+    /// Install a live bot-speaking probe (overrides the signal-driven flag).
+    pub fn with_bot_speaking_probe(
+        mut self,
+        probe: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.bot_speaking_probe = Some(Box::new(probe));
+        self
     }
 
     /// Whether a user turn is currently active.
@@ -115,7 +130,10 @@ impl TurnController {
         }
 
         let ctx = TurnCtx {
-            bot_speaking: self.bot_speaking.load(Ordering::Acquire),
+            bot_speaking: match &self.bot_speaking_probe {
+                Some(probe) => probe(),
+                None => self.bot_speaking.load(Ordering::Acquire),
+            },
             turn_active: self.turn_active.load(Ordering::Acquire),
             stt_ttfs_p99_ms: match self.stt_ttfs_p99_ms.load(Ordering::Acquire) {
                 0 => None,

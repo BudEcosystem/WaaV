@@ -310,6 +310,7 @@ fn conv_config(base_url: String, streaming: bool) -> ConversationConfig {
         allow_interruption: true,
         eager_eot: false,
         provider_kind: None,
+        barge_in_min_words: None,
     }
 }
 
