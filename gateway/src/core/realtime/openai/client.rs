@@ -84,6 +84,13 @@ const WS_CHANNEL_CAPACITY: usize = 256;
 /// The client supports automatic reconnection with exponential backoff when
 /// the connection is lost. Configure via `ReconnectionConfig` in the `RealtimeConfig`.
 /// Default behavior: up to 5 retry attempts with exponential backoff (1s, 2s, 4s, 8s, 16s).
+/// B-G2: playback state of the currently-streaming assistant item.
+struct ItemPlayback {
+    item_id: String,
+    first_delta: std::time::Instant,
+    duration_ms: u64,
+}
+
 pub struct OpenAIRealtime {
     /// Configuration
     config: RealtimeConfig,
@@ -134,6 +141,18 @@ pub struct OpenAIRealtime {
 
     /// Reconnection event callback
     reconnection_callback: Arc<Mutex<Option<ReconnectionCallback>>>,
+
+    /// B-G2 playback tracking for truncate: the currently-playing assistant
+    /// item (id, first-delta instant, audio duration received so far).
+    playback: Arc<std::sync::Mutex<Option<ItemPlayback>>>,
+    /// B-G2 rolling preroll of recently SENT user audio (re-appended after
+    /// an input-buffer clear so the speech onset isn't lost). Reuses the
+    /// D-G1 ring (push/evict-by-cap/snapshot).
+    preroll: Arc<crate::core::websocket::AudioReplayBuffer>,
+    /// B-G2 local conversation log (finalized user/assistant transcripts) —
+    /// replayed as conversation items after a reconnect (no response
+    /// requested): the socket is disposable, the context is the truth.
+    conversation_log: Arc<RwLock<Vec<crate::core::realtime::ReplayConversationItem>>>,
 
     /// Shared, process-global resilience handles (W-D2 fleet adoption): the single reconnect
     /// governor + this provider's shared circuit breaker. Unlike the streaming STT providers, the
@@ -258,6 +277,7 @@ impl OpenAIRealtime {
     /// * `assistant_transcript` - Accumulated assistant transcript buffer
     /// * `pending_function_calls` - Map of call_id -> function_name for tracking function calls
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn handle_server_event(
         event: ServerEvent,
         transcript_cb: &Arc<Mutex<Option<TranscriptCallback>>>,
@@ -269,6 +289,8 @@ impl OpenAIRealtime {
         session_id: &Arc<RwLock<Option<String>>>,
         assistant_transcript: &Arc<RwLock<String>>,
         pending_function_calls: &Arc<RwLock<HashMap<String, String>>>,
+        playback: &Arc<std::sync::Mutex<Option<ItemPlayback>>>,
+        conversation_log: &Arc<RwLock<Vec<crate::core::realtime::ReplayConversationItem>>>,
     ) {
         match event {
             ServerEvent::SessionCreated { session } => {
@@ -329,6 +351,14 @@ impl OpenAIRealtime {
                 ..
             } => {
                 tracing::debug!("User transcript: {}", transcript);
+                // B-G2: finalized user turn → the local conversation log
+                // (replayed after a reconnect).
+                conversation_log.write().await.push(
+                    crate::core::realtime::ReplayConversationItem {
+                        role: TranscriptRole::User,
+                        text: transcript.clone(),
+                    },
+                );
                 if let Some(cb) = transcript_cb.lock().await.as_ref() {
                     cb(TranscriptResult {
                         text: transcript,
@@ -366,6 +396,15 @@ impl OpenAIRealtime {
                 // Clear accumulated transcript
                 *assistant_transcript.write().await = String::new();
 
+                // B-G2: finalized assistant turn → the local conversation
+                // log (replayed after a reconnect).
+                conversation_log.write().await.push(
+                    crate::core::realtime::ReplayConversationItem {
+                        role: TranscriptRole::Assistant,
+                        text: transcript.clone(),
+                    },
+                );
+
                 if let Some(cb) = transcript_cb.lock().await.as_ref() {
                     cb(TranscriptResult {
                         text: transcript,
@@ -387,6 +426,25 @@ impl OpenAIRealtime {
                 if let Some(cb) = audio_cb.lock().await.as_ref() {
                     match BASE64_STANDARD.decode(&delta) {
                         Ok(audio_bytes) => {
+                            // B-G2 truncate bookkeeping: 24 kHz PCM16 mono =
+                            // 48 bytes/ms. Same item extends; a new item
+                            // restarts the playback estimate.
+                            {
+                                let chunk_ms = (audio_bytes.len() as u64) / 48;
+                                let mut pb = playback.lock().expect("playback lock");
+                                match pb.as_mut() {
+                                    Some(p) if p.item_id == item_id => {
+                                        p.duration_ms += chunk_ms;
+                                    }
+                                    _ => {
+                                        *pb = Some(ItemPlayback {
+                                            item_id: item_id.clone(),
+                                            first_delta: std::time::Instant::now(),
+                                            duration_ms: chunk_ms,
+                                        });
+                                    }
+                                }
+                            }
                             cb(RealtimeAudioData {
                                 data: Bytes::from(audio_bytes),
                                 sample_rate: 24000,
@@ -526,6 +584,10 @@ impl BaseRealtime for OpenAIRealtime {
             last_session_config: Arc::new(RwLock::new(None)),
             reconnection_callback: Arc::new(Mutex::new(None)),
             resilience: None,
+            playback: Arc::new(std::sync::Mutex::new(None)),
+            // ~660ms of 24k PCM16 — comfortably covers VAD onset latency.
+            preroll: Arc::new(crate::core::websocket::AudioReplayBuffer::new(32_000)),
+            conversation_log: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -589,6 +651,8 @@ impl BaseRealtime for OpenAIRealtime {
         let connected = self.connected.clone();
         let assistant_transcript = self.assistant_transcript.clone();
         let pending_function_calls = self.pending_function_calls.clone();
+        let playback = self.playback.clone();
+        let conversation_log = self.conversation_log.clone();
 
         // Clone reconnection-related state
         let reconnection_config = self.reconnection_config.clone();
@@ -658,6 +722,8 @@ impl BaseRealtime for OpenAIRealtime {
                                                 &session_id,
                                                 &assistant_transcript,
                                                 &pending_function_calls,
+                                                &playback,
+                                                &conversation_log,
                                             ).await;
                                         }
                                         Err(e) => {
@@ -835,6 +901,37 @@ impl BaseRealtime for OpenAIRealtime {
                             }
                         }
 
+                        // B-G2: rebuild server-side conversation state by
+                        // replaying the LOCAL log as conversation items —
+                        // WITHOUT a response.create (no duplicate inference;
+                        // the context is the durable truth, the socket is
+                        // disposable).
+                        {
+                            let log = conversation_log.read().await.clone();
+                            if !log.is_empty() {
+                                tracing::info!(
+                                    items = log.len(),
+                                    "Replaying conversation context after reconnection"
+                                );
+                                for item in &log {
+                                    let event = ClientEvent::ConversationItemCreate {
+                                        item: Self::replay_item_to_conversation_item(item),
+                                        previous_item_id: None,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&event)
+                                        && let Err(e) = current_ws_sink
+                                            .send(Message::Text(json.into()))
+                                            .await
+                                    {
+                                        tracing::error!(
+                                            "Failed to replay conversation item: {e}"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
                         // Invoke reconnection callback
                         if let Some(cb) = reconnection_callback.lock().await.as_ref() {
                             cb(ReconnectionEvent {
@@ -913,6 +1010,9 @@ impl BaseRealtime for OpenAIRealtime {
             return Err(RealtimeError::NotConnected);
         }
 
+        // B-G2: rolling preroll — an input-buffer clear (barge-in) wipes the
+        // speech onset; this ring re-appends it.
+        self.preroll.push(audio_data.clone());
         let event = ClientEvent::audio_append(&audio_data);
         self.send_event(event).await
     }
@@ -1119,6 +1219,76 @@ impl BaseRealtime for OpenAIRealtime {
         self.send_event(event).await
     }
 
+    // ── B-G2: S2S-as-a-service surface ──
+
+    fn emits_user_turn_frames(&self) -> bool {
+        // Server VAD configured ⇒ the server produces turn signals; without
+        // it (manual mode) the gateway's turn policy drives commits.
+        self.config.turn_detection.is_some()
+    }
+
+    async fn truncate_response(
+        &mut self,
+        item_id: &str,
+        audio_end_ms: u64,
+    ) -> RealtimeResult<()> {
+        self.send_event(ClientEvent::ConversationItemTruncate {
+            item_id: item_id.to_string(),
+            content_index: 0,
+            audio_end_ms: audio_end_ms as u32,
+        })
+        .await
+    }
+
+    async fn truncate_current_response(&mut self) -> RealtimeResult<Option<(String, u64)>> {
+        let target = {
+            let pb = self.playback.lock().expect("playback lock");
+            pb.as_ref().map(|p| {
+                let elapsed = p.first_delta.elapsed().as_millis() as u64;
+                (
+                    p.item_id.clone(),
+                    crate::core::realtime::clamp_truncate_ms(elapsed, p.duration_ms),
+                )
+            })
+        };
+        match target {
+            Some((item_id, end_ms)) => {
+                self.truncate_response(&item_id, end_ms).await?;
+                // The item is truncated: playback estimate is spent.
+                *self.playback.lock().expect("playback lock") = None;
+                Ok(Some((item_id, end_ms)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn replay_user_audio_preroll(&mut self) -> RealtimeResult<()> {
+        let tail = self.preroll.snapshot();
+        if tail.is_empty() {
+            return Ok(());
+        }
+        let bytes: usize = tail.iter().map(|c| c.len()).sum();
+        tracing::debug!(chunks = tail.len(), bytes, "replaying user-audio preroll");
+        for chunk in tail {
+            self.send_event(ClientEvent::audio_append(&chunk)).await?;
+        }
+        Ok(())
+    }
+
+    async fn replay_conversation(
+        &mut self,
+        items: &[crate::core::realtime::ReplayConversationItem],
+    ) -> RealtimeResult<()> {
+        for item in items {
+            self.send_event(ClientEvent::ConversationItemCreate {
+                item: Self::replay_item_to_conversation_item(item),
+                previous_item_id: None,
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
     fn get_provider_info(&self) -> serde_json::Value {
         serde_json::json!({
             "provider": "openai",
@@ -1160,6 +1330,34 @@ impl BaseRealtime for OpenAIRealtime {
 
 impl OpenAIRealtime {
     /// Send an event to the WebSocket.
+    /// B-G2: map a replay-log item to the wire conversation item. Pure —
+    /// pinned by tests (`input_text` for user, `text` for assistant; never
+    /// a response request).
+    fn replay_item_to_conversation_item(
+        item: &crate::core::realtime::ReplayConversationItem,
+    ) -> ConversationItem {
+        let (role, content_type) = match item.role {
+            TranscriptRole::User => ("user", "input_text"),
+            TranscriptRole::Assistant => ("assistant", "text"),
+        };
+        ConversationItem {
+            id: None,
+            item_type: "message".to_string(),
+            status: Some("completed".to_string()),
+            role: Some(role.to_string()),
+            content: Some(vec![ContentPart {
+                content_type: content_type.to_string(),
+                text: Some(item.text.clone()),
+                audio: None,
+                transcript: None,
+            }]),
+            call_id: None,
+            name: None,
+            arguments: None,
+            output: None,
+        }
+    }
+
     async fn send_event(&self, event: ClientEvent) -> RealtimeResult<()> {
         if let Some(sender) = self.ws_sender.lock().await.as_ref() {
             sender
@@ -1210,6 +1408,9 @@ impl Default for OpenAIRealtime {
                 last_session_config: Arc::new(RwLock::new(None)),
                 reconnection_callback: Arc::new(Mutex::new(None)),
                 resilience: None,
+                playback: Arc::new(std::sync::Mutex::new(None)),
+                preroll: Arc::new(crate::core::websocket::AudioReplayBuffer::new(32_000)),
+                conversation_log: Arc::new(RwLock::new(Vec::new())),
             }
         })
     }
@@ -1222,6 +1423,63 @@ impl Default for OpenAIRealtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn emits_user_turn_frames_false_when_turn_detection_disabled() {
+        use crate::core::realtime::TurnDetectionConfig;
+        let server_vad = OpenAIRealtime::new(RealtimeConfig {
+            provider: "openai".into(),
+            api_key: "k".into(),
+            model: "gpt-4o-realtime-preview".into(),
+            turn_detection: Some(TurnDetectionConfig::default()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(server_vad.emits_user_turn_frames(), "server VAD → server turn frames");
+
+        let manual = OpenAIRealtime::new(RealtimeConfig {
+            provider: "openai".into(),
+            api_key: "k".into(),
+            model: "gpt-4o-realtime-preview".into(),
+            turn_detection: None,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            !manual.emits_user_turn_frames(),
+            "manual mode → the GATEWAY's turn policy drives commits"
+        );
+    }
+
+    #[test]
+    fn replay_items_render_as_completed_messages_never_responses() {
+        use crate::core::realtime::{ReplayConversationItem, TranscriptRole};
+        let user = OpenAIRealtime::replay_item_to_conversation_item(&ReplayConversationItem {
+            role: TranscriptRole::User,
+            text: "hello there".into(),
+        });
+        assert_eq!(user.item_type, "message");
+        assert_eq!(user.role.as_deref(), Some("user"));
+        let c = &user.content.as_ref().unwrap()[0];
+        assert_eq!(c.content_type, "input_text", "user side speaks input_text");
+        assert_eq!(c.text.as_deref(), Some("hello there"));
+
+        let bot = OpenAIRealtime::replay_item_to_conversation_item(&ReplayConversationItem {
+            role: TranscriptRole::Assistant,
+            text: "hi!".into(),
+        });
+        assert_eq!(bot.role.as_deref(), Some("assistant"));
+        assert_eq!(bot.content.as_ref().unwrap()[0].content_type, "text");
+        // The replay event is ConversationItemCreate — a RESPONSE is never
+        // requested by replay (no duplicate inference on reconnect).
+        let evt = ClientEvent::ConversationItemCreate {
+            item: bot,
+            previous_item_id: None,
+        };
+        let wire = serde_json::to_string(&evt).unwrap();
+        assert!(wire.contains("conversation.item.create"));
+        assert!(!wire.contains("response.create"));
+    }
 
     #[tokio::test]
     async fn test_openai_realtime_creation() {

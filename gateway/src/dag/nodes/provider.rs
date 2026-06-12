@@ -845,6 +845,37 @@ impl DAGNode for TTSProviderNode {
     }
 }
 
+/// B-G2: one PERSISTENT realtime (S2S) session per node id — the socket,
+/// its callbacks, and per-response signaling live across turns instead of
+/// being rebuilt per `execute()` (the old request-scoped behavior cost a
+/// full WS handshake + session.update on every utterance and discarded all
+/// server-side conversation state).
+pub struct SessionRealtime {
+    /// The connected provider (locked per turn — one in-flight response).
+    pub provider: tokio::sync::Mutex<crate::core::realtime::BoxedRealtime>,
+    /// Monotonic `response.done` counter (watch, not Notify: a done that
+    /// lands BEFORE the node starts waiting must not be lost — the waiter
+    /// compares against the count it captured before `create_response`).
+    response_done_tx: tokio::sync::watch::Sender<u64>,
+    /// Latest finalized assistant transcript (taken per turn).
+    last_transcript: parking_lot::Mutex<String>,
+}
+
+/// Shared across every per-turn `DAGContext` clone (the map itself is the
+/// stable resource; entries are created on first use per node id). Inserted
+/// at DAG-init under [`resource_keys::REALTIME_PROVIDER_PREFIX`]`sessions`.
+pub type RealtimeSessionMap = parking_lot::Mutex<
+    std::collections::HashMap<String, Arc<SessionRealtime>>,
+>;
+
+/// Resource key for the [`RealtimeSessionMap`].
+pub fn realtime_sessions_key() -> String {
+    format!(
+        "{}sessions",
+        crate::dag::context::resource_keys::REALTIME_PROVIDER_PREFIX
+    )
+}
+
 /// Realtime provider node
 ///
 /// Wraps a realtime provider (e.g., OpenAI Realtime) for bidirectional voice processing.
@@ -882,6 +913,196 @@ impl RealtimeProviderNode {
     /// Get the provider name
     pub fn provider(&self) -> &str {
         &self.provider
+    }
+
+    /// B-G2: get-or-create the persistent session for this node, run one
+    /// turn through it, stream audio to the cascade sink, return the
+    /// assistant transcript as the node's data output.
+    async fn execute_session_scoped(
+        &self,
+        input: DAGData,
+        ctx: &mut DAGContext,
+        sessions: Arc<RealtimeSessionMap>,
+    ) -> DAGResult<DAGData> {
+        let (audio_data, text_data) = match &input {
+            DAGData::Audio(bytes) => (Some(bytes.clone()), None),
+            DAGData::TTSAudio(tts) => (Some(tts.data.clone()), None),
+            DAGData::Text(text) => (None, Some(text.clone())),
+            DAGData::STTResult(stt) => (None, Some(stt.transcript.clone())),
+            DAGData::Empty => return Ok(DAGData::Empty),
+            other => {
+                return Err(DAGError::UnsupportedDataType {
+                    expected: "audio or text".to_string(),
+                    actual: other.type_name().to_string(),
+                });
+            }
+        };
+
+        // Get-or-create OUTSIDE the entry lock (creation awaits connect).
+        let existing = sessions.lock().get(self.id.to_string().as_str()).cloned();
+        let session = match existing {
+            Some(s) => s,
+            None => {
+                let s = self.create_session(ctx).await?;
+                sessions.lock().insert(self.id.clone(), Arc::clone(&s));
+                s
+            }
+        };
+
+        let mut provider = session.provider.lock().await;
+        // Subscribe BEFORE triggering the response: a done landing between
+        // create_response and the wait below still advances the counter we
+        // compare against (no lost wakeup).
+        let mut done_rx = session.response_done_tx.subscribe();
+        let baseline = *done_rx.borrow();
+        if let Some(audio) = audio_data {
+            provider.send_audio(audio).await.map_err(|e| {
+                DAGError::RealtimeProviderError {
+                    provider: self.provider.clone(),
+                    error: format!("Failed to send audio: {e}"),
+                }
+            })?;
+            // Manual mode needs an explicit commit; server-VAD providers
+            // commit on their own.
+            if !provider.emits_user_turn_frames()
+                && let Err(e) = provider.commit_audio_buffer().await
+            {
+                warn!(node_id = %self.id, error = %e, "audio buffer commit failed");
+            }
+        }
+        if let Some(text) = text_data {
+            provider.send_text(&text).await.map_err(|e| {
+                DAGError::RealtimeProviderError {
+                    provider: self.provider.clone(),
+                    error: format!("Failed to send text: {e}"),
+                }
+            })?;
+        }
+        provider.create_response().await.map_err(|e| {
+            DAGError::RealtimeProviderError {
+                provider: self.provider.clone(),
+                error: format!("Failed to create response: {e}"),
+            }
+        })?;
+        drop(provider);
+
+        // Audio streams to the sink as it arrives; here we only wait for the
+        // turn boundary, then surface the transcript downstream.
+        let timeout = ctx
+            .remaining_time()
+            .unwrap_or(Duration::from_secs(30))
+            .min(Duration::from_secs(30));
+        let wait = async {
+            while *done_rx.borrow() <= baseline {
+                if done_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        };
+        if tokio::time::timeout(timeout, wait).await.is_err() {
+            warn!(node_id = %self.id, "realtime response timed out; returning partial transcript");
+        }
+        let transcript = std::mem::take(&mut *session.last_transcript.lock());
+        Ok(DAGData::Text(transcript))
+    }
+
+    /// Connect a NEW persistent provider with session-scoped callbacks:
+    /// audio → the cascade sink (`DagOutput::Audio`), finalized assistant
+    /// transcripts → the per-turn slot, `response.done` → the turn notify.
+    async fn create_session(&self, ctx: &DAGContext) -> DAGResult<Arc<SessionRealtime>> {
+        let registry = crate::plugin::global_registry();
+        let realtime_config = RealtimeConfig {
+            model: self.model.clone().unwrap_or_default(),
+            provider: self.provider.clone(),
+            ..Default::default()
+        };
+        let realtime = registry
+            .create_realtime(&self.provider, realtime_config)
+            .map_err(|e| DAGError::RealtimeProviderError {
+                provider: self.provider.clone(),
+                error: e.to_string(),
+            })?;
+
+        let (response_done_tx, _) = tokio::sync::watch::channel(0u64);
+        let session = Arc::new(SessionRealtime {
+            provider: tokio::sync::Mutex::new(realtime),
+            response_done_tx,
+            last_transcript: parking_lot::Mutex::new(String::new()),
+        });
+
+        {
+            let mut provider = session.provider.lock().await;
+
+            // Audio → the cascade sink: downstream cannot tell S2S from TTS.
+            let output_tx = ctx.output_tx.clone().expect("checked by caller");
+            let audio_cb: AudioOutputCallback = Arc::new(move |audio: RealtimeAudioData| {
+                let tx = output_tx.clone();
+                Box::pin(async move {
+                    let _ = tx
+                        .send(crate::dag::context::DagOutput::Audio(
+                            crate::dag::nodes::TTSAudioData {
+                                data: audio.data,
+                                sample_rate: audio.sample_rate,
+                                format: "pcm16".to_string(),
+                                duration_ms: None,
+                                is_final: false,
+                            },
+                        ))
+                        .await;
+                }) as Pin<Box<dyn Future<Output = ()> + Send>>
+            });
+            provider.on_audio(audio_cb).map_err(|e| DAGError::RealtimeProviderError {
+                provider: self.provider.clone(),
+                error: format!("Failed to register audio callback: {e}"),
+            })?;
+
+            // Finalized ASSISTANT transcripts → the per-turn slot.
+            let transcript_slot = Arc::clone(&session);
+            let transcript_cb: TranscriptCallback = Arc::new(move |t: TranscriptResult| {
+                let session = Arc::clone(&transcript_slot);
+                Box::pin(async move {
+                    if t.is_final
+                        && matches!(t.role, crate::core::realtime::TranscriptRole::Assistant)
+                    {
+                        *session.last_transcript.lock() = t.text;
+                    }
+                }) as Pin<Box<dyn Future<Output = ()> + Send>>
+            });
+            provider.on_transcript(transcript_cb).map_err(|e| {
+                DAGError::RealtimeProviderError {
+                    provider: self.provider.clone(),
+                    error: format!("Failed to register transcript callback: {e}"),
+                }
+            })?;
+
+            // response.done → the turn boundary.
+            let done = Arc::clone(&session);
+            let done_cb: crate::core::realtime::ResponseDoneCallback =
+                Arc::new(move |_response_id: String| {
+                    let session = Arc::clone(&done);
+                    Box::pin(async move {
+                        session.response_done_tx.send_modify(|c| *c += 1);
+                    }) as Pin<Box<dyn Future<Output = ()> + Send>>
+                });
+            provider.on_response_done(done_cb).map_err(|e| {
+                DAGError::RealtimeProviderError {
+                    provider: self.provider.clone(),
+                    error: format!("Failed to register response-done callback: {e}"),
+                }
+            })?;
+
+            provider.connect().await.map_err(|e| DAGError::RealtimeProviderError {
+                provider: self.provider.clone(),
+                error: format!("Failed to connect: {e}"),
+            })?;
+            info!(
+                node_id = %self.id,
+                provider = %self.provider,
+                "Persistent realtime session connected (B-G2)"
+            );
+        }
+
+        Ok(session)
     }
 }
 
@@ -923,6 +1144,20 @@ impl DAGNode for RealtimeProviderNode {
             input_type = %input.type_name(),
             "Processing through realtime provider"
         );
+
+        // B-G2: session-scoped path. When the session map resource is
+        // present (every gateway DAG session — inserted at init) AND the
+        // cascade output sink is attached, the provider persists across
+        // turns and its audio rides DagOutput::Audio — byte-for-byte the
+        // same downstream contract as cascade TTS (S2S is a drop-in).
+        if let Some(sessions) = ctx.get_resource_as::<RealtimeSessionMap>(&realtime_sessions_key())
+            && ctx.output_tx.is_some()
+        {
+            return self.execute_session_scoped(input, ctx, sessions).await;
+        }
+
+        // Legacy request-scoped path (direct executor use, unit tests, no
+        // sink): unchanged behavior.
 
         // Extract input data (audio or text)
         let (audio_data, text_data, has_audio_input) = match &input {
@@ -1281,5 +1516,200 @@ mod tests {
         assert!(caps.contains(&NodeCapability::TextInput));
         assert!(caps.contains(&NodeCapability::AudioOutput));
         assert!(caps.contains(&NodeCapability::TextOutput));
+    }
+}
+
+#[cfg(test)]
+mod session_realtime_tests {
+    use super::*;
+    use crate::core::realtime::{
+        AudioOutputCallback as RtAudioCb, BaseRealtime, ConnectionState as RtConn,
+        RealtimeError, RealtimeResult, TranscriptCallback as RtTranscriptCb, TranscriptRole,
+    };
+    use crate::dag::context::DagOutput;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CONNECTS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Mock S2S provider: `create_response` immediately emits one audio
+    /// chunk, a finalized assistant transcript, and response-done.
+    struct MockS2S {
+        audio_cb: Option<RtAudioCb>,
+        transcript_cb: Option<RtTranscriptCb>,
+        done_cb: Option<crate::core::realtime::ResponseDoneCallback>,
+        turn: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl BaseRealtime for MockS2S {
+        fn new(_c: RealtimeConfig) -> RealtimeResult<Self> {
+            Ok(Self { audio_cb: None, transcript_cb: None, done_cb: None, turn: 0 })
+        }
+        async fn connect(&mut self) -> RealtimeResult<()> {
+            CONNECTS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn get_connection_state(&self) -> RtConn {
+            RtConn::Connected
+        }
+        async fn send_audio(&mut self, _a: bytes::Bytes) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn send_text(&mut self, _t: &str) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn create_response(&mut self) -> RealtimeResult<()> {
+            self.turn += 1;
+            let turn = self.turn;
+            if let Some(cb) = &self.audio_cb {
+                cb(crate::core::realtime::RealtimeAudioData {
+                    data: bytes::Bytes::from(vec![0xBB; 480]),
+                    sample_rate: 24_000,
+                    item_id: Some(format!("item_{turn}")),
+                    response_id: Some(format!("resp_{turn}")),
+                })
+                .await;
+            }
+            if let Some(cb) = &self.transcript_cb {
+                cb(crate::core::realtime::TranscriptResult {
+                    text: format!("answer {turn}"),
+                    role: TranscriptRole::Assistant,
+                    is_final: true,
+                    item_id: Some(format!("item_{turn}")),
+                })
+                .await;
+            }
+            if let Some(cb) = &self.done_cb {
+                cb(format!("resp_{turn}")).await;
+            }
+            Ok(())
+        }
+        async fn cancel_response(&mut self) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn commit_audio_buffer(&mut self) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn clear_audio_buffer(&mut self) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_transcript(&mut self, c: RtTranscriptCb) -> RealtimeResult<()> {
+            self.transcript_cb = Some(c);
+            Ok(())
+        }
+        fn on_audio(&mut self, c: RtAudioCb) -> RealtimeResult<()> {
+            self.audio_cb = Some(c);
+            Ok(())
+        }
+        fn on_error(
+            &mut self,
+            _c: crate::core::realtime::RealtimeErrorCallback,
+        ) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_function_call(
+            &mut self,
+            _c: crate::core::realtime::FunctionCallCallback,
+        ) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_speech_event(
+            &mut self,
+            _c: crate::core::realtime::SpeechEventCallback,
+        ) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_response_done(
+            &mut self,
+            c: crate::core::realtime::ResponseDoneCallback,
+        ) -> RealtimeResult<()> {
+            self.done_cb = Some(c);
+            Ok(())
+        }
+        fn on_reconnection(
+            &mut self,
+            _c: crate::core::realtime::ReconnectionCallback,
+        ) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn update_session(&mut self, _c: RealtimeConfig) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn submit_function_result(&mut self, _i: &str, _r: &str) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn get_provider_info(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+    }
+
+    /// B-G2: session-scoped realtime — ONE connect across turns, audio
+    /// routed through the cascade `DagOutput::Audio` sink, transcript
+    /// surfaced as the node's data output.
+    #[tokio::test]
+    async fn realtime_session_persists_and_routes_audio_through_cascade_sink() {
+        crate::plugin::global_registry().register_realtime(
+            "mock-s2s-bg2",
+            Arc::new(|c| Ok(Box::new(MockS2S::new(c)?) as Box<dyn BaseRealtime>)),
+            crate::plugin::ProviderMetadata {
+                name: "mock-s2s-bg2".into(),
+                display_name: "Mock S2S".into(),
+                description: "test".into(),
+                ..Default::default()
+            },
+        );
+        CONNECTS.store(0, Ordering::SeqCst);
+
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<DagOutput>(16);
+        let mut ctx = DAGContext::new("session-rt".to_string());
+        ctx.set_output_tx(output_tx);
+        let sessions: Arc<RealtimeSessionMap> =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        ctx.set_resource(realtime_sessions_key(), Arc::clone(&sessions));
+
+        let node = RealtimeProviderNode::new("rt1", "mock-s2s-bg2");
+        let started = std::time::Instant::now();
+
+        // Turn 1
+        let out = node
+            .execute(DAGData::Text("hello".into()), &mut ctx)
+            .await
+            .expect("turn 1");
+        assert!(matches!(&out, DAGData::Text(t) if t == "answer 1"), "got {out:?}");
+        // Turn 2 — the SAME session (no reconnect).
+        let out = node
+            .execute(DAGData::Text("again".into()), &mut ctx)
+            .await
+            .expect("turn 2");
+        assert!(matches!(&out, DAGData::Text(t) if t == "answer 2"), "got {out:?}");
+
+        assert_eq!(
+            CONNECTS.load(Ordering::SeqCst),
+            1,
+            "the provider must persist across turns (request-scoped was 1 connect PER turn)"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a done landing before the wait must not be LOST (lost wakeup = 30s timeout/turn)"
+        );
+        assert_eq!(sessions.lock().len(), 1);
+
+        // Audio rode the cascade sink — indistinguishable from cascade TTS.
+        let mut sink_audio = 0usize;
+        while let Ok(out) = output_rx.try_recv() {
+            if let DagOutput::Audio(a) = out {
+                assert_eq!(a.data.len(), 480);
+                assert_eq!(a.sample_rate, 24_000);
+                assert_eq!(a.format, "pcm16");
+                sink_audio += 1;
+            }
+        }
+        assert_eq!(sink_audio, 2, "one audio chunk per turn through DagOutput::Audio");
     }
 }

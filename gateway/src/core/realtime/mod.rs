@@ -55,9 +55,9 @@ pub use base::{
     AudioOutputCallback, BaseRealtime, BoxedRealtime, ConnectionState, FunctionCallCallback,
     FunctionCallRequest, FunctionDefinition, InputTranscriptionConfig, RealtimeAudioData,
     RealtimeConfig, RealtimeError, RealtimeErrorCallback, RealtimeFactory, RealtimeResult,
-    ReconnectionCallback, ReconnectionEvent, ResponseDoneCallback, SpeechEvent,
-    SpeechEventCallback, ToolDefinition, TranscriptCallback, TranscriptResult, TranscriptRole,
-    TurnDetectionConfig,
+    ReconnectionCallback, ReconnectionEvent, ReplayConversationItem, ResponseDoneCallback,
+    SpeechEvent, SpeechEventCallback, ToolDefinition, TranscriptCallback, TranscriptResult,
+    TranscriptRole, TurnDetectionConfig, clamp_truncate_ms, run_barge_in_sequence,
 };
 pub use hume::{
     EVIVersion, HUME_EVI_DEFAULT_SAMPLE_RATE, HUME_EVI_WEBSOCKET_URL, HumeEVI, HumeEVIConfig,

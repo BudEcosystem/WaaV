@@ -342,17 +342,28 @@ async fn handle_realtime_incoming(
             true
         }
         RealtimeIncomingMessage::CancelResponse => {
-            if let Some(provider) = realtime_provider
-                && let Err(e) = provider.cancel_response().await
-            {
-                let _ = message_tx
-                    .send(RealtimeMessageRoute::Outgoing(
-                        RealtimeOutgoingMessage::Error {
-                            code: Some("cancel_error".to_string()),
-                            message: format!("Failed to cancel response: {e}"),
-                        },
-                    ))
-                    .await;
+            // B-G2: a client cancel IS a barge-in — run the FULL sequence
+            // (clear input buffer → replay preroll → cancel → truncate the
+            // partially-heard item) so the provider's conversation state
+            // matches what the user actually heard, instead of the old
+            // shallow cancel-only forward.
+            if let Some(provider) = realtime_provider {
+                match crate::core::realtime::run_barge_in_sequence(provider.as_mut()).await {
+                    Ok(Some((item_id, end_ms))) => {
+                        tracing::debug!(item_id, end_ms, "barge-in: response truncated");
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        let _ = message_tx
+                            .send(RealtimeMessageRoute::Outgoing(
+                                RealtimeOutgoingMessage::Error {
+                                    code: Some("cancel_error".to_string()),
+                                    message: format!("Failed to cancel response: {e}"),
+                                },
+                            ))
+                            .await;
+                    }
+                }
             }
             true
         }

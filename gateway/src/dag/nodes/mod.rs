@@ -20,7 +20,10 @@ pub use input::{AudioInputNode, TextInputNode};
 pub use llm::{ChatMessage, LlmEndpointConfig, LlmEndpointNode, ResponseFormat, ToolDefinition};
 pub use output::{AudioOutputNode, TextOutputNode, WebhookOutputNode};
 pub use processor::ProcessorNode;
-pub use provider::{RealtimeProviderNode, STTProviderNode, TTSProviderNode};
+pub use provider::{
+    RealtimeProviderNode, RealtimeSessionMap, STTProviderNode, SessionRealtime,
+    TTSProviderNode, realtime_sessions_key,
+};
 pub use router::{JoinNode, RouterNode, SplitNode};
 pub use transform::{PassthroughNode, TransformNode};
 
