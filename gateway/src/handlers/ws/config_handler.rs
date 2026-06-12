@@ -168,10 +168,29 @@ pub async fn handle_config_message(
     // C-G5: one egress-resampling context for the whole session (None when
     // the client didn't ask for a playback rate — zero cost).
     let egress_audio = EgressAudio::from_tts_config(tts_ws_config.as_ref());
+    // E-G2: optional WS egress re-framer (None = legacy verbatim frames).
+    let ws_chunker = WsEgressChunker::from_tts_config(tts_ws_config.as_ref());
 
     // Register early TTS callback for cached audio
     if let Some(ref vm) = voice_manager {
-        register_early_tts_callback(vm, message_tx, egress_audio.clone()).await;
+        register_early_tts_callback(vm, message_tx, egress_audio.clone(), ws_chunker.clone())
+            .await;
+        // E-G2: on barge-in clear, the chunker's carried remainder is STALE
+        // bot audio — drop it. Raw-WS sessions have a free audio-clear slot;
+        // LiveKit sessions overwrite this with their own clear callback
+        // below (their egress path bypasses the chunker anyway).
+        if let Some(chunker) = ws_chunker.clone()
+            && livekit_ws_config.is_none()
+        {
+            let _ = vm
+                .on_audio_clear(move || {
+                    let chunker = Arc::clone(&chunker);
+                    Box::pin(async move {
+                        chunker.clear();
+                    })
+                })
+                .await;
+        }
     }
 
     // Initialize LiveKit client if configured
@@ -240,6 +259,7 @@ pub async fn handle_config_message(
             operation_queue.as_ref(),
             message_tx,
             egress_audio.clone(),
+            ws_chunker.clone(),
         )
         .await;
         if let Some(egress) = egress_audio.clone() {
@@ -249,6 +269,7 @@ pub async fn handle_config_message(
                 operation_queue.as_ref(),
                 message_tx,
                 egress,
+                ws_chunker.clone(),
             )
             .await;
         }
@@ -997,6 +1018,7 @@ async fn register_early_tts_callback(
     voice_manager: &Arc<VoiceManager>,
     message_tx: &mpsc::Sender<MessageRoute>,
     egress_audio: Option<Arc<EgressAudio>>,
+    ws_chunker: Option<Arc<WsEgressChunker>>,
 ) {
     let message_tx_for_early_tts = message_tx.clone();
 
@@ -1004,6 +1026,7 @@ async fn register_early_tts_callback(
         .on_tts_audio(move |audio_data: AudioData| {
             let message_tx = message_tx_for_early_tts.clone();
             let egress_audio = egress_audio.clone();
+            let ws_chunker = ws_chunker.clone();
 
             Box::pin(async move {
                 debug!(
@@ -1023,16 +1046,22 @@ async fn register_early_tts_callback(
                     return;
                 }
 
-                // Send audio as binary data to WebSocket. DroppableAudio
-                // policy (RC8): a slow client sheds stale frames instead of
-                // stalling the voice path; drops are counted.
-                let audio_bytes = Bytes::from(data);
-                crate::handlers::ws::messages::send_with_policy(
-                    &message_tx,
-                    MessageRoute::Binary(audio_bytes),
-                    crate::handlers::ws::messages::MessageClass::DroppableAudio,
-                )
-                .await;
+                // E-G2: re-frame for tight barge-in; legacy verbatim when
+                // unset. Send audio as binary data to WebSocket with the
+                // DroppableAudio policy (RC8): a slow client sheds stale
+                // frames instead of stalling the voice path.
+                let frames: Vec<Bytes> = match &ws_chunker {
+                    Some(c) => c.push(&data),
+                    None => vec![Bytes::from(data)],
+                };
+                for frame in frames {
+                    crate::handlers::ws::messages::send_with_policy(
+                        &message_tx,
+                        MessageRoute::Binary(frame),
+                        crate::handlers::ws::messages::MessageClass::DroppableAudio,
+                    )
+                    .await;
+                }
             })
         })
         .await
@@ -1056,6 +1085,48 @@ pub(crate) struct EgressAudio {
 /// wf_85659e16 — zero validation). 8 kHz (telephony) to 192 kHz (hi-res).
 pub(crate) fn valid_playback_rate(rate: u32) -> bool {
     (8_000..=192_000).contains(&rate)
+}
+
+/// E-G2: per-session WS egress re-framer — bounds the barge-in residual to
+/// one chunk on the RAW-WS path (LiveKit already frames internally).
+pub(crate) struct WsEgressChunker {
+    inner: parking_lot::Mutex<crate::core::audio::OutputChunker>,
+}
+
+impl WsEgressChunker {
+    fn from_tts_config(tts: Option<&TTSWebSocketConfig>) -> Option<Arc<Self>> {
+        let tts = tts?;
+        let chunk_ms = tts.audio_out_chunk_ms?;
+        if chunk_ms == 0 || chunk_ms > 1000 {
+            warn!(chunk_ms, "audio_out_chunk_ms outside (0,1000]; WS chunking disabled");
+            return None;
+        }
+        // The chunk size follows the rate of the bytes actually delivered:
+        // the client playback rate when egress resampling is on, else the
+        // provider rate.
+        let rate = tts
+            .client_playback_rate
+            .filter(|r| valid_playback_rate(*r))
+            .or(tts.sample_rate)
+            .unwrap_or(24_000);
+        Some(Arc::new(Self {
+            inner: parking_lot::Mutex::new(crate::core::audio::OutputChunker::new(
+                chunk_ms, rate,
+            )),
+        }))
+    }
+
+    fn push(&self, data: &[u8]) -> Vec<bytes::Bytes> {
+        self.inner.lock().push(data)
+    }
+
+    fn flush(&self) -> Option<bytes::Bytes> {
+        self.inner.lock().flush_remainder()
+    }
+
+    pub(crate) fn clear(&self) {
+        self.inner.lock().clear();
+    }
 }
 
 impl EgressAudio {
@@ -1114,6 +1185,7 @@ async fn deliver_tts_audio(
     livekit_client: Option<&Arc<RwLock<LiveKitClient>>>,
     operation_queue: Option<&crate::livekit::OperationQueue>,
     message_tx: &mpsc::Sender<MessageRoute>,
+    ws_chunker: Option<&Arc<WsEgressChunker>>,
 ) {
     let mut sent_to_livekit = false;
 
@@ -1182,13 +1254,20 @@ async fn deliver_tts_audio(
     // Fall back to WebSocket if LiveKit is not available or failed
     if !sent_to_livekit {
         debug!("Sending TTS audio to WebSocket client: {} bytes", audio.len());
-        let audio_bytes = Bytes::from(audio);
-        crate::handlers::ws::messages::send_with_policy(
-            message_tx,
-            MessageRoute::Binary(audio_bytes),
-            crate::handlers::ws::messages::MessageClass::DroppableAudio,
-        )
-        .await;
+        // E-G2: re-frame on the RAW-WS path only — LiveKit frames at 10ms
+        // internally and clear_buffer flushes its queue.
+        let frames: Vec<Bytes> = match ws_chunker {
+            Some(c) => c.push(&audio),
+            None => vec![Bytes::from(audio)],
+        };
+        for frame in frames {
+            crate::handlers::ws::messages::send_with_policy(
+                message_tx,
+                MessageRoute::Binary(frame),
+                crate::handlers::ws::messages::MessageClass::DroppableAudio,
+            )
+            .await;
+        }
     }
 }
 
@@ -1204,6 +1283,7 @@ async fn register_tts_complete_with_flush(
     operation_queue: Option<&crate::livekit::OperationQueue>,
     message_tx: &mpsc::Sender<MessageRoute>,
     egress_audio: Arc<EgressAudio>,
+    ws_chunker: Option<Arc<WsEgressChunker>>,
 ) {
     let message_tx = message_tx.clone();
     let livekit_client = livekit_client.cloned();
@@ -1214,6 +1294,7 @@ async fn register_tts_complete_with_flush(
             let livekit_client = livekit_client.clone();
             let operation_queue = operation_queue.clone();
             let egress_audio = egress_audio.clone();
+            let ws_chunker = ws_chunker.clone();
             Box::pin(async move {
                 let tail = egress_audio.flush();
                 if !tail.is_empty() {
@@ -1222,6 +1303,19 @@ async fn register_tts_complete_with_flush(
                         livekit_client.as_ref(),
                         operation_queue.as_ref(),
                         &message_tx,
+                        ws_chunker.as_ref(),
+                    )
+                    .await;
+                }
+                // E-G2: the chunker's sub-chunk remainder is REAL audio at
+                // utterance end — deliver it before the completion event.
+                if let Some(c) = &ws_chunker
+                    && let Some(rem) = c.flush()
+                {
+                    crate::handlers::ws::messages::send_with_policy(
+                        &message_tx,
+                        MessageRoute::Binary(rem),
+                        crate::handlers::ws::messages::MessageClass::DroppableAudio,
                     )
                     .await;
                 }
@@ -1249,6 +1343,7 @@ async fn register_final_tts_callback(
     operation_queue: Option<&crate::livekit::OperationQueue>,
     message_tx: &mpsc::Sender<MessageRoute>,
     egress_audio: Option<Arc<EgressAudio>>,
+    ws_chunker: Option<Arc<WsEgressChunker>>,
 ) {
     let message_tx_for_tts = message_tx.clone();
     let livekit_client_for_tts = livekit_client.cloned();
@@ -1260,6 +1355,7 @@ async fn register_final_tts_callback(
             let livekit_client = livekit_client_for_tts.clone();
             let operation_queue = operation_queue_for_tts.clone();
             let egress_audio = egress_audio.clone();
+            let ws_chunker = ws_chunker.clone();
 
             Box::pin(async move {
                 // C-G5: client playback rate (passthrough when unset). A
@@ -1280,6 +1376,7 @@ async fn register_final_tts_callback(
                     livekit_client.as_ref(),
                     operation_queue.as_ref(),
                     &message_tx,
+                    ws_chunker.as_ref(),
                 )
                 .await;
             })
@@ -1413,6 +1510,7 @@ async fn initialize_livekit_client(
         audio_format: None,
         sample_rate: Some(24000), // Default sample rate for LiveKit
         client_playback_rate: None,
+            audio_out_chunk_ms: None,
         connection_timeout: None,
         request_timeout: None,
         model: "".to_string(),
@@ -1843,6 +1941,7 @@ async fn initialize_dag_routing(
                             livekit_client.as_ref(),
                             operation_queue.as_ref(),
                             &message_tx,
+                            None, // DAG sessions: chunking knob rides the conversation path only (carrier gap noted)
                         )
                         .await;
                     }

@@ -2255,6 +2255,19 @@ components:
           - 'null'
           description: Audio format preference
           example: linear16
+        audio_out_chunk_ms:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            WS egress re-framing (E-G2): when set, PCM TTS audio is sliced into
+            chunks of this many milliseconds before the WebSocket send, so a
+            barge-in clear truncates within ONE chunk instead of letting a whole
+            synthesis frame play out client-side. Omitted = verbatim frames
+            (legacy). LiveKit egress already frames at 10ms internally.
+          example: 20
+          minimum: 0
         client_playback_rate:
           type:
           - integer

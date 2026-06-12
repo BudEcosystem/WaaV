@@ -392,6 +392,15 @@ pub struct TTSWebSocketConfig {
     /// Sample rate preference
     #[cfg_attr(feature = "openapi", schema(example = 24000))]
     pub sample_rate: Option<u32>,
+    /// WS egress re-framing (E-G2): when set, PCM TTS audio is sliced into
+    /// chunks of this many milliseconds before the WebSocket send, so a
+    /// barge-in clear truncates within ONE chunk instead of letting a whole
+    /// synthesis frame play out client-side. Omitted = verbatim frames
+    /// (legacy). LiveKit egress already frames at 10ms internally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(example = 20))]
+    pub audio_out_chunk_ms: Option<u32>,
+
     /// Client playback rate (C-G5): when set, the gateway resamples PCM TTS
     /// egress from the provider's rate to THIS rate before delivery (WS
     /// binary and LiveKit), so clients with a fixed-rate audio sink never
