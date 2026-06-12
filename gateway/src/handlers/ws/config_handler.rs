@@ -1685,9 +1685,15 @@ async fn register_dag_stream_driver(
     profiler: Arc<crate::core::observability::LatencyProfiler>,
 ) {
     let message_tx = message_tx.clone();
-    // P1.3: DAG turns get the same per-turn latency trace as conversation
-    // turns (path="dag"), with the per-node breakdown from ctx.timing.
-    let dag_turn_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // A-G0: the DAG session drives turn policy through the same controller
+    // spine as the conversation path (legacy set = previous inline gate).
+    // The controller's turn_id keys the TurnTrace (A11 partial: one id per
+    // turn across policy + profiling on this path).
+    let turn_controller = Arc::new(crate::core::turn::TurnController::new(
+        vec![Box::new(crate::core::turn::strategies::AnySpeechStart)],
+        vec![Box::new(crate::core::turn::strategies::LegacySpeechFinalStop)],
+        vec![],
+    ));
     let result = voice_manager
         .on_stt_result(move |stt: STTResult| {
             let compiled_dag = compiled_dag.clone();
@@ -1696,7 +1702,7 @@ async fn register_dag_stream_driver(
             let post_stt_node_id = post_stt_node_id.clone();
             let message_tx = message_tx.clone();
             let profiler = profiler.clone();
-            let dag_turn_seq = dag_turn_seq.clone();
+            let turn_controller = turn_controller.clone();
 
             Box::pin(async move {
                 // Transcript egress: the DAG path REPLACES the simple-path STT callback
@@ -1714,13 +1720,37 @@ async fn register_dag_stream_driver(
                     }))
                     .await;
 
-                // Only fire the pipeline on a finalized turn with real content.
-                if !stt.is_speech_final || stt.transcript.trim().is_empty() {
+                // Turn policy via the controller (legacy set ≡ the previous
+                // inline `is_speech_final && !empty` gate); the DAG runs on
+                // the Stopped event, keyed by the controller's turn_id.
+                let signal = if stt.is_final || stt.is_speech_final {
+                    crate::core::turn::ControllerSignal::SttFinal {
+                        text: stt.transcript.clone(),
+                        is_speech_final: stt.is_speech_final,
+                        is_finalized: stt.is_finalized,
+                    }
+                } else {
+                    crate::core::turn::ControllerSignal::SttInterim {
+                        text: stt.transcript.clone(),
+                        confidence: stt.confidence,
+                    }
+                };
+                let events = turn_controller.feed(&signal);
+                let Some((turn_id, turn_transcript)) =
+                    events.into_iter().find_map(|e| match e {
+                        crate::core::turn::TurnEvent::Stopped { turn_id, transcript } => {
+                            Some((turn_id, transcript))
+                        }
+                        // Started/barge-in has no DAG-side action today (the
+                        // DAG has no cancellable bot turn at this layer).
+                        _ => None,
+                    })
+                else {
                     return;
-                }
+                };
 
                 debug!(
-                    transcript = %stt.transcript,
+                    transcript = %turn_transcript,
                     start_node = %post_stt_node_id,
                     "StreamDriver: running DAG for finalized turn"
                 );
@@ -1729,7 +1759,6 @@ async fn register_dag_stream_driver(
                 let mut ctx = ctx_template.clone_for_branch();
 
                 use crate::core::observability::{TurnOutcome, TurnPath, TurnSink, TurnTrace};
-                let turn_id = dag_turn_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut trace = TurnTrace::open(
                     turn_id,
                     Arc::from(ctx.stream_id.as_str()),
@@ -1738,7 +1767,7 @@ async fn register_dag_stream_driver(
                 );
 
                 let input = crate::dag::nodes::DAGData::STTResult(STTResultData {
-                    transcript: stt.transcript.clone(),
+                    transcript: turn_transcript,
                     is_final: stt.is_final,
                     is_speech_final: stt.is_speech_final,
                     confidence: stt.confidence as f64,
