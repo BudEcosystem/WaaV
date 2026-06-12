@@ -23,6 +23,7 @@ pub mod state;
 pub mod stt;
 pub mod text;
 pub mod tts;
+pub mod turn;
 pub mod turn_decision;
 pub mod turn_detect;
 pub mod voice_manager;
