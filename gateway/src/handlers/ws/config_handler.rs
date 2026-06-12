@@ -524,6 +524,9 @@ async fn initialize_conversation_loop(
                 if !events.is_empty() {
                     orch.handle_turn_events(&events).await;
                 }
+                // A-G7: any STT activity (and the turns it starts) re-arms
+                // the idle re-engagement timer.
+                orch.poke_idle_timer();
             })
         })
         .await;

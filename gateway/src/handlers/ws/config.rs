@@ -129,6 +129,13 @@ pub struct ConversationWebSocketConfig {
     /// output.
     #[serde(default = "default_strip_markdown")]
     pub strip_markdown: bool,
+
+    /// Idle re-engagement (A-G7): after this many ms of silence (no user
+    /// speech, no bot turn, bot not speaking), the bot gently checks in.
+    /// Omitted/0 = off.
+    #[serde(default)]
+    #[cfg_attr(feature = "openapi", schema(example = 15000))]
+    pub user_idle_timeout_ms: u64,
 }
 
 fn default_strip_markdown() -> bool {
@@ -166,6 +173,7 @@ impl ConversationWebSocketConfig {
             summarize_target_tokens: self.summarize_target_tokens,
             mute_strategy: self.mute_strategy.clone(),
             strip_markdown: self.strip_markdown,
+            user_idle_timeout_ms: self.user_idle_timeout_ms,
         }
     }
 }

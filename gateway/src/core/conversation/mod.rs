@@ -26,6 +26,7 @@
 //! present. Absent it, the existing STT/TTS-primitive behavior is unchanged.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex as SyncMutex;
 use tokio_util::sync::CancellationToken;
@@ -101,6 +102,9 @@ pub struct ConversationConfig {
     /// ticks, links, headings — spoken asterisks/URLs ruin voice output.
     /// Default ON.
     pub strip_markdown: bool,
+    /// Idle re-engagement (A-G7): after this many ms with no user/bot
+    /// activity, the bot speaks a gentle re-engagement turn. `0` = off.
+    pub user_idle_timeout_ms: u64,
 }
 
 impl Default for ConversationConfig {
@@ -121,6 +125,7 @@ impl Default for ConversationConfig {
             summarize_target_tokens: 0,
             mute_strategy: None,
             strip_markdown: true,
+            user_idle_timeout_ms: 0,
         }
     }
 }
@@ -167,6 +172,10 @@ pub struct ConversationOrchestrator {
     next_turn_id: Arc<std::sync::atomic::AtomicU64>,
     /// In-flight EAGER (speculative) turn, if any (P1.2b).
     eager: Arc<SyncMutex<Option<EagerTurn>>>,
+    /// A-G7 idle generation: bumped on EVERY activity; an armed idle task
+    /// only fires while its captured generation is current (any activity
+    /// disarms stale timers structurally — no cancellation plumbing).
+    idle_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// A speculative LLM turn started on a turn-complete PREDICTION, before the
@@ -211,6 +220,7 @@ impl ConversationOrchestrator {
             turn: Arc::new(SyncMutex::new(None)),
             next_turn_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             eager: Arc::new(SyncMutex::new(None)),
+            idle_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -231,6 +241,7 @@ impl ConversationOrchestrator {
             turn: Arc::new(SyncMutex::new(None)),
             next_turn_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             eager: Arc::new(SyncMutex::new(None)),
+            idle_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -822,6 +833,47 @@ impl ConversationOrchestrator {
         if let Err(e) = self.run_turn(transcript).await {
             warn!(session = %self.session_id, error = %e, "conversation turn failed");
         }
+    }
+
+    /// A-G7: register activity (user speech, bot turn) and re-arm the idle
+    /// timer. The armed task fires `user_idle_timeout_ms` later ONLY if its
+    /// generation is still current AND nothing is busy at fire time (no
+    /// active turn, bot not audibly speaking) — the exact races Pipecat's
+    /// idle controller guards. Busy-at-fire re-checks until idle or stale.
+    pub fn poke_idle_timer(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        let timeout_ms = self.config.user_idle_timeout_ms;
+        let generation = self.idle_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        if timeout_ms == 0 {
+            return;
+        }
+        let orch = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
+                if orch.idle_generation.load(Ordering::Acquire) != generation {
+                    return; // newer activity re-armed; this timer is stale
+                }
+                // INVARIANT: never fire while a turn is active (incl. tool
+                // loops) or the bot is still audibly speaking.
+                if orch.has_active_turn() || orch.voice_manager.is_bot_speaking() {
+                    continue; // busy: re-check after another period
+                }
+                debug!(session = %orch.session_id, "user idle; re-engaging");
+                // The turn itself bumps the generation via run_turn's
+                // poke at completion (below), so we won't re-fire in a loop
+                // unless the user STAYS silent for another full period.
+                if let Err(e) = orch
+                    .run_turn(
+                        "[The user has been silent for a while. Briefly and                          naturally check in with them or offer help — one short                          sentence.]",
+                    )
+                    .await
+                {
+                    warn!(session = %orch.session_id, error = %e, "idle re-engagement failed");
+                }
+                return;
+            }
+        });
     }
 
     /// Whether a bot LLM turn is currently in flight (thinking or speaking).

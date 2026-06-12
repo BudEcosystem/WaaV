@@ -716,6 +716,15 @@ components:
           - 'null'
           format: float
           description: Sampling temperature.
+        user_idle_timeout_ms:
+          type: integer
+          format: int64
+          description: |-
+            Idle re-engagement (A-G7): after this many ms of silence (no user
+            speech, no bot turn, bot not speaking), the bot gently checks in.
+            Omitted/0 = off.
+          example: 15000
+          minimum: 0
     DAGWebSocketConfig:
       type: object
       description: |-

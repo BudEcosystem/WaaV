@@ -960,3 +960,109 @@ async fn tool_loop_final_answer_is_spoken_after_streamed_preamble() {
         .count();
     assert_eq!(preambles, 1, "preamble committed exactly once: {history:?}");
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// A-G7 — idle re-engagement.
+// ──────────────────────────────────────────────────────────────────────────────
+fn idle_config(base_url: String, timeout_ms: u64) -> ConversationConfig {
+    ConversationConfig {
+        user_idle_timeout_ms: timeout_ms,
+        ..conv_config(base_url, false)
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn idle_fires_after_bot_silence() {
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let llm_state = LlmMockState::default();
+    *llm_state.reply.lock() = "Are you still there?".to_string();
+    let base_url = start_llm_mock(llm_state.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+
+    let orchestrator = Arc::new(
+        ConversationOrchestrator::new("session-idle", idle_config(base_url, 80), vm.clone())
+            .expect("orchestrator"),
+    );
+
+    // User activity arms the timer; then silence.
+    orchestrator.poke_idle_timer();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let requests = llm_state.requests.lock().clone();
+    assert_eq!(requests.len(), 1, "exactly one idle re-engagement inference");
+    let msgs = requests[0]["messages"].as_array().unwrap();
+    assert!(
+        msgs.iter().any(|m| m["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("silent for a while")),
+        "re-engagement prompt present: {msgs:?}"
+    );
+    let spoken = TTS_STATS.spoken.lock().clone();
+    assert!(
+        spoken.iter().any(|s| s.contains("Are you still there")),
+        "the re-engagement reply must be spoken: {spoken:?}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn idle_suppressed_mid_turn_and_disabled_when_zero() {
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    // Disabled (0): no inference ever.
+    let llm_state = LlmMockState::default();
+    *llm_state.reply.lock() = "never".to_string();
+    let base_url = start_llm_mock(llm_state.clone()).await;
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+    let orch = Arc::new(
+        ConversationOrchestrator::new("session-idle-off", idle_config(base_url, 0), vm.clone())
+            .expect("orchestrator"),
+    );
+    orch.poke_idle_timer();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(llm_state.requests.lock().is_empty(), "0 = disabled");
+
+    // Mid-turn suppression: a slow LLM turn is in flight when the timer
+    // fires — it must NOT inject a second inference until the turn ends.
+    let llm_state2 = LlmMockState::default();
+    *llm_state2.reply.lock() = "slow answer".to_string();
+    llm_state2.delay_ms.store(300, Ordering::SeqCst);
+    let base_url2 = start_llm_mock(llm_state2.clone()).await;
+    let orch2 = Arc::new(
+        ConversationOrchestrator::new(
+            "session-idle-busy",
+            idle_config(base_url2, 60),
+            vm.clone(),
+        )
+        .expect("orchestrator"),
+    );
+    let o = orch2.clone();
+    let turn = tokio::spawn(async move {
+        o.run_turn("a question").await.ok();
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    orch2.poke_idle_timer(); // fires at +60ms — mid-turn
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        llm_state2.requests.lock().len(),
+        1,
+        "no idle inference while a turn is active"
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(2), turn).await;
+}

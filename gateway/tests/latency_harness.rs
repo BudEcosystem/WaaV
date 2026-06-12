@@ -314,6 +314,7 @@ fn conv_config(base_url: String, streaming: bool) -> ConversationConfig {
         summarize_target_tokens: 0,
         mute_strategy: None,
         strip_markdown: true,
+        user_idle_timeout_ms: 0,
     }
 }
 
