@@ -105,6 +105,14 @@ pub struct ConversationWebSocketConfig {
     /// are clamped to 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub barge_in_min_words: Option<usize>,
+
+    /// Token-aware context compaction (B-G6): when the session context's
+    /// estimated tokens cross this value, older messages are summarized
+    /// after the turn (system + recent turns kept verbatim). Omitted/0 =
+    /// off.
+    #[serde(default)]
+    #[cfg_attr(feature = "openapi", schema(example = 6000))]
+    pub summarize_target_tokens: usize,
 }
 
 fn default_conversation_streaming() -> bool {
@@ -135,6 +143,7 @@ impl ConversationWebSocketConfig {
             eager_eot: self.eager_eot,
             provider_kind: self.provider_kind,
             barge_in_min_words: self.barge_in_min_words,
+            summarize_target_tokens: self.summarize_target_tokens,
         }
     }
 }

@@ -678,6 +678,15 @@ components:
         streaming:
           type: boolean
           description: Stream tokens to TTS as they arrive (default true).
+        summarize_target_tokens:
+          type: integer
+          description: |-
+            Token-aware context compaction (B-G6): when the session context's
+            estimated tokens cross this value, older messages are summarized
+            after the turn (system + recent turns kept verbatim). Omitted/0 =
+            off.
+          example: 6000
+          minimum: 0
         system_prompt:
           type:
           - string

@@ -28,12 +28,14 @@ use tracing::{debug, instrument, warn};
 
 pub mod adapter;
 pub mod functions;
+pub mod summarize;
 
 pub use adapter::{AdapterKind, LlmAdapter, LlmStreamEvent};
 pub use functions::{
     CANCEL_ASYNC_TOOL_NAME, FunctionCallParams, FunctionHandler, FunctionRegistry,
     FunctionResult, RegistryItem, ToolLoopOptions, run_tool_loop,
 };
+pub use summarize::SummaryConfig;
 
 /// Whitelisted environment variables that can be accessed via `${VAR}` syntax.
 ///
@@ -827,6 +829,43 @@ impl LlmClient {
         } else {
             self.complete_sync(session_id, Some(input), api_key, cancel, false).await
         }
+    }
+
+    /// Stateless ONE-SHOT completion over an explicit message list — no
+    /// session history is read or written (B-G6 summarization, detached
+    /// utility inferences). Non-streaming.
+    pub async fn complete_detached(
+        &self,
+        messages: &[ChatMessage],
+        api_key: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> LlmResult<LlmResponse> {
+        let resolved = self.resolve_api_key(api_key);
+        let api_key = resolved.as_deref();
+        let http_request = self.build_http_request(messages, false, api_key);
+        let response = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(LlmError::Cancelled),
+            r = http_request.send() => r.map_err(|e| self.endpoint_err(format!("Request failed: {}", e)))?,
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(self.endpoint_err(format!("HTTP {} - {}", status, error_text)));
+        }
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| self.endpoint_err(format!("Failed to parse response: {}", e)))?;
+        let parsed = self.adapter.parse_response(body).map_err(|e| self.endpoint_err(e))?;
+        Ok(LlmResponse {
+            id: parsed.id,
+            model: parsed.model,
+            content: parsed.message.content.clone().unwrap_or_default(),
+            finish_reason: parsed.finish_reason,
+            tool_calls: parsed.message.tool_calls.clone().unwrap_or_default(),
+            usage: parsed.usage,
+        })
     }
 
     /// Re-run inference from the stored history AS-IS — no new user message

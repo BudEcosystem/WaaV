@@ -91,6 +91,10 @@ pub struct ConversationConfig {
     /// require ≥ N words to interrupt (1 word when silent). `None`/`0` keeps
     /// the legacy any-speech barge-in. Values < 2 are clamped to 2.
     pub barge_in_min_words: Option<usize>,
+    /// Token-aware context compaction (B-G6): when the session context's
+    /// token ESTIMATE crosses this value, the oldest messages are
+    /// summarized after the turn (system + recent kept). `0` = off.
+    pub summarize_target_tokens: usize,
 }
 
 impl Default for ConversationConfig {
@@ -108,6 +112,7 @@ impl Default for ConversationConfig {
             eager_eot: false,
             provider_kind: None,
             barge_in_min_words: None,
+            summarize_target_tokens: 0,
         }
     }
 }
@@ -534,6 +539,29 @@ impl ConversationOrchestrator {
         };
 
         self.end_turn(id);
+
+        // B-G6: compact the context AFTER the turn (and after end_turn, so
+        // summarization never extends the bot-busy window). Failure is loud
+        // but never fatal — the next turn still runs.
+        if self.config.summarize_target_tokens > 0 {
+            let cfg = crate::core::llm::SummaryConfig {
+                target_tokens: self.config.summarize_target_tokens,
+                ..Default::default()
+            };
+            if let Err(e) = self
+                .llm
+                .maybe_summarize(
+                    &self.session_id,
+                    &cfg,
+                    self.config.api_key.as_deref(),
+                    &CancellationToken::new(),
+                )
+                .await
+            {
+                warn!(session = %self.session_id, error = %e, "context summarization failed");
+            }
+        }
+
         outcome
     }
 

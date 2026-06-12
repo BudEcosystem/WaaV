@@ -1524,7 +1524,7 @@ mod session_realtime_tests {
     use super::*;
     use crate::core::realtime::{
         AudioOutputCallback as RtAudioCb, BaseRealtime, ConnectionState as RtConn,
-        RealtimeError, RealtimeResult, TranscriptCallback as RtTranscriptCb, TranscriptRole,
+        RealtimeResult, TranscriptCallback as RtTranscriptCb, TranscriptRole,
     };
     use crate::dag::context::DagOutput;
     use std::sync::atomic::{AtomicUsize, Ordering};
