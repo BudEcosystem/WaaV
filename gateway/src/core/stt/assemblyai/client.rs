@@ -134,6 +134,9 @@ struct AssemblyAiTransport {
     /// Readiness flag shared with the client's `is_ready()`: true from `Begin` until the
     /// transport drops; restored by the next `Begin` after a supervised reconnect.
     is_connected: Arc<AtomicBool>,
+    /// D-G1: shared replay ring — pushed by the send arm, cleared on
+    /// end-of-turn, replayed by `restore_session`.
+    replay: Arc<crate::core::websocket::AudioReplayBuffer>,
 }
 
 #[async_trait::async_trait]
@@ -141,8 +144,24 @@ impl WsTransport for AssemblyAiTransport {
     async fn restore_session(&mut self) -> Result<(), RestoreError> {
         // AssemblyAI puts every feature (sample rate, encoding, speech model, format_turns,
         // keyterms, language detection, diarization) in the connect URL, so a fresh dial already
-        // restored the featured session — nothing to re-send. The server's `Begin` frame
-        // (observed in `run`) confirms the new session and re-arms `is_connected`.
+        // restored the featured session. What a fresh dial CANNOT restore is the un-finalized
+        // audio tail — the provider is stateless across sockets, so any audio sent after the
+        // last end-of-turn but lost to the drop must be replayed (D-G1). Empty on the first
+        // connect.
+        let tail = self.replay.snapshot();
+        if !tail.is_empty() {
+            let tail_bytes: usize = tail.iter().map(|c| c.len()).sum();
+            info!(
+                chunks = tail.len(),
+                bytes = tail_bytes,
+                "AssemblyAI: replaying un-finalized audio tail after reconnect"
+            );
+            for chunk in tail {
+                self.ws_sink.send(Message::Binary(chunk)).await.map_err(|e| {
+                    RestoreError::new(format!("audio replay send failed: {e}"))
+                })?;
+            }
+        }
         Ok(())
     }
 
@@ -154,6 +173,10 @@ impl WsTransport for AssemblyAiTransport {
             tokio::select! {
                 // Handle outgoing audio data
                 Some(audio_data) = audio_rx.recv() => {
+                    // D-G1: record BEFORE the write — a chunk whose write
+                    // fails is precisely the audio the next connection must
+                    // replay (Bytes clone = refcount).
+                    self.replay.push(audio_data.clone());
                     // AssemblyAI accepts raw binary audio data (no base64 encoding)
                     // Zero-copy: Bytes is passed directly to WebSocket
                     let data_len = audio_data.len();
@@ -187,6 +210,7 @@ impl WsTransport for AssemblyAiTransport {
                                 msg,
                                 &self.result_tx,
                                 &self.session_id,
+                                &self.replay,
                             ).await {
                                 Ok(should_continue) => {
                                     if !should_continue {
@@ -382,6 +406,11 @@ pub struct AssemblyAISTT {
     /// supervisor checks it at its loop top and after a racy `Reconnectable` outcome, so a client
     /// close racing a server-side close can never trigger a spurious reconnect.
     intentional_disconnect: Arc<AtomicBool>,
+
+    /// D-G1 reconnect audio-replay: the un-finalized audio tail (cleared on
+    /// every end-of-turn), replayed into the fresh socket by
+    /// `restore_session` after a supervised reconnect.
+    replay: Arc<crate::core::websocket::AudioReplayBuffer>,
 }
 
 impl Default for AssemblyAISTT {
@@ -404,6 +433,7 @@ impl Default for AssemblyAISTT {
             is_connected: Arc::new(AtomicBool::new(false)),
             resilience: None,
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
+            replay: Arc::new(crate::core::websocket::AudioReplayBuffer::default()),
         }
     }
 }
@@ -460,6 +490,7 @@ impl AssemblyAISTT {
         message: Message,
         result_tx: &mpsc::Sender<STTResult>,
         session_id: &Arc<RwLock<Option<String>>>,
+        replay: &crate::core::websocket::AudioReplayBuffer,
     ) -> Result<bool, STTError> {
         // Returns true if connection should continue, false if terminated
         match message {
@@ -485,6 +516,11 @@ impl AssemblyAISTT {
                                 (sum / turn.words.len() as f64) as f32
                             };
 
+                            // D-G1: an end-of-turn means everything sent so
+                            // far is durably transcribed — drop the tail.
+                            if turn.end_of_turn {
+                                replay.clear();
+                            }
                             let stt_result = STTResult::new(
                                 turn.transcript,
                                 turn.end_of_turn, // is_final
@@ -638,6 +674,7 @@ impl AssemblyAISTT {
         // close (W-D1 disconnect-vs-close race fix).
         self.intentional_disconnect.store(false, Ordering::SeqCst);
         let disconnect_flag = Arc::clone(&self.intentional_disconnect);
+        let replay = Arc::clone(&self.replay);
         let supervisor = match self.resilience.clone() {
             Some(r) => ReconnectableStream::with_breaker_and_governor(
                 ReconnectableStreamConfig::new("assemblyai", reconnection),
@@ -668,6 +705,7 @@ impl AssemblyAISTT {
                     let is_connected = Arc::clone(&is_connected);
                     let result_tx = result_tx.clone();
                     let error_tx = error_tx.clone();
+                    let replay = Arc::clone(&replay);
                     async move {
                         // Build WebSocket request with AssemblyAI authentication
                         // Note: AssemblyAI uses "Authorization: <API_KEY>" (no Bearer prefix
@@ -724,6 +762,7 @@ impl AssemblyAISTT {
                             connected_tx,
                             session_id,
                             is_connected,
+                            replay,
                         })
                     }
                 })
@@ -839,6 +878,7 @@ impl BaseSTT for AssemblyAISTT {
             is_connected: Arc::new(AtomicBool::new(false)),
             resilience: None,
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
+            replay: Arc::new(crate::core::websocket::AudioReplayBuffer::default()),
         })
     }
 
@@ -1270,7 +1310,7 @@ mod tests {
             r#"{"type":"Begin","id":"test-session-123","expires_at":1704067200}"#.into(),
         );
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id).await;
+        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
 
         assert!(result.is_ok());
         assert!(result.unwrap()); // Should continue
@@ -1289,7 +1329,7 @@ mod tests {
             r#"{"type":"Turn","turn_order":0,"transcript":"Hello world","end_of_turn":true,"words":[{"start":0,"end":500,"confidence":0.95,"text":"Hello"},{"start":500,"end":1000,"confidence":0.98,"text":"world"}]}"#.into(),
         );
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id).await;
+        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
 
         assert!(result.is_ok());
         assert!(result.unwrap()); // Should continue
@@ -1310,7 +1350,7 @@ mod tests {
             r#"{"type":"Termination","audio_duration_ms":5000,"terminated_normally":true}"#.into(),
         );
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id).await;
+        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
 
         assert!(result.is_ok());
         assert!(!result.unwrap()); // Should NOT continue (termination)
@@ -1326,7 +1366,7 @@ mod tests {
                 .into(),
         );
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id).await;
+        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
 
         assert!(result.is_err());
         if let Err(STTError::AuthenticationFailed(msg)) = result {
@@ -1346,7 +1386,7 @@ mod tests {
                 .into(),
         );
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id).await;
+        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
 
         assert!(result.is_err());
         if let Err(STTError::ProviderError(msg)) = result {

@@ -366,6 +366,11 @@ pub struct DeepgramSTT {
     /// client close racing a server-side close can never trigger a spurious reconnect (the unbiased
     /// inner select may pick the stream-ended arm over the shutdown arm).
     intentional_disconnect: Arc<AtomicBool>,
+    /// D-G1 reconnect audio-replay: the un-finalized audio tail (cleared on
+    /// every `is_final`), replayed into the fresh socket after a reconnect so
+    /// words spoken around the drop aren't lost — Deepgram is stateless
+    /// across connections.
+    replay: Arc<crate::core::websocket::AudioReplayBuffer>,
 }
 
 /// Constants for Deepgram regional endpoints
@@ -397,6 +402,7 @@ impl DeepgramSTT {
             error_callback: Arc::new(Mutex::new(None)),
             resilience: None,
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
+            replay: Arc::new(crate::core::websocket::AudioReplayBuffer::default()),
         }
     }
 
@@ -611,6 +617,7 @@ impl DeepgramSTT {
     fn handle_websocket_message(
         message: Message,
         result_tx: &mpsc::Sender<STTResult>,
+        replay: &crate::core::websocket::AudioReplayBuffer,
     ) -> Result<(), STTError> {
         match message {
             Message::Text(text) => {
@@ -636,6 +643,12 @@ impl DeepgramSTT {
                                     // EoT logic may stop waiting on STT.
                                     if is_final && response.from_finalize == Some(true) {
                                         stt_result = stt_result.finalized();
+                                    }
+
+                                    // D-G1: everything sent so far is durably
+                                    // transcribed — drop the replay tail.
+                                    if is_final {
+                                        replay.clear();
                                     }
 
                                     // Send result (non-blocking with bounded channel)
@@ -750,6 +763,9 @@ impl DeepgramSTT {
         // a reconnect that races a server-side close (W-D1).
         self.intentional_disconnect.store(false, Ordering::SeqCst);
         let intentional_disconnect = Arc::clone(&self.intentional_disconnect);
+        // D-G1: shared with the task so the send arm records, the parser
+        // clears on finals, and each reconnect iteration replays the tail.
+        let replay = Arc::clone(&self.replay);
 
         // Start the connection task
         let connection_handle = tokio::spawn(async move {
@@ -850,6 +866,26 @@ impl DeepgramSTT {
 
                 let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
+                // D-G1: replay the un-finalized audio tail into the fresh
+                // connection (empty on the first connect). Without this,
+                // words spoken after the last final but before the drop are
+                // silently lost — the provider is stateless across sockets.
+                let tail = replay.snapshot();
+                if !tail.is_empty() {
+                    let tail_bytes: usize = tail.iter().map(|c| c.len()).sum();
+                    info!(
+                        chunks = tail.len(),
+                        bytes = tail_bytes,
+                        "Deepgram: replaying un-finalized audio tail after reconnect"
+                    );
+                    for chunk in tail {
+                        if let Err(e) = ws_sink.send(Message::Binary(chunk)).await {
+                            warn!("Deepgram: audio replay send failed: {e}");
+                            break;
+                        }
+                    }
+                }
+
                 // Keep-alive mechanism to prevent connection timeout
                 // Deepgram connections timeout after 10 seconds of inactivity
                 // Send keep-alive messages every 1 second when no audio is being sent
@@ -864,6 +900,10 @@ impl DeepgramSTT {
                     tokio::select! {
                         // Handle outgoing audio data
                         Some(audio_data) = ws_rx.recv() => {
+                            // D-G1: record BEFORE the write — a chunk whose
+                            // write fails is precisely the audio the next
+                            // connection must replay (Bytes clone = refcount).
+                            replay.push(audio_data.clone());
                             let message = Message::Binary(audio_data);
                             if let Err(e) = ws_sink.send(message).await {
                                 let stt_error = STTError::NetworkError(format!(
@@ -882,7 +922,7 @@ impl DeepgramSTT {
                         message = timeout(WS_MESSAGE_TIMEOUT, ws_stream.next()) => {
                             match message {
                                 Ok(Some(Ok(msg))) => {
-                                    if let Err(e) = Self::handle_websocket_message(msg, &result_tx) {
+                                    if let Err(e) = Self::handle_websocket_message(msg, &result_tx, &replay) {
                                         error!("Streaming error from Deepgram: {}", e);
                                         let _ = error_tx.try_send(e);
                                         // A provider `Error` frame is typically fatal (bad
@@ -971,7 +1011,7 @@ impl DeepgramSTT {
                                                         received_speech_final = true;
                                                     }
 
-                                                if let Err(e) = Self::handle_websocket_message(msg, &result_tx) {
+                                                if let Err(e) = Self::handle_websocket_message(msg, &result_tx, &replay) {
                                                     warn!("Error handling message after CloseStream: {}", e);
                                                 }
 
@@ -1138,6 +1178,7 @@ impl Default for DeepgramSTT {
             error_callback: Arc::new(Mutex::new(None)),
             resilience: None,
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
+            replay: Arc::new(crate::core::websocket::AudioReplayBuffer::default()),
         }
     }
 }
@@ -1347,14 +1388,24 @@ mod tests {
 
         let finalize_ack = r#"{"type":"Results","is_final":true,"speech_final":true,"from_finalize":true,
             "channel":{"alternatives":[{"transcript":"all done","confidence":0.98}]}}"#;
-        DeepgramSTT::handle_websocket_message(Message::Text(finalize_ack.into()), &tx).unwrap();
+        DeepgramSTT::handle_websocket_message(
+            Message::Text(finalize_ack.into()),
+            &tx,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .unwrap();
         let r = rx.recv().await.unwrap();
         assert!(r.is_finalized, "Finalize ack must set is_finalized");
         assert!(r.is_final);
 
         let ordinary_final = r#"{"type":"Results","is_final":true,"speech_final":false,
             "channel":{"alternatives":[{"transcript":"hello","confidence":0.9}]}}"#;
-        DeepgramSTT::handle_websocket_message(Message::Text(ordinary_final.into()), &tx).unwrap();
+        DeepgramSTT::handle_websocket_message(
+            Message::Text(ordinary_final.into()),
+            &tx,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .unwrap();
         let r = rx.recv().await.unwrap();
         assert!(!r.is_finalized, "ordinary finals are not finalized");
 
@@ -1362,7 +1413,12 @@ mod tests {
         // finalized — the invariant is enforced at the mapping site.
         let weird_interim = r#"{"type":"Results","is_final":false,"from_finalize":true,
             "channel":{"alternatives":[{"transcript":"par","confidence":0.5}]}}"#;
-        DeepgramSTT::handle_websocket_message(Message::Text(weird_interim.into()), &tx).unwrap();
+        DeepgramSTT::handle_websocket_message(
+            Message::Text(weird_interim.into()),
+            &tx,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .unwrap();
         let r = rx.recv().await.unwrap();
         assert!(!r.is_finalized, "interim can never be finalized");
     }
@@ -1807,7 +1863,11 @@ mod tests {
         "#;
 
         let message = Message::Text(json_response.to_string().into());
-        let result = DeepgramSTT::handle_websocket_message(message, &result_tx);
+        let result = DeepgramSTT::handle_websocket_message(
+            message,
+            &result_tx,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        );
 
         assert!(result.is_ok());
 

@@ -92,7 +92,6 @@ smart-turn = [
     "dep:ort",
     "dep:ndarray",
     "dep:mel_spec",
-    "dep:rubato",
     "dep:realfft",
     "dep:num",
     "dep:dirs",
@@ -258,7 +257,7 @@ rtrb = { version = "0.3", optional = true }  # Lock-free ring buffer for inter-n
 
 # Smart Turn dependencies (audio-based turn detection)
 mel_spec = { version = "0.3", optional = true }  # Whisper-compatible mel spectrogram extraction
-rubato = { version = "0.16", optional = true }  # High-quality audio resampling
+rubato = { version = "0.16" }  # High-quality audio resampling (C-G5 resampler is core: TTS egress client_playback_rate works in every build)
 realfft = { version = "3.4", optional = true }  # FFT for mel spectrogram (fallback)
 
 # Silero VAD dependencies

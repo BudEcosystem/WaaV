@@ -755,3 +755,223 @@ async fn assemblyai_recovers_after_midstream_kill() {
         "finals lost across the AssemblyAI reconnect: got {got:?}, expected {expected:?}"
     );
 }
+
+// =============================================================================
+// Part E — D-G1 reconnect audio-replay: the un-finalized tail crosses the gap
+// =============================================================================
+
+/// Which provider protocol the replay mock speaks.
+#[derive(Clone, Copy)]
+enum ReplayProto {
+    Deepgram,
+    AssemblyAi,
+}
+
+/// Binary audio captured per connection, in arrival order.
+#[derive(Default)]
+struct ReplayObservations {
+    audio_per_conn: Vec<Vec<Vec<u8>>>,
+}
+
+/// A mock STT server choreographed around DISTINCT tagged audio chunks:
+/// - conn 0: on receiving the 0xA1 chunk → send a FINAL transcript (the
+///   client clears its replay ring on it); on receiving the 0xA3 chunk →
+///   drop the socket abruptly (0xA2 and 0xA3 are now the un-finalized tail).
+/// - conn 1: capture everything; on receiving a 0xA4 chunk → send a FINAL so
+///   the test can observe completion.
+async fn spawn_replay_mock(proto: ReplayProto) -> (u16, Arc<Mutex<ReplayObservations>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let obs = Arc::new(Mutex::new(ReplayObservations::default()));
+    let obs_ret = Arc::clone(&obs);
+    let conn_count = Arc::new(AtomicUsize::new(0));
+
+    fn final_frame(proto: ReplayProto, idx: usize) -> String {
+        match proto {
+            ReplayProto::Deepgram => format!(
+                r#"{{"type":"Results","is_final":true,"speech_final":false,"channel":{{"alternatives":[{{"transcript":"final {idx}","confidence":0.99}}]}}}}"#
+            ),
+            ReplayProto::AssemblyAi => format!(
+                r#"{{"type":"Turn","turn_order":{idx},"transcript":"final {idx}","end_of_turn":true,"words":[]}}"#
+            ),
+        }
+    }
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let obs = Arc::clone(&obs);
+            let conn_count = Arc::clone(&conn_count);
+            tokio::spawn(async move {
+                let ws = match accept_hdr_async(stream, |_req: &Request, resp: Response| Ok(resp))
+                    .await
+                {
+                    Ok(ws) => ws,
+                    Err(_) => return,
+                };
+                let which = conn_count.fetch_add(1, Ordering::AcqRel);
+                obs.lock().await.audio_per_conn.push(Vec::new());
+
+                let (mut write, mut read) = ws.split();
+
+                if matches!(proto, ReplayProto::AssemblyAi) {
+                    let begin = format!(
+                        r#"{{"type":"Begin","id":"sess-{which}","expires_at":1704067200}}"#
+                    );
+                    if write.send(Message::Text(begin.into())).await.is_err() {
+                        return;
+                    }
+                }
+
+                while let Some(msg) = read.next().await {
+                    match msg {
+                        Ok(Message::Binary(b)) => {
+                            let tag = b.first().copied().unwrap_or(0);
+                            obs.lock().await.audio_per_conn[which].push(b.to_vec());
+                            match (which, tag) {
+                                (0, 0xA1) => {
+                                    // Ack everything so far: the client clears its ring.
+                                    if write
+                                        .send(Message::Text(final_frame(proto, 0).into()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                (0, 0xA3) => {
+                                    // Mid-stream kill with 0xA2+0xA3 un-finalized.
+                                    return;
+                                }
+                                (_, 0xA4) => {
+                                    let _ = write
+                                        .send(Message::Text(final_frame(proto, 1).into()))
+                                        .await;
+                                }
+                                _ => {}
+                            }
+                        }
+                        Ok(Message::Close(_)) | Err(_) => return,
+                        Ok(Message::Text(t)) => {
+                            if t.contains("CloseStream") || t.contains("Terminate") {
+                                return;
+                            }
+                        }
+                        Ok(_) => {}
+                    }
+                }
+            });
+        }
+    });
+
+    (port, obs_ret)
+}
+
+fn tagged(tag: u8) -> bytes::Bytes {
+    bytes::Bytes::from(vec![tag; 320])
+}
+
+/// Drives a REAL provider through the replay mock and asserts the D-G1
+/// contract: the un-finalized tail (0xA2, 0xA3) is replayed FIRST on the new
+/// connection, in order, and the finalized chunk (0xA1) is NOT replayed.
+async fn assert_replays_unfinalized_tail(provider_name: &str, proto: ReplayProto) {
+    let (port, obs) = spawn_replay_mock(proto).await;
+    let endpoint = format!("ws://127.0.0.1:{port}");
+
+    let std_cfg = StandardSTTConfig {
+        base: STTConfig {
+            provider: provider_name.into(),
+            api_key: "test-key".into(),
+            model: if matches!(proto, ReplayProto::Deepgram) { "nova-3".into() } else { String::new() },
+            language: "en".into(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "linear16".into(),
+        },
+        features: SttFeatures::default(),
+        extras: Default::default(),
+    }
+    .with_endpoint_override(&endpoint);
+
+    let mut provider = create_stt_standard(provider_name, std_cfg).expect("build provider");
+
+    let finals = Arc::new(AtomicUsize::new(0));
+    let finals_cb = Arc::clone(&finals);
+    let cb: STTResultCallback = Arc::new(move |r: STTResult| {
+        let finals = Arc::clone(&finals_cb);
+        Box::pin(async move {
+            if r.is_final {
+                finals.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    });
+    provider.on_result(cb).await.unwrap();
+    provider.connect().await.expect("initial connect");
+
+    // 1) Send the chunk the mock ACKS with a final → the ring clears.
+    provider.send_audio(tagged(0xA1)).await.expect("send A1");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while finals.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < deadline, "never received the first final ack");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // 2) The at-risk tail: sent after the last final, then the socket dies.
+    provider.send_audio(tagged(0xA2)).await.expect("send A2");
+    provider.send_audio(tagged(0xA3)).await.expect("send A3");
+
+    // 3) Keep nudging with 0xA4 until the reconnected session acks (the
+    //    sends may fail during the gap — that is the point).
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while finals.load(Ordering::SeqCst) < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "no final from the reconnected session — replay/reconnect failed"
+        );
+        let _ = provider.send_audio(tagged(0xA4)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _ = provider.disconnect().await;
+
+    let obs = obs.lock().await;
+    assert!(
+        obs.audio_per_conn.len() >= 2,
+        "expected a reconnect (>=2 connections), saw {}",
+        obs.audio_per_conn.len()
+    );
+    let conn2 = &obs.audio_per_conn[1];
+    assert!(
+        conn2.len() >= 2,
+        "second connection received too little audio: {} frames",
+        conn2.len()
+    );
+    // The REPLAYED tail comes first, oldest first, before any fresh audio.
+    assert_eq!(
+        conn2[0][0], 0xA2,
+        "first frame on the new connection must be the replayed 0xA2 chunk"
+    );
+    assert_eq!(conn2[0].len(), 320, "replayed chunk must be byte-identical");
+    assert_eq!(
+        conn2[1][0], 0xA3,
+        "second frame must be the replayed 0xA3 chunk (order preserved)"
+    );
+    // The finalized chunk must NOT be replayed (cleared by the final ack).
+    assert!(
+        conn2.iter().all(|f| f[0] != 0xA1),
+        "0xA1 was finalized before the drop — replaying it would duplicate words"
+    );
+}
+
+#[tokio::test]
+async fn deepgram_replays_unfinalized_audio_after_kill() {
+    assert_replays_unfinalized_tail("deepgram", ReplayProto::Deepgram).await;
+}
+
+#[tokio::test]
+async fn assemblyai_replays_unfinalized_audio_after_kill() {
+    assert_replays_unfinalized_tail("assemblyai", ReplayProto::AssemblyAi).await;
+}
