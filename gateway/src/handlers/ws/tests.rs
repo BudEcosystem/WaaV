@@ -36,6 +36,7 @@ fn test_ws_config_serialization() {
         speaking_rate: Some(1.0),
         audio_format: Some("pcm".to_string()),
         sample_rate: Some(22050),
+        client_playback_rate: None,
         connection_timeout: Some(30),
         request_timeout: Some(60),
         model: "".to_string(), // Model is in Voice ID for Deepgram
@@ -81,6 +82,7 @@ fn test_incoming_message_serialization() {
             speaking_rate: Some(1.0),
             audio_format: Some("pcm".to_string()),
             sample_rate: Some(22050),
+            client_playback_rate: None,
             connection_timeout: Some(30),
             request_timeout: Some(60),
             model: "".to_string(), // Model is in Voice ID for Deepgram
@@ -394,6 +396,7 @@ fn test_tts_ws_config_conversion_with_all_values() {
         speaking_rate: Some(1.5),
         audio_format: Some("wav".to_string()),
         sample_rate: Some(22050),
+        client_playback_rate: None,
         connection_timeout: Some(60),
         request_timeout: Some(120),
         model: "".to_string(), // Model is in Voice ID for Deepgram
@@ -428,6 +431,7 @@ fn test_tts_ws_config_conversion_with_defaults() {
         speaking_rate: None,
         audio_format: None,
         sample_rate: None,
+        client_playback_rate: None,
         connection_timeout: None,
         request_timeout: None,
         model: "".to_string(), // Model is in Voice ID for Deepgram
@@ -491,6 +495,7 @@ fn test_livekit_ws_config_conversion() {
         speaking_rate: Some(1.0),
         audio_format: Some("pcm".to_string()),
         sample_rate: Some(22050),
+        client_playback_rate: None,
         connection_timeout: Some(30),
         request_timeout: Some(60),
         model: "".to_string(),
@@ -535,6 +540,7 @@ fn test_livekit_config_with_empty_listen_participants() {
         speaking_rate: Some(1.0),
         audio_format: Some("pcm".to_string()),
         sample_rate: Some(22050),
+        client_playback_rate: None,
         connection_timeout: Some(30),
         request_timeout: Some(60),
         model: "".to_string(),
@@ -576,6 +582,7 @@ fn test_livekit_config_with_listen_participants() {
         speaking_rate: Some(1.0),
         audio_format: Some("pcm".to_string()),
         sample_rate: Some(22050),
+        client_playback_rate: None,
         connection_timeout: Some(30),
         request_timeout: Some(60),
         model: "".to_string(),
@@ -707,6 +714,7 @@ fn test_incoming_message_config_with_livekit() {
             speaking_rate: Some(1.0),
             audio_format: Some("pcm".to_string()),
             sample_rate: Some(22050),
+            client_playback_rate: None,
             connection_timeout: Some(30),
             request_timeout: Some(60),
             model: "".to_string(),
@@ -761,6 +769,7 @@ fn test_incoming_message_config_without_livekit() {
             speaking_rate: Some(1.0),
             audio_format: Some("pcm".to_string()),
             sample_rate: Some(22050),
+            client_playback_rate: None,
             connection_timeout: Some(30),
             request_timeout: Some(60),
             model: "".to_string(),
@@ -1028,6 +1037,7 @@ fn test_tts_ws_config_conversion_mixed_values() {
         speaking_rate: None, // Should use default
         audio_format: Some("pcm".to_string()),
         sample_rate: None, // Should use default
+        client_playback_rate: None,
         connection_timeout: Some(45),
         request_timeout: None, // Should use default
         model: "".to_string(), // Model is in Voice ID for Deepgram
@@ -1080,6 +1090,7 @@ fn test_config_message_without_livekit_routing() {
             speaking_rate: Some(1.0),
             audio_format: Some("pcm".to_string()),
             sample_rate: Some(22050),
+            client_playback_rate: None,
             connection_timeout: Some(30),
             request_timeout: Some(60),
             model: "".to_string(),
@@ -1139,6 +1150,7 @@ fn test_config_message_with_livekit_routing() {
             speaking_rate: Some(1.0),
             audio_format: Some("pcm".to_string()),
             sample_rate: Some(22050),
+            client_playback_rate: None,
             connection_timeout: Some(30),
             request_timeout: Some(60),
             model: "".to_string(),
@@ -1407,6 +1419,7 @@ fn test_config_message_audio_default() {
             speaking_rate: Some(1.0),
             audio_format: Some("pcm".to_string()),
             sample_rate: Some(22050),
+            client_playback_rate: None,
             connection_timeout: Some(30),
             request_timeout: Some(60),
             model: "".to_string(),
@@ -1493,4 +1506,101 @@ fn test_unified_message_for_livekit_integration() {
     assert!(json_binary.contains("\"data\":"));
     // Should not contain message field for binary data
     assert!(!json_binary.contains("\"message\":null"));
+}
+
+// --- C-G5 pt3: client playback rate (egress resampling) ---
+
+fn tts_cfg(provider_rate: Option<u32>, client_rate: Option<u32>) -> TTSWebSocketConfig {
+    TTSWebSocketConfig {
+        api_key: None,
+        provider: "deepgram".to_string(),
+        voice_id: None,
+        speaking_rate: None,
+        audio_format: Some("linear16".to_string()),
+        sample_rate: provider_rate,
+        client_playback_rate: client_rate,
+        connection_timeout: None,
+        request_timeout: None,
+        model: "aura-asteria-en".to_string(),
+        pronunciations: Vec::new(),
+        emotion: None,
+        emotion_intensity: None,
+        delivery_style: None,
+        emotion_description: None,
+        features: Default::default(),
+        extras: Default::default(),
+    }
+}
+
+#[test]
+fn client_playback_rate_is_wire_compatible() {
+    // Absent on the wire → None (existing clients unaffected).
+    let json = r#"{"provider":"deepgram","model":"aura-asteria-en"}"#;
+    let cfg: TTSWebSocketConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(cfg.client_playback_rate, None);
+    // Present → honored.
+    let json = r#"{"provider":"deepgram","model":"aura-asteria-en","client_playback_rate":48000}"#;
+    let cfg: TTSWebSocketConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(cfg.client_playback_rate, Some(48000));
+    // Unset never serializes (no schema noise for old readers).
+    let out = serde_json::to_string(&tts_cfg(Some(24000), None)).unwrap();
+    assert!(!out.contains("client_playback_rate"));
+}
+
+#[test]
+fn egress_audio_context_only_when_requested() {
+    use super::config_handler::EgressAudio;
+    assert!(EgressAudio::from_tts_config(None).is_none(), "no TTS config");
+    assert!(
+        EgressAudio::from_tts_config(Some(&tts_cfg(Some(24000), None))).is_none(),
+        "no client rate requested → zero-cost None"
+    );
+    assert!(EgressAudio::from_tts_config(Some(&tts_cfg(Some(24000), Some(48000)))).is_some());
+}
+
+#[test]
+fn egress_audio_converts_pcm_and_passes_compressed_through() {
+    use super::config_handler::EgressAudio;
+    let egress = EgressAudio::from_tts_config(Some(&tts_cfg(Some(24000), Some(48000)))).unwrap();
+
+    // 0.5s of 24k PCM16 → ~2x bytes at 48k (minus the filter tail).
+    let pcm: Vec<u8> = (0..12_000i32)
+        .flat_map(|i| (((i as f32 * 0.05).sin() * 20000.0) as i16).to_le_bytes())
+        .collect();
+    let out = egress.convert(pcm.clone(), "linear16", 24_000);
+    assert!(
+        out.len() > pcm.len() * 3 / 2,
+        "expected ~2x upsampled bytes, got {} from {}",
+        out.len(),
+        pcm.len()
+    );
+
+    // Compressed: untouched.
+    let mp3 = vec![0xFFu8; 1200];
+    assert_eq!(egress.convert(mp3.clone(), "mp3", 24_000), mp3);
+
+    // Chunk without a stamped rate: the configured provider rate (24k) is
+    // the fallback, so conversion still happens.
+    let out = egress.convert(pcm.clone(), "pcm", 0);
+    assert!(out.len() > pcm.len() * 3 / 2, "configured-rate fallback must convert");
+}
+
+#[test]
+fn livekit_track_rate_matches_delivered_bytes() {
+    let lk = LiveKitWebSocketConfig {
+        room_name: "room".to_string(),
+        enable_recording: false,
+        waav_participant_identity: None,
+        waav_participant_name: None,
+        listen_participants: vec![],
+    };
+    // No client rate → provider rate.
+    let cfg = lk.to_livekit_config("t".into(), &tts_cfg(Some(22050), None), "ws://x");
+    assert_eq!(cfg.sample_rate, 22050);
+    // Client rate set → the track must run at the rate of the RESAMPLED bytes.
+    let cfg = lk.to_livekit_config("t".into(), &tts_cfg(Some(24000), Some(48000)), "ws://x");
+    assert_eq!(cfg.sample_rate, 48000);
+    // Nothing configured → 24k default.
+    let cfg = lk.to_livekit_config("t".into(), &tts_cfg(None, None), "ws://x");
+    assert_eq!(cfg.sample_rate, 24000);
 }

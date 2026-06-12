@@ -165,9 +165,13 @@ pub async fn handle_config_message(
         None
     };
 
+    // C-G5: one egress-resampling context for the whole session (None when
+    // the client didn't ask for a playback rate — zero cost).
+    let egress_audio = EgressAudio::from_tts_config(tts_ws_config.as_ref());
+
     // Register early TTS callback for cached audio
     if let Some(ref vm) = voice_manager {
-        register_early_tts_callback(vm, message_tx).await;
+        register_early_tts_callback(vm, message_tx, egress_audio.clone()).await;
     }
 
     // Initialize LiveKit client if configured
@@ -232,6 +236,7 @@ pub async fn handle_config_message(
             livekit_client.as_ref(),
             operation_queue.as_ref(),
             message_tx,
+            egress_audio.clone(),
         )
         .await;
     }
@@ -255,6 +260,7 @@ pub async fn handle_config_message(
             dag_operation_queue.as_ref(),
             message_tx,
             app_state.core_state.profiler.clone(),
+            egress_audio.clone(),
         )
         .await
         {
@@ -935,12 +941,14 @@ async fn wait_for_providers_ready(
 async fn register_early_tts_callback(
     voice_manager: &Arc<VoiceManager>,
     message_tx: &mpsc::Sender<MessageRoute>,
+    egress_audio: Option<Arc<EgressAudio>>,
 ) {
     let message_tx_for_early_tts = message_tx.clone();
 
     if let Err(e) = voice_manager
         .on_tts_audio(move |audio_data: AudioData| {
             let message_tx = message_tx_for_early_tts.clone();
+            let egress_audio = egress_audio.clone();
 
             Box::pin(async move {
                 debug!(
@@ -948,10 +956,18 @@ async fn register_early_tts_callback(
                     audio_data.data.len()
                 );
 
+                // C-G5: client playback rate (passthrough when unset).
+                let data = match &egress_audio {
+                    Some(e) => {
+                        e.convert(audio_data.data, &audio_data.format, audio_data.sample_rate)
+                    }
+                    None => audio_data.data,
+                };
+
                 // Send audio as binary data to WebSocket. DroppableAudio
                 // policy (RC8): a slow client sheds stale frames instead of
                 // stalling the voice path; drops are counted.
-                let audio_bytes = Bytes::from(audio_data.data);
+                let audio_bytes = Bytes::from(data);
                 crate::handlers::ws::messages::send_with_policy(
                     &message_tx,
                     MessageRoute::Binary(audio_bytes),
@@ -963,6 +979,45 @@ async fn register_early_tts_callback(
         .await
     {
         warn!("Failed to register early TTS audio callback: {:?}", e);
+    }
+}
+
+/// C-G5 pt3: per-session egress resampling context — built once when the
+/// client configured `client_playback_rate`; shared by EVERY TTS delivery
+/// path (early callback, final callback, DAG audio drain) so the resampler's
+/// filter state stays continuous across the session's single egress stream.
+pub(crate) struct EgressAudio {
+    target_rate: u32,
+    provider_rate: u32,
+    resampler: parking_lot::Mutex<crate::core::audio::StreamResampler>,
+}
+
+impl EgressAudio {
+    /// `None` unless the session asked for a client playback rate.
+    pub(crate) fn from_tts_config(tts: Option<&TTSWebSocketConfig>) -> Option<Arc<Self>> {
+        let tts = tts?;
+        let target_rate = tts.client_playback_rate?;
+        Some(Arc::new(Self {
+            target_rate,
+            provider_rate: tts.sample_rate.unwrap_or(24000),
+            resampler: parking_lot::Mutex::new(crate::core::audio::StreamResampler::new()),
+        }))
+    }
+
+    /// Convert one chunk to the client rate; passthrough whenever the
+    /// standardized seam says no work applies (non-PCM, identity, unknown
+    /// input rate).
+    pub(crate) fn convert(&self, data: Vec<u8>, format: &str, chunk_rate: u32) -> Vec<u8> {
+        let mut r = self.resampler.lock();
+        crate::core::audio::egress_to_client_rate(
+            &mut r,
+            &data,
+            format,
+            chunk_rate,
+            self.provider_rate,
+            self.target_rate,
+        )
+        .unwrap_or(data)
     }
 }
 
@@ -1061,6 +1116,7 @@ async fn register_final_tts_callback(
     livekit_client: Option<&Arc<RwLock<LiveKitClient>>>,
     operation_queue: Option<&crate::livekit::OperationQueue>,
     message_tx: &mpsc::Sender<MessageRoute>,
+    egress_audio: Option<Arc<EgressAudio>>,
 ) {
     let message_tx_for_tts = message_tx.clone();
     let livekit_client_for_tts = livekit_client.cloned();
@@ -1071,10 +1127,18 @@ async fn register_final_tts_callback(
             let message_tx = message_tx_for_tts.clone();
             let livekit_client = livekit_client_for_tts.clone();
             let operation_queue = operation_queue_for_tts.clone();
+            let egress_audio = egress_audio.clone();
 
             Box::pin(async move {
+                // C-G5: client playback rate (passthrough when unset).
+                let data = match &egress_audio {
+                    Some(e) => {
+                        e.convert(audio_data.data, &audio_data.format, audio_data.sample_rate)
+                    }
+                    None => audio_data.data,
+                };
                 deliver_tts_audio(
-                    audio_data.data,
+                    data,
                     livekit_client.as_ref(),
                     operation_queue.as_ref(),
                     &message_tx,
@@ -1209,6 +1273,7 @@ async fn initialize_livekit_client(
         speaking_rate: None,
         audio_format: None,
         sample_rate: Some(24000), // Default sample rate for LiveKit
+        client_playback_rate: None,
         connection_timeout: None,
         request_timeout: None,
         model: "".to_string(),
@@ -1528,6 +1593,7 @@ async fn initialize_dag_routing(
     operation_queue: Option<&crate::livekit::OperationQueue>,
     message_tx: &mpsc::Sender<MessageRoute>,
     profiler: Arc<crate::core::observability::LatencyProfiler>,
+    egress_audio: Option<Arc<EgressAudio>>,
 ) -> Result<bool, String> {
     // Get DAG definition from template or inline
     let dag_definition: DAGDefinition = if let Some(ref def) = dag_config.definition {
@@ -1597,8 +1663,18 @@ async fn initialize_dag_routing(
             while let Some(output) = output_rx.recv().await {
                 match output {
                     DagOutput::Audio(audio) => {
+                        // C-G5: client playback rate (passthrough when unset)
+                        // — the SAME standardized seam as the simple path.
+                        let data = match &egress_audio {
+                            Some(e) => e.convert(
+                                audio.data.to_vec(),
+                                &audio.format,
+                                audio.sample_rate,
+                            ),
+                            None => audio.data.to_vec(),
+                        };
                         deliver_tts_audio(
-                            audio.data.to_vec(),
+                            data,
                             livekit_client.as_ref(),
                             operation_queue.as_ref(),
                             &message_tx,

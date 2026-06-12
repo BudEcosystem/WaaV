@@ -587,3 +587,103 @@ async fn test_deepgram_gateway_ws_live() {
         "gateway should stream real Deepgram Aura audio to the client, got {audio_bytes} B"
     );
 }
+
+/// C-G5 pt3 live gate: real Deepgram Aura chunks (their real format/rate
+/// stamps) through the STANDARDIZED egress seam — exactly what the session
+/// handler does when a client configures `client_playback_rate`.
+#[tokio::test]
+#[ignore = "Requires DEEPGRAM_API_KEY; real billed Deepgram TTS call"]
+async fn test_egress_client_playback_rate_live() {
+    use waav_gateway::core::audio::{StreamResampler, egress_to_client_rate};
+
+    struct Cap(tokio::sync::mpsc::UnboundedSender<AudioData>);
+    impl AudioCallback for Cap {
+        fn on_audio(
+            &self,
+            a: AudioData,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            let tx = self.0.clone();
+            Box::pin(async move {
+                let _ = tx.send(a);
+            })
+        }
+        fn on_error(
+            &self,
+            e: TTSError,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async move { panic!("live TTS error: {e:?}") })
+        }
+        fn on_complete(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {})
+        }
+    }
+
+    let config = TTSConfig {
+        provider: "deepgram".to_string(),
+        api_key: api_key(),
+        voice_id: Some("aura-asteria-en".to_string()),
+        model: "aura-asteria-en".to_string(),
+        audio_format: Some("linear16".to_string()),
+        sample_rate: Some(SAMPLE_RATE),
+        ..Default::default()
+    };
+    let mut tts = DeepgramTTS::new(config).expect("create DeepgramTTS");
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AudioData>();
+    tts.on_audio(Arc::new(Cap(tx))).unwrap();
+    tts.connect().await.expect("connect DeepgramTTS");
+    tokio::time::timeout(Duration::from_secs(15), tts.speak(SENTENCE, true))
+        .await
+        .expect("speak timed out")
+        .expect("speak failed");
+
+    // Stream every REAL chunk through the egress seam at 2x the provider
+    // rate — the same per-chunk call the session handler makes.
+    let target = SAMPLE_RATE * 2;
+    let mut resampler = StreamResampler::new();
+    let mut in_bytes = 0usize;
+    let mut out_bytes = 0usize;
+    let mut chunks = 0usize;
+    while let Ok(Some(a)) =
+        tokio::time::timeout(Duration::from_secs(10), rx.recv()).await
+    {
+        in_bytes += a.data.len();
+        chunks += 1;
+        let converted = egress_to_client_rate(
+            &mut resampler,
+            &a.data,
+            &a.format,
+            a.sample_rate,
+            SAMPLE_RATE,
+            target,
+        )
+        .expect("PCM at half the client rate must be converted");
+        out_bytes += converted.len();
+        if in_bytes > 48_000 {
+            break;
+        }
+    }
+    tts.disconnect().await.ok();
+
+    println!(
+        "[egress] {chunks} live chunks: {in_bytes} B @{SAMPLE_RATE} -> {out_bytes} B @{target}"
+    );
+    assert!(chunks >= 2, "expected a streamed (multi-chunk) synthesis, got {chunks}");
+    assert!(in_bytes > 8_000, "synthesis too short: {in_bytes} B");
+    // 2x rate => ~2x bytes; the resampler may still hold < one chunk (1024
+    // frames = 4096 output bytes) of tail.
+    let expected = in_bytes * 2;
+    assert!(
+        out_bytes + 8_192 >= expected && out_bytes <= expected + 8_192,
+        "expected ~{expected} B at the client rate, got {out_bytes} B"
+    );
+
+    // Identity contract live: a client at the provider rate costs nothing.
+    let mut id = StreamResampler::new();
+    assert!(
+        egress_to_client_rate(&mut id, &[0u8; 4096], "linear16", SAMPLE_RATE, SAMPLE_RATE, SAMPLE_RATE)
+            .is_none(),
+        "identity must be zero-work"
+    );
+}

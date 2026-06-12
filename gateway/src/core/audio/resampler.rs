@@ -174,6 +174,34 @@ pub fn resample_pcm16(
     Some(bytes)
 }
 
+/// C-G5 pt3: convert one egress TTS chunk to the CLIENT's playback rate.
+///
+/// The single standardized egress seam — every delivery path (simple
+/// STT→TTS callback, DAG `audio_output` drain) calls this with the chunk's
+/// own metadata. Returns `None` ⇒ deliver the ORIGINAL bytes unchanged:
+/// - the chunk is not PCM-family (compressed containers can't be resampled
+///   here; the client asked for a rate we can't honor on this format),
+/// - the input rate is unknown (chunk undeclared AND no configured provider
+///   rate — byte math would corrupt the audio),
+/// - identity (input rate == target).
+pub fn egress_to_client_rate(
+    r: &mut StreamResampler,
+    data: &[u8],
+    format: &str,
+    chunk_rate: u32,
+    configured_provider_rate: u32,
+    target_rate: u32,
+) -> Option<Vec<u8>> {
+    if !crate::core::tts::sniff::is_pcm_family(format) {
+        debug!(format, "egress resample skipped: non-PCM format passes through");
+        return None;
+    }
+    // The chunk's own declared rate wins; the session's configured provider
+    // rate is the fallback for providers that don't stamp chunks.
+    let in_rate = if chunk_rate != 0 { chunk_rate } else { configured_provider_rate };
+    resample_pcm16(r, data, in_rate, target_rate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,4 +286,62 @@ mod tests {
         assert_eq!(out.len() % 2, 0, "whole samples only");
         assert!(!out.is_empty());
     }
+    // --- C-G5 pt3: the standardized egress seam ---
+
+    fn pcm16(samples: &[f32]) -> Vec<u8> {
+        samples
+            .iter()
+            .flat_map(|&s| ((s * 32767.0) as i16).to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn egress_passthrough_for_non_pcm() {
+        let mut r = StreamResampler::new();
+        let bytes = vec![0u8; 4000];
+        assert!(
+            egress_to_client_rate(&mut r, &bytes, "mp3", 24_000, 24_000, 48_000).is_none(),
+            "compressed formats pass through untouched"
+        );
+    }
+
+    #[test]
+    fn egress_identity_and_unknown_rate_pass_through() {
+        let mut r = StreamResampler::new();
+        let bytes = pcm16(&sine(2048, 0.05));
+        // Identity: chunk already at the client rate.
+        assert!(egress_to_client_rate(&mut r, &bytes, "pcm", 24_000, 0, 24_000).is_none());
+        // Unknown input rate everywhere: passthrough, never corrupt.
+        assert!(egress_to_client_rate(&mut r, &bytes, "pcm", 0, 0, 48_000).is_none());
+    }
+
+    #[test]
+    fn egress_resamples_pcm_to_client_rate() {
+        let mut r = StreamResampler::new();
+        // 1s of 24k PCM16 → 48k: ~2x the samples (minus the filter tail).
+        let bytes = pcm16(&sine(24_000, 0.05));
+        let out = egress_to_client_rate(&mut r, &bytes, "linear16", 24_000, 0, 48_000)
+            .expect("rate differs: must resample");
+        let out_samples = out.len() / 2;
+        assert!(
+            (out_samples as f32 - 48_000.0).abs() < 4096.0,
+            "expected ~48000 samples, got {out_samples}"
+        );
+    }
+
+    #[test]
+    fn egress_falls_back_to_configured_provider_rate() {
+        let mut r = StreamResampler::new();
+        // Chunk doesn't stamp its rate (0): the session's configured provider
+        // rate (24k) is the input-rate fallback.
+        let bytes = pcm16(&sine(24_000, 0.05));
+        let out = egress_to_client_rate(&mut r, &bytes, "pcm", 0, 24_000, 16_000)
+            .expect("configured fallback rate must enable the conversion");
+        let out_samples = out.len() / 2;
+        assert!(
+            (out_samples as f32 - 16_000.0).abs() < 3000.0,
+            "expected ~16000 samples, got {out_samples}"
+        );
+    }
 }
+

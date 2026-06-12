@@ -15,5 +15,5 @@ pub mod vad;
 
 pub use ring_buffer::AudioRingBuffer;
 #[cfg(any(feature = "silero-vad", feature = "smart-turn", feature = "noise-filter"))]
-pub use resampler::{StreamResampler, resample_pcm16};
+pub use resampler::{StreamResampler, egress_to_client_rate, resample_pcm16};
 pub use vad::{VADAnalyzer, VADParams, VADState, VADTransition};

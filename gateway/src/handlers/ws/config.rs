@@ -312,8 +312,13 @@ impl LiveKitWebSocketConfig {
             url: livekit_url.to_string(),
             token,
             room_name: self.room_name.clone(),
-            // Use TTS config sample rate, default to 24000 if not specified
-            sample_rate: tts_config.sample_rate.unwrap_or(24000),
+            // The LiveKit track rate must match the BYTES we feed it: the
+            // client playback rate when egress resampling is on (C-G5),
+            // else the provider rate, defaulting to 24000.
+            sample_rate: tts_config
+                .client_playback_rate
+                .or(tts_config.sample_rate)
+                .unwrap_or(24000),
             // Assume mono audio for TTS (1 channel)
             channels: 1,
             // Enable noise filter by default when compiled with the optional feature
@@ -344,6 +349,14 @@ pub struct TTSWebSocketConfig {
     /// Sample rate preference
     #[cfg_attr(feature = "openapi", schema(example = 24000))]
     pub sample_rate: Option<u32>,
+    /// Client playback rate (C-G5): when set, the gateway resamples PCM TTS
+    /// egress from the provider's rate to THIS rate before delivery (WS
+    /// binary and LiveKit), so clients with a fixed-rate audio sink never
+    /// resample provider-side or client-side. Identity (provider already at
+    /// this rate) is zero-cost; non-PCM formats pass through unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(example = 48000))]
+    pub client_playback_rate: Option<u32>,
     /// Connection timeout in seconds
     #[cfg_attr(feature = "openapi", schema(example = 30))]
     pub connection_timeout: Option<u64>,
