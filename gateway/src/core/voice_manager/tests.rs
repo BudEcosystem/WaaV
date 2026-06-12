@@ -564,6 +564,7 @@ async fn test_hard_timeout_fallback_without_turn_detector() {
         turn_detection_inference_timeout_ms: 50,
         speech_final_hard_timeout_ms: 200, // 200ms hard timeout for faster testing
         duplicate_window_ms: 100,
+        stt_ttfs_p99_ms: None,
     };
 
     let processor = crate::core::voice_manager::stt_result::STTResultProcessor::new(config);
@@ -649,6 +650,7 @@ async fn test_hard_timeout_with_turn_detector_failure() {
         turn_detection_inference_timeout_ms: 50,
         speech_final_hard_timeout_ms: 200,
         duplicate_window_ms: 100,
+        stt_ttfs_p99_ms: None,
     };
 
     let processor = crate::core::voice_manager::stt_result::STTResultProcessor::new(config);
@@ -728,6 +730,7 @@ async fn test_cancellation_cleanup_on_real_speech_final() {
         turn_detection_inference_timeout_ms: 100,
         speech_final_hard_timeout_ms: 5000, // Long timeout
         duplicate_window_ms: 500,
+        stt_ttfs_p99_ms: None,
     };
 
     let processor = crate::core::voice_manager::stt_result::STTResultProcessor::new(config);
@@ -815,6 +818,7 @@ async fn test_continuous_speech_hard_timeout_not_restarted() {
         turn_detection_inference_timeout_ms: 50,
         speech_final_hard_timeout_ms: 200, // Hard timeout fires first
         duplicate_window_ms: 100,
+        stt_ttfs_p99_ms: None,
     };
 
     let processor = crate::core::voice_manager::stt_result::STTResultProcessor::new(config);
@@ -910,6 +914,7 @@ async fn test_hard_timeout_observability() {
         turn_detection_inference_timeout_ms: 50,
         speech_final_hard_timeout_ms: 200,
         duplicate_window_ms: 100,
+        stt_ttfs_p99_ms: None,
     };
 
     let processor = crate::core::voice_manager::stt_result::STTResultProcessor::new(config);

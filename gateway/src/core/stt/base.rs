@@ -579,6 +579,16 @@ pub trait BaseSTT: Send + Sync {
     /// Get provider-specific information
     fn get_provider_info(&self) -> &'static str;
 
+    /// The provider's measured speech-end → final-transcript p99 latency
+    /// (ms), when benchmarked (D-G8). Feeds the TTFS-aware end-of-turn wait
+    /// (A-G2): SLOW providers get a longer detection wait so their real
+    /// final isn't beaten by a forced fire. Default `None` = unknown — the
+    /// configured wait applies unchanged. Turn-based providers (server owns
+    /// the turn boundary) should also return `None`.
+    fn ttfs_p99_ms(&self) -> Option<u64> {
+        None
+    }
+
     /// Inject the shared, process-global resilience handles (W-D2): the single reconnect
     /// governor (storm control across all sessions) and this provider's shared circuit breaker
     /// (a trip in one session is visible to every other session of the provider).

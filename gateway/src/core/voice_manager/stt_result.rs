@@ -42,6 +42,13 @@ pub struct STTProcessingConfig {
     pub speech_final_hard_timeout_ms: u64,
     /// Window to prevent duplicate speech_final events (ms)
     pub duplicate_window_ms: usize,
+    /// The active STT provider's measured speech-end→final p99 (ms), when
+    /// known (D-G8 / A-G2). Extends the detection wait for SLOW providers so
+    /// their real final isn't beaten by a forced fire (which the duplicate
+    /// window then has to clean up); fast providers keep the configured
+    /// user-resume floor — the floor is a UX window, never shortened by STT
+    /// speed. `None` = unknown → configured wait only.
+    pub stt_ttfs_p99_ms: Option<u64>,
 }
 
 impl Default for STTProcessingConfig {
@@ -51,6 +58,7 @@ impl Default for STTProcessingConfig {
             turn_detection_inference_timeout_ms: 100, // 100ms max for model inference
             speech_final_hard_timeout_ms: 2500, // 2.5s hard upper bound (reduced from 5s for faster response)
             duplicate_window_ms: 500,       // 500ms duplicate prevention window
+            stt_ttfs_p99_ms: None,
         }
     }
 }
@@ -68,7 +76,30 @@ impl STTProcessingConfig {
             turn_detection_inference_timeout_ms,
             speech_final_hard_timeout_ms,
             duplicate_window_ms,
+            stt_ttfs_p99_ms: None,
         }
+    }
+
+    /// Attach the provider's measured speech-end→final p99 (D-G8 / A-G2).
+    pub fn with_stt_ttfs_p99_ms(mut self, ttfs: Option<u64>) -> Self {
+        self.stt_ttfs_p99_ms = ttfs;
+        self
+    }
+
+    /// The effective detection wait (A-G2): the configured user-resume floor,
+    /// EXTENDED to the provider's TTFS p99 when that is slower — so a slow
+    /// provider's real final isn't beaten by a forced fire. `finalized` =
+    /// the provider acked a finalize handshake (nothing more coming): the
+    /// TTFS extension collapses back to the floor. Clamped so the wait can
+    /// never crowd out the hard-timeout backstop.
+    pub fn effective_wait_ms(&self, finalized: bool) -> u64 {
+        let floor = self.stt_speech_final_wait_ms;
+        let wait = match (self.stt_ttfs_p99_ms, finalized) {
+            (Some(ttfs), false) => floor.max(ttfs),
+            _ => floor,
+        };
+        // Leave the hard timeout room to act as the absolute backstop.
+        wait.min((self.speech_final_hard_timeout_ms * 2) / 3)
     }
 }
 
@@ -327,7 +358,11 @@ impl STTResultProcessor {
         turn_detector: Option<Arc<RwLock<TurnDetector>>>,
         segment_generation: usize,
     ) -> JoinHandle<()> {
-        let stt_wait_ms = self.config.stt_speech_final_wait_ms;
+        // A-G2: floor extended to the provider's TTFS p99 (slow providers'
+        // real finals must not be beaten by a forced fire); a FINALIZED
+        // result (provider acked: nothing more coming) collapses back to the
+        // user-resume floor.
+        let stt_wait_ms = self.config.effective_wait_ms(result.is_finalized);
         let inference_timeout_ms = self.config.turn_detection_inference_timeout_ms;
 
         tokio::spawn(async move {
@@ -592,6 +627,76 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
+    // --- A-G2: TTFS-aware effective wait ---
+
+    #[test]
+    fn effective_wait_unchanged_without_ttfs() {
+        let c = STTProcessingConfig::new(600, 100, 2500, 500);
+        assert_eq!(c.effective_wait_ms(false), 600);
+        assert_eq!(c.effective_wait_ms(true), 600);
+    }
+
+    #[test]
+    fn slow_provider_extends_wait_fast_keeps_floor() {
+        // Slow provider (ttfs 900 > floor 600): wait extends so the real
+        // final isn't beaten by a forced fire.
+        let slow = STTProcessingConfig::new(600, 100, 2500, 500).with_stt_ttfs_p99_ms(Some(900));
+        assert_eq!(slow.effective_wait_ms(false), 900);
+        // Fast provider (ttfs 350 < floor): the floor is a USER-resume
+        // window — never shortened by STT speed.
+        let fast = STTProcessingConfig::new(600, 100, 2500, 500).with_stt_ttfs_p99_ms(Some(350));
+        assert_eq!(fast.effective_wait_ms(false), 600);
+    }
+
+    #[test]
+    fn finalized_collapses_extension_to_floor() {
+        // The provider acked finalize (nothing more coming): no reason to
+        // wait out the slow-provider extension; the floor remains.
+        let c = STTProcessingConfig::new(600, 100, 2500, 500).with_stt_ttfs_p99_ms(Some(1200));
+        assert_eq!(c.effective_wait_ms(false), 1200);
+        assert_eq!(c.effective_wait_ms(true), 600);
+    }
+
+    #[test]
+    fn wait_never_crowds_out_hard_timeout() {
+        // ttfs larger than the hard timeout: clamped to 2/3 of it so the
+        // backstop still acts.
+        let c = STTProcessingConfig::new(600, 100, 1500, 500).with_stt_ttfs_p99_ms(Some(5000));
+        assert_eq!(c.effective_wait_ms(false), 1000);
+    }
+
+    /// Behavioral: a finalized final shortens the live detection wait — the
+    /// forced fire happens at the floor, not the TTFS-extended wait.
+    #[tokio::test]
+    async fn finalized_shortens_live_detection_wait() {
+        let config = STTProcessingConfig::new(40, 30, 5000, 100)
+            .with_stt_ttfs_p99_ms(Some(10_000)); // extension would exceed the test budget
+        let processor = STTResultProcessor::new(config);
+        let fires = Arc::new(AtomicUsize::new(0));
+        let fires_cb = fires.clone();
+        let callback: STTCallback = Arc::new(move |result: STTResult| {
+            let fires = fires_cb.clone();
+            Box::pin(async move {
+                if result.is_speech_final {
+                    fires.fetch_add(1, Ordering::SeqCst);
+                }
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>
+        });
+        let state = fresh_state(callback);
+
+        // FINALIZED final: the wait collapses to the 40ms floor (without the
+        // finalized flag it would be clamped to 2/3 × 5000 ≈ 3333ms — far
+        // beyond this test's window).
+        let finalized = STTResult::new("done now".into(), true, false, 0.9).finalized();
+        let _ = processor.process_result(finalized, state.clone(), None).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            1,
+            "finalized result must collapse the TTFS extension to the floor"
+        );
+    }
+
     fn fresh_state(callback: STTCallback) -> Arc<SyncRwLock<SpeechFinalState>> {
         Arc::new(SyncRwLock::new(SpeechFinalState {
             text_buffer: String::new(),
@@ -618,6 +723,7 @@ mod tests {
             turn_detection_inference_timeout_ms: 30,
             speech_final_hard_timeout_ms: 120,
             duplicate_window_ms: 100,
+            stt_ttfs_p99_ms: None,
         };
         let processor = STTResultProcessor::new(config);
 
@@ -670,6 +776,7 @@ mod tests {
             turn_detection_inference_timeout_ms: 100,
             speech_final_hard_timeout_ms: 5000,
             duplicate_window_ms: 100,
+            stt_ttfs_p99_ms: None,
         };
         let processor = STTResultProcessor::new(config);
         let noop: STTCallback = Arc::new(|_| Box::pin(async {}));
@@ -705,6 +812,7 @@ mod tests {
             turn_detection_inference_timeout_ms: 30,
             speech_final_hard_timeout_ms: 120,
             duplicate_window_ms: 5_000,
+            stt_ttfs_p99_ms: None,
         };
         let processor = STTResultProcessor::new(config);
         let fires = Arc::new(AtomicUsize::new(0));
@@ -762,6 +870,7 @@ mod tests {
             turn_detection_inference_timeout_ms: 50,
             speech_final_hard_timeout_ms: 200, // 200ms hard timeout
             duplicate_window_ms: 100,
+            stt_ttfs_p99_ms: None,
         };
 
         let processor = STTResultProcessor::new(config);
@@ -827,6 +936,7 @@ mod tests {
             turn_detection_inference_timeout_ms: 50,
             speech_final_hard_timeout_ms: 500, // Long timeout
             duplicate_window_ms: 100,
+            stt_ttfs_p99_ms: None,
         };
 
         let processor = STTResultProcessor::new(config);
@@ -892,6 +1002,7 @@ mod tests {
             turn_detection_inference_timeout_ms: 50,
             speech_final_hard_timeout_ms: 200, // Hard timeout fires first
             duplicate_window_ms: 100,
+            stt_ttfs_p99_ms: None,
         };
 
         let processor = STTResultProcessor::new(config);
@@ -1097,6 +1208,7 @@ mod tests {
             turn_detection_inference_timeout_ms: 50,
             speech_final_hard_timeout_ms: 150,
             duplicate_window_ms: 100,
+            stt_ttfs_p99_ms: None,
         });
         let handle = processor.create_hard_timeout_task(state.clone(), 7);
 

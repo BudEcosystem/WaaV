@@ -761,7 +761,10 @@ impl VoiceManager {
         let turn_detector_clone = self.turn_detector.clone();
         let observers_clone = self.observers.clone();
 
-        // Create STT processor with configured timeouts from VoiceManagerConfig
+        // Create STT processor with configured timeouts from VoiceManagerConfig,
+        // plus the provider's measured TTFS p99 (A-G2/D-G8: a slow provider's
+        // real final must not be beaten by the forced fire).
+        let provider_ttfs = { self.stt.read().await.ttfs_p99_ms() };
         let processing_config = STTProcessingConfig::new(
             self.config.speech_final_config.stt_speech_final_wait_ms,
             self.config
@@ -769,7 +772,8 @@ impl VoiceManager {
                 .turn_detection_inference_timeout_ms,
             self.config.speech_final_config.speech_final_hard_timeout_ms,
             self.config.speech_final_config.duplicate_window_ms,
-        );
+        )
+        .with_stt_ttfs_p99_ms(provider_ttfs);
         let stt_processor = STTResultProcessor::new(processing_config);
 
         let wrapper_callback: STTResultCallback = Arc::new(move |result| {

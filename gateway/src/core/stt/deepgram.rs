@@ -1311,6 +1311,12 @@ impl BaseSTT for DeepgramSTT {
         "Deepgram STT WebSocket"
     }
 
+    /// Measured speech-end→final p99 (Pipecat's benchmarked table: Deepgram
+    /// ≈0.35s; consistent with WaaV's live LATENCY_ANALYSIS stt stage).
+    fn ttfs_p99_ms(&self) -> Option<u64> {
+        Some(350)
+    }
+
     fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
         // Store the shared process-global handles; the next `start_connection` will use them so
         // every Deepgram session trips the same breaker and shares the one reconnect cap (W-D2).
