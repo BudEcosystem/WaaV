@@ -83,6 +83,10 @@ pub struct ConversationConfig {
     /// speak; user kept talking → cancel with zero history pollution. Opt-in:
     /// raises LLM call volume on resumed turns. Default false.
     pub eager_eot: bool,
+    /// Vendor wire format for the LLM (B-G1): `None` = OpenAI-compatible
+    /// (with canonical-host inference); `Some(Anthropic|Gemini)` speaks the
+    /// native Messages / generateContent APIs.
+    pub provider_kind: Option<crate::core::llm::AdapterKind>,
 }
 
 impl Default for ConversationConfig {
@@ -98,6 +102,7 @@ impl Default for ConversationConfig {
             max_history: 20,
             allow_interruption: true,
             eager_eot: false,
+            provider_kind: None,
         }
     }
 }
@@ -122,6 +127,7 @@ impl ConversationConfig {
             max_tokens: self.max_tokens.or(Some(VOICE_DEFAULT_MAX_TOKENS)),
             streaming: self.streaming,
             max_history: self.max_history,
+            provider_kind: self.provider_kind,
             ..Default::default()
         }
     }

@@ -432,7 +432,7 @@ impl TurnSink for LatencyProfiler {
         }
         if self.stream_subscribers.load(Ordering::Relaxed) > 0 {
             let n = self.seq.fetch_add(1, Ordering::Relaxed);
-            if self.sample_n <= 1 || n % self.sample_n == 0 {
+            if self.sample_n <= 1 || n.is_multiple_of(self.sample_n) {
                 let _ = self.broadcast.send(arc);
             }
         }

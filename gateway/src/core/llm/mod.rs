@@ -26,6 +26,10 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 
+pub mod adapter;
+
+pub use adapter::{AdapterKind, LlmAdapter, LlmStreamEvent};
+
 /// Whitelisted environment variables that can be accessed via `${VAR}` syntax.
 ///
 /// Prevents exposure of sensitive system environment variables; only AI provider
@@ -452,6 +456,13 @@ pub struct LlmClientConfig {
     /// Extra provider-specific parameters.
     #[serde(default)]
     pub extra: HashMap<String, serde_json::Value>,
+    /// Which vendor wire format to speak (B-G1). `None` infers ONLY the two
+    /// canonical hosts (`api.anthropic.com`, `generativelanguage.googleapis.com`)
+    /// and otherwise defaults to OpenAI — an OpenAI-compatible proxy in front
+    /// of Claude/Gemini speaks the OpenAI format, so the URL is never trusted
+    /// beyond the canonical hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_kind: Option<AdapterKind>,
 }
 
 impl Default for LlmClientConfig {
@@ -476,6 +487,7 @@ impl Default for LlmClientConfig {
             assistant_id: None,
             thread_id: None,
             extra: HashMap::new(),
+            provider_kind: None,
         }
     }
 }
@@ -551,6 +563,10 @@ pub type TokenCallback = Arc<dyn Fn(&str) + Send + Sync>;
 pub struct LlmClient {
     config: LlmClientConfig,
     client: reqwest::Client,
+    /// The vendor wire-format adapter (B-G1). Stateless `'static` unit —
+    /// selected once at construction from `config.provider_kind` (or the
+    /// canonical-host inference).
+    adapter: &'static dyn LlmAdapter,
     /// Per-session conversation history, keyed by session/stream id. Isolated so
     /// one user's context never leaks into another's.
     histories: Arc<RwLock<HashMap<String, ConversationHistory>>>,
@@ -577,11 +593,33 @@ impl LlmClient {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
+        let adapter = adapter::select_adapter(&config);
         Self {
             config,
             client,
+            adapter,
             histories: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Clone this client speaking a DIFFERENT vendor wire format while
+    /// SHARING the per-session histories (the canonical context is
+    /// vendor-neutral, so a mid-session vendor switch re-renders the same
+    /// conversation without poisoning it — B-G1).
+    pub fn with_adapter(&self, kind: AdapterKind) -> Self {
+        let mut config = self.config.clone();
+        config.provider_kind = Some(kind);
+        Self {
+            adapter: adapter::adapter_for(kind),
+            config,
+            client: self.client.clone(),
+            histories: Arc::clone(&self.histories),
+        }
+    }
+
+    /// The active vendor adapter kind.
+    pub fn adapter_kind(&self) -> AdapterKind {
+        self.adapter.kind()
     }
 
     /// Access the configuration.
@@ -597,7 +635,9 @@ impl LlmClient {
 
     /// Resolve the API key.
     ///
-    /// Priority: per-call key > config key (literal or `${ENV_VAR}`) > `OPENAI_API_KEY`.
+    /// Priority: per-call key > config key (literal or `${ENV_VAR}`) > the
+    /// active vendor's default env var (`OPENAI_API_KEY` /
+    /// `ANTHROPIC_API_KEY` / `GOOGLE_AI_API_KEY`).
     pub fn resolve_api_key(&self, per_call: Option<&str>) -> Option<String> {
         if let Some(key) = per_call {
             return Some(key.to_string());
@@ -618,28 +658,32 @@ impl LlmClient {
             return Some(key.clone());
         }
 
-        std::env::var("OPENAI_API_KEY").ok()
+        std::env::var(self.adapter.default_env_key()).ok()
     }
 
-    fn build_request(&self, messages: Vec<ChatMessage>, stream: bool) -> ChatCompletionRequest {
-        let mut request = ChatCompletionRequest {
-            model: self.config.model.clone(),
-            messages,
-            temperature: self.config.temperature,
-            top_p: self.config.top_p,
-            max_tokens: self.config.max_tokens,
-            stream: Some(stream),
-            tools: self.config.tools.clone(),
-            tool_choice: self.config.tool_choice.clone(),
-            response_format: self.config.response_format.clone(),
-            stop: self.config.stop.clone(),
-            extra: self.config.extra.clone(),
-            ..Default::default()
-        };
-        if self.config.max_tokens.is_none() {
-            request.max_completion_tokens = Some(4096);
+    /// Render a vendor request via the adapter and apply the operator's extra
+    /// config headers (vendor auth/version headers come from the adapter).
+    fn build_http_request(
+        &self,
+        messages: &[ChatMessage],
+        stream: bool,
+        api_key: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        let rendered = self.adapter.render_request(messages, &self.config, stream, api_key);
+        let mut req = self
+            .client
+            .post(&rendered.url)
+            .header("Content-Type", "application/json");
+        if stream {
+            req = req.header("Accept", "text/event-stream");
         }
-        request
+        for (k, v) in &rendered.headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        for (k, v) in &self.config.headers {
+            req = req.header(k, v);
+        }
+        req.json(&rendered.body)
     }
 
     /// Build the message list to send. `staged = false` (classic): the user
@@ -699,19 +743,6 @@ impl LlmClient {
         }
         history.add(ChatMessage::user(input));
         history.add(ChatMessage::assistant(assistant_content));
-    }
-
-    fn apply_headers(&self, mut req: reqwest::RequestBuilder, api_key: Option<&str>) -> reqwest::RequestBuilder {
-        if let Some(key) = api_key {
-            req = req.header("Authorization", format!("Bearer {}", key));
-        }
-        if let Some(org) = &self.config.organization {
-            req = req.header("OpenAI-Organization", org);
-        }
-        for (key, value) in &self.config.headers {
-            req = req.header(key, value);
-        }
-        req
     }
 
     /// Run a single completion turn.
@@ -774,15 +805,7 @@ impl LlmClient {
         staged: bool,
     ) -> LlmResult<LlmResponse> {
         let messages = self.prepare_messages(session_id, input, staged).await;
-        let request = self.build_request(messages, false);
-
-        let http_request = self.apply_headers(
-            self.client
-                .post(self.chat_completions_url())
-                .header("Content-Type", "application/json")
-                .json(&request),
-            api_key,
-        );
+        let http_request = self.build_http_request(&messages, false, api_key);
 
         let response = tokio::select! {
             biased;
@@ -796,29 +819,26 @@ impl LlmClient {
             return Err(self.endpoint_err(format!("HTTP {} - {}", status, error_text)));
         }
 
-        let completion: ChatCompletionResponse = response
+        let body: serde_json::Value = response
             .json()
             .await
             .map_err(|e| self.endpoint_err(format!("Failed to parse response: {}", e)))?;
-
-        let assistant_message = completion
-            .choices
-            .first()
-            .map(|c| c.message.clone())
-            .ok_or_else(|| self.endpoint_err("No choices in response".to_string()))?;
+        let parsed = self
+            .adapter
+            .parse_response(body)
+            .map_err(|e| self.endpoint_err(e))?;
 
         if !staged {
-            self.record_assistant(session_id, assistant_message.clone())
-                .await;
+            self.record_assistant(session_id, parsed.message.clone()).await;
         }
 
         Ok(LlmResponse {
-            id: completion.id,
-            model: completion.model,
-            content: assistant_message.content.clone().unwrap_or_default(),
-            finish_reason: completion.choices.first().and_then(|c| c.finish_reason.clone()),
-            tool_calls: assistant_message.tool_calls.clone().unwrap_or_default(),
-            usage: completion.usage,
+            id: parsed.id,
+            model: parsed.model,
+            content: parsed.message.content.clone().unwrap_or_default(),
+            finish_reason: parsed.finish_reason,
+            tool_calls: parsed.message.tool_calls.clone().unwrap_or_default(),
+            usage: parsed.usage,
         })
     }
 
@@ -833,16 +853,7 @@ impl LlmClient {
         staged: bool,
     ) -> LlmResult<LlmResponse> {
         let messages = self.prepare_messages(session_id, input, staged).await;
-        let request = self.build_request(messages, true);
-
-        let http_request = self.apply_headers(
-            self.client
-                .post(self.chat_completions_url())
-                .header("Content-Type", "application/json")
-                .header("Accept", "text/event-stream")
-                .json(&request),
-            api_key,
-        );
+        let http_request = self.build_http_request(&messages, true, api_key);
 
         let response = tokio::select! {
             biased;
@@ -861,7 +872,11 @@ impl LlmClient {
         let mut completion_id = String::new();
         let mut model_name = String::new();
         let mut finish_reason: Option<String> = None;
-        let mut tool_call_builders: HashMap<u32, (String, String, String, String)> = HashMap::new();
+        let mut usage: Option<Usage> = None;
+        // index → (id, name, accumulated args)
+        let mut tool_call_builders: HashMap<u32, (String, String, String)> = HashMap::new();
+        let mut parse_state = adapter::StreamParseState::default();
+        let mut stream_done = false;
 
         let mut byte_buffer: Vec<u8> = Vec::new();
         let mut buffer = String::new();
@@ -904,7 +919,6 @@ impl LlmClient {
                 }
             }
 
-            let mut stream_done = false;
             while let Some(newline_pos) = buffer.find('\n') {
                 let line = buffer[..newline_pos].trim().to_string();
                 buffer = buffer[newline_pos + 1..].to_string();
@@ -912,81 +926,80 @@ impl LlmClient {
                 if line.is_empty() {
                     continue;
                 }
-                if line == "data: [DONE]" {
-                    // The protocol end marker: stop reading the body NOW.
-                    // Waiting for the server/proxy to close the connection
-                    // (keep-alive linger) would hold the final sentence —
-                    // often the whole reply — out of TTS for the duration
-                    // (brutal-review finding, wf_0cc69d62).
-                    stream_done = true;
-                    break;
-                }
 
-                if let Some(data) = line.strip_prefix("data: ") {
-                    match serde_json::from_str::<ChatCompletionChunk>(data) {
-                        Ok(chunk) => {
-                            if completion_id.is_empty() {
-                                completion_id = chunk.id.clone();
+                // Vendor-specific framing is normalized by the adapter; this
+                // loop only accumulates the normalized events.
+                for event in self.adapter.parse_stream_line(&line, &mut parse_state) {
+                    match event {
+                        LlmStreamEvent::Meta { id, model } => {
+                            if completion_id.is_empty()
+                                && let Some(id) = id
+                            {
+                                completion_id = id;
                             }
-                            if model_name.is_empty() {
-                                model_name = chunk.model.clone();
-                            }
-
-                            for choice in &chunk.choices {
-                                if let Some(content) = &choice.delta.content {
-                                    full_content.push_str(content);
-                                    if let Some(cb) = &on_token {
-                                        cb(content);
-                                    }
-                                    if full_content.len() > MAX_LLM_STREAM_CONTENT_BYTES {
-                                        warn!(
-                                            limit = %MAX_LLM_STREAM_CONTENT_BYTES,
-                                            "LLM stream exceeded max content size, terminating"
-                                        );
-                                        return Err(self.endpoint_err(format!(
-                                            "Streaming response exceeded {} bytes",
-                                            MAX_LLM_STREAM_CONTENT_BYTES
-                                        )));
-                                    }
-                                }
-                                if choice.finish_reason.is_some() {
-                                    finish_reason = choice.finish_reason.clone();
-                                }
-
-                                if let Some(tc_deltas) = &choice.delta.tool_calls {
-                                    for tc_delta in tc_deltas {
-                                        let entry = tool_call_builders
-                                            .entry(tc_delta.index)
-                                            .or_insert_with(|| {
-                                                (
-                                                    String::new(),
-                                                    String::new(),
-                                                    String::new(),
-                                                    String::new(),
-                                                )
-                                            });
-                                        if let Some(id) = &tc_delta.id {
-                                            entry.0 = id.clone();
-                                        }
-                                        if let Some(t) = &tc_delta.call_type {
-                                            entry.1 = t.clone();
-                                        }
-                                        if let Some(f) = &tc_delta.function {
-                                            if let Some(name) = &f.name {
-                                                entry.2 = name.clone();
-                                            }
-                                            if let Some(args) = &f.arguments {
-                                                entry.3.push_str(args);
-                                            }
-                                        }
-                                    }
-                                }
+                            if model_name.is_empty()
+                                && let Some(model) = model
+                            {
+                                model_name = model;
                             }
                         }
-                        Err(e) => {
-                            warn!(error = %e, data = %data, "Failed to parse streaming chunk");
+                        LlmStreamEvent::TextDelta(content) => {
+                            full_content.push_str(&content);
+                            if let Some(cb) = &on_token {
+                                cb(&content);
+                            }
+                            if full_content.len() > MAX_LLM_STREAM_CONTENT_BYTES {
+                                warn!(
+                                    limit = %MAX_LLM_STREAM_CONTENT_BYTES,
+                                    "LLM stream exceeded max content size, terminating"
+                                );
+                                return Err(self.endpoint_err(format!(
+                                    "Streaming response exceeded {} bytes",
+                                    MAX_LLM_STREAM_CONTENT_BYTES
+                                )));
+                            }
+                        }
+                        LlmStreamEvent::ToolCallDelta { index, id, name, args_delta } => {
+                            let entry = tool_call_builders
+                                .entry(index)
+                                .or_insert_with(|| (String::new(), String::new(), String::new()));
+                            if let Some(id) = id {
+                                entry.0 = id;
+                            }
+                            if let Some(name) = name {
+                                entry.1 = name;
+                            }
+                            if let Some(args) = args_delta {
+                                entry.2.push_str(&args);
+                            }
+                        }
+                        LlmStreamEvent::Finish(reason) => {
+                            finish_reason = reason;
+                        }
+                        LlmStreamEvent::Usage(u) => {
+                            usage = Some(u);
+                        }
+                        LlmStreamEvent::StreamEnd => {
+                            // Explicit end marker (`data: [DONE]`,
+                            // `message_stop`): stop reading the body NOW.
+                            // Waiting for the server/proxy to close the
+                            // connection (keep-alive linger) would hold the
+                            // final sentence — often the whole reply — out of
+                            // TTS for the duration (brutal-review finding,
+                            // wf_0cc69d62).
+                            stream_done = true;
+                        }
+                        LlmStreamEvent::Error(detail) => {
+                            // A vendor-signalled mid-stream failure: surface
+                            // it instead of returning the truncated text as
+                            // success.
+                            return Err(self
+                                .endpoint_err(format!("mid-stream provider error: {detail}")));
                         }
                     }
+                }
+                if stream_done {
+                    break;
                 }
             }
             if stream_done {
@@ -995,15 +1008,11 @@ impl LlmClient {
         }
 
         let mut tool_calls: Vec<ToolCall> = Vec::new();
-        for (_, (id, call_type, name, arguments)) in tool_call_builders {
+        for (_, (id, name, arguments)) in tool_call_builders {
             if !id.is_empty() {
                 tool_calls.push(ToolCall {
                     id,
-                    call_type: if call_type.is_empty() {
-                        "function".to_string()
-                    } else {
-                        call_type
-                    },
+                    call_type: "function".to_string(),
                     function: FunctionCall { name, arguments },
                 });
             }
@@ -1035,7 +1044,10 @@ impl LlmClient {
             content: full_content,
             finish_reason,
             tool_calls,
-            usage: None,
+            // Vendors that report usage while streaming (Anthropic
+            // message_delta, Gemini usageMetadata, OpenAI w/ include_usage)
+            // now surface it instead of dropping it.
+            usage,
         })
     }
 
@@ -1111,6 +1123,40 @@ pub fn find_utf8_boundary(bytes: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B-G1: a mid-session vendor switch shares the SAME histories (the
+    /// canonical context is vendor-neutral) while swapping the wire format.
+    #[tokio::test]
+    async fn with_adapter_shares_histories_and_swaps_wire_format() {
+        let client = LlmClient::new(LlmClientConfig::default());
+        assert_eq!(client.adapter_kind(), AdapterKind::OpenAi);
+
+        // Seed history through the OpenAI-shaped client.
+        client
+            .commit_turn("s1", "hello", "hi there")
+            .await;
+
+        let claude = client.with_adapter(AdapterKind::Anthropic);
+        assert_eq!(claude.adapter_kind(), AdapterKind::Anthropic);
+
+        // Same underlying history map: the switched client sees the turn.
+        let histories = claude.histories.read().await;
+        let h = histories.get("s1").expect("shared history must survive the switch");
+        assert_eq!(h.messages().len(), 2);
+        drop(histories);
+
+        // And the original client sees writes made through the new one.
+        claude.commit_turn("s1", "more", "ok").await;
+        let histories = client.histories.read().await;
+        assert_eq!(histories.get("s1").unwrap().messages().len(), 4);
+    }
+
+    #[test]
+    fn provider_kind_selects_adapter() {
+        let mut cfg = LlmClientConfig::default();
+        cfg.provider_kind = Some(AdapterKind::Gemini);
+        assert_eq!(LlmClient::new(cfg).adapter_kind(), AdapterKind::Gemini);
+    }
 
     #[test]
     fn test_chat_message_constructors() {

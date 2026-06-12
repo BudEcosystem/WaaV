@@ -92,6 +92,12 @@ pub struct ConversationWebSocketConfig {
     /// Opt-in — raises LLM call volume on resumed turns (default false).
     #[serde(default)]
     pub eager_eot: bool,
+
+    /// LLM vendor wire format (B-G1): `"openai"` (default) | `"anthropic"` |
+    /// `"gemini"`. Omitted = OpenAI-compatible, with canonical-host inference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, example = "anthropic"))]
+    pub provider_kind: Option<crate::core::llm::AdapterKind>,
 }
 
 fn default_conversation_streaming() -> bool {
@@ -120,6 +126,7 @@ impl ConversationWebSocketConfig {
             max_history: self.max_history,
             allow_interruption: self.allow_interruption,
             eager_eot: self.eager_eot,
+            provider_kind: self.provider_kind,
         }
     }
 }

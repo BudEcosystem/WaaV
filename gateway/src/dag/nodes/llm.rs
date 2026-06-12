@@ -112,6 +112,10 @@ pub struct LlmEndpointConfig {
     /// Extra provider-specific parameters.
     #[serde(default)]
     pub extra: HashMap<String, serde_json::Value>,
+    /// Vendor wire format (B-G1): `openai` (default) | `anthropic` | `gemini`.
+    /// `None` infers only the canonical vendor hosts from `base_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_kind: Option<crate::core::llm::AdapterKind>,
 }
 
 impl Default for LlmEndpointConfig {
@@ -136,6 +140,7 @@ impl Default for LlmEndpointConfig {
             assistant_id: None,
             thread_id: None,
             extra: HashMap::new(),
+            provider_kind: None,
         }
     }
 }
@@ -162,6 +167,7 @@ impl From<LlmEndpointConfig> for LlmClientConfig {
             assistant_id: c.assistant_id,
             thread_id: c.thread_id,
             extra: c.extra,
+            provider_kind: c.provider_kind,
         }
     }
 }
