@@ -92,8 +92,33 @@ impl AudioReplayBuffer {
         // whole beats slicing PCM mid-sample.
     }
 
-    /// The provider finalized everything sent so far — drop the tail.
+    /// The provider finalized a segment — drop the tail EXCEPT the most
+    /// recent onset window. A final never covers audio still in flight when
+    /// it was emitted (the next utterance's first syllables are typically
+    /// already in the ring during continuous speech — review wf_6783a4b3:
+    /// clear-all lost exactly those words when the socket died before the
+    /// next final). The keep window is cap/20 (250 ms at the default 5 s
+    /// cap), trading a rare ~250 ms duplicate for never losing an onset.
     pub fn clear(&self) {
+        let keep_bytes = self.cap_bytes / 20;
+        let mut inner = self.inner.lock();
+        while inner.bytes > keep_bytes && inner.chunks.len() > 1 {
+            if let Some(old) = inner.chunks.pop_front() {
+                inner.bytes -= old.len();
+            }
+        }
+        if inner.bytes > keep_bytes {
+            // A single oversized chunk: dropping it whole is the lossy-but-
+            // bounded choice (it predates the final; the duplicate risk of
+            // keeping a >250ms chunk outweighs the onset value).
+            inner.chunks.clear();
+            inner.bytes = 0;
+        }
+    }
+
+    /// Unconditional reset (session teardown / reconfigure): nothing from
+    /// the previous stream may replay into the next.
+    pub fn clear_all(&self) {
         let mut inner = self.inner.lock();
         inner.chunks.clear();
         inner.bytes = 0;
@@ -131,9 +156,23 @@ mod tests {
         assert_eq!(snap[1][0], 2);
         // Snapshot does NOT clear: a second drop before finals replays again.
         assert_eq!(b.len_bytes(), 200);
-        // A finalized transcript clears the at-risk tail.
+        // A finalized transcript clears the at-risk tail EXCEPT the recent
+        // onset window (cap/20 = 51 bytes here): chunk 1 (100 B) evicted,
+        // chunk 2 dropped as a single over-window chunk.
         b.clear();
         assert_eq!(b.len_bytes(), 0);
+        assert!(b.snapshot().is_empty());
+        // With a small recent chunk inside the keep window, clear PRESERVES
+        // it — the next utterance's onset must survive a final.
+        let b = AudioReplayBuffer::new(2_000); // keep window = 100 B
+        b.push(chunk(1, 500));
+        b.push(chunk(2, 80));
+        b.clear();
+        let snap = b.snapshot();
+        assert_eq!(snap.len(), 1, "onset chunk survives the final");
+        assert_eq!(snap[0][0], 2);
+        // Teardown reset is unconditional.
+        b.clear_all();
         assert!(b.snapshot().is_empty());
     }
 

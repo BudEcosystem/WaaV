@@ -852,3 +852,111 @@ async fn normal_completion_does_not_double_commit() {
     assert_eq!(assistants.len(), 1, "exactly one assistant message: {history:?}");
     assert_eq!(assistants[0].content.as_deref(), Some("Complete answer."));
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Review wf_6783a4b3: tool-loop turns must SPEAK the final answer even when
+// the round-0 response streamed a preamble, and a cancel inside the loop
+// must not double-commit the preamble.
+// ──────────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+#[serial_test::serial]
+async fn tool_loop_final_answer_is_spoken_after_streamed_preamble() {
+    use serde_json::json;
+    use waav_gateway::core::llm::{FunctionRegistry, ToolDefinition};
+
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    // Scripted mock: req 1 → SSE preamble + tool call; req 2 → final answer.
+    use axum::response::sse::{Event, Sse};
+    use futures::stream;
+    #[derive(Clone, Default)]
+    struct Hits(Arc<AtomicUsize>);
+    async fn sse_chat(
+        axum::extract::State(hits): axum::extract::State<Hits>,
+    ) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+        let n = hits.0.fetch_add(1, Ordering::SeqCst);
+        let chunks: Vec<Value> = if n == 0 {
+            vec![
+                json!({"id":"1","object":"chat.completion.chunk","created":1,"model":"m",
+                    "choices":[{"index":0,"delta":{"content":"Let me check the weather."},"finish_reason":null}]}),
+                json!({"id":"1","object":"chat.completion.chunk","created":1,"model":"m",
+                    "choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_w","type":"function",
+                        "function":{"name":"get_weather","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
+            ]
+        } else {
+            vec![json!({"id":"2","object":"chat.completion.chunk","created":1,"model":"m",
+                "choices":[{"index":0,"delta":{"content":"It is sunny and minus three."},"finish_reason":"stop"}]})]
+        };
+        let events = chunks
+            .into_iter()
+            .map(|c| Ok(Event::default().data(c.to_string())))
+            .chain(std::iter::once(Ok(Event::default().data("[DONE]"))))
+            .collect::<Vec<_>>();
+        Sse::new(stream::iter(events))
+    }
+    let hits = Hits::default();
+    let app = Router::new()
+        .route("/chat/completions", post(sse_chat))
+        .with_state(hits.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base_url = format!("http://127.0.0.1:{}", addr.port());
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+
+    let registry = Arc::new(FunctionRegistry::new());
+    registry.register(
+        ToolDefinition::function("get_weather", "weather", json!({"type":"object"})),
+        Arc::new(|_p| Box::pin(async { Ok(json!({"weather":"sunny","temp_c":-3})) })),
+    );
+    let cfg = conv_config(base_url.clone(), true);
+    let llm = Arc::new(
+        LlmClient::new(LlmClientConfig {
+            base_url,
+            model: "mock-llm".to_string(),
+            api_key: Some("test".into()),
+            system_prompt: cfg.system_prompt.clone(),
+            streaming: true,
+            ..Default::default()
+        })
+        .with_functions(Arc::clone(&registry)),
+    );
+    let orchestrator = Arc::new(ConversationOrchestrator::with_client(
+        "session-toolspeak",
+        cfg,
+        llm.clone(),
+        vm.clone(),
+    ));
+    orchestrator.run_turn("what's the weather?").await.expect("turn");
+
+    let spoken = TTS_STATS.spoken.lock().clone();
+    assert!(
+        spoken.iter().any(|s| s.contains("Let me check the weather")),
+        "preamble spoken: {spoken:?}"
+    );
+    assert!(
+        spoken.iter().any(|s| s.contains("sunny and minus three")),
+        "the tool loop's FINAL answer must reach TTS (spoke-flag fix): {spoken:?}"
+    );
+
+    // History shape: user, assistant{preamble+call}, tool, assistant(final)
+    // — and the preamble appears EXACTLY once (double-commit fix).
+    let history = llm.history_snapshot("session-toolspeak").await;
+    let preambles = history
+        .iter()
+        .filter(|m| {
+            m.content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Let me check the weather")
+        })
+        .count();
+    assert_eq!(preambles, 1, "preamble committed exactly once: {history:?}");
+}

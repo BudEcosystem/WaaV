@@ -911,7 +911,14 @@ async fn assert_replays_unfinalized_tail(provider_name: &str, proto: ReplayProto
     provider.on_result(cb).await.unwrap();
     provider.connect().await.expect("initial connect");
 
-    // 1) Send the chunk the mock ACKS with a final → the ring clears.
+    // 1) A LARGE chunk beyond the onset-keep window (cap/20 = 8000 B),
+    //    then the chunk the mock ACKS with a final. The final clears the
+    //    ring EXCEPT the recent onset window: 0xA0 must never replay;
+    //    0xA1 may (it is the onset-window survivor).
+    provider
+        .send_audio(bytes::Bytes::from(vec![0xA0u8; 9_000]))
+        .await
+        .expect("send A0");
     provider.send_audio(tagged(0xA1)).await.expect("send A1");
     let deadline = Instant::now() + Duration::from_secs(5);
     while finals.load(Ordering::SeqCst) < 1 {
@@ -948,20 +955,28 @@ async fn assert_replays_unfinalized_tail(provider_name: &str, proto: ReplayProto
         "second connection received too little audio: {} frames",
         conn2.len()
     );
-    // The REPLAYED tail comes first, oldest first, before any fresh audio.
-    assert_eq!(
-        conn2[0][0], 0xA2,
-        "first frame on the new connection must be the replayed 0xA2 chunk"
-    );
-    assert_eq!(conn2[0].len(), 320, "replayed chunk must be byte-identical");
-    assert_eq!(
-        conn2[1][0], 0xA3,
-        "second frame must be the replayed 0xA3 chunk (order preserved)"
-    );
-    // The finalized chunk must NOT be replayed (cleared by the final ack).
+    // Audio finalized BEYOND the onset window must never replay.
     assert!(
-        conn2.iter().all(|f| f[0] != 0xA1),
-        "0xA1 was finalized before the drop — replaying it would duplicate words"
+        conn2.iter().all(|f| f[0] != 0xA0),
+        "0xA0 was finalized and beyond the keep window — replaying it duplicates a whole utterance"
+    );
+    // The un-finalized tail replays FIRST, oldest first, byte-identical —
+    // possibly preceded by the onset-window survivor (0xA1, ≤250ms kept by
+    // design so a final never wipes the NEXT utterance's first syllables).
+    let a2 = conn2
+        .iter()
+        .position(|f| f[0] == 0xA2)
+        .expect("replayed 0xA2 chunk missing on the new connection");
+    assert!(
+        conn2[..a2].iter().all(|f| f[0] == 0xA1),
+        "only the onset-window survivor may precede the replayed tail: {:?}",
+        conn2.iter().map(|f| f[0]).collect::<Vec<_>>()
+    );
+    assert_eq!(conn2[a2].len(), 320, "replayed chunk must be byte-identical");
+    assert_eq!(
+        conn2[a2 + 1][0],
+        0xA3,
+        "0xA3 must directly follow 0xA2 (order preserved)"
     );
 }
 

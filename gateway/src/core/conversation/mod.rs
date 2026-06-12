@@ -451,10 +451,23 @@ impl ConversationOrchestrator {
         // content lands on the normal speak path below (the streaming pump
         // saw no text for a tool-call response, so the !spoke fallback
         // speaks it).
+        let mut ran_tool_loop = false;
         let result = match result {
             Ok(response)
-                if !response.tool_calls.is_empty() && self.llm.functions().is_some() =>
+                if !response.tool_calls.is_empty()
+                    && self.llm.functions().is_some_and(|r| !r.is_empty()) =>
             {
+                // The initial inference COMPLETED (recorded with its
+                // preamble): the streamed accumulator is spent — without
+                // this, a cancel inside the tool loop would commit the
+                // preamble a SECOND time after the tool results (review
+                // wf_6783a4b3: duplicate assistant text).
+                streamed_text.lock().clear();
+                // The pump spoke (at most) round-0 preamble; the loop's
+                // FINAL answer must still reach TTS through the fallback
+                // speak below (review wf_6783a4b3: a true `spoke` here left
+                // the bot permanently silent after "let me check...").
+                ran_tool_loop = true;
                 let registry =
                     Arc::clone(self.llm.functions().expect("guarded by condition"));
                 crate::core::llm::run_tool_loop(
@@ -485,7 +498,9 @@ impl ConversationOrchestrator {
                     // deltas and deliver the answer (or nothing) at the end. If
                     // the pump spoke nothing, fall back to the final content; if
                     // that is empty too, say so loudly instead of going silent.
-                    !spoke.load(std::sync::atomic::Ordering::Relaxed)
+                    // A completed TOOL LOOP always speaks its final answer —
+                    // the pump only ever saw the round-0 preamble.
+                    ran_tool_loop || !spoke.load(std::sync::atomic::Ordering::Relaxed)
                 } else {
                     true
                 };

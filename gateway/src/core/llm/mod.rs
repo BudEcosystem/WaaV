@@ -524,6 +524,16 @@ impl ConversationHistory {
                 .position(|m| m.role != MessageRole::System)
             {
                 self.messages.remove(idx);
+                // Pair-aware eviction (review wf_6783a4b3): the oldest
+                // non-system slot must never be left on a tool RESULT whose
+                // call was just (or previously) evicted — strict providers
+                // 400 on orphan tool messages. Any tool message now at the
+                // front is by definition an orphan: drop it with its call.
+                while idx < self.messages.len()
+                    && self.messages[idx].role == MessageRole::Tool
+                {
+                    self.messages.remove(idx);
+                }
             } else {
                 break;
             }
@@ -755,8 +765,16 @@ impl LlmClient {
             .or_insert_with(|| ConversationHistory::new(self.config.max_history));
 
         // CONTINUE mode (B-G4 re-inference after tool results): the request
-        // is the stored history exactly as-is — no new user message.
+        // is the stored history exactly as-is — no new user message. An
+        // EMPTY history would render an empty messages array (provider
+        // 400): inject the configured system prompt so the request is at
+        // least well-formed (review wf_6783a4b3, unverified #25).
         let Some(input) = input else {
+            if history.messages().is_empty()
+                && let Some(system_prompt) = &self.config.system_prompt
+            {
+                history.add(ChatMessage::system(system_prompt));
+            }
             return history.messages().to_vec();
         };
 
@@ -1188,6 +1206,22 @@ impl LlmClient {
         let mut histories = self.histories.write().await;
         if let Some(history) = histories.get_mut(session_id) {
             history.add(ChatMessage::tool(tool_call_id, result));
+        }
+    }
+
+    /// Add a BATCH of tool results under one lock acquisition: a concurrent
+    /// turn's user message must never interleave between a batch's results
+    /// (pairing violation → strict providers 400 forever).
+    pub async fn add_tool_results_batch(
+        &self,
+        session_id: &str,
+        results: Vec<(String, String)>,
+    ) {
+        let mut histories = self.histories.write().await;
+        if let Some(history) = histories.get_mut(session_id) {
+            for (id, result) in results {
+                history.add(ChatMessage::tool(id, result));
+            }
         }
     }
 

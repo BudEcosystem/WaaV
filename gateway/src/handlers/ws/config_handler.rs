@@ -1450,8 +1450,9 @@ async fn initialize_livekit_client(
 /// state (time-swapped audio into VAD/smart-turn) and even the STT byte
 /// stream itself. One bounded channel + one forwarder task preserves frame
 /// order while keeping the LiveKit callback non-blocking; when the consumer
-/// can't keep up the OLDEST frames drop (stale audio is the right thing to
-/// shed on a voice path) with a rate-limited warning.
+/// can't keep up the NEWEST frame is shed (the channel already holds older,
+/// contiguous audio — dropping the head would tear the stream mid-utterance)
+/// with a rate-limited warning.
 fn setup_livekit_audio_callback(
     livekit_client: &mut LiveKitClient,
     voice_manager: &Arc<VoiceManager>,
@@ -1462,7 +1463,6 @@ fn setup_livekit_audio_callback(
     let voice_manager = voice_manager.clone();
     let message_tx = message_tx.clone();
     tokio::spawn(async move {
-        let mut dropped_logged = 0usize;
         while let Some(audio_data) = frame_rx.recv().await {
             debug!("Received LiveKit audio: {} bytes", audio_data.len());
             if let Err(e) = voice_manager.receive_audio(audio_data.into()).await {
@@ -1473,16 +1473,20 @@ fn setup_livekit_audio_callback(
                     }))
                     .await;
             }
-            dropped_logged = dropped_logged.saturating_sub(1);
         }
     });
 
+    let dropped = std::sync::atomic::AtomicUsize::new(0);
     livekit_client.set_audio_callback(move |audio_data: Vec<u8>| {
         if let Err(mpsc::error::TrySendError::Full(_)) = frame_tx.try_send(audio_data) {
             // Consumer behind by >64 frames (~640ms at 10ms frames): shed
             // the NEW frame (the channel already holds older, more
-            // contiguous audio) and let the pipeline catch up.
-            warn!("LiveKit ingress queue full; dropping audio frame");
+            // contiguous audio) and let the pipeline catch up. Warn once
+            // per 100 sheds — per-frame warns flood at frame rate.
+            let n = dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n.is_multiple_of(100) {
+                warn!(total_dropped = n + 1, "LiveKit ingress queue full; shedding frames");
+            }
         }
     });
 }

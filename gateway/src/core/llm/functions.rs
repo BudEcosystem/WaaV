@@ -281,10 +281,27 @@ pub async fn run_tool_loop(
     let mut rounds = 0usize;
     while !response.tool_calls.is_empty() {
         if rounds >= opts.max_rounds {
+            // CRITICAL (review wf_6783a4b3): the assistant{tool_calls}
+            // message is ALREADY in history — bailing without results leaves
+            // it unpaired and every later request 400s on strict providers
+            // (session permanently bricked). Write synthetic terminal
+            // results so pairing holds, then stop.
             warn!(
                 session = session_id,
-                rounds, "tool loop hit max_rounds; returning last response"
+                rounds, "tool loop hit max_rounds; writing terminal results and stopping"
             );
+            let results: Vec<(String, String)> = response
+                .tool_calls
+                .iter()
+                .map(|c| {
+                    (
+                        c.id.clone(),
+                        json!({"error": "aborted: tool loop reached max_rounds"}).to_string(),
+                    )
+                })
+                .collect();
+            llm.add_tool_results_batch(session_id, results).await;
+            response.tool_calls.clear();
             break;
         }
         rounds += 1;
@@ -299,11 +316,16 @@ pub async fn run_tool_loop(
 
         let results = execute_batch(registry, session_id, &batch, cancel, opts.parallel).await;
 
-        // Pairing invariant: exactly one result per tool_call_id, batch order.
-        for (call, value) in batch.iter().zip(results) {
-            let rendered = value.to_string();
-            llm.add_tool_result(session_id, &call.id, &rendered).await;
-        }
+        // Pairing invariant: exactly one result per tool_call_id, batch
+        // order — appended under ONE history-lock acquisition so a
+        // concurrent turn's user message can never interleave between a
+        // batch's results (review wf_6783a4b3).
+        let rendered: Vec<(String, String)> = batch
+            .iter()
+            .zip(results)
+            .map(|(call, value)| (call.id.clone(), value.to_string()))
+            .collect();
+        llm.add_tool_results_batch(session_id, rendered).await;
 
         // ONE re-inference for the whole batch (group_id semantics).
         response = llm
@@ -838,9 +860,81 @@ mod tests {
         let opts = ToolLoopOptions { parallel: true, max_rounds: 3 };
         let resp = run_tool_loop(&llm, &reg, "s1", first, None, &token, opts).await.unwrap();
         assert!(
-            !resp.tool_calls.is_empty(),
-            "loop returns the last tool-call response when capped"
+            resp.tool_calls.is_empty(),
+            "capped loop must not hand back live tool calls (they were terminally answered)"
         );
         assert_eq!(mock.requests.lock().len(), 1 + 3, "initial + max_rounds inferences");
+
+        // CRITICAL pairing pin (review wf_6783a4b3): the bail must leave NO
+        // unpaired assistant{tool_calls} — every call id in history has a
+        // tool result, so the session is NOT bricked on strict providers.
+        let history = llm.history_snapshot("s1").await;
+        let result_ids: std::collections::HashSet<&str> = history
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Tool))
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        for m in &history {
+            if let Some(calls) = &m.tool_calls {
+                for c in calls {
+                    assert!(
+                        result_ids.contains(c.id.as_str()),
+                        "unpaired tool call {} after max_rounds bail: {history:?}",
+                        c.id
+                    );
+                }
+            }
+        }
+        let last_results: Vec<_> = history
+            .iter()
+            .rev()
+            .take_while(|m| matches!(m.role, MessageRole::Tool))
+            .collect();
+        assert_eq!(last_results.len(), 2, "the final batch got terminal results");
+        assert!(
+            last_results[0]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("max_rounds"),
+            "terminal results say why"
+        );
+    }
+
+    #[test]
+    fn history_trim_never_orphans_tool_messages() {
+        // review wf_6783a4b3: count-based eviction crossing a tool exchange
+        // must take the whole exchange, never leaving a leading orphan tool
+        // result (strict providers 400 on it forever).
+        use crate::core::llm::{ChatMessage, ConversationHistory, MessageRole};
+        let mut h = ConversationHistory::new(4);
+        h.add(ChatMessage::system("p"));
+        h.add(ChatMessage::user("q1"));
+        let mut call = ChatMessage::assistant("");
+        call.tool_calls = Some(vec![crate::core::llm::ToolCall {
+            id: "c1".into(),
+            call_type: "function".into(),
+            function: crate::core::llm::FunctionCall { name: "f".into(), arguments: "{}".into() },
+        }]);
+        h.add(call);
+        h.add(ChatMessage::tool("c1", "result"));
+        // Over capacity: evictions start. q1 goes, then the assistant{call}
+        // — its orphaned result MUST go with it.
+        h.add(ChatMessage::user("q2"));
+        h.add(ChatMessage::assistant("a2"));
+        let msgs = h.messages();
+        assert!(
+            !msgs
+                .iter()
+                .enumerate()
+                .any(|(i, m)| m.role == MessageRole::Tool
+                    && !msgs[..i].iter().any(|p| p
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|cs| cs.iter().any(|c| Some(c.id.as_str())
+                            == m.tool_call_id.as_deref())))),
+            "orphan tool message survived the trim: {msgs:?}"
+        );
+        assert_eq!(msgs[0].role, MessageRole::System, "system always survives");
     }
 }

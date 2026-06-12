@@ -147,6 +147,11 @@ pub struct FlowManager {
     /// Available at every node, alongside the node's own functions.
     global_functions: Vec<FlowFunctionSchema>,
     action_sink: Option<ActionSink>,
+    /// The session PERSONA — tracked explicitly (review wf_6783a4b3: the
+    /// "system is history[0]" inference broke when embedders seeded flows
+    /// from the standard config). Seeded from the LlmClient's configured
+    /// system prompt; updated by every node `role_message`.
+    persona: Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for FlowManager {
@@ -165,6 +170,7 @@ impl FlowManager {
         session_id: impl Into<String>,
         api_key: Option<String>,
     ) -> Self {
+        let persona = llm.config().system_prompt.clone();
         Self {
             llm,
             registry,
@@ -174,6 +180,7 @@ impl FlowManager {
             pending_transition: Arc::new(Mutex::new(None)),
             global_functions: Vec::new(),
             action_sink: None,
+            persona: Mutex::new(persona),
         }
     }
 
@@ -200,7 +207,14 @@ impl FlowManager {
         first: NodeConfig,
         cancel: &CancellationToken,
     ) -> LlmResult<Option<LlmResponse>> {
-        self.set_node(first, cancel).await
+        match self.set_node(first, cancel).await? {
+            // The entry inference may itself call tools (lookup-then-greet
+            // nodes are core pipecat-flows usage): run the flow loop, or
+            // the calls are silently dropped AND the dangling
+            // assistant{tool_calls} poisons history (review wf_6783a4b3).
+            Some(response) => self.run_flow_loop(response, cancel).await,
+            None => Ok(None),
+        }
     }
 
     /// Drive one USER turn through the flow: inference on the current
@@ -214,6 +228,15 @@ impl FlowManager {
         transcript: &str,
         cancel: &CancellationToken,
     ) -> LlmResult<Option<LlmResponse>> {
+        // A transition staged by an aborted/dropped earlier turn must never
+        // fire on THIS unrelated turn (review wf_6783a4b3: pending leak).
+        if let Some(stale) = self.pending_transition.lock().take() {
+            warn!(
+                session = %self.session_id,
+                node = ?stale.name,
+                "discarding stale pending transition from an aborted turn"
+            );
+        }
         let response = self
             .llm
             .complete(&self.session_id, transcript, self.api_key.as_deref(), cancel, None)
@@ -235,7 +258,24 @@ impl FlowManager {
                 return Ok(Some(response));
             }
             if rounds >= MAX_ROUNDS {
-                warn!(session = %self.session_id, "flow loop hit max rounds");
+                // Same CRITICAL shape as B-G4's loop: bailing with the
+                // assistant{tool_calls} already recorded but unanswered
+                // bricks the session on strict providers. Pair them with
+                // terminal results first (review wf_6783a4b3).
+                warn!(session = %self.session_id, "flow loop hit max rounds; writing terminal results");
+                let results: Vec<(String, String)> = response
+                    .tool_calls
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.id.clone(),
+                            serde_json::json!({"error": "aborted: flow loop reached max rounds"})
+                                .to_string(),
+                        )
+                    })
+                    .collect();
+                self.llm.add_tool_results_batch(&self.session_id, results).await;
+                response.tool_calls.clear();
                 return Ok(Some(response));
             }
             rounds += 1;
@@ -246,11 +286,12 @@ impl FlowManager {
             // are captured into pending_transition by the wrappers.
             let results =
                 execute_batch(&self.registry, &self.session_id, &batch, cancel, true).await;
-            for (call, value) in batch.iter().zip(results) {
-                self.llm
-                    .add_tool_result(&self.session_id, &call.id, &value.to_string())
-                    .await;
-            }
+            let rendered: Vec<(String, String)> = batch
+                .iter()
+                .zip(results)
+                .map(|(call, value)| (call.id.clone(), value.to_string()))
+                .collect();
+            self.llm.add_tool_results_batch(&self.session_id, rendered).await;
 
             // TWO-PHASE: results are in context; NOW the transition fires.
             let next = self.pending_transition.lock().take();
@@ -314,9 +355,14 @@ impl FlowManager {
         }
         self.registry.swap_tools(items);
 
-        // Persona persists until another node changes it.
+        // Persona persists until another node changes it (tracked
+        // explicitly — never inferred from history position).
         if let Some(role) = &node.role_message {
-            self.llm.upsert_system(&self.session_id, role).await;
+            *self.persona.lock() = Some(role.clone());
+        }
+        let persona = self.persona.lock().clone();
+        if let Some(p) = &persona {
+            self.llm.upsert_system(&self.session_id, p).await;
         }
 
         // Context strategy.
@@ -334,20 +380,9 @@ impl FlowManager {
                         "ResetWithSummary: native summarizer (B-G6) not built; behaving as Reset"
                     );
                 }
-                // Rebuild: persona system message (the node's, else the one
-                // already in context) + the node's task messages.
-                let system = match &node.role_message {
-                    Some(r) => Some(r.clone()),
-                    None => self
-                        .llm
-                        .history_snapshot(&self.session_id)
-                        .await
-                        .first()
-                        .filter(|m| m.role == crate::core::llm::MessageRole::System)
-                        .and_then(|m| m.content.clone()),
-                };
+                // Rebuild: the tracked persona + the node's task messages.
                 let mut messages = Vec::new();
-                if let Some(system) = system {
+                if let Some(system) = &persona {
                     messages.push(ChatMessage::system(system));
                 }
                 messages.extend(node.task_messages.clone());
