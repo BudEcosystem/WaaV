@@ -6,7 +6,7 @@
 //! egress (provider rate → client playback rate) — so rate conversion can
 //! never diverge per call site again.
 //!
-//! Properties (soxr-stream parity via rubato's `SincFixedIn`):
+//! Properties (soxr-stream parity via rubato's `FftFixedIn`):
 //! - **Filter history across chunks**: the sinc delay line persists between
 //!   calls, so chunk boundaries produce no clicks (the canonical stateless-
 //!   per-chunk failure).
@@ -23,19 +23,19 @@
 
 use std::time::Instant;
 
-use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
+use rubato::{FftFixedIn, Resampler};
 use tracing::{debug, warn};
 
 /// Drop stale filter state when this much wall time passed since the last
 /// chunk (Pipecat `CLEAR_STREAM_AFTER_SECS` parity).
 const CLEAR_AFTER: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// Fixed input chunk the sinc resampler consumes per process call.
+/// Fixed input chunk the resampler consumes per process call.
 const CHUNK_FRAMES: usize = 1024;
 
 /// Streaming mono f32 resampler. See the module docs for the contract.
 pub struct StreamResampler {
-    inner: Option<SincFixedIn<f32>>,
+    inner: Option<FftFixedIn<f32>>,
     in_rate: u32,
     out_rate: u32,
     last_call: Option<Instant>,
@@ -123,14 +123,10 @@ impl StreamResampler {
                 "stream resampler rate change; rebuilding"
             );
         }
-        let params = SincInterpolationParameters {
-            sinc_len: 128,
-            f_cutoff: 0.95,
-            oversampling_factor: 128,
-            interpolation: SincInterpolationType::Linear,
-            window: WindowFunction::BlackmanHarris2,
-        };
-        match SincFixedIn::new(out_rate as f64 / in_rate as f64, 1.0, params, CHUNK_FRAMES, 1) {
+        // FftFixedIn: FFT-based polyphase — the same engine the smart-turn
+        // mel extractor uses (Send-friendly, unlike SincFixedIn's boxed
+        // interpolator), with quality well above voice requirements.
+        match FftFixedIn::<f32>::new(in_rate as usize, out_rate as usize, CHUNK_FRAMES, 2, 1) {
             Ok(r) => {
                 self.inner = Some(r);
                 self.in_rate = in_rate;

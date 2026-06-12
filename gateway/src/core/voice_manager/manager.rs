@@ -69,6 +69,11 @@ pub struct VoiceManager {
     // Uses interior mutability so it can be initialized in start()
     #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
     smart_turn_processor: Arc<RwLock<Option<SmartTurnProcessor>>>,
+    /// C-G5 ingress resampler: wire rate → the 16 kHz the VAD/smart-turn
+    /// models require. Identity (zero work) for 16 kHz clients. The STT
+    /// provider always receives the ORIGINAL bytes at the wire rate.
+    #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+    ingress_resampler: Arc<SyncRwLock<crate::core::audio::StreamResampler>>,
 
     // Callback for smart turn detection results
     #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
@@ -182,6 +187,10 @@ impl VoiceManager {
             turn_detector,
             #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
             smart_turn_processor: Arc::new(RwLock::new(None)), // Initialized in start() if configured
+            #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+            ingress_resampler: Arc::new(SyncRwLock::new(
+                crate::core::audio::StreamResampler::new(),
+            )),
             #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
             smart_turn_callback: Arc::new(SyncRwLock::new(None)),
             interruption_state: Arc::new(InterruptionState {
@@ -467,8 +476,20 @@ impl VoiceManager {
                         // Convert bytes to f32 samples (assuming 16-bit PCM)
                         let samples = self.bytes_to_f32_samples(&audio);
 
+                        // C-G5 ingress: the VAD/smart-turn models require
+                        // 16 kHz; resample when the wire rate differs (8 kHz
+                        // telephony, 48 kHz WebRTC). Identity (None) for
+                        // 16 kHz clients — zero extra work. The STT provider
+                        // below still gets the ORIGINAL wire-rate bytes.
+                        let wire_rate = self.config.stt_config.sample_rate;
+                        let resampled = self
+                            .ingress_resampler
+                            .write()
+                            .resample(&samples, wire_rate, 16_000);
+                        let samples = resampled.as_deref().unwrap_or(&samples);
+
                         // Process through smart turn detector
-                        match processor.process_audio(&samples).await {
+                        match processor.process_audio(samples).await {
                             Ok(result) => {
                                 if let Some(obs) = &frame_observers {
                                     obs.notify_smart_turn(

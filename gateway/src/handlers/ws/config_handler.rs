@@ -635,8 +635,13 @@ async fn initialize_voice_manager(
     {
         #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
         {
+            // C-G5 ingress: the VoiceManager resamples the frame path to
+            // 16 kHz BEFORE the VAD/smart-turn models, so the processor is
+            // always constructed at 16 kHz — non-16k clients (8 kHz
+            // telephony, 48 kHz WebRTC) no longer fail the processor's
+            // config validation (the silero/vad rate cross-check).
             let mut st_cfg = crate::core::smart_turn::SmartTurnProcessorConfig::new()
-                .with_sample_rate(stt_ws_config.sample_rate);
+                .with_sample_rate(16_000);
             if let Some(threshold) = td.threshold {
                 st_cfg = st_cfg.with_threshold(threshold);
             }
