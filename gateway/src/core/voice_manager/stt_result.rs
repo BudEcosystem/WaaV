@@ -10,6 +10,22 @@ use tracing::{debug, info};
 
 use crate::core::{stt::STTResult, turn_detect::TurnDetector};
 
+/// Append `fragment` to `buf`, inserting a single space when both sides have
+/// content and neither boundary char is whitespace — so multi-final segments
+/// don't concatenate as `"Hello there.How are you"`.
+fn append_with_space(buf: &mut String, fragment: &str) {
+    if fragment.is_empty() {
+        return;
+    }
+    if !buf.is_empty()
+        && !buf.ends_with(char::is_whitespace)
+        && !fragment.starts_with(char::is_whitespace)
+    {
+        buf.push(' ');
+    }
+    buf.push_str(fragment);
+}
+
 use super::state::SpeechFinalState;
 
 /// Configuration for STT result processing
@@ -132,8 +148,9 @@ impl STTResultProcessor {
                 old_handle.abort();
             }
 
-            // Use push_str for O(1) amortized append instead of format!() which allocates a new string
-            state.text_buffer.push_str(&result.transcript);
+            // O(1) amortized append; space-aware so multi-final segments don't
+            // concatenate as "Hello there.How are you".
+            append_with_space(&mut state.text_buffer, &result.transcript);
 
             // Bound the per-turn buffer (RC8): a pathological provider sending
             // endless is_finals must not grow memory without limit — keep the
@@ -204,13 +221,14 @@ impl STTResultProcessor {
     /// Handle a real speech_final result
     fn handle_real_speech_final(
         &self,
-        result: STTResult,
+        mut result: STTResult,
         speech_final_state: Arc<SyncRwLock<SpeechFinalState>>,
         now_ms: usize,
     ) -> Option<STTResult> {
         let mut state = speech_final_state.write();
 
-        // Check for duplicate within the configured window
+        // Check for duplicate within the configured window (compare the RAW
+        // provider fragment, before enrichment below).
         if self.is_duplicate_speech_final(&state, &result.transcript, now_ms) {
             debug!(
                 "Ignoring duplicate real speech_final - turn detection fired {}ms ago",
@@ -221,6 +239,18 @@ impl STTResultProcessor {
 
         // Cancel any pending detection tasks
         self.cancel_detection_task(&mut state);
+
+        // SEGMENT TRANSCRIPT TRUTH: earlier is_final fragments of this segment
+        // were accumulated in text_buffer; the provider's speech_final result
+        // carries only the LAST fragment. Consumers fire the LLM turn with the
+        // delivered transcript, so a multi-final utterance ("Hello there." +
+        // "How are you") would otherwise run the turn with just "How are you"
+        // — truncated LLM input. Deliver the full segment text.
+        if !state.text_buffer.is_empty() {
+            let mut full = std::mem::take(&mut state.text_buffer);
+            append_with_space(&mut full, &result.transcript);
+            result.transcript = full;
+        }
 
         // Reset state for next speech segment
         self.reset_speech_state(&mut state);
@@ -427,7 +457,9 @@ impl STTResultProcessor {
                     .turn_detection_last_fired_ms
                     .store(fire_time_ms, Ordering::Release);
                 let text = std::mem::take(&mut state.text_buffer);
-                state.last_forced_text = text;
+                // Keep a copy for the duplicate window (a late provider
+                // speech_final carrying a fragment of this text is a dup).
+                state.last_forced_text = text.clone();
                 state
                     .waiting_for_speech_final
                     .store(false, Ordering::Release);
@@ -437,12 +469,19 @@ impl STTResultProcessor {
                 }
                 state.segment_start_ms.store(0, Ordering::Release);
                 state.hard_timeout_deadline_ms.store(0, Ordering::Release);
-                state.user_callback.clone()
+                state.user_callback.clone().map(|cb| (cb, text))
             }
         };
 
-        if let Some(callback) = claimed {
-            let forced_result = STTResult::new(String::new(), true, true, 1.0);
+        if let Some((callback, text)) = claimed {
+            // The forced signal must CARRY the segment's buffered transcript:
+            // both consumers (conversation orchestrator + DAG StreamDriver)
+            // gate turns on `is_speech_final && !transcript.empty()`, so an
+            // empty forced final never ran a turn — the entire timer /
+            // turn-detector fallback path was dead (found during A-G0 contract
+            // verification; the buffer was captured into last_forced_text and
+            // only ever read by tests).
+            let forced_result = STTResult::new(text, true, true, 1.0);
             info!("Forcing speech_final via {}", detection_method);
             callback(forced_result).await;
         }
@@ -456,10 +495,20 @@ impl STTResultProcessor {
         now_ms: usize,
     ) -> bool {
         let last_fired_ms = state.turn_detection_last_fired_ms.load(Ordering::Acquire);
-
-        last_fired_ms > 0
-            && now_ms.saturating_sub(last_fired_ms) < self.config.duplicate_window_ms
-            && state.last_forced_text == transcript
+        if last_fired_ms == 0
+            || now_ms.saturating_sub(last_fired_ms) >= self.config.duplicate_window_ms
+        {
+            return false;
+        }
+        // Within the window: the forced fire delivered the FULL buffered
+        // segment, while a late provider speech_final carries only its last
+        // FRAGMENT — containment (not equality) catches that. An empty
+        // fragment inside the window is also a dup (a bare provider
+        // speech_final marker trailing the forced fire). The window is short
+        // (duplicate_window_ms); a genuinely new utterance with provider
+        // endpointing cannot complete inside it.
+        let t = transcript.trim();
+        t.is_empty() || state.last_forced_text.contains(t)
     }
 
     /// Cancel any existing detection task
@@ -532,6 +581,168 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    fn fresh_state(callback: STTCallback) -> Arc<SyncRwLock<SpeechFinalState>> {
+        Arc::new(SyncRwLock::new(SpeechFinalState {
+            text_buffer: String::new(),
+            turn_detection_handle: None,
+            hard_timeout_handle: None,
+            waiting_for_speech_final: AtomicBool::new(false),
+            user_callback: Some(callback),
+            turn_detection_last_fired_ms: AtomicUsize::new(0),
+            last_forced_text: String::new(),
+            segment_start_ms: AtomicUsize::new(0),
+            hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
+        }))
+    }
+
+    /// SEGMENT TRANSCRIPT TRUTH (pre-A-G0 contract fix): the forced/timer
+    /// speech_final must CARRY the buffered segment text — both consumers gate
+    /// turns on non-empty transcripts, so an empty forced final means the
+    /// whole timer fallback never runs a turn (the pre-fix behavior).
+    #[tokio::test]
+    async fn forced_fire_carries_buffered_transcript() {
+        let config = STTProcessingConfig {
+            stt_speech_final_wait_ms: 30,
+            turn_detection_inference_timeout_ms: 30,
+            speech_final_hard_timeout_ms: 120,
+            duplicate_window_ms: 100,
+        };
+        let processor = STTResultProcessor::new(config);
+
+        let forced_texts: Arc<parking_lot::Mutex<Vec<String>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = forced_texts.clone();
+        let callback: STTCallback = Arc::new(move |result: STTResult| {
+            let sink = sink.clone();
+            Box::pin(async move {
+                if result.is_speech_final {
+                    sink.lock().push(result.transcript);
+                }
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>
+        });
+        let state = fresh_state(callback);
+
+        // Two finals, never a provider speech_final → the timer path fires.
+        let _ = processor
+            .process_result(
+                STTResult::new("Hello there.".into(), true, false, 0.9),
+                state.clone(),
+                None,
+            )
+            .await;
+        let _ = processor
+            .process_result(
+                STTResult::new("How are you".into(), true, false, 0.9),
+                state.clone(),
+                None,
+            )
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let texts = forced_texts.lock();
+        assert_eq!(texts.len(), 1, "exactly one forced speech_final");
+        assert_eq!(
+            texts[0], "Hello there. How are you",
+            "forced final must carry the FULL space-joined segment text"
+        );
+    }
+
+    /// A real provider speech_final delivers the full segment (buffered
+    /// fragments + its own), not just the last fragment — otherwise long
+    /// utterances run the LLM with truncated input.
+    #[tokio::test]
+    async fn real_speech_final_includes_prior_final_fragments() {
+        let config = STTProcessingConfig {
+            stt_speech_final_wait_ms: 500,
+            turn_detection_inference_timeout_ms: 100,
+            speech_final_hard_timeout_ms: 5000,
+            duplicate_window_ms: 100,
+        };
+        let processor = STTResultProcessor::new(config);
+        let noop: STTCallback = Arc::new(|_| Box::pin(async {}));
+        let state = fresh_state(noop);
+
+        let _ = processor
+            .process_result(
+                STTResult::new("Hello there.".into(), true, false, 0.9),
+                state.clone(),
+                None,
+            )
+            .await;
+        let delivered = processor
+            .process_result(
+                STTResult::new("How are you".into(), true, true, 0.9),
+                state.clone(),
+                None,
+            )
+            .await
+            .expect("real speech_final must be delivered");
+        assert_eq!(delivered.transcript, "Hello there. How are you");
+        assert!(delivered.is_speech_final);
+        // Buffer consumed: the next segment starts clean.
+        assert!(state.read().text_buffer.is_empty());
+    }
+
+    /// A late provider speech_final carrying a FRAGMENT of the just-forced
+    /// text is a duplicate (containment, not equality) — no double turn.
+    #[tokio::test]
+    async fn late_fragment_after_forced_fire_is_deduplicated() {
+        let config = STTProcessingConfig {
+            stt_speech_final_wait_ms: 30,
+            turn_detection_inference_timeout_ms: 30,
+            speech_final_hard_timeout_ms: 120,
+            duplicate_window_ms: 5_000,
+        };
+        let processor = STTResultProcessor::new(config);
+        let fires = Arc::new(AtomicUsize::new(0));
+        let fires_cb = fires.clone();
+        let callback: STTCallback = Arc::new(move |result: STTResult| {
+            let fires = fires_cb.clone();
+            Box::pin(async move {
+                if result.is_speech_final {
+                    fires.fetch_add(1, Ordering::SeqCst);
+                }
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>
+        });
+        let state = fresh_state(callback);
+
+        let _ = processor
+            .process_result(
+                STTResult::new("book a flight to Paris".into(), true, false, 0.9),
+                state.clone(),
+                None,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(fires.load(Ordering::SeqCst), 1, "forced fire happened");
+
+        // The provider's own (late) speech_final with the trailing fragment.
+        let dup = processor
+            .process_result(
+                STTResult::new("to Paris".into(), true, true, 0.9),
+                state.clone(),
+                None,
+            )
+            .await;
+        assert!(dup.is_none(), "fragment of the forced text within the window is a dup");
+    }
+
+    #[test]
+    fn append_with_space_joins_cleanly() {
+        let mut b = String::new();
+        append_with_space(&mut b, "Hello there.");
+        append_with_space(&mut b, "How are you");
+        assert_eq!(b, "Hello there. How are you");
+        let mut b2 = "ends with space ".to_string();
+        append_with_space(&mut b2, "next");
+        assert_eq!(b2, "ends with space next");
+        let mut b3 = "x".to_string();
+        append_with_space(&mut b3, "");
+        assert_eq!(b3, "x");
+    }
 
     #[tokio::test]
     async fn test_hard_timeout_fires_when_no_speech_final() {

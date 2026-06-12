@@ -282,12 +282,14 @@ async fn test_speech_final_timing_control() {
             .process_result(result2, speech_final_state.clone(), None)
             .await;
 
-        // Should return the original speech_final result
+        // Should return the FULL segment (buffered fragments + this one) —
+        // the old pass-through dropped "Hello world" and ran turns with
+        // truncated input (segment-transcript-truth fix).
         assert!(processed2.is_some());
         let final_result = processed2.unwrap();
         assert!(final_result.is_speech_final);
         assert!(final_result.is_final);
-        assert_eq!(final_result.transcript, "final result");
+        assert_eq!(final_result.transcript, "Hello world final result");
         assert_eq!(final_result.confidence, 0.95);
 
         // State should be reset
