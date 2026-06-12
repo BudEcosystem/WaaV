@@ -315,12 +315,18 @@ impl ConversationOrchestrator {
         // reasoning-model empty-stream failure mode).
         let spoke = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        // B-G5: every streamed delta accumulates here so a barge-in can
+        // commit the PARTIAL reply to history — the model's next turn must
+        // know it was cut off (Pipecat parity; prevents repeat/contradict).
+        let streamed_text: Arc<SyncMutex<String>> = Arc::new(SyncMutex::new(String::new()));
+
         let (on_token, pump) = if streaming {
             let token_for_cb = token.clone();
             // Channel from the (sync) token callback to an async pump that calls speak().
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             let first_token_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let obs_cb = observers.clone();
+            let streamed_cb = Arc::clone(&streamed_text);
             let cb: crate::core::llm::TokenCallback = Arc::new(move |delta: &str| {
                 if !delta.is_empty()
                     && !first_token_seen.swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -328,6 +334,7 @@ impl ConversationOrchestrator {
                 {
                     obs.notify_llm_first_token(crate::core::observability::now_monotonic_ns());
                 }
+                streamed_cb.lock().push_str(delta);
                 let _ = tx.send(delta.to_string());
             });
 
@@ -504,7 +511,23 @@ impl ConversationOrchestrator {
                 }
             }
             Err(LlmError::Cancelled) => {
-                debug!(session = %self.session_id, "LLM turn cancelled (barge-in/teardown)");
+                // B-G5: the streamed portion lands in history so the model
+                // knows it was cut off. (Normal completion records the full
+                // reply via record_assistant — the paths are mutually
+                // exclusive, so no double-commit is possible.)
+                let partial = streamed_text.lock().clone();
+                if !partial.trim().is_empty() {
+                    self.llm
+                        .commit_partial_assistant(&self.session_id, &partial)
+                        .await;
+                    debug!(
+                        session = %self.session_id,
+                        partial_chars = partial.len(),
+                        "barge-in: partial assistant reply committed to context"
+                    );
+                } else {
+                    debug!(session = %self.session_id, "LLM turn cancelled (barge-in/teardown)");
+                }
                 Ok(())
             }
             Err(e) => Err(e.into()),

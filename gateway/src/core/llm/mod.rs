@@ -1116,6 +1116,23 @@ impl LlmClient {
         })
     }
 
+    /// Commit a PARTIAL assistant reply cut off by a barge-in (B-G5,
+    /// Pipecat parity): the model's next turn must know it was interrupted
+    /// mid-answer — without this it repeats or contradicts itself. The
+    /// caller guarantees the turn's user message is already in history
+    /// (non-staged turns append it at request time), so ordering stays
+    /// user → assistant(partial).
+    pub async fn commit_partial_assistant(&self, session_id: &str, partial: &str) {
+        let partial = partial.trim();
+        if partial.is_empty() {
+            return;
+        }
+        let mut histories = self.histories.write().await;
+        if let Some(history) = histories.get_mut(session_id) {
+            history.add(ChatMessage::assistant(partial));
+        }
+    }
+
     /// Add a tool result message to a session's history.
     pub async fn add_tool_result(&self, session_id: &str, tool_call_id: &str, result: &str) {
         let mut histories = self.histories.write().await;

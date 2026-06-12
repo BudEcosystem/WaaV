@@ -655,3 +655,200 @@ async fn eager_divergent_transcript_discards_without_history_pollution() {
         "staged speculation must leave NO orphan user message"
     );
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// B-G5 — barge-in commits the PARTIAL assistant reply to context.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Slow SSE mock: emits an early delta, then stalls long enough for the test
+/// to barge in mid-stream, then (if still connected) finishes.
+async fn start_slow_sse_llm_mock() -> String {
+    use axum::response::sse::{Event, Sse};
+    use futures::stream;
+
+    async fn sse_chat(
+    ) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+        let early = json!({"id":"1","object":"chat.completion.chunk","created":1,"model":"m",
+            "choices":[{"index":0,"delta":{"content":"The capital of France is"},"finish_reason":null}]});
+        let late = json!({"id":"1","object":"chat.completion.chunk","created":1,"model":"m",
+            "choices":[{"index":0,"delta":{"content":" Paris, a city of light."},"finish_reason":"stop"}]});
+        let events = stream::unfold(0u8, move |step| {
+            let early = early.clone();
+            let late = late.clone();
+            async move {
+                match step {
+                    0 => Some((Ok(Event::default().data(early.to_string())), 1)),
+                    1 => {
+                        // Stall mid-stream: the barge-in lands here.
+                        tokio::time::sleep(Duration::from_millis(2_000)).await;
+                        Some((Ok(Event::default().data(late.to_string())), 2))
+                    }
+                    2 => Some((Ok(Event::default().data("[DONE]")), 3)),
+                    _ => None,
+                }
+            }
+        });
+        Sse::new(events)
+    }
+
+    let app = Router::new().route("/chat/completions", post(sse_chat));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://127.0.0.1:{}", addr.port())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn barge_in_commits_partial_assistant_text() {
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let base_url = start_slow_sse_llm_mock().await;
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+
+    let cfg = conv_config(base_url.clone(), true);
+    let llm = Arc::new(LlmClient::new(LlmClientConfig {
+        base_url,
+        model: "mock-llm".to_string(),
+        api_key: Some("test".to_string()),
+        system_prompt: cfg.system_prompt.clone(),
+        streaming: true,
+        ..Default::default()
+    }));
+    let orchestrator = Arc::new(ConversationOrchestrator::with_client(
+        "session-partial",
+        cfg,
+        llm.clone(),
+        vm.clone(),
+    ));
+
+    let orch1 = orchestrator.clone();
+    let turn = tokio::spawn(async move {
+        orch1.run_turn("what is the capital of France?").await.ok();
+    });
+    // Let the first delta arrive, then barge in mid-stream.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    orchestrator.handle_barge_in().await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), turn).await;
+
+    let history = llm.history_snapshot("session-partial").await;
+    let last = history.last().expect("history must not be empty");
+    assert!(
+        matches!(last.role, waav_gateway::core::llm::MessageRole::Assistant),
+        "the cut-off turn must end with the PARTIAL assistant message, got {history:?}"
+    );
+    let content = last.content.as_deref().unwrap_or_default();
+    assert!(
+        content.contains("The capital of France is") && !content.contains("city of light"),
+        "history must hold exactly the streamed portion, got {content:?}"
+    );
+    // Exactly ONE assistant message (no double commit).
+    let assistants = history
+        .iter()
+        .filter(|m| matches!(m.role, waav_gateway::core::llm::MessageRole::Assistant))
+        .count();
+    assert_eq!(assistants, 1);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn barge_in_before_any_token_commits_nothing() {
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    // Slow NON-streamed body: cancelled before any token is seen.
+    let llm_state = LlmMockState::default();
+    *llm_state.reply.lock() = "Never delivered.".to_string();
+    llm_state.delay_ms.store(1_500, Ordering::SeqCst);
+    let base_url = start_llm_mock(llm_state.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+
+    let cfg = conv_config(base_url.clone(), true);
+    let llm = Arc::new(LlmClient::new(LlmClientConfig {
+        base_url,
+        model: "mock-llm".to_string(),
+        api_key: Some("test".to_string()),
+        system_prompt: cfg.system_prompt.clone(),
+        streaming: true,
+        ..Default::default()
+    }));
+    let orchestrator = Arc::new(ConversationOrchestrator::with_client(
+        "session-nopartial",
+        cfg,
+        llm.clone(),
+        vm.clone(),
+    ));
+
+    let orch1 = orchestrator.clone();
+    let turn = tokio::spawn(async move {
+        orch1.run_turn("hello?").await.ok();
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    orchestrator.handle_barge_in().await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), turn).await;
+
+    let history = llm.history_snapshot("session-nopartial").await;
+    assert!(
+        !history
+            .iter()
+            .any(|m| matches!(m.role, waav_gateway::core::llm::MessageRole::Assistant)),
+        "no tokens streamed → nothing to commit, got {history:?}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn normal_completion_does_not_double_commit() {
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let llm_state = LlmMockState::default();
+    *llm_state.reply.lock() = "Complete answer.".to_string();
+    let base_url = start_llm_mock(llm_state.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+
+    let cfg = conv_config(base_url.clone(), false);
+    let llm = Arc::new(LlmClient::new(LlmClientConfig {
+        base_url,
+        model: "mock-llm".to_string(),
+        api_key: Some("test".to_string()),
+        system_prompt: cfg.system_prompt.clone(),
+        streaming: false,
+        ..Default::default()
+    }));
+    let orchestrator = Arc::new(ConversationOrchestrator::with_client(
+        "session-noduple",
+        cfg,
+        llm.clone(),
+        vm.clone(),
+    ));
+    orchestrator.run_turn("hi").await.expect("turn");
+
+    let history = llm.history_snapshot("session-noduple").await;
+    let assistants: Vec<_> = history
+        .iter()
+        .filter(|m| matches!(m.role, waav_gateway::core::llm::MessageRole::Assistant))
+        .collect();
+    assert_eq!(assistants.len(), 1, "exactly one assistant message: {history:?}");
+    assert_eq!(assistants[0].content.as_deref(), Some("Complete answer."));
+}
