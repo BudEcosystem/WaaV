@@ -46,6 +46,17 @@ pub enum AdapterKind {
     Gemini,
 }
 
+impl AdapterKind {
+    /// Stable label for metrics (`provider` tag — no per-call alloc).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
+        }
+    }
+}
+
 /// A fully rendered HTTP request: vendor endpoint + auth headers + JSON body.
 #[derive(Debug, Clone)]
 pub struct RenderedRequest {

@@ -47,6 +47,14 @@ pub const CIRCUIT_BREAKER_STATE: &str = "waav_circuit_breaker_state";
 /// `circuit_open`=breaker rejected the attempt). Makes the reconnect path observable (W-C1).
 pub const RECONNECTS_TOTAL: &str = "waav_reconnects_total";
 
+/// D-G9: characters submitted to TTS synthesis, per provider (cost proxy).
+pub const TTS_CHARS_TOTAL: &str = "waav_tts_chars_total";
+
+/// D-G9: LLM token usage by kind, per provider
+/// (`kind` ∈ prompt|completion|cache_read|cache_creation|reasoning —
+/// a kind is emitted only when the wire usage object carries it).
+pub const LLM_TOKENS_TOTAL: &str = "waav_llm_tokens_total";
+
 // -----------------------------------------------------------------------------
 // Live latency-profiling series (per-turn + per-frame realtime budget).
 // `path` ∈ {conversation,dag}; `stage`/`outcome`/`queue` are fixed enums; `node`
@@ -277,6 +285,14 @@ fn describe_series() {
     );
     metrics::describe_counter!(TURNS_TOTAL, "Total turns by path and outcome");
     metrics::describe_counter!(
+        TTS_CHARS_TOTAL,
+        "Characters submitted to TTS synthesis, per provider (D-G9)"
+    );
+    metrics::describe_counter!(
+        LLM_TOKENS_TOTAL,
+        "LLM token usage by kind (prompt/completion/cache_read/cache_creation/reasoning), per provider (D-G9)"
+    );
+    metrics::describe_counter!(
         TURN_BOTTLENECK_TOTAL,
         "Dominant-stage tally for completed turns"
     );
@@ -345,6 +361,21 @@ pub fn set_circuit_breaker_state(provider: &str, state_code: u8) {
 /// Record a reconnect attempt outcome on `waav_reconnects_total`. `outcome` is one of
 /// `success` / `failure` / `exhausted` / `circuit_open`. Emitted from the streaming reconnect
 /// path so reconnects are observable (W-C1).
+/// D-G9: count TTS characters (call with `text.len()` at submit time).
+pub fn count_tts_chars(provider: &str, chars: usize) {
+    counter!(TTS_CHARS_TOTAL, "provider" => provider.to_string()).increment(chars as u64);
+}
+
+/// D-G9: count LLM tokens of one kind (emit only kinds the wire reported).
+pub fn count_llm_tokens(provider: &str, kind: &'static str, tokens: u64) {
+    counter!(
+        LLM_TOKENS_TOTAL,
+        "provider" => provider.to_string(),
+        "kind" => kind,
+    )
+    .increment(tokens);
+}
+
 pub fn record_reconnect(provider: &str, outcome: &str) {
     counter!(
         RECONNECTS_TOTAL,
@@ -475,6 +506,38 @@ mod tests {
         assert!(
             text.contains("unit-provider"),
             "provider label present in exposition"
+        );
+    }
+
+    /// D-G9: TTS chars accumulate by text length; LLM tokens split by kind
+    /// and only wire-reported kinds appear.
+    #[test]
+    fn dg9_usage_series_render() {
+        let _ = metrics_handle();
+        count_tts_chars("unit-tts", 27);
+        count_tts_chars("unit-tts", 13);
+        count_llm_tokens("unit-llm", "prompt", 100);
+        count_llm_tokens("unit-llm", "completion", 40);
+        count_llm_tokens("unit-llm", "reasoning", 7);
+
+        let text = render();
+        let chars_line = text
+            .lines()
+            .find(|l| l.starts_with(TTS_CHARS_TOTAL) && l.contains("unit-tts"))
+            .expect("tts chars series present");
+        assert!(chars_line.ends_with(" 40"), "27+13 chars: {chars_line}");
+        assert!(
+            text.lines().any(|l| l.contains(LLM_TOKENS_TOTAL)
+                && l.contains("unit-llm")
+                && l.contains("kind=\"reasoning\"")
+                && l.ends_with(" 7")),
+            "reasoning kind present with its count"
+        );
+        assert!(
+            !text.lines().any(|l| l.contains(LLM_TOKENS_TOTAL)
+                && l.contains("unit-llm")
+                && l.contains("kind=\"cache_read\"")),
+            "kinds the wire never reported must not appear"
         );
     }
 

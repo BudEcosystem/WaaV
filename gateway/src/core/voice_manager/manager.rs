@@ -643,6 +643,11 @@ impl VoiceManager {
         if let Some(obs) = self.observers.read().clone() {
             obs.notify_tts_request(crate::core::observability::now_monotonic_ns());
         }
+        // D-G9: synthesis cost proxy.
+        crate::core::metrics::bridge::count_tts_chars(
+            &self.config.tts_config.provider,
+            text.len(),
+        );
         // Send text to TTS provider
         {
             let mut tts = self.tts.write().await;
@@ -740,7 +745,9 @@ impl VoiceManager {
         // the audio-buffer clear or the state reset below, or the stale
         // playout deadline survives the barge-in (review wf_5772cd64 #10).
         let mut tts = self.tts.write().await;
-        if let Err(e) = tts.clear().await {
+        // D-G7: the standardized context seam — defaults to clear(), but
+        // context-aware WS providers cancel the SPECIFIC server context.
+        if let Err(e) = tts.on_audio_context_interrupted(None).await {
             warn!(error = %e, "TTS provider clear failed; continuing barge-in cleanup");
         }
         // Invalidate epoch-gated speaks WHILE holding the TTS lock: any

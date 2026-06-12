@@ -404,6 +404,28 @@ pub struct Usage {
 // Client configuration + per-session history
 // =============================================================================
 
+/// D-G9: export wire-reported token usage as counters. Kinds beyond
+/// prompt/completion come from the details objects (cached_tokens,
+/// reasoning_tokens) and are emitted ONLY when the wire carried them.
+fn export_usage_metrics(provider: &str, usage: &Usage) {
+    use crate::core::metrics::bridge::count_llm_tokens;
+    count_llm_tokens(provider, "prompt", usage.prompt_tokens as u64);
+    count_llm_tokens(provider, "completion", usage.completion_tokens as u64);
+    if let Some(d) = &usage.prompt_tokens_details {
+        if let Some(n) = d.get("cached_tokens").and_then(|v| v.as_u64()) {
+            count_llm_tokens(provider, "cache_read", n);
+        }
+        if let Some(n) = d.get("cache_creation_tokens").and_then(|v| v.as_u64()) {
+            count_llm_tokens(provider, "cache_creation", n);
+        }
+    }
+    if let Some(d) = &usage.completion_tokens_details
+        && let Some(n) = d.get("reasoning_tokens").and_then(|v| v.as_u64())
+    {
+        count_llm_tokens(provider, "reasoning", n);
+    }
+}
+
 /// LLM client configuration. Field-compatible with the former
 /// `LlmEndpointConfig` so the DAG node can keep deserializing the same JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -882,7 +904,12 @@ impl LlmClient {
             content: parsed.message.content.clone().unwrap_or_default(),
             finish_reason: parsed.finish_reason,
             tool_calls: parsed.message.tool_calls.clone().unwrap_or_default(),
-            usage: parsed.usage,
+            usage: {
+                if let Some(u) = &parsed.usage {
+                    export_usage_metrics(self.adapter.kind().as_str(), u);
+                }
+                parsed.usage
+            },
         })
     }
 
@@ -971,7 +998,12 @@ impl LlmClient {
             content: parsed.message.content.clone().unwrap_or_default(),
             finish_reason: parsed.finish_reason,
             tool_calls: parsed.message.tool_calls.clone().unwrap_or_default(),
-            usage: parsed.usage,
+            usage: {
+                if let Some(u) = &parsed.usage {
+                    export_usage_metrics(self.adapter.kind().as_str(), u);
+                }
+                parsed.usage
+            },
         })
     }
 

@@ -394,6 +394,25 @@ pub trait BaseTTS: Send + Sync {
         }
     }
 
+    /// An audio CONTEXT was interrupted (barge-in) — Pipecat's
+    /// `on_audio_context_interrupted`, standardized for all providers
+    /// (D-G7). `context_id = None` ⇒ everything. Default delegates to
+    /// [`Self::clear`]; context-aware WebSocket providers override to cancel
+    /// the specific server-side context.
+    async fn on_audio_context_interrupted(
+        &mut self,
+        _context_id: Option<&str>,
+    ) -> TTSResult<()> {
+        self.clear().await
+    }
+
+    /// An audio context PLAYED TO COMPLETION — free any server-side
+    /// resources tied to it (D-G7). Default no-op; context-aware WebSocket
+    /// providers override (e.g. send a context-close frame).
+    async fn on_audio_context_completed(&mut self, _context_id: &str) -> TTSResult<()> {
+        Ok(())
+    }
+
     /// Flush the TTS provider
     ///
     /// Forces any queued text to be processed immediately.
@@ -624,6 +643,32 @@ mod tests {
         let result = tts.speak("Hello", false).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), TTSError::ProviderNotReady(_)));
+    }
+
+    /// D-G7: the default context-interrupted hook IS clear() — barge-in
+    /// behavior unchanged for all non-context providers.
+    #[tokio::test]
+    async fn default_interrupted_delegates_to_clear() {
+        let config = TTSConfig::default();
+        let mut tts = MockTTS::new(config).unwrap();
+        tts.connect().await.unwrap();
+        // MockTTS::clear errors when not ready; ready → Ok. Delegation is
+        // observable through identical Result behavior on both paths.
+        assert!(tts.on_audio_context_interrupted(None).await.is_ok());
+        tts.disconnect().await.unwrap();
+        assert_eq!(
+            tts.clear().await.is_err(),
+            tts.on_audio_context_interrupted(None).await.is_err(),
+            "interrupted must follow clear()'s behavior exactly"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_default_is_noop() {
+        let config = TTSConfig::default();
+        let mut tts = MockTTS::new(config).unwrap();
+        // Never connected: a no-op must still succeed (frees nothing).
+        assert!(tts.on_audio_context_completed("ctx-1").await.is_ok());
     }
 
     // --- AudioData::playback_ms: the standardized chunk-duration math

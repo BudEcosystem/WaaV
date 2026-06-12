@@ -475,6 +475,71 @@ pub struct STTConfig {
     pub model: String,
 }
 
+/// Sparse mid-call settings delta (D-G6): `None` = not in the delta.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SttSettingsDelta {
+    pub model: Option<String>,
+    pub language: Option<String>,
+    pub encoding: Option<String>,
+    pub sample_rate: Option<u32>,
+    pub punctuation: Option<bool>,
+    /// Provider-specific overflow (forwarded opaque; never
+    /// connection-relevant by itself).
+    #[serde(default)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+impl SttSettingsDelta {
+    /// The fields whose change requires a transport reconnect.
+    pub fn is_connection_relevant(field: &str) -> bool {
+        matches!(field, "model" | "language" | "encoding" | "sample_rate")
+    }
+
+    /// Merge into `base`, returning (merged, changed-field names). A field
+    /// present in the delta but EQUAL to the current value does not count
+    /// as changed (no spurious reconnects).
+    pub fn merge_into(
+        &self,
+        mut base: STTConfig,
+    ) -> (STTConfig, std::collections::HashSet<&'static str>) {
+        let mut changed = std::collections::HashSet::new();
+        if let Some(v) = &self.model
+            && *v != base.model
+        {
+            base.model = v.clone();
+            changed.insert("model");
+        }
+        if let Some(v) = &self.language
+            && *v != base.language
+        {
+            base.language = v.clone();
+            changed.insert("language");
+        }
+        if let Some(v) = &self.encoding
+            && *v != base.encoding
+        {
+            base.encoding = v.clone();
+            changed.insert("encoding");
+        }
+        if let Some(v) = self.sample_rate
+            && v != base.sample_rate
+        {
+            base.sample_rate = v;
+            changed.insert("sample_rate");
+        }
+        if let Some(v) = self.punctuation
+            && v != base.punctuation
+        {
+            base.punctuation = v;
+            changed.insert("punctuation");
+        }
+        if !self.extra.is_empty() {
+            changed.insert("extra");
+        }
+        (base, changed)
+    }
+}
+
 impl Default for STTConfig {
     fn default() -> Self {
         Self {
@@ -590,6 +655,42 @@ pub trait BaseSTT: Send + Sync {
     /// # Returns
     /// * `Result<(), STTError>` - Success or error
     async fn update_config(&mut self, config: STTConfig) -> Result<(), STTError>;
+
+    /// Apply a SPARSE mid-call settings delta (D-G6, Pipecat
+    /// `ServiceSettings` parity): merge ONLY the given fields into the
+    /// current config and reconnect ONLY when a connection-relevant field
+    /// (model/language/encoding/sample_rate) changed. Returns the set of
+    /// field names that actually changed. The merge/decide logic lives HERE
+    /// in the base (standardized for all providers); providers only execute
+    /// the resulting full-config update.
+    async fn apply_settings_delta(
+        &mut self,
+        delta: SttSettingsDelta,
+    ) -> Result<std::collections::HashSet<&'static str>, STTError> {
+        let Some(current) = self.get_config().cloned() else {
+            return Err(STTError::ConfigurationError(
+                "no current config to apply a settings delta to".into(),
+            ));
+        };
+        let (merged, changed) = delta.merge_into(current);
+        if changed.is_empty() {
+            return Ok(changed);
+        }
+        if changed.iter().any(|f| SttSettingsDelta::is_connection_relevant(f)) {
+            // Full update (providers reconnect inside update_config).
+            self.update_config(merged).await?;
+        } else {
+            // Non-connection knob: store without touching the transport.
+            self.set_config_only(merged);
+        }
+        Ok(changed)
+    }
+
+    /// Store a merged config WITHOUT reconnecting (D-G6 non-connection
+    /// path). Default falls back to nothing (providers that can't update
+    /// in place simply keep serving with prior settings until reconnect);
+    /// providers with an owned config override to persist it.
+    fn set_config_only(&mut self, _config: STTConfig) {}
 
     /// Get provider-specific information
     fn get_provider_info(&self) -> &'static str;
@@ -723,6 +824,8 @@ mod tests {
         config: Option<STTConfig>,
         connected: AtomicBool,
         callback: Option<STTResultCallback>,
+        /// D-G6 test instrumentation: full-config updates (= reconnects).
+        reconnects: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -732,6 +835,7 @@ mod tests {
                 config: Some(config),
                 connected: AtomicBool::new(false),
                 callback: None,
+                reconnects: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
@@ -784,6 +888,7 @@ mod tests {
 
         async fn update_config(&mut self, config: STTConfig) -> Result<(), STTError> {
             if self.is_ready() {
+                self.reconnects.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.config = Some(config);
                 Ok(())
             } else {
@@ -791,9 +896,94 @@ mod tests {
             }
         }
 
+        fn set_config_only(&mut self, config: STTConfig) {
+            self.config = Some(config);
+        }
+
         fn get_provider_info(&self) -> &'static str {
             "MockSTT v1.0"
         }
+    }
+
+    // --- D-G6: sparse settings delta ---
+
+    fn base_cfg() -> STTConfig {
+        STTConfig {
+            model: "nova-3".to_string(),
+            provider: "mock".to_string(),
+            api_key: "k".to_string(),
+            language: "en-US".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "linear16".to_string(),
+        }
+    }
+
+    #[test]
+    fn delta_merges_only_given_fields_and_returns_changed_set() {
+        let delta = SttSettingsDelta {
+            language: Some("hi".into()),
+            punctuation: Some(false),
+            ..Default::default()
+        };
+        let (merged, changed) = delta.merge_into(base_cfg());
+        assert_eq!(merged.language, "hi");
+        assert!(!merged.punctuation);
+        assert_eq!(merged.model, "nova-3", "absent fields untouched");
+        assert_eq!(merged.sample_rate, 16000);
+        assert_eq!(
+            changed,
+            ["language", "punctuation"].into_iter().collect::<std::collections::HashSet<_>>()
+        );
+
+        // A field present but EQUAL to the current value is NOT a change.
+        let noop = SttSettingsDelta { language: Some("en-US".into()), ..Default::default() };
+        let (_, changed) = noop.merge_into(base_cfg());
+        assert!(changed.is_empty(), "equal-value delta must be a no-op");
+    }
+
+    #[tokio::test]
+    async fn non_connection_field_does_not_reconnect() {
+        let mut stt = MockSTT::new(base_cfg()).unwrap();
+        stt.connect().await.unwrap();
+        let delta = SttSettingsDelta { punctuation: Some(false), ..Default::default() };
+        let changed = stt.apply_settings_delta(delta).await.unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(
+            stt.reconnects.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a non-connection knob must NOT reconnect"
+        );
+        assert!(!stt.get_config().unwrap().punctuation, "but it must be stored");
+    }
+
+    #[tokio::test]
+    async fn connection_field_triggers_reconnect() {
+        let mut stt = MockSTT::new(base_cfg()).unwrap();
+        stt.connect().await.unwrap();
+        let delta = SttSettingsDelta { language: Some("hi".into()), ..Default::default() };
+        let changed = stt.apply_settings_delta(delta).await.unwrap();
+        assert!(changed.contains("language"));
+        assert_eq!(
+            stt.reconnects.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "exactly ONE reconnect for a connection-relevant change"
+        );
+        assert_eq!(stt.get_config().unwrap().language, "hi");
+    }
+
+    #[test]
+    fn extra_overflow_roundtrips() {
+        let mut delta = SttSettingsDelta::default();
+        delta.extra.insert("keyterms".into(), serde_json::json!(["WaaV"]));
+        let json = serde_json::to_string(&delta).unwrap();
+        let back: SttSettingsDelta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.extra["keyterms"], serde_json::json!(["WaaV"]));
+        // extra alone marks a change but is never connection-relevant.
+        let (_, changed) = back.merge_into(base_cfg());
+        assert_eq!(changed, ["extra"].into_iter().collect());
+        assert!(!SttSettingsDelta::is_connection_relevant("extra"));
     }
 
     #[tokio::test]
