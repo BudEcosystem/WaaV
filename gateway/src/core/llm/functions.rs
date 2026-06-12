@@ -149,6 +149,19 @@ impl FunctionRegistry {
         self.items.write().remove(name).is_some()
     }
 
+    /// Replace the ENTIRE tool set in one write-lock acquisition (B-G3
+    /// flows: tools must swap atomically with the node's context — a
+    /// request rendered mid-swap must never see a mix of old and new
+    /// node tools).
+    pub fn swap_tools(&self, items: Vec<RegistryItem>) {
+        let mut map = self.items.write();
+        map.clear();
+        for item in items {
+            let name = item.definition.function.name.clone();
+            map.insert(name, Arc::new(item));
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.items.read().is_empty()
     }
@@ -301,7 +314,9 @@ pub async fn run_tool_loop(
 }
 
 /// Execute one batch; returns one JSON value per call, in order.
-async fn execute_batch(
+/// `pub(crate)`: the flow layer (B-G3) runs its OWN loop around this — an
+/// edge transition must NOT re-infer on the old node's context.
+pub(crate) async fn execute_batch(
     registry: &Arc<FunctionRegistry>,
     session_id: &str,
     batch: &[ToolCall],

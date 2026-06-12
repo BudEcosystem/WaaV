@@ -535,6 +535,17 @@ impl ConversationHistory {
     pub fn clear(&mut self) {
         self.messages.clear();
     }
+
+    /// Replace the leading system message, or insert one at the front
+    /// (B-G3 `role_message` persistence).
+    pub fn upsert_system(&mut self, content: &str) {
+        match self.messages.first_mut() {
+            Some(m) if m.role == MessageRole::System => {
+                m.content = Some(content.to_string());
+            }
+            _ => self.messages.insert(0, ChatMessage::system(content)),
+        }
+    }
 }
 
 /// Result of an LLM turn.
@@ -1139,6 +1150,42 @@ impl LlmClient {
         if let Some(history) = histories.get_mut(session_id) {
             history.add(ChatMessage::tool(tool_call_id, result));
         }
+    }
+
+    /// Append messages to a session's context (B-G3 flows: APPEND strategy /
+    /// task messages). Creates the session entry if missing.
+    pub async fn append_context(&self, session_id: &str, messages: Vec<ChatMessage>) {
+        let mut histories = self.histories.write().await;
+        let history = histories
+            .entry(session_id.to_string())
+            .or_insert_with(|| ConversationHistory::new(self.config.max_history));
+        for m in messages {
+            history.add(m);
+        }
+    }
+
+    /// REPLACE a session's context wholesale (B-G3 flows: RESET strategy).
+    pub async fn set_context(&self, session_id: &str, messages: Vec<ChatMessage>) {
+        let mut histories = self.histories.write().await;
+        let history = histories
+            .entry(session_id.to_string())
+            .or_insert_with(|| ConversationHistory::new(self.config.max_history));
+        history.clear();
+        for m in messages {
+            history.add(m);
+        }
+    }
+
+    /// Set/replace the session's SYSTEM instruction in place (B-G3
+    /// `role_message`): replaces the leading system message, or inserts one
+    /// at the front. The canonical context stays vendor-neutral — each
+    /// adapter renders system placement its own way.
+    pub async fn upsert_system(&self, session_id: &str, content: &str) {
+        let mut histories = self.histories.write().await;
+        let history = histories
+            .entry(session_id.to_string())
+            .or_insert_with(|| ConversationHistory::new(self.config.max_history));
+        history.upsert_system(content);
     }
 
     /// Clear a session's conversation history (keeps the entry).

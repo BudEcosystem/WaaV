@@ -2,6 +2,7 @@ pub mod audio;
 pub mod cache;
 pub mod conversation;
 pub mod emotion;
+pub mod flow;
 pub mod llm;
 pub mod metrics;
 // Canonical SSRF/URL validation shared by the DAG endpoint nodes, the
