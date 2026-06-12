@@ -313,6 +313,7 @@ fn conv_config(base_url: String, streaming: bool) -> ConversationConfig {
         barge_in_min_words: None,
         summarize_target_tokens: 0,
         mute_strategy: None,
+        strip_markdown: true,
     }
 }
 

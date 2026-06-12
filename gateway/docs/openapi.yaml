@@ -690,6 +690,12 @@ components:
         streaming:
           type: boolean
           description: Stream tokens to TTS as they arrive (default true).
+        strip_markdown:
+          type: boolean
+          description: |-
+            Strip markdown (bold/code/links/headings) from LLM sentences before
+            TTS (C-G4). Default true — spoken asterisks and URLs ruin voice
+            output.
         summarize_target_tokens:
           type: integer
           description: |-

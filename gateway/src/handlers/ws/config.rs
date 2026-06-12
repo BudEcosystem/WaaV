@@ -123,6 +123,16 @@ pub struct ConversationWebSocketConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(example = "until_first_bot_complete"))]
     pub mute_strategy: Option<String>,
+
+    /// Strip markdown (bold/code/links/headings) from LLM sentences before
+    /// TTS (C-G4). Default true — spoken asterisks and URLs ruin voice
+    /// output.
+    #[serde(default = "default_strip_markdown")]
+    pub strip_markdown: bool,
+}
+
+fn default_strip_markdown() -> bool {
+    true
 }
 
 fn default_conversation_streaming() -> bool {
@@ -155,6 +165,7 @@ impl ConversationWebSocketConfig {
             barge_in_min_words: self.barge_in_min_words,
             summarize_target_tokens: self.summarize_target_tokens,
             mute_strategy: self.mute_strategy.clone(),
+            strip_markdown: self.strip_markdown,
         }
     }
 }

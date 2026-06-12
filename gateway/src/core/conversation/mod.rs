@@ -97,6 +97,10 @@ pub struct ConversationConfig {
     pub summarize_target_tokens: usize,
     /// User-mute strategy name (A-G5); see the WS config for values.
     pub mute_strategy: Option<String>,
+    /// Strip markdown from sentences before TTS (C-G4): `**bold**`, code
+    /// ticks, links, headings — spoken asterisks/URLs ruin voice output.
+    /// Default ON.
+    pub strip_markdown: bool,
 }
 
 impl Default for ConversationConfig {
@@ -116,6 +120,7 @@ impl Default for ConversationConfig {
             barge_in_min_words: None,
             summarize_target_tokens: 0,
             mute_strategy: None,
+            strip_markdown: true,
         }
     }
 }
@@ -353,6 +358,7 @@ impl ConversationOrchestrator {
             let vm_pump = vm.clone();
             let spoke_pump = spoke.clone();
             let obs_pump = observers.clone();
+            let strip_md = self.config.strip_markdown;
             let handle = tokio::spawn(async move {
                 let mut agg = crate::core::text::SentenceAggregator::default();
 
@@ -361,9 +367,17 @@ impl ConversationOrchestrator {
                     text: String,
                     allow_interruption: bool,
                     epoch: usize,
+                    strip_markdown: bool,
                     spoke: &std::sync::atomic::AtomicBool,
                     obs: &Option<Arc<crate::core::observability::ObserverRegistry>>,
                 ) -> bool {
+                    // C-G4: strip markdown on the COMPLETE sentence (the
+                    // aggregator's unit — per-token would tear ** pairs).
+                    let text = if strip_markdown {
+                        crate::core::text::strip_markdown_for_tts(&text)
+                    } else {
+                        text
+                    };
                     if text.trim().is_empty() {
                         return true;
                     }
@@ -404,7 +418,7 @@ impl ConversationOrchestrator {
                                     if token_for_cb.is_cancelled() {
                                         break 'pump;
                                     }
-                                    if !speak_sentence(&vm_pump, sentence, allow_interruption, epoch, &spoke_pump, &obs_pump).await {
+                                    if !speak_sentence(&vm_pump, sentence, allow_interruption, epoch, strip_md, &spoke_pump, &obs_pump).await {
                                         break 'pump;
                                     }
                                 }
@@ -416,7 +430,7 @@ impl ConversationOrchestrator {
                                 if !token_for_cb.is_cancelled()
                                     && let Some(tail) = agg.flush()
                                 {
-                                    let _ = speak_sentence(&vm_pump, tail, allow_interruption, epoch, &spoke_pump, &obs_pump).await;
+                                    let _ = speak_sentence(&vm_pump, tail, allow_interruption, epoch, strip_md, &spoke_pump, &obs_pump).await;
                                 }
                                 break;
                             }
@@ -508,9 +522,14 @@ impl ConversationOrchestrator {
                     true
                 };
                 if need_fallback_speak && !content_empty {
+                    let speak_text = if self.config.strip_markdown {
+                        crate::core::text::strip_markdown_for_tts(&response.content)
+                    } else {
+                        response.content.clone()
+                    };
                     match self
                         .voice_manager
-                        .speak_if_epoch(&response.content, true, allow_interruption, epoch)
+                        .speak_if_epoch(&speak_text, true, allow_interruption, epoch)
                         .await
                     {
                         Ok(true) => Ok(()),
@@ -760,6 +779,11 @@ impl ConversationOrchestrator {
                     let mut sentences = agg.push_str(&content);
                     sentences.extend(agg.flush());
                     for sentence in sentences {
+                        let sentence = if self.config.strip_markdown {
+                            crate::core::text::strip_markdown_for_tts(&sentence)
+                        } else {
+                            sentence
+                        };
                         match self
                             .voice_manager
                             .speak_if_epoch(
