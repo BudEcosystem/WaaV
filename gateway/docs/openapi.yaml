@@ -667,6 +667,18 @@ components:
           type: string
           description: Model identifier.
           example: gpt-4o-mini
+        mute_strategy:
+          type:
+          - string
+          - 'null'
+          description: |-
+            User-mute strategy (A-G5): while active, USER INPUT is suppressed
+            (bot/lifecycle signals always flow).
+            `"always_while_bot_speaks"` = no barge-in at all;
+            `"until_first_bot_complete"` = greeting/disclaimer guard;
+            `"first_speech_only"` = only the first user utterance passes.
+            Omitted = no muting (barge-in works normally).
+          example: until_first_bot_complete
         provider_kind:
           type:
           - string

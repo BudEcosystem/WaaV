@@ -95,6 +95,8 @@ pub struct ConversationConfig {
     /// token ESTIMATE crosses this value, the oldest messages are
     /// summarized after the turn (system + recent kept). `0` = off.
     pub summarize_target_tokens: usize,
+    /// User-mute strategy name (A-G5); see the WS config for values.
+    pub mute_strategy: Option<String>,
 }
 
 impl Default for ConversationConfig {
@@ -113,6 +115,7 @@ impl Default for ConversationConfig {
             provider_kind: None,
             barge_in_min_words: None,
             summarize_target_tokens: 0,
+            mute_strategy: None,
         }
     }
 }

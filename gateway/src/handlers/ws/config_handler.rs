@@ -413,6 +413,25 @@ async fn initialize_conversation_loop(
             }
             _ => Box::new(crate::core::turn::strategies::AnySpeechStart),
         };
+    // A-G5: optional user-mute strategy (OR-combined in the controller;
+    // user input drops while active, lifecycle signals always flow).
+    let mute_strategies: Vec<Box<dyn crate::core::turn::UserMuteStrategy>> =
+        match conv_config.mute_strategy.as_deref() {
+            Some("always_while_bot_speaks") => vec![Box::new(
+                crate::core::turn::strategies::AlwaysMuteWhileBotSpeaks,
+            )],
+            Some("until_first_bot_complete") => vec![Box::new(
+                crate::core::turn::strategies::MuteUntilFirstBotComplete::default(),
+            )],
+            Some("first_speech_only") => vec![Box::new(
+                crate::core::turn::strategies::FirstSpeechMute::default(),
+            )],
+            Some(other) => {
+                warn!(strategy = other, "unknown mute_strategy; muting disabled");
+                vec![]
+            }
+            None => vec![],
+        };
     let vm_probe = voice_manager.clone();
     let orch_probe = orchestrator.clone();
     let turn_controller = Arc::new(
@@ -422,7 +441,7 @@ async fn initialize_conversation_loop(
                 Box::new(crate::core::turn::strategies::EagerSmartTurnSpeculate),
                 Box::new(crate::core::turn::strategies::LegacySpeechFinalStop),
             ],
-            vec![],
+            mute_strategies,
         )
         // Bot-BUSY truth: audibly speaking OR an LLM turn in flight — the
         // TTFT thinking window must keep the MinWords gate up (a backchannel

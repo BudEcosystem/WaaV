@@ -4,6 +4,11 @@
 
 pub mod legacy;
 pub mod min_words;
+pub mod mute;
 
 pub use legacy::{AnySpeechStart, EagerSmartTurnSpeculate, LegacySpeechFinalStop};
 pub use min_words::MinWordsStart;
+pub use mute::{
+    AlwaysMuteWhileBotSpeaks, FirstSpeechMute, FunctionCallActivity, FunctionCallGuard,
+    FunctionCallMute, MuteUntilFirstBotComplete,
+};

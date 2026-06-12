@@ -113,6 +113,16 @@ pub struct ConversationWebSocketConfig {
     #[serde(default)]
     #[cfg_attr(feature = "openapi", schema(example = 6000))]
     pub summarize_target_tokens: usize,
+
+    /// User-mute strategy (A-G5): while active, USER INPUT is suppressed
+    /// (bot/lifecycle signals always flow).
+    /// `"always_while_bot_speaks"` = no barge-in at all;
+    /// `"until_first_bot_complete"` = greeting/disclaimer guard;
+    /// `"first_speech_only"` = only the first user utterance passes.
+    /// Omitted = no muting (barge-in works normally).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(example = "until_first_bot_complete"))]
+    pub mute_strategy: Option<String>,
 }
 
 fn default_conversation_streaming() -> bool {
@@ -144,6 +154,7 @@ impl ConversationWebSocketConfig {
             provider_kind: self.provider_kind,
             barge_in_min_words: self.barge_in_min_words,
             summarize_target_tokens: self.summarize_target_tokens,
+            mute_strategy: self.mute_strategy.clone(),
         }
     }
 }
