@@ -423,6 +423,33 @@ impl ConversationOrchestrator {
             let _ = handle.await;
         }
 
+        // B-G4: a tool-call response runs the server-side tool loop (every
+        // batch's results land in history, then ONE re-inference) while the
+        // turn is still active — the bot-busy probe must stay up through
+        // tool execution, exactly like the thinking window. The loop's final
+        // content lands on the normal speak path below (the streaming pump
+        // saw no text for a tool-call response, so the !spoke fallback
+        // speaks it).
+        let result = match result {
+            Ok(response)
+                if !response.tool_calls.is_empty() && self.llm.functions().is_some() =>
+            {
+                let registry =
+                    Arc::clone(self.llm.functions().expect("guarded by condition"));
+                crate::core::llm::run_tool_loop(
+                    &self.llm,
+                    &registry,
+                    &self.session_id,
+                    response,
+                    self.config.api_key.as_deref(),
+                    &token,
+                    crate::core::llm::ToolLoopOptions::default(),
+                )
+                .await
+            }
+            other => other,
+        };
+
         self.end_turn(id);
 
         match result {
@@ -511,7 +538,23 @@ impl ConversationOrchestrator {
             let result = llm
                 .complete_staged(&session_id, &text_owned, api_key.as_deref(), &task_token, None)
                 .await;
-            *response_store.lock() = Some(result.map(|r| r.content).map_err(|_| ()));
+            *response_store.lock() = Some(
+                result
+                    .map(|r| {
+                        if r.tool_calls.is_empty() {
+                            r.content
+                        } else {
+                            // A speculative TOOL turn is never confirmed:
+                            // executing side effects on a prediction is
+                            // wrong, and committing the text half without
+                            // running the tools is worse. Empty content
+                            // makes confirmation fall through to a real
+                            // turn, where the tool loop runs (B-G4).
+                            String::new()
+                        }
+                    })
+                    .map_err(|_| ()),
+            );
         });
         *guard = Some(EagerTurn {
             transcript: text.to_string(),

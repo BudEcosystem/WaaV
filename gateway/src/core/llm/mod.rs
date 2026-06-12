@@ -27,8 +27,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 
 pub mod adapter;
+pub mod functions;
 
 pub use adapter::{AdapterKind, LlmAdapter, LlmStreamEvent};
+pub use functions::{
+    CANCEL_ASYNC_TOOL_NAME, FunctionCallParams, FunctionHandler, FunctionRegistry,
+    FunctionResult, RegistryItem, ToolLoopOptions, run_tool_loop,
+};
 
 /// Whitelisted environment variables that can be accessed via `${VAR}` syntax.
 ///
@@ -570,6 +575,10 @@ pub struct LlmClient {
     /// Per-session conversation history, keyed by session/stream id. Isolated so
     /// one user's context never leaks into another's.
     histories: Arc<RwLock<HashMap<String, ConversationHistory>>>,
+    /// Server-side tool registry (B-G4). When set, its definitions are
+    /// advertised in EVERY request (merged after `config.tools`) — the same
+    /// registry drives `run_tool_loop` after a tool-call response.
+    functions: Option<Arc<functions::FunctionRegistry>>,
 }
 
 impl std::fmt::Debug for LlmClient {
@@ -599,7 +608,20 @@ impl LlmClient {
             client,
             adapter,
             histories: Arc::new(RwLock::new(HashMap::new())),
+            functions: None,
         }
+    }
+
+    /// Attach a server-side function registry (B-G4): its tools are
+    /// advertised in every request and executed by [`run_tool_loop`].
+    pub fn with_functions(mut self, registry: Arc<functions::FunctionRegistry>) -> Self {
+        self.functions = Some(registry);
+        self
+    }
+
+    /// The attached function registry, if any.
+    pub fn functions(&self) -> Option<&Arc<functions::FunctionRegistry>> {
+        self.functions.as_ref()
     }
 
     /// Clone this client speaking a DIFFERENT vendor wire format while
@@ -614,6 +636,7 @@ impl LlmClient {
             config,
             client: self.client.clone(),
             histories: Arc::clone(&self.histories),
+            functions: self.functions.clone(),
         }
     }
 
@@ -669,7 +692,22 @@ impl LlmClient {
         stream: bool,
         api_key: Option<&str>,
     ) -> reqwest::RequestBuilder {
-        let rendered = self.adapter.render_request(messages, &self.config, stream, api_key);
+        // B-G4: advertise registry tools in every request. Config-declared
+        // tools come first; registry definitions are appended (and the
+        // builtin cancel tool rides along while async tools exist).
+        let cfg_with_tools;
+        let cfg = match &self.functions {
+            Some(reg) if !reg.is_empty() => {
+                let mut tools = self.config.tools.clone().unwrap_or_default();
+                tools.extend(reg.request_tools());
+                let mut c = self.config.clone();
+                c.tools = Some(tools);
+                cfg_with_tools = c;
+                &cfg_with_tools
+            }
+            _ => &self.config,
+        };
+        let rendered = self.adapter.render_request(messages, cfg, stream, api_key);
         let mut req = self
             .client
             .post(&rendered.url)
@@ -695,13 +733,19 @@ impl LlmClient {
     async fn prepare_messages(
         &self,
         session_id: &str,
-        input: &str,
+        input: Option<&str>,
         staged: bool,
     ) -> Vec<ChatMessage> {
         let mut histories = self.histories.write().await;
         let history = histories
             .entry(session_id.to_string())
             .or_insert_with(|| ConversationHistory::new(self.config.max_history));
+
+        // CONTINUE mode (B-G4 re-inference after tool results): the request
+        // is the stored history exactly as-is — no new user message.
+        let Some(input) = input else {
+            return history.messages().to_vec();
+        };
 
         if staged {
             let mut messages = history.messages().to_vec();
@@ -767,10 +811,31 @@ impl LlmClient {
         let resolved = self.resolve_api_key(api_key);
         let api_key = resolved.as_deref();
         if self.config.streaming {
-            self.complete_streaming(session_id, input, api_key, cancel, on_token, false)
+            self.complete_streaming(session_id, Some(input), api_key, cancel, on_token, false)
                 .await
         } else {
-            self.complete_sync(session_id, input, api_key, cancel, false).await
+            self.complete_sync(session_id, Some(input), api_key, cancel, false).await
+        }
+    }
+
+    /// Re-run inference from the stored history AS-IS — no new user message
+    /// (B-G4: the follow-up inference after tool results landed; also the
+    /// async-tool final delivery turn). The assistant reply is recorded into
+    /// history like any turn.
+    pub async fn continue_from_history(
+        &self,
+        session_id: &str,
+        api_key: Option<&str>,
+        cancel: &CancellationToken,
+        on_token: Option<TokenCallback>,
+    ) -> LlmResult<LlmResponse> {
+        let resolved = self.resolve_api_key(api_key);
+        let api_key = resolved.as_deref();
+        if self.config.streaming {
+            self.complete_streaming(session_id, None, api_key, cancel, on_token, false)
+                .await
+        } else {
+            self.complete_sync(session_id, None, api_key, cancel, false).await
         }
     }
 
@@ -788,10 +853,10 @@ impl LlmClient {
         let resolved = self.resolve_api_key(api_key);
         let api_key = resolved.as_deref();
         if self.config.streaming {
-            self.complete_streaming(session_id, input, api_key, cancel, on_token, true)
+            self.complete_streaming(session_id, Some(input), api_key, cancel, on_token, true)
                 .await
         } else {
-            self.complete_sync(session_id, input, api_key, cancel, true).await
+            self.complete_sync(session_id, Some(input), api_key, cancel, true).await
         }
     }
 
@@ -799,7 +864,7 @@ impl LlmClient {
     async fn complete_sync(
         &self,
         session_id: &str,
-        input: &str,
+        input: Option<&str>,
         api_key: Option<&str>,
         cancel: &CancellationToken,
         staged: bool,
@@ -846,7 +911,7 @@ impl LlmClient {
     async fn complete_streaming(
         &self,
         session_id: &str,
-        input: &str,
+        input: Option<&str>,
         api_key: Option<&str>,
         cancel: &CancellationToken,
         on_token: Option<TokenCallback>,

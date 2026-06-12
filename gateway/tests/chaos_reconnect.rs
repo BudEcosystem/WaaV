@@ -832,15 +832,14 @@ async fn spawn_replay_mock(proto: ReplayProto) -> (u16, Arc<Mutex<ReplayObservat
                             let tag = b.first().copied().unwrap_or(0);
                             obs.lock().await.audio_per_conn[which].push(b.to_vec());
                             match (which, tag) {
-                                (0, 0xA1) => {
-                                    // Ack everything so far: the client clears its ring.
+                                // Ack everything so far: the client clears its ring.
+                                (0, 0xA1)
                                     if write
                                         .send(Message::Text(final_frame(proto, 0).into()))
                                         .await
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
+                                        .is_err() =>
+                                {
+                                    return;
                                 }
                                 (0, 0xA3) => {
                                     // Mid-stream kill with 0xA2+0xA3 un-finalized.
