@@ -525,75 +525,118 @@ impl ConversationOrchestrator {
     ///   turn whose reply streams to TTS — unless a CONFIRMED eager speculation
     ///   already holds the reply, which is committed and spoken instead.
     pub async fn on_stt_result(&self, result: &STTResult) {
+        // Derive the same events the legacy policy produces and route them
+        // through the SINGLE event handler (A-G0): any non-empty speech is a
+        // potential barge-in; a finalized turn with content runs the LLM.
         let has_text = !result.transcript.trim().is_empty();
-
-        // Take the speculation BEFORE barge-in handling (which cancels eager
-        // turns) when this is the potentially-confirming final.
-        let eager = if result.is_speech_final && has_text {
-            self.eager.lock().take()
-        } else {
-            None
-        };
-
-        // Barge-in: new user speech arrives while the bot may be talking. Only
-        // meaningful when there is text (avoid clearing on empty interims).
+        let mut events = Vec::new();
         if has_text {
-            self.handle_barge_in().await;
+            events.push(crate::core::turn::TurnEvent::Started { turn_id: 0, interrupt: true });
+        }
+        if result.is_speech_final && has_text {
+            events.push(crate::core::turn::TurnEvent::Stopped {
+                turn_id: 0,
+                transcript: result.transcript.trim().to_string(),
+            });
+        }
+        self.handle_turn_events(&events).await;
+    }
+
+    /// Act on turn-decision events (from a [`crate::core::turn::TurnController`]
+    /// or the [`Self::on_stt_result`] compatibility derivation) — the SINGLE
+    /// place that owns the eager/barge-in ordering: the speculation is taken
+    /// BEFORE barge-in handling (which cancels eager turns) whenever the
+    /// batch finalizes a turn.
+    pub async fn handle_turn_events(&self, events: &[crate::core::turn::TurnEvent]) {
+        use crate::core::turn::TurnEvent;
+
+        let finalizing = events.iter().any(|e| matches!(e, TurnEvent::Stopped { .. }));
+        let mut eager = if finalizing { self.eager.lock().take() } else { None };
+
+        for event in events {
+            match event {
+                TurnEvent::Started { interrupt: true, .. } => {
+                    self.handle_barge_in().await;
+                }
+                TurnEvent::Started { .. } => {}
+                TurnEvent::Speculate { .. } => {
+                    // The signal rarely carries the full segment text; the
+                    // VoiceManager's turn buffer is the source of truth.
+                    let text = self.voice_manager.current_turn_text();
+                    if !text.trim().is_empty() {
+                        self.trigger_eager_turn(&text);
+                    }
+                }
+                TurnEvent::Stopped { transcript, .. } => {
+                    let transcript = transcript.trim().to_string();
+                    if !transcript.is_empty() {
+                        self.run_finalized_turn(&transcript, eager.take()).await;
+                    }
+                }
+                // No legacy consumers yet: ResetAggregation lands with the
+                // MinWords gate (A-G3), MuteChanged with the mute strategies
+                // (A-G5).
+                TurnEvent::ResetAggregation | TurnEvent::MuteChanged { .. } => {}
+            }
+        }
+        // A speculation taken for a batch whose Stopped carried no usable
+        // transcript must not silently leak: put it back untouched.
+        if let Some(e) = eager {
+            *self.eager.lock() = Some(e);
+        }
+    }
+
+    /// Run the finalized turn: confirm a held eager speculation when its
+    /// transcript matches, otherwise run a fresh LLM turn.
+    async fn run_finalized_turn(&self, transcript: &str, eager: Option<EagerTurn>) {
+        // Eager confirmation: prediction matched the final transcript →
+        // the held speculative reply IS the turn. Commit + speak.
+        if let Some(eager) = eager {
+            if eager.transcript == transcript {
+                let _ = eager.task.await;
+                let held = eager.response.lock().take();
+                if let Some(Ok(content)) = held
+                    && !content.trim().is_empty()
+                {
+                    self.llm
+                        .commit_turn(&self.session_id, transcript, &content)
+                        .await;
+                    // Speak through the SAME sentence aggregator as the
+                    // streaming pump: per-sentence chunks + the 160-char
+                    // cap apply to eager replies too (a single monolithic
+                    // speak() of a multi-sentence reply has worse first-
+                    // audio latency and one giant interruption window —
+                    // brutal-review finding, wf_0cc69d62).
+                    let mut agg = crate::core::text::SentenceAggregator::default();
+                    let mut sentences = agg.push_str(&content);
+                    sentences.extend(agg.flush());
+                    for sentence in sentences {
+                        let speak_res = if self.config.allow_interruption {
+                            self.voice_manager.speak(&sentence, true).await
+                        } else {
+                            self.voice_manager
+                                .speak_with_interruption(&sentence, true, false)
+                                .await
+                        };
+                        if let Err(e) = speak_res {
+                            warn!(session = %self.session_id, error = %e,
+                                  "speaking confirmed eager reply failed");
+                            break;
+                        }
+                    }
+                    debug!(session = %self.session_id, "eager turn confirmed and spoken");
+                    return;
+                }
+                // staged call failed/empty → fall through to a normal turn
+            } else {
+                eager.token.cancel();
+                debug!(session = %self.session_id,
+                       "eager speculation discarded (transcript diverged)");
+            }
         }
 
-        // Only fire the LLM→TTS pipeline on a finalized turn with real content.
-        if result.is_speech_final && has_text {
-            let transcript = result.transcript.trim().to_string();
-
-            // Eager confirmation: prediction matched the final transcript →
-            // the held speculative reply IS the turn. Commit + speak.
-            if let Some(eager) = eager {
-                if eager.transcript == transcript {
-                    let _ = eager.task.await;
-                    let held = eager.response.lock().take();
-                    if let Some(Ok(content)) = held
-                        && !content.trim().is_empty()
-                    {
-                        self.llm
-                            .commit_turn(&self.session_id, &transcript, &content)
-                            .await;
-                        // Speak through the SAME sentence aggregator as the
-                        // streaming pump: per-sentence chunks + the 160-char
-                        // cap apply to eager replies too (a single monolithic
-                        // speak() of a multi-sentence reply has worse first-
-                        // audio latency and one giant interruption window —
-                        // brutal-review finding, wf_0cc69d62).
-                        let mut agg = crate::core::text::SentenceAggregator::default();
-                        let mut sentences = agg.push_str(&content);
-                        sentences.extend(agg.flush());
-                        for sentence in sentences {
-                            let speak_res = if self.config.allow_interruption {
-                                self.voice_manager.speak(&sentence, true).await
-                            } else {
-                                self.voice_manager
-                                    .speak_with_interruption(&sentence, true, false)
-                                    .await
-                            };
-                            if let Err(e) = speak_res {
-                                warn!(session = %self.session_id, error = %e,
-                                      "speaking confirmed eager reply failed");
-                                break;
-                            }
-                        }
-                        debug!(session = %self.session_id, "eager turn confirmed and spoken");
-                        return;
-                    }
-                    // staged call failed/empty → fall through to a normal turn
-                } else {
-                    eager.token.cancel();
-                    debug!(session = %self.session_id,
-                           "eager speculation discarded (transcript diverged)");
-                }
-            }
-
-            if let Err(e) = self.run_turn(&transcript).await {
-                warn!(session = %self.session_id, error = %e, "conversation turn failed");
-            }
+        if let Err(e) = self.run_turn(transcript).await {
+            warn!(session = %self.session_id, error = %e, "conversation turn failed");
         }
     }
 

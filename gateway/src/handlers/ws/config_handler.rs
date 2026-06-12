@@ -382,20 +382,39 @@ async fn initialize_conversation_loop(
 
     // P1.2b eager end-of-turn: a smart-turn PREDICTION (turn-complete before
     // the provider's speech_final) starts a held+staged speculative LLM turn.
-    // No-op unless the conversation config opted in (eager_eot) — the gate
-    // lives in trigger_eager_turn. Provider-agnostic by construction.
+    // A-G0: the per-session turn-policy controller. The LEGACY strategy set
+    // replicates the previously hardcoded policy exactly (any non-empty
+    // speech = barge-in; speech_final with content = run the turn; smart-turn
+    // complete = eager speculation). Policy improvements (MinWords gate,
+    // TTFS-aware floor, mutes) land as strategy swaps here — never as new
+    // hardcoded branches.
+    let turn_controller = Arc::new(crate::core::turn::TurnController::new(
+        vec![Box::new(crate::core::turn::strategies::AnySpeechStart)],
+        vec![
+            Box::new(crate::core::turn::strategies::EagerSmartTurnSpeculate),
+            Box::new(crate::core::turn::strategies::LegacySpeechFinalStop),
+        ],
+        vec![],
+    ));
+
+    // Smart-turn verdicts feed the controller as an OPAQUE complete signal
+    // (the TurnDecisionEngine stays the detector); a Speculate event drives
+    // the eager path. No-op unless the conversation config opted in
+    // (eager_eot) — that gate lives in trigger_eager_turn.
     #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
     {
         let orch_eager = orchestrator.clone();
-        let vm_eager = voice_manager.clone();
+        let ctrl_eager = turn_controller.clone();
         if let Err(e) = voice_manager
             .on_smart_turn(move |result| {
                 let orch = orch_eager.clone();
-                let vm = vm_eager.clone();
+                let ctrl = ctrl_eager.clone();
                 Box::pin(async move {
-                    if result.is_turn_complete {
-                        let text = vm.current_turn_text();
-                        orch.trigger_eager_turn(&text);
+                    let events = ctrl.feed(&crate::core::turn::ControllerSignal::SmartTurn {
+                        is_complete: result.is_turn_complete,
+                    });
+                    if !events.is_empty() {
+                        orch.handle_turn_events(&events).await;
                     }
                 })
             })
@@ -410,14 +429,17 @@ async fn initialize_conversation_loop(
     // forwards the transcript and runs the loop, so there is no double delivery.)
     let message_tx_clone = message_tx.clone();
     let orch = orchestrator.clone();
+    let ctrl = turn_controller.clone();
     let register_result = voice_manager
         .on_stt_result(move |stt: STTResult| {
             let message_tx = message_tx_clone.clone();
             let orch = orch.clone();
+            let ctrl = ctrl.clone();
             Box::pin(async move {
-                // Transcript egress (interim + final), matching the simple path:
-                // the orchestrator REPLACES the default STT callback, so it must
-                // forward the transcript to the client itself.
+                // Transcript egress (interim + final) FIRST, as a synchronous
+                // side-effect of this callback — the actor-bug guardrail
+                // (PIPECAT_FIX_PLAN §6.2 X3): the controller only decides
+                // turn policy, it never owns transcript delivery.
                 let _ = message_tx
                     .send(MessageRoute::Outgoing(OutgoingMessage::STTResult {
                         transcript: stt.transcript.clone(),
@@ -427,9 +449,24 @@ async fn initialize_conversation_loop(
                     }))
                     .await;
 
-                // Drive the conversation loop (barge-in on any speech; LLM→TTS on
-                // a finalized turn).
-                orch.on_stt_result(&stt).await;
+                // Turn policy via the controller; the orchestrator acts on the
+                // events from THIS task (caller-fires-callback preserved).
+                let signal = if stt.is_final || stt.is_speech_final {
+                    crate::core::turn::ControllerSignal::SttFinal {
+                        text: stt.transcript.clone(),
+                        is_speech_final: stt.is_speech_final,
+                        is_finalized: stt.is_finalized,
+                    }
+                } else {
+                    crate::core::turn::ControllerSignal::SttInterim {
+                        text: stt.transcript.clone(),
+                        confidence: stt.confidence,
+                    }
+                };
+                let events = ctrl.feed(&signal);
+                if !events.is_empty() {
+                    orch.handle_turn_events(&events).await;
+                }
             })
         })
         .await;

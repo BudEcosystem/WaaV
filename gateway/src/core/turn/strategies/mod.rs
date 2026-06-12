@@ -4,4 +4,4 @@
 
 pub mod legacy;
 
-pub use legacy::{AnySpeechStart, LegacySpeechFinalStop};
+pub use legacy::{AnySpeechStart, EagerSmartTurnSpeculate, LegacySpeechFinalStop};

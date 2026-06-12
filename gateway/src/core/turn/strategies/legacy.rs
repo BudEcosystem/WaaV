@@ -34,6 +34,23 @@ impl UserTurnStartStrategy for AnySpeechStart {
     }
 }
 
+/// Eager end-of-turn speculation (P1.2b): a smart-turn COMPLETE verdict
+/// (consumed opaque from the `TurnDecisionEngine`) starts the LLM
+/// speculatively while the turn stays open — confirmed or superseded by the
+/// eventual `speech_final` (WaaV's `Speculate` semantics, fix-plan §6.2 A8).
+/// The orchestrator's `eager_eot` config gate still applies downstream.
+#[derive(Debug, Default)]
+pub struct EagerSmartTurnSpeculate;
+
+impl UserTurnStopStrategy for EagerSmartTurnSpeculate {
+    fn on_signal(&mut self, sig: &ControllerSignal, _ctx: &TurnCtx) -> StopVerdict {
+        match sig {
+            ControllerSignal::SmartTurn { is_complete: true } => StopVerdict::Speculate,
+            _ => StopVerdict::Ignore,
+        }
+    }
+}
+
 /// Legacy stop: the provider's (or forced) `speech_final` with non-empty text
 /// ends the turn. The transcript carried by the signal is the FULL segment
 /// text (segment-transcript-truth fix in `stt_result.rs`).
