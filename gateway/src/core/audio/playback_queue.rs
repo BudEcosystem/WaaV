@@ -78,19 +78,28 @@ impl PlaybackQueue {
 
     /// Append a unit for playout.
     pub fn enqueue(&self, unit: PlaybackUnit) {
+        // Update `uninterruptible_pending` WHILE HOLDING the deque lock so the
+        // counter and the queue contents are always mutated atomically together.
+        // Without this, the bare fetch_add raced a concurrent `clear_all`
+        // (counter zeroed under the lock) followed by a `pop` (fetch_sub) →
+        // unsigned underflow. The lock-free reads in has_uninterruptible_* stay
+        // lock-free; the lock only serializes WRITES.
+        let mut q = self.lock();
         if !unit.interruptible {
             self.uninterruptible_pending.fetch_add(1, Ordering::Release);
         }
-        self.lock().push_back(unit);
+        q.push_back(unit);
     }
 
     /// Pop the next unit for the pump to deliver. For an uninterruptible unit
-    /// this MOVES it from "queued" to "in flight": it increments in-flight
-    /// BEFORE decrementing pending so the active sum never momentarily dips to 0
-    /// (a barge-in in that window must still see protection). The pump must call
-    /// [`mark_played`](Self::mark_played) once the unit finishes playing.
+    /// this MOVES it from "queued" to "in flight" (under the deque lock): it
+    /// increments in-flight BEFORE decrementing pending so the active sum never
+    /// momentarily dips to 0 (a barge-in in that window must still see
+    /// protection). The pump must call [`mark_played`](Self::mark_played) once
+    /// the unit finishes playing.
     pub fn pop_front(&self) -> Option<PlaybackUnit> {
-        let unit = self.lock().pop_front();
+        let mut q = self.lock();
+        let unit = q.pop_front();
         if let Some(u) = &unit {
             if !u.interruptible {
                 self.uninterruptible_in_flight.fetch_add(1, Ordering::Release);
@@ -306,6 +315,76 @@ mod tests {
         assert_eq!(id(&q.pop_front().unwrap()), 20);
         assert_eq!(id(&q.pop_front().unwrap()), 30);
         assert!(q.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_enqueue_pop_clear_holds_invariants() {
+        // Three concurrent actors (TTS-callback enqueue, pump pop+mark_played,
+        // barge-in clear) hammer the queue. The counter must never underflow and
+        // must end consistent with an empty queue. This is the hardening test for
+        // the under-lock counter fix (a bare fetch_add/sub raced clear_all into
+        // an unsigned underflow).
+        use std::sync::Arc;
+        let q = Arc::new(PlaybackQueue::new());
+        let mut handles = Vec::new();
+
+        for p in 0..4u32 {
+            let q = q.clone();
+            handles.push(tokio::spawn(async move {
+                for i in 0..3000u32 {
+                    let unit = if (i + p) % 3 == 0 {
+                        PlaybackUnit::uninterruptible(audio((i % 251) as u8))
+                    } else {
+                        PlaybackUnit::interruptible(audio((i % 251) as u8))
+                    };
+                    q.enqueue(unit);
+                    if i % 64 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }));
+        }
+        for _ in 0..2 {
+            let q = q.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..6000u32 {
+                    if let Some(u) = q.pop_front() {
+                        q.mark_played(u.interruptible);
+                    }
+                    // Reading the protection signal must never panic mid-flight.
+                    let _ = q.has_uninterruptible_active();
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        for c in 0..2u32 {
+            let q = q.clone();
+            handles.push(tokio::spawn(async move {
+                for i in 0..1000u32 {
+                    if (i + c) % 2 == 0 {
+                        q.clear_interruptible();
+                    } else {
+                        q.clear_all();
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Drain everything left and play it out, then a final blanket clear.
+        while let Some(u) = q.pop_front() {
+            q.mark_played(u.interruptible);
+        }
+        q.clear_all();
+        // No underflow: pending matches an empty queue, in-flight settled to 0.
+        assert!(q.is_empty());
+        assert!(
+            !q.has_uninterruptible_active(),
+            "counters settle to zero with no underflow after the storm"
+        );
     }
 
     #[test]
