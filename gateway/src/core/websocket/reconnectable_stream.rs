@@ -360,10 +360,15 @@ impl ReconnectableStream {
                 self.manager.reset();
             }
             // D-G2: feed the connection lifetime to the breaker's quick-fail
-            // detector — 3 consecutive handshake-then-die connections (bad
-            // credentials' signature) trip it PERMANENTLY instead of
-            // backoff-looping forever.
-            self.breaker.record_connection_closed(stable_for);
+            // detector — 3 consecutive handshake-then-die SERVER closes (bad
+            // credentials' signature) enter the (recoverable) FATAL state
+            // instead of backoff-looping forever. A CLEAN close — a `Completed`
+            // outcome or a client-intended disconnect — is NOT a quick-failure
+            // signal (review wc71hewlx #0: counting normal short hangups took
+            // healthy providers offline gateway-wide).
+            let intentional = matches!(outcome, ReconnectOutcome::Completed)
+                || self.intentional_disconnect.load(Ordering::Acquire);
+            self.breaker.record_connection_closed(stable_for, intentional);
             match outcome {
                 ReconnectOutcome::Completed => {
                     return SupervisorExit::Completed;

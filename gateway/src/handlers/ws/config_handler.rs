@@ -288,13 +288,18 @@ pub async fn handle_config_message(
             ws_chunker.clone(),
         )
         .await;
-        if let Some(egress) = egress_audio.clone() {
+        // Register the utterance-end flush when EITHER the resampler OR the
+        // chunker holds a sub-chunk tail (review wc71hewlx #9: a chunker-only
+        // session — audio_out_chunk_ms set, no client_playback_rate — left
+        // its remainder unflushed, clipping tails + leaking carry across
+        // utterances).
+        if egress_audio.is_some() || ws_chunker.is_some() {
             register_tts_complete_with_flush(
                 vm,
                 livekit_client.as_ref(),
                 operation_queue.as_ref(),
                 message_tx,
-                egress,
+                egress_audio.clone(),
                 ws_chunker.clone(),
             )
             .await;
@@ -1324,7 +1329,7 @@ async fn register_tts_complete_with_flush(
     livekit_client: Option<&Arc<RwLock<LiveKitClient>>>,
     operation_queue: Option<&crate::livekit::OperationQueue>,
     message_tx: &mpsc::Sender<MessageRoute>,
-    egress_audio: Arc<EgressAudio>,
+    egress_audio: Option<Arc<EgressAudio>>,
     ws_chunker: Option<Arc<WsEgressChunker>>,
 ) {
     let message_tx = message_tx.clone();
@@ -1338,7 +1343,9 @@ async fn register_tts_complete_with_flush(
             let egress_audio = egress_audio.clone();
             let ws_chunker = ws_chunker.clone();
             Box::pin(async move {
-                let tail = egress_audio.flush();
+                // The resampler tail (when egress resampling is on) flows
+                // through the chunker like every other chunk.
+                let tail = egress_audio.as_ref().map(|e| e.flush()).unwrap_or_default();
                 if !tail.is_empty() {
                     deliver_tts_audio(
                         tail,

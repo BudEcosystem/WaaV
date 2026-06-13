@@ -220,11 +220,22 @@ impl LiveKitClient {
                             // BEFORE registering the new one (Pipecat
                             // close-old-before-register).
                             let mut streams = active_streams.lock().await;
-                            let key = participant.identity().to_string();
+                            // Key by (participant, TRACK sid) — a participant
+                            // can publish more than one audio track (mic +
+                            // screenshare-audio); keying on identity alone
+                            // aborted the first track's task on the second
+                            // SUBSCRIBE (review wc71hewlx #6). The same key
+                            // still aborts a genuine RESUBSCRIBE of the SAME
+                            // track.
+                            let key = format!(
+                                "{}::{}",
+                                participant.identity(),
+                                publication.sid()
+                            );
                             if let Some(old) = streams.insert(key.clone(), handle) {
                                 if !old.is_finished() {
                                     info!(
-                                        participant = %key,
+                                        track = %key,
                                         "resubscribe: aborting the previous audio stream task"
                                     );
                                 }
@@ -253,14 +264,11 @@ impl LiveKitClient {
                     publication.sid(),
                     participant.identity()
                 );
-                // E-G3: stop the participant's stream task NOW — relying on
-                // the SDK to close the underlying stream leaked tasks under
-                // resubscribe storms.
-                if let Some(handle) = active_streams
-                    .lock()
-                    .await
-                    .remove(participant.identity().as_str())
-                {
+                // E-G3: stop ONLY this track's stream task (composite key —
+                // review wc71hewlx #6) — relying on the SDK to close the
+                // underlying stream leaked tasks under resubscribe storms.
+                let key = format!("{}::{}", participant.identity(), publication.sid());
+                if let Some(handle) = active_streams.lock().await.remove(&key) {
                     handle.abort();
                 }
             }

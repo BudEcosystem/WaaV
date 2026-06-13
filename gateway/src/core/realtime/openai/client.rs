@@ -542,12 +542,17 @@ impl OpenAIRealtime {
 
             ServerEvent::ResponseDone { response } => {
                 tracing::debug!("Response done: {}", response.id);
-                // B-G2 (review wf_d43814c3 #1): the response finished playing —
-                // CLEAR the playback estimate so a later barge-in/CancelResponse
-                // cannot truncate a fully-heard (already-completed) item, which
-                // the server would interpret as deleting heard assistant
-                // context.
-                *playback.lock().expect("playback lock") = None;
+                // B-G2 (review wc71hewlx #10): do NOT clear `playback` here.
+                // response.done is GENERATION end — the client is still
+                // PLAYING OUT the audio, so a barge-in during playout must
+                // still truncate to what the user heard. Clearing here sent
+                // NO truncate (OpenAI kept the full response while the user
+                // heard only part). The estimate is instead cleared exactly
+                // when WE truncate (truncate_current_response, preventing the
+                // double-truncate of an already-truncated item), and a fully-
+                // drained item truncates at min(elapsed, duration)=duration —
+                // a harmless no-op. The next response's first audio delta
+                // overwrites it with the new item.
                 if let Some(cb) = response_done_cb.lock().await.as_ref() {
                     cb(response.id).await;
                 }
@@ -1507,10 +1512,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn truncate_current_response_none_after_response_done() {
-        // review wf_d43814c3 #1: a CancelResponse after the response finished
-        // must not truncate a fully-heard item. Driving a ResponseDone clears
-        // the playback estimate, so truncate_current_response returns None.
+    async fn truncate_clears_playback_preventing_double_truncate() {
+        // review wc71hewlx #10: a barge-in DURING playout truncates the
+        // playing item; a SECOND truncate (e.g. a duplicate cancel) finds the
+        // estimate cleared and is a no-op (no double-truncate). The estimate
+        // is cleared by US on truncate — NOT on response.done (which is only
+        // generation end while the client is still playing).
         let mut rt = OpenAIRealtime::new(RealtimeConfig {
             provider: "openai".into(),
             api_key: "k".into(),
@@ -1518,20 +1525,24 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        // Simulate an in-flight item, then completion.
+        // Inject a connected sender so the truncate event has somewhere to go
+        // (we only care that the playback estimate is consumed, not the wire).
+        let (tx, mut rx) = mpsc::channel::<ClientEvent>(16);
+        *rt.ws_sender.lock().await = Some(tx);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
         *rt.playback.lock().unwrap() = Some(ItemPlayback {
             item_id: "item_1".into(),
             first_delta: std::time::Instant::now(),
             duration_ms: 800,
         });
-        // ResponseDone clears playback (the handler path); emulate its effect.
-        *rt.playback.lock().unwrap() = None;
-        assert!(
-            rt.truncate_current_response().await.unwrap().is_none(),
-            "no playing item ⇒ nothing to truncate (no deletion of heard context)"
-        );
+        // First barge-in: the playing item IS truncated (not None).
+        let truncated = rt.truncate_current_response().await.unwrap();
+        assert!(truncated.is_some(), "a playing item must be truncated on barge-in");
+        // Second barge-in: estimate cleared ⇒ no double-truncate.
+        assert!(rt.truncate_current_response().await.unwrap().is_none());
     }
 
+    #[test]
     fn replay_items_render_as_completed_messages_never_responses() {
         use crate::core::realtime::{ReplayConversationItem, TranscriptRole};
         let user = OpenAIRealtime::replay_item_to_conversation_item(&ReplayConversationItem {

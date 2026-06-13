@@ -184,6 +184,10 @@ pub struct ConversationOrchestrator {
     /// first time the bot completes a spoken turn, so `MuteUntilFirstBotComplete`
     /// opens for a silently-listening user. None = no greeting guard wired.
     first_bot_complete_latch: Arc<SyncMutex<Option<Arc<std::sync::atomic::AtomicBool>>>>,
+    /// D-G3 (review wc71hewlx #3): set once a turn classifies FATAL. Stops
+    /// further turns from running — every subsequent utterance would hammer
+    /// the same dead key/config, burning latency and money on silence.
+    fatal_stopped: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A speculative LLM turn started on a turn-complete PREDICTION, before the
@@ -231,6 +235,7 @@ impl ConversationOrchestrator {
             idle_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fatal_handler: Arc::new(SyncMutex::new(None)),
             first_bot_complete_latch: Arc::new(SyncMutex::new(None)),
+            fatal_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -254,6 +259,7 @@ impl ConversationOrchestrator {
             idle_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fatal_handler: Arc::new(SyncMutex::new(None)),
             first_bot_complete_latch: Arc::new(SyncMutex::new(None)),
+            fatal_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -732,6 +738,11 @@ impl ConversationOrchestrator {
     ///   turn whose reply streams to TTS — unless a CONFIRMED eager speculation
     ///   already holds the reply, which is committed and spoken instead.
     pub async fn on_stt_result(&self, result: &STTResult) {
+        // D-G3 (review wc71hewlx #3): once a turn classified FATAL, stop —
+        // re-running turns against a dead key only burns latency and money.
+        if self.fatal_stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         // Derive the same events the legacy policy produces and route them
         // through the SINGLE event handler (A-G0): any non-empty speech is a
         // potential barge-in; a finalized turn with content runs the LLM.
@@ -905,7 +916,12 @@ impl ConversationOrchestrator {
                 }
                 StageErrorClass::Fatal => {
                     tracing::error!(session = %self.session_id, error = %e,
-                        "FATAL turn error (auth/config) — surfacing to the session");
+                        "FATAL turn error (auth/config) — stopping the session");
+                    // STOP further turns: every subsequent utterance would
+                    // fail identically against the dead key (review
+                    // wc71hewlx #3). on_stt_result short-circuits once set.
+                    self.fatal_stopped
+                        .store(true, std::sync::atomic::Ordering::Release);
                     let handler = self.fatal_handler.lock().take();
                     if let Some(handler) = handler {
                         handler(e.to_string());
@@ -938,10 +954,18 @@ impl ConversationOrchestrator {
         if timeout_ms == 0 {
             return;
         }
-        let orch = Arc::clone(self);
+        // WEAK self-ref (review wf_d43814c3): a STRONG Arc kept the
+        // orchestrator (and a spawned task per STT signal) alive past session
+        // teardown and fired a post-mortem re-engagement turn on a stopped
+        // VoiceManager. With a Weak, the task exits as soon as the session's
+        // last strong ref drops.
+        let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
+                let Some(orch) = weak.upgrade() else {
+                    return; // session torn down — never fire post-mortem
+                };
                 if orch.idle_generation.load(Ordering::Acquire) != generation {
                     return; // newer activity re-armed; this timer is stale
                 }
@@ -951,17 +975,20 @@ impl ConversationOrchestrator {
                     continue; // busy: re-check after another period
                 }
                 debug!(session = %orch.session_id, "user idle; re-engaging");
-                // The turn itself bumps the generation via run_turn's
-                // poke at completion (below), so we won't re-fire in a loop
-                // unless the user STAYS silent for another full period.
                 if let Err(e) = orch
                     .run_turn(
-                        "[The user has been silent for a while. Briefly and                          naturally check in with them or offer help — one short                          sentence.]",
+                        "[The user has been silent for a while. Briefly and \
+                         naturally check in with them or offer help — one short \
+                         sentence.]",
                     )
                     .await
                 {
                     warn!(session = %orch.session_id, error = %e, "idle re-engagement failed");
                 }
+                // ONE-SHOT per idle window: the re-engagement is deliberately
+                // not re-armed here (that would nag a persistently-silent
+                // caller). The NEXT real user activity re-arms via its own
+                // poke_idle_timer call.
                 return;
             }
         });
@@ -1002,14 +1029,34 @@ pub fn classify_llm_error(error: &LlmError) -> StageErrorClass {
         LlmError::Cancelled => StageErrorClass::Recoverable,
         LlmError::Endpoint { error, .. } => {
             let e = error.to_lowercase();
+            // A 5xx is the SERVER struggling — transient, ALWAYS recoverable,
+            // even if the body happens to echo auth words (review wc71hewlx
+            // #5: a 500 whose message contained "authentication" was wrongly
+            // surfaced as fatal on a call that could have healed).
+            let is_5xx = e.contains("http 5");
+            if is_5xx {
+                return StageErrorClass::Recoverable;
+            }
+            // Billing exhaustion is an UNRECOVERABLE wall — retrying every
+            // turn against insufficient quota burns latency and money
+            // (review wc71hewlx #4). Plain rate-limiting (429 without a quota
+            // marker) stays recoverable (it clears).
+            let billing = e.contains("insufficient_quota")
+                || e.contains("insufficient quota")
+                || (e.contains("http 429") && e.contains("quota"))
+                || e.contains("billing")
+                || e.contains("exceeded your current quota");
             let auth_status = e.contains("http 401") || e.contains("http 403");
             let auth_text = e.contains("invalid api key")
                 || e.contains("invalid_api_key")
                 || e.contains("incorrect api key")
+                || e.contains("api key not valid")
                 || e.contains("authentication")
                 || e.contains("unauthorized");
-            let config = e.contains("model_not_found") || e.contains("does not exist");
-            if auth_status || auth_text || config {
+            let config = e.contains("model_not_found")
+                || e.contains("does not exist")
+                || e.contains("model `");
+            if billing || auth_status || auth_text || config {
                 StageErrorClass::Fatal
             } else {
                 StageErrorClass::Recoverable
@@ -1159,7 +1206,7 @@ mod stage_error_tests {
     /// that might have healed).
     #[test]
     fn error_classification_matrix() {
-        // FATAL: auth / authz / config.
+        // FATAL: auth / authz / config / billing-exhaustion.
         for msg in [
             "HTTP 401 - {\"error\":\"bad key\"}",
             "HTTP 403 - forbidden",
@@ -1167,6 +1214,9 @@ mod stage_error_tests {
             "HTTP 400 - invalid_api_key",
             "HTTP 404 - The model `gpt-9` does not exist",
             "HTTP 400 - authentication failed",
+            // review wc71hewlx #4: billing exhaustion is an unrecoverable wall.
+            "HTTP 429 - You exceeded your current quota; insufficient_quota",
+            "HTTP 429 - billing hard limit reached",
         ] {
             assert_eq!(
                 classify_llm_error(&endpoint_err(msg)),
@@ -1178,7 +1228,10 @@ mod stage_error_tests {
         for msg in [
             "HTTP 500 - internal server error",
             "HTTP 503 - overloaded",
-            "HTTP 429 - rate limited",
+            "HTTP 429 - rate limited", // plain rate-limit (no quota marker) clears
+            // review wc71hewlx #5: a 5xx body echoing auth words is still
+            // transient — never fatal.
+            "HTTP 502 - upstream authentication gateway error",
             "Request failed: connection reset by peer",
             "Request failed: operation timed out",
         ] {

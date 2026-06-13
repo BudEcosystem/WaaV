@@ -22,16 +22,19 @@ static CODE: OnceLock<Regex> = OnceLock::new();
 static MD_LINK: OnceLock<Regex> = OnceLock::new();
 static URL_SCHEME: OnceLock<Regex> = OnceLock::new();
 static HEADING: OnceLock<Regex> = OnceLock::new();
+static LIST_BULLET: OnceLock<Regex> = OnceLock::new();
+static STRIKETHROUGH: OnceLock<Regex> = OnceLock::new();
 static REPEAT_RUN: OnceLock<Regex> = OnceLock::new();
 
 /// Strip the markdown constructs that ruin spoken output. Returns the
 /// input unchanged (no alloc beyond the clone) when no markdown chars are
 /// present.
 pub fn strip_markdown_for_tts(text: &str) -> String {
-    // Fast path: nothing markdown-ish at all.
+    // Fast path: nothing markdown-ish at all. (`+` covers `+` list bullets;
+    // numbered-list bullets only strip when another marker is also present.)
     if !text
         .chars()
-        .any(|c| matches!(c, '*' | '`' | '[' | '#' | '_' | ':' | '~' | '-' | '='))
+        .any(|c| matches!(c, '*' | '`' | '[' | '#' | '_' | ':' | '~' | '-' | '=' | '+'))
     {
         return text.to_string();
     }
@@ -63,6 +66,16 @@ pub fn strip_markdown_for_tts(text: &str) -> String {
     out = re(r"`([^`]*)`", &CODE).replace_all(&out, "$1").into_owned();
     // Leading heading markers.
     out = re(r"(?m)^\s*#{1,6}\s+", &HEADING).replace_all(&out, "").into_owned();
+    // ~~strikethrough~~ markers (before the divider strip so `~~~~~` runs
+    // aren't half-eaten).
+    out = re(r"~~([^~]+)~~", &STRIKETHROUGH).replace_all(&out, "$1").into_owned();
+    // Leading list bullets (review wf_d43814c3: "* Option one" / "- first" /
+    // "+ x" / "1. step" was read aloud as "asterisk option one"). Strip the
+    // marker, keep the text. (`(?m)^` anchors to line starts so a mid-word
+    // `-`/`*` is untouched.)
+    out = re(r"(?m)^[ \t]*(?:[-*+]|\d{1,3}[.)])[ \t]+", &LIST_BULLET)
+        .replace_all(&out, "")
+        .into_owned();
     // 5+ repeated punctuation (divider lines like ----- or =====). The
     // regex crate has no backreferences: one alternation per divider char.
     out = re(r"-{5,}|={5,}|_{5,}|~{5,}|\*{5,}|#{5,}", &REPEAT_RUN)
@@ -110,6 +123,24 @@ mod tests {
     fn headings_and_dividers_stripped() {
         assert_eq!(strip_markdown_for_tts("## Heading text"), "Heading text");
         assert_eq!(strip_markdown_for_tts("before ----- after"), "before  after");
+    }
+
+    #[test]
+    fn list_bullets_and_strikethrough_stripped() {
+        // review wf_d43814c3: list markers must not be spoken.
+        assert_eq!(strip_markdown_for_tts("* Option one"), "Option one");
+        assert_eq!(strip_markdown_for_tts("- first item"), "first item");
+        assert_eq!(strip_markdown_for_tts("+ plus item"), "plus item");
+        // Numbered bullets strip when the text also carries a markdown char
+        // (the fast-path gate doesn't trip on pure "1. " to avoid scanning
+        // every numeric sentence) — e.g. alongside a bold marker.
+        assert_eq!(
+            strip_markdown_for_tts("1. **step** one"),
+            "step one"
+        );
+        assert_eq!(strip_markdown_for_tts("~~scratch that~~ done"), "scratch that done");
+        // A subtraction (no trailing-space bullet shape) is untouched.
+        assert_eq!(strip_markdown_for_tts("5-3 equals 2"), "5-3 equals 2");
     }
 
     #[test]
