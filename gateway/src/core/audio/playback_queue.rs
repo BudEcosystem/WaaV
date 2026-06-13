@@ -53,12 +53,21 @@ impl PlaybackUnit {
 }
 
 /// FIFO queue of [`PlaybackUnit`]s with O(1) uninterruptible-presence tracking.
+///
+/// Protection must span a unit's whole life — *queued* AND *in flight* (popped
+/// by the pump and audibly playing in the transport). Two counters track that:
+/// `uninterruptible_pending` (still in the queue) and `uninterruptible_in_flight`
+/// (popped, playing). [`has_uninterruptible_active`](Self::has_uninterruptible_active)
+/// is their OR — the barge-in protection signal. (The earlier single-queued
+/// counter let a barge-in kill a disclaimer the instant the pump popped it; the
+/// brutal review caught that.)
 #[derive(Default)]
 pub struct PlaybackQueue {
     inner: Mutex<VecDeque<PlaybackUnit>>,
-    /// Count of uninterruptible units currently queued — read on the barge-in
-    /// hot path without locking/scanning (the queue lock is only for mutation).
+    /// Uninterruptible units still in the queue (read O(1) on the barge-in path).
     uninterruptible_pending: AtomicUsize,
+    /// Uninterruptible units the pump has popped and is delivering/playing.
+    uninterruptible_in_flight: AtomicUsize,
 }
 
 impl PlaybackQueue {
@@ -75,16 +84,33 @@ impl PlaybackQueue {
         self.lock().push_back(unit);
     }
 
-    /// Pop the next unit for the pump to deliver, keeping the uninterruptible
-    /// count in sync.
+    /// Pop the next unit for the pump to deliver. For an uninterruptible unit
+    /// this MOVES it from "queued" to "in flight": it increments in-flight
+    /// BEFORE decrementing pending so the active sum never momentarily dips to 0
+    /// (a barge-in in that window must still see protection). The pump must call
+    /// [`mark_played`](Self::mark_played) once the unit finishes playing.
     pub fn pop_front(&self) -> Option<PlaybackUnit> {
         let unit = self.lock().pop_front();
         if let Some(u) = &unit {
             if !u.interruptible {
+                self.uninterruptible_in_flight.fetch_add(1, Ordering::Release);
                 self.uninterruptible_pending.fetch_sub(1, Ordering::Release);
             }
         }
         unit
+    }
+
+    /// The pump signals that a previously-popped unit has finished playing.
+    /// Decrements the in-flight count for an uninterruptible unit (saturating —
+    /// a blanket `clear_all` may have already zeroed it).
+    pub fn mark_played(&self, interruptible: bool) {
+        if !interruptible {
+            let _ = self.uninterruptible_in_flight.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |c| Some(c.saturating_sub(1)),
+            );
+        }
     }
 
     /// Barge-in: drop every interruptible unit, **keep** uninterruptible ones in
@@ -99,8 +125,10 @@ impl PlaybackQueue {
         before - q.len()
     }
 
-    /// Blanket clear (back-compat): drop everything, including uninterruptible
-    /// units. Returns how many units were dropped.
+    /// Blanket clear (back-compat): drop everything queued, including
+    /// uninterruptible units. Returns how many units were dropped. The in-flight
+    /// count is left to the pump's `mark_played` (the in-flight unit isn't in
+    /// the queue, so clearing the queue can't account for it).
     pub fn clear_all(&self) -> usize {
         let mut q = self.lock();
         let n = q.len();
@@ -109,10 +137,17 @@ impl PlaybackQueue {
         n
     }
 
-    /// O(1): is at least one uninterruptible unit still queued? Read this on the
-    /// barge-in path to decide whether a selective clear is even needed.
+    /// O(1): is at least one uninterruptible unit still QUEUED?
     pub fn has_uninterruptible_pending(&self) -> bool {
         self.uninterruptible_pending.load(Ordering::Acquire) > 0
+    }
+
+    /// O(1): is any uninterruptible audio still protected — queued OR in flight
+    /// (popped and playing)? THIS is the barge-in protection signal: a selective
+    /// clear is warranted whenever it is true.
+    pub fn has_uninterruptible_active(&self) -> bool {
+        self.uninterruptible_pending.load(Ordering::Acquire) > 0
+            || self.uninterruptible_in_flight.load(Ordering::Acquire) > 0
     }
 
     /// Number of queued units.
@@ -209,6 +244,42 @@ mod tests {
         assert!(q.has_uninterruptible_pending(), "one uninterruptible still queued");
         let _ = q.pop_front(); // drops audio(3) (uninterruptible)
         assert!(!q.has_uninterruptible_pending(), "now none");
+    }
+
+    #[test]
+    fn in_flight_unit_stays_active_until_mark_played() {
+        // The protection signal must span queue → in-flight → played, or a
+        // barge-in kills the disclaimer the instant the pump pops it (brutal
+        // review wf_e53f4d85 #2).
+        let q = PlaybackQueue::new();
+        q.enqueue(PlaybackUnit::uninterruptible(audio(2)));
+        assert!(q.has_uninterruptible_active());
+        assert!(q.has_uninterruptible_pending());
+        // The pump pops it → in flight: no longer QUEUED, but still ACTIVE.
+        let _ = q.pop_front();
+        assert!(!q.has_uninterruptible_pending(), "no longer queued");
+        assert!(
+            q.has_uninterruptible_active(),
+            "still in flight ⇒ still protected from barge-in"
+        );
+        // Playout completes.
+        q.mark_played(false);
+        assert!(
+            !q.has_uninterruptible_active(),
+            "protection ends only when playout completes"
+        );
+    }
+
+    #[test]
+    fn mark_played_is_noop_for_interruptible_and_saturates() {
+        let q = PlaybackQueue::new();
+        // Interruptible playout never touches the protection count.
+        q.mark_played(true);
+        assert!(!q.has_uninterruptible_active());
+        // An extra uninterruptible mark_played (e.g. after clear_all) must not
+        // underflow.
+        q.mark_played(false);
+        assert!(!q.has_uninterruptible_active());
     }
 
     #[test]
