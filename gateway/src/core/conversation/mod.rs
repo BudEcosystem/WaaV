@@ -180,6 +180,10 @@ pub struct ConversationOrchestrator {
     /// embedder surfaces it to the client / ends the session. None = log
     /// only (tests, direct embedding).
     fatal_handler: Arc<SyncMutex<Option<Arc<dyn Fn(String) + Send + Sync>>>>,
+    /// A-G5 greeting-guard latch (review wf_d43814c3 #4): flipped true the
+    /// first time the bot completes a spoken turn, so `MuteUntilFirstBotComplete`
+    /// opens for a silently-listening user. None = no greeting guard wired.
+    first_bot_complete_latch: Arc<SyncMutex<Option<Arc<std::sync::atomic::AtomicBool>>>>,
 }
 
 /// A speculative LLM turn started on a turn-complete PREDICTION, before the
@@ -226,6 +230,7 @@ impl ConversationOrchestrator {
             eager: Arc::new(SyncMutex::new(None)),
             idle_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fatal_handler: Arc::new(SyncMutex::new(None)),
+            first_bot_complete_latch: Arc::new(SyncMutex::new(None)),
         })
     }
 
@@ -248,6 +253,7 @@ impl ConversationOrchestrator {
             eager: Arc::new(SyncMutex::new(None)),
             idle_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fatal_handler: Arc::new(SyncMutex::new(None)),
+            first_bot_complete_latch: Arc::new(SyncMutex::new(None)),
         }
     }
 
@@ -594,26 +600,41 @@ impl ConversationOrchestrator {
 
         self.end_turn(id);
 
-        // B-G6: compact the context AFTER the turn (and after end_turn, so
-        // summarization never extends the bot-busy window). Failure is loud
-        // but never fatal — the next turn still runs.
+        // A-G5 (review wf_d43814c3 #4): the bot completed a turn that ran to
+        // completion (not a barge-in cancel) — flip the greeting-guard latch
+        // so `MuteUntilFirstBotComplete` opens, including for a silent
+        // listener. `!token.is_cancelled()` covers both streaming and
+        // non-streaming paths; an interrupted turn does not count.
+        if outcome.is_ok()
+            && !token.is_cancelled()
+            && let Some(latch) = self.first_bot_complete_latch.lock().clone()
+        {
+            latch.store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        // B-G6: compact the context AFTER the turn — DETACHED, so the up-to-5s
+        // summary inference never blocks this run_turn (which is awaited on the
+        // STT result-forwarding chain, review wf_d43814c3) and never extends
+        // the bot-busy window. The CAS replace
+        // ([`LlmClient::replace_context_if_unchanged`]) makes the concurrent-
+        // turn race safe; failure is loud but never fatal.
         if self.config.summarize_target_tokens > 0 {
-            let cfg = crate::core::llm::SummaryConfig {
-                target_tokens: self.config.summarize_target_tokens,
-                ..Default::default()
-            };
-            if let Err(e) = self
-                .llm
-                .maybe_summarize(
-                    &self.session_id,
-                    &cfg,
-                    self.config.api_key.as_deref(),
-                    &CancellationToken::new(),
-                )
-                .await
-            {
-                warn!(session = %self.session_id, error = %e, "context summarization failed");
-            }
+            let llm = Arc::clone(&self.llm);
+            let session_id = self.session_id.clone();
+            let target_tokens = self.config.summarize_target_tokens;
+            let api_key = self.config.api_key.clone();
+            tokio::spawn(async move {
+                let cfg = crate::core::llm::SummaryConfig {
+                    target_tokens,
+                    ..Default::default()
+                };
+                if let Err(e) = llm
+                    .maybe_summarize(&session_id, &cfg, api_key.as_deref(), &CancellationToken::new())
+                    .await
+                {
+                    warn!(session = %session_id, error = %e, "context summarization failed");
+                }
+            });
         }
 
         outcome
@@ -868,6 +889,12 @@ impl ConversationOrchestrator {
     /// D-G3: install the fatal-error handler (invoked once per fatal).
     pub fn set_fatal_handler(&self, handler: Arc<dyn Fn(String) + Send + Sync>) {
         *self.fatal_handler.lock() = Some(handler);
+    }
+
+    /// A-G5: install the greeting-guard latch (flipped on the first completed
+    /// bot turn) so `MuteUntilFirstBotComplete` can open.
+    pub fn set_first_bot_complete_latch(&self, latch: Arc<std::sync::atomic::AtomicBool>) {
+        *self.first_bot_complete_latch.lock() = Some(latch);
     }
 
     /// A-G7: register activity (user speech, bot turn) and re-arm the idle

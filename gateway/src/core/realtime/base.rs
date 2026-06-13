@@ -412,20 +412,27 @@ pub fn clamp_truncate_ms(elapsed_ms: u64, duration_ms: u64) -> u64 {
     elapsed_ms.min(duration_ms)
 }
 
-/// The FULL barge-in sequence for a realtime (S2S) provider, in Pipecat's
-/// exact order (B-G2): clear the input buffer → replay the user-audio
-/// preroll the clear wiped → cancel the in-flight response → truncate the
-/// partially-heard item so server state matches heard audio. One
-/// standardized sequence for every handler; each step is best-effort (a
-/// failed clear must not skip the cancel).
+/// The barge-in sequence for a realtime (S2S) provider, in Pipecat's order
+/// (B-G2): [clear the input buffer → replay the user-audio preroll] → cancel
+/// the in-flight response → truncate the partially-heard item so server state
+/// matches heard audio. Each step is best-effort (a failed clear must not skip
+/// the cancel).
+///
+/// MODE-AWARE (review wf_d43814c3 #11): the bracketed input-buffer steps run
+/// ONLY in MANUAL mode. In server-VAD mode the provider already detects the
+/// barge-in and manages its own input buffer; a gateway clear+preroll there
+/// re-triggers the server VAD and destroys user speech beyond the preroll
+/// ring. cancel + truncate run in both modes.
 pub async fn run_barge_in_sequence(
     provider: &mut (dyn BaseRealtime + Send),
 ) -> RealtimeResult<Option<(String, u64)>> {
-    if let Err(e) = provider.clear_audio_buffer().await {
-        tracing::warn!(error = %e, "barge-in: input buffer clear failed; continuing");
-    }
-    if let Err(e) = provider.replay_user_audio_preroll().await {
-        tracing::warn!(error = %e, "barge-in: preroll replay failed; continuing");
+    if !provider.emits_user_turn_frames() {
+        if let Err(e) = provider.clear_audio_buffer().await {
+            tracing::warn!(error = %e, "barge-in: input buffer clear failed; continuing");
+        }
+        if let Err(e) = provider.replay_user_audio_preroll().await {
+            tracing::warn!(error = %e, "barge-in: preroll replay failed; continuing");
+        }
     }
     if let Err(e) = provider.cancel_response().await {
         tracing::warn!(error = %e, "barge-in: response cancel failed; continuing");
@@ -733,12 +740,16 @@ mod tests {
         struct MockRt {
             calls: Arc<StdMutex<Vec<&'static str>>>,
             fail_clear: bool,
+            server_vad: bool,
         }
 
         #[async_trait::async_trait]
         impl BaseRealtime for MockRt {
             fn new(_c: RealtimeConfig) -> RealtimeResult<Self> {
                 unreachable!()
+            }
+            fn emits_user_turn_frames(&self) -> bool {
+                self.server_vad
             }
             async fn connect(&mut self) -> RealtimeResult<()> {
                 Ok(())
@@ -821,21 +832,34 @@ mod tests {
             }
         }
 
+        // MANUAL mode: the full sequence, exact order.
         let rec = Recorder::default();
-        let mut rt = MockRt { calls: Arc::clone(&rec.0), fail_clear: false };
+        let mut rt = MockRt { calls: Arc::clone(&rec.0), fail_clear: false, server_vad: false };
         let truncated = run_barge_in_sequence(&mut rt).await.unwrap();
         assert_eq!(truncated, Some(("item_1".to_string(), 420)));
         assert_eq!(
             *rec.0.lock().unwrap(),
             vec!["clear", "preroll", "cancel", "truncate"],
-            "exact Pipecat order"
+            "manual mode: exact Pipecat order"
         );
 
         // Best-effort: a failed clear must not skip the rest.
         let rec = Recorder::default();
-        let mut rt = MockRt { calls: Arc::clone(&rec.0), fail_clear: true };
+        let mut rt = MockRt { calls: Arc::clone(&rec.0), fail_clear: true, server_vad: false };
         let _ = run_barge_in_sequence(&mut rt).await;
         assert_eq!(*rec.0.lock().unwrap(), vec!["clear", "preroll", "cancel", "truncate"]);
+
+        // review wf_d43814c3 #11: SERVER-VAD mode SKIPS the input-buffer
+        // clear+preroll (which would re-trigger the server VAD and destroy
+        // user speech); only cancel + truncate run.
+        let rec = Recorder::default();
+        let mut rt = MockRt { calls: Arc::clone(&rec.0), fail_clear: false, server_vad: true };
+        let _ = run_barge_in_sequence(&mut rt).await;
+        assert_eq!(
+            *rec.0.lock().unwrap(),
+            vec!["cancel", "truncate"],
+            "server-VAD mode: no input-buffer clear/preroll"
+        );
     }
 
     #[test]

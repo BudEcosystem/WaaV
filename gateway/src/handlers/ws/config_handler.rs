@@ -454,14 +454,20 @@ async fn initialize_conversation_loop(
 
     // A-G5: optional user-mute strategy (OR-combined in the controller;
     // user input drops while active, lifecycle signals always flow).
+    // `first_bot_complete_latch` is the shared session-lifecycle flag the
+    // greeting guard reads; flipped on the first TTS-complete below.
+    let mut first_bot_complete_latch: Option<Arc<std::sync::atomic::AtomicBool>> = None;
     let mute_strategies: Vec<Box<dyn crate::core::turn::UserMuteStrategy>> =
         match conv_config.mute_strategy.as_deref() {
             Some("always_while_bot_speaks") => vec![Box::new(
                 crate::core::turn::strategies::AlwaysMuteWhileBotSpeaks,
             )],
-            Some("until_first_bot_complete") => vec![Box::new(
-                crate::core::turn::strategies::MuteUntilFirstBotComplete::default(),
-            )],
+            Some("until_first_bot_complete") => {
+                let (strategy, latch) =
+                    crate::core::turn::strategies::MuteUntilFirstBotComplete::new();
+                first_bot_complete_latch = Some(latch);
+                vec![Box::new(strategy)]
+            }
             Some("first_speech_only") => vec![Box::new(
                 crate::core::turn::strategies::FirstSpeechMute::default(),
             )],
@@ -471,6 +477,16 @@ async fn initialize_conversation_loop(
             }
             None => vec![],
         };
+
+    // A-G5/wf_d43814c3 #4: the greeting-guard latch is flipped by the
+    // orchestrator when the bot's FIRST spoken turn completes (a SILENTLY
+    // listening user is then unmuted with no signal-sampling dependency).
+    // NOTE: `until_first_bot_complete` is only meaningful when the bot speaks
+    // proactively (greeting/disclaimer-on-join); without such an utterance
+    // input stays guarded — the conservative disclaimer semantics.
+    if let Some(latch) = first_bot_complete_latch.clone() {
+        orchestrator.set_first_bot_complete_latch(latch);
+    }
     let vm_probe = voice_manager.clone();
     let orch_probe = orchestrator.clone();
     let turn_controller = Arc::new(

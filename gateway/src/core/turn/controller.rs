@@ -244,13 +244,15 @@ impl TurnController {
     }
 
     fn reset_strategies(&self) {
+        // ONLY start/stop strategies reset per turn — they track within-turn
+        // aggregation. MUTE strategies are SESSION-lifecycle (greeting guard,
+        // first-speech) and must NOT be reset on a turn start: doing so wiped
+        // their latched state and deadlocked `MuteUntilFirstBotComplete` /
+        // no-op'd `FirstSpeechMute` (review wf_d43814c3 #3).
         for s in self.start.lock().iter_mut() {
             s.reset();
         }
         for s in self.stop.lock().iter_mut() {
-            s.reset();
-        }
-        for s in self.mute.lock().iter_mut() {
             s.reset();
         }
     }

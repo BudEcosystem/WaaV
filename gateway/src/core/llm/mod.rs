@@ -526,6 +526,10 @@ impl Default for LlmClientConfig {
 pub struct ConversationHistory {
     messages: Vec<ChatMessage>,
     max_messages: usize,
+    /// Monotonic mutation counter (B-G6): bumped on every change so a
+    /// read-modify-write (summarization) can detect a concurrent mutation
+    /// and refuse to clobber it (review wf_d43814c3 #2 lost-update RMW).
+    version: u64,
 }
 
 impl ConversationHistory {
@@ -533,10 +537,17 @@ impl ConversationHistory {
         Self {
             messages: Vec::new(),
             max_messages,
+            version: 0,
         }
     }
 
+    /// The current mutation version (B-G6 CAS).
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
     pub fn add(&mut self, message: ChatMessage) {
+        self.version = self.version.wrapping_add(1);
         self.messages.push(message);
         // Trim history to max_messages (keep system message if present).
         while self.messages.len() > self.max_messages {
@@ -567,12 +578,14 @@ impl ConversationHistory {
     }
 
     pub fn clear(&mut self) {
+        self.version = self.version.wrapping_add(1);
         self.messages.clear();
     }
 
     /// Replace the leading system message, or insert one at the front
     /// (B-G3 `role_message` persistence).
     pub fn upsert_system(&mut self, content: &str) {
+        self.version = self.version.wrapping_add(1);
         match self.messages.first_mut() {
             Some(m) if m.role == MessageRole::System => {
                 m.content = Some(content.to_string());
@@ -1319,6 +1332,43 @@ impl LlmClient {
             .get(session_id)
             .map(|h| h.messages().to_vec())
             .unwrap_or_default()
+    }
+
+    /// Snapshot a session's history WITH its mutation version (B-G6 CAS).
+    /// `None` when the session has no history entry yet.
+    pub async fn history_snapshot_versioned(
+        &self,
+        session_id: &str,
+    ) -> Option<(Vec<ChatMessage>, u64)> {
+        let histories = self.histories.read().await;
+        histories
+            .get(session_id)
+            .map(|h| (h.messages().to_vec(), h.version()))
+    }
+
+    /// Atomically replace a session's context ONLY IF its version is still
+    /// `expected_version` (B-G6 lost-update guard, review wf_d43814c3 #2):
+    /// a turn that appended during the summary's inference window bumped the
+    /// version, so the stale rewrite is refused rather than destroying the
+    /// concurrent append (and orphaning tool messages). Returns whether the
+    /// replace was applied.
+    pub async fn replace_context_if_unchanged(
+        &self,
+        session_id: &str,
+        expected_version: u64,
+        messages: Vec<ChatMessage>,
+    ) -> bool {
+        let mut histories = self.histories.write().await;
+        match histories.get_mut(session_id) {
+            Some(history) if history.version() == expected_version => {
+                history.clear();
+                for m in messages {
+                    history.add(m);
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     fn endpoint_err(&self, error: String) -> LlmError {

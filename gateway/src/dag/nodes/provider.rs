@@ -898,6 +898,7 @@ impl RealtimeProviderNode {
         }
     }
 
+
     /// Set the model
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
@@ -1014,6 +1015,9 @@ impl RealtimeProviderNode {
         let realtime_config = RealtimeConfig {
             model: self.model.clone().unwrap_or_default(),
             provider: self.provider.clone(),
+            // review wf_d43814c3 #10: source the key (node config or env);
+            // an empty api_key is rejected by the OpenAI realtime provider.
+            api_key: resolve_node_credential(&self.config, "api_key").unwrap_or_default(),
             ..Default::default()
         };
         let realtime = registry
@@ -1181,6 +1185,9 @@ impl DAGNode for RealtimeProviderNode {
         let realtime_config = RealtimeConfig {
             model: self.model.clone().unwrap_or_default(),
             provider: self.provider.clone(),
+            // review wf_d43814c3 #10: source the key (node config or env);
+            // an empty api_key is rejected by the OpenAI realtime provider.
+            api_key: resolve_node_credential(&self.config, "api_key").unwrap_or_default(),
             ..Default::default()
         };
 

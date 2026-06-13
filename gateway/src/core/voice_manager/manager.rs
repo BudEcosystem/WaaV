@@ -631,6 +631,13 @@ impl VoiceManager {
             debug!("speak_if_epoch: clear happened since capture; sentence dropped");
             return Ok(false);
         }
+        // D-G9 (review wf_d43814c3): count chars on THIS path too — the
+        // orchestrator speaks via speak_if_epoch, not speak(), so the
+        // counter was never incremented on the production conversation path.
+        crate::core::metrics::bridge::count_tts_chars(
+            &self.config.tts_config.provider,
+            text.chars().count(),
+            );
         tts.speak(text, flush)
             .await
             .map_err(VoiceManagerError::TTSError)?;
@@ -646,8 +653,8 @@ impl VoiceManager {
         // D-G9: synthesis cost proxy.
         crate::core::metrics::bridge::count_tts_chars(
             &self.config.tts_config.provider,
-            text.len(),
-        );
+            text.chars().count(),
+            );
         // Send text to TTS provider
         {
             let mut tts = self.tts.write().await;
@@ -706,6 +713,12 @@ impl VoiceManager {
             self.interruption_state.reset();
         }
 
+        // D-G9: synthesis cost proxy (covers the non-interruptible /
+        // speak_if_epoch-delegated path).
+        crate::core::metrics::bridge::count_tts_chars(
+            &self.config.tts_config.provider,
+            text.chars().count(),
+            );
         // Send text to TTS provider
         {
             let mut tts = self.tts.write().await;

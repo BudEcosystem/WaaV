@@ -153,7 +153,13 @@ impl LlmClient {
         api_key: Option<&str>,
         cancel: &CancellationToken,
     ) -> LlmResult<bool> {
-        let snapshot = self.history_snapshot(session_id).await;
+        // Snapshot WITH the mutation version: the rewrite at the end only
+        // applies if no turn mutated the context during the inference window
+        // (review wf_d43814c3 #2 — a lost-update RMW destroyed concurrent
+        // appends and orphaned tool messages).
+        let Some((snapshot, version)) = self.history_snapshot_versioned(session_id).await else {
+            return Ok(false);
+        };
         let estimate = estimate_tokens(&snapshot);
         if estimate < config.target_tokens {
             return Ok(false);
@@ -208,13 +214,25 @@ impl LlmClient {
             )));
         }
         rebuilt.extend(tail);
-        self.set_context(session_id, rebuilt).await;
-        info!(
-            session = session_id,
-            summarized = summary.is_some(),
-            "context compacted"
-        );
-        Ok(true)
+        // CAS replace: if a turn appended/changed the context during the
+        // summary inference, its version moved — refuse the stale rewrite and
+        // leave the (now-current) history intact. The next turn re-checks.
+        let applied = self
+            .replace_context_if_unchanged(session_id, version, rebuilt)
+            .await;
+        if applied {
+            info!(
+                session = session_id,
+                summarized = summary.is_some(),
+                "context compacted"
+            );
+        } else {
+            warn!(
+                session = session_id,
+                "context changed during summarization; rewrite skipped (no data lost)"
+            );
+        }
+        Ok(applied)
     }
 }
 
@@ -241,6 +259,7 @@ mod tests {
         requests: Arc<parking_lot::Mutex<Vec<Value>>>,
         reply: Arc<parking_lot::Mutex<String>>,
         fail: Arc<std::sync::atomic::AtomicBool>,
+        delay_ms: Arc<std::sync::atomic::AtomicU64>,
     }
 
     async fn start_mock(reply: &str) -> (String, MockState) {
@@ -248,9 +267,14 @@ mod tests {
             requests: Arc::new(parking_lot::Mutex::new(Vec::new())),
             reply: Arc::new(parking_lot::Mutex::new(reply.to_string())),
             fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         async fn chat(State(st): State<MockState>, Json(req): Json<Value>) -> impl axum::response::IntoResponse {
             st.requests.lock().push(req);
+            let delay = st.delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
             if st.fail.load(std::sync::atomic::Ordering::SeqCst) {
                 return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"boom"})));
             }
@@ -406,5 +430,84 @@ mod tests {
         assert!(!after.iter().any(|m| {
             m.content.as_deref().unwrap_or_default().contains("Prior conversation summary")
         }));
+    }
+
+    /// review wf_d43814c3 #2: a turn that appends DURING the summary inference
+    /// window must not be destroyed by the rewrite. The version-checked
+    /// replace refuses the stale rewrite; the concurrent message survives.
+    #[tokio::test]
+    async fn concurrent_append_during_summary_is_not_lost() {
+        let (url, st) = start_mock("a summary of the early conversation").await;
+        st.delay_ms.store(150, std::sync::atomic::Ordering::SeqCst);
+        let llm = Arc::new(client(&url));
+        let cancel = CancellationToken::new();
+        let cfg = SummaryConfig { target_tokens: 100, min_messages_after: 2, ..Default::default() };
+
+        let mut big = vec![ChatMessage::system("persona")];
+        for _ in 0..8 {
+            big.push(msg_of_len(MessageRole::User, 200));
+            big.push(msg_of_len(MessageRole::Assistant, 200));
+        }
+        seed(&llm, "s", big).await;
+
+        // Kick off summarization (blocks ~150ms on the mock)...
+        let llm_bg = Arc::clone(&llm);
+        let cfg_bg = cfg.clone();
+        let handle = tokio::spawn(async move {
+            llm_bg.maybe_summarize("s", &cfg_bg, None, &cancel).await
+        });
+        // ...and append a NEW turn while it's in flight (bumps the version).
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        llm.append_context(
+            "s",
+            vec![ChatMessage::user("URGENT new turn during summary")],
+        )
+        .await;
+
+        let applied = handle.await.unwrap().unwrap();
+        assert!(!applied, "the stale rewrite must be refused (version moved)");
+
+        let after = llm.history_snapshot("s").await;
+        assert!(
+            after.iter().any(|m| m
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("URGENT new turn during summary")),
+            "the concurrent append must survive: {after:?}"
+        );
+        assert!(
+            !after.iter().any(|m| m
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Prior conversation summary")),
+            "no stale summary rewrite was applied"
+        );
+    }
+
+    /// The CAS replace applies when the version is unchanged, and refuses on
+    /// a stale version (deterministic, no timing).
+    #[tokio::test]
+    async fn replace_context_if_unchanged_is_a_cas() {
+        let (url, _st) = start_mock("x").await;
+        let llm = client(&url);
+        seed(&llm, "s", vec![ChatMessage::system("p"), ChatMessage::user("hi")]).await;
+        let (_snap, version) = llm.history_snapshot_versioned("s").await.unwrap();
+
+        // A concurrent mutation moves the version.
+        llm.append_context("s", vec![ChatMessage::user("concurrent")]).await;
+        assert!(
+            !llm.replace_context_if_unchanged("s", version, vec![ChatMessage::system("rewritten")])
+                .await,
+            "stale version: replace refused"
+        );
+        // The fresh version applies.
+        let (_snap, v2) = llm.history_snapshot_versioned("s").await.unwrap();
+        assert!(
+            llm.replace_context_if_unchanged("s", v2, vec![ChatMessage::system("rewritten")])
+                .await
+        );
+        assert_eq!(llm.history_snapshot("s").await.len(), 1);
     }
 }

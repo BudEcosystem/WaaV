@@ -32,42 +32,42 @@ impl UserMuteStrategy for AlwaysMuteWhileBotSpeaks {
     }
 }
 
-/// Greeting guard: mute from session start until the bot completes its first
-/// utterance. Detects the start→stop edge from BOTH explicit Bot signals
-/// AND `ctx.bot_speaking` transitions — production wiring drives the
-/// controller's bot truth through the playout PROBE (A-G3), not Bot
-/// signals, so a signal-only version would mute forever.
-#[derive(Debug, Default)]
+/// Greeting/disclaimer guard: mute from session start until the bot's FIRST
+/// utterance completes.
+///
+/// Driven by a SHARED latch (`first_complete`) the orchestration layer flips
+/// on the first TTS-complete — NOT by sampling signals (review wf_d43814c3
+/// #4: a user who listens silently through the greeting sends zero signals
+/// while the bot speaks, so a probe-edge version that only samples at signal
+/// time never observes the completion and mutes forever). The external latch
+/// removes that dependency: the greeting's completion flips it regardless of
+/// whether any user input arrived.
+///
+/// NOTE: this strategy is only meaningful WITH a bot utterance that plays
+/// without requiring user input first (a greeting/disclaimer-on-join, or any
+/// prior bot turn). With no such utterance, input stays guarded — the
+/// correct disclaimer semantics, not a bug.
+#[derive(Debug, Clone)]
 pub struct MuteUntilFirstBotComplete {
-    bot_started: bool,
-    first_complete: bool,
-    prev_ctx_speaking: bool,
+    first_complete: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl MuteUntilFirstBotComplete {
+    /// Build the strategy plus the shared latch the orchestration layer flips
+    /// on the first bot-utterance completion.
+    pub fn new() -> (Self, Arc<std::sync::atomic::AtomicBool>) {
+        let latch = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (Self { first_complete: Arc::clone(&latch) }, latch)
+    }
 }
 
 impl UserMuteStrategy for MuteUntilFirstBotComplete {
-    fn on_signal(&mut self, sig: &ControllerSignal, ctx: &TurnCtx) -> bool {
-        match sig {
-            ControllerSignal::BotStarted => self.bot_started = true,
-            ControllerSignal::BotStopped if self.bot_started => {
-                self.first_complete = true;
-            }
-            _ => {}
-        }
-        // Probe-driven edges (the production path).
-        if ctx.bot_speaking {
-            self.bot_started = true;
-        } else if self.prev_ctx_speaking && self.bot_started {
-            self.first_complete = true;
-        }
-        self.prev_ctx_speaking = ctx.bot_speaking;
-        !self.first_complete
+    fn on_signal(&mut self, _sig: &ControllerSignal, _ctx: &TurnCtx) -> bool {
+        !self.first_complete.load(Ordering::Acquire)
     }
-
-    fn reset(&mut self) {
-        self.bot_started = false;
-        self.first_complete = false;
-        self.prev_ctx_speaking = false;
-    }
+    // No reset(): the latch is SESSION-lifecycle external state, never
+    // per-turn — and the controller no longer resets mute strategies anyway
+    // (review wf_d43814c3 #3).
 }
 
 /// Only the FIRST user speech segment passes; everything after its
@@ -177,31 +177,30 @@ mod tests {
 
     #[test]
     fn mute_until_first_bot_complete_blocks_from_start() {
-        let mut s = MuteUntilFirstBotComplete::default();
+        use std::sync::atomic::Ordering;
+        let (mut s, latch) = MuteUntilFirstBotComplete::new();
         // Muted from session start (before the bot even starts).
         assert!(s.on_signal(&interim("hi"), &ctx(false)));
-        // Bot speaks its greeting...
-        assert!(s.on_signal(&ControllerSignal::BotStarted, &ctx(true)));
+        // Bot speaks its greeting; the user barges in — still muted.
         assert!(s.on_signal(&interim("interrupting!"), &ctx(true)), "greeting protected");
-        // ...and completes: input opens.
-        assert!(!s.on_signal(&ControllerSignal::BotStopped, &ctx(false)));
+        // The greeting's first TTS-complete flips the shared latch...
+        latch.store(true, Ordering::Release);
         assert!(!s.on_signal(&interim("now I can talk"), &ctx(false)));
-        // A spurious BotStopped BEFORE any BotStarted must not open early.
-        let mut s2 = MuteUntilFirstBotComplete::default();
-        assert!(s2.on_signal(&ControllerSignal::BotStopped, &ctx(false)));
     }
 
     #[test]
-    fn mute_until_first_bot_complete_works_with_probe_only() {
-        // Production drives bot truth via the playout PROBE (ctx), never
-        // Bot signals: the greeting guard must edge-detect from ctx alone.
-        let mut s = MuteUntilFirstBotComplete::default();
-        assert!(s.on_signal(&interim("hi"), &ctx(false)), "muted before greeting");
-        assert!(s.on_signal(&interim("interrupting"), &ctx(true)), "greeting protected");
-        assert!(
-            !s.on_signal(&interim("now I talk"), &ctx(false)),
-            "probe true→false edge opens input"
-        );
+    fn mute_until_first_bot_complete_opens_for_silent_listener() {
+        // review wf_d43814c3 #4: a user who listens SILENTLY through the
+        // greeting sends NO signals while the bot speaks. The external latch
+        // (flipped on TTS-complete) means their first post-greeting signal
+        // sees first_complete=true — no signal-sampling dependency, no
+        // forever-mute.
+        use std::sync::atomic::Ordering;
+        let (mut s, latch) = MuteUntilFirstBotComplete::new();
+        // (zero signals during the greeting) ... greeting completes:
+        latch.store(true, Ordering::Release);
+        // The very first signal the user sends is NOT muted.
+        assert!(!s.on_signal(&interim("hello after greeting"), &ctx(false)));
     }
 
     #[test]

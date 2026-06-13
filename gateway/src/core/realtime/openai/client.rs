@@ -64,6 +64,11 @@ use crate::core::realtime::base::{
 /// Channel capacity for WebSocket message sending.
 const WS_CHANNEL_CAPACITY: usize = 256;
 
+/// B-G2: cap on the local conversation log replayed on every reconnect
+/// (review wf_d43814c3): a long session must not grow it unbounded. ~100
+/// turns is far more context than any reconnect needs.
+const MAX_REPLAY_LOG_ITEMS: usize = 100;
+
 // =============================================================================
 // OpenAI Realtime Client
 // =============================================================================
@@ -291,6 +296,7 @@ impl OpenAIRealtime {
         pending_function_calls: &Arc<RwLock<HashMap<String, String>>>,
         playback: &Arc<std::sync::Mutex<Option<ItemPlayback>>>,
         conversation_log: &Arc<RwLock<Vec<crate::core::realtime::ReplayConversationItem>>>,
+        audio_format: OpenAIRealtimeAudioFormat,
     ) {
         match event {
             ServerEvent::SessionCreated { session } => {
@@ -359,6 +365,16 @@ impl OpenAIRealtime {
                         text: transcript.clone(),
                     },
                 );
+                {
+                    // Bound the replay log (review wf_d43814c3): keep the most
+                    // recent turns so a long session cannot grow it unbounded
+                    // (the full log is replayed on every reconnect).
+                    let mut log = conversation_log.write().await;
+                    let len = log.len();
+                    if len > MAX_REPLAY_LOG_ITEMS {
+                        log.drain(0..len - MAX_REPLAY_LOG_ITEMS);
+                    }
+                }
                 if let Some(cb) = transcript_cb.lock().await.as_ref() {
                     cb(TranscriptResult {
                         text: transcript,
@@ -404,6 +420,16 @@ impl OpenAIRealtime {
                         text: transcript.clone(),
                     },
                 );
+                {
+                    // Bound the replay log (review wf_d43814c3): keep the most
+                    // recent turns so a long session cannot grow it unbounded
+                    // (the full log is replayed on every reconnect).
+                    let mut log = conversation_log.write().await;
+                    let len = log.len();
+                    if len > MAX_REPLAY_LOG_ITEMS {
+                        log.drain(0..len - MAX_REPLAY_LOG_ITEMS);
+                    }
+                }
 
                 if let Some(cb) = transcript_cb.lock().await.as_ref() {
                     cb(TranscriptResult {
@@ -426,11 +452,13 @@ impl OpenAIRealtime {
                 if let Some(cb) = audio_cb.lock().await.as_ref() {
                     match BASE64_STANDARD.decode(&delta) {
                         Ok(audio_bytes) => {
-                            // B-G2 truncate bookkeeping: 24 kHz PCM16 mono =
-                            // 48 bytes/ms. Same item extends; a new item
+                            // B-G2 truncate bookkeeping: FORMAT-aware bytes/ms
+                            // (PCM16 @24k = 48, G.711 @8k = 8 — review
+                            // wf_d43814c3 #6). Same item extends; a new item
                             // restarts the playback estimate.
                             {
-                                let chunk_ms = (audio_bytes.len() as u64) / 48;
+                                let chunk_ms =
+                                    (audio_bytes.len() as u64) / audio_format.bytes_per_ms();
                                 let mut pb = playback.lock().expect("playback lock");
                                 match pb.as_mut() {
                                     Some(p) if p.item_id == item_id => {
@@ -447,7 +475,7 @@ impl OpenAIRealtime {
                             }
                             cb(RealtimeAudioData {
                                 data: Bytes::from(audio_bytes),
-                                sample_rate: 24000,
+                                sample_rate: audio_format.sample_rate(),
                                 item_id: Some(item_id),
                                 response_id: Some(response_id),
                             })
@@ -514,6 +542,12 @@ impl OpenAIRealtime {
 
             ServerEvent::ResponseDone { response } => {
                 tracing::debug!("Response done: {}", response.id);
+                // B-G2 (review wf_d43814c3 #1): the response finished playing —
+                // CLEAR the playback estimate so a later barge-in/CancelResponse
+                // cannot truncate a fully-heard (already-completed) item, which
+                // the server would interpret as deleting heard assistant
+                // context.
+                *playback.lock().expect("playback lock") = None;
                 if let Some(cb) = response_done_cb.lock().await.as_ref() {
                     cb(response.id).await;
                 }
@@ -653,6 +687,7 @@ impl BaseRealtime for OpenAIRealtime {
         let pending_function_calls = self.pending_function_calls.clone();
         let playback = self.playback.clone();
         let conversation_log = self.conversation_log.clone();
+        let audio_format = self.audio_format; // Copy
 
         // Clone reconnection-related state
         let reconnection_config = self.reconnection_config.clone();
@@ -724,6 +759,7 @@ impl BaseRealtime for OpenAIRealtime {
                                                 &pending_function_calls,
                                                 &playback,
                                                 &conversation_log,
+                                                audio_format,
                                             ).await;
                                         }
                                         Err(e) => {
@@ -1222,9 +1258,15 @@ impl BaseRealtime for OpenAIRealtime {
     // ── B-G2: S2S-as-a-service surface ──
 
     fn emits_user_turn_frames(&self) -> bool {
-        // Server VAD configured ⇒ the server produces turn signals; without
-        // it (manual mode) the gateway's turn policy drives commits.
-        self.config.turn_detection.is_some()
+        // review wf_d43814c3 #7: OpenAI's `session.turn_detection` defaults to
+        // server VAD ON, and WaaV OMITS the field when `config.turn_detection`
+        // is None (`skip_serializing_if`), so the server STILL runs VAD and
+        // produces turn frames. Server VAD is therefore on UNLESS the config
+        // explicitly selects the `None` (manual) variant.
+        !matches!(
+            self.config.turn_detection,
+            Some(crate::core::realtime::base::TurnDetectionConfig::None)
+        )
     }
 
     async fn truncate_response(
@@ -1425,33 +1467,71 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn emits_user_turn_frames_false_when_turn_detection_disabled() {
+    async fn emits_user_turn_frames_tracks_server_vad_default(){
         use crate::core::realtime::TurnDetectionConfig;
-        let server_vad = OpenAIRealtime::new(RealtimeConfig {
-            provider: "openai".into(),
-            api_key: "k".into(),
-            model: "gpt-4o-realtime-preview".into(),
-            turn_detection: Some(TurnDetectionConfig::default()),
-            ..Default::default()
-        })
-        .unwrap();
-        assert!(server_vad.emits_user_turn_frames(), "server VAD → server turn frames");
-
-        let manual = OpenAIRealtime::new(RealtimeConfig {
-            provider: "openai".into(),
-            api_key: "k".into(),
-            model: "gpt-4o-realtime-preview".into(),
-            turn_detection: None,
-            ..Default::default()
-        })
-        .unwrap();
+        let mk = |td: Option<TurnDetectionConfig>| {
+            OpenAIRealtime::new(RealtimeConfig {
+                provider: "openai".into(),
+                api_key: "k".into(),
+                model: "gpt-4o-realtime-preview".into(),
+                turn_detection: td,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        // Explicit server VAD → server produces turn frames.
+        assert!(mk(Some(TurnDetectionConfig::default())).emits_user_turn_frames());
+        // review wf_d43814c3 #7: OMITTED turn_detection is serialized away, so
+        // OpenAI keeps its SERVER-VAD DEFAULT (on) — frames still come from the
+        // server.
         assert!(
-            !manual.emits_user_turn_frames(),
-            "manual mode → the GATEWAY's turn policy drives commits"
+            mk(None).emits_user_turn_frames(),
+            "omitted turn_detection ⇒ OpenAI server-VAD default is ON"
+        );
+        // ONLY the explicit manual variant flips it off.
+        assert!(
+            !mk(Some(TurnDetectionConfig::None)).emits_user_turn_frames(),
+            "explicit None (manual) ⇒ the gateway drives turns"
         );
     }
 
     #[test]
+    fn audio_format_bytes_per_ms_matches_rate() {
+        // review wf_d43814c3 #6: telephony g711 is 1 byte/sample @8kHz = 8
+        // B/ms; hardcoding PCM16's 48 over-truncated 6×.
+        assert_eq!(OpenAIRealtimeAudioFormat::Pcm16.bytes_per_ms(), 48);
+        assert_eq!(OpenAIRealtimeAudioFormat::G711Ulaw.bytes_per_ms(), 8);
+        assert_eq!(OpenAIRealtimeAudioFormat::G711Alaw.bytes_per_ms(), 8);
+        // 200ms of g711 = 1600 bytes (not 1600/48 ≈ 33ms).
+        assert_eq!(1600 / OpenAIRealtimeAudioFormat::G711Ulaw.bytes_per_ms(), 200);
+    }
+
+    #[tokio::test]
+    async fn truncate_current_response_none_after_response_done() {
+        // review wf_d43814c3 #1: a CancelResponse after the response finished
+        // must not truncate a fully-heard item. Driving a ResponseDone clears
+        // the playback estimate, so truncate_current_response returns None.
+        let mut rt = OpenAIRealtime::new(RealtimeConfig {
+            provider: "openai".into(),
+            api_key: "k".into(),
+            model: "gpt-4o-realtime-preview".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        // Simulate an in-flight item, then completion.
+        *rt.playback.lock().unwrap() = Some(ItemPlayback {
+            item_id: "item_1".into(),
+            first_delta: std::time::Instant::now(),
+            duration_ms: 800,
+        });
+        // ResponseDone clears playback (the handler path); emulate its effect.
+        *rt.playback.lock().unwrap() = None;
+        assert!(
+            rt.truncate_current_response().await.unwrap().is_none(),
+            "no playing item ⇒ nothing to truncate (no deletion of heard context)"
+        );
+    }
+
     fn replay_items_render_as_completed_messages_never_responses() {
         use crate::core::realtime::{ReplayConversationItem, TranscriptRole};
         let user = OpenAIRealtime::replay_item_to_conversation_item(&ReplayConversationItem {

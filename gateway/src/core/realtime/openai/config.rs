@@ -191,6 +191,18 @@ impl OpenAIRealtimeAudioFormat {
         }
     }
 
+    /// Bytes per millisecond of audio (B-G2 truncate math, review
+    /// wf_d43814c3 #6): PCM16 = 2 bytes/sample @24kHz = 48 B/ms; G.711 =
+    /// 1 byte/sample @8kHz = 8 B/ms. Hardcoding 48 over-truncated telephony
+    /// sessions 6×.
+    #[inline]
+    pub fn bytes_per_ms(&self) -> u64 {
+        match self {
+            Self::Pcm16 => 48,
+            Self::G711Ulaw | Self::G711Alaw => 8,
+        }
+    }
+
     /// Parse from string, with fallback to default.
     pub fn from_str_or_default(s: &str) -> Self {
         match s.to_lowercase().as_str() {
