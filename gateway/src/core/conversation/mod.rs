@@ -656,8 +656,32 @@ impl ConversationOrchestrator {
             return;
         }
         let mut guard = self.eager.lock();
-        if guard.is_some() {
-            return; // one in-flight speculation at a time
+        // A-G4 supersede-not-discard: predictions arrive as the user keeps
+        // speaking. The OLD behavior pinned the FIRST prediction and ignored
+        // later (fuller) ones, so a final that extended the first prediction
+        // discarded the speculation and ran a full fresh turn — zero latency
+        // win. Instead, when a new prediction EXTENDS the in-flight one (or
+        // diverges to a longer transcript), CANCEL the stale speculation and
+        // re-speculate on the fuller text — the latest prediction is the most
+        // likely to match the final, maximizing eager confirmations.
+        if let Some(existing) = guard.as_ref() {
+            if existing.transcript == text {
+                return; // already speculating on exactly this text
+            }
+            // Only supersede when the new text is a richer continuation
+            // (avoids thrashing on a transient shorter interim). The
+            // common case — the user appended words — is `text` starting
+            // with the old transcript; also supersede any strictly longer
+            // divergence.
+            let is_extension = text.starts_with(&existing.transcript)
+                || text.len() > existing.transcript.len();
+            if !is_extension {
+                return;
+            }
+            existing.token.cancel();
+            existing.task.abort();
+            debug!(session = %self.session_id,
+                   "eager speculation superseded by a fuller prediction");
         }
         let token = CancellationToken::new();
         let response: Arc<SyncMutex<Option<Result<String, ()>>>> =
@@ -791,7 +815,12 @@ impl ConversationOrchestrator {
         // Eager confirmation: prediction matched the final transcript →
         // the held speculative reply IS the turn. Commit + speak.
         if let Some(eager) = eager {
-            if eager.transcript == transcript {
+            // A-G4: NORMALIZED match (trim + collapse whitespace + case-fold)
+            // — the smart-turn PREDICTION transcript and the provider's
+            // FINAL routinely differ only in casing/spacing ("what's the
+            // weather" vs "What's the weather"); the LLM answer is identical,
+            // so an exact `==` needlessly discarded confirmable speculations.
+            if eager_transcript_matches(&eager.transcript, transcript) {
                 let _ = eager.task.await;
                 let held = eager.response.lock().take();
                 if let Some(Ok(content)) = held
@@ -989,6 +1018,19 @@ pub fn classify_llm_error(error: &LlmError) -> StageErrorClass {
     }
 }
 
+/// A-G4: whether an eager speculation's transcript matches the final closely
+/// enough to confirm. Normalizes whitespace and case — the prediction and the
+/// provider's final routinely differ only there, and the LLM's answer is
+/// insensitive to those, so an exact byte comparison needlessly discarded
+/// confirmable speculations. Punctuation/word differences still diverge (the
+/// staged answer would be on different input — never speak a wrong reply).
+fn eager_transcript_matches(speculation: &str, final_transcript: &str) -> bool {
+    fn norm(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    }
+    norm(speculation) == norm(final_transcript)
+}
+
 /// Validate a client-supplied LLM base URL for SSRF.
 ///
 /// Thin wrapper over the canonical [`crate::core::net::validate_url_for_ssrf`]
@@ -1002,6 +1044,24 @@ fn validate_llm_url(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eager_match_is_whitespace_and_case_insensitive() {
+        // A-G4: prediction vs final differing only in case/spacing confirms.
+        assert!(eager_transcript_matches(
+            "what's the weather today",
+            "What's the weather today"
+        ));
+        assert!(eager_transcript_matches("hello   world", "Hello world"));
+        assert!(eager_transcript_matches(" trailing space ", "trailing space"));
+        // But genuinely different content does NOT confirm (never speak a
+        // reply staged on different input).
+        assert!(!eager_transcript_matches(
+            "what's the weather",
+            "what's the weather today"
+        ));
+        assert!(!eager_transcript_matches("book a flight", "cancel a flight"));
+    }
 
     #[test]
     fn test_config_default() {

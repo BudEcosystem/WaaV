@@ -656,6 +656,73 @@ async fn eager_divergent_transcript_discards_without_history_pollution() {
     );
 }
 
+/// A-G4 supersede: a fuller prediction REPLACES an earlier one (instead of
+/// being ignored), so a case-/space-differing final still CONFIRMS — the
+/// eager latency win survives the user appending words. The held reply is
+/// spoken and committed exactly once with NO orphan user message.
+#[tokio::test]
+#[serial_test::serial]
+async fn eager_supersede_confirms_on_fuller_prediction() {
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let llm_state = LlmMockState::default();
+    *llm_state.reply.lock() = "Paris is the capital.".to_string();
+    llm_state.delay_ms.store(120, Ordering::SeqCst);
+    let base_url = start_llm_mock(llm_state.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let saw_audio = wire_audio_egress(&vm).await;
+
+    let orch =
+        ConversationOrchestrator::new("eager-3", eager_config(base_url), vm).expect("orch");
+
+    // First (short) prediction…
+    orch.trigger_eager_turn("what is the");
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    // …superseded by a FULLER prediction (the user kept speaking).
+    orch.trigger_eager_turn("what is the capital of france");
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    // The provider final differs only in CASE → A-G4 normalized confirm.
+    orch.on_stt_result(&final_result("What is the capital of France"))
+        .await;
+
+    let spoken = TTS_STATS.spoken.lock().clone();
+    assert!(
+        spoken.iter().any(|s| s.contains("Paris is the capital")),
+        "the superseding speculation's held reply must be spoken: {spoken:?}"
+    );
+    assert!(saw_audio.load(Ordering::SeqCst));
+
+    // No orphan user message: the next turn's history carries the FINAL
+    // transcript exactly once (the superseded short prediction left nothing).
+    *llm_state.reply.lock() = "Next.".to_string();
+    llm_state.delay_ms.store(0, Ordering::SeqCst);
+    orch.on_stt_result(&final_result("thanks")).await;
+    let requests = llm_state.requests.lock().clone();
+    let last = requests.last().unwrap();
+    let users: Vec<String> = last["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .filter_map(|m| m["content"].as_str().map(String::from))
+        .collect();
+    assert_eq!(
+        users.iter().filter(|c| c.contains("capital of France")).count(),
+        1,
+        "exactly one capital-question user message (the FINAL transcript): {users:?}"
+    );
+    assert!(
+        !users.iter().any(|c| c == "what is the"),
+        "the superseded SHORT prediction must never be committed: {users:?}"
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // B-G5 — barge-in commits the PARTIAL assistant reply to context.
 // ──────────────────────────────────────────────────────────────────────────────
