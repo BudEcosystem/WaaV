@@ -10,10 +10,12 @@ pub mod ring_buffer;
 // The single streaming resampler (C-G5) — ALWAYS built: TTS egress
 // `client_playback_rate` is part of the session API in every build.
 pub mod output_chunker;
+pub mod playback_queue;
 pub mod resampler;
 pub mod vad;
 
 pub use ring_buffer::AudioRingBuffer;
 pub use output_chunker::{DEFAULT_AUDIO_OUT_CHUNK_MS, OutputChunker};
+pub use playback_queue::{PlaybackQueue, PlaybackUnit};
 pub use resampler::{StreamResampler, egress_to_client_rate, resample_pcm16};
 pub use vad::{VADAnalyzer, VADParams, VADState, VADTransition};
