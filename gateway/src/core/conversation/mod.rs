@@ -109,6 +109,13 @@ pub struct ConversationConfig {
     /// sent to the wire is floor-clamped to the model's floor in
     /// `to_client_config`; the floor is echoed to the client at config time.
     pub reasoning_effort: Option<crate::core::llm::ReasoningEffort>,
+    /// D3: latency-masking mode (default `Auto`). One masking utterance/turn when
+    /// first audio is slow, so the caller never hears dead air.
+    pub latency_filler: LatencyFiller,
+    /// D3: override the masking wait threshold (ms). `None` = mode default.
+    pub latency_filler_after_ms: Option<u64>,
+    /// D3: custom masking phrases. Empty = the built-in action-phrase pool.
+    pub latency_filler_phrases: Vec<String>,
 }
 
 impl Default for ConversationConfig {
@@ -131,9 +138,57 @@ impl Default for ConversationConfig {
             strip_markdown: true,
             user_idle_timeout_ms: 0,
             reasoning_effort: None,
+            latency_filler: LatencyFiller::default(),
+            latency_filler_after_ms: None,
+            latency_filler_phrases: Vec::new(),
         }
     }
 }
+
+/// D3 (REALTIME_REASONING.md §4.3): the unified latency-masking mode. ONE knob
+/// covering the action-preamble + pre-rendered gap-filler, deduped to at most one
+/// masking utterance per turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum LatencyFiller {
+    /// Never speak a masking utterance.
+    Off,
+    /// (Default) Speak ONE short masking utterance per turn when first audio is
+    /// slow — keeps the line alive while the LLM/RAG/tool/reasoning runs.
+    #[default]
+    Auto,
+    /// Lower the wait threshold for known-slow (RAG/agentic/reasoning) routes.
+    Aggressive,
+}
+
+impl LatencyFiller {
+    /// Wait before a masking utterance fires, given an optional operator override.
+    /// `Auto` ~800ms (under the ~2s "unnatural" line); `Aggressive` ~400ms.
+    pub fn wait_ms(self, override_ms: Option<u64>) -> u64 {
+        override_ms.unwrap_or(match self {
+            LatencyFiller::Off => u64::MAX,
+            LatencyFiller::Auto => 800,
+            LatencyFiller::Aggressive => 400,
+        })
+    }
+
+    /// Whether masking is enabled at all.
+    pub fn enabled(self) -> bool {
+        !matches!(self, LatencyFiller::Off)
+    }
+}
+
+/// D3: the built-in action-phrase pool when the operator supplies none. Action
+/// wording (never "um"/"hmm"), kept short (<~1s synthesized) so an uninterruptible
+/// clip can't talk over a barging user.
+pub const DEFAULT_FILLER_PHRASES: &[&str] = &[
+    "Let me check that.",
+    "One moment.",
+    "Let me look into that.",
+    "Give me a moment.",
+    "Just a second.",
+];
 
 /// Default `max_tokens` cap for the VOICE path when the operator doesn't set
 /// one (X-G1). A spoken reply of ~30s is ~75 words (~100 tokens); 256 leaves
@@ -149,7 +204,10 @@ impl ConversationConfig {
             base_url: self.base_url.clone(),
             model: self.model.clone(),
             api_key: self.api_key.clone(),
-            system_prompt: self.system_prompt.clone(),
+            // D3 double-ack guard (critique H2): when masking is on, the gateway
+            // may itself speak a "one moment" filler — so instruct the model NOT
+            // to open with its own filler, or the caller hears it twice.
+            system_prompt: self.system_prompt_with_filler_guard(),
             temperature: self.temperature,
             // X-G1: cap completion length for voice unless explicitly set.
             max_tokens: self.max_tokens.or(Some(VOICE_DEFAULT_MAX_TOKENS)),
@@ -165,6 +223,22 @@ impl ConversationConfig {
             .0,
             ..Default::default()
         }
+    }
+
+    /// D3: the system prompt, plus a one-line "answer directly, don't open with a
+    /// filler" guard when masking is enabled (prevents the gateway-filler +
+    /// model-filler double-ack). Identity when masking is off.
+    fn system_prompt_with_filler_guard(&self) -> Option<String> {
+        const GUARD: &str = "Answer directly and concisely. Do not begin your reply with \
+            filler such as \"let me check\", \"one moment\", or \"sure\" — a brief holding \
+            phrase is already spoken for you when needed.";
+        if !self.latency_filler.enabled() {
+            return self.system_prompt.clone();
+        }
+        Some(match &self.system_prompt {
+            Some(p) if !p.trim().is_empty() => format!("{p}\n\n{GUARD}"),
+            _ => GUARD.to_string(),
+        })
     }
 
     /// D1: the reasoning effort actually applied + the model's floor, for the
@@ -211,6 +285,15 @@ pub struct ConversationOrchestrator {
     /// further turns from running — every subsequent utterance would hammer
     /// the same dead key/config, burning latency and money on silence.
     fatal_stopped: Arc<std::sync::atomic::AtomicBool>,
+    /// D3: set true when a latency-masking utterance was spoken this turn (the
+    /// one-per-turn latch + the recovery-line trigger). Reset in `begin_turn`.
+    masking_fired: Arc<std::sync::atomic::AtomicBool>,
+    /// D3: the in-flight masking timer task, aborted on first audio / barge-in /
+    /// turn end so it never fires after the turn is done.
+    masking_handle: Arc<SyncMutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// D3: round-robin index into the filler phrase pool (gentle rotation so the
+    /// same phrase doesn't repeat back-to-back).
+    masking_phrase_idx: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// A speculative LLM turn started on a turn-complete PREDICTION, before the
@@ -259,6 +342,9 @@ impl ConversationOrchestrator {
             fatal_handler: Arc::new(SyncMutex::new(None)),
             first_bot_complete_latch: Arc::new(SyncMutex::new(None)),
             fatal_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            masking_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            masking_handle: Arc::new(SyncMutex::new(None)),
+            masking_phrase_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -283,6 +369,9 @@ impl ConversationOrchestrator {
             fatal_handler: Arc::new(SyncMutex::new(None)),
             first_bot_complete_latch: Arc::new(SyncMutex::new(None)),
             fatal_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            masking_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            masking_handle: Arc::new(SyncMutex::new(None)),
+            masking_phrase_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -308,6 +397,11 @@ impl ConversationOrchestrator {
             .next_turn_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let token = CancellationToken::new();
+        // D3: a fresh turn starts with no masking spoken, and any stale masking
+        // timer from a prior turn is torn down.
+        self.masking_fired
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.abort_masking();
         let mut guard = self.turn.lock();
         if let Some((_, prev)) = guard.take() {
             prev.cancel();
@@ -322,6 +416,37 @@ impl ConversationOrchestrator {
         if matches!(guard.as_ref(), Some((cur, _)) if *cur == id) {
             *guard = None;
         }
+    }
+
+    /// D3: abort the in-flight masking timer (no-op if none). Called when first
+    /// audio arrives, on barge-in, and at turn end so a filler never fires late.
+    fn abort_masking(&self) {
+        if let Some(h) = self.masking_handle.lock().take() {
+            h.abort();
+        }
+    }
+
+    /// D3: pick the next masking phrase (operator pool or the built-in default),
+    /// rotating so the same phrase doesn't repeat back-to-back.
+    fn next_filler_phrase(&self) -> Option<String> {
+        let custom = &self.config.latency_filler_phrases;
+        let len = if custom.is_empty() {
+            DEFAULT_FILLER_PHRASES.len()
+        } else {
+            custom.len()
+        };
+        if len == 0 {
+            return None;
+        }
+        let i = self
+            .masking_phrase_idx
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % len;
+        Some(if custom.is_empty() {
+            DEFAULT_FILLER_PHRASES[i].to_string()
+        } else {
+            custom[i].clone()
+        })
     }
 
     /// React to a barge-in (the turn controller already passed the MinWords /
@@ -340,6 +465,8 @@ impl ConversationOrchestrator {
     pub async fn handle_barge_in(&self) {
         // Cancel compute FIRST, before any protected-window check.
         let had_turn = self.cancel_current_turn();
+        // D3: tear down a pending masking timer so no filler fires post-barge-in.
+        self.abort_masking();
         if let Some(eager) = self.eager.lock().take() {
             eager.token.cancel();
             debug!(session = %self.session_id, "barge-in cancelled eager speculative turn");
@@ -385,6 +512,56 @@ impl ConversationOrchestrator {
         // True once the pump actually delivered any text to TTS (guards the
         // reasoning-model empty-stream failure mode).
         let spoke = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // D3 (REALTIME_REASONING.md §4.3): latency masking. Arm a SINGLE timer on
+        // this CONFIRMED-EoT path (never on the speculative/eager path). If no
+        // audio has reached TTS by the wait threshold, speak ONE short action
+        // phrase (interruptible) to keep the line alive while the LLM/RAG/tool
+        // runs IN PARALLEL (it is already dispatched — the timer never defers it).
+        // The latch makes it one-utterance-per-turn; first-audio / barge-in / turn
+        // end abort it. Off ⇒ zero added work (no task spawned).
+        if self.config.latency_filler.enabled() {
+            let wait_ms = self
+                .config
+                .latency_filler
+                .wait_ms(self.config.latency_filler_after_ms);
+            if let Some(phrase) = self.next_filler_phrase() {
+                let vm = self.voice_manager.clone();
+                let spoke_t = spoke.clone();
+                let token_t = token.clone();
+                let latch = self.masking_fired.clone();
+                let session = self.session_id.clone();
+                let handle = tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                    // Re-check at fire time: not cancelled, no audio yet, not
+                    // already fired, and the bot isn't already speaking.
+                    if token_t.is_cancelled() || spoke_t.load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        return;
+                    }
+                    if latch.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        return; // one masking utterance per turn
+                    }
+                    // Suppress the filler's own VAD tail (≤400ms) while keeping the
+                    // clip interruptible, then speak it (epoch-gated so a barge-in
+                    // that already cleared drops it).
+                    vm.arm_barge_in_suppression(350);
+                    match vm.speak_if_epoch(&phrase, true, true, epoch).await {
+                        Ok(true) => debug!(session = %session, %phrase, "D3 masking filler spoken"),
+                        Ok(false) => {
+                            // Cleared before we could speak — undo the latch so a
+                            // recovery line can still fire if content is empty.
+                            latch.store(false, std::sync::atomic::Ordering::Release);
+                        }
+                        Err(e) => {
+                            warn!(session = %session, error = %e, "D3 masking filler failed");
+                            latch.store(false, std::sync::atomic::Ordering::Release);
+                        }
+                    }
+                });
+                *self.masking_handle.lock() = Some(handle);
+            }
+        }
 
         // B-G5: every streamed delta accumulates here so a barge-in can
         // commit the PARTIAL reply to history — the model's next turn must
@@ -603,9 +780,26 @@ impl ConversationOrchestrator {
                         warn!(
                             session = %self.session_id,
                             "LLM turn produced NO speakable content (reasoning-only \
-                             model or empty completion) — bot stays silent; check the \
-                             configured model/max_tokens"
+                             model or empty completion) — check the configured \
+                             model/max_tokens"
                         );
+                        // D3 recovery: if a masking filler already promised an
+                        // answer ("one moment") and the turn then produced nothing,
+                        // a spoken recovery line beats dead air (critique M3).
+                        if self
+                            .masking_fired
+                            .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            let _ = self
+                                .voice_manager
+                                .speak_if_epoch(
+                                    "Sorry, I didn't catch that — could you say it again?",
+                                    true,
+                                    allow_interruption,
+                                    epoch,
+                                )
+                                .await;
+                        }
                     }
                     Ok(())
                 }
@@ -633,6 +827,9 @@ impl ConversationOrchestrator {
             Err(e) => Err(e.into()),
         };
 
+        // D3: the turn is done — tear down the masking timer (a no-op if it
+        // already fired or first audio aborted it; prevents a late stray filler).
+        self.abort_masking();
         self.end_turn(id);
 
         // A-G5 (review wf_d43814c3 #4): the bot completed a turn that ran to
@@ -1218,6 +1415,8 @@ mod tests {
             model: "m".into(),
             system_prompt: Some("be nice".into()),
             max_history: 7,
+            // Isolate the carry-through from the D3 filler-guard addendum.
+            latency_filler: LatencyFiller::Off,
             ..Default::default()
         };
         let cc = c.to_client_config();
@@ -1225,6 +1424,36 @@ mod tests {
         assert_eq!(cc.model, "m");
         assert_eq!(cc.system_prompt.as_deref(), Some("be nice"));
         assert_eq!(cc.max_history, 7);
+    }
+
+    #[test]
+    fn d3_filler_guard_appended_only_when_masking_on() {
+        // Masking on (default Auto) → the user's prompt is preserved and the
+        // anti-double-ack guard is appended.
+        let on = ConversationConfig {
+            system_prompt: Some("be nice".into()),
+            ..Default::default()
+        };
+        let p = on.to_client_config().system_prompt.unwrap();
+        assert!(p.starts_with("be nice"), "user prompt preserved: {p}");
+        assert!(p.contains("Do not begin your reply with filler"), "guard appended: {p}");
+
+        // Masking off → identity (the prompt is untouched).
+        let off = ConversationConfig {
+            system_prompt: Some("be nice".into()),
+            latency_filler: LatencyFiller::Off,
+            ..Default::default()
+        };
+        assert_eq!(off.to_client_config().system_prompt.as_deref(), Some("be nice"));
+
+        // No prompt + masking on → just the guard.
+        let bare = ConversationConfig { system_prompt: None, ..Default::default() };
+        assert!(
+            bare.to_client_config()
+                .system_prompt
+                .unwrap()
+                .contains("Answer directly")
+        );
     }
 
     #[test]

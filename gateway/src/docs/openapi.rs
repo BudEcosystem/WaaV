@@ -107,6 +107,7 @@ use crate::handlers::{
         DAGWebSocketConfig,
         ConversationWebSocketConfig,
         crate::core::llm::ReasoningEffort,
+        crate::core::conversation::LatencyFiller,
         Pronunciation,
         // Standardized advanced-feature vocabulary (carried across the dispatch boundary)
         SttFeatures,

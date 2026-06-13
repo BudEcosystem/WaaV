@@ -146,6 +146,24 @@ pub struct ConversationWebSocketConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(example = "minimal"))]
     pub reasoning_effort: Option<crate::core::llm::ReasoningEffort>,
+
+    /// D3 (REALTIME_REASONING.md §4.3): latency-masking mode —
+    /// `off | auto | aggressive`. `auto` (default) speaks ONE short action phrase
+    /// when first audio is slow (reasoning/RAG/tool), keeping the line alive while
+    /// the real answer streams in behind it — at most one masking utterance per
+    /// turn, codec- & language-correct, interruptible by barge-in.
+    #[serde(default)]
+    #[cfg_attr(feature = "openapi", schema(example = "auto"))]
+    pub latency_filler: crate::core::conversation::LatencyFiller,
+    /// D3: override the masking wait threshold in ms (mode default otherwise:
+    /// auto ~800, aggressive ~400). Keep well under the ~2s "feels broken" line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(example = 800))]
+    pub latency_filler_after_ms: Option<u64>,
+    /// D3: custom masking phrases (action wording, e.g. "Let me check that order").
+    /// Empty = the built-in pool. Pre-rendered at session start at the call's rate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub latency_filler_phrases: Vec<String>,
 }
 
 fn default_strip_markdown() -> bool {
@@ -185,6 +203,9 @@ impl ConversationWebSocketConfig {
             strip_markdown: self.strip_markdown,
             user_idle_timeout_ms: self.user_idle_timeout_ms,
             reasoning_effort: self.reasoning_effort,
+            latency_filler: self.latency_filler,
+            latency_filler_after_ms: self.latency_filler_after_ms,
+            latency_filler_phrases: self.latency_filler_phrases.clone(),
         }
     }
 }

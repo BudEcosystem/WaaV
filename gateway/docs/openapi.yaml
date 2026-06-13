@@ -652,6 +652,31 @@ components:
             Eager end-of-turn (P1.2b): start the LLM speculatively on a
             turn-complete prediction, confirm/cancel on the provider final.
             Opt-in — raises LLM call volume on resumed turns (default false).
+        latency_filler:
+          $ref: '#/components/schemas/LatencyFiller'
+          description: |-
+            D3 (REALTIME_REASONING.md §4.3): latency-masking mode —
+            `off | auto | aggressive`. `auto` (default) speaks ONE short action phrase
+            when first audio is slow (reasoning/RAG/tool), keeping the line alive while
+            the real answer streams in behind it — at most one masking utterance per
+            turn, codec- & language-correct, interruptible by barge-in.
+        latency_filler_after_ms:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            D3: override the masking wait threshold in ms (mode default otherwise:
+            auto ~800, aggressive ~400). Keep well under the ~2s "feels broken" line.
+          example: 800
+          minimum: 0
+        latency_filler_phrases:
+          type: array
+          items:
+            type: string
+          description: |-
+            D3: custom masking phrases (action wording, e.g. "Let me check that order").
+            Empty = the built-in pool. Pre-rendered at session start at the call's rate.
         max_history:
           type: integer
           description: Max retained history messages (default 20).
@@ -1222,6 +1247,16 @@ components:
       - low
       - medium
       - high
+    LatencyFiller:
+      type: string
+      description: |-
+        D3 (REALTIME_REASONING.md §4.3): the unified latency-masking mode. ONE knob
+        covering the action-preamble + pre-rendered gap-filler, deduped to at most one
+        masking utterance per turn.
+      enum:
+      - off
+      - auto
+      - aggressive
     ListRoomsResponse:
       type: object
       description: |-

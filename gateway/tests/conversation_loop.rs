@@ -32,7 +32,7 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
-use waav_gateway::core::conversation::{ConversationConfig, ConversationOrchestrator};
+use waav_gateway::core::conversation::{ConversationConfig, ConversationOrchestrator, LatencyFiller};
 use waav_gateway::core::llm::{LlmClient, LlmClientConfig};
 use waav_gateway::core::stt::{BaseSTT, STTResult};
 use waav_gateway::core::tts::{AudioCallback, AudioData, BaseTTS, TTSConfig, TTSResult};
@@ -461,6 +461,92 @@ async fn barge_in_during_protected_window_cancels_llm() {
         !spoken.iter().any(|s| s.contains("This is a long answer")),
         "the in-flight LLM must be cancelled even inside a protected window, got: {:?}",
         spoken
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// D3 latency_filler masking: one filler on a slow turn, silence on a fast turn.
+// ──────────────────────────────────────────────────────────────────────────────
+const FILLER_PHRASES: &[&str] = &[
+    "Let me check that.",
+    "One moment.",
+    "Let me look into that.",
+    "Give me a moment.",
+    "Just a second.",
+];
+
+fn is_filler(s: &str) -> bool {
+    FILLER_PHRASES.contains(&s) || s.contains("didn't catch that")
+}
+
+async fn run_masking_turn(filler: LatencyFiller, after_ms: u64, llm_delay_ms: usize) -> Vec<String> {
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let llm_state = LlmMockState::default();
+    *llm_state.reply.lock() = "Your balance is forty two dollars.".to_string();
+    llm_state.delay_ms.store(llm_delay_ms, Ordering::SeqCst);
+    let base_url = start_llm_mock(llm_state.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+
+    // streaming=false matches the non-streaming mock LLM; the masking timer is
+    // armed before the streaming branch, so this exercises masking either way.
+    let cfg = ConversationConfig {
+        latency_filler: filler,
+        latency_filler_after_ms: Some(after_ms),
+        ..conv_config(base_url, false)
+    };
+    let orchestrator =
+        Arc::new(ConversationOrchestrator::new("session-mask", cfg, vm.clone()).expect("orch"));
+    orchestrator.run_turn("what is my balance").await.ok();
+    // Let any (aborted) masking task settle.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    TTS_STATS.spoken.lock().clone()
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn latency_filler_speaks_one_filler_on_slow_llm() {
+    // Slow LLM (600ms) with a 150ms wait → exactly ONE filler, then the answer.
+    let spoken = run_masking_turn(LatencyFiller::Auto, 150, 600).await;
+    let fillers: Vec<_> = spoken.iter().filter(|s| is_filler(s)).collect();
+    assert_eq!(fillers.len(), 1, "exactly one masking filler expected, got: {spoken:?}");
+    assert!(
+        spoken.iter().any(|s| s.contains("forty two")),
+        "the real answer must still be spoken: {spoken:?}"
+    );
+    // Ordering: the filler precedes the answer.
+    let fi = spoken.iter().position(|s| is_filler(s)).unwrap();
+    let ai = spoken.iter().position(|s| s.contains("forty two")).unwrap();
+    assert!(fi < ai, "filler must precede the answer: {spoken:?}");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn latency_filler_silent_on_fast_llm() {
+    // Fast LLM (0ms) with a 150ms wait → the turn finishes first → NO filler.
+    let spoken = run_masking_turn(LatencyFiller::Auto, 150, 0).await;
+    assert!(
+        !spoken.iter().any(|s| is_filler(s)),
+        "a fast turn must not speak a filler: {spoken:?}"
+    );
+    assert!(spoken.iter().any(|s| s.contains("forty two")));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn latency_filler_off_speaks_nothing() {
+    // Off → no filler even on a slow turn.
+    let spoken = run_masking_turn(LatencyFiller::Off, 150, 600).await;
+    assert!(
+        !spoken.iter().any(|s| is_filler(s)),
+        "latency_filler=off must never speak a filler: {spoken:?}"
     );
 }
 
