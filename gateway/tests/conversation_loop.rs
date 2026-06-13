@@ -410,6 +410,61 @@ async fn barge_in_interrupts_tts() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// TEST 2b (REALTIME_REASONING.md §4.4 / critique C3): a barge-in DURING a
+// protected (filler/uninterruptible) window must STILL cancel the in-flight LLM —
+// the old `handle_barge_in` early-returned and let a slow reasoning turn keep
+// burning for the clip's whole duration. RED on the pre-fix code.
+// ──────────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+#[serial_test::serial]
+async fn barge_in_during_protected_window_cancels_llm() {
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let llm_state = LlmMockState::default();
+    *llm_state.reply.lock() = "This is a long answer.".to_string();
+    llm_state.delay_ms.store(1500, Ordering::SeqCst); // slow LLM, in flight at barge-in
+    let base_url = start_llm_mock(llm_state.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+
+    let orchestrator = Arc::new(
+        ConversationOrchestrator::new("session-protected", conv_config(base_url, false), vm.clone())
+            .expect("orchestrator"),
+    );
+
+    // Kick off a slow turn; let it reach the (1.5s) LLM request.
+    let orch1 = orchestrator.clone();
+    let turn1 = tokio::spawn(async move {
+        orch1.run_turn("think hard about this").await.ok();
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Open a protected window (as a filler clip would) and confirm it blocks.
+    vm.arm_barge_in_suppression(400);
+    assert!(
+        vm.is_interruption_blocked().await,
+        "test setup: the protected window must block interruption"
+    );
+
+    // Barge in DURING the protected window — the slow LLM must still be cancelled.
+    orchestrator.handle_barge_in().await;
+
+    let _ = tokio::time::timeout(Duration::from_secs(3), turn1).await;
+    let spoken = TTS_STATS.spoken.lock().clone();
+    assert!(
+        !spoken.iter().any(|s| s.contains("This is a long answer")),
+        "the in-flight LLM must be cancelled even inside a protected window, got: {:?}",
+        spoken
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // TEST 3: multi-turn history is preserved (turn 2 includes turn 1).
 // ──────────────────────────────────────────────────────────────────────────────
 #[tokio::test]

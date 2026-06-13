@@ -324,23 +324,29 @@ impl ConversationOrchestrator {
         }
     }
 
-    /// React to a barge-in (new user speech while the bot is interruptible):
-    /// cancel the in-flight LLM turn and clear queued/playing TTS.
+    /// React to a barge-in (the turn controller already passed the MinWords /
+    /// mute gate by emitting `Started { interrupt: true }`): cancel the in-flight
+    /// LLM/eager turn and clear queued/playing TTS.
     ///
-    /// Reuses the VoiceManager's `interruption_state` as the source of truth: if
-    /// the current bot audio is in a non-interruptible window, this is a no-op
-    /// (the VoiceManager will also ignore the new speech).
+    /// CRITICAL (REALTIME_REASONING.md §4.4 / critique C3): the COMPUTE cancel
+    /// (LLM + eager) happens UNCONDITIONALLY — a barge-in during a protected
+    /// (filler/uninterruptible) window must still stop a slow reasoning turn, not
+    /// let it burn for the clip's whole duration. The protected-window guard
+    /// governs only the AUDIO: `clear_tts` self-protects an in-flight
+    /// uninterruptible clip (the A-G6 selective path keeps it and skips the epoch
+    /// bump; the legacy path's `can_interrupt()` gate skips the blanket clear
+    /// inside the window) — so a disclaimer/filler still finishes playing while
+    /// the LLM is cancelled and the queued interruptible audio is dropped.
     pub async fn handle_barge_in(&self) {
-        if self.voice_manager.is_interruption_blocked().await {
-            debug!(session = %self.session_id, "barge-in ignored (non-interruptible window)");
-            return;
-        }
+        // Cancel compute FIRST, before any protected-window check.
         let had_turn = self.cancel_current_turn();
         if let Some(eager) = self.eager.lock().take() {
             eager.token.cancel();
             debug!(session = %self.session_id, "barge-in cancelled eager speculative turn");
         }
-        // Clear any queued/in-flight TTS so the bot stops talking immediately.
+        // Clear queued/in-flight TTS. This is safe to call unconditionally: it
+        // preserves a still-playing uninterruptible clip and no-ops the blanket
+        // clear when the window forbids it, while dropping interruptible audio.
         if let Err(e) = self.voice_manager.clear_tts().await {
             warn!(session = %self.session_id, error = %e, "clear_tts during barge-in failed");
         }

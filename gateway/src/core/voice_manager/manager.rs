@@ -792,6 +792,26 @@ impl VoiceManager {
         !self.interruption_state.can_interrupt()
     }
 
+    /// D3 (REALTIME_REASONING.md §4.3): open a SHORT, auto-expiring barge-in
+    /// suppression window so a just-enqueued masking/filler clip isn't instantly
+    /// cut by its own VAD tail — while the clip itself stays interruptible in the
+    /// queue. Clamped to ≤400 ms (shorter than human reaction + STT-partial
+    /// latency, so a genuine barge-in is almost never swallowed). After the
+    /// window, `can_interrupt()` returns true again on its own.
+    pub fn arm_barge_in_suppression(&self, ms: u64) {
+        let now = crate::core::voice_manager::state::now_monotonic_ms();
+        let window = ms.min(400) as usize;
+        self.interruption_state
+            .allow_interruption
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.interruption_state
+            .is_completed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.interruption_state
+            .non_interruptible_until_ms
+            .store(now + window, std::sync::atomic::Ordering::Release);
+    }
+
     /// Clear any queued text from the TTS provider and audio buffers
     ///
     /// This method clears both the TTS text queue and any audio buffers
