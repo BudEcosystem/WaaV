@@ -10,6 +10,136 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 
+fn ag6_voice_manager() -> VoiceManager {
+    let stt_config = STTConfig {
+        provider: "deepgram".to_string(),
+        api_key: "test_key".to_string(),
+        ..Default::default()
+    };
+    let tts_config = TTSConfig {
+        provider: "deepgram".to_string(),
+        api_key: "test_key".to_string(),
+        ..Default::default()
+    };
+    VoiceManager::new(VoiceManagerConfig::new(stt_config, tts_config), None).unwrap()
+}
+
+fn ag6_audio(tag: u8) -> crate::core::tts::AudioData {
+    crate::core::tts::AudioData {
+        data: vec![tag; 8],
+        sample_rate: 24_000,
+        format: "pcm".to_string(),
+        duration_ms: Some(40),
+    }
+}
+
+/// A gated egress sink: signals (on `started_tx`) when the pump pops a chunk and
+/// begins delivering it (so the test knows it is in flight), then blocks on a
+/// semaphore until the test releases it, recording delivered chunk ids.
+fn ag6_gated_sink() -> (
+    impl Fn(crate::core::tts::AudioData) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    + Send
+    + Sync
+    + 'static,
+    Arc<std::sync::Mutex<Vec<u8>>>,
+    Arc<tokio::sync::Semaphore>,
+    mpsc::UnboundedReceiver<u8>,
+) {
+    let delivered = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (started_tx, started_rx) = mpsc::unbounded_channel();
+    let d = delivered.clone();
+    let g = gate.clone();
+    let sink = move |a: crate::core::tts::AudioData| {
+        let d = d.clone();
+        let g = g.clone();
+        let started_tx = started_tx.clone();
+        Box::pin(async move {
+            let id = a.data[0];
+            let _ = started_tx.send(id);
+            let _permit = g.acquire().await.unwrap();
+            d.lock().unwrap().push(id);
+        }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    };
+    (sink, delivered, gate, started_rx)
+}
+
+#[tokio::test]
+async fn ag6_pump_engaged_only_when_enabled() {
+    // Disabled (default): no pump — the validated immediate-delivery path.
+    let vm = ag6_voice_manager();
+    vm.on_tts_audio(|_a| Box::pin(async {})).await.unwrap();
+    assert!(!vm.test_has_playback_pump(), "default A-G6 off ⇒ no pump");
+
+    // Enabled before on_tts_audio ⇒ the pump is created.
+    let vm = ag6_voice_manager();
+    vm.set_uninterruptible_playback(true);
+    vm.on_tts_audio(|_a| Box::pin(async {})).await.unwrap();
+    assert!(vm.test_has_playback_pump(), "A-G6 on ⇒ pump engaged");
+}
+
+#[tokio::test]
+async fn ag6_queued_uninterruptible_survives_barge_in() {
+    // Mixed queue: int1, uninterruptible(2), int2. A barge-in keeps 2 and drops
+    // the interruptible audio queued behind it. No synthesis-deadline override
+    // is needed (the gate is has_uninterruptible_active, not a timer).
+    let vm = ag6_voice_manager();
+    vm.set_uninterruptible_playback(true);
+    let (sink, delivered, gate, _started) = ag6_gated_sink();
+    vm.on_tts_audio(sink).await.unwrap();
+
+    vm.test_set_allow_interruption(true);
+    vm.test_emit_tts_chunk(ag6_audio(1)).await;
+    vm.test_set_allow_interruption(false);
+    vm.test_emit_tts_chunk(ag6_audio(2)).await;
+    vm.test_set_allow_interruption(true);
+    vm.test_emit_tts_chunk(ag6_audio(3)).await;
+
+    vm.clear_tts().await.unwrap();
+    gate.add_permits(8);
+    for _ in 0..50 {
+        if delivered.lock().unwrap().contains(&2) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let got = delivered.lock().unwrap().clone();
+    assert!(got.contains(&2), "the uninterruptible chunk survived: {got:?}");
+    assert!(!got.contains(&3), "the trailing interruptible chunk was dropped: {got:?}");
+}
+
+#[tokio::test]
+async fn ag6_in_flight_uninterruptible_survives_barge_in() {
+    // The review-#2 case: the disclaimer's only chunk is already POPPED (in
+    // flight, playing in the transport) when the barge-in arrives. The protection
+    // signal (has_uninterruptible_active) must still hold, so clear_tts takes the
+    // selective path and does NOT flush the transport mid-disclaimer.
+    let vm = ag6_voice_manager();
+    vm.set_uninterruptible_playback(true);
+    let (sink, delivered, gate, mut started) = ag6_gated_sink();
+    vm.on_tts_audio(sink).await.unwrap();
+
+    vm.test_set_allow_interruption(false);
+    vm.test_emit_tts_chunk(ag6_audio(2)).await;
+    // Wait until the pump has popped it and begun delivery (now in flight).
+    assert_eq!(started.recv().await, Some(2));
+
+    // Barge-in while it is in flight: must be the selective (non-flushing) path.
+    vm.clear_tts().await.unwrap();
+
+    gate.add_permits(8);
+    for _ in 0..50 {
+        if delivered.lock().unwrap().contains(&2) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        delivered.lock().unwrap().contains(&2),
+        "the in-flight uninterruptible chunk was protected from the barge-in"
+    );
+}
+
 #[tokio::test]
 async fn test_voice_manager_creation() {
     let stt_config = STTConfig {

@@ -101,6 +101,16 @@ pub struct VoiceManager {
     // None ⇒ a single relaxed read per call site, zero work. Set once at
     // session setup via `set_observers`; read-mostly thereafter.
     observers: Arc<SyncRwLock<Option<Arc<ObserverRegistry>>>>,
+
+    /// A-G6: when uninterruptible playback is enabled, TTS chunks are metered to
+    /// the transport through this pump's queue so a barge-in can selectively
+    /// keep uninterruptible audio. `None` (the default) ⇒ chunks flow straight
+    /// to the transport (the validated immediate-delivery hot path, unchanged).
+    playback_pump: Arc<SyncRwLock<Option<crate::core::audio::PlaybackPump>>>,
+    /// A-G6 master switch (env `WAAV_UNINTERRUPTIBLE_PLAYBACK`, off by default).
+    /// Atomic so it can be toggled before `on_tts_audio` (and in tests) without
+    /// a process-global env var.
+    uninterruptible_playback: AtomicBool,
 }
 
 impl VoiceManager {
@@ -213,7 +223,46 @@ impl VoiceManager {
             clear_notify: Arc::new(Notify::new()),
             clear_epoch: Arc::new(AtomicUsize::new(0)),
             observers: Arc::new(SyncRwLock::new(None)),
+            playback_pump: Arc::new(SyncRwLock::new(None)),
+            uninterruptible_playback: AtomicBool::new(
+                std::env::var("WAAV_UNINTERRUPTIBLE_PLAYBACK")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false),
+            ),
         })
+    }
+
+    /// A-G6: enable/disable uninterruptible playback (the metered pump path).
+    /// Must be set BEFORE `on_tts_audio` registers the egress callback. Defaults
+    /// from `WAAV_UNINTERRUPTIBLE_PLAYBACK`.
+    pub fn set_uninterruptible_playback(&self, enabled: bool) {
+        self.uninterruptible_playback
+            .store(enabled, Ordering::Release);
+    }
+
+    /// Test seam: is the A-G6 playback pump engaged?
+    #[cfg(test)]
+    pub fn test_has_playback_pump(&self) -> bool {
+        self.playback_pump.read().is_some()
+    }
+
+    /// Test seam: push a chunk through the registered TTS egress wrapper exactly
+    /// as a provider would (so the A-G6 enqueue path is exercised end-to-end).
+    #[cfg(test)]
+    pub async fn test_emit_tts_chunk(&self, audio: AudioData) {
+        let cb = self.tts_audio_callback.read().clone();
+        if let Some(cb) = cb {
+            cb(audio).await;
+        }
+    }
+
+    /// Test seam: set the interruptibility tag applied to subsequently-emitted
+    /// chunks (what `speak_with_interruption` toggles).
+    #[cfg(test)]
+    pub fn test_set_allow_interruption(&self, allow: bool) {
+        self.interruption_state
+            .allow_interruption
+            .store(allow, Ordering::Release);
     }
 
     /// Attach a per-session observer registry (latency profiling, custom
@@ -356,6 +405,11 @@ impl VoiceManager {
     /// # }
     /// ```
     pub async fn stop(&self) -> VoiceManagerResult<()> {
+        // A-G6: drop the playback pump (aborts its metering task) FIRST, before
+        // the fallible disconnects below — a disconnect error must not leak the
+        // pump task (review wf_e53f4d85 #4; mirrors the timer-abort-first order).
+        *self.playback_pump.write() = None;
+
         // Cancel any pending speech final timer
         {
             let mut state = self.speech_final_state.write();
@@ -746,10 +800,50 @@ impl VoiceManager {
     /// # Returns
     /// * `VoiceManagerResult<()>` - Success or error
     pub async fn clear_tts(&self) -> VoiceManagerResult<()> {
-        // Check if we're allowed to clear
-        if !self.interruption_state.can_interrupt() {
-            // Not allowed to interrupt yet
-            return Ok(());
+        // A-G6: per-chunk selective barge-in. Snapshot the queue Arc without
+        // holding the pump lock across the awaits below.
+        let pb_queue = self
+            .playback_pump
+            .read()
+            .as_ref()
+            .map(|p| p.queue().clone());
+
+        match &pb_queue {
+            // A-G6 ON. The QUEUE's own O(1) `has_uninterruptible_active` is the
+            // protection signal — uninterruptible audio QUEUED *or* IN FLIGHT
+            // (popped by the pump and playing in the transport). It is NOT gated
+            // on the whole-utterance `can_interrupt()` / `non_interruptible_until_ms`
+            // window: that deadline is anchored to *synthesis* time, but the pump
+            // meters *playout*, so it expires while a disclaimer is still queued
+            // behind interruptible audio (brutal review wf_e53f4d85 #1/#3). The
+            // natural bound on protection is the pump's `mark_played` — protection
+            // ends exactly when the audio finishes playing, not on a timer.
+            Some(q) => {
+                if q.has_uninterruptible_active() {
+                    // Protection active: drop queued INTERRUPTIBLE audio (any
+                    // speech queued behind the disclaimer is cut — the A10 fix:
+                    // the old blanket early-return left it stuck), KEEP queued
+                    // uninterruptible audio, and DON'T touch the provider or
+                    // transport so the in-flight disclaimer plays out. Do NOT
+                    // reset the interruption window — that would drop protection.
+                    let dropped = q.clear_interruptible();
+                    debug!(
+                        dropped,
+                        "A-G6 selective barge-in: kept uninterruptible audio, dropped queued interruptible"
+                    );
+                    return Ok(());
+                }
+                // Nothing protected (no uninterruptible queued or in flight) ⇒
+                // FULL clear, including anything still queued.
+                q.clear_all();
+            }
+            // A-G6 OFF: the legacy immediate-delivery path — the whole-utterance
+            // window gates the (blanket) clear, unchanged.
+            None => {
+                if !self.interruption_state.can_interrupt() {
+                    return Ok(());
+                }
+            }
         }
 
         debug!("Starting audio clearing process");
@@ -1017,11 +1111,34 @@ impl VoiceManager {
         let interruption_state_clone = self.interruption_state.clone();
         let observers_clone = self.observers.clone();
 
+        // A-G6: when uninterruptible playback is enabled, build a pump whose sink
+        // IS the user callback and meter chunks through its queue; the wrapper
+        // enqueues instead of delivering directly. Off (default) ⇒ no pump, the
+        // wrapper delivers straight to the transport (unchanged hot path).
+        let playback_enqueuer = if self.uninterruptible_playback.load(Ordering::Acquire) {
+            let sink_cb = user_callback.clone();
+            let sink: crate::core::audio::PlaybackSink =
+                Arc::new(move |audio: AudioData| sink_cb(audio));
+            let fallback_rate = self.config.tts_config.sample_rate.unwrap_or(24_000);
+            let pump = crate::core::audio::PlaybackPump::spawn(
+                Arc::new(crate::core::audio::PlaybackQueue::new()),
+                sink,
+                fallback_rate,
+                crate::core::audio::DEFAULT_PLAYBACK_LEAD,
+            );
+            let enq = pump.enqueuer();
+            *self.playback_pump.write() = Some(pump); // keep the pump task alive
+            Some(enq)
+        } else {
+            None
+        };
+
         // Create wrapper that checks clearing state and updates interruption timing
         let wrapper_callback = Arc::new(move |mut audio_data: AudioData| {
             let user_cb = user_callback.clone();
             let int_state = interruption_state_clone.clone();
             let observers = observers_clone.read().clone();
+            let playback_enqueuer = playback_enqueuer.clone();
 
             Box::pin(async move {
                 // Check if this is new audio after completion
@@ -1092,8 +1209,21 @@ impl VoiceManager {
                     obs.notify_audio_out(crate::core::observability::now_monotonic_ns());
                 }
 
-                // Call the user's callback
-                user_cb(audio_data).await;
+                match &playback_enqueuer {
+                    // A-G6 on: enqueue tagged by the CURRENT utterance's
+                    // interruptibility; the pump meters it to the user callback.
+                    Some(enq) => {
+                        let interruptible = int_state.allow_interruption.load(Ordering::Acquire);
+                        let unit = if interruptible {
+                            crate::core::audio::PlaybackUnit::interruptible(audio_data)
+                        } else {
+                            crate::core::audio::PlaybackUnit::uninterruptible(audio_data)
+                        };
+                        enq.enqueue(unit);
+                    }
+                    // A-G6 off: deliver straight to the transport (unchanged).
+                    None => user_cb(audio_data).await,
+                }
             }) as Pin<Box<dyn Future<Output = ()> + Send>>
         });
 
