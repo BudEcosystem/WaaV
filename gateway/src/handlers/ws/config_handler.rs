@@ -234,10 +234,11 @@ pub async fn handle_config_message(
                 );
             }
 
-            // Get auth_id for tenant-scoped recording paths
-            let auth_id = {
+            // Get auth_id for tenant-scoped recording paths + the D-G4 task
+            // tracker so the LiveKit audio forwarder is audited at teardown.
+            let (auth_id, task_tracker) = {
                 let state_guard = state.read().await;
-                state_guard.auth.id.clone()
+                (state_guard.auth.id.clone(), state_guard.task_tracker.clone())
             };
 
             match initialize_livekit_client(
@@ -252,6 +253,7 @@ pub async fn handle_config_message(
                 app_state.livekit_room_handler.as_ref(),
                 &stream_id,
                 auth_id.as_deref(),
+                &task_tracker,
             )
             .await
             {
@@ -1453,6 +1455,7 @@ async fn initialize_livekit_client(
     room_handler: Option<&Arc<crate::livekit::room_handler::LiveKitRoomHandler>>,
     stream_id: &str,
     auth_id: Option<&str>,
+    task_tracker: &Arc<crate::core::observability::SessionTaskTracker>,
 ) -> Option<(
     Arc<RwLock<LiveKitClient>>,
     Option<crate::livekit::OperationQueue>,
@@ -1585,7 +1588,7 @@ async fn initialize_livekit_client(
 
     // Set up audio callback to forward to STT processing
     if let Some(vm) = voice_manager {
-        setup_livekit_audio_callback(&mut livekit_client, vm, message_tx);
+        setup_livekit_audio_callback(&mut livekit_client, vm, message_tx, task_tracker);
     }
 
     // Set up data callback
@@ -1644,12 +1647,18 @@ fn setup_livekit_audio_callback(
     livekit_client: &mut LiveKitClient,
     voice_manager: &Arc<VoiceManager>,
     message_tx: &mpsc::Sender<MessageRoute>,
+    task_tracker: &Arc<crate::core::observability::SessionTaskTracker>,
 ) {
     let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(64);
 
     let voice_manager = voice_manager.clone();
     let message_tx = message_tx.clone();
-    tokio::spawn(async move {
+    // D-G4: this forwarder runs for the session lifetime. Its `frame_tx` lives
+    // inside the LiveKit client's audio callback, which is NOT dropped before
+    // teardown's audit, so the loop is stopped by the audit's abort (it cancels
+    // cleanly at the recv await point — not counted dangling). Track it so that
+    // abort happens and a genuinely-wedged forwarder would surface.
+    let handle = tokio::spawn(async move {
         while let Some(audio_data) = frame_rx.recv().await {
             debug!("Received LiveKit audio: {} bytes", audio_data.len());
             if let Err(e) = voice_manager.receive_audio(audio_data.into()).await {
@@ -1662,6 +1671,7 @@ fn setup_livekit_audio_callback(
             }
         }
     });
+    task_tracker.track("livekit-audio-forwarder", handle);
 
     let dropped = std::sync::atomic::AtomicUsize::new(0);
     livekit_client.set_audio_callback(move |audio_data: Vec<u8>| {
@@ -1968,7 +1978,12 @@ async fn initialize_dag_routing(
         let message_tx = message_tx.clone();
         let livekit_client = livekit_client.cloned();
         let operation_queue = operation_queue.cloned();
-        tokio::spawn(async move {
+        // D-G4: session-lifetime drain loop. Its `output_tx` clones live in
+        // `state.dag_context` and the VoiceManager stt_callback, neither dropped
+        // before teardown's audit, so the loop is stopped by the audit's abort
+        // (cancels cleanly at the recv await point — not counted dangling).
+        let task_tracker = state.read().await.task_tracker.clone();
+        let drain = tokio::spawn(async move {
             while let Some(output) = output_rx.recv().await {
                 match output {
                     DagOutput::Audio(audio) => {
@@ -2018,6 +2033,7 @@ async fn initialize_dag_routing(
             }
             debug!("DAG output drain task ended");
         });
+        task_tracker.track("dag-output-drain", drain);
     }
 
     // Store DAG state in connection.

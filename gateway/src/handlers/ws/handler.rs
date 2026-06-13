@@ -192,7 +192,7 @@ async fn run_voice_socket_session(
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     // Spawn task to handle outgoing messages - simple and direct for low latency
-    let sender_task = tokio::spawn(async move {
+    let mut sender_task = tokio::spawn(async move {
         loop {
             select! {
                 route_opt = message_rx.recv() => {
@@ -302,13 +302,18 @@ async fn run_voice_socket_session(
     // Clean up resources - graceful shutdown with timeout fallback
     // Signal shutdown to sender task
     let _ = shutdown_tx.send(());
-    // Wait for graceful completion with timeout, then abort if needed
-    match tokio::time::timeout(Duration::from_millis(500), sender_task).await {
+    // Wait for graceful completion with timeout, then abort if needed.
+    // D-G4: on timeout, ABORT the handle rather than letting `timeout` drop it
+    // (a dropped JoinHandle detaches — the sender would leak past the session);
+    // record it as a dangling task.
+    match tokio::time::timeout(Duration::from_millis(500), &mut sender_task).await {
         Ok(_) => {
             debug!("Sender task completed gracefully");
         }
         Err(_) => {
-            warn!("Sender task did not complete within timeout, connection may have stalled");
+            warn!("Sender task did not complete within timeout; aborting (D-G4)");
+            sender_task.abort();
+            crate::core::metrics::bridge::record_session_dangling_task();
         }
     }
 
@@ -355,6 +360,26 @@ async fn run_voice_socket_session(
                 );
                 crate::core::metrics::bridge::record_session_teardown_timeout();
             }
+        }
+    }
+
+    // D-G4 (Pipecat `_print_dangling_tasks` parity): cancel the session's
+    // tracked tasks (LiveKit audio forwarder, DAG output drain) and warn about
+    // any that RESIST cancellation. These loops block on a recv whose sender
+    // ConnectionState still holds, so they only stop via this abort; a clean
+    // cancellation finishes at its await point within the grace and is not
+    // counted, while a wedged task surfaces as `waav_session_dangling_tasks_total`.
+    // Clone the Arc so we never hold the connection read lock across the grace.
+    {
+        let tracker = state.read().await.task_tracker.clone();
+        let dangling = tracker
+            .abort_and_audit(crate::core::observability::DEFAULT_TEARDOWN_GRACE)
+            .await;
+        if dangling > 0 {
+            warn!(
+                count = dangling,
+                "session task(s) resisted cancellation at teardown (D-G4)"
+            );
         }
     }
 

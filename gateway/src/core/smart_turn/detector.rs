@@ -682,6 +682,17 @@ impl SmartTurnDetector {
     /// so we need to transpose it to column-major order (mels × frames).
     ///
     /// Uses pre-allocated transpose buffer to avoid runtime allocations.
+    ///
+    /// # D-G4 (teardown) note
+    ///
+    /// `session.run` below is a **synchronous** ORT call with no await point, so
+    /// an in-flight inference cannot be force-cancelled by a `tokio::time::timeout`
+    /// (the critique's "FFI-timeout is inert" finding). It is bounded instead by
+    /// the session-teardown budget in the WS handler: if a wedged inference holds
+    /// this lock past the budget, teardown warns and proceeds, and the inference
+    /// thread runs to natural completion (detached) rather than hanging the
+    /// session. Inference stays inline (not `spawn_blocking`) on purpose — it is a
+    /// ~12 ms hot-path step and the offload overhead would cost more than it saves.
     async fn run_inference(&mut self, input_data: &[f32]) -> Result<f32> {
         let mut session = self.session.lock().await;
 

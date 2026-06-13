@@ -29,6 +29,7 @@ pub mod heartbeat;
 pub mod observer;
 pub mod profiler;
 pub mod speaking;
+pub mod task_tracker;
 pub mod turn_profile;
 
 pub use latency::{LatencyMetrics, UserBotLatencyObserver, now_monotonic_ns};
@@ -40,6 +41,7 @@ pub use profiler::{
     RollingWindow, SubscriberGuard, WindowStats,
 };
 pub use speaking::{BotSpeakingStarted, BotSpeakingState, BotSpeakingStopped};
+pub use task_tracker::{DEFAULT_TEARDOWN_GRACE, SessionTaskTracker};
 pub use turn_profile::{
     QueueSnapshot, Stage, TurnOutcome, TurnPath, TurnProfiler, TurnSink, TurnSummary, TurnTrace,
 };

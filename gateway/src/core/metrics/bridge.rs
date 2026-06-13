@@ -54,6 +54,9 @@ pub const TURN_ERRORS_TOTAL: &str = "waav_turn_errors_total";
 /// D-G4: session teardowns that exceeded the bounded budget.
 pub const SESSION_TEARDOWN_TIMEOUTS_TOTAL: &str = "waav_session_teardown_timeouts_total";
 
+/// D-G4: session-lifetime tasks still running at teardown (leak signal).
+pub const SESSION_DANGLING_TASKS_TOTAL: &str = "waav_session_dangling_tasks_total";
+
 /// D-G10: pipeline liveness-probe round-trip time (ms).
 pub const PIPELINE_HEARTBEAT_MS: &str = "waav_pipeline_heartbeat_ms";
 
@@ -314,6 +317,10 @@ fn describe_series() {
         "Session teardowns that exceeded the bounded budget (D-G4)"
     );
     metrics::describe_counter!(
+        SESSION_DANGLING_TASKS_TOTAL,
+        "Session-lifetime tasks still running at teardown, warned and aborted (D-G4)"
+    );
+    metrics::describe_counter!(
         TTS_CHARS_TOTAL,
         "Characters submitted to TTS synthesis, per provider (D-G9)"
     );
@@ -398,6 +405,12 @@ pub fn count_turn_error(class: &'static str) {
 /// D-G4: a session teardown exceeded its budget ("blocked somewhere?").
 pub fn record_session_teardown_timeout() {
     counter!(SESSION_TEARDOWN_TIMEOUTS_TOTAL).increment(1);
+}
+
+/// D-G4: a session-lifetime task was still running at teardown (Pipecat
+/// `_print_dangling_tasks` parity) — warned and aborted by the task tracker.
+pub fn record_session_dangling_task() {
+    counter!(SESSION_DANGLING_TASKS_TOTAL).increment(1);
 }
 
 /// D-G10: a successful pipeline liveness probe took `ms`.
@@ -569,6 +582,7 @@ mod tests {
         count_llm_tokens("unit-llm", "completion", 40);
         count_llm_tokens("unit-llm", "reasoning", 7);
         record_session_teardown_timeout();
+        record_session_dangling_task();
 
         let text = render();
         let chars_line = text
@@ -592,6 +606,10 @@ mod tests {
         assert!(
             text.contains(SESSION_TEARDOWN_TIMEOUTS_TOTAL),
             "D-G4 teardown-timeout counter present"
+        );
+        assert!(
+            text.contains(SESSION_DANGLING_TASKS_TOTAL),
+            "D-G4 dangling-task counter present"
         );
     }
 
