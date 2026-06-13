@@ -26,6 +26,9 @@ use crate::dag::{compiler::CompiledDAG, context::DAGContext, executor::DAGExecut
 /// - Optimized for the common case: many reads, few writes
 pub struct ConnectionState {
     pub voice_manager: Option<Arc<VoiceManager>>,
+    /// D-G10: per-session pipeline liveness heartbeat (env-gated, off by
+    /// default). Held here so it is aborted when the connection drops.
+    pub heartbeat: Option<crate::core::observability::HeartbeatMonitor>,
     pub livekit_client: Option<Arc<RwLock<LiveKitClient>>>,
     /// Operation queue for non-blocking LiveKit operations
     pub livekit_operation_queue: Option<OperationQueue>,
@@ -67,6 +70,7 @@ impl ConnectionState {
     pub fn new() -> Self {
         Self {
             voice_manager: None,
+            heartbeat: None,
             livekit_client: None,
             livekit_operation_queue: None,
             audio_enabled: AtomicBool::new(false),
@@ -90,6 +94,7 @@ impl ConnectionState {
     pub fn with_auth(auth: Auth) -> Self {
         Self {
             voice_manager: None,
+            heartbeat: None,
             livekit_client: None,
             livekit_operation_queue: None,
             audio_enabled: AtomicBool::new(false),

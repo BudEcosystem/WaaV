@@ -156,6 +156,32 @@ pub async fn handle_config_message(
                 // Store in connection state
                 let mut state_guard = state.write().await;
                 state_guard.voice_manager = Some(vm.clone());
+                // D-G10: optional pipeline liveness heartbeat (env-gated, off
+                // by default) probing audio-provider readiness; aborted when
+                // the connection state drops.
+                if let Some(period_ms) = std::env::var("WAAV_HEARTBEAT_PERIOD_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                {
+                    use crate::core::observability::{
+                        HeartbeatConfig, HeartbeatMonitor, LivenessProbe,
+                    };
+                    let vm_probe = vm.clone();
+                    let probe: LivenessProbe = Arc::new(move || {
+                        let vm = vm_probe.clone();
+                        Box::pin(async move { vm.is_ready().await })
+                    });
+                    let cfg = HeartbeatConfig {
+                        period: std::time::Duration::from_millis(period_ms),
+                        timeout: std::time::Duration::from_secs(5),
+                    };
+                    state_guard.heartbeat = Some(HeartbeatMonitor::spawn(
+                        cfg,
+                        stream_id.clone(),
+                        probe,
+                    ));
+                }
                 Some(vm)
             }
             None => return true,

@@ -54,6 +54,12 @@ pub const TURN_ERRORS_TOTAL: &str = "waav_turn_errors_total";
 /// D-G4: session teardowns that exceeded the bounded budget.
 pub const SESSION_TEARDOWN_TIMEOUTS_TOTAL: &str = "waav_session_teardown_timeouts_total";
 
+/// D-G10: pipeline liveness-probe round-trip time (ms).
+pub const PIPELINE_HEARTBEAT_MS: &str = "waav_pipeline_heartbeat_ms";
+
+/// D-G10: pipeline liveness probes that timed out / found a wedged stage.
+pub const PIPELINE_HEARTBEAT_MISSES_TOTAL: &str = "waav_pipeline_heartbeat_misses_total";
+
 /// D-G9: characters submitted to TTS synthesis, per provider (cost proxy).
 pub const TTS_CHARS_TOTAL: &str = "waav_tts_chars_total";
 
@@ -259,6 +265,14 @@ fn describe_series() {
         "Total streaming reconnect attempts by provider and outcome \
          (success/failure/exhausted/circuit_open)"
     );
+    metrics::describe_histogram!(
+        PIPELINE_HEARTBEAT_MS,
+        "Pipeline liveness-probe round-trip time in ms (D-G10)"
+    );
+    metrics::describe_counter!(
+        PIPELINE_HEARTBEAT_MISSES_TOTAL,
+        "Pipeline liveness probes that timed out or found a wedged stage (D-G10)"
+    );
 
     // --- Latency profiling ---
     metrics::describe_histogram!(
@@ -384,6 +398,16 @@ pub fn count_turn_error(class: &'static str) {
 /// D-G4: a session teardown exceeded its budget ("blocked somewhere?").
 pub fn record_session_teardown_timeout() {
     counter!(SESSION_TEARDOWN_TIMEOUTS_TOTAL).increment(1);
+}
+
+/// D-G10: a successful pipeline liveness probe took `ms`.
+pub fn observe_pipeline_heartbeat_ms(ms: f64) {
+    histogram!(PIPELINE_HEARTBEAT_MS).record(ms);
+}
+
+/// D-G10: a pipeline liveness probe timed out / found a wedged stage.
+pub fn record_pipeline_heartbeat_miss() {
+    counter!(PIPELINE_HEARTBEAT_MISSES_TOTAL).increment(1);
 }
 
 /// D-G9: count TTS characters (call with `text.len()` at submit time).

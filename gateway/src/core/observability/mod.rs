@@ -25,6 +25,7 @@
 
 pub mod latency;
 pub mod async_observer;
+pub mod heartbeat;
 pub mod observer;
 pub mod profiler;
 pub mod speaking;
@@ -33,6 +34,7 @@ pub mod turn_profile;
 pub use latency::{LatencyMetrics, UserBotLatencyObserver, now_monotonic_ns};
 pub use observer::{ObserverRegistry, VoiceObserver};
 pub use async_observer::{AsyncObserver, DEFAULT_ASYNC_OBSERVER_QUEUE};
+pub use heartbeat::{HeartbeatConfig, HeartbeatMonitor, LivenessProbe};
 pub use profiler::{
     FrameProfiler, LatencyProfiler, ProfileSnapshot, ProfilingConfig, RealtimeBlockers,
     RollingWindow, SubscriberGuard, WindowStats,
