@@ -687,6 +687,17 @@ components:
             LLM vendor wire format (B-G1): `"openai"` (default) | `"anthropic"` |
             `"gemini"`. Omitted = OpenAI-compatible, with canonical-host inference.
           example: anthropic
+        reasoning_effort:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/ReasoningEffort'
+            description: |-
+              D1 (REALTIME_REASONING.md §4.1): reasoning/thinking-effort dial —
+              `off | minimal | low | medium | high`. One typed knob, mapped to each
+              vendor's native thinking control and clamped to the model's floor (an
+              adaptive-only model can't go below its floor; the applied/floor values
+              are echoed back in the config-ack). Omitted = vendor default. Keep a
+              FAST, non-reasoning model on the spoken path for realtime latency.
         streaming:
           type: boolean
           description: Stream tokens to TTS as they arrive (default true).
@@ -1484,6 +1495,34 @@ components:
             - error
       - type: object
         description: |-
+          Non-fatal configuration advisory (D1 / REALTIME_REASONING.md §7.4).
+
+          Sent at config time when a setting is sub-optimal but the session still
+          starts — e.g. a reasoning model placed on the spoken path (high TTFT),
+          or a `reasoning_effort` clamped up to an adaptive-only model's floor. The
+          SDK can surface this to the developer; it never closes the session.
+        required:
+        - code
+        - message
+        - type
+        properties:
+          code:
+            type: string
+            description: |-
+              Stable machine code, e.g. `reasoning_model_on_voice_path`,
+              `reasoning_effort_clamped`.
+            example: reasoning_model_on_voice_path
+          detail:
+            description: Optional structured detail (applied/floor effort, measured TTFT, …).
+          message:
+            type: string
+            description: Human-readable explanation + the one-line fix.
+          type:
+            type: string
+            enum:
+            - config_warning
+      - type: object
+        description: |-
           SIP transfer specific error
 
           This message is sent when a SIP transfer operation fails.
@@ -1714,6 +1753,26 @@ components:
         status:
           type: string
           description: '`"ready"` when every enabled provider is ready, else `"not_ready"`.'
+    ReasoningEffort:
+      type: string
+      description: |-
+        D1 (REALTIME_REASONING.md §4.1): the reasoning/thinking-effort dial — ONE
+        typed knob the adapter maps to each vendor's native control, clamped to the
+        model's floor. `Off` *minimizes* thinking; it is not always literally zero,
+        because some 2026 models are adaptive-thinking-only and have a floor — the
+        resolved value is echoed back to the client so the floor is observable.
+
+        Cascade (Chat-Completions) wire forms, EXACTLY ONE param per vendor:
+        - OpenAI: flat string `reasoning_effort` (`Off`→`"none"`);
+        - Anthropic: `thinking { type:"enabled", budget_tokens }` (`Off`→omit);
+        - Gemini: `generationConfig.thinkingConfig.thinkingBudget` (`Off`→`0`) —
+          never paired with `thinkingLevel` (that 400s).
+      enum:
+      - off
+      - minimal
+      - low
+      - medium
+      - high
     RemoveParticipantErrorResponse:
       type: object
       description: |-

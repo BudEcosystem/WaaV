@@ -66,6 +66,7 @@ fn sarvam_translate_node() -> NodeDefinition {
             assistant_id: None,
             timeout_ms: Some(120_000),
             headers: Default::default(),
+                reasoning_effort: None,
         },
     )
 }
@@ -216,6 +217,7 @@ async fn dag_streaming_emits_incremental_audio_live() {
             assistant_id: None,
             timeout_ms: Some(120_000),
             headers: Default::default(),
+                reasoning_effort: None,
         },
     );
 
@@ -303,6 +305,7 @@ async fn dag_streaming_fanout_audio_and_text_live() {
             assistant_id: None,
             timeout_ms: Some(120_000),
             headers: Default::default(),
+                reasoning_effort: None,
         },
     );
     let text_out = NodeDefinition::new(

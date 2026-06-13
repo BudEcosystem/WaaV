@@ -105,6 +105,10 @@ pub struct ConversationConfig {
     /// Idle re-engagement (A-G7): after this many ms with no user/bot
     /// activity, the bot speaks a gentle re-engagement turn. `0` = off.
     pub user_idle_timeout_ms: u64,
+    /// D1: reasoning/thinking-effort dial. `None` = vendor default. The value
+    /// sent to the wire is floor-clamped to the model's floor in
+    /// `to_client_config`; the floor is echoed to the client at config time.
+    pub reasoning_effort: Option<crate::core::llm::ReasoningEffort>,
 }
 
 impl Default for ConversationConfig {
@@ -126,6 +130,7 @@ impl Default for ConversationConfig {
             mute_strategy: None,
             strip_markdown: true,
             user_idle_timeout_ms: 0,
+            reasoning_effort: None,
         }
     }
 }
@@ -151,8 +156,26 @@ impl ConversationConfig {
             streaming: self.streaming,
             max_history: self.max_history,
             provider_kind: self.provider_kind,
+            // D1: send the floor-clamped value (an adaptive-only model can't
+            // honor a lower request; the floor is echoed back at config time).
+            reasoning_effort: crate::core::llm::ReasoningEffort::resolve(
+                &self.model,
+                self.reasoning_effort,
+            )
+            .0,
             ..Default::default()
         }
+    }
+
+    /// D1: the reasoning effort actually applied + the model's floor, for the
+    /// session-ack echo (so a clamped/adaptive-only model is observable).
+    pub fn resolved_reasoning_effort(
+        &self,
+    ) -> (
+        Option<crate::core::llm::ReasoningEffort>,
+        crate::core::llm::ReasoningEffort,
+    ) {
+        crate::core::llm::ReasoningEffort::resolve(&self.model, self.reasoning_effort)
     }
 }
 
@@ -1091,6 +1114,39 @@ fn validate_llm_url(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn to_client_config_applies_reasoning_floor_clamp() {
+        use crate::core::llm::ReasoningEffort;
+        // Ordinary fast model: Off stays Off on the wire.
+        let cfg = ConversationConfig {
+            model: "gpt-4o-mini".into(),
+            reasoning_effort: Some(ReasoningEffort::Off),
+            ..Default::default()
+        };
+        assert_eq!(cfg.to_client_config().reasoning_effort, Some(ReasoningEffort::Off));
+        assert_eq!(
+            cfg.resolved_reasoning_effort(),
+            (Some(ReasoningEffort::Off), ReasoningEffort::Off)
+        );
+
+        // Adaptive-only model: a request below the floor is raised on the wire,
+        // and the floor is reported for the ack echo.
+        let cfg = ConversationConfig {
+            model: "claude-opus-4-8".into(),
+            reasoning_effort: Some(ReasoningEffort::Off),
+            ..Default::default()
+        };
+        assert_eq!(cfg.to_client_config().reasoning_effort, Some(ReasoningEffort::Low));
+        assert_eq!(
+            cfg.resolved_reasoning_effort(),
+            (Some(ReasoningEffort::Low), ReasoningEffort::Low)
+        );
+
+        // None → no param, floor still reported.
+        let cfg = ConversationConfig { model: "gpt-4o-mini".into(), ..Default::default() };
+        assert_eq!(cfg.to_client_config().reasoning_effort, None);
+    }
 
     #[test]
     fn eager_match_is_whitespace_and_case_insensitive() {

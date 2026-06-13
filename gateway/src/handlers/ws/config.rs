@@ -136,6 +136,16 @@ pub struct ConversationWebSocketConfig {
     #[serde(default)]
     #[cfg_attr(feature = "openapi", schema(example = 15000))]
     pub user_idle_timeout_ms: u64,
+
+    /// D1 (REALTIME_REASONING.md §4.1): reasoning/thinking-effort dial —
+    /// `off | minimal | low | medium | high`. One typed knob, mapped to each
+    /// vendor's native thinking control and clamped to the model's floor (an
+    /// adaptive-only model can't go below its floor; the applied/floor values
+    /// are echoed back in the config-ack). Omitted = vendor default. Keep a
+    /// FAST, non-reasoning model on the spoken path for realtime latency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(example = "minimal"))]
+    pub reasoning_effort: Option<crate::core::llm::ReasoningEffort>,
 }
 
 fn default_strip_markdown() -> bool {
@@ -174,6 +184,7 @@ impl ConversationWebSocketConfig {
             mute_strategy: self.mute_strategy.clone(),
             strip_markdown: self.strip_markdown,
             user_idle_timeout_ms: self.user_idle_timeout_ms,
+            reasoning_effort: self.reasoning_effort,
         }
     }
 }
@@ -621,6 +632,36 @@ pub fn compute_tts_config_hash(standard: &crate::core::tts::standard::StandardTT
 #[cfg(test)]
 mod config_tests {
     use super::*;
+
+    #[test]
+    fn conversation_config_threads_reasoning_effort() {
+        use crate::core::llm::ReasoningEffort;
+        // Present + typed (lowercase) → threads to the core config.
+        let c: ConversationWebSocketConfig = serde_json::from_value(serde_json::json!({
+            "base_url": "http://localhost:11434/v1",
+            "model": "llama3.2:1b",
+            "reasoning_effort": "minimal"
+        }))
+        .unwrap();
+        assert_eq!(c.reasoning_effort, Some(ReasoningEffort::Minimal));
+        assert_eq!(c.to_conversation_config().reasoning_effort, Some(ReasoningEffort::Minimal));
+
+        // Omitted → None (backward-compatible).
+        let c2: ConversationWebSocketConfig = serde_json::from_value(serde_json::json!({
+            "base_url": "http://localhost:11434/v1",
+            "model": "llama3.2:1b"
+        }))
+        .unwrap();
+        assert_eq!(c2.reasoning_effort, None);
+
+        // A typo is rejected at deserialize (typed enum).
+        assert!(
+            serde_json::from_value::<ConversationWebSocketConfig>(serde_json::json!({
+                "base_url": "x", "model": "y", "reasoning_effort": "minimial"
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn tts_cache_hash_includes_features_and_extras() {

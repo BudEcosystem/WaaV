@@ -106,6 +106,7 @@ use crate::handlers::{
         LiveKitWebSocketConfig,
         DAGWebSocketConfig,
         ConversationWebSocketConfig,
+        crate::core::llm::ReasoningEffort,
         Pronunciation,
         // Standardized advanced-feature vocabulary (carried across the dispatch boundary)
         SttFeatures,

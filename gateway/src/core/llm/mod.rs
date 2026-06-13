@@ -30,7 +30,7 @@ pub mod adapter;
 pub mod functions;
 pub mod summarize;
 
-pub use adapter::{AdapterKind, LlmAdapter, LlmStreamEvent};
+pub use adapter::{AdapterKind, LlmAdapter, LlmStreamEvent, ReasoningEffort};
 pub use functions::{
     CANCEL_ASYNC_TOOL_NAME, FunctionCallParams, FunctionHandler, FunctionRegistry,
     FunctionResult, RegistryItem, ToolLoopOptions, run_tool_loop,
@@ -492,6 +492,11 @@ pub struct LlmClientConfig {
     /// beyond the canonical hosts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_kind: Option<AdapterKind>,
+    /// D1: reasoning/thinking-effort dial. `None` = vendor default (no param
+    /// emitted). Vendor-mapped + floor-clamped in `adapter.rs` (the cascade path
+    /// applies the floor in `ConversationConfig::to_client_config`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl Default for LlmClientConfig {
@@ -517,6 +522,7 @@ impl Default for LlmClientConfig {
             thread_id: None,
             extra: HashMap::new(),
             provider_kind: None,
+            reasoning_effort: None,
         }
     }
 }

@@ -312,6 +312,24 @@ pub enum OutgoingMessage {
         /// Error message
         message: String,
     },
+    /// Non-fatal configuration advisory (D1 / REALTIME_REASONING.md §7.4).
+    ///
+    /// Sent at config time when a setting is sub-optimal but the session still
+    /// starts — e.g. a reasoning model placed on the spoken path (high TTFT),
+    /// or a `reasoning_effort` clamped up to an adaptive-only model's floor. The
+    /// SDK can surface this to the developer; it never closes the session.
+    #[serde(rename = "config_warning")]
+    ConfigWarning {
+        /// Stable machine code, e.g. `reasoning_model_on_voice_path`,
+        /// `reasoning_effort_clamped`.
+        #[cfg_attr(feature = "openapi", schema(example = "reasoning_model_on_voice_path"))]
+        code: String,
+        /// Human-readable explanation + the one-line fix.
+        message: String,
+        /// Optional structured detail (applied/floor effort, measured TTFT, …).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<serde_json::Value>,
+    },
     /// SIP transfer specific error
     ///
     /// This message is sent when a SIP transfer operation fails.

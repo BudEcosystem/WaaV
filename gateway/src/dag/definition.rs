@@ -631,6 +631,10 @@ pub enum NodeType {
         /// Extra headers for the API request
         #[serde(default)]
         headers: HashMap<String, String>,
+        /// D1: reasoning/thinking-effort dial (`off|minimal|low|medium|high`).
+        /// Vendor-mapped in the adapter. Omitted = vendor default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<crate::core::llm::ReasoningEffort>,
     },
 
     /// Webhook notification (fire-and-forget)

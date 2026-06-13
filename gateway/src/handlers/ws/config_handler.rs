@@ -386,6 +386,7 @@ pub async fn handle_config_message(
         match initialize_conversation_loop(conv_config, &stream_id, vm, message_tx).await {
             Ok(true) => {
                 info!("Conversation loop initialized for stream {}", stream_id);
+                emit_reasoning_config_warnings(conv_config, message_tx).await;
                 true
             }
             Ok(false) => false,
@@ -437,6 +438,75 @@ pub async fn handle_config_message(
 /// callback. The callback still forwards every transcript to the client (so
 /// `stt_result` egress is preserved, matching the simple path), then drives the
 /// LLM→TTS loop on each finalized turn. Barge-in and history are handled inside
+/// D1: cheap heuristic (runs ONCE at config time) — is this model id known to
+/// do extended reasoning by default, making it a poor choice for the
+/// low-latency spoken path? Used only to emit a non-fatal advisory.
+fn is_known_reasoning_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.contains("deepseek-r1")
+        || m.contains("-thinking")
+        || m.contains("reasoner")
+        || m.contains("qwq")
+}
+
+/// D1 (REALTIME_REASONING.md §7.4): emit non-fatal config advisories — a
+/// reasoning model on the spoken path (high TTFT) and an effort clamped up to an
+/// adaptive-only model's floor. Active, in-band guidance instead of silent
+/// Grafana-only signals; reuses the `record_degraded` idiom.
+async fn emit_reasoning_config_warnings(
+    conv_config: &ConversationWebSocketConfig,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) {
+    if is_known_reasoning_model(&conv_config.model) {
+        crate::core::metrics::bridge::record_degraded(
+            "reasoning_model_on_voice_path",
+            "reasoning_model_id",
+        );
+        warn!(
+            model = %conv_config.model,
+            "a reasoning model is on the spoken path — first-audio latency will be seconds"
+        );
+        let _ = message_tx
+            .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
+                code: "reasoning_model_on_voice_path".to_string(),
+                message: format!(
+                    "model '{}' is a reasoning model on the spoken path; first-audio latency \
+                     will be seconds. Keep a FAST model on `model` (add a `reasoning_model` for \
+                     two-tier when available), or lower `reasoning_effort`.",
+                    conv_config.model
+                ),
+                detail: None,
+            }))
+            .await;
+    }
+    // Floor-clamp echo: surface when the applied effort differs from the request
+    // (an adaptive-only model can't go as low as asked).
+    if let Some(req) = conv_config.reasoning_effort {
+        let (applied, floor) = conv_config.to_conversation_config().resolved_reasoning_effort();
+        if applied != Some(req) {
+            let _ = message_tx
+                .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
+                    code: "reasoning_effort_clamped".to_string(),
+                    message: format!(
+                        "model '{}' cannot honor reasoning_effort '{}'; clamped to its floor '{}'.",
+                        conv_config.model,
+                        req.as_str(),
+                        floor.as_str()
+                    ),
+                    detail: Some(serde_json::json!({
+                        "requested": req.as_str(),
+                        "applied": applied.map(|e| e.as_str()),
+                        "floor": floor.as_str(),
+                    })),
+                }))
+                .await;
+        }
+    }
+}
+
 /// the orchestrator. Returns `Ok(true)` when the loop is active.
 async fn initialize_conversation_loop(
     conv_config: &ConversationWebSocketConfig,
@@ -2243,6 +2313,33 @@ async fn register_dag_stream_driver(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_known_reasoning_model_matrix() {
+        // Reasoning models (poor for the spoken path) → true.
+        for m in [
+            "o1-mini",
+            "o3",
+            "o4-mini",
+            "deepseek-r1:1.5b",
+            "gpt-5-thinking",
+            "claude-sonnet-4-6-thinking",
+            "DeepSeek-Reasoner",
+            "qwq-32b",
+        ] {
+            assert!(is_known_reasoning_model(m), "{m} should be flagged reasoning");
+        }
+        // Fast / non-reasoning models → false.
+        for m in [
+            "gpt-4o-mini",
+            "llama3.2:1b",
+            "claude-haiku-4-5",
+            "gemini-3-flash",
+            "grok-4.1-fast",
+        ] {
+            assert!(!is_known_reasoning_model(m), "{m} should NOT be flagged");
+        }
+    }
 
     #[test]
     fn test_stream_id_generation_when_none() {

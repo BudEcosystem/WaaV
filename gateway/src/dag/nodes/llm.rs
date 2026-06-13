@@ -116,6 +116,10 @@ pub struct LlmEndpointConfig {
     /// `None` infers only the canonical vendor hosts from `base_url`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_kind: Option<crate::core::llm::AdapterKind>,
+    /// D1: reasoning/thinking-effort dial for this DAG LLM node (vendor-mapped
+    /// in the adapter). `None` = vendor default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<crate::core::llm::ReasoningEffort>,
 }
 
 impl Default for LlmEndpointConfig {
@@ -141,6 +145,7 @@ impl Default for LlmEndpointConfig {
             thread_id: None,
             extra: HashMap::new(),
             provider_kind: None,
+            reasoning_effort: None,
         }
     }
 }
@@ -168,6 +173,7 @@ impl From<LlmEndpointConfig> for LlmClientConfig {
             thread_id: c.thread_id,
             extra: c.extra,
             provider_kind: c.provider_kind,
+            reasoning_effort: c.reasoning_effort,
         }
     }
 }
@@ -462,6 +468,18 @@ impl DAGNode for LlmEndpointNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn llm_endpoint_config_threads_reasoning_effort() {
+        use crate::core::llm::{LlmClientConfig, ReasoningEffort};
+        let mut ec = LlmEndpointConfig::default();
+        ec.reasoning_effort = Some(ReasoningEffort::Low);
+        let client: LlmClientConfig = ec.into();
+        assert_eq!(client.reasoning_effort, Some(ReasoningEffort::Low));
+        // Omitted stays None.
+        let client2: LlmClientConfig = LlmEndpointConfig::default().into();
+        assert_eq!(client2.reasoning_effort, None);
+    }
 
     #[test]
     fn test_chat_message_constructors() {

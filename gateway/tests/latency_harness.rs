@@ -693,6 +693,7 @@ mod dag_e2e {
                 assistant_id: None,
                 timeout_ms: Some(120_000),
                 headers: Default::default(),
+                reasoning_effort: None,
             },
         );
 
@@ -784,6 +785,7 @@ mod dag_e2e {
                 assistant_id: None,
                 timeout_ms: Some(120_000),
                 headers: Default::default(),
+                reasoning_effort: None,
             },
         );
         let tts = NodeDefinition::new(

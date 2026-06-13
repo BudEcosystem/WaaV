@@ -14,7 +14,21 @@
 use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
-use waav_gateway::core::llm::{AdapterKind, LlmClient, LlmClientConfig};
+use waav_gateway::core::llm::{AdapterKind, LlmClient, LlmClientConfig, ReasoningEffort};
+
+/// Credential-free local live gate: returns the ollama OpenAI-compatible base
+/// URL only when ollama is reachable, else `None` (test self-skips, so CI without
+/// ollama still passes). Exercises the OpenAI adapter against a real endpoint.
+fn ollama_base() -> Option<String> {
+    let addr: std::net::SocketAddr = "127.0.0.1:11434".parse().unwrap();
+    match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)) {
+        Ok(_) => Some("http://127.0.0.1:11434/v1".to_string()),
+        Err(_) => {
+            eprintln!("[skip] ollama not reachable at 127.0.0.1:11434 — d1 live test skipped");
+            None
+        }
+    }
+}
 
 fn key(var: &str) -> Option<String> {
     match std::env::var(var) {
@@ -101,6 +115,52 @@ async fn gemini_live_round_trip() {
 async fn openai_live_round_trip() {
     let Some(k) = key("OPENAI_API_KEY") else { return };
     round_trip(AdapterKind::OpenAi, "https://api.openai.com/v1", "gpt-4o-mini", k).await;
+}
+
+/// D1 LIVE (credential-free, ollama): the critical end-to-end proof that the
+/// reasoning_effort dial is correct on a REAL endpoint —
+///  (1) a FAST/non-reasoning model with `Off` emits NO thinking param and does
+///      NOT 400 ("model does not support thinking"), and
+///  (2) a REASONING model with `Low` is accepted and answers.
+/// NOT `#[ignore]` — self-skips when ollama is down so CI is unaffected.
+#[tokio::test]
+async fn d1_reasoning_effort_live_ollama() {
+    let Some(base) = ollama_base() else { return };
+
+    // (1) fast model + Off → no param → must succeed (the bug this guards against
+    //     400s every call against a non-reasoning model).
+    let fast = LlmClientConfig {
+        base_url: base.clone(),
+        model: "llama3.2:1b".into(),
+        api_key: Some("ollama".into()), // ollama ignores the key
+        system_prompt: Some("Reply in one short sentence.".into()),
+        max_tokens: Some(40),
+        streaming: false,
+        reasoning_effort: Some(ReasoningEffort::Off),
+        ..Default::default()
+    };
+    let r = LlmClient::new(fast)
+        .complete("d1-fast", "say hello", None, &CancellationToken::new(), None)
+        .await
+        .expect("fast model + reasoning_effort=Off must NOT 400");
+    assert!(!r.content.trim().is_empty(), "fast model produced no content");
+
+    // (2) reasoning model + Low → thinking param accepted → non-empty answer.
+    let reason = LlmClientConfig {
+        base_url: base,
+        model: "deepseek-r1:1.5b".into(),
+        api_key: Some("ollama".into()),
+        max_tokens: Some(1200),
+        streaming: false,
+        reasoning_effort: Some(ReasoningEffort::Low),
+        ..Default::default()
+    };
+    let r2 = LlmClient::new(reason)
+        .complete("d1-reason", "What is 2+2? Reply with just the number.", None, &CancellationToken::new(), None)
+        .await
+        .expect("reasoning model + reasoning_effort=Low must be accepted");
+    assert!(!r2.content.trim().is_empty(), "reasoning model produced empty content");
+    eprintln!("[live d1] fast={:?} reason={:?}", r.content, r2.content);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

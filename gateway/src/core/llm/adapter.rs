@@ -57,6 +57,110 @@ impl AdapterKind {
     }
 }
 
+/// D1 (REALTIME_REASONING.md §4.1): the reasoning/thinking-effort dial — ONE
+/// typed knob the adapter maps to each vendor's native control, clamped to the
+/// model's floor. `Off` *minimizes* thinking; it is not always literally zero,
+/// because some 2026 models are adaptive-thinking-only and have a floor — the
+/// resolved value is echoed back to the client so the floor is observable.
+///
+/// Cascade (Chat-Completions) wire forms, EXACTLY ONE param per vendor:
+/// - OpenAI: flat string `reasoning_effort` (`Off`→`"none"`);
+/// - Anthropic: `thinking { type:"enabled", budget_tokens }` (`Off`→omit);
+/// - Gemini: `generationConfig.thinkingConfig.thinkingBudget` (`Off`→`0`) —
+///   never paired with `thinkingLevel` (that 400s).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum ReasoningEffort {
+    /// Minimize thinking (vendor "none"/budget 0), subject to the model floor.
+    Off,
+    /// The smallest non-zero effort a vendor exposes.
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    /// Canonical lowercase label (config echo / metrics — no per-call alloc).
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    /// Total order for floor-clamping (Off < Minimal < Low < Medium < High).
+    #[inline]
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Minimal => 1,
+            Self::Low => 2,
+            Self::Medium => 3,
+            Self::High => 4,
+        }
+    }
+
+    /// The minimum effort a model can actually honor. Adaptive-thinking-only
+    /// families (Opus 4.7/4.8, Gemini Fable/Mythos, Fable-5) cannot be driven to
+    /// zero reasoning → floor at `Low` so the echoed value is honest. Everything
+    /// else floors at `Off`.
+    pub fn floor_for_model(model: &str) -> Self {
+        let m = model.to_ascii_lowercase();
+        let adaptive_only = m.contains("opus-4-7")
+            || m.contains("opus-4.7")
+            || m.contains("opus-4-8")
+            || m.contains("opus-4.8")
+            || m.contains("gemini-fable")
+            || m.contains("gemini-mythos")
+            || m.contains("fable-5")
+            || m.contains("gemini-3-mythos");
+        if adaptive_only { Self::Low } else { Self::Off }
+    }
+
+    /// Raise `self` to at least `floor`.
+    pub fn clamp_to_floor(self, floor: Self) -> Self {
+        if self.rank() >= floor.rank() { self } else { floor }
+    }
+
+    /// Single source of truth: returns `(applied, floor)` where `applied` is the
+    /// floor-clamped value to actually send (`None` when nothing was requested →
+    /// vendor default, no param emitted) and `floor` is always the model's floor
+    /// (for the session-ack echo).
+    pub fn resolve(model: &str, requested: Option<Self>) -> (Option<Self>, Self) {
+        let floor = Self::floor_for_model(model);
+        (requested.map(|r| r.clamp_to_floor(floor)), floor)
+    }
+}
+
+/// Anthropic extended-thinking budget per effort. The caller MUST further clamp
+/// to `< max_tokens` (Anthropic 400s otherwise).
+fn anthropic_budget_tokens(e: ReasoningEffort) -> u32 {
+    match e {
+        ReasoningEffort::Off => 0,
+        ReasoningEffort::Minimal => 1024,
+        ReasoningEffort::Low => 2048,
+        ReasoningEffort::Medium => 4096,
+        ReasoningEffort::High => 8192,
+    }
+}
+
+/// Gemini `thinkingBudget` per effort (`0` disables; cap 24576).
+fn gemini_budget(e: ReasoningEffort) -> u32 {
+    match e {
+        ReasoningEffort::Off => 0,
+        ReasoningEffort::Minimal => 1024,
+        ReasoningEffort::Low => 4096,
+        ReasoningEffort::Medium => 12288,
+        ReasoningEffort::High => 24576,
+    }
+}
+
 /// A fully rendered HTTP request: vendor endpoint + auth headers + JSON body.
 #[derive(Debug, Clone)]
 pub struct RenderedRequest {
@@ -274,6 +378,19 @@ impl LlmAdapter for OpenAiAdapter {
             }
             None => {
                 obj.insert("max_completion_tokens".into(), json!(4096));
+            }
+        }
+        // D1: OpenAI Chat-Completions takes the FLAT string `reasoning_effort`.
+        // CRITICAL (live-verified): a NON-reasoning model 400s on ANY thinking
+        // param ("model does not support thinking"), and the recommended path is
+        // a FAST model — so `Off`/`None` emit NOTHING (no param, never a 400).
+        // Only an explicit `Minimal..High` emits the param (use it on a
+        // reasoning-capable model); the floor-clamp upgrades adaptive-only models
+        // to `Low`, which then emits. EXACTLY ONE param (no nested `reasoning`).
+        // Inserted before the `cfg.extra` flatten so an explicit knob wins.
+        if let Some(effort) = cfg.reasoning_effort {
+            if effort != ReasoningEffort::Off {
+                obj.insert("reasoning_effort".into(), json!(effort.as_str()));
             }
         }
         if let Some(tools) = &cfg.tools {
@@ -518,6 +635,20 @@ impl LlmAdapter for AnthropicAdapter {
         }
         if let Some(p) = cfg.top_p {
             obj.insert("top_p".into(), json!(p));
+        }
+        // D1: Anthropic extended thinking. `Off`/`None` → emit nothing (default
+        // is no thinking). EXACTLY ONE param (`thinking`). INVARIANT: Anthropic
+        // 400s unless `budget_tokens < max_tokens`, so clamp the budget below the
+        // body's `max_tokens` (the voice path caps at 256).
+        if let Some(effort) = cfg.reasoning_effort {
+            if effort != ReasoningEffort::Off {
+                let max_tok = cfg.max_tokens.unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS);
+                let budget = anthropic_budget_tokens(effort).min(max_tok.saturating_sub(1));
+                obj.insert(
+                    "thinking".into(),
+                    json!({ "type": "enabled", "budget_tokens": budget }),
+                );
+            }
         }
         if let Some(stop) = &cfg.stop {
             obj.insert("stop_sequences".into(), json!(stop));
@@ -834,6 +965,19 @@ impl LlmAdapter for GeminiAdapter {
         if let Some(stop) = &cfg.stop {
             generation_config.insert("stopSequences".into(), json!(stop));
         }
+        // D1: Gemini thinking via the numeric `thinkingBudget` ONLY — NEVER
+        // paired with `thinkingLevel` (Gemini 400s on conflicting thinking
+        // params). Like OpenAI, `Off`/`None` emit NOTHING (a non-thinking model
+        // rejects a thinkingConfig); only `Minimal..High` set a budget. Nested
+        // under `generationConfig.thinkingConfig`.
+        if let Some(effort) = cfg.reasoning_effort {
+            if effort != ReasoningEffort::Off {
+                generation_config.insert(
+                    "thinkingConfig".into(),
+                    json!({ "thinkingBudget": gemini_budget(effort) }),
+                );
+            }
+        }
         obj.insert("generationConfig".into(), Value::Object(generation_config));
 
         if let Some(tools) = &cfg.tools
@@ -1100,6 +1244,118 @@ mod tests {
         assert_eq!(r.body["max_tokens"], 256);
         assert!(r.body.get("max_completion_tokens").is_none());
         assert_eq!(r.body["stream"], true);
+    }
+
+    // --- D1 reasoning_effort: enum logic (STEP 0) ---
+
+    #[test]
+    fn reasoning_effort_serde_roundtrip_lowercase() {
+        for (v, s) in [
+            (ReasoningEffort::Off, "\"off\""),
+            (ReasoningEffort::Minimal, "\"minimal\""),
+            (ReasoningEffort::Low, "\"low\""),
+            (ReasoningEffort::Medium, "\"medium\""),
+            (ReasoningEffort::High, "\"high\""),
+        ] {
+            assert_eq!(serde_json::to_string(&v).unwrap(), s);
+            assert_eq!(serde_json::from_str::<ReasoningEffort>(s).unwrap(), v);
+            assert_eq!(v.as_str(), s.trim_matches('"'));
+        }
+        // A typo fails to deserialize (typed enum catches it, like AdapterKind).
+        assert!(serde_json::from_str::<ReasoningEffort>("\"minimial\"").is_err());
+        assert!(serde_json::from_str::<ReasoningEffort>("\"xhigh\"").is_err());
+    }
+
+    #[test]
+    fn reasoning_effort_floor_clamp_resolve() {
+        // Ordinary models floor at Off; adaptive-only models floor at Low.
+        assert_eq!(ReasoningEffort::floor_for_model("gpt-4o-mini"), ReasoningEffort::Off);
+        assert_eq!(ReasoningEffort::floor_for_model("llama3.2:1b"), ReasoningEffort::Off);
+        assert_eq!(ReasoningEffort::floor_for_model("claude-opus-4-8"), ReasoningEffort::Low);
+        assert_eq!(ReasoningEffort::floor_for_model("fable-5"), ReasoningEffort::Low);
+        // clamp raises to the floor but never lowers a higher request.
+        assert_eq!(ReasoningEffort::Off.clamp_to_floor(ReasoningEffort::Low), ReasoningEffort::Low);
+        assert_eq!(ReasoningEffort::High.clamp_to_floor(ReasoningEffort::Low), ReasoningEffort::High);
+        assert_eq!(ReasoningEffort::Off.clamp_to_floor(ReasoningEffort::Off), ReasoningEffort::Off);
+        // resolve = (applied, floor); None stays None (vendor default).
+        assert_eq!(
+            ReasoningEffort::resolve("gpt-4o-mini", Some(ReasoningEffort::Off)),
+            (Some(ReasoningEffort::Off), ReasoningEffort::Off)
+        );
+        assert_eq!(
+            ReasoningEffort::resolve("claude-opus-4-8", Some(ReasoningEffort::Off)),
+            (Some(ReasoningEffort::Low), ReasoningEffort::Low)
+        );
+        assert_eq!(
+            ReasoningEffort::resolve("gpt-4o-mini", None),
+            (None, ReasoningEffort::Off)
+        );
+    }
+
+    // --- D1 reasoning_effort: per-vendor request mapping (STEP 1) ---
+
+    #[test]
+    fn openai_maps_reasoning_effort_flat_string() {
+        // Some(Low) → flat top-level `reasoning_effort: "low"`; Off → "none";
+        // None → key absent. EXACTLY ONE param: never a nested reasoning object.
+        let mut c = cfg(None);
+        c.reasoning_effort = Some(ReasoningEffort::Low);
+        let r = OpenAiAdapter.render_request(&convo(), &c, false, None);
+        assert_eq!(r.body["reasoning_effort"], "low");
+        assert!(r.body.get("reasoning").is_none());
+        assert!(r.body.get("thinking").is_none());
+
+        // Off → NO param (a fast/non-reasoning model 400s on any thinking param;
+        // live-verified against ollama "does not support thinking").
+        c.reasoning_effort = Some(ReasoningEffort::Off);
+        let r = OpenAiAdapter.render_request(&convo(), &c, false, None);
+        assert!(r.body.get("reasoning_effort").is_none(), "Off emits no param");
+
+        c.reasoning_effort = None;
+        let r = OpenAiAdapter.render_request(&convo(), &c, false, None);
+        assert!(r.body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn anthropic_maps_reasoning_effort_to_thinking_budget_below_max_tokens() {
+        let mut c = cfg(Some(AdapterKind::Anthropic));
+        c.max_tokens = Some(256); // the voice path's cap
+        c.reasoning_effort = Some(ReasoningEffort::High); // raw budget 8192 > 256
+        let r = AnthropicAdapter.render_request(&convo(), &c, false, None);
+        assert_eq!(r.body["thinking"]["type"], "enabled");
+        let budget = r.body["thinking"]["budget_tokens"].as_u64().unwrap();
+        assert!(budget < 256, "budget {budget} must be < max_tokens 256 (anti-400)");
+        assert!(r.body.get("reasoning_effort").is_none(), "exactly one param");
+
+        // Off → no thinking key at all (Anthropic default is no extended thinking).
+        c.reasoning_effort = Some(ReasoningEffort::Off);
+        let r = AnthropicAdapter.render_request(&convo(), &c, false, None);
+        assert!(r.body.get("thinking").is_none());
+
+        c.reasoning_effort = None;
+        let r = AnthropicAdapter.render_request(&convo(), &c, false, None);
+        assert!(r.body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn gemini_maps_reasoning_effort_only_thinking_budget_never_level_pair() {
+        let mut c = cfg(Some(AdapterKind::Gemini));
+        // Off → NO thinkingConfig (a non-thinking model rejects it).
+        c.reasoning_effort = Some(ReasoningEffort::Off);
+        let r = GeminiAdapter.render_request(&convo(), &c, false, None);
+        assert!(r.body["generationConfig"].get("thinkingConfig").is_none());
+
+        // High → only thinkingBudget, NEVER a thinkingLevel pair (400 tripwire).
+        c.reasoning_effort = Some(ReasoningEffort::High);
+        let r = GeminiAdapter.render_request(&convo(), &c, false, None);
+        let tc = &r.body["generationConfig"]["thinkingConfig"];
+        assert_eq!(tc["thinkingBudget"], 24576);
+        assert!(tc.get("thinkingLevel").is_none());
+        assert!(tc.get("thinking_level").is_none());
+
+        c.reasoning_effort = None;
+        let r = GeminiAdapter.render_request(&convo(), &c, false, None);
+        assert!(r.body["generationConfig"].get("thinkingConfig").is_none());
     }
 
     // --- Anthropic: the hard transforms ---

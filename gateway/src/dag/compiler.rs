@@ -353,6 +353,7 @@ impl DAGCompiler {
                 assistant_id,
                 timeout_ms,
                 headers,
+                reasoning_effort,
             } => {
                 // Build LLM config from node definition
                 let mut llm_config = LlmEndpointConfig {
@@ -366,6 +367,7 @@ impl DAGCompiler {
                     timeout_ms: timeout_ms.unwrap_or(60000),
                     headers: headers.clone(),
                     assistant_id: assistant_id.clone(),
+                    reasoning_effort: *reasoning_effort,
                     ..Default::default()
                 };
 
@@ -809,6 +811,7 @@ mod tests {
                 assistant_id: None,
                 timeout_ms: None,
                 headers: HashMap::new(),
+                reasoning_effort: None,
             },
         ));
         dag.add_node(NodeDefinition::new("output", NodeType::Passthrough));
@@ -1003,6 +1006,7 @@ mod tests {
                 assistant_id: None,
                 timeout_ms: None,
                 headers: HashMap::new(),
+                reasoning_effort: None,
             },
         ));
         dag.add_node(NodeDefinition::new("output", NodeType::Passthrough));
