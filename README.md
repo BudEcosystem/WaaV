@@ -47,6 +47,7 @@ WaaV eliminates the complexity of integrating with multiple voice AI providers b
 - [Quick Start](#quick-start)
 - [Audio Processing Pipeline](#audio-processing-pipeline)
 - [Realtime & Latency](#realtime--latency)
+- [Realtime Reasoning](#realtime-reasoning)
 - [Features](#features)
 - [DAG Pipeline Engine](#dag-pipeline-engine)
 - [Providers](#providers)
@@ -64,7 +65,16 @@ WaaV eliminates the complexity of integrating with multiple voice AI providers b
 
 ## Latest Updates
 
-**June 2026 — Realtime & production-hardening release.** A full brutal audit + measured-latency rebuild landed across the gateway. Every change below ships with extreme-TDD coverage and was validated **live against real providers** (lib suite ~5,820 tests, 0 failing). Detailed reports live alongside this README: [`AUDIT_REPORT.md`](AUDIT_REPORT.md), [`LATENCY_ANALYSIS.md`](LATENCY_ANALYSIS.md), [`REALTIME_ROADMAP.md`](REALTIME_ROADMAP.md), [`MASTER_PLAN.md`](MASTER_PLAN.md).
+**June 2026 — Realtime Reasoning release.** WaaV now runs **reasoning / "thinking" LLMs in live voice** — a class that was previously unusable on the spoken path (9–18 s to first audio, every trivial turn taxed, a stuck model hangs the call). A full opt-in, flat-configured feature set makes a slow "smart" model *feel instant* while a fast model handles the rest, with a safety net that guarantees the call never goes silent or drops. Shipped with extreme-TDD + multi-agent brutal-review + live validation (lib suite **~6,186 tests, 0 failing**; validated against OpenAI / Anthropic / Gemini-compatible endpoints + a credential-free ollama gate). See **[Realtime Reasoning](#realtime-reasoning)** and [`REALTIME_REASONING.md`](REALTIME_REASONING.md) / [`REASONING_FOLLOWUP_PLAN.md`](REASONING_FOLLOWUP_PLAN.md).
+
+- **Two-tier router** — name a fast `model`; add one field `reasoning_model` to light up automatic escalation (complex / math / multi-turn → the reasoner; chit-chat stays fast), both tiers sharing one conversation history.
+- **Latency masking** — `latency_filler` speaks a short holding phrase while the model thinks, so the caller hears a response in **~0.8 s** instead of seconds of silence; deduped to one utterance per turn, interruptible.
+- **Never dead air, never dropped** — a stuck or stalled reasoner (`reasoning_budget_ms` max-silence-gap watchdog) degrades to the fast draft or a graceful spoken apology; a partial answer is committed, never talked over.
+- **Reasoning-effort dial** — one typed `reasoning_effort` (off/minimal/low/medium/high) maps to each vendor's native control (OpenAI flat effort · Anthropic extended-thinking · Gemini thinking-budget), floor-clamped per model and provider-kind-aware, and emits **nothing** when a model can't reason (never a 400). Spans the cascade and the OpenAI-Realtime (S2S) path.
+- **Chain-of-thought never spoken** — `<think>…</think>` reasoning emitted inline by DeepSeek-R1 / QwQ-class models (incl. via ollama) is stripped from TTS on both the conversation and DAG paths.
+- **Cost-bounded** — a per-turn LLM-call ceiling (`max_llm_calls_per_turn`) + a reasoning-token cap (`max_reasoning_tokens`) keep the 2× two-tier spend in check on a billing gateway.
+
+**June 2026 — Realtime & production-hardening release.** A full brutal audit + measured-latency rebuild landed across the gateway. Every change below ships with extreme-TDD coverage and was validated **live against real providers**. Detailed reports live alongside this README: [`AUDIT_REPORT.md`](AUDIT_REPORT.md), [`LATENCY_ANALYSIS.md`](LATENCY_ANALYSIS.md), [`REALTIME_ROADMAP.md`](REALTIME_ROADMAP.md), [`MASTER_PLAN.md`](MASTER_PLAN.md).
 
 **Realtime**
 - **Streaming WebSocket TTS** — Deepgram Aura over `wss://…/v1/speak` with per-utterance cancellation. Live-measured **first-audio ~510 ms vs ~1,510 ms** for the batch/HTTP path. Selected via the standardized `tts_config.features.streaming` flag; HTTP providers keep working unchanged.
@@ -213,16 +223,69 @@ WaaV is built for **natural-conversation latency** — the user-perceived metric
 |-------|------|-------|
 | STT finalization | ~250–700 ms (endpointing) | ML turn detection (`turn_detection.enabled`) predicts end-of-turn early |
 | Gateway glue | **~12 ms** | n/a — not the bottleneck |
-| LLM time-to-first-token | provider-dependent | use a fast, **non-reasoning** model (reasoning models stream thoughts, not the answer) |
+| LLM time-to-first-token | provider-dependent | a fast, low-TTFT model — **or** a reasoning model via the two-tier [Realtime Reasoning](#realtime-reasoning) path (masked + routed so it *feels* instant) |
 | TTS first-audio | **~510 ms streaming** / ~1,510 ms batch | `tts_config.features.streaming` |
 
 **Make it realtime:**
 1. `tts_config.features.streaming: true` — WebSocket TTS (Deepgram Aura today).
-2. A low-TTFT, non-reasoning LLM in `conversation_config` (or DAG `llm` node).
+2. A low-TTFT LLM in `conversation_config` (or DAG `llm` node) — **or** add a `reasoning_model` for the masked + routed two-tier [Realtime Reasoning](#realtime-reasoning) path.
 3. `stt_config.turn_detection.enabled: true` (+ `eager: true` and `conversation_config.eager_eot: true` for speculative starts).
 4. Watch it live: `WAAV_DEBUG_PROFILE=1` then `GET /debug/profile` — per-turn p50/p90/p99 per stage, bottleneck histogram, and a `realtime_blockers` block.
 
 See [`LATENCY_ANALYSIS.md`](LATENCY_ANALYSIS.md) for the full measured breakdown and [`REALTIME_ROADMAP.md`](REALTIME_ROADMAP.md) for the SOTA-researched path to sub-300 ms.
+
+---
+
+## Realtime Reasoning
+
+Reasoning ("thinking") LLMs — OpenAI o-series, DeepSeek-R1, QwQ, Claude / Gemini extended-thinking — give far better answers but are **9–18 s to first user-visible token** (they think before they speak). Naively dropped onto a voice call that is unusable: the caller hears seconds of dead silence, every trivial turn pays the full reasoning tax, and a stuck model hangs the line.
+
+WaaV makes a reasoning LLM **feel instant in voice** — perceived first response **~0.8 s**, a fast model handling everything that doesn't need deep thought, and a safety net so the call never goes silent or drops. Everything is opt-in and flat-configured next to the existing `conversation_config` fields.
+
+**Two fields is the whole mental model:** name a fast `model`; add `reasoning_model` for a smart-but-slow brain.
+
+```jsonc
+{
+  "conversation": {
+    "model": "gpt-4o-mini",          // fast tier — handles simple turns at ~170 ms
+    "reasoning_model": "o3",         // ← presence lights up two-tier routing + masking
+
+    // ── optional tuning (all flat, all safe-defaulted) ──
+    "reasoning_route": "auto",       // auto (heuristic escalation) | always
+    "reasoning_effort": "low",       // off|minimal|low|medium|high  (vendor-mapped, floor-clamped)
+    "latency_filler": "auto",        // off|auto|aggressive — mask the think-gap
+    "reasoning_budget_ms": 15000,    // max silence (to first audio OR between chunks) → degrade
+    "max_reasoning_tokens": 4096,    // reasoning-tier output ceiling (cost)
+    "max_llm_calls_per_turn": 8,     // per-turn re-inference ceiling (cost)
+    "degradation_message": null      // spoken apology when every tier fails (null = built-in)
+    // reasoning_base_url / reasoning_api_key / reasoning_provider_kind — optional, for a
+    // cross-vendor reasoning tier (e.g. fast = local ollama, reasoning = OpenAI o3)
+  }
+}
+```
+
+**What you get:**
+
+| Capability | Config | Behaviour |
+|---|---|---|
+| **Two-tier routing** | `reasoning_model`, `reasoning_route` | a word-aware heuristic escalates complex / multi-step-math / multi-turn-follow-up turns to the reasoner and keeps billing/sales chit-chat (`"not interested"`, `"no refund"`) on the fast tier; both tiers share one history |
+| **Latency masking** | `latency_filler` (+ `latency_filler_after_ms`, `latency_filler_phrases`) | one short holding phrase while the model thinks → perceived first audio ~0.8 s; interruptible; one per turn; deduped vs the model's own filler |
+| **Reasoning-effort dial** | `reasoning_effort` | typed enum → OpenAI `reasoning_effort` / Anthropic `thinking{budget}` / Gemini `thinkingBudget`; floor-clamped per model; provider-kind-aware; **emits nothing when a model can't reason** (no 400s); sampling params suppressed when thinking is on |
+| **Stall watchdog + degradation** | `reasoning_budget_ms`, `degradation_message` | a reasoner with no audio — or frozen mid-stream — past the budget degrades to the fast draft / a graceful spoken apology; a partial answer is committed, never restarted-over; the session never drops |
+| **Cost budget** | `max_reasoning_tokens`, `max_llm_calls_per_turn` | bound the reasoning tier's token + call spend (eager/two-tier/escalation all multiply spend on a billing gateway) |
+| **Chain-of-thought stripping** | automatic | `<think>…</think>` is never spoken to the caller (conversation **and** DAG paths) |
+| **Realtime (S2S)** | `reasoning_effort` | the same dial maps onto the OpenAI Realtime `session.update` (`reasoning.effort`) |
+
+**Measured (live, ollama; the gateway's own overhead is ~12 ms):**
+
+| | Reasoner naive (single-tier) | WaaV two-tier + masking |
+|---|---|---|
+| Simple turn (`"hi"`) | full reasoning latency (8.9 s+) | **~0.17 s** (routed to the fast tier) |
+| Complex turn — *perceived* first audio | 8.9–18 s of silence | **~0.8 s** (`"one moment"`, then the answer) |
+| Stuck / looping reasoner | hangs to the request timeout | **bounded by `reasoning_budget_ms`** → fast fallback |
+| Chain-of-thought | spoken aloud | **stripped** |
+
+The reasoned *answer* still takes its compute time — masking makes it *feel* responsive, routing keeps it off the cheap turns, and the watchdog guarantees it never hangs. A repeatable harness (`live_reasoning_before_after_measurement`, `#[ignore]`) measures the before/after on your own hardware. Full design + adversarial critique: [`REALTIME_REASONING.md`](REALTIME_REASONING.md), [`REASONING_FOLLOWUP_PLAN.md`](REASONING_FOLLOWUP_PLAN.md).
 
 ---
 
@@ -231,6 +294,7 @@ See [`LATENCY_ANALYSIS.md`](LATENCY_ANALYSIS.md) for the full measured breakdown
 ### Core Capabilities
 
 - **WebSocket Streaming** (`/ws`) - Real-time bidirectional audio/text with provider switching
+- **Realtime Reasoning** - run thinking/reasoning LLMs in live voice: two-tier fast+reasoning routing, latency masking, a stall/degradation safety net, cost budgets, a per-vendor effort dial, and automatic chain-of-thought stripping ([details](#realtime-reasoning))
 - **REST API** - TTS synthesis, voice listing, health checks
 - **LiveKit Integration** - WebRTC rooms, SIP webhooks, participant management
 - **Multi-Provider Support** - Unified interface across [70+ global providers](gateway/docs/SUPPORTED_PROVIDERS.md)
