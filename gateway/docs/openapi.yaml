@@ -646,6 +646,13 @@ components:
           type: string
           description: OpenAI-compatible base URL for the LLM (e.g. `https://api.openai.com/v1`).
           example: https://api.openai.com/v1
+        degradation_message:
+          type:
+          - string
+          - 'null'
+          description: |-
+            P1: the spoken line used when EVERY LLM tier fails — a graceful apology
+            instead of dead air. Omit for the built-in default.
         eager_eot:
           type: boolean
           description: |-
@@ -724,6 +731,18 @@ components:
           description: |-
             S1/S2: reasoning-tier base URL (defaults to `base_url` — one endpoint can
             serve both a fast and a reasoning model).
+        reasoning_budget_ms:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            P1: reasoning-tier first-audio budget (ms). If the reasoner streams no
+            audio within this window, the turn degrades to the fast tier rather than
+            leaving the caller in silence. Omit for the safe default (15000); `0`
+            disables the budget. Ignored without a `reasoning_model`.
+          example: 15000
+          minimum: 0
         reasoning_effort:
           oneOf:
           - type: 'null'

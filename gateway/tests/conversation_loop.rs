@@ -210,28 +210,42 @@ struct LlmMockState {
     requests: Arc<Mutex<Vec<Value>>>,
     delay_ms: Arc<AtomicUsize>,
     reply: Arc<Mutex<String>>,
+    /// P1: when set, the endpoint returns HTTP 500 (a failing LLM tier).
+    fail: Arc<AtomicBool>,
 }
 
 async fn start_llm_mock(state: LlmMockState) -> String {
-    async fn chat(State(state): State<LlmMockState>, Json(req): Json<Value>) -> Json<Value> {
+    async fn chat(
+        State(state): State<LlmMockState>,
+        Json(req): Json<Value>,
+    ) -> (axum::http::StatusCode, Json<Value>) {
         state.requests.lock().push(req.clone());
         let delay = state.delay_ms.load(Ordering::SeqCst);
         if delay > 0 {
             tokio::time::sleep(Duration::from_millis(delay as u64)).await;
         }
+        if state.fail.load(Ordering::SeqCst) {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": { "message": "mock tier failure" } })),
+            );
+        }
         let reply = state.reply.lock().clone();
-        Json(json!({
-            "id": "chatcmpl-conv-mock",
-            "object": "chat.completion",
-            "created": 1_700_000_000u64,
-            "model": "mock-llm",
-            "choices": [{
-                "index": 0,
-                "message": { "role": "assistant", "content": reply },
-                "finish_reason": "stop"
-            }],
-            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
-        }))
+        (
+            axum::http::StatusCode::OK,
+            Json(json!({
+                "id": "chatcmpl-conv-mock",
+                "object": "chat.completion",
+                "created": 1_700_000_000u64,
+                "model": "mock-llm",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": reply },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+            })),
+        )
     }
 
     let app = Router::new()
@@ -650,6 +664,152 @@ async fn two_tier_routes_complex_to_reasoning_simple_to_fast() {
         fast_state.requests.lock().len(),
         1,
         "exactly the one simple turn hit the fast endpoint"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// P1 degradation ladder (REALTIME_REASONING.md §8): an LLM tier failure must
+// NEVER be dead air or a dropped session.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Single-tier, recoverable failure (500): no fallback tier exists ⇒ the caller
+/// hears the canned apology, and the error is still classified RECOVERABLE so the
+/// session survives (no fatal-stop on a transient 500).
+#[tokio::test]
+#[serial_test::serial]
+async fn p1_single_tier_failure_speaks_canned_apology() {
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let st = LlmMockState::default();
+    st.fail.store(true, Ordering::SeqCst); // the (only) tier is down (500)
+    let url = start_llm_mock(st.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+
+    let cfg = ConversationConfig {
+        latency_filler: LatencyFiller::Off,
+        ..conv_config(url, false)
+    };
+    let orch = Arc::new(ConversationOrchestrator::new("p1-apology", cfg, vm.clone()).expect("orch"));
+    let fatal_fired = Arc::new(AtomicUsize::new(0));
+    let ff = Arc::clone(&fatal_fired);
+    orch.set_fatal_handler(Arc::new(move |_e| {
+        ff.fetch_add(1, Ordering::SeqCst);
+    }));
+
+    // The real entry point classifies the error; P1 speaks the apology first.
+    orch.on_stt_result(&final_result("hello")).await;
+    let spoken = TTS_STATS.spoken.lock().clone();
+    assert!(
+        spoken.iter().any(|s| s.contains("having trouble")),
+        "the caller must hear the canned apology, got: {spoken:?}"
+    );
+    assert_eq!(
+        fatal_fired.load(Ordering::SeqCst),
+        0,
+        "a 500 is RECOVERABLE — the session must not fatal-stop"
+    );
+}
+
+/// Two-tier: a SIMPLE turn routes to the fast tier; the fast tier is down ⇒ the
+/// ladder degrades to the healthy reasoning tier (never a canned apology when a
+/// working tier exists).
+#[tokio::test]
+#[serial_test::serial]
+async fn p1_fast_tier_failure_degrades_to_reasoning() {
+    use waav_gateway::core::conversation::RoutingMode;
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let fast = LlmMockState::default();
+    fast.fail.store(true, Ordering::SeqCst); // fast tier down
+    let fast_url = start_llm_mock(fast.clone()).await;
+    let reason = LlmMockState::default();
+    *reason.reply.lock() = "Reasoned fallback.".to_string();
+    let reason_url = start_llm_mock(reason.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+
+    let cfg = ConversationConfig {
+        reasoning_model: Some("reasoning-mock".to_string()),
+        reasoning_base_url: Some(reason_url),
+        reasoning_route: RoutingMode::Auto, // "hi there" stays on fast → fast 500 → degrade
+        latency_filler: LatencyFiller::Off,
+        ..conv_config(fast_url, false)
+    };
+    let orch =
+        Arc::new(ConversationOrchestrator::new("p1-fallback", cfg, vm.clone()).expect("orch"));
+
+    let r = orch.run_turn("hi there").await;
+    assert!(r.is_ok(), "{r:?}");
+    let spoken = TTS_STATS.spoken.lock().clone();
+    assert!(
+        spoken.iter().any(|s| s.contains("Reasoned fallback")),
+        "a fast-tier failure must degrade to the reasoning tier, got: {spoken:?}"
+    );
+    assert_eq!(
+        reason.requests.lock().len(),
+        1,
+        "the reasoning tier served the degraded turn"
+    );
+}
+
+/// Two-tier P1.b: a reasoner that streams NO audio within its first-audio budget
+/// is cancelled and the turn degrades to the fast draft — the slow answer is
+/// never spoken, and the caller is never left on a stuck reasoner.
+#[tokio::test]
+#[serial_test::serial]
+async fn p1_reasoner_over_budget_degrades_to_fast_draft() {
+    use waav_gateway::core::conversation::RoutingMode;
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let fast = LlmMockState::default();
+    *fast.reply.lock() = "Fast draft answer.".to_string();
+    let fast_url = start_llm_mock(fast.clone()).await;
+    let reason = LlmMockState::default();
+    *reason.reply.lock() = "Slow reasoned answer.".to_string();
+    reason.delay_ms.store(3000, Ordering::SeqCst); // 3s ≫ the 200ms budget
+    let reason_url = start_llm_mock(reason.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+
+    let cfg = ConversationConfig {
+        reasoning_model: Some("reasoning-mock".to_string()),
+        reasoning_base_url: Some(reason_url),
+        reasoning_route: RoutingMode::Always, // force the reasoner
+        reasoning_budget_ms: 200,             // tiny first-audio budget
+        latency_filler: LatencyFiller::Off,
+        ..conv_config(fast_url, false)
+    };
+    let orch = Arc::new(ConversationOrchestrator::new("p1-budget", cfg, vm.clone()).expect("orch"));
+
+    let r = orch.run_turn("please reason carefully about this").await;
+    assert!(r.is_ok(), "{r:?}");
+    let spoken = TTS_STATS.spoken.lock().clone();
+    assert!(
+        spoken.iter().any(|s| s.contains("Fast draft answer")),
+        "an over-budget reasoner must degrade to the fast draft, got: {spoken:?}"
+    );
+    assert!(
+        !spoken.iter().any(|s| s.contains("Slow reasoned answer")),
+        "the over-budget reasoner's answer must NOT be spoken: {spoken:?}"
     );
 }
 
@@ -1483,6 +1643,13 @@ async fn fatal_stage_error_fires_handler_once() {
 
     orch.on_stt_result(&final_result("hello?")).await;
     assert_eq!(fatal_fired.load(Ordering::SeqCst), 1, "401 fires the fatal handler");
+    // P1 composes with the fatal-stop: the caller hears the apology BEFORE the
+    // session tears down — a fatal stop is never silent.
+    let spoken = TTS_STATS.spoken.lock().clone();
+    assert!(
+        spoken.iter().any(|s| s.contains("having trouble")),
+        "P1: even a fatal-stop turn speaks the canned apology, got: {spoken:?}"
+    );
     // A second failing turn does NOT re-fire (handler taken once).
     orch.on_stt_result(&final_result("still there?")).await;
     assert_eq!(fatal_fired.load(Ordering::SeqCst), 1, "fatal fires exactly once");

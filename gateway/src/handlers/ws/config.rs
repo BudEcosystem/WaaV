@@ -190,6 +190,17 @@ pub struct ConversationWebSocketConfig {
     #[serde(default)]
     #[cfg_attr(feature = "openapi", schema(example = "auto"))]
     pub reasoning_route: crate::core::conversation::RoutingMode,
+    /// P1: reasoning-tier first-audio budget (ms). If the reasoner streams no
+    /// audio within this window, the turn degrades to the fast tier rather than
+    /// leaving the caller in silence. Omit for the safe default (15000); `0`
+    /// disables the budget. Ignored without a `reasoning_model`.
+    #[serde(default)]
+    #[cfg_attr(feature = "openapi", schema(example = 15000))]
+    pub reasoning_budget_ms: Option<u64>,
+    /// P1: the spoken line used when EVERY LLM tier fails — a graceful apology
+    /// instead of dead air. Omit for the built-in default.
+    #[serde(default)]
+    pub degradation_message: Option<String>,
 }
 
 fn default_strip_markdown() -> bool {
@@ -237,6 +248,10 @@ impl ConversationWebSocketConfig {
             reasoning_api_key: self.reasoning_api_key.clone(),
             reasoning_provider_kind: self.reasoning_provider_kind,
             reasoning_route: self.reasoning_route,
+            reasoning_budget_ms: self
+                .reasoning_budget_ms
+                .unwrap_or(crate::core::conversation::DEFAULT_REASONING_BUDGET_MS),
+            degradation_message: self.degradation_message.clone(),
         }
     }
 }

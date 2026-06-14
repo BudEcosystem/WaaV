@@ -130,7 +130,28 @@ pub struct ConversationConfig {
     pub reasoning_provider_kind: Option<crate::core::llm::AdapterKind>,
     /// S2: how to route turns between the fast and reasoning tiers.
     pub reasoning_route: RoutingMode,
+    /// P1 (REALTIME_REASONING.md §8): first-audio budget for the reasoning tier,
+    /// in ms. If the reasoner streams NO audio within this window, the turn is
+    /// treated as over-budget and DEGRADES to the fast tier (the caller never
+    /// sits in silence waiting on a stuck reasoner). A reasoner that has already
+    /// started speaking is left to finish — a committed answer is never truncated.
+    /// `0` disables the budget (the reasoner runs to its own LLM request timeout).
+    /// Ignored for single-tier configs. Default [`DEFAULT_REASONING_BUDGET_MS`].
+    pub reasoning_budget_ms: u64,
+    /// P1: the canned line spoken when EVERY tier fails (or produces no content)
+    /// and nothing else has been said this turn — a graceful apology instead of
+    /// dead air or a dropped session. `None` ⇒ [`DEFAULT_DEGRADATION_MESSAGE`].
+    pub degradation_message: Option<String>,
 }
+
+/// P1: default reasoning-tier first-audio budget (ms). Generous enough not to
+/// truncate legitimate deep reasoning, tight enough that a *stuck* reasoner
+/// yields to a fast draft rather than leaving a live call silent.
+pub const DEFAULT_REASONING_BUDGET_MS: u64 = 15_000;
+
+/// P1: default spoken apology when all LLM tiers fail — never dead air.
+pub const DEFAULT_DEGRADATION_MESSAGE: &str =
+    "Sorry, I'm having trouble with that right now. Could you try again?";
 
 impl Default for ConversationConfig {
     fn default() -> Self {
@@ -160,6 +181,8 @@ impl Default for ConversationConfig {
             reasoning_api_key: None,
             reasoning_provider_kind: None,
             reasoning_route: RoutingMode::default(),
+            reasoning_budget_ms: DEFAULT_REASONING_BUDGET_MS,
+            degradation_message: None,
         }
     }
 }
@@ -487,7 +510,10 @@ impl ConversationOrchestrator {
     /// configured AND (route=Always OR the heuristic flags the turn complex);
     /// otherwise the fast `model`. Both tiers SHARE history, so escalation
     /// continues the same conversation.
-    fn select_tier(&self, transcript: &str) -> &Arc<LlmClient> {
+    /// Pick the tier for this turn. Returns `(tier, is_reasoning)` so the caller
+    /// can apply the reasoning-tier first-audio budget (P1) and pick the correct
+    /// degradation fallback (the *other* tier).
+    fn select_tier(&self, transcript: &str) -> (&Arc<LlmClient>, bool) {
         if let Some(reasoning) = &self.reasoning_llm {
             let escalate = match self.config.reasoning_route {
                 RoutingMode::Always => true,
@@ -495,10 +521,116 @@ impl ConversationOrchestrator {
             };
             if escalate {
                 debug!(session = %self.session_id, "S2: escalating turn to the reasoning tier");
-                return reasoning;
+                return (reasoning, true);
             }
         }
-        &self.llm
+        (&self.llm, false)
+    }
+
+    /// P1 degradation ladder: the tier to fall back to when `primary` fails or
+    /// runs over its first-audio budget. The fast tier falls back to the reasoner
+    /// (if configured) and vice-versa; single-tier configs have no fallback.
+    fn fallback_tier(&self, primary_is_reasoning: bool) -> Option<&Arc<LlmClient>> {
+        if primary_is_reasoning {
+            Some(&self.llm)
+        } else {
+            self.reasoning_llm.as_ref()
+        }
+    }
+
+    /// P1: speak a graceful degraded response when the primary tier failed and
+    /// nothing has been spoken this turn. Tries the fallback tier ONCE
+    /// (non-streaming — correctness over latency on the exceptional path), and
+    /// if that also yields nothing, speaks the canned apology so the caller is
+    /// never in silence. Records `waav_degraded_total`.
+    ///
+    /// Returns `true` only when the fallback tier produced a real answer (the
+    /// turn genuinely RECOVERED). Returns `false` when it fell through to the
+    /// canned apology — the caller still propagates the original error so the
+    /// D-G3 fatal/recoverable classifier can decide whether to stop the session
+    /// (a dead API key must not be retried every turn). The apology is spoken
+    /// either way, so a fatal-stop is never silent.
+    async fn speak_degraded(
+        &self,
+        transcript: &str,
+        primary_is_reasoning: bool,
+        epoch: usize,
+        allow_interruption: bool,
+        token: &CancellationToken,
+    ) -> bool {
+        // A real barge-in already cleared this turn — degrading would talk over
+        // the caller. The epoch guard below is the final backstop.
+        if token.is_cancelled() {
+            return false;
+        }
+        // The masking filler (if any) has served its purpose; stop it so it
+        // cannot fire on top of the degraded answer.
+        self.abort_masking();
+
+        // Rung 1: the other tier. A fresh token — the primary's token may have
+        // been cancelled to stop a stuck reasoner.
+        if let Some(fallback) = self.fallback_tier(primary_is_reasoning) {
+            let fb_token = CancellationToken::new();
+            match fallback
+                .complete(
+                    &self.session_id,
+                    transcript,
+                    self.config.api_key.as_deref(),
+                    &fb_token,
+                    None,
+                )
+                .await
+            {
+                Ok(resp) if !resp.content.trim().is_empty() => {
+                    let text = if self.config.strip_markdown {
+                        crate::core::text::strip_markdown_for_tts(&resp.content)
+                    } else {
+                        resp.content.clone()
+                    };
+                    crate::core::metrics::bridge::record_degraded(
+                        "conversation",
+                        if primary_is_reasoning {
+                            "reasoning_tier_to_fast"
+                        } else {
+                            "fast_tier_to_reasoning"
+                        },
+                    );
+                    warn!(
+                        session = %self.session_id,
+                        primary_is_reasoning,
+                        "P1: primary LLM tier failed — degraded to the fallback tier"
+                    );
+                    let _ = self
+                        .voice_manager
+                        .speak_if_epoch(&text, true, allow_interruption, epoch)
+                        .await;
+                    return true; // recovered on the fallback tier
+                }
+                other => {
+                    debug!(
+                        session = %self.session_id,
+                        ok = other.is_ok(),
+                        "P1: fallback tier also failed/empty — using canned apology"
+                    );
+                }
+            }
+        }
+
+        // Rung 2: the canned apology — never dead air. We did NOT recover, so the
+        // caller still surfaces the original error to the fatal/recoverable
+        // classifier (the apology has already been spoken).
+        crate::core::metrics::bridge::record_degraded("conversation", "all_tiers_failed");
+        warn!(session = %self.session_id, "P1: all LLM tiers failed — speaking canned apology");
+        let msg = self
+            .config
+            .degradation_message
+            .as_deref()
+            .unwrap_or(DEFAULT_DEGRADATION_MESSAGE);
+        let _ = self
+            .voice_manager
+            .speak_if_epoch(msg, true, allow_interruption, epoch)
+            .await;
+        false
     }
 
     /// Cancel any in-flight LLM turn. Returns true if one was running.
@@ -611,7 +743,7 @@ impl ConversationOrchestrator {
         let (id, token) = self.begin_turn();
         // S2: select the fast or reasoning tier for this turn (both share
         // history; the D3 filler masks the reasoning tier's latency).
-        let llm = self.select_tier(transcript);
+        let (llm, is_reasoning) = self.select_tier(transcript);
         // Barge-in clear epoch (review wf_85659e16 #5): captured ONCE at
         // turn start; any clear during the turn invalidates every later
         // sentence enqueue of this turn — checked under the TTS lock, so a
@@ -807,15 +939,60 @@ impl ConversationOrchestrator {
             (None, None)
         };
 
-        let result = llm
-            .complete(
+        // P1.b: time-box the reasoning tier's FIRST AUDIO. The common (fast or
+        // single-tier) path is the bare await — zero added machinery. Only an
+        // escalated reasoning turn with a positive budget gets the deadline race:
+        // if the reasoner streams NO audio within the budget, cancel it (via a
+        // CHILD token so the turn token stays alive for the fallback) and mark
+        // the breach so the outcome match degrades to the fast draft. A reasoner
+        // that has ALREADY started speaking is never truncated — the deadline
+        // simply disarms.
+        let budget_ms = if is_reasoning {
+            self.config.reasoning_budget_ms
+        } else {
+            0
+        };
+        let mut budget_exceeded = false;
+        let result = if budget_ms > 0 && self.reasoning_llm.is_some() {
+            let reasoner_token = token.child_token();
+            let complete_fut = llm.complete(
+                &self.session_id,
+                transcript,
+                self.config.api_key.as_deref(),
+                &reasoner_token,
+                on_token,
+            );
+            tokio::pin!(complete_fut);
+            let deadline = tokio::time::sleep(Duration::from_millis(budget_ms));
+            tokio::pin!(deadline);
+            let mut armed = true;
+            loop {
+                tokio::select! {
+                    biased;
+                    r = &mut complete_fut => break r,
+                    _ = &mut deadline, if armed => {
+                        armed = false; // disarm: this branch is never polled again
+                        if !spoke.load(std::sync::atomic::Ordering::Acquire)
+                            && !token.is_cancelled()
+                        {
+                            budget_exceeded = true;
+                            reasoner_token.cancel(); // stop the stuck reasoner
+                        }
+                        // If audio is already flowing, do nothing — let the
+                        // committed answer run to completion.
+                    }
+                }
+            }
+        } else {
+            llm.complete(
                 &self.session_id,
                 transcript,
                 self.config.api_key.as_deref(),
                 &token,
                 on_token,
             )
-            .await;
+            .await
+        };
 
         // `complete()` returning drops the token callback → channel closes → the
         // pump flushes its remainder and exits. Await it so `spoke` is final and
@@ -932,6 +1109,17 @@ impl ConversationOrchestrator {
                     Ok(())
                 }
             }
+            Err(LlmError::Cancelled) if budget_exceeded => {
+                // P1.b: NOT a barge-in — the reasoner blew its first-audio budget
+                // and we cancelled it. The turn token is still alive (only the
+                // child was cancelled), so degrade to the fast draft / canned
+                // apology rather than leaving the caller on a stuck reasoner. A
+                // deliberate budget cancel is never an error to surface, so this
+                // path always completes Ok (the apology covers the worst case).
+                self.speak_degraded(transcript, is_reasoning, epoch, allow_interruption, &token)
+                    .await;
+                Ok(())
+            }
             Err(LlmError::Cancelled) => {
                 // B-G5: the streamed portion lands in history so the model
                 // knows it was cut off. (Normal completion records the full
@@ -952,7 +1140,23 @@ impl ConversationOrchestrator {
                 }
                 Ok(())
             }
-            Err(e) => Err(e.into()),
+            Err(e) => {
+                // P1.a: an LLM tier failed outright. Speak SOMETHING (fallback
+                // tier, then a canned apology) so the caller never hears dead air.
+                // If the fallback tier produced a real answer the turn genuinely
+                // recovered (Ok); otherwise we still surface the original error so
+                // the D-G3 classifier can fatal-stop a dead key (the apology has
+                // already been spoken, so the stop is never silent).
+                warn!(session = %self.session_id, error = %e, "P1: LLM turn failed — degrading");
+                if self
+                    .speak_degraded(transcript, is_reasoning, epoch, allow_interruption, &token)
+                    .await
+                {
+                    Ok(())
+                } else {
+                    Err(e.into())
+                }
+            }
         };
 
         // D3: the turn is done — tear down the masking timer (a no-op if it
