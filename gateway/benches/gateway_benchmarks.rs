@@ -166,6 +166,7 @@ fn bench_message_serialization(c: &mut Criterion) {
         is_final: true,
         is_speech_final: true,
         confidence: 0.95,
+        segment_transcript: None,
     };
 
     // Error message

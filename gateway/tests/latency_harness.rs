@@ -315,6 +315,10 @@ fn conv_config(base_url: String, streaming: bool) -> ConversationConfig {
         mute_strategy: None,
         strip_markdown: true,
         user_idle_timeout_ms: 0,
+        // Disable latency masking so it can't perturb the latency measurement;
+        // all other reasoning fields take their (safe) defaults.
+        latency_filler: waav_gateway::core::conversation::LatencyFiller::Off,
+        ..Default::default()
     }
 }
 
