@@ -138,6 +138,24 @@ impl ReasoningEffort {
     }
 }
 
+/// Anthropic minimum `budget_tokens` for the `type:"enabled"` thinking form.
+/// Below this, the API 400s — so we don't emit the enabled form (see render).
+const ANTHROPIC_MIN_THINKING_BUDGET: u32 = 1024;
+
+/// Whether an Anthropic model is adaptive-thinking-ONLY (Opus 4.7/4.8, Fable 5):
+/// these REJECT `thinking:{type:"enabled",budget_tokens}` with a 400 and only
+/// honor their built-in adaptive thinking — so we emit no thinking block at all
+/// (the model thinks adaptively by default; budget can't control it).
+fn is_anthropic_adaptive_only(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("opus-4-7")
+        || m.contains("opus-4.7")
+        || m.contains("opus-4-8")
+        || m.contains("opus-4.8")
+        || m.contains("fable-5")
+        || m.contains("claude-fable")
+}
+
 /// Anthropic extended-thinking budget per effort. The caller MUST further clamp
 /// to `< max_tokens` (Anthropic 400s otherwise).
 fn anthropic_budget_tokens(e: ReasoningEffort) -> u32 {
@@ -636,18 +654,27 @@ impl LlmAdapter for AnthropicAdapter {
         if let Some(p) = cfg.top_p {
             obj.insert("top_p".into(), json!(p));
         }
-        // D1: Anthropic extended thinking. `Off`/`None` → emit nothing (default
-        // is no thinking). EXACTLY ONE param (`thinking`). INVARIANT: Anthropic
-        // 400s unless `budget_tokens < max_tokens`, so clamp the budget below the
-        // body's `max_tokens` (the voice path caps at 256).
+        // D1: Anthropic extended thinking (brutal-review hardened). `Off`/`None`
+        // → nothing. EXACTLY ONE param. The `enabled` form requires
+        // `1024 <= budget_tokens < max_tokens`; the voice cap (256) makes that
+        // jointly unsatisfiable, and adaptive-only models (Opus 4.7/4.8, Fable 5)
+        // reject the `enabled` form entirely. So: adaptive-only → emit nothing
+        // (model thinks adaptively by default); otherwise emit `enabled` ONLY when
+        // a valid budget (>= 1024 and < max_tokens) fits — else emit nothing
+        // rather than a guaranteed 400.
         if let Some(effort) = cfg.reasoning_effort {
-            if effort != ReasoningEffort::Off {
+            if effort != ReasoningEffort::Off && !is_anthropic_adaptive_only(&cfg.model) {
                 let max_tok = cfg.max_tokens.unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS);
                 let budget = anthropic_budget_tokens(effort).min(max_tok.saturating_sub(1));
-                obj.insert(
-                    "thinking".into(),
-                    json!({ "type": "enabled", "budget_tokens": budget }),
-                );
+                if budget >= ANTHROPIC_MIN_THINKING_BUDGET {
+                    obj.insert(
+                        "thinking".into(),
+                        json!({ "type": "enabled", "budget_tokens": budget }),
+                    );
+                }
+                // else: budget can't satisfy [1024, max_tokens) — skip thinking
+                // (no 400). A reasoning Anthropic model on voice needs a higher
+                // explicit max_tokens to actually think.
             }
         }
         if let Some(stop) = &cfg.stop {
@@ -1317,21 +1344,40 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_maps_reasoning_effort_to_thinking_budget_below_max_tokens() {
+    fn anthropic_maps_reasoning_effort_thinking_400_safe() {
+        // Voice cap (256): a valid budget needs 1024 <= budget < max_tokens, which
+        // is unsatisfiable at 256 → emit NO thinking block (never a guaranteed 400).
         let mut c = cfg(Some(AdapterKind::Anthropic));
-        c.max_tokens = Some(256); // the voice path's cap
-        c.reasoning_effort = Some(ReasoningEffort::High); // raw budget 8192 > 256
+        c.max_tokens = Some(256);
+        c.reasoning_effort = Some(ReasoningEffort::High);
+        let r = AnthropicAdapter.render_request(&convo(), &c, false, None);
+        assert!(
+            r.body.get("thinking").is_none(),
+            "budget can't satisfy [1024, 256) → no thinking block, not a 400"
+        );
+
+        // Room for a valid budget → enabled with 1024 <= budget < max_tokens.
+        c.max_tokens = Some(4000);
         let r = AnthropicAdapter.render_request(&convo(), &c, false, None);
         assert_eq!(r.body["thinking"]["type"], "enabled");
         let budget = r.body["thinking"]["budget_tokens"].as_u64().unwrap();
-        assert!(budget < 256, "budget {budget} must be < max_tokens 256 (anti-400)");
+        assert!((1024..4000).contains(&(budget as u32)), "budget {budget} in [1024,4000)");
         assert!(r.body.get("reasoning_effort").is_none(), "exactly one param");
 
-        // Off → no thinking key at all (Anthropic default is no extended thinking).
+        // Adaptive-only model (Opus 4.8) rejects the enabled form → emit nothing.
+        c.model = "claude-opus-4-8".to_string();
+        c.reasoning_effort = Some(ReasoningEffort::High);
+        let r = AnthropicAdapter.render_request(&convo(), &c, false, None);
+        assert!(
+            r.body.get("thinking").is_none(),
+            "adaptive-only model: never the enabled+budget form (it 400s)"
+        );
+
+        // Off / None → no thinking key (default no extended thinking).
+        c.model = "claude-sonnet-4-5".to_string();
         c.reasoning_effort = Some(ReasoningEffort::Off);
         let r = AnthropicAdapter.render_request(&convo(), &c, false, None);
         assert!(r.body.get("thinking").is_none());
-
         c.reasoning_effort = None;
         let r = AnthropicAdapter.render_request(&convo(), &c, false, None);
         assert!(r.body.get("thinking").is_none());

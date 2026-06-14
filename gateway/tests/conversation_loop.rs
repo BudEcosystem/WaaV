@@ -550,6 +550,48 @@ async fn latency_filler_off_speaks_nothing() {
     );
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn latency_filler_does_not_poison_interruptibility() {
+    // REGRESSION (brutal review CRITICAL): the masking filler must NOT leave the
+    // session non-interruptible — a barge-in on the real answer (and on every
+    // later turn) must keep working. The old code armed a session-global
+    // suppression window that was never restored, silently disabling barge-in.
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let llm_state = LlmMockState::default();
+    *llm_state.reply.lock() = "Your balance is forty two dollars.".to_string();
+    llm_state.delay_ms.store(400, Ordering::SeqCst);
+    let base_url = start_llm_mock(llm_state.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+
+    let cfg = ConversationConfig {
+        latency_filler: LatencyFiller::Auto,
+        latency_filler_after_ms: Some(100),
+        ..conv_config(base_url, false)
+    };
+    let orchestrator =
+        Arc::new(ConversationOrchestrator::new("session-poison", cfg, vm.clone()).expect("orch"));
+    orchestrator.run_turn("what is my balance").await.ok();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // A filler fired (slow turn past the 100ms threshold).
+    let spoken = TTS_STATS.spoken.lock().clone();
+    assert!(spoken.iter().any(|s| is_filler(s)), "filler should have fired: {spoken:?}");
+    // The session must NOT be stuck non-interruptible after the masked turn.
+    assert!(
+        !vm.is_interruption_blocked().await,
+        "barge-in must remain available after a masking filler (no allow_interruption poisoning)"
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // TEST 3: multi-turn history is preserved (turn 2 includes turn 1).
 // ──────────────────────────────────────────────────────────────────────────────

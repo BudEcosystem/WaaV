@@ -542,10 +542,15 @@ impl ConversationOrchestrator {
                     if latch.swap(true, std::sync::atomic::Ordering::AcqRel) {
                         return; // one masking utterance per turn
                     }
-                    // Suppress the filler's own VAD tail (≤400ms) while keeping the
-                    // clip interruptible, then speak it (epoch-gated so a barge-in
-                    // that already cleared drops it).
-                    vm.arm_barge_in_suppression(350);
+                    // Speak the filler as ORDINARY interruptible audio (epoch-gated
+                    // so a barge-in that already cleared drops it). We must NOT flip
+                    // the session-global interruption flag here: the filler is
+                    // interruptible by design, and a real barge-in during it (or
+                    // during the real answer that follows) must be honored — the
+                    // brutal review proved that poisoning allow_interruption here
+                    // silently disabled barge-in for the WHOLE answer (critique:
+                    // re-introduced the §4.4 failure). Echo cancellation, not a
+                    // session-wide suppression window, handles the bot's own tail.
                     match vm.speak_if_epoch(&phrase, true, true, epoch).await {
                         Ok(true) => debug!(session = %session, %phrase, "D3 masking filler spoken"),
                         Ok(false) => {
