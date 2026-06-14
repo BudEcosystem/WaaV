@@ -667,6 +667,102 @@ async fn two_tier_routes_complex_to_reasoning_simple_to_fast() {
     );
 }
 
+/// A5: a short anaphoric follow-up to a reasoning turn STICKS to the reasoning
+/// tier for one turn (the dropped-thread fix) — proven through the real
+/// select_tier→run_turn→tier-endpoint path.
+#[tokio::test]
+#[serial_test::serial]
+async fn two_tier_sticky_followup_stays_on_reasoning() {
+    use waav_gateway::core::conversation::RoutingMode;
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let fast_state = LlmMockState::default();
+    *fast_state.reply.lock() = "Fast reply.".to_string();
+    let fast_url = start_llm_mock(fast_state.clone()).await;
+    let reason_state = LlmMockState::default();
+    *reason_state.reply.lock() = "Reasoned reply.".to_string();
+    let reason_url = start_llm_mock(reason_state.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+    let cfg = ConversationConfig {
+        reasoning_model: Some("reasoning-mock".to_string()),
+        reasoning_base_url: Some(reason_url),
+        reasoning_route: RoutingMode::Auto,
+        latency_filler: LatencyFiller::Off,
+        ..conv_config(fast_url, false)
+    };
+    let orch =
+        Arc::new(ConversationOrchestrator::new("session-sticky", cfg, vm.clone()).expect("orch"));
+
+    // Turn 1 escalates (keyword); turn 2 is a bare continuation that would have
+    // dropped to fast under the old heuristic — it must STICK to reasoning.
+    orch.run_turn("calculate my mortgage payment").await.ok();
+    orch.run_turn("and the second one?").await.ok();
+
+    assert_eq!(
+        reason_state.requests.lock().len(),
+        2,
+        "the continuation must stick to the reasoning tier (no dropped thread)"
+    );
+    assert_eq!(
+        fast_state.requests.lock().len(),
+        0,
+        "the fast tier must not be hit on a sticky continuation"
+    );
+}
+
+/// A5: everyday negated/billing speech must NOT false-escalate onto the 2×-cost
+/// reasoning tier — proven end-to-end (the money-leak fix).
+#[tokio::test]
+#[serial_test::serial]
+async fn two_tier_negation_stays_fast() {
+    use waav_gateway::core::conversation::RoutingMode;
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let fast_state = LlmMockState::default();
+    *fast_state.reply.lock() = "Fast reply.".to_string();
+    let fast_url = start_llm_mock(fast_state.clone()).await;
+    let reason_state = LlmMockState::default();
+    *reason_state.reply.lock() = "Reasoned reply.".to_string();
+    let reason_url = start_llm_mock(reason_state.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+    let cfg = ConversationConfig {
+        reasoning_model: Some("reasoning-mock".to_string()),
+        reasoning_base_url: Some(reason_url),
+        reasoning_route: RoutingMode::Auto,
+        latency_filler: LatencyFiller::Off,
+        ..conv_config(fast_url, false)
+    };
+    let orch =
+        Arc::new(ConversationOrchestrator::new("session-neg", cfg, vm.clone()).expect("orch"));
+
+    orch.run_turn("i said no refund please").await.ok();
+
+    assert_eq!(
+        fast_state.requests.lock().len(),
+        1,
+        "negated billing speech must stay on the fast tier"
+    );
+    assert_eq!(
+        reason_state.requests.lock().len(),
+        0,
+        "it must NOT false-escalate to the reasoning tier"
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // P1 degradation ladder (REALTIME_REASONING.md §8): an LLM tier failure must
 // NEVER be dead air or a dropped session.

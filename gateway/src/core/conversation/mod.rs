@@ -260,32 +260,142 @@ pub enum RoutingMode {
     Always,
 }
 
-/// S2: cheap per-turn escalation heuristic — does this user turn look like it
-/// needs the reasoning tier (multi-step math/logic/analysis, or a long ask)?
-/// Single-pass lowercase scan; no model call (single-digit µs). The design's
-/// fallback when no trained classifier exists.
+/// S2 (REALTIME_REASONING.md §5 + FOLLOWUP §2.1): cheap per-turn escalation
+/// heuristic — does this user turn look like it needs the reasoning tier? One
+/// word-aware lowercase scan, no model call (single-digit µs): the design's
+/// fallback when no trained classifier exists. WORD-AWARE (token equality, not
+/// substring) + negation-guarded, so everyday billing/sales speech ("not
+/// interested", "no refund", "that's reasonable", "interesting weather") no
+/// longer false-escalates onto the 2×-cost reasoning tier.
 pub fn turn_needs_reasoning(transcript: &str) -> bool {
+    turn_needs_reasoning_ctx(transcript, false)
+}
+
+/// Context-aware variant: also keeps a SHORT anaphoric continuation after a
+/// reasoning turn on the reasoning tier for ONE turn (`prev_was_reasoning`), so
+/// a follow-up like "and the second one?" doesn't drop the reasoning thread.
+pub fn turn_needs_reasoning_ctx(transcript: &str, prev_was_reasoning: bool) -> bool {
     let t = transcript.to_lowercase();
-    const HARD: &[&str] = &[
-        "calculate",
-        "compute",
-        "how many",
-        "how much",
-        "why ",
-        "explain",
-        "compare",
-        "step by step",
-        "reason",
-        "prove",
-        "analy", // analyze/analysis
-        "percent",
-        "interest",
-        "refund",
-        "what's the total",
-        "work out",
-        "figure out",
+    let tokens = reasoning_tokenize(&t);
+
+    // Length signal — a long ask escalates regardless of language.
+    if tokens.len() > 28 {
+        return true;
+    }
+
+    // Single-word lemmas (token equality — NO substring leak) + multi-word
+    // phrases (contiguous token window); a hit preceded by a negator is skipped.
+    // (Bare "interest"/"refund" were dropped: a transactional "I want a refund"
+    // needs no reasoning — the math cases are caught by calculate/how much/%.)
+    const SINGLE: &[&str] = &[
+        "calculate", "compute", "calculation", "explain", "compare", "reason",
+        "prove", "analyze", "analyse", "analysis", "analytical", "percent",
+        "percentage", "why", "estimate", "convert",
     ];
-    t.split_whitespace().count() > 28 || HARD.iter().any(|k| t.contains(k))
+    const PHRASES: &[&[&str]] = &[
+        &["how", "many"],
+        &["how", "much"],
+        &["step", "by", "step"],
+        &["what's", "the", "total"],
+        &["work", "out"],
+        &["figure", "out"],
+        &["break", "down"],
+    ];
+    if reasoning_keyword_hit(&tokens, SINGLE, PHRASES) {
+        return true;
+    }
+
+    // Cross-lingual numeric signal: a percentage figure ('%' alongside a digit)
+    // is calc/financial in any language. Tight on purpose — bare digits are NOT
+    // a signal (phone/order/date numbers must not escalate).
+    if t.contains('%') && t.bytes().any(|b| b.is_ascii_digit()) {
+        return true;
+    }
+
+    // Stickiness: a short continuation of a reasoning thread stays on reasoning.
+    prev_was_reasoning && reasoning_is_short_continuation(&tokens)
+}
+
+/// Tokenize lowercase text into words, KEEPING intra-word apostrophes so
+/// contractions ("don't", "what's") stay whole — Unicode-aware, so non-Latin
+/// scripts (Devanagari/CJK) tokenize correctly too.
+fn reasoning_tokenize(t: &str) -> Vec<&str> {
+    t.split(|c: char| !(c.is_alphanumeric() || c == '\'' || c == '\u{2019}'))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn reasoning_is_negator(tok: &str) -> bool {
+    const NEGATORS: &[&str] = &[
+        "no", "not", "never", "without", "cannot", "can't", "won't", "don't",
+        "isn't", "aren't", "wasn't", "doesn't", "didn't", "couldn't",
+        "shouldn't", "wouldn't", "nor", "zero",
+    ];
+    NEGATORS.contains(&tok)
+}
+
+/// A single-token or contiguous-phrase keyword hit NOT immediately preceded by
+/// a negator.
+fn reasoning_keyword_hit(tokens: &[&str], single: &[&str], phrases: &[&[&str]]) -> bool {
+    for (i, tok) in tokens.iter().enumerate() {
+        if single.contains(tok) && !(i > 0 && reasoning_is_negator(tokens[i - 1])) {
+            return true;
+        }
+    }
+    for phrase in phrases {
+        let n = phrase.len();
+        if n == 0 || tokens.len() < n {
+            continue;
+        }
+        for start in 0..=tokens.len() - n {
+            if &tokens[start..start + n] == *phrase
+                && !(start > 0 && reasoning_is_negator(tokens[start - 1]))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A short anaphoric follow-up (≤8 tokens, opens with or carries a continuation
+/// cue, no closing/negating cue) that should stick to the reasoning tier.
+fn reasoning_is_short_continuation(tokens: &[&str]) -> bool {
+    if tokens.is_empty() || tokens.len() > 8 {
+        return false;
+    }
+    const CLOSING: &[&str] = &["thanks", "thank", "bye", "goodbye", "stop", "cancel"];
+    if tokens
+        .iter()
+        .any(|t| CLOSING.contains(t) || reasoning_is_negator(t))
+    {
+        return false; // user is wrapping up / negating — don't stick
+    }
+    const OPENERS: &[&str] = &["and", "also", "then", "next", "again", "now", "plus", "minus"];
+    if tokens.first().is_some_and(|t| OPENERS.contains(t)) {
+        return true;
+    }
+    const CUES: &[&[&str]] = &[
+        &["what", "about"],
+        &["how", "about"],
+        &["the", "second"],
+        &["the", "other"],
+        &["the", "next"],
+        &["do", "it"],
+        &["same", "for"],
+        &["what", "if"],
+    ];
+    for cue in CUES {
+        let n = cue.len();
+        if tokens.len() >= n {
+            for s in 0..=tokens.len() - n {
+                if &tokens[s..s + n] == *cue {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Cheap heuristic (single &str scan): is this model id known to do extended
@@ -427,6 +537,10 @@ pub struct ConversationOrchestrator {
     /// S1/S2: the slow reasoning tier, sharing history with `llm`. `None` =
     /// single-tier. Built from `config.reasoning_model` via `with_tier_overrides`.
     reasoning_llm: Option<Arc<LlmClient>>,
+    /// A5: 1-bit ledger of whether the PREVIOUS turn ran on the reasoning tier,
+    /// so a short anaphoric follow-up can stick to the reasoning thread for one
+    /// turn (set unconditionally in `select_tier` on every two-tier turn).
+    last_turn_was_reasoning: Arc<SyncMutex<bool>>,
 }
 
 /// S1/S2: build the reasoning tier (sharing `base.histories`) when configured.
@@ -516,6 +630,7 @@ impl ConversationOrchestrator {
             session_id: session_id.into(),
             llm,
             reasoning_llm,
+            last_turn_was_reasoning: Arc::new(SyncMutex::new(false)),
             voice_manager,
             config: Arc::new(config),
             turn: Arc::new(SyncMutex::new(None)),
@@ -545,6 +660,7 @@ impl ConversationOrchestrator {
             session_id: session_id.into(),
             llm,
             reasoning_llm,
+            last_turn_was_reasoning: Arc::new(SyncMutex::new(false)),
             voice_manager,
             config: Arc::new(config),
             turn: Arc::new(SyncMutex::new(None)),
@@ -576,8 +692,16 @@ impl ConversationOrchestrator {
         if let Some(reasoning) = &self.reasoning_llm {
             let escalate = match self.config.reasoning_route {
                 RoutingMode::Always => true,
-                RoutingMode::Auto => turn_needs_reasoning(transcript),
+                // A5: feed the prior turn's tier so a short anaphoric follow-up
+                // sticks to the reasoning thread for one turn.
+                RoutingMode::Auto => {
+                    let prev = *self.last_turn_was_reasoning.lock();
+                    turn_needs_reasoning_ctx(transcript, prev)
+                }
             };
+            // A5: record the decision UNCONDITIONALLY (gating the write on
+            // `escalate` would latch it true forever → unbounded over-escalation).
+            *self.last_turn_was_reasoning.lock() = escalate;
             if escalate {
                 debug!(session = %self.session_id, "S2: escalating turn to the reasoning tier");
                 return (reasoning, true);
@@ -1897,6 +2021,37 @@ mod tests {
         let long = format!("i want to {}understand this", "really ".repeat(30));
         assert!(turn_needs_reasoning(&long));
         assert_eq!(RoutingMode::default(), RoutingMode::Auto);
+
+        // A5 — word-boundary + negation: everyday billing/sales speech that the
+        // old substring scan false-escalated must now stay FAST.
+        for t in [
+            "i said no refund",     // "refund" no longer a keyword
+            "i'm not interested",   // "interested" != "interest" (word-boundary)
+            "that's reasonable",    // "reasonable" != "reason"
+            "interesting weather",  // "interesting" != "interest"
+            "please don't explain", // "explain" immediately negated by "don't"
+        ] {
+            assert!(!turn_needs_reasoning(t), "{t:?} must NOT false-escalate");
+        }
+
+        // A5 — numeric/percentage signal escalates cross-lingually; bare digits
+        // (phone / order / date) must NOT escalate.
+        assert!(turn_needs_reasoning("calcule 15% de 2400"), "percentage math escalates");
+        assert!(turn_needs_reasoning("what is 20% of my bill"), "percentage escalates");
+        for t in ["call me at 5551234", "order number 12345", "i'll be there on the 15th"] {
+            assert!(!turn_needs_reasoning(t), "{t:?} bare digits must stay fast");
+        }
+
+        // A5 — apostrophe-safe tokenizer: contractions stay whole.
+        assert!(turn_needs_reasoning("what's the total of these"), "what's the total escalates");
+
+        // A5 — stickiness: a short continuation after a reasoning turn sticks; a
+        // closing/standalone follow-up does not; nothing sticks without context.
+        assert!(turn_needs_reasoning_ctx("and the second one?", true), "continuation sticks");
+        assert!(turn_needs_reasoning_ctx("what about next year", true), "continuation sticks");
+        assert!(!turn_needs_reasoning_ctx("and the second one?", false), "no stick without context");
+        assert!(!turn_needs_reasoning_ctx("thanks that's all", true), "closing does not stick");
+        assert!(!turn_needs_reasoning_ctx("no that's wrong", true), "negation does not stick");
     }
 
     #[test]
