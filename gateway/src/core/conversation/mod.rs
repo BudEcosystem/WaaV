@@ -281,7 +281,9 @@ pub fn turn_needs_reasoning(transcript: &str) -> bool {
 /// reasoning turn on the reasoning tier for ONE turn (`prev_was_reasoning`), so
 /// a follow-up like "and the second one?" doesn't drop the reasoning thread.
 pub fn turn_needs_reasoning_ctx(transcript: &str, prev_was_reasoning: bool) -> bool {
-    let t = transcript.to_lowercase();
+    // Normalize the curly apostrophe (U+2019, common from STT/keyboards) to ASCII
+    // so contractions match the ASCII phrase/lemma literals ("what's the total").
+    let t = transcript.to_lowercase().replace('\u{2019}', "'");
     let tokens = reasoning_tokenize(&t);
 
     // Length signal — a long ask escalates regardless of language.
@@ -291,12 +293,13 @@ pub fn turn_needs_reasoning_ctx(transcript: &str, prev_was_reasoning: bool) -> b
 
     // Single-word lemmas (token equality — NO substring leak) + multi-word
     // phrases (contiguous token window); a hit preceded by a negator is skipped.
-    // (Bare "interest"/"refund" were dropped: a transactional "I want a refund"
-    // needs no reasoning — the math cases are caught by calculate/how much/%.)
+    // (Bare "interest"/"refund"/"estimate"/"convert" were dropped: transactional
+    // requests need no reasoning — the math cases are caught by calculate/how
+    // much/percent/% signals.)
     const SINGLE: &[&str] = &[
         "calculate", "compute", "calculation", "explain", "compare", "reason",
         "prove", "analyze", "analyse", "analysis", "analytical", "percent",
-        "percentage", "why", "estimate", "convert",
+        "percentage", "why",
     ];
     const PHRASES: &[&[&str]] = &[
         &["how", "many"],
@@ -311,10 +314,11 @@ pub fn turn_needs_reasoning_ctx(transcript: &str, prev_was_reasoning: bool) -> b
         return true;
     }
 
-    // Cross-lingual numeric signal: a percentage figure ('%' alongside a digit)
-    // is calc/financial in any language. Tight on purpose — bare digits are NOT
-    // a signal (phone/order/date numbers must not escalate).
-    if t.contains('%') && t.bytes().any(|b| b.is_ascii_digit()) {
+    // Cross-lingual percentage-MATH signal: a percentage figure being OPERATED on
+    // ("20% of", "15% de"). Requiring the "of"/"de" connector keeps the genuine
+    // calc intent while excluding the ubiquitous intensifier/discount idioms
+    // ("50% off", "100% sure", "80% right now") that merely co-occur with '%'.
+    if has_percentage_math(&t) {
         return true;
     }
 
@@ -322,13 +326,38 @@ pub fn turn_needs_reasoning_ctx(transcript: &str, prev_was_reasoning: bool) -> b
     prev_was_reasoning && reasoning_is_short_continuation(&tokens)
 }
 
-/// Tokenize lowercase text into words, KEEPING intra-word apostrophes so
+/// Tokenize lowercase text into words, KEEPING intra-word ASCII apostrophes so
 /// contractions ("don't", "what's") stay whole — Unicode-aware, so non-Latin
-/// scripts (Devanagari/CJK) tokenize correctly too.
+/// scripts (Devanagari/CJK) tokenize correctly too. (The curly apostrophe is
+/// normalized to ASCII by the caller before tokenizing.)
 fn reasoning_tokenize(t: &str) -> Vec<&str> {
-    t.split(|c: char| !(c.is_alphanumeric() || c == '\'' || c == '\u{2019}'))
+    t.split(|c: char| !(c.is_alphanumeric() || c == '\''))
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// A percentage figure being OPERATED on: a digit immediately before `%` (allow
+/// one space, "20%" or "20 %") followed by an "of"/"de" connector. This escalates
+/// genuine percentage math ("what is 20% of my bill", "calcule 15% de 2400") but
+/// NOT the intensifier/discount idioms ("50% off", "100% sure", "80% right now")
+/// that merely contain a `%` next to a digit. (English/Romance connectors only by
+/// design — `route=always` is the documented full cross-lingual path.)
+fn has_percentage_math(t: &str) -> bool {
+    for (i, _) in t.match_indices('%') {
+        let digit_before = t[..i]
+            .trim_end()
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_digit());
+        if !digit_before {
+            continue;
+        }
+        let after = t[i + 1..].trim_start();
+        if after == "of" || after == "de" || after.starts_with("of ") || after.starts_with("de ") {
+            return true;
+        }
+    }
+    false
 }
 
 fn reasoning_is_negator(tok: &str) -> bool {
@@ -720,16 +749,20 @@ impl ConversationOrchestrator {
         if let Some(reasoning) = &self.reasoning_llm {
             let escalate = match self.config.reasoning_route {
                 RoutingMode::Always => true,
-                // A5: feed the prior turn's tier so a short anaphoric follow-up
-                // sticks to the reasoning thread for one turn.
                 RoutingMode::Auto => {
                     let prev = *self.last_turn_was_reasoning.lock();
+                    // INTRINSIC complexity (keyword/length/%), context-free — this
+                    // alone ARMS stickiness for the next turn. A5: arm the ledger
+                    // on `intrinsic` only, so stickiness is a true ONE-SHOT (a
+                    // sticky continuation runs on reasoning THIS turn but does not
+                    // re-arm). Writing the sticky `escalate` instead would let a
+                    // chain of "and…"/"now…" follow-ups latch reasoning forever.
+                    *self.last_turn_was_reasoning.lock() = turn_needs_reasoning(transcript);
+                    // Escalate this turn on intrinsic complexity OR a one-shot
+                    // sticky continuation of a prior reasoning turn.
                     turn_needs_reasoning_ctx(transcript, prev)
                 }
             };
-            // A5: record the decision UNCONDITIONALLY (gating the write on
-            // `escalate` would latch it true forever → unbounded over-escalation).
-            *self.last_turn_was_reasoning.lock() = escalate;
             if escalate {
                 debug!(session = %self.session_id, "S2: escalating turn to the reasoning tier");
                 return (reasoning, true);
@@ -1133,11 +1166,15 @@ impl ConversationOrchestrator {
         // True once the pump actually delivered any text to TTS (guards the
         // reasoning-model empty-stream failure mode).
         let spoke = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // A7: monotonic ns of the LAST audio that reached TTS (0 = none yet). The
-        // stall watchdog measures the silence gap from here (or from the request
-        // start when nothing has been spoken), so a reasoner that streams one
-        // token then freezes is degraded — not just one that never starts.
-        let last_audio_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // A7: monotonic ns of the LAST streaming PROGRESS — the last non-empty
+        // token delta (0 = none yet). The stall watchdog measures the gap from
+        // here (or the request start), so it tracks reasoner LIVENESS, not TTS
+        // emit timing: a reasoner streaming tokens (even a long not-yet-spoken
+        // sentence, or one whose TTS synthesis is slow) is alive and not
+        // degraded, while one that stops producing tokens is. Non-streaming turns
+        // never advance it (no deltas) → the watchdog measures from request start,
+        // preserving the original first-audio (TTFA) degrade.
+        let last_progress_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         // D3 (REALTIME_REASONING.md §4.3): latency masking. Arm a SINGLE timer on
         // this CONFIRMED-EoT path (never on the speculative/eager path). If no
@@ -1206,12 +1243,21 @@ impl ConversationOrchestrator {
             let first_token_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let obs_cb = observers.clone();
             let streamed_cb = Arc::clone(&streamed_text);
+            let progress_cb = last_progress_at.clone();
             let cb: crate::core::llm::TokenCallback = Arc::new(move |delta: &str| {
-                if !delta.is_empty()
-                    && !first_token_seen.swap(true, std::sync::atomic::Ordering::Relaxed)
-                    && let Some(obs) = &obs_cb
-                {
-                    obs.notify_llm_first_token(crate::core::observability::now_monotonic_ns());
+                if !delta.is_empty() {
+                    // A7: heartbeat reasoner LIVENESS on every token (before any
+                    // aggregation/synthesis), so the watchdog never mistakes a
+                    // long in-progress sentence or slow TTS for a stall.
+                    progress_cb.store(
+                        crate::core::observability::now_monotonic_ns(),
+                        std::sync::atomic::Ordering::Release,
+                    );
+                    if !first_token_seen.swap(true, std::sync::atomic::Ordering::Relaxed)
+                        && let Some(obs) = &obs_cb
+                    {
+                        obs.notify_llm_first_token(crate::core::observability::now_monotonic_ns());
+                    }
                 }
                 streamed_cb.lock().push_str(delta);
                 let _ = tx.send(delta.to_string());
@@ -1223,13 +1269,11 @@ impl ConversationOrchestrator {
             // speaking each completed sentence as soon as it is confirmed.
             let vm_pump = vm.clone();
             let spoke_pump = spoke.clone();
-            let last_audio_pump = last_audio_at.clone();
             let obs_pump = observers.clone();
             let strip_md = self.config.strip_markdown;
             let handle = tokio::spawn(async move {
                 let mut agg = crate::core::text::SentenceAggregator::default();
 
-                #[allow(clippy::too_many_arguments)]
                 async fn speak_sentence(
                     vm: &VoiceManager,
                     text: String,
@@ -1237,7 +1281,6 @@ impl ConversationOrchestrator {
                     epoch: usize,
                     strip_markdown: bool,
                     spoke: &std::sync::atomic::AtomicBool,
-                    last_audio: &std::sync::atomic::AtomicU64,
                     obs: &Option<Arc<crate::core::observability::ObserverRegistry>>,
                 ) -> bool {
                     // C-G4: strip markdown on the COMPLETE sentence (the
@@ -1258,15 +1301,7 @@ impl ConversationOrchestrator {
                         );
                     }
                     match vm.speak_if_epoch(&text, true, allow_interruption, epoch).await {
-                        Ok(true) => {
-                            // A7: heartbeat — record the moment audio reached TTS
-                            // so the stall watchdog measures the gap from HERE.
-                            last_audio.store(
-                                crate::core::observability::now_monotonic_ns(),
-                                std::sync::atomic::Ordering::Release,
-                            );
-                            true
-                        }
+                        Ok(true) => true,
                         Ok(false) => {
                             // A barge-in cleared TTS since this turn started:
                             // the rest of this turn's sentences are stale.
@@ -1295,7 +1330,7 @@ impl ConversationOrchestrator {
                                     if token_for_cb.is_cancelled() {
                                         break 'pump;
                                     }
-                                    if !speak_sentence(&vm_pump, sentence, allow_interruption, epoch, strip_md, &spoke_pump, &last_audio_pump, &obs_pump).await {
+                                    if !speak_sentence(&vm_pump, sentence, allow_interruption, epoch, strip_md, &spoke_pump, &obs_pump).await {
                                         break 'pump;
                                     }
                                 }
@@ -1307,7 +1342,7 @@ impl ConversationOrchestrator {
                                 if !token_for_cb.is_cancelled()
                                     && let Some(tail) = agg.flush()
                                 {
-                                    let _ = speak_sentence(&vm_pump, tail, allow_interruption, epoch, strip_md, &spoke_pump, &last_audio_pump, &obs_pump).await;
+                                    let _ = speak_sentence(&vm_pump, tail, allow_interruption, epoch, strip_md, &spoke_pump, &obs_pump).await;
                                 }
                                 break;
                             }
@@ -1360,7 +1395,7 @@ impl ConversationOrchestrator {
                     biased;
                     r = &mut complete_fut => break r,
                     _ = ticker.tick() => {
-                        let anchor = last_audio_at.load(std::sync::atomic::Ordering::Acquire);
+                        let anchor = last_progress_at.load(std::sync::atomic::Ordering::Acquire);
                         let base = if anchor == 0 { req_start } else { anchor };
                         let gap = crate::core::observability::now_monotonic_ns()
                             .saturating_sub(base);
@@ -1508,7 +1543,11 @@ impl ConversationOrchestrator {
                     Ok(())
                 }
             }
-            Err(LlmError::Cancelled) if budget_exceeded => {
+            // LOW-10 guard: a budget breach cancels ONLY the child reasoner_token
+            // (the parent stays alive), so `!token.is_cancelled()` excludes a real
+            // barge-in (which cancels the parent) from being mis-handled as a
+            // stall — it falls through to the plain Cancelled (barge-in) arm.
+            Err(LlmError::Cancelled) if budget_exceeded && !token.is_cancelled() => {
                 // P1.b/A7: NOT a barge-in — the reasoner blew its max-silence-gap
                 // budget (no first audio, OR audio then a stall) and we cancelled
                 // it via the child token (the turn token is still alive).
@@ -1885,6 +1924,12 @@ impl ConversationOrchestrator {
                         }
                     }
                     self.end_turn(turn_id);
+                    // A5: a confirmed eager reply ALWAYS ran on the FAST tier
+                    // (committed via self.llm) but bypassed select_tier, so keep
+                    // the reasoning-stickiness ledger honest — otherwise a prior
+                    // reasoning turn's `true` would spuriously stick the NEXT
+                    // anaphoric follow-up onto the 2× tier.
+                    *self.last_turn_was_reasoning.lock() = false;
                     debug!(session = %self.session_id, "eager turn confirmed and spoken");
                     return;
                 }
@@ -2124,16 +2169,26 @@ mod tests {
             assert!(!turn_needs_reasoning(t), "{t:?} must NOT false-escalate");
         }
 
-        // A5 — numeric/percentage signal escalates cross-lingually; bare digits
-        // (phone / order / date) must NOT escalate.
+        // A5 — percentage-MATH ("N% of/de") escalates cross-lingually; bare digits
+        // (phone/order/date) and '%'-INTENSIFIER/DISCOUNT idioms must NOT escalate.
         assert!(turn_needs_reasoning("calcule 15% de 2400"), "percentage math escalates");
-        assert!(turn_needs_reasoning("what is 20% of my bill"), "percentage escalates");
-        for t in ["call me at 5551234", "order number 12345", "i'll be there on the 15th"] {
-            assert!(!turn_needs_reasoning(t), "{t:?} bare digits must stay fast");
+        assert!(turn_needs_reasoning("what is 20% of my bill"), "percentage of X escalates");
+        for t in [
+            "call me at 5551234",
+            "order number 12345",
+            "i'll be there on the 15th",
+            "is the 50% off deal still on", // discount idiom, not math
+            "i'm 100% sure that's fine",    // intensifier
+            "my battery is at 80% right now",
+            "yeah 1000% i agree",
+            "we're 100% done here",
+        ] {
+            assert!(!turn_needs_reasoning(t), "{t:?} must stay fast (no calc intent)");
         }
 
-        // A5 — apostrophe-safe tokenizer: contractions stay whole.
-        assert!(turn_needs_reasoning("what's the total of these"), "what's the total escalates");
+        // A5 — apostrophe-safe tokenizer: ASCII and CURLY contractions both match.
+        assert!(turn_needs_reasoning("what's the total of these"), "ascii apostrophe");
+        assert!(turn_needs_reasoning("what\u{2019}s the total of these"), "curly apostrophe");
 
         // A5 — stickiness: a short continuation after a reasoning turn sticks; a
         // closing/standalone follow-up does not; nothing sticks without context.

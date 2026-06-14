@@ -717,6 +717,55 @@ async fn two_tier_sticky_followup_stays_on_reasoning() {
     );
 }
 
+/// A5: stickiness is a true ONE-SHOT — a chain of bare continuations must NOT
+/// latch the session on the reasoning tier indefinitely (the over-escalation
+/// regression the review caught). Turn 1 escalates, turn 2 sticks, turn 3 drops.
+#[tokio::test]
+#[serial_test::serial]
+async fn two_tier_stickiness_is_one_shot() {
+    use waav_gateway::core::conversation::RoutingMode;
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let fast_state = LlmMockState::default();
+    *fast_state.reply.lock() = "Fast reply.".to_string();
+    let fast_url = start_llm_mock(fast_state.clone()).await;
+    let reason_state = LlmMockState::default();
+    *reason_state.reply.lock() = "Reasoned reply.".to_string();
+    let reason_url = start_llm_mock(reason_state.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+    let cfg = ConversationConfig {
+        reasoning_model: Some("reasoning-mock".to_string()),
+        reasoning_base_url: Some(reason_url),
+        reasoning_route: RoutingMode::Auto,
+        latency_filler: LatencyFiller::Off,
+        ..conv_config(fast_url, false)
+    };
+    let orch =
+        Arc::new(ConversationOrchestrator::new("session-oneshot", cfg, vm.clone()).expect("orch"));
+
+    orch.run_turn("calculate my mortgage payment").await.ok(); // intrinsic → reasoning
+    orch.run_turn("and the second one?").await.ok(); // sticks → reasoning
+    orch.run_turn("and the third?").await.ok(); // one-shot expired → FAST
+
+    assert_eq!(
+        reason_state.requests.lock().len(),
+        2,
+        "exactly the intrinsic turn + one sticky follow-up hit the reasoning tier"
+    );
+    assert_eq!(
+        fast_state.requests.lock().len(),
+        1,
+        "the second bare continuation must drop back to the fast tier (no indefinite latch)"
+    );
+}
+
 /// A5: everyday negated/billing speech must NOT false-escalate onto the 2×-cost
 /// reasoning tier — proven end-to-end (the money-leak fix).
 #[tokio::test]
