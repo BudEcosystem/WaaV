@@ -717,6 +717,156 @@ async fn two_tier_sticky_followup_stays_on_reasoning() {
     );
 }
 
+/// LIVE before/after MEASUREMENT (ollama, credential-free) of a reasoning LLM on
+/// the voice path. `#[ignore]` — run explicitly:
+///   cargo test --features <…> --test conversation_loop -- --ignored --nocapture \
+///       live_reasoning_before_after_measurement
+/// Prints a before/after latency report AND validates the spoken UX (no
+/// chain-of-thought leak, masking filler present, routing keeps simple turns fast).
+#[tokio::test]
+#[ignore]
+async fn live_reasoning_before_after_measurement() {
+    use std::time::Instant;
+    if std::net::TcpStream::connect("127.0.0.1:11434").is_err() {
+        eprintln!("[skip] ollama not reachable at 127.0.0.1:11434");
+        return;
+    }
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    let ollama = "http://127.0.0.1:11434/v1".to_string();
+    register_mock_tts();
+
+    // (first-audio seconds, total-turn seconds, full spoken sequence)
+    async fn measure(orch: &Arc<ConversationOrchestrator>, transcript: &str) -> (f64, f64, Vec<String>) {
+        reset_tts_stats();
+        let t0 = Instant::now();
+        let o = orch.clone();
+        let tx = transcript.to_string();
+        let h = tokio::spawn(async move {
+            o.run_turn(&tx).await.ok();
+        });
+        let mut first: Option<f64> = None;
+        loop {
+            if first.is_none() && !TTS_STATS.spoken.lock().is_empty() {
+                first = Some(t0.elapsed().as_secs_f64());
+            }
+            if h.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = h.await;
+        let total = t0.elapsed().as_secs_f64();
+        let spoken = TTS_STATS.spoken.lock().clone();
+        (first.unwrap_or(total), total, spoken)
+    }
+
+    // BEFORE: a reasoning model naively single-tier — no masking, no routing.
+    let vm_b = build_voice_manager();
+    vm_b.start().await.unwrap();
+    let _ = wire_audio_egress(&vm_b).await;
+    let before = Arc::new(
+        ConversationOrchestrator::new(
+            "before",
+            ConversationConfig {
+                base_url: ollama.clone(),
+                model: "deepseek-r1:1.5b".into(),
+                api_key: Some("ollama".into()),
+                system_prompt: Some("Answer the user concisely.".into()),
+                max_tokens: Some(1500), // room to think AND answer
+                streaming: true,
+                latency_filler: LatencyFiller::Off,
+                reasoning_budget_ms: 0,
+                ..Default::default()
+            },
+            vm_b,
+        )
+        .unwrap(),
+    );
+    let (b_simple_first, b_simple_total, b_simple_spoken) =
+        measure(&before, "hi there, are you open today?").await;
+    let (b_complex_first, b_complex_total, b_complex_spoken) =
+        measure(&before, "how much is a 15% tip on a 60 dollar bill?").await;
+
+    // AFTER: fast model + reasoning_model, masking auto, routing auto.
+    let vm_a = build_voice_manager();
+    vm_a.start().await.unwrap();
+    let _ = wire_audio_egress(&vm_a).await;
+    let after = Arc::new(
+        ConversationOrchestrator::new(
+            "after",
+            ConversationConfig {
+                base_url: ollama.clone(),
+                model: "llama3.2:1b".into(),
+                api_key: Some("ollama".into()),
+                system_prompt: Some("Answer the user concisely.".into()),
+                streaming: true,
+                reasoning_model: Some("deepseek-r1:1.5b".into()),
+                reasoning_base_url: Some(ollama.clone()),
+                max_reasoning_tokens: Some(1500),
+                latency_filler: LatencyFiller::Auto,
+                reasoning_budget_ms: 120_000, // generous — measure the real masked answer
+                ..Default::default()
+            },
+            vm_a,
+        )
+        .unwrap(),
+    );
+    let (a_simple_first, a_simple_total, a_simple_spoken) =
+        measure(&after, "hi there, are you open today?").await;
+    let (a_complex_first, a_complex_total, a_complex_spoken) =
+        measure(&after, "how much is a 15% tip on a 60 dollar bill?").await;
+
+    let leaked = |s: &[String]| s.iter().any(|u| u.contains("<think>") || u.contains("</think>"));
+    let answer_correct = a_complex_spoken
+        .iter()
+        .chain(b_complex_spoken.iter())
+        .any(|s| s.contains('9') || s.to_lowercase().contains("nine"));
+
+    eprintln!("\n===== WaaV reasoning-LLM voice — BEFORE / AFTER (live ollama, GB10) =====");
+    eprintln!("fast=llama3.2:1b  reasoning=deepseek-r1:1.5b\n");
+    eprintln!("BEFORE (reasoner naive single-tier; no masking, no routing):");
+    eprintln!("  simple 'hi':   first audio {b_simple_first:6.2}s | total {b_simple_total:6.2}s");
+    eprintln!("                 spoke: {b_simple_spoken:?}");
+    eprintln!("  complex 'tip': first audio {b_complex_first:6.2}s | total {b_complex_total:6.2}s");
+    eprintln!("                 spoke: {b_complex_spoken:?}");
+    eprintln!("\nAFTER (two-tier + masking auto + routing auto):");
+    eprintln!("  simple 'hi':   first audio {a_simple_first:6.2}s | total {a_simple_total:6.2}s  (→ FAST tier)");
+    eprintln!("                 spoke: {a_simple_spoken:?}");
+    eprintln!("  complex 'tip': PERCEIVED first audio {a_complex_first:6.2}s | full answer {a_complex_total:6.2}s  (filler→answer)");
+    eprintln!("                 spoke: {a_complex_spoken:?}");
+    eprintln!("\nUX / perceived-intelligence validation:");
+    eprintln!(
+        "  <think> chain-of-thought leaked to TTS?   BEFORE={} AFTER={}  (must be false)",
+        leaked(&b_complex_spoken),
+        leaked(&a_complex_spoken)
+    );
+    eprintln!(
+        "  AFTER-complex 1st utterance is a masking filler? {}",
+        a_complex_spoken.first().map(|s| is_filler(s)).unwrap_or(false)
+    );
+    eprintln!("  reasoned answer got the math right (mentions 9/nine)? {answer_correct}");
+    eprintln!(
+        "  simple-turn speedup (routing):     {:5.1}x faster ({b_simple_first:.2}s → {a_simple_first:.2}s)",
+        b_simple_first / a_simple_first.max(0.001)
+    );
+    eprintln!(
+        "  complex-turn perceived speedup (masking): {:5.1}x faster ({b_complex_first:.2}s → {a_complex_first:.2}s)",
+        b_complex_first / a_complex_first.max(0.001)
+    );
+    eprintln!("========================================================================\n");
+
+    // Hard invariants.
+    assert!(!leaked(&b_complex_spoken), "BEFORE: chain-of-thought must NEVER be spoken");
+    assert!(!leaked(&a_complex_spoken), "AFTER: chain-of-thought must NEVER be spoken");
+    assert!(!a_complex_spoken.is_empty(), "the complex turn must speak something");
+    assert!(
+        a_simple_first < b_simple_first,
+        "routing must make the simple turn faster ({a_simple_first:.2}s vs {b_simple_first:.2}s)"
+    );
+}
+
 /// A5: stickiness is a true ONE-SHOT — a chain of bare continuations must NOT
 /// latch the session on the reasoning tier indefinitely (the over-escalation
 /// regression the review caught). Turn 1 escalates, turn 2 sticks, turn 3 drops.

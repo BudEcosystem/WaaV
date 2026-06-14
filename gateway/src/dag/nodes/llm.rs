@@ -341,17 +341,20 @@ impl DAGNode for LlmEndpointNode {
             .await
             .map_err(map_llm_error)?;
 
+        // Reasoning-model chain-of-thought (`<think>…</think>`) must not flow
+        // downstream (it would be spoken by a TTS node / re-fed to another LLM).
+        let content = crate::core::text::strip_think(&response.content);
         // A plain text completion (no tool calls) flows downstream as `Text` so it chains directly
         // into a TTS / text-output / another LLM node (e.g. STT → translate(LLM) → TTS). Tool-call
         // responses keep the structured `Json` envelope so a router/transform can act on them.
-        if response.tool_calls.is_empty() && !response.content.is_empty() {
-            return Ok(DAGData::Text(response.content));
+        if response.tool_calls.is_empty() && !content.trim().is_empty() {
+            return Ok(DAGData::Text(content));
         }
 
         let response_json = serde_json::json!({
             "id": response.id,
             "model": response.model,
-            "content": if response.content.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(response.content) },
+            "content": if content.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(content) },
             "role": "assistant",
             "finish_reason": response.finish_reason,
             "tool_calls": if response.tool_calls.is_empty() { serde_json::Value::Null } else { serde_json::json!(response.tool_calls) },
@@ -399,6 +402,8 @@ impl DAGNode for LlmEndpointNode {
             });
 
             let mut agg = SentenceAggregator::default();
+            // Drop reasoning chain-of-thought before it streams downstream.
+            let mut think = crate::core::text::ThinkStripper::default();
             let mut emitted_any = false;
             let completion = self.client.complete(
                 &ctx.stream_id,
@@ -414,7 +419,7 @@ impl DAGNode for LlmEndpointNode {
                 tokio::select! {
                     res = &mut completion => break res,
                     Some(tok) = tok_rx.recv() => {
-                        for sentence in agg.push_str(&tok) {
+                        for sentence in agg.push_str(&think.push(&tok)) {
                             // Barge-in/teardown mid-burst: stop emitting stale
                             // sentences downstream.
                             if ctx.cancel_token.is_cancelled() {
@@ -430,7 +435,7 @@ impl DAGNode for LlmEndpointNode {
             };
             // Catch any tokens that landed between the last poll and completion.
             while let Ok(tok) = tok_rx.try_recv() {
-                for sentence in agg.push_str(&tok) {
+                for sentence in agg.push_str(&think.push(&tok)) {
                     if ctx.cancel_token.is_cancelled() {
                         return Ok(());
                     }
@@ -440,13 +445,27 @@ impl DAGNode for LlmEndpointNode {
                     }
                 }
             }
+            // Flush any non-think tail held by the filter into the aggregator.
+            for sentence in agg.push_str(&think.flush()) {
+                if ctx.cancel_token.is_cancelled() {
+                    return Ok(());
+                }
+                emitted_any = true;
+                if outputs.send(DAGData::Text(sentence)).await.is_err() {
+                    return Ok(());
+                }
+            }
             let mut tail = agg.flush();
             match completion_result {
                 Ok(response) => {
                     // Non-streaming providers deliver content only in the final response, not as
-                    // deltas — fall back to the full content so the chain still produces output.
+                    // deltas — fall back to the full content (chain-of-thought stripped) so the
+                    // chain still produces output.
                     if !emitted_any && tail.is_none() && !response.content.is_empty() {
-                        tail = Some(response.content);
+                        let stripped = crate::core::text::strip_think(&response.content);
+                        if !stripped.trim().is_empty() {
+                            tail = Some(stripped);
+                        }
                     }
                 }
                 Err(e) => return Err(map_llm_error(e)),

@@ -838,10 +838,11 @@ impl ConversationOrchestrator {
             .await;
             match fb_result {
                 Ok(Ok(resp)) if !resp.content.trim().is_empty() => {
+                    let content = crate::core::text::strip_think(&resp.content);
                     let text = if self.config.strip_markdown {
-                        crate::core::text::strip_markdown_for_tts(&resp.content)
+                        crate::core::text::strip_markdown_for_tts(&content)
                     } else {
-                        resp.content.clone()
+                        content
                     };
                     crate::core::metrics::bridge::record_degraded(
                         "conversation",
@@ -1011,10 +1012,11 @@ impl ConversationOrchestrator {
             .await;
         match result {
             Ok(resp) if !resp.content.trim().is_empty() => {
+                let content = crate::core::text::strip_think(&resp.content);
                 let text = if self.config.strip_markdown {
-                    crate::core::text::strip_markdown_for_tts(&resp.content)
+                    crate::core::text::strip_markdown_for_tts(&content)
                 } else {
-                    resp.content
+                    content
                 };
                 crate::core::metrics::bridge::record_async_tool("spoke");
                 let _ = self
@@ -1273,6 +1275,11 @@ impl ConversationOrchestrator {
             let strip_md = self.config.strip_markdown;
             let handle = tokio::spawn(async move {
                 let mut agg = crate::core::text::SentenceAggregator::default();
+                // Reasoning-model chain-of-thought (`<think>…</think>`) must NEVER
+                // reach TTS — the caller would hear the model reasoning aloud.
+                // Filter each delta BEFORE aggregation (handles tags split across
+                // deltas); a non-reasoning model's stream passes through untouched.
+                let mut think = crate::core::text::ThinkStripper::default();
 
                 async fn speak_sentence(
                     vm: &VoiceManager,
@@ -1321,6 +1328,8 @@ impl ConversationOrchestrator {
                         _ = token_for_cb.cancelled() => break,
                         maybe = rx.recv() => match maybe {
                             Some(chunk) => {
+                                // Drop chain-of-thought before it can be spoken.
+                                let chunk = think.push(&chunk);
                                 if chunk.is_empty() { continue; }
                                 for sentence in agg.push_str(&chunk) {
                                     // Re-check cancellation BETWEEN sentences:
@@ -1336,9 +1345,17 @@ impl ConversationOrchestrator {
                                 }
                             }
                             None => {
-                                // Stream ended: speak the held remainder (a
-                                // boundary awaiting lookahead must still fire)
-                                // — unless the turn was cancelled.
+                                // Stream ended: flush any non-think tail held by
+                                // the think filter into the aggregator, then speak
+                                // the held remainder (a boundary awaiting lookahead
+                                // must still fire) — unless the turn was cancelled.
+                                let think_tail = think.flush();
+                                if !think_tail.is_empty() {
+                                    for sentence in agg.push_str(&think_tail) {
+                                        if token_for_cb.is_cancelled() { break; }
+                                        let _ = speak_sentence(&vm_pump, sentence, allow_interruption, epoch, strip_md, &spoke_pump, &obs_pump).await;
+                                    }
+                                }
                                 if !token_for_cb.is_cancelled()
                                     && let Some(tail) = agg.flush()
                                 {
@@ -1483,7 +1500,11 @@ impl ConversationOrchestrator {
         // below or has_active_turn() sticks true and the MinWords gate jams.
         let outcome: Result<(), ConversationOrchestratorError> = match result {
             Ok(response) => {
-                let content_empty = response.content.trim().is_empty();
+                // Strip reasoning chain-of-thought before the content is spoken
+                // OR judged empty: a reply that is ALL `<think>…</think>` and no
+                // answer must count as empty (→ recovery line), not be spoken.
+                let speakable = crate::core::text::strip_think(&response.content);
+                let content_empty = speakable.trim().is_empty();
                 let need_fallback_speak = if streaming {
                     // Reasoning-model guard: some models stream only reasoning
                     // deltas and deliver the answer (or nothing) at the end. If
@@ -1497,9 +1518,9 @@ impl ConversationOrchestrator {
                 };
                 if need_fallback_speak && !content_empty {
                     let speak_text = if self.config.strip_markdown {
-                        crate::core::text::strip_markdown_for_tts(&response.content)
+                        crate::core::text::strip_markdown_for_tts(&speakable)
                     } else {
-                        response.content.clone()
+                        speakable.clone()
                     };
                     match self
                         .voice_manager
@@ -1892,7 +1913,9 @@ impl ConversationOrchestrator {
                     // audio latency and one giant interruption window —
                     // brutal-review finding, wf_0cc69d62).
                     let mut agg = crate::core::text::SentenceAggregator::default();
-                    let mut sentences = agg.push_str(&content);
+                    // Never speak chain-of-thought (eager is fast-tier-only, but
+                    // strip defensively so a thinking model can't leak here).
+                    let mut sentences = agg.push_str(&crate::core::text::strip_think(&content));
                     sentences.extend(agg.flush());
                     for sentence in sentences {
                         let sentence = if self.config.strip_markdown {
