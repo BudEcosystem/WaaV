@@ -130,12 +130,13 @@ pub struct ConversationConfig {
     pub reasoning_provider_kind: Option<crate::core::llm::AdapterKind>,
     /// S2: how to route turns between the fast and reasoning tiers.
     pub reasoning_route: RoutingMode,
-    /// P1 (REALTIME_REASONING.md §8): first-audio budget for the reasoning tier,
-    /// in ms. If the reasoner streams NO audio within this window, the turn is
-    /// treated as over-budget and DEGRADES to the fast tier (the caller never
-    /// sits in silence waiting on a stuck reasoner). A reasoner that has already
-    /// started speaking is left to finish — a committed answer is never truncated.
-    /// `0` disables the budget (the reasoner runs to its own LLM request timeout).
+    /// P1+A7 (REALTIME_REASONING.md §8, FOLLOWUP §2.2): the reasoning tier's
+    /// MAX-SILENCE-GAP budget, in ms — the longest the line may go silent BEFORE
+    /// first audio OR BETWEEN audio chunks. If exceeded, the reasoner is cancelled
+    /// and: with audio already played, the partial is committed (no talk-over
+    /// restart); with none yet, the turn DEGRADES to the fast tier. A reasoner
+    /// streaming steadily resets the gap on each chunk and is never truncated.
+    /// `0` disables the watchdog (the reasoner runs to its own request timeout).
     /// Ignored for single-tier configs. Default [`DEFAULT_REASONING_BUDGET_MS`].
     pub reasoning_budget_ms: u64,
     /// P1: the canned line spoken when EVERY tier fails (or produces no content)
@@ -166,10 +167,15 @@ pub const DEFAULT_MAX_LLM_CALLS_PER_TURN: u32 = 8;
 /// the reasoning tier is decoupled from the fast tier's 256 voice cap.
 pub const REASONING_DEFAULT_MAX_TOKENS: u32 = 4096;
 
-/// P1: default reasoning-tier first-audio budget (ms). Generous enough not to
-/// truncate legitimate deep reasoning, tight enough that a *stuck* reasoner
-/// yields to a fast draft rather than leaving a live call silent.
+/// P1+A7: default reasoning-tier max-silence-gap budget (ms) — the longest the
+/// line may go silent BEFORE first audio OR between audio chunks. Generous
+/// enough not to truncate legitimate deep reasoning, tight enough that a *stuck*
+/// or *stalled* reasoner yields rather than leaving a live call silent.
 pub const DEFAULT_REASONING_BUDGET_MS: u64 = 15_000;
+
+/// A7: how often the stall watchdog samples the silence gap (ms). Internal — not
+/// operator-tunable; bounds breach-detection latency without busy-looping.
+const STALL_POLL_MS: u64 = 250;
 
 /// P1: default spoken apology when all LLM tiers fail — never dead air.
 pub const DEFAULT_DEGRADATION_MESSAGE: &str =
@@ -1089,6 +1095,11 @@ impl ConversationOrchestrator {
         // True once the pump actually delivered any text to TTS (guards the
         // reasoning-model empty-stream failure mode).
         let spoke = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A7: monotonic ns of the LAST audio that reached TTS (0 = none yet). The
+        // stall watchdog measures the silence gap from here (or from the request
+        // start when nothing has been spoken), so a reasoner that streams one
+        // token then freezes is degraded — not just one that never starts.
+        let last_audio_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         // D3 (REALTIME_REASONING.md §4.3): latency masking. Arm a SINGLE timer on
         // this CONFIRMED-EoT path (never on the speculative/eager path). If no
@@ -1174,11 +1185,13 @@ impl ConversationOrchestrator {
             // speaking each completed sentence as soon as it is confirmed.
             let vm_pump = vm.clone();
             let spoke_pump = spoke.clone();
+            let last_audio_pump = last_audio_at.clone();
             let obs_pump = observers.clone();
             let strip_md = self.config.strip_markdown;
             let handle = tokio::spawn(async move {
                 let mut agg = crate::core::text::SentenceAggregator::default();
 
+                #[allow(clippy::too_many_arguments)]
                 async fn speak_sentence(
                     vm: &VoiceManager,
                     text: String,
@@ -1186,6 +1199,7 @@ impl ConversationOrchestrator {
                     epoch: usize,
                     strip_markdown: bool,
                     spoke: &std::sync::atomic::AtomicBool,
+                    last_audio: &std::sync::atomic::AtomicU64,
                     obs: &Option<Arc<crate::core::observability::ObserverRegistry>>,
                 ) -> bool {
                     // C-G4: strip markdown on the COMPLETE sentence (the
@@ -1206,7 +1220,15 @@ impl ConversationOrchestrator {
                         );
                     }
                     match vm.speak_if_epoch(&text, true, allow_interruption, epoch).await {
-                        Ok(true) => true,
+                        Ok(true) => {
+                            // A7: heartbeat — record the moment audio reached TTS
+                            // so the stall watchdog measures the gap from HERE.
+                            last_audio.store(
+                                crate::core::observability::now_monotonic_ns(),
+                                std::sync::atomic::Ordering::Release,
+                            );
+                            true
+                        }
                         Ok(false) => {
                             // A barge-in cleared TTS since this turn started:
                             // the rest of this turn's sentences are stale.
@@ -1235,7 +1257,7 @@ impl ConversationOrchestrator {
                                     if token_for_cb.is_cancelled() {
                                         break 'pump;
                                     }
-                                    if !speak_sentence(&vm_pump, sentence, allow_interruption, epoch, strip_md, &spoke_pump, &obs_pump).await {
+                                    if !speak_sentence(&vm_pump, sentence, allow_interruption, epoch, strip_md, &spoke_pump, &last_audio_pump, &obs_pump).await {
                                         break 'pump;
                                     }
                                 }
@@ -1247,7 +1269,7 @@ impl ConversationOrchestrator {
                                 if !token_for_cb.is_cancelled()
                                     && let Some(tail) = agg.flush()
                                 {
-                                    let _ = speak_sentence(&vm_pump, tail, allow_interruption, epoch, strip_md, &spoke_pump, &obs_pump).await;
+                                    let _ = speak_sentence(&vm_pump, tail, allow_interruption, epoch, strip_md, &spoke_pump, &last_audio_pump, &obs_pump).await;
                                 }
                                 break;
                             }
@@ -1260,14 +1282,17 @@ impl ConversationOrchestrator {
             (None, None)
         };
 
-        // P1.b: time-box the reasoning tier's FIRST AUDIO. The common (fast or
-        // single-tier) path is the bare await — zero added machinery. Only an
-        // escalated reasoning turn with a positive budget gets the deadline race:
-        // if the reasoner streams NO audio within the budget, cancel it (via a
-        // CHILD token so the turn token stays alive for the fallback) and mark
-        // the breach so the outcome match degrades to the fast draft. A reasoner
-        // that has ALREADY started speaking is never truncated — the deadline
-        // simply disarms.
+        // P1.b + A7: the reasoning tier's MAX-SILENCE-GAP watchdog. The common
+        // (fast or single-tier) path is the bare await — zero added machinery.
+        // An escalated reasoning turn with a positive budget gets an interval
+        // watchdog that measures the gap since the LAST audio reached TTS (or the
+        // request start when nothing has yet). If that gap exceeds the budget the
+        // reasoner is cancelled (via a CHILD token so the turn token stays alive)
+        // and the breach is marked. This subsumes BOTH "no first audio in N ms"
+        // (TTFA) AND "audio started then froze N ms" (mid-stream stall) — a
+        // reasoner that emits one token then hangs no longer leaves dead air. A
+        // reasoner streaming steadily resets the gap on every sentence and never
+        // trips.
         let budget_ms = if is_reasoning {
             self.config.reasoning_budget_ms
         } else {
@@ -1276,6 +1301,8 @@ impl ConversationOrchestrator {
         let mut budget_exceeded = false;
         let result = if budget_ms > 0 && self.reasoning_llm.is_some() {
             let reasoner_token = token.child_token();
+            let req_start = crate::core::observability::now_monotonic_ns();
+            let budget_ns = budget_ms.saturating_mul(1_000_000);
             let complete_fut = llm.complete(
                 &self.session_id,
                 transcript,
@@ -1284,23 +1311,26 @@ impl ConversationOrchestrator {
                 on_token,
             );
             tokio::pin!(complete_fut);
-            let deadline = tokio::time::sleep(Duration::from_millis(budget_ms));
-            tokio::pin!(deadline);
-            let mut armed = true;
+            // Poll at most every STALL_POLL_MS so breach detection is prompt
+            // without busy-looping; cap at the budget for tiny budgets.
+            let poll = budget_ms.clamp(1, STALL_POLL_MS);
+            let mut ticker = tokio::time::interval(Duration::from_millis(poll));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await; // consume the immediate first tick
             loop {
                 tokio::select! {
                     biased;
                     r = &mut complete_fut => break r,
-                    _ = &mut deadline, if armed => {
-                        armed = false; // disarm: this branch is never polled again
-                        if !spoke.load(std::sync::atomic::Ordering::Acquire)
-                            && !token.is_cancelled()
-                        {
+                    _ = ticker.tick() => {
+                        let anchor = last_audio_at.load(std::sync::atomic::Ordering::Acquire);
+                        let base = if anchor == 0 { req_start } else { anchor };
+                        let gap = crate::core::observability::now_monotonic_ns()
+                            .saturating_sub(base);
+                        if gap >= budget_ns && !token.is_cancelled() {
                             budget_exceeded = true;
-                            reasoner_token.cancel(); // stop the stuck reasoner
+                            reasoner_token.cancel(); // stop the stuck/stalled reasoner
+                            // complete_fut now resolves to Cancelled on the next poll.
                         }
-                        // If audio is already flowing, do nothing — let the
-                        // committed answer run to completion.
                     }
                 }
             }
@@ -1441,21 +1471,43 @@ impl ConversationOrchestrator {
                 }
             }
             Err(LlmError::Cancelled) if budget_exceeded => {
-                // P1.b: NOT a barge-in — the reasoner blew its first-audio budget
-                // and we cancelled it. The turn token is still alive (only the
-                // child was cancelled), so degrade to the fast draft / canned
-                // apology rather than leaving the caller on a stuck reasoner. A
-                // deliberate budget cancel is never an error to surface, so this
-                // path always completes Ok (the apology covers the worst case).
-                self.speak_degraded(
-                    is_reasoning,
-                    epoch,
-                    allow_interruption,
-                    &token,
-                    spoke.load(std::sync::atomic::Ordering::Acquire),
-                )
-                .await;
-                Ok(())
+                // P1.b/A7: NOT a barge-in — the reasoner blew its max-silence-gap
+                // budget (no first audio, OR audio then a stall) and we cancelled
+                // it via the child token (the turn token is still alive).
+                let partial = streamed_text.lock().clone();
+                let has_partial = !partial.trim().is_empty();
+                if spoke.load(std::sync::atomic::Ordering::Acquire) && has_partial {
+                    // A7: STALL after a coherent partial — do NOT restart (a fast
+                    // draft would talk over / contradict it). Commit the partial
+                    // so the model knows it was cut, and end the turn cleanly.
+                    // (Guard on `has_partial`: a cleared accumulator must never
+                    // commit an empty string while `spoke` suppresses degrade.)
+                    self.llm
+                        .commit_partial_assistant(&self.session_id, &partial)
+                        .await;
+                    crate::core::metrics::bridge::record_degraded(
+                        "conversation",
+                        "reasoning_stall_after_partial",
+                    );
+                    debug!(
+                        session = %self.session_id,
+                        "A7: reasoner stalled after partial audio — committed partial, no restart"
+                    );
+                    Ok(())
+                } else {
+                    // No audio yet (TTFA breach): degrade to the fast draft /
+                    // canned apology rather than leaving the caller on a stuck
+                    // reasoner. A deliberate budget cancel is never surfaced.
+                    self.speak_degraded(
+                        is_reasoning,
+                        epoch,
+                        allow_interruption,
+                        &token,
+                        spoke.load(std::sync::atomic::Ordering::Acquire),
+                    )
+                    .await;
+                    Ok(())
+                }
             }
             Err(LlmError::Cancelled) => {
                 // B-G5: the streamed portion lands in history so the model

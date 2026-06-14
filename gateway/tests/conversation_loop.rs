@@ -1405,6 +1405,173 @@ async fn start_slow_sse_llm_mock() -> String {
     format!("http://127.0.0.1:{}", addr.port())
 }
 
+/// A7 SSE mock: streams ONE complete sentence (spoken immediately — the trailing
+/// "Now" confirms the boundary), then STALLS far past the budget, then more.
+async fn start_sentence_then_stall_sse_mock() -> String {
+    use axum::response::sse::{Event, Sse};
+    use futures::stream;
+    async fn sse_chat(
+    ) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+        let early = json!({"id":"1","object":"chat.completion.chunk","created":1,"model":"m",
+            "choices":[{"index":0,"delta":{"content":"The answer is forty two. Now"},"finish_reason":null}]});
+        let late = json!({"id":"1","object":"chat.completion.chunk","created":1,"model":"m",
+            "choices":[{"index":0,"delta":{"content":" let me continue reasoning."},"finish_reason":"stop"}]});
+        let events = stream::unfold(0u8, move |step| {
+            let (early, late) = (early.clone(), late.clone());
+            async move {
+                match step {
+                    0 => Some((Ok(Event::default().data(early.to_string())), 1)),
+                    1 => {
+                        tokio::time::sleep(Duration::from_millis(3_000)).await; // ≫ budget
+                        Some((Ok(Event::default().data(late.to_string())), 2))
+                    }
+                    2 => Some((Ok(Event::default().data("[DONE]")), 3)),
+                    _ => None,
+                }
+            }
+        });
+        Sse::new(events)
+    }
+    let app = Router::new().route("/chat/completions", post(sse_chat));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://127.0.0.1:{}", addr.port())
+}
+
+/// A7 SSE mock: streams 5 sentences ~80ms apart — a HEALTHY reasoner that must
+/// NOT trip a 300ms stall watchdog (each chunk resets the silence gap).
+async fn start_steady_stream_sse_mock() -> String {
+    use axum::response::sse::{Event, Sse};
+    use futures::stream;
+    async fn sse_chat(
+    ) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+        let events = stream::unfold(0u8, move |step| async move {
+            if step < 5 {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                let fin = if step == 4 { "stop" } else { "null" };
+                let chunk = json!({"id":"1","object":"chat.completion.chunk","created":1,"model":"m",
+                    "choices":[{"index":0,
+                        "delta":{"content":format!("Sentence number {step} here. ")},
+                        "finish_reason": if fin=="stop" {serde_json::Value::String("stop".into())} else {serde_json::Value::Null}}]});
+                Some((Ok(Event::default().data(chunk.to_string())), step + 1))
+            } else if step == 5 {
+                Some((Ok(Event::default().data("[DONE]")), 6))
+            } else {
+                None
+            }
+        });
+        Sse::new(events)
+    }
+    let app = Router::new().route("/chat/completions", post(sse_chat));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://127.0.0.1:{}", addr.port())
+}
+
+/// A7: a reasoner that streams a coherent partial sentence then STALLS past the
+/// budget must commit the partial and NOT restart on the fast tier (no
+/// talk-over) — the dead-air-mid-sentence case D3 masking can't cover.
+#[tokio::test]
+#[serial_test::serial]
+async fn a7_reasoner_stall_after_partial_commits_not_restart() {
+    use waav_gateway::core::conversation::RoutingMode;
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let fast = LlmMockState::default();
+    *fast.reply.lock() = "Fast draft answer.".to_string();
+    let fast_url = start_llm_mock(fast.clone()).await;
+    let reason_url = start_sentence_then_stall_sse_mock().await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+    let cfg = ConversationConfig {
+        reasoning_model: Some("reasoning-mock".to_string()),
+        reasoning_base_url: Some(reason_url),
+        reasoning_route: RoutingMode::Always,
+        reasoning_budget_ms: 300, // tiny silence-gap bound
+        latency_filler: LatencyFiller::Off,
+        ..conv_config(fast_url, true) // STREAMING reasoning tier
+    };
+    let orch = Arc::new(ConversationOrchestrator::new("a7-stall", cfg, vm.clone()).expect("orch"));
+
+    let t0 = std::time::Instant::now();
+    orch.run_turn("reason about this please").await.ok();
+    let elapsed = t0.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(2_500),
+        "the watchdog must fire well before the 3s stall ends, took {elapsed:?}"
+    );
+    let spoken = TTS_STATS.spoken.lock().clone();
+    assert!(
+        spoken.iter().any(|s| s.contains("forty two")),
+        "the coherent partial must have been spoken: {spoken:?}"
+    );
+    assert!(
+        !spoken.iter().any(|s| s.contains("Fast draft answer")),
+        "a stall AFTER partial audio must NOT restart on the fast tier: {spoken:?}"
+    );
+    assert!(
+        !spoken.iter().any(|s| s.contains("continue reasoning")),
+        "the post-stall remainder must never be spoken: {spoken:?}"
+    );
+}
+
+/// A7: a healthy reasoner streaming steadily (gaps under the budget) must NOT
+/// trip the stall watchdog — it speaks its whole answer, never degrades.
+#[tokio::test]
+#[serial_test::serial]
+async fn a7_healthy_stream_does_not_trip_watchdog() {
+    use waav_gateway::core::conversation::RoutingMode;
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let fast = LlmMockState::default();
+    *fast.reply.lock() = "Fast draft answer.".to_string();
+    let fast_url = start_llm_mock(fast.clone()).await;
+    let reason_url = start_steady_stream_sse_mock().await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+    let cfg = ConversationConfig {
+        reasoning_model: Some("reasoning-mock".to_string()),
+        reasoning_base_url: Some(reason_url),
+        reasoning_route: RoutingMode::Always,
+        reasoning_budget_ms: 300, // each ~80ms chunk resets the gap
+        latency_filler: LatencyFiller::Off,
+        ..conv_config(fast_url, true)
+    };
+    let orch =
+        Arc::new(ConversationOrchestrator::new("a7-healthy", cfg, vm.clone()).expect("orch"));
+
+    orch.run_turn("reason about this please").await.ok();
+
+    let spoken = TTS_STATS.spoken.lock().clone();
+    assert!(
+        spoken.iter().any(|s| s.contains("Sentence number 4")),
+        "a steadily-streaming reasoner must speak its whole answer: {spoken:?}"
+    );
+    assert!(
+        !spoken.iter().any(|s| s.contains("Fast draft answer")),
+        "a healthy stream must NOT degrade to the fast tier: {spoken:?}"
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn barge_in_commits_partial_assistant_text() {

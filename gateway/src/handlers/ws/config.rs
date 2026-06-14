@@ -190,10 +190,11 @@ pub struct ConversationWebSocketConfig {
     #[serde(default)]
     #[cfg_attr(feature = "openapi", schema(example = "auto"))]
     pub reasoning_route: crate::core::conversation::RoutingMode,
-    /// P1: reasoning-tier first-audio budget (ms). If the reasoner streams no
-    /// audio within this window, the turn degrades to the fast tier rather than
-    /// leaving the caller in silence. Omit for the safe default (15000); `0`
-    /// disables the budget. Ignored without a `reasoning_model`.
+    /// P1+A7: reasoning-tier max-silence-gap budget (ms) — the longest the line
+    /// may go silent before first audio OR between audio chunks. If exceeded, a
+    /// reasoner with partial audio commits it (no restart) and one with none
+    /// degrades to the fast tier — the caller is never left in silence. Omit for
+    /// the safe default (15000); `0` disables. Ignored without a `reasoning_model`.
     #[serde(default)]
     #[cfg_attr(feature = "openapi", schema(example = 15000))]
     pub reasoning_budget_ms: Option<u64>,
