@@ -205,46 +205,82 @@ impl OpenAIRealtime {
 
     /// Build the initial session configuration.
     fn build_session_config(&self) -> SessionConfig {
-        let reasoning = self
-            .config
-            .reasoning_effort
-            .and_then(super::messages::RealtimeReasoning::from_effort);
+        use super::messages::{AudioConfig, AudioFormat, AudioInput, AudioOutput};
+
+        // GA audio format object (Beta sent a bare `"pcm16"` string).
+        let ga_format = || match self.audio_format {
+            OpenAIRealtimeAudioFormat::Pcm16 => AudioFormat {
+                format_type: "audio/pcm".to_string(),
+                rate: Some(24000),
+            },
+            OpenAIRealtimeAudioFormat::G711Ulaw => AudioFormat {
+                format_type: "audio/pcmu".to_string(),
+                rate: None,
+            },
+            OpenAIRealtimeAudioFormat::G711Alaw => AudioFormat {
+                format_type: "audio/pcma".to_string(),
+                rate: None,
+            },
+        };
+
+        let turn_detection = self.config.turn_detection.as_ref().map(|td| match td {
+            crate::core::realtime::base::TurnDetectionConfig::ServerVad {
+                threshold,
+                prefix_padding_ms,
+                silence_duration_ms,
+                create_response,
+                interrupt_response,
+            } => TurnDetection::ServerVad {
+                threshold: *threshold,
+                prefix_padding_ms: *prefix_padding_ms,
+                silence_duration_ms: *silence_duration_ms,
+                create_response: *create_response,
+                interrupt_response: *interrupt_response,
+            },
+            crate::core::realtime::base::TurnDetectionConfig::SemanticVad {
+                eagerness,
+                create_response,
+                interrupt_response,
+            } => TurnDetection::SemanticVad {
+                eagerness: eagerness.clone(),
+                create_response: *create_response,
+                interrupt_response: *interrupt_response,
+            },
+            crate::core::realtime::base::TurnDetectionConfig::None => TurnDetection::None {},
+        });
+
+        // GA nests the Beta-era flat audio fields under audio.input / audio.output.
+        let audio = AudioConfig {
+            input: Some(AudioInput {
+                format: Some(ga_format()),
+                transcription: self.config.input_audio_transcription.as_ref().map(|t| {
+                    InputAudioTranscription {
+                        model: t.model.clone(),
+                    }
+                }),
+                noise_reduction: super::messages::NoiseReduction::from_opt(
+                    self.config.input_audio_noise_reduction.as_deref(),
+                ),
+                turn_detection,
+            }),
+            output: Some(AudioOutput {
+                format: Some(ga_format()),
+                voice: Some(self.voice.as_str().to_string()),
+                speed: None,
+            }),
+        };
+
+        // NOTE: GA `gpt-realtime` exposes no session-level `temperature` or
+        // `reasoning` (confirmed against the live `session.created` schema), so
+        // `self.config.{temperature,reasoning_effort}` are intentionally NOT
+        // mapped here — sending either 400s the session. The cascade dial still
+        // applies to the LLM path; S2S reasoning awaits a reasoning-capable
+        // realtime model exposing the field.
         SessionConfig {
-            modalities: Some(vec!["text".to_string(), "audio".to_string()]),
-            voice: Some(self.voice.as_str().to_string()),
+            session_type: "realtime".to_string(),
+            output_modalities: Some(vec!["audio".to_string()]),
             instructions: self.config.instructions.clone(),
-            input_audio_format: Some(self.audio_format.as_str().to_string()),
-            output_audio_format: Some(self.audio_format.as_str().to_string()),
-            input_audio_transcription: self.config.input_audio_transcription.as_ref().map(|t| {
-                InputAudioTranscription {
-                    model: t.model.clone(),
-                }
-            }),
-            turn_detection: self.config.turn_detection.as_ref().map(|td| match td {
-                crate::core::realtime::base::TurnDetectionConfig::ServerVad {
-                    threshold,
-                    prefix_padding_ms,
-                    silence_duration_ms,
-                    create_response,
-                    interrupt_response,
-                } => TurnDetection::ServerVad {
-                    threshold: *threshold,
-                    prefix_padding_ms: *prefix_padding_ms,
-                    silence_duration_ms: *silence_duration_ms,
-                    create_response: *create_response,
-                    interrupt_response: *interrupt_response,
-                },
-                crate::core::realtime::base::TurnDetectionConfig::SemanticVad {
-                    eagerness,
-                    create_response,
-                    interrupt_response,
-                } => TurnDetection::SemanticVad {
-                    eagerness: eagerness.clone(),
-                    create_response: *create_response,
-                    interrupt_response: *interrupt_response,
-                },
-                crate::core::realtime::base::TurnDetectionConfig::None => TurnDetection::None {},
-            }),
+            audio: Some(audio),
             tools: self.config.tools.as_ref().map(|tools| {
                 tools
                     .iter()
@@ -257,28 +293,13 @@ impl OpenAIRealtime {
                     .collect()
             }),
             tool_choice: self.config.tool_choice.clone(),
-            // S2S: the cascade reasoning dial mapped onto the realtime session
-            // (Off ⇒ nothing — fail-safe for non-reasoning realtime models).
-            reasoning: reasoning.clone(),
-            // A reasoning realtime session REJECTS an explicit temperature (must be
-            // unset/default with reasoning enabled) — suppress it to avoid a 400 on
-            // session.update, mirroring the cascade Anthropic thinking rule.
-            temperature: if reasoning.is_some() {
-                None
-            } else {
-                self.config.temperature
-            },
-            max_response_output_tokens: self.config.max_response_output_tokens.map(|t| {
+            max_output_tokens: self.config.max_response_output_tokens.map(|t| {
                 if t < 0 {
                     super::messages::MaxTokens::Infinite("inf".to_string())
                 } else {
                     super::messages::MaxTokens::Number(t)
                 }
             }),
-            // Input-audio noise reduction (near_field / far_field), if configured.
-            input_audio_noise_reduction: super::messages::NoiseReduction::from_opt(
-                self.config.input_audio_noise_reduction.as_deref(),
-            ),
         }
     }
 
@@ -667,7 +688,10 @@ impl BaseRealtime for OpenAIRealtime {
         let request = http::Request::builder()
             .uri(&url)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("OpenAI-Beta", "realtime=v1")
+            // GA Realtime API (gpt-realtime): the `OpenAI-Beta: realtime=v1` header
+            // is RETIRED. Sending it now makes OpenAI reject the session with
+            // "The Realtime Beta API is no longer supported. Please use
+            // /v1/realtime for the GA API." (live-caught). GA auth = bearer alone.
             .header("Sec-WebSocket-Protocol", "realtime")
             .header(
                 "Sec-WebSocket-Key",
@@ -895,7 +919,7 @@ impl BaseRealtime for OpenAIRealtime {
                 let request = match http::Request::builder()
                     .uri(&ws_url)
                     .header("Authorization", format!("Bearer {}", api_key))
-                    .header("OpenAI-Beta", "realtime=v1")
+                    // GA Realtime: no `OpenAI-Beta` header (retired). See connect().
                     .header("Sec-WebSocket-Protocol", "realtime")
                     .header(
                         "Sec-WebSocket-Key",
@@ -1519,37 +1543,40 @@ mod tests {
     }
 
     #[test]
-    fn s2s_reasoning_suppresses_temperature() {
+    fn ga_build_session_config_shape_omits_temperature_and_reasoning() {
         use crate::core::llm::ReasoningEffort;
-        // A reasoning realtime session REJECTS temperature → it must be dropped.
+        // GA `gpt-realtime` has no session-level temperature/reasoning. Even with
+        // both set on the config, build_session_config must emit the GA NESTED
+        // shape and leak NEITHER field (either 400s session.update).
         let c = OpenAIRealtime::new(RealtimeConfig {
             provider: "openai".into(),
             api_key: "k".into(),
-            model: "gpt-realtime-2".into(),
+            model: "gpt-realtime".into(),
             temperature: Some(0.7),
             reasoning_effort: Some(ReasoningEffort::Low),
             ..Default::default()
         })
         .unwrap();
         let sc = c.build_session_config();
-        assert!(sc.reasoning.is_some(), "reasoning effort mapped onto the session");
-        assert!(
-            sc.temperature.is_none(),
-            "temperature must be suppressed when reasoning is enabled (else session.update 400)"
+        assert_eq!(sc.session_type, "realtime", "GA requires session.type");
+        assert_eq!(
+            sc.output_modalities,
+            Some(vec!["audio".to_string()]),
+            "GA renamed modalities ⇒ output_modalities"
         );
-
-        // No reasoning → temperature flows through unchanged.
-        let c2 = OpenAIRealtime::new(RealtimeConfig {
-            provider: "openai".into(),
-            api_key: "k".into(),
-            model: "gpt-4o-realtime-preview".into(),
-            temperature: Some(0.7),
-            ..Default::default()
-        })
-        .unwrap();
-        let sc2 = c2.build_session_config();
-        assert!(sc2.reasoning.is_none());
-        assert!(sc2.temperature.is_some(), "no reasoning ⇒ temperature kept");
+        let audio = sc.audio.as_ref().expect("GA nests audio.input/output");
+        assert!(
+            audio.output.as_ref().unwrap().voice.is_some(),
+            "voice nests under audio.output"
+        );
+        assert_eq!(
+            audio.input.as_ref().unwrap().format.as_ref().unwrap().format_type,
+            "audio/pcm",
+            "PCM16 ⇒ {{type: audio/pcm, rate: 24000}}"
+        );
+        let json = serde_json::to_value(&sc).unwrap();
+        assert!(json.get("temperature").is_none(), "GA: no session temperature");
+        assert!(json.get("reasoning").is_none(), "GA: no session reasoning");
     }
 
     #[test]

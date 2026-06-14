@@ -88,12 +88,30 @@ pub struct LlmEndpointConfig {
     /// Tool choice strategy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
+    /// OpenAI `parallel_tool_calls`: `false` forces sequential single-tool turns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     /// Response format.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<ResponseFormat>,
     /// Stop sequences.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
+    /// Deterministic sampling seed (model-agnostic).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+    /// Presence penalty (sampling-family — suppressed for reasoning models).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    /// Frequency penalty (sampling-family — suppressed for reasoning models).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    /// `logprobs` request (sampling-family — suppressed for reasoning models).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<serde_json::Value>,
+    /// Stable end-user identifier for OpenAI abuse monitoring.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
     /// Request timeout in milliseconds.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
@@ -136,8 +154,14 @@ impl Default for LlmEndpointConfig {
             streaming: false,
             tools: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             response_format: None,
             stop: None,
+            seed: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            user: None,
             timeout_ms: default_timeout_ms(),
             max_history: default_max_history(),
             headers: HashMap::new(),
@@ -164,8 +188,14 @@ impl From<LlmEndpointConfig> for LlmClientConfig {
             streaming: c.streaming,
             tools: c.tools,
             tool_choice: c.tool_choice,
+            parallel_tool_calls: c.parallel_tool_calls,
             response_format: c.response_format,
             stop: c.stop,
+            seed: c.seed,
+            presence_penalty: c.presence_penalty,
+            frequency_penalty: c.frequency_penalty,
+            logprobs: c.logprobs,
+            user: c.user,
             timeout_ms: c.timeout_ms,
             max_history: c.max_history,
             headers: c.headers,
