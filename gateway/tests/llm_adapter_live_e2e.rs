@@ -30,6 +30,74 @@ fn ollama_base() -> Option<String> {
     }
 }
 
+/// Key-gated (env ONLY, never written to a file): the OpenAI API key, or `None`
+/// (test self-skips).
+fn openai_key() -> Option<String> {
+    match std::env::var("OPENAI_API_KEY") {
+        Ok(k) if !k.trim().is_empty() => Some(k),
+        _ => {
+            eprintln!("[skip] OPENAI_API_KEY not set — OpenAI live test skipped");
+            None
+        }
+    }
+}
+
+/// LIVE (OpenAI, key-gated): a REASONING model (gpt-5-mini) must round-trip
+/// through WaaV's OpenAI adapter — this is the regression for the
+/// `max_tokens`→`max_completion_tokens` shape (reasoning models 400 on
+/// `max_tokens`; live-caught). Validates the fast tier + the two-tier shape too.
+#[tokio::test]
+async fn openai_reasoning_model_live_round_trip() {
+    let Some(key) = openai_key() else { return };
+    let cancel = CancellationToken::new();
+
+    // Fast (chat) model — classic max_tokens shape.
+    let fast = LlmClient::new(LlmClientConfig {
+        base_url: "https://api.openai.com/v1".into(),
+        model: "gpt-4o-mini".into(),
+        api_key: Some(key.clone()),
+        max_tokens: Some(20),
+        streaming: false,
+        ..Default::default()
+    });
+    let r = fast
+        .complete("oai-fast", "Reply with exactly: OK", None, &cancel, None)
+        .await
+        .expect("gpt-4o-mini must round-trip");
+    assert!(!r.content.trim().is_empty(), "fast model empty");
+
+    // REASONING model — REQUIRES max_completion_tokens (max_tokens would 400).
+    // reasoning_effort=low + a real max_tokens (the shape that broke live).
+    for streaming in [false, true] {
+        let reasoning = LlmClient::new(LlmClientConfig {
+            base_url: "https://api.openai.com/v1".into(),
+            model: "gpt-5-mini".into(),
+            api_key: Some(key.clone()),
+            reasoning_effort: Some(ReasoningEffort::Low),
+            max_tokens: Some(2000),
+            temperature: Some(0.7), // must be SUPPRESSED for reasoning models
+            streaming,
+            ..Default::default()
+        });
+        let r = reasoning
+            .complete(
+                &format!("oai-reason-{streaming}"),
+                "What is 2+2? Reply with just the number.",
+                None,
+                &cancel,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("gpt-5-mini (streaming={streaming}) must NOT 400: {e}"));
+        assert!(
+            r.content.contains('4'),
+            "reasoning model answer (streaming={streaming}): {:?}",
+            r.content
+        );
+        eprintln!("[live openai] gpt-5-mini streaming={streaming} → {:?}", r.content.trim());
+    }
+}
+
 fn key(var: &str) -> Option<String> {
     match std::env::var(var) {
         Ok(v) if !v.trim().is_empty() => Some(v),

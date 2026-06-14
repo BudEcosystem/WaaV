@@ -236,6 +236,11 @@ pub struct RealtimeConfig {
     #[serde(default)]
     pub reasoning_effort: Option<crate::core::llm::ReasoningEffort>,
 
+    /// Input-audio noise reduction: `"near_field"` (headsets / close mics) or
+    /// `"far_field"` (laptop / room mics). `None`/`"off"` = off.
+    #[serde(default)]
+    pub input_audio_noise_reduction: Option<String>,
+
     /// Reconnection configuration for automatic reconnection on connection loss.
     #[serde(default)]
     pub reconnection: Option<ReconnectionConfig>,

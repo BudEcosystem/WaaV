@@ -167,10 +167,12 @@ mod tests {
     #[test]
     fn test_all_voices() {
         let voices = OpenAIVoice::all();
-        assert_eq!(voices.len(), 11);
+        assert_eq!(voices.len(), 13);
         assert!(voices.contains(&OpenAIVoice::Alloy));
         assert!(voices.contains(&OpenAIVoice::Nova));
         assert!(voices.contains(&OpenAIVoice::Verse));
+        assert!(voices.contains(&OpenAIVoice::Marin));
+        assert!(voices.contains(&OpenAIVoice::Cedar));
     }
 
     #[test]

@@ -65,9 +65,10 @@ impl std::fmt::Display for OpenAITTSModel {
 
 /// Available voices for OpenAI TTS.
 ///
-/// OpenAI provides 11 distinct voices with different characteristics:
+/// OpenAI provides 13 distinct voices with different characteristics:
 /// - Alloy, Echo, Fable, Onyx, Nova, Shimmer: Original voices
 /// - Ash, Ballad, Coral, Sage, Verse: Additional voices
+/// - Marin, Cedar: newest voices, recommended by OpenAI for gpt-4o-mini-tts
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OpenAIVoice {
@@ -94,6 +95,10 @@ pub enum OpenAIVoice {
     Shimmer,
     /// Verse voice
     Verse,
+    /// Marin voice (newest; recommended for gpt-4o-mini-tts)
+    Marin,
+    /// Cedar voice (newest; recommended for gpt-4o-mini-tts)
+    Cedar,
 }
 
 impl OpenAIVoice {
@@ -112,6 +117,8 @@ impl OpenAIVoice {
             Self::Sage => "sage",
             Self::Shimmer => "shimmer",
             Self::Verse => "verse",
+            Self::Marin => "marin",
+            Self::Cedar => "cedar",
         }
     }
 
@@ -129,6 +136,8 @@ impl OpenAIVoice {
             "sage" => Self::Sage,
             "shimmer" => Self::Shimmer,
             "verse" => Self::Verse,
+            "marin" => Self::Marin,
+            "cedar" => Self::Cedar,
             _ => Self::default(),
         }
     }
@@ -147,6 +156,8 @@ impl OpenAIVoice {
             Self::Sage,
             Self::Shimmer,
             Self::Verse,
+            Self::Marin,
+            Self::Cedar,
         ]
     }
 }
@@ -289,9 +300,12 @@ mod tests {
     #[test]
     fn test_voice_all() {
         let voices = OpenAIVoice::all();
-        assert_eq!(voices.len(), 11);
+        assert_eq!(voices.len(), 13);
         assert!(voices.contains(&OpenAIVoice::Alloy));
         assert!(voices.contains(&OpenAIVoice::Verse));
+        assert!(voices.contains(&OpenAIVoice::Marin));
+        assert!(voices.contains(&OpenAIVoice::Cedar));
+        assert_eq!(OpenAIVoice::from_str_or_default("cedar"), OpenAIVoice::Cedar);
     }
 
     #[test]

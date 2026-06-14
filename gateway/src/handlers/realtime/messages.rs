@@ -134,6 +134,11 @@ pub struct RealtimeSessionConfig {
     /// (or omitted) sends nothing — recommended start for production voice: `low`.
     #[serde(default)]
     pub reasoning_effort: Option<crate::core::llm::ReasoningEffort>,
+
+    /// Input-audio noise reduction: `near_field` (headsets / close mics) or
+    /// `far_field` (laptop / room mics). Omitted = off.
+    #[serde(default)]
+    pub input_audio_noise_reduction: Option<String>,
 }
 
 /// Turn detection configuration

@@ -668,6 +668,7 @@ async fn handle_session_update(
         max_response_output_tokens: config.max_response_tokens,
         modalities: config.modalities,
         reasoning_effort: config.reasoning_effort, // S2S
+        input_audio_noise_reduction: config.input_audio_noise_reduction.clone(),
         ..Default::default()
     };
 
@@ -760,6 +761,7 @@ fn build_realtime_config(api_key: String, config: &RealtimeSessionConfig) -> Rea
         tools,
         modalities: config.modalities.clone(),
         reasoning_effort: config.reasoning_effort, // S2S
+        input_audio_noise_reduction: config.input_audio_noise_reduction.clone(),
         ..Default::default()
     }
 }

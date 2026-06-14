@@ -118,8 +118,13 @@ mod tests {
             OpenAIRealtimeModel::Gpt4oMiniRealtimePreview
         );
         assert_eq!(
+            OpenAIRealtimeModel::from_str_or_default("gpt-realtime"),
+            OpenAIRealtimeModel::GptRealtime
+        );
+        // Default is now the GA gpt-realtime.
+        assert_eq!(
             OpenAIRealtimeModel::from_str_or_default("unknown"),
-            OpenAIRealtimeModel::Gpt4oRealtimePreview
+            OpenAIRealtimeModel::GptRealtime
         );
     }
 

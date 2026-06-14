@@ -275,6 +275,10 @@ impl OpenAIRealtime {
                     super::messages::MaxTokens::Number(t)
                 }
             }),
+            // Input-audio noise reduction (near_field / far_field), if configured.
+            input_audio_noise_reduction: super::messages::NoiseReduction::from_opt(
+                self.config.input_audio_noise_reduction.as_deref(),
+            ),
         }
     }
 

@@ -461,12 +461,34 @@ pub struct LlmClientConfig {
     /// Tool choice strategy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
+    /// OpenAI `parallel_tool_calls`: `false` forces sequential single-tool turns.
+    /// `None` omits it (vendor default = parallel allowed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     /// Response format.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<ResponseFormat>,
     /// Stop sequences.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
+    /// Deterministic sampling seed (OpenAI `seed`). Model-agnostic — emitted for
+    /// reasoning models too.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+    /// Presence penalty \[-2, 2]. Sampling-family — SUPPRESSED for reasoning
+    /// models (they 400 on it), like `temperature`/`top_p`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    /// Frequency penalty \[-2, 2]. Sampling-family — suppressed for reasoning models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    /// `logprobs` request (bool or `{logprobs, top_logprobs}` shape). Sampling-family
+    /// — suppressed for reasoning models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<serde_json::Value>,
+    /// Stable end-user identifier for OpenAI abuse monitoring (`user`). Model-agnostic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
     /// Request timeout in milliseconds.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
@@ -513,8 +535,14 @@ impl Default for LlmClientConfig {
             streaming: false,
             tools: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             response_format: None,
             stop: None,
+            seed: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            user: None,
             timeout_ms: default_timeout_ms(),
             max_history: default_max_history(),
             headers: HashMap::new(),

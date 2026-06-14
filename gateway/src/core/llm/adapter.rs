@@ -170,6 +170,16 @@ fn is_anthropic_adaptive_only(model: &str) -> bool {
     is_adaptive_reasoning_only(model)
 }
 
+/// OpenAI reasoning models (o-series + the gpt-5 family) use a distinct
+/// Chat-Completions request shape: they REQUIRE `max_completion_tokens` (reject
+/// `max_tokens` with a 400) and reject sampling params (`temperature`/`top_p` —
+/// only the default is allowed). Detected by id so the OpenAI render can shape
+/// the request correctly (and so a reasoning tier on OpenAI actually works).
+pub(crate) fn is_openai_reasoning_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") || m.starts_with("gpt-5")
+}
+
 /// Anthropic extended-thinking budget per effort. The caller MUST further clamp
 /// to `< max_tokens` (Anthropic 400s otherwise).
 fn anthropic_budget_tokens(e: ReasoningEffort) -> u32 {
@@ -398,13 +408,24 @@ impl LlmAdapter for OpenAiAdapter {
             "stream": stream,
         });
         let obj = body.as_object_mut().expect("object literal");
-        if let Some(t) = cfg.temperature {
-            obj.insert("temperature".into(), json!(t));
-        }
-        if let Some(p) = cfg.top_p {
-            obj.insert("top_p".into(), json!(p));
+        // OpenAI REASONING models (o-series, gpt-5) use a DISTINCT request shape:
+        // they REQUIRE `max_completion_tokens` (a `max_tokens` is a hard 400 —
+        // live-verified) and reject sampling params (temperature/top_p — only the
+        // default is allowed). Chat models keep the classic shape. This is what
+        // makes the reasoning tier actually work against real OpenAI.
+        let is_reasoning = is_openai_reasoning_model(&cfg.model);
+        if !is_reasoning {
+            if let Some(t) = cfg.temperature {
+                obj.insert("temperature".into(), json!(t));
+            }
+            if let Some(p) = cfg.top_p {
+                obj.insert("top_p".into(), json!(p));
+            }
         }
         match cfg.max_tokens {
+            Some(m) if is_reasoning => {
+                obj.insert("max_completion_tokens".into(), json!(m));
+            }
             Some(m) => {
                 obj.insert("max_tokens".into(), json!(m));
             }
@@ -436,6 +457,32 @@ impl LlmAdapter for OpenAiAdapter {
         }
         if let Some(stop) = &cfg.stop {
             obj.insert("stop".into(), json!(stop));
+        }
+        // Tool-call concurrency control (reasoning models support tools, so this
+        // is emitted regardless of `is_reasoning`).
+        if let Some(ptc) = cfg.parallel_tool_calls {
+            obj.insert("parallel_tool_calls".into(), json!(ptc));
+        }
+        // Sampling-family params: reasoning models (o-series / gpt-5) 400 on these
+        // exactly like `temperature`/`top_p`, so suppress them there. First-classing
+        // these (vs. raw `extra` passthrough) is what makes the suppression possible.
+        if !is_reasoning {
+            if let Some(pp) = cfg.presence_penalty {
+                obj.insert("presence_penalty".into(), json!(pp));
+            }
+            if let Some(fp) = cfg.frequency_penalty {
+                obj.insert("frequency_penalty".into(), json!(fp));
+            }
+            if let Some(lp) = &cfg.logprobs {
+                obj.insert("logprobs".into(), lp.clone());
+            }
+        }
+        // Determinism + abuse-attribution: model-agnostic, safe for reasoning models.
+        if let Some(seed) = cfg.seed {
+            obj.insert("seed".into(), json!(seed));
+        }
+        if let Some(user) = &cfg.user {
+            obj.insert("user".into(), json!(user));
         }
         for (k, v) in &cfg.extra {
             obj.insert(k.clone(), v.clone());
@@ -1368,6 +1415,73 @@ mod tests {
         c.reasoning_effort = None;
         let r = OpenAiAdapter.render_request(&convo(), &c, false, None);
         assert!(r.body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn openai_reasoning_model_uses_max_completion_tokens_and_no_sampling() {
+        // Live-verified: o-series / gpt-5 REJECT `max_tokens` (400 "use
+        // max_completion_tokens") and reject temperature/top_p.
+        for model in ["gpt-5-mini", "o3", "o4-mini", "gpt-5", "o1"] {
+            let mut c = cfg(None);
+            c.model = model.to_string();
+            c.max_tokens = Some(2000);
+            c.temperature = Some(0.7);
+            c.top_p = Some(0.9);
+            c.reasoning_effort = Some(ReasoningEffort::Low);
+            let r = OpenAiAdapter.render_request(&convo(), &c, false, None);
+            assert_eq!(r.body["max_completion_tokens"], 2000, "{model}: max_completion_tokens");
+            assert!(r.body.get("max_tokens").is_none(), "{model}: no max_tokens (400-safe)");
+            assert!(r.body.get("temperature").is_none(), "{model}: temperature suppressed");
+            assert!(r.body.get("top_p").is_none(), "{model}: top_p suppressed");
+            assert_eq!(r.body["reasoning_effort"], "low", "{model}: effort still mapped");
+        }
+        // A chat model keeps the classic shape (max_tokens + sampling).
+        let mut c = cfg(None);
+        c.model = "gpt-4o-mini".to_string();
+        c.max_tokens = Some(256);
+        c.temperature = Some(0.7);
+        let r = OpenAiAdapter.render_request(&convo(), &c, false, None);
+        assert_eq!(r.body["max_tokens"], 256, "chat model keeps max_tokens");
+        assert!(r.body.get("max_completion_tokens").is_none());
+        assert!((r.body["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-3);
+    }
+
+    #[test]
+    fn openai_renders_parallel_tool_calls_penalties_seed_user_logprobs() {
+        // Chat model: every first-classed param renders on the wire.
+        let mut c = cfg(None);
+        c.model = "gpt-4o-mini".to_string();
+        c.parallel_tool_calls = Some(false);
+        c.presence_penalty = Some(0.5);
+        c.frequency_penalty = Some(0.3);
+        c.seed = Some(42);
+        c.user = Some("end-user-1".to_string());
+        c.logprobs = Some(json!(true));
+        let r = OpenAiAdapter.render_request(&convo(), &c, false, None);
+        assert_eq!(r.body["parallel_tool_calls"], false);
+        assert!((r.body["presence_penalty"].as_f64().unwrap() - 0.5).abs() < 1e-3);
+        assert!((r.body["frequency_penalty"].as_f64().unwrap() - 0.3).abs() < 1e-3);
+        assert_eq!(r.body["seed"], 42);
+        assert_eq!(r.body["user"], "end-user-1");
+        assert_eq!(r.body["logprobs"], true);
+
+        // Reasoning model: sampling-family (penalties + logprobs) suppressed (400-safe);
+        // seed/user/parallel_tool_calls survive (model-agnostic / tool-compatible).
+        let mut c = cfg(None);
+        c.model = "gpt-5-mini".to_string();
+        c.parallel_tool_calls = Some(false);
+        c.presence_penalty = Some(0.5);
+        c.frequency_penalty = Some(0.3);
+        c.logprobs = Some(json!(true));
+        c.seed = Some(7);
+        c.user = Some("u2".to_string());
+        let r = OpenAiAdapter.render_request(&convo(), &c, false, None);
+        assert!(r.body.get("presence_penalty").is_none(), "presence_penalty suppressed");
+        assert!(r.body.get("frequency_penalty").is_none(), "frequency_penalty suppressed");
+        assert!(r.body.get("logprobs").is_none(), "logprobs suppressed");
+        assert_eq!(r.body["parallel_tool_calls"], false, "parallel_tool_calls kept");
+        assert_eq!(r.body["seed"], 7, "seed kept");
+        assert_eq!(r.body["user"], "u2", "user kept");
     }
 
     #[test]

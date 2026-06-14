@@ -92,6 +92,32 @@ pub struct SessionConfig {
     /// (they reject the field) — the same fail-safe as the cascade `Off` rule.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<RealtimeReasoning>,
+
+    /// Input-audio noise reduction: `near_field` (close mics / headsets) or
+    /// `far_field` (laptop / room mics). Omitted = off. A large mic-quality win
+    /// for real phone/room audio with near-zero latency cost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_audio_noise_reduction: Option<NoiseReduction>,
+}
+
+/// Realtime input-audio noise-reduction strategy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NoiseReduction {
+    /// `"near_field"` | `"far_field"`.
+    #[serde(rename = "type")]
+    pub reduction_type: String,
+}
+
+impl NoiseReduction {
+    /// Build from a config string; `None`/empty/`"off"`/`"none"` ⇒ no reduction.
+    pub fn from_opt(s: Option<&str>) -> Option<Self> {
+        match s.map(|v| v.to_ascii_lowercase()) {
+            Some(v) if v == "near_field" || v == "far_field" => {
+                Some(Self { reduction_type: v })
+            }
+            _ => None,
+        }
+    }
 }
 
 /// S2S: native realtime reasoning control mapped from the cascade `ReasoningEffort`.
@@ -850,6 +876,7 @@ mod tests {
                 temperature: None,
                 max_response_output_tokens: None,
                 reasoning: None,
+                input_audio_noise_reduction: None,
             },
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -887,6 +914,7 @@ mod tests {
             temperature: None,
             max_response_output_tokens: None,
             reasoning: RealtimeReasoning::from_effort(ReasoningEffort::Low),
+            input_audio_noise_reduction: None,
         };
         let json = serde_json::to_value(&cfg).unwrap();
         assert_eq!(json["reasoning"]["effort"], "low");
