@@ -142,7 +142,21 @@ pub struct ConversationConfig {
     /// and nothing else has been said this turn — a graceful apology instead of
     /// dead air or a dropped session. `None` ⇒ [`DEFAULT_DEGRADATION_MESSAGE`].
     pub degradation_message: Option<String>,
+    /// P2 (REALTIME_REASONING.md §8): per-turn ceiling on LLM re-inference rounds
+    /// (the tool-call loop — the dominant spend multiplier). Bounds a pathological
+    /// call-me-again loop on a billing gateway. Default
+    /// [`DEFAULT_MAX_LLM_CALLS_PER_TURN`].
+    pub max_llm_calls_per_turn: u32,
+    /// P2: hard ceiling on the reasoning tier's output tokens (thinking + answer)
+    /// — the single most direct $ lever, since reasoning models bill every
+    /// thinking token. Clamps the reasoning tier's `max_tokens` to at most this
+    /// (the fast tier is unaffected). `None` = no extra clamp beyond `max_tokens`.
+    pub max_reasoning_tokens: Option<u32>,
 }
+
+/// P2: default per-turn LLM re-inference ceiling. Matches the built-in tool-loop
+/// bound (`ToolLoopOptions::max_rounds`) so the default preserves prior behavior.
+pub const DEFAULT_MAX_LLM_CALLS_PER_TURN: u32 = 8;
 
 /// P1: default reasoning-tier first-audio budget (ms). Generous enough not to
 /// truncate legitimate deep reasoning, tight enough that a *stuck* reasoner
@@ -183,6 +197,8 @@ impl Default for ConversationConfig {
             reasoning_route: RoutingMode::default(),
             reasoning_budget_ms: DEFAULT_REASONING_BUDGET_MS,
             degradation_message: None,
+            max_llm_calls_per_turn: DEFAULT_MAX_LLM_CALLS_PER_TURN,
+            max_reasoning_tokens: None,
         }
     }
 }
@@ -410,6 +426,8 @@ fn build_reasoning_tier(base: &Arc<LlmClient>, config: &ConversationConfig) -> O
         config.reasoning_provider_kind,
         // The reasoning tier wants to actually reason — let it (no forced Off).
         config.reasoning_effort.or(Some(crate::core::llm::ReasoningEffort::Low)),
+        // P2: clamp the reasoning tier's output-token budget to the cost ceiling.
+        config.max_reasoning_tokens,
     )))
 }
 
@@ -1027,6 +1045,13 @@ impl ConversationOrchestrator {
                 ran_tool_loop = true;
                 let registry =
                     Arc::clone(llm.functions().expect("guarded by condition"));
+                // P2: bound the per-turn re-inference rounds (the dominant spend
+                // multiplier) by the configured cost budget. A call-me-again loop
+                // can no longer run away on a billing gateway.
+                let tool_opts = crate::core::llm::ToolLoopOptions {
+                    max_rounds: self.config.max_llm_calls_per_turn as usize,
+                    ..Default::default()
+                };
                 crate::core::llm::run_tool_loop(
                     llm,
                     &registry,
@@ -1034,7 +1059,7 @@ impl ConversationOrchestrator {
                     response,
                     self.config.api_key.as_deref(),
                     &token,
-                    crate::core::llm::ToolLoopOptions::default(),
+                    tool_opts,
                 )
                 .await
             }

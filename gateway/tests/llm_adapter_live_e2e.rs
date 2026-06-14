@@ -188,6 +188,7 @@ async fn s2_two_tier_shares_history_live_ollama() {
         None,
         None,
         Some(ReasoningEffort::Low),
+        None,
     );
     let cancel = CancellationToken::new();
 

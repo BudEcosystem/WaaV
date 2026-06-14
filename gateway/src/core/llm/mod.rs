@@ -716,6 +716,7 @@ impl LlmClient {
         api_key: Option<String>,
         provider_kind: Option<AdapterKind>,
         reasoning_effort: Option<ReasoningEffort>,
+        max_tokens_clamp: Option<u32>,
     ) -> Self {
         let mut config = self.config.clone();
         config.model = model;
@@ -728,6 +729,11 @@ impl LlmClient {
         // The reasoning tier may use its own vendor; otherwise inherit.
         config.provider_kind = provider_kind.or(config.provider_kind);
         config.reasoning_effort = reasoning_effort;
+        // P2: a reasoning-token ceiling clamps the priciest tier's output budget
+        // (thinking + answer) to at most the configured cap — never raises it.
+        if let Some(ceil) = max_tokens_clamp {
+            config.max_tokens = Some(config.max_tokens.map_or(ceil, |existing| existing.min(ceil)));
+        }
         let kind = adapter::select_adapter(&config).kind();
         Self {
             adapter: adapter::adapter_for(kind),

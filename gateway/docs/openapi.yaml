@@ -688,6 +688,28 @@ components:
           type: integer
           description: Max retained history messages (default 20).
           minimum: 0
+        max_llm_calls_per_turn:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            P2: per-turn ceiling on LLM re-inference rounds (the tool-call loop — the
+            dominant spend multiplier on a billing gateway). Omit for the safe default
+            (8).
+          example: 8
+          minimum: 0
+        max_reasoning_tokens:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            P2: hard ceiling on the reasoning tier's output tokens (thinking + answer)
+            — the most direct cost lever for reasoning models. Clamps the reasoning
+            tier's `max_tokens`; the fast tier is unaffected. Omit for no extra clamp.
+          example: 2048
+          minimum: 0
         max_tokens:
           type:
           - integer

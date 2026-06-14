@@ -201,6 +201,18 @@ pub struct ConversationWebSocketConfig {
     /// instead of dead air. Omit for the built-in default.
     #[serde(default)]
     pub degradation_message: Option<String>,
+    /// P2: per-turn ceiling on LLM re-inference rounds (the tool-call loop — the
+    /// dominant spend multiplier on a billing gateway). Omit for the safe default
+    /// (8).
+    #[serde(default)]
+    #[cfg_attr(feature = "openapi", schema(example = 8))]
+    pub max_llm_calls_per_turn: Option<u32>,
+    /// P2: hard ceiling on the reasoning tier's output tokens (thinking + answer)
+    /// — the most direct cost lever for reasoning models. Clamps the reasoning
+    /// tier's `max_tokens`; the fast tier is unaffected. Omit for no extra clamp.
+    #[serde(default)]
+    #[cfg_attr(feature = "openapi", schema(example = 2048))]
+    pub max_reasoning_tokens: Option<u32>,
 }
 
 fn default_strip_markdown() -> bool {
@@ -252,6 +264,10 @@ impl ConversationWebSocketConfig {
                 .reasoning_budget_ms
                 .unwrap_or(crate::core::conversation::DEFAULT_REASONING_BUDGET_MS),
             degradation_message: self.degradation_message.clone(),
+            max_llm_calls_per_turn: self
+                .max_llm_calls_per_turn
+                .unwrap_or(crate::core::conversation::DEFAULT_MAX_LLM_CALLS_PER_TURN),
+            max_reasoning_tokens: self.max_reasoning_tokens,
         }
     }
 }

@@ -814,6 +814,57 @@ async fn p1_reasoner_over_budget_degrades_to_fast_draft() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// P2 cost budget (REALTIME_REASONING.md §8): bound the spend multipliers.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// The reasoning-token ceiling clamps the reasoning tier's `max_tokens` (the
+/// priciest calls) without touching the fast tier — the request that reaches the
+/// reasoning endpoint carries the clamped budget.
+#[tokio::test]
+#[serial_test::serial]
+async fn p2_reasoning_token_ceiling_clamps_reasoning_tier() {
+    use waav_gateway::core::conversation::RoutingMode;
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let fast = LlmMockState::default();
+    *fast.reply.lock() = "Fast.".to_string();
+    let fast_url = start_llm_mock(fast.clone()).await;
+    let reason = LlmMockState::default();
+    *reason.reply.lock() = "Reasoned.".to_string();
+    let reason_url = start_llm_mock(reason.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+
+    let cfg = ConversationConfig {
+        max_tokens: Some(8000),                  // generous base budget
+        reasoning_model: Some("reasoning-mock".to_string()),
+        reasoning_base_url: Some(reason_url),
+        reasoning_route: RoutingMode::Always,    // force the reasoner
+        max_reasoning_tokens: Some(2048),        // P2 ceiling ≪ base
+        latency_filler: LatencyFiller::Off,
+        ..conv_config(fast_url, false)
+    };
+    let orch = Arc::new(ConversationOrchestrator::new("p2-clamp", cfg, vm.clone()).expect("orch"));
+
+    orch.run_turn("reason about this please").await.ok();
+
+    let reqs = reason.requests.lock().clone();
+    assert_eq!(reqs.len(), 1, "the reasoning tier served the turn");
+    assert_eq!(
+        reqs[0]["max_tokens"].as_u64(),
+        Some(2048),
+        "the reasoning tier's max_tokens must be clamped to the P2 ceiling, got: {}",
+        reqs[0]["max_tokens"]
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // TEST 3: multi-turn history is preserved (turn 2 includes turn 1).
 // ──────────────────────────────────────────────────────────────────────────────
 #[tokio::test]
