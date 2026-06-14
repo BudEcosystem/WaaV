@@ -481,6 +481,49 @@ impl OpenAIRealtime {
                 }
             }
 
+            // Text-modality output (GA `response.output_text.*`) — e.g. a
+            // text-only per-response override. Deliver it as an assistant
+            // transcript, mirroring the audio-transcript path.
+            ServerEvent::TextDelta { delta, .. } => {
+                assistant_transcript.write().await.push_str(&delta);
+                if let Some(cb) = transcript_cb.lock().await.as_ref() {
+                    let current = assistant_transcript.read().await.clone();
+                    cb(TranscriptResult {
+                        text: current,
+                        role: TranscriptRole::Assistant,
+                        is_final: false,
+                        item_id: None,
+                    })
+                    .await;
+                }
+            }
+
+            ServerEvent::TextDone { text, item_id, .. } => {
+                *assistant_transcript.write().await = String::new();
+                conversation_log.write().await.push(
+                    crate::core::realtime::ReplayConversationItem {
+                        role: TranscriptRole::Assistant,
+                        text: text.clone(),
+                    },
+                );
+                {
+                    let mut log = conversation_log.write().await;
+                    let len = log.len();
+                    if len > MAX_REPLAY_LOG_ITEMS {
+                        log.drain(0..len - MAX_REPLAY_LOG_ITEMS);
+                    }
+                }
+                if let Some(cb) = transcript_cb.lock().await.as_ref() {
+                    cb(TranscriptResult {
+                        text,
+                        role: TranscriptRole::Assistant,
+                        is_final: true,
+                        item_id: Some(item_id),
+                    })
+                    .await;
+                }
+            }
+
             ServerEvent::AudioDelta {
                 delta,
                 item_id,
@@ -1138,6 +1181,48 @@ impl BaseRealtime for OpenAIRealtime {
             response: Some(ResponseConfig::default()),
         };
         self.send_event(event).await
+    }
+
+    async fn create_response_with(
+        &mut self,
+        overrides: crate::core::realtime::base::RealtimeResponseOverride,
+    ) -> RealtimeResult<()> {
+        if !self.is_ready() {
+            return Err(RealtimeError::NotConnected);
+        }
+        use super::messages::{AudioConfig, AudioOutput, MaxTokens};
+        // Map the provider-agnostic override onto the GA `response.create`
+        // `response` object (live-confirmed accepted shape). A per-response
+        // voice nests under audio.output; `out_of_band` ⇒ conversation:"none".
+        let audio = overrides.voice.as_ref().map(|v| AudioConfig {
+            input: None,
+            output: Some(AudioOutput {
+                format: None,
+                voice: Some(v.clone()),
+                speed: None,
+            }),
+        });
+        let response = ResponseConfig {
+            output_modalities: overrides.modalities.clone(),
+            instructions: overrides.instructions.clone(),
+            audio,
+            tools: None,
+            tool_choice: None,
+            max_output_tokens: overrides.max_output_tokens.map(|t| {
+                if t < 0 {
+                    MaxTokens::Infinite("inf".to_string())
+                } else {
+                    MaxTokens::Number(t)
+                }
+            }),
+            conversation: overrides.out_of_band.then(|| "none".to_string()),
+            metadata: overrides.metadata.clone(),
+            input: None,
+        };
+        self.send_event(ClientEvent::ResponseCreate {
+            response: Some(response),
+        })
+        .await
     }
 
     async fn cancel_response(&mut self) -> RealtimeResult<()> {

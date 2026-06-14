@@ -28,8 +28,8 @@
 //! - response.audio.done - Audio generation complete
 //! - response.audio_transcript.delta - Transcript chunk
 //! - response.audio_transcript.done - Transcript complete
-//! - response.text.delta - Text chunk
-//! - response.text.done - Text complete
+//! - response.output_text.delta - Text chunk (GA)
+//! - response.output_text.done - Text complete (GA)
 //! - response.done - Response complete
 //! - error - Error occurred
 
@@ -296,40 +296,41 @@ pub struct ContentPart {
 // Response Configuration
 // =============================================================================
 
-/// Response configuration for creating responses.
+/// Per-response config for the GA `response.create` `response` object.
+///
+/// GA-shaped (live-confirmed accepted): `output_modalities` (was Beta
+/// `modalities`), nested `audio.output` (voice/format, was flat `voice` /
+/// `output_audio_format`), `max_output_tokens` (was `max_response_output_tokens`).
+/// `conversation:"none"` makes the response out-of-band. Default ⇒ `{}` (no
+/// override), which GA accepts. GA `gpt-realtime` has no per-response
+/// `temperature`, so it is not modeled.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResponseConfig {
-    /// Response modalities
+    /// Output modalities for this response (GA renamed Beta `modalities`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub modalities: Option<Vec<String>>,
-    /// System instructions
+    pub output_modalities: Option<Vec<String>>,
+    /// Per-response system instructions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
-    /// Voice for audio
+    /// Nested audio output (voice + format) for this response.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub voice: Option<String>,
-    /// Output audio format
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_audio_format: Option<String>,
-    /// Tools
+    pub audio: Option<AudioConfig>,
+    /// Tools.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDef>>,
-    /// Tool choice
+    /// Tool choice.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
-    /// Temperature
+    /// Max output tokens (GA renamed `max_response_output_tokens`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-    /// Max output tokens
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_response_output_tokens: Option<MaxTokens>,
-    /// Conversation to use
+    pub max_output_tokens: Option<MaxTokens>,
+    /// `"none"` ⇒ out-of-band response (not added to the default conversation).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
-    /// Metadata
+    /// Opaque metadata echoed back on the response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
-    /// Input items to add
+    /// Input items to add for this response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<Vec<ConversationItem>>,
 }
@@ -590,7 +591,7 @@ pub enum ServerEvent {
     },
 
     /// Text delta
-    #[serde(rename = "response.text.delta")]
+    #[serde(rename = "response.output_text.delta")]
     TextDelta {
         /// Response ID
         response_id: String,
@@ -605,7 +606,7 @@ pub enum ServerEvent {
     },
 
     /// Text done
-    #[serde(rename = "response.text.done")]
+    #[serde(rename = "response.output_text.done")]
     TextDone {
         /// Response ID
         response_id: String,

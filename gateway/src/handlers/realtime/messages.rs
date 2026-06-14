@@ -37,9 +37,14 @@ pub enum RealtimeIncomingMessage {
         text: String,
     },
 
-    /// Request model to generate a response
+    /// Request model to generate a response, optionally with per-response
+    /// overrides (instructions/modalities/voice/token cap/out-of-band). A bare
+    /// `{"type":"create_response"}` keeps the old no-override behavior.
     #[serde(rename = "create_response")]
-    CreateResponse,
+    CreateResponse {
+        #[serde(default)]
+        response: Option<ClientResponseConfig>,
+    },
 
     /// Cancel current response generation
     #[serde(rename = "cancel_response")]
@@ -65,6 +70,34 @@ pub enum RealtimeIncomingMessage {
     /// Update session configuration mid-stream
     #[serde(rename = "update_session")]
     UpdateSession(RealtimeSessionConfig),
+}
+
+/// Per-response override carried by the `create_response` message.
+///
+/// Provider-agnostic; maps to [`crate::core::realtime::base::RealtimeResponseOverride`]
+/// (OpenAI Realtime GA `response.create`). All fields optional — omit for the
+/// session defaults.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ClientResponseConfig {
+    /// Output modalities for this response (e.g. `["text"]` or `["audio"]`).
+    #[serde(default)]
+    pub modalities: Option<Vec<String>>,
+    /// Per-response system instructions.
+    #[serde(default)]
+    pub instructions: Option<String>,
+    /// Output voice for this response.
+    #[serde(default)]
+    pub voice: Option<String>,
+    /// Max output tokens for this response (negative ⇒ unlimited).
+    #[serde(default)]
+    pub max_output_tokens: Option<i32>,
+    /// Out-of-band: don't add this response to the default conversation.
+    #[serde(default)]
+    pub out_of_band: Option<bool>,
+    /// Opaque metadata echoed back on the response.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Realtime session configuration
@@ -378,7 +411,7 @@ impl RealtimeIncomingMessage {
                 }
             }
             // Other messages don't have user-provided content that needs size limits
-            RealtimeIncomingMessage::CreateResponse
+            RealtimeIncomingMessage::CreateResponse { .. }
             | RealtimeIncomingMessage::CancelResponse
             | RealtimeIncomingMessage::CommitAudio
             | RealtimeIncomingMessage::ClearAudio => {}

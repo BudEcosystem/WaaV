@@ -584,10 +584,29 @@ impl OpenAISTTConfig {
             OpenAISTTModel::from_str_or_default(&base.model)
         };
 
-        Self {
+        let mut cfg = Self {
             base,
             model,
             ..Default::default()
+        };
+        cfg.coerce_response_format_for_model();
+        cfg
+    }
+
+    /// gpt-4o-transcribe / gpt-4o-mini-transcribe support ONLY `json`/`text`
+    /// response formats — `verbose_json` (the whisper-1 default, needed for word
+    /// timestamps) returns a 400 on them. Coerce `VerboseJson` → `Json` for those
+    /// models so the default (and any word-timestamp request) degrades safely
+    /// instead of erroring. Streaming (`stream=true`) is `json`-only too, and
+    /// only those models stream, so this covers it. `DiarizedJson` is untouched
+    /// (its own model path).
+    fn coerce_response_format_for_model(&mut self) {
+        if self.model != OpenAISTTModel::Whisper1
+            && self.response_format == ResponseFormat::VerboseJson
+        {
+            self.response_format = ResponseFormat::Json;
+            // Word-timestamp granularities require verbose_json — drop them too.
+            self.timestamp_granularities.clear();
         }
     }
 
@@ -665,6 +684,9 @@ impl OpenAISTTConfig {
                     cs.as_str().filter(|s| !s.is_empty()).map(|_| ChunkingStrategy::default())
                 });
         }
+        // The word-timestamp branch above may have set VerboseJson; coerce back to
+        // Json for gpt-4o-transcribe / -mini (they reject verbose_json).
+        cfg.coerce_response_format_for_model();
         cfg
     }
 
@@ -819,6 +841,29 @@ mod tests {
     // then through the SAME `transcription_text_fields()` the client posts, asserting each
     // api_param (`stream`, `include[]=logprobs`, `chunking_strategy`, `known_speaker_names[]`,
     // `known_speaker_references[]`) is present in the form body.
+    #[test]
+    fn gpt4o_transcribe_coerces_verbose_json_to_json() {
+        // Live-caught: gpt-4o-transcribe / -mini 400 on the verbose_json default.
+        for m in ["gpt-4o-transcribe", "gpt-4o-mini-transcribe"] {
+            let base = STTConfig {
+                model: m.to_string(),
+                ..Default::default()
+            };
+            let cfg = OpenAISTTConfig::from_base(base);
+            assert_eq!(
+                cfg.response_format,
+                ResponseFormat::Json,
+                "{m}: verbose_json must coerce to json"
+            );
+        }
+        // whisper-1 keeps the verbose_json default (it supports it).
+        let wcfg = OpenAISTTConfig::from_base(STTConfig {
+            model: "whisper-1".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(wcfg.response_format, ResponseFormat::VerboseJson);
+    }
+
     #[test]
     fn advanced_features_reach_multipart_form_fields() {
         use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};

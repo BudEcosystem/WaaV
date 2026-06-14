@@ -43,8 +43,10 @@ const MAX_WS_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 /// Default provider if not specified
 const DEFAULT_PROVIDER: &str = "openai";
 
-/// Default model if not specified
-const DEFAULT_MODEL: &str = "gpt-4o-realtime-preview";
+/// Default model if not specified — GA `gpt-realtime` (the Beta-era
+/// `gpt-4o-realtime-preview` is retired; a model-less session must not default
+/// to it).
+const DEFAULT_MODEL: &str = "gpt-realtime";
 
 /// Realtime WebSocket handler
 ///
@@ -326,18 +328,35 @@ async fn handle_realtime_incoming(
             }
             true
         }
-        RealtimeIncomingMessage::CreateResponse => {
-            if let Some(provider) = realtime_provider
-                && let Err(e) = provider.create_response().await
-            {
-                let _ = message_tx
-                    .send(RealtimeMessageRoute::Outgoing(
-                        RealtimeOutgoingMessage::Error {
-                            code: Some("response_error".to_string()),
-                            message: format!("Failed to create response: {e}"),
-                        },
-                    ))
-                    .await;
+        RealtimeIncomingMessage::CreateResponse { response } => {
+            if let Some(provider) = realtime_provider {
+                // With overrides → per-response `create_response_with`; bare
+                // message → the session-default `create_response`.
+                let result = match response {
+                    Some(ov) => {
+                        let overrides =
+                            crate::core::realtime::RealtimeResponseOverride {
+                                modalities: ov.modalities,
+                                instructions: ov.instructions,
+                                voice: ov.voice,
+                                max_output_tokens: ov.max_output_tokens,
+                                out_of_band: ov.out_of_band.unwrap_or(false),
+                                metadata: ov.metadata,
+                            };
+                        provider.create_response_with(overrides).await
+                    }
+                    None => provider.create_response().await,
+                };
+                if let Err(e) = result {
+                    let _ = message_tx
+                        .send(RealtimeMessageRoute::Outgoing(
+                            RealtimeOutgoingMessage::Error {
+                                code: Some("response_error".to_string()),
+                                message: format!("Failed to create response: {e}"),
+                            },
+                        ))
+                        .await;
+                }
             }
             true
         }
@@ -803,6 +822,7 @@ mod tests {
 
     #[test]
     fn test_default_model() {
-        assert_eq!(DEFAULT_MODEL, "gpt-4o-realtime-preview");
+        // GA default — the Beta-era preview is retired (see DEFAULT_MODEL).
+        assert_eq!(DEFAULT_MODEL, "gpt-realtime");
     }
 }

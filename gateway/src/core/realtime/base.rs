@@ -572,6 +572,30 @@ pub type ReconnectionCallback =
 ///     realtime.send_audio(audio_bytes).await?;
 /// }
 /// ```
+/// Per-response override for [`BaseRealtime::create_response_with`]
+/// (provider-agnostic).
+///
+/// Maps onto the OpenAI Realtime GA `response.create` `response` object so a
+/// single turn can override the session defaults — e.g. a text-only out-of-band
+/// summary, a different voice, or a tighter token cap. All-default ⇒ no override
+/// (behaves exactly like [`BaseRealtime::create_response`]).
+#[derive(Debug, Clone, Default)]
+pub struct RealtimeResponseOverride {
+    /// Output modalities for THIS response (e.g. `["text"]` or `["audio"]`).
+    pub modalities: Option<Vec<String>>,
+    /// Per-response system instructions (override the session instructions).
+    pub instructions: Option<String>,
+    /// Output voice for THIS response.
+    pub voice: Option<String>,
+    /// Max output tokens for THIS response (negative ⇒ "inf").
+    pub max_output_tokens: Option<i32>,
+    /// Out-of-band response: do NOT add it to the default conversation
+    /// (GA `conversation: "none"`) — e.g. a side classification/summary.
+    pub out_of_band: bool,
+    /// Opaque metadata echoed back on the response.
+    pub metadata: Option<serde_json::Value>,
+}
+
 #[async_trait]
 pub trait BaseRealtime: Send + Sync {
     /// Create a new realtime provider instance.
@@ -609,6 +633,18 @@ pub trait BaseRealtime: Send + Sync {
 
     /// Request the model to generate a response.
     async fn create_response(&mut self) -> RealtimeResult<()>;
+
+    /// Request a response with a per-response override (provider-agnostic).
+    ///
+    /// The default implementation ignores the override and delegates to
+    /// [`Self::create_response`]; providers that support per-response params
+    /// (OpenAI Realtime GA `response.create`) override this to apply them.
+    async fn create_response_with(
+        &mut self,
+        _overrides: RealtimeResponseOverride,
+    ) -> RealtimeResult<()> {
+        self.create_response().await
+    }
 
     /// Cancel the current response generation.
     async fn cancel_response(&mut self) -> RealtimeResult<()>;

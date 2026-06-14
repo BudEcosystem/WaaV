@@ -400,12 +400,9 @@ impl OpenAISTT {
 
         // Check response status
         let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| STTError::NetworkError(format!("Failed to read response: {e}")))?;
 
         if !status.is_success() {
+            let response_text = response.text().await.unwrap_or_default();
             // Try to parse as OpenAI error
             let error_msg = if let Ok(error_response) =
                 serde_json::from_str::<OpenAIErrorResponse>(&response_text)
@@ -430,6 +427,22 @@ impl OpenAISTT {
 
             return Err(STTError::ProviderError(error_msg));
         }
+
+        // Streaming (gpt-4o-transcribe / -mini + interim_results): the body is an
+        // SSE stream of `transcript.text.delta` → `transcript.text.done`, NOT a
+        // single JSON doc. Parse it incrementally, emitting interim + final
+        // STTResults. whisper-1 silently ignores `stream`, so it stays on the
+        // batch path below.
+        if config.stream && config.model.as_str() != "whisper-1" {
+            self.process_streaming_transcription(response).await?;
+            self.audio_buffer.clear();
+            return Ok(());
+        }
+
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| STTError::NetworkError(format!("Failed to read response: {e}")))?;
 
         // Parse response based on format
         let transcription_result = self.parse_response(&response_text, config)?;
@@ -456,6 +469,75 @@ impl OpenAISTT {
         // Clear the buffer after successful transcription
         self.audio_buffer.clear();
 
+        Ok(())
+    }
+
+    /// Parse an SSE transcription stream (`stream=true` on gpt-4o-transcribe /
+    /// gpt-4o-mini-transcribe). `transcript.text.delta` events accumulate into
+    /// interim (non-final) results; `transcript.text.done` carries the full
+    /// final text. Wire shape live-confirmed against the real API.
+    async fn process_streaming_transcription(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<(), STTError> {
+        use futures_util::StreamExt;
+        let mut stream = response.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut accumulated = String::new();
+        let mut got_final = false;
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|e| STTError::NetworkError(format!("stream read failed: {e}")))?;
+            buf.extend_from_slice(&chunk);
+            // Drain complete `\n`-terminated lines; SSE events are `data: {json}`.
+            while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                let raw: Vec<u8> = buf.drain(..=nl).collect();
+                let line = String::from_utf8_lossy(&raw);
+                let line = line.trim();
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    continue;
+                }
+                let Ok(ev) = serde_json::from_str::<serde_json::Value>(data) else {
+                    continue;
+                };
+                match ev.get("type").and_then(|t| t.as_str()) {
+                    Some("transcript.text.delta") => {
+                        if let Some(d) = ev.get("delta").and_then(|d| d.as_str()) {
+                            accumulated.push_str(d);
+                            if let Some(cb) = self.result_callback.lock().await.as_ref() {
+                                cb(STTResult::new(accumulated.clone(), false, false, 1.0)).await;
+                            }
+                        }
+                    }
+                    Some("transcript.text.done") => {
+                        let text = ev
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| accumulated.clone());
+                        got_final = true;
+                        info!(
+                            "Streaming transcription complete: {} characters",
+                            text.len()
+                        );
+                        if let Some(cb) = self.result_callback.lock().await.as_ref() {
+                            cb(STTResult::new(text, true, true, 1.0)).await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Stream ended without an explicit done event → finalize what we have.
+        if !got_final && !accumulated.is_empty() {
+            if let Some(cb) = self.result_callback.lock().await.as_ref() {
+                cb(STTResult::new(accumulated, true, true, 1.0)).await;
+            }
+        }
         Ok(())
     }
 

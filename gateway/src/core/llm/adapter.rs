@@ -170,14 +170,36 @@ fn is_anthropic_adaptive_only(model: &str) -> bool {
     is_adaptive_reasoning_only(model)
 }
 
-/// OpenAI reasoning models (o-series + the gpt-5 family) use a distinct
-/// Chat-Completions request shape: they REQUIRE `max_completion_tokens` (reject
-/// `max_tokens` with a 400) and reject sampling params (`temperature`/`top_p` —
-/// only the default is allowed). Detected by id so the OpenAI render can shape
-/// the request correctly (and so a reasoning tier on OpenAI actually works).
+/// OpenAI reasoning models (o-series + the gpt-5 family + codex / computer-use)
+/// use a distinct Chat-Completions request shape: they REQUIRE
+/// `max_completion_tokens` (reject `max_tokens` with a 400) and reject sampling
+/// params (`temperature`/`top_p`/penalties/`logprobs` — only the default is
+/// allowed). Detected by id so the OpenAI render shapes the request correctly
+/// (and so a reasoning tier on OpenAI actually works).
 pub(crate) fn is_openai_reasoning_model(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") || m.starts_with("gpt-5")
+    // `gpt-5*-chat-latest` are NON-reasoning ChatGPT tunes that DO accept
+    // temperature/sampling — exclude them before the gpt-5 family test, else we
+    // strip valid params (false-positive). Checked first.
+    if m.contains("-chat-latest") {
+        return false;
+    }
+    // o-series: a leading `o` followed by a digit (o1/o3/o4/… and a future o5).
+    // Excludes `gpt-4o`, `omni`, `gpt-oss` (none lead with bare `o<digit>`).
+    if let Some(rest) = m.strip_prefix('o')
+        && rest.as_bytes().first().is_some_and(u8::is_ascii_digit)
+    {
+        return true;
+    }
+    // gpt-5 .. gpt-9 families — future-proofs gpt-5.x → gpt-6/7/8/9. `gpt-4o`
+    // resolves to digit `4` here and is correctly excluded.
+    if let Some(rest) = m.strip_prefix("gpt-")
+        && rest.as_bytes().first().is_some_and(|b| (b'5'..=b'9').contains(b))
+    {
+        return true;
+    }
+    // Reasoning models sharing neither the o- nor gpt-5 prefix.
+    m.starts_with("codex") || m.starts_with("computer-use")
 }
 
 /// Anthropic extended-thinking budget per effort. The caller MUST further clamp
@@ -747,6 +769,16 @@ impl LlmAdapter for AnthropicAdapter {
             && !tools.is_empty()
         {
             obj.insert("tools".into(), Value::Array(Self::convert_tools(tools)));
+            // Anthropic controls parallel tool calls via
+            // `tool_choice.disable_parallel_tool_use` — NOT OpenAI's top-level
+            // `parallel_tool_calls`. Map `parallel_tool_calls:false` so the
+            // operator's intent is honored (else the model may fan out calls).
+            if cfg.parallel_tool_calls == Some(false) {
+                obj.insert(
+                    "tool_choice".into(),
+                    json!({ "type": "auto", "disable_parallel_tool_use": true }),
+                );
+            }
         }
         for (k, v) in &cfg.extra {
             obj.insert(k.clone(), v.clone());
@@ -1054,6 +1086,18 @@ impl LlmAdapter for GeminiAdapter {
         );
         if let Some(stop) = &cfg.stop {
             generation_config.insert("stopSequences".into(), json!(stop));
+        }
+        // Gemini `generationConfig` supports these under camelCase names — first-class
+        // them like OpenAI instead of only via `extra` (`user`/`parallel_tool_calls`
+        // have no Gemini equivalent and stay dropped).
+        if let Some(seed) = cfg.seed {
+            generation_config.insert("seed".into(), json!(seed));
+        }
+        if let Some(pp) = cfg.presence_penalty {
+            generation_config.insert("presencePenalty".into(), json!(pp));
+        }
+        if let Some(fp) = cfg.frequency_penalty {
+            generation_config.insert("frequencyPenalty".into(), json!(fp));
         }
         // D1: Gemini thinking via the numeric `thinkingBudget` ONLY — NEVER
         // paired with `thinkingLevel` (Gemini 400s on conflicting thinking
@@ -1418,6 +1462,26 @@ mod tests {
     }
 
     #[test]
+    fn is_openai_reasoning_model_classifies_correctly() {
+        // Reasoning → max_completion_tokens shape (incl. future-proofed ids).
+        for m in [
+            "o1", "o1-mini", "o3", "o3-pro", "o4-mini", "o4-mini-2025-04-16", "o5-future",
+            "gpt-5", "gpt-5-mini", "gpt-5.1", "gpt-5.1-codex", "gpt-6", "gpt-9-future",
+            "codex-mini-latest", "computer-use-preview",
+        ] {
+            assert!(is_openai_reasoning_model(m), "{m} should be reasoning");
+        }
+        // NON-reasoning → keep classic max_tokens + sampling (no false positives).
+        for m in [
+            "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "chatgpt-4o-latest",
+            "gpt-5-chat-latest", "gpt-5.1-chat-latest", // chat tunes accept temperature
+            "omni-model", "gpt-oss-20b", "deepseek-chat", "llama-3.1-8b",
+        ] {
+            assert!(!is_openai_reasoning_model(m), "{m} should NOT be reasoning");
+        }
+    }
+
+    #[test]
     fn openai_reasoning_model_uses_max_completion_tokens_and_no_sampling() {
         // Live-verified: o-series / gpt-5 REJECT `max_tokens` (400 "use
         // max_completion_tokens") and reject temperature/top_p.
@@ -1773,6 +1837,37 @@ mod tests {
         let schema = &r.body["tools"][0]["functionDeclarations"][0]["parameters"];
         assert!(schema.get("additionalProperties").is_none());
         assert!(schema["properties"]["x"].get("additionalProperties").is_none());
+    }
+
+    #[test]
+    fn anthropic_maps_parallel_tool_calls_false_to_disable_parallel_tool_use() {
+        let mut c = cfg(Some(AdapterKind::Anthropic));
+        c.tools = Some(vec![ToolDefinition::function(
+            "f",
+            "d",
+            serde_json::json!({"type":"object"}),
+        )]);
+        c.parallel_tool_calls = Some(false);
+        let r = AnthropicAdapter.render_request(&convo(), &c, false, None);
+        assert_eq!(r.body["tool_choice"]["type"], "auto");
+        assert_eq!(r.body["tool_choice"]["disable_parallel_tool_use"], true);
+        // Parallel allowed (or unset) ⇒ no forced tool_choice.
+        c.parallel_tool_calls = Some(true);
+        let r2 = AnthropicAdapter.render_request(&convo(), &c, false, None);
+        assert!(r2.body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn gemini_maps_seed_and_penalties_into_generation_config() {
+        let mut c = cfg(None);
+        c.seed = Some(42);
+        c.presence_penalty = Some(0.5);
+        c.frequency_penalty = Some(0.3);
+        let r = GeminiAdapter.render_request(&convo(), &c, false, None);
+        let gc = &r.body["generationConfig"];
+        assert_eq!(gc["seed"], 42);
+        assert!((gc["presencePenalty"].as_f64().unwrap() - 0.5).abs() < 1e-3);
+        assert!((gc["frequencyPenalty"].as_f64().unwrap() - 0.3).abs() < 1e-3);
     }
 
     #[test]

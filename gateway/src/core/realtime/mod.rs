@@ -54,8 +54,9 @@ pub mod openai;
 pub use base::{
     AudioOutputCallback, BaseRealtime, BoxedRealtime, ConnectionState, FunctionCallCallback,
     FunctionCallRequest, FunctionDefinition, InputTranscriptionConfig, RealtimeAudioData,
-    RealtimeConfig, RealtimeError, RealtimeErrorCallback, RealtimeFactory, RealtimeResult,
-    ReconnectionCallback, ReconnectionEvent, ReplayConversationItem, ResponseDoneCallback,
+    RealtimeConfig, RealtimeError, RealtimeErrorCallback, RealtimeFactory, RealtimeResponseOverride,
+    RealtimeResult, ReconnectionCallback, ReconnectionEvent, ReplayConversationItem,
+    ResponseDoneCallback,
     SpeechEvent, SpeechEventCallback, ToolDefinition, TranscriptCallback, TranscriptResult,
     TranscriptRole, TurnDetectionConfig, clamp_truncate_ms, run_barge_in_sequence,
 };
