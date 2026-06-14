@@ -33,7 +33,7 @@ WaaV eliminates the complexity of integrating with multiple voice AI providers b
 **Key Highlights:**
 - **[70+ Cloud Providers](gateway/docs/SUPPORTED_PROVIDERS.md)** - Global STT/TTS coverage including Deepgram, ElevenLabs, Google Cloud, Azure, OpenAI, plus regional providers for India (Sarvam, Gnani, Bhashini), China (Alibaba, Baidu, Tencent, iFlytek), Southeast Asia (Zalo, FPT, NECTEC), and more
 - **DAG Pipeline Engine** - Build custom voice workflows with conditional routing, multi-provider orchestration, and data transformations
-- **OpenAI & Hume AI Realtime** - Full-duplex audio-to-audio streaming with GPT-4o and Hume EVI
+- **OpenAI & Hume AI Realtime** - Full-duplex audio-to-audio streaming with OpenAI `gpt-realtime` (GA) and Hume EVI
 - **WebSocket Streaming** - Real-time bidirectional audio with sub-second latency
 - **LiveKit Integration** - WebRTC rooms and SIP telephony support
 - **Advanced Audio Processing** - DeepFilterNet noise suppression, ONNX-based turn detection
@@ -65,12 +65,18 @@ WaaV eliminates the complexity of integrating with multiple voice AI providers b
 
 ## Latest Updates
 
+**June 2026 — OpenAI full-surface parity (live-validated).** Every OpenAI voice capability was brought up against the **real OpenAI API** with the full gateway running, end-to-end. Live testing caught two classes of breakage that unit tests (which only ever hit an OpenAI-*compatible* local endpoint) could not:
+
+- **Reasoning models now actually work on the chat path.** OpenAI's o-series + gpt-5 family **reject `max_tokens`** (400: *"use `max_completion_tokens`"*) and reject sampling params — so WaaV's reasoning feature set was silently broken against production OpenAI (it only ever ran against ollama, which accepts `max_tokens`). The adapter now emits `max_completion_tokens` and suppresses temperature/top-p/penalties/logprobs for reasoning models. Live-verified: `gpt-5-mini` round-trips streaming + non-streaming, and the **full cascade** (Whisper STT → `gpt-5-mini` reasoning → TTS) speaks a correct answer end-to-end.
+- **Realtime (S2S) migrated Beta → GA — it was 100 % broken.** WaaV spoke the **retired Realtime Beta API** (rejected outright by OpenAI). Probing the GA contract directly yielded the exact migration: drop the `OpenAI-Beta` header; nest the session under `audio.input`/`audio.output` with `{type:"audio/pcm",rate}` formats, `output_modalities`, and `session.type:"realtime"`; and follow GA's renamed server events (`response.output_audio.delta`, `response.output_audio_transcript.delta`, `conversation.item.added`). Live-verified S2S round-trip through `/realtime`: **`gpt-realtime`** + the new **`marin`/`cedar`** voices + **`near_field`/`far_field` noise reduction** → 170 KB of audio, first-audio ~1.8 s.
+- **Surface refresh + chat-param parity.** New TTS + Realtime voices (`marin`, `cedar`); refreshed Realtime model enum (`gpt-realtime` GA default, `gpt-realtime-mini`); input-audio noise reduction; and `parallel_tool_calls` + `seed` + `presence_penalty` + `frequency_penalty` + `logprobs` + `user` first-classed on both the cascade **and** DAG LLM nodes (with reasoning-model-aware suppression). TTS validated live across 6 voice/format combos (wav/pcm/mp3/opus).
+
 **June 2026 — Realtime Reasoning release.** WaaV now runs **reasoning / "thinking" LLMs in live voice** — a class that was previously unusable on the spoken path (9–18 s to first audio, every trivial turn taxed, a stuck model hangs the call). A full opt-in, flat-configured feature set makes a slow "smart" model *feel instant* while a fast model handles the rest, with a safety net that guarantees the call never goes silent or drops. Shipped with extreme-TDD + multi-agent brutal-review + live validation (lib suite **~6,186 tests, 0 failing**; validated against OpenAI / Anthropic / Gemini-compatible endpoints + a credential-free ollama gate). See **[Realtime Reasoning](#realtime-reasoning)** and [`REALTIME_REASONING.md`](REALTIME_REASONING.md) / [`REASONING_FOLLOWUP_PLAN.md`](REASONING_FOLLOWUP_PLAN.md).
 
 - **Two-tier router** — name a fast `model`; add one field `reasoning_model` to light up automatic escalation (complex / math / multi-turn → the reasoner; chit-chat stays fast), both tiers sharing one conversation history.
 - **Latency masking** — `latency_filler` speaks a short holding phrase while the model thinks, so the caller hears a response in **~0.8 s** instead of seconds of silence; deduped to one utterance per turn, interruptible.
 - **Never dead air, never dropped** — a stuck or stalled reasoner (`reasoning_budget_ms` max-silence-gap watchdog) degrades to the fast draft or a graceful spoken apology; a partial answer is committed, never talked over.
-- **Reasoning-effort dial** — one typed `reasoning_effort` (off/minimal/low/medium/high) maps to each vendor's native control (OpenAI flat effort · Anthropic extended-thinking · Gemini thinking-budget), floor-clamped per model and provider-kind-aware, and emits **nothing** when a model can't reason (never a 400). Spans the cascade and the OpenAI-Realtime (S2S) path.
+- **Reasoning-effort dial** — one typed `reasoning_effort` (off/minimal/low/medium/high) maps to each vendor's native control (OpenAI flat effort · Anthropic extended-thinking · Gemini thinking-budget), floor-clamped per model and provider-kind-aware, and emits **nothing** when a model can't reason (never a 400). Drives the cascade LLM path; the S2S mapping is retained for a reasoning-capable Realtime model (GA `gpt-realtime` exposes no session reasoning).
 - **Chain-of-thought never spoken** — `<think>…</think>` reasoning emitted inline by DeepSeek-R1 / QwQ-class models (incl. via ollama) is stripped from TTS on both the conversation and DAG paths.
 - **Cost-bounded** — a per-turn LLM-call ceiling (`max_llm_calls_per_turn`) + a reasoning-token cap (`max_reasoning_tokens`) keep the 2× two-tier spend in check on a billing gateway.
 
@@ -274,7 +280,7 @@ WaaV makes a reasoning LLM **feel instant in voice** — perceived first respons
 | **Stall watchdog + degradation** | `reasoning_budget_ms`, `degradation_message` | a reasoner with no audio — or frozen mid-stream — past the budget degrades to the fast draft / a graceful spoken apology; a partial answer is committed, never restarted-over; the session never drops |
 | **Cost budget** | `max_reasoning_tokens`, `max_llm_calls_per_turn` | bound the reasoning tier's token + call spend (eager/two-tier/escalation all multiply spend on a billing gateway) |
 | **Chain-of-thought stripping** | automatic | `<think>…</think>` is never spoken to the caller (conversation **and** DAG paths) |
-| **Realtime (S2S)** | `reasoning_effort` | the same dial maps onto the OpenAI Realtime `session.update` (`reasoning.effort`) |
+| **Realtime (S2S)** | `reasoning_effort` | mapping is retained for a reasoning-capable Realtime model; GA `gpt-realtime` exposes no session-level reasoning, so the field is omitted there (no 400) — the dial drives the cascade LLM path today |
 
 **Measured (live, ollama; the gateway's own overhead is ~12 ms):**
 
@@ -358,7 +364,7 @@ WaaV Gateway supports **27 STT providers**, **32 TTS providers**, and **2 Realti
 
 | Provider | Protocol | Features |
 |----------|----------|----------|
-| **OpenAI Realtime** | WebSocket | GPT-4o full-duplex streaming, function calling, VAD |
+| **OpenAI Realtime** | WebSocket | `gpt-realtime` (GA) full-duplex streaming, function calling, server-VAD, input-audio noise reduction |
 | **Hume AI EVI** | WebSocket | Empathic voice interface, 48 emotion dimensions, prosody analysis |
 
 ---

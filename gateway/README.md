@@ -14,7 +14,7 @@ A high-performance real-time voice processing server built in Rust that provides
 - **70+ Cloud Providers**: Comprehensive coverage of global and regional STT/TTS services
   - **STT (27 providers)**: Deepgram, Google Cloud, Azure, ElevenLabs, OpenAI, AssemblyAI, Cartesia, AWS Transcribe, IBM Watson, Groq, Gnani, Sarvam AI, Speechmatics, Gladia, Rev AI, Phonexia, Yandex, Tinkoff, SberDevices, Bhashini, iFlytek, Alibaba Cloud, Baidu, Tencent, Huawei, NAVER CLOVA, and more
   - **TTS (32 providers)**: Deepgram, ElevenLabs, Google Cloud, Azure, OpenAI, Cartesia, AWS Polly, IBM Watson, Hume AI, LMNT, Play.ht, Murf.ai, WellSaid Labs, Resemble AI, Speechify, Unreal Speech, Smallest.ai, and regional providers
-  - **Realtime (2 providers)**: OpenAI GPT-4o Realtime, Hume EVI (48 emotion dimensions)
+  - **Realtime (2 providers)**: OpenAI `gpt-realtime` (GA Realtime API), Hume EVI (48 emotion dimensions)
 - **Regional Language Support**: India (22 languages), China (25+ with dialects), Southeast Asia (Thai, Vietnamese, Indonesian)
 - **Audio-Disabled Mode**: Development mode without API keys
 
