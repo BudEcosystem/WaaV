@@ -179,6 +179,22 @@ impl LatencyFiller {
     }
 }
 
+/// Cheap heuristic (single &str scan): is this model id known to do extended
+/// reasoning by default? Used to (a) advise against a reasoning model on the
+/// spoken path and (b) disable eager speculation for it (D5 — eager + a reasoner
+/// is lose-lose: each speculative fire pays full think-time, cancel-on-resume
+/// wastes it). Single source of truth, reused by the config-time advisory.
+pub fn is_reasoning_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.contains("deepseek-r1")
+        || m.contains("-thinking")
+        || m.contains("reasoner")
+        || m.contains("qwq")
+}
+
 /// D3: the built-in action-phrase pool when the operator supplies none. Action
 /// wording (never "um"/"hmm"), kept short (<~1s synthesized) so an uninterruptible
 /// clip can't talk over a barging user.
@@ -888,6 +904,14 @@ impl ConversationOrchestrator {
         if !self.config.eager_eot {
             return;
         }
+        // D5 (REALTIME_REASONING.md §4.5): eager speculation pairs with the FAST
+        // model ONLY. On a reasoning model each speculative fire pays the full
+        // multi-second think-time and a supersede-on-resume throws it away — pure
+        // cost. Skip eager structurally for a reasoning model (the config-time
+        // advisory tells the operator).
+        if is_reasoning_model(&self.config.model) {
+            return;
+        }
         let text = transcript.trim();
         if text.is_empty() {
             return;
@@ -1322,6 +1346,16 @@ fn validate_llm_url(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_reasoning_model_matrix() {
+        for m in ["o1-mini", "o3", "o4-mini", "deepseek-r1:1.5b", "gpt-5-thinking", "qwq-32b"] {
+            assert!(is_reasoning_model(m), "{m} is a reasoning model");
+        }
+        for m in ["gpt-4o-mini", "llama3.2:1b", "claude-haiku-4-5", "gemini-3-flash"] {
+            assert!(!is_reasoning_model(m), "{m} is not a reasoning model");
+        }
+    }
 
     #[test]
     fn to_client_config_applies_reasoning_floor_clamp() {

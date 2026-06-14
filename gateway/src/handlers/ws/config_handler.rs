@@ -438,18 +438,11 @@ pub async fn handle_config_message(
 /// callback. The callback still forwards every transcript to the client (so
 /// `stt_result` egress is preserved, matching the simple path), then drives the
 /// LLM→TTS loop on each finalized turn. Barge-in and history are handled inside
-/// D1: cheap heuristic (runs ONCE at config time) — is this model id known to
-/// do extended reasoning by default, making it a poor choice for the
-/// low-latency spoken path? Used only to emit a non-fatal advisory.
+/// D1: is this model id known to do extended reasoning by default (a poor choice
+/// for the low-latency spoken path)? Single source of truth in the conversation
+/// module (also drives D5's eager-disable).
 fn is_known_reasoning_model(model: &str) -> bool {
-    let m = model.to_ascii_lowercase();
-    m.starts_with("o1")
-        || m.starts_with("o3")
-        || m.starts_with("o4")
-        || m.contains("deepseek-r1")
-        || m.contains("-thinking")
-        || m.contains("reasoner")
-        || m.contains("qwq")
+    crate::core::conversation::is_reasoning_model(model)
 }
 
 /// D1 (REALTIME_REASONING.md §7.4): emit non-fatal config advisories — a
@@ -476,6 +469,23 @@ async fn emit_reasoning_config_warnings(
                     "model '{}' is a reasoning model on the spoken path; first-audio latency \
                      will be seconds. Keep a FAST model on `model` (add a `reasoning_model` for \
                      two-tier when available), or lower `reasoning_effort`.",
+                    conv_config.model
+                ),
+                detail: None,
+            }))
+            .await;
+    }
+    // D5: eager speculation is auto-disabled on a reasoning model (it would pay
+    // full think-time per speculative fire) — tell the operator so it isn't a
+    // silent no-op.
+    if conv_config.eager_eot && is_known_reasoning_model(&conv_config.model) {
+        let _ = message_tx
+            .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
+                code: "eager_eot_disabled_for_reasoning_model".to_string(),
+                message: format!(
+                    "eager_eot is ignored for reasoning model '{}' — each speculative \
+                     turn would pay full think-time and be discarded on resume. Use a \
+                     fast `model` to benefit from eager.",
                     conv_config.model
                 ),
                 detail: None,
