@@ -419,9 +419,11 @@ pub fn is_reasoning_model(model: &str) -> bool {
         || m.contains("reasoner")
         || m.contains("qwq")
         // Adaptive-thinking-only families (opus-4.x, gemini-fable/mythos, fable-5)
-        // reason by construction — the clamp already floors them above Off, so the
-        // eager-disable + advisories must treat them as reasoning models too.
-        || crate::core::llm::ReasoningEffort::floor_for_model(model)
+        // reason by construction wherever they run — for the eager-disable +
+        // voice-path advisory we treat them as reasoning models regardless of
+        // transport (the conservative Anthropic-floor assumption; A10b only
+        // makes the WIRE floor transport-specific, not this classification).
+        || crate::core::llm::ReasoningEffort::floor_for_model(model, crate::core::llm::AdapterKind::Anthropic)
             != crate::core::llm::ReasoningEffort::Off
 }
 
@@ -445,6 +447,20 @@ pub const DEFAULT_FILLER_PHRASES: &[&str] = &[
 pub const VOICE_DEFAULT_MAX_TOKENS: u32 = 256;
 
 impl ConversationConfig {
+    /// A10b: the resolved wire vendor for THIS config (the same `select_adapter`
+    /// resolver `LlmClient::new` uses), so the reasoning floor is honest per
+    /// transport — a Claude model fronted by an OpenAI-compatible proxy renders
+    /// (and floors) as OpenAI, not Anthropic.
+    fn adapter_kind(&self) -> crate::core::llm::AdapterKind {
+        let probe = LlmClientConfig {
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            provider_kind: self.provider_kind,
+            ..Default::default()
+        };
+        crate::core::llm::adapter::select_adapter(&probe).kind()
+    }
+
     fn to_client_config(&self) -> LlmClientConfig {
         LlmClientConfig {
             base_url: self.base_url.clone(),
@@ -462,8 +478,10 @@ impl ConversationConfig {
             provider_kind: self.provider_kind,
             // D1: send the floor-clamped value (an adaptive-only model can't
             // honor a lower request; the floor is echoed back at config time).
+            // A10b: the floor respects the resolved wire vendor.
             reasoning_effort: crate::core::llm::ReasoningEffort::resolve(
                 &self.model,
+                self.adapter_kind(),
                 self.reasoning_effort,
             )
             .0,
@@ -495,7 +513,11 @@ impl ConversationConfig {
         Option<crate::core::llm::ReasoningEffort>,
         crate::core::llm::ReasoningEffort,
     ) {
-        crate::core::llm::ReasoningEffort::resolve(&self.model, self.reasoning_effort)
+        crate::core::llm::ReasoningEffort::resolve(
+            &self.model,
+            self.adapter_kind(),
+            self.reasoning_effort,
+        )
     }
 }
 
@@ -2168,10 +2190,11 @@ mod tests {
             (Some(ReasoningEffort::Off), ReasoningEffort::Off)
         );
 
-        // Adaptive-only model: a request below the floor is raised on the wire,
-        // and the floor is reported for the ack echo.
+        // Adaptive-only model ON THE ANTHROPIC WIRE: a request below the floor is
+        // raised, and the floor is reported for the ack echo.
         let cfg = ConversationConfig {
             model: "claude-opus-4-8".into(),
+            provider_kind: Some(crate::core::llm::AdapterKind::Anthropic),
             reasoning_effort: Some(ReasoningEffort::Off),
             ..Default::default()
         };
@@ -2179,6 +2202,20 @@ mod tests {
         assert_eq!(
             cfg.resolved_reasoning_effort(),
             (Some(ReasoningEffort::Low), ReasoningEffort::Low)
+        );
+
+        // A10b: the SAME model fronted by an OpenAI-compatible proxy floors at Off
+        // — no forced param to a proxy that may reject it, and the ack is honest.
+        let cfg = ConversationConfig {
+            model: "claude-opus-4-8".into(),
+            provider_kind: Some(crate::core::llm::AdapterKind::OpenAi),
+            reasoning_effort: Some(ReasoningEffort::Off),
+            ..Default::default()
+        };
+        assert_eq!(cfg.to_client_config().reasoning_effort, Some(ReasoningEffort::Off));
+        assert_eq!(
+            cfg.resolved_reasoning_effort(),
+            (Some(ReasoningEffort::Off), ReasoningEffort::Off)
         );
 
         // None → no param, floor still reported.

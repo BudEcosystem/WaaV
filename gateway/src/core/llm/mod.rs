@@ -739,14 +739,25 @@ impl LlmClient {
     ) -> Self {
         let mut config = self.config.clone();
         config.model = model;
+        let base_url_overridden = base_url.is_some();
         if let Some(b) = base_url {
             config.base_url = b;
         }
         if let Some(k) = api_key {
             config.api_key = Some(k);
         }
-        // The reasoning tier may use its own vendor; otherwise inherit.
-        config.provider_kind = provider_kind.or(config.provider_kind);
+        // A10a: pick the reasoning tier's wire vendor correctly. An EXPLICIT
+        // reasoning_provider_kind wins. Otherwise, if the reasoning tier got its
+        // OWN base_url (a different host/vendor), DO NOT inherit the fast tier's
+        // explicit provider_kind — that would POST e.g. an OpenAI body to an
+        // Anthropic host (hard 400 on every escalated turn). Clear it so
+        // select_adapter re-infers from the reasoning base_url + model. Only when
+        // the base_url is shared do we inherit the fast tier's vendor.
+        config.provider_kind = match provider_kind {
+            Some(k) => Some(k),
+            None if base_url_overridden => None,
+            None => config.provider_kind,
+        };
         config.reasoning_effort = reasoning_effort;
         // The reasoning tier's output budget is set EXPLICITLY by the caller
         // (build_reasoning_tier computes a think-capable value bounded by the P2
@@ -1569,6 +1580,52 @@ mod tests {
         history.add(ChatMessage::user("Great"));
         assert!(history.messages.len() <= 6);
         assert_eq!(history.messages[0].role, MessageRole::System);
+    }
+
+    #[test]
+    fn a10a_reasoning_tier_reinfers_vendor_from_its_own_base_url() {
+        // Fast tier explicitly OpenAI.
+        let fast = LlmClient::new(LlmClientConfig {
+            base_url: "https://api.openai.com/v1".into(),
+            model: "gpt-4o-mini".into(),
+            provider_kind: Some(AdapterKind::OpenAi),
+            ..Default::default()
+        });
+        // Cross-vendor reasoning tier on the Anthropic host, NO explicit
+        // reasoning_provider_kind → must re-infer Anthropic from its OWN host,
+        // not inherit OpenAI (which would POST an OpenAI body to api.anthropic.com
+        // → 400 every escalated turn).
+        let reasoning = fast.with_tier_overrides(
+            "claude-3-5-sonnet".into(),
+            Some("https://api.anthropic.com/v1".into()),
+            None,
+            None,
+            Some(ReasoningEffort::Low),
+            None,
+        );
+        assert_eq!(
+            reasoning.adapter_kind(),
+            AdapterKind::Anthropic,
+            "cross-vendor reasoning tier must re-infer Anthropic, not inherit OpenAI"
+        );
+        // No base_url override → still inherit the fast tier's explicit vendor.
+        let same_host =
+            fast.with_tier_overrides("o3".into(), None, None, None, Some(ReasoningEffort::Low), None);
+        assert_eq!(
+            same_host.adapter_kind(),
+            AdapterKind::OpenAi,
+            "no base_url override → inherit the fast tier's vendor"
+        );
+        // Explicit reasoning_provider_kind always wins.
+        let explicit = fast.with_tier_overrides(
+            "some-model".into(),
+            Some("https://proxy.internal/v1".into()),
+            None,
+            Some(AdapterKind::Anthropic),
+            Some(ReasoningEffort::Low),
+            None,
+        );
+        assert_eq!(explicit.adapter_kind(), AdapterKind::Anthropic, "explicit kind wins");
     }
 
     #[test]

@@ -110,11 +110,19 @@ impl ReasoningEffort {
         }
     }
 
-    /// The minimum effort a model can actually honor. Adaptive-thinking-only
-    /// families cannot be driven to zero reasoning → floor at `Low` so the echoed
-    /// value is honest. Everything else floors at `Off`.
-    pub fn floor_for_model(model: &str) -> Self {
-        if is_adaptive_reasoning_only(model) { Self::Low } else { Self::Off }
+    /// The minimum effort a model can actually honor, on the resolved WIRE path.
+    /// A10b: the adaptive-only `Low` floor is an ANTHROPIC-native fact (the model
+    /// reasons adaptively and 400s on an explicit-zero), so it is asserted ONLY
+    /// when `kind == Anthropic`. On the OpenAI/Gemini wire (e.g. a LiteLLM/
+    /// OpenRouter proxy fronting Claude) `reasoning_effort` is just an optional
+    /// flat string the proxy may reject — forcing `Low` would be both wrong and a
+    /// dishonest floor echo, so floor at `Off`. Everything else floors at `Off`.
+    pub fn floor_for_model(model: &str, kind: AdapterKind) -> Self {
+        if kind == AdapterKind::Anthropic && is_adaptive_reasoning_only(model) {
+            Self::Low
+        } else {
+            Self::Off
+        }
     }
 
     /// Raise `self` to at least `floor`.
@@ -126,8 +134,8 @@ impl ReasoningEffort {
     /// floor-clamped value to actually send (`None` when nothing was requested →
     /// vendor default, no param emitted) and `floor` is always the model's floor
     /// (for the session-ack echo).
-    pub fn resolve(model: &str, requested: Option<Self>) -> (Option<Self>, Self) {
-        let floor = Self::floor_for_model(model);
+    pub fn resolve(model: &str, kind: AdapterKind, requested: Option<Self>) -> (Option<Self>, Self) {
+        let floor = Self::floor_for_model(model, kind);
         (requested.map(|r| r.clamp_to_floor(floor)), floor)
     }
 }
@@ -1303,26 +1311,37 @@ mod tests {
 
     #[test]
     fn reasoning_effort_floor_clamp_resolve() {
-        // Ordinary models floor at Off; adaptive-only models floor at Low.
-        assert_eq!(ReasoningEffort::floor_for_model("gpt-4o-mini"), ReasoningEffort::Off);
-        assert_eq!(ReasoningEffort::floor_for_model("llama3.2:1b"), ReasoningEffort::Off);
-        assert_eq!(ReasoningEffort::floor_for_model("claude-opus-4-8"), ReasoningEffort::Low);
-        assert_eq!(ReasoningEffort::floor_for_model("fable-5"), ReasoningEffort::Low);
+        use AdapterKind::{Anthropic, Gemini, OpenAi};
+        // Ordinary models floor at Off; adaptive-only models floor at Low — but
+        // ONLY on the Anthropic wire (A10b).
+        assert_eq!(ReasoningEffort::floor_for_model("gpt-4o-mini", OpenAi), ReasoningEffort::Off);
+        assert_eq!(ReasoningEffort::floor_for_model("llama3.2:1b", OpenAi), ReasoningEffort::Off);
+        assert_eq!(ReasoningEffort::floor_for_model("claude-opus-4-8", Anthropic), ReasoningEffort::Low);
+        assert_eq!(ReasoningEffort::floor_for_model("fable-5", Anthropic), ReasoningEffort::Low);
+        // A10b: the SAME adaptive-only model fronted by an OpenAI/Gemini proxy
+        // floors at Off (forcing Low would emit a param the proxy may reject).
+        assert_eq!(ReasoningEffort::floor_for_model("claude-opus-4-8", OpenAi), ReasoningEffort::Off);
+        assert_eq!(ReasoningEffort::floor_for_model("claude-opus-4-8", Gemini), ReasoningEffort::Off);
         // clamp raises to the floor but never lowers a higher request.
         assert_eq!(ReasoningEffort::Off.clamp_to_floor(ReasoningEffort::Low), ReasoningEffort::Low);
         assert_eq!(ReasoningEffort::High.clamp_to_floor(ReasoningEffort::Low), ReasoningEffort::High);
         assert_eq!(ReasoningEffort::Off.clamp_to_floor(ReasoningEffort::Off), ReasoningEffort::Off);
         // resolve = (applied, floor); None stays None (vendor default).
         assert_eq!(
-            ReasoningEffort::resolve("gpt-4o-mini", Some(ReasoningEffort::Off)),
+            ReasoningEffort::resolve("gpt-4o-mini", OpenAi, Some(ReasoningEffort::Off)),
             (Some(ReasoningEffort::Off), ReasoningEffort::Off)
         );
         assert_eq!(
-            ReasoningEffort::resolve("claude-opus-4-8", Some(ReasoningEffort::Off)),
+            ReasoningEffort::resolve("claude-opus-4-8", Anthropic, Some(ReasoningEffort::Off)),
             (Some(ReasoningEffort::Low), ReasoningEffort::Low)
         );
+        // A10b: opus on an OpenAI proxy → Off stays Off (no forced param, honest floor).
         assert_eq!(
-            ReasoningEffort::resolve("gpt-4o-mini", None),
+            ReasoningEffort::resolve("claude-opus-4-8", OpenAi, Some(ReasoningEffort::Off)),
+            (Some(ReasoningEffort::Off), ReasoningEffort::Off)
+        );
+        assert_eq!(
+            ReasoningEffort::resolve("gpt-4o-mini", OpenAi, None),
             (None, ReasoningEffort::Off)
         );
     }
