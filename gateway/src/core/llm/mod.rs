@@ -32,7 +32,7 @@ pub mod summarize;
 
 pub use adapter::{AdapterKind, LlmAdapter, LlmStreamEvent, ReasoningEffort};
 pub use functions::{
-    CANCEL_ASYNC_TOOL_NAME, FunctionCallParams, FunctionHandler, FunctionRegistry,
+    AsyncToolResult, CANCEL_ASYNC_TOOL_NAME, FunctionCallParams, FunctionHandler, FunctionRegistry,
     FunctionResult, RegistryItem, ToolLoopOptions, run_tool_loop,
 };
 pub use summarize::SummaryConfig;

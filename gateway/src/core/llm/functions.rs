@@ -64,10 +64,27 @@ pub type FunctionHandler = Arc<
         + Sync,
 >;
 
-/// Delivery sink for async-tool finals/progress: `(session_id,
-/// tool_call_id, function_name, is_final, value)`. Wired by the
-/// orchestration layer to append context + trigger a follow-up inference.
-pub type AsyncFinalSink = Arc<dyn Fn(String, String, String, bool, Value) + Send + Sync>;
+/// A delivered async-tool result (final or progress). The orchestration layer
+/// wires a sink to append it to context and — turn-id-gated — volunteer it.
+#[derive(Clone, Debug)]
+pub struct AsyncToolResult {
+    pub session_id: String,
+    /// S3 (M6): the turn that SPAWNED the tool. The orchestrator volunteers the
+    /// result only while this is still the latest turn — a stale RAG answer must
+    /// never talk over a new topic.
+    pub turn_id: u64,
+    pub tool_call_id: String,
+    pub name: String,
+    pub is_final: bool,
+    /// S3: whether a follow-up inference should run on the final (Pipecat's
+    /// `run_llm`). `false` ⇒ record-only (chain tools without re-inference).
+    pub run_llm: bool,
+    pub value: Value,
+}
+
+/// Delivery sink for async-tool finals/progress. Wired by the orchestration
+/// layer to append context + (turn-id-gated) trigger a follow-up inference.
+pub type AsyncFinalSink = Arc<dyn Fn(AsyncToolResult) + Send + Sync>;
 
 /// One registered function.
 pub struct RegistryItem {
@@ -82,6 +99,11 @@ pub struct RegistryItem {
     pub timeout: Duration,
     /// Bookkeeping for auto-registered (derived) tools.
     pub auto_registered: bool,
+    /// S3: for an ASYNC tool, whether its final triggers a follow-up inference
+    /// (the bot volunteers the result). `false` ⇒ record-only: the result lands
+    /// in history but the bot stays silent (chain tools without inference).
+    /// Ignored for synchronous tools. Default `true`.
+    pub run_llm: bool,
 }
 
 impl RegistryItem {
@@ -92,11 +114,19 @@ impl RegistryItem {
             cancel_on_interruption: true,
             timeout: Duration::from_secs(30),
             auto_registered: false,
+            run_llm: true,
         }
     }
 
     pub fn asynchronous(mut self) -> Self {
         self.cancel_on_interruption = false;
+        self
+    }
+
+    /// S3: mark an async tool record-only — its final lands in history but the
+    /// bot does not volunteer it (no follow-up inference).
+    pub fn record_only(mut self) -> Self {
+        self.run_llm = false;
         self
     }
 
@@ -221,25 +251,30 @@ impl FunctionRegistry {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn deliver_async(
         &self,
         session_id: &str,
+        turn_id: u64,
         tool_call_id: &str,
         name: &str,
         is_final: bool,
+        run_llm: bool,
         value: Value,
     ) {
         if is_final {
             self.in_flight_async.write().remove(tool_call_id);
         }
         match &*self.async_sink.read() {
-            Some(sink) => sink(
-                session_id.to_string(),
-                tool_call_id.to_string(),
-                name.to_string(),
+            Some(sink) => sink(AsyncToolResult {
+                session_id: session_id.to_string(),
+                turn_id,
+                tool_call_id: tool_call_id.to_string(),
+                name: name.to_string(),
                 is_final,
+                run_llm,
                 value,
-            ),
+            }),
             None => warn!(
                 tool_call_id,
                 name, "async tool result dropped: no AsyncFinalSink wired"
@@ -254,11 +289,15 @@ impl FunctionRegistry {
 pub struct ToolLoopOptions {
     pub parallel: bool,
     pub max_rounds: usize,
+    /// S3 (M6): the conversation turn running this loop. Stamped onto any async
+    /// tool spawned in it, so the orchestrator can turn-id-gate the follow-up.
+    /// `0` = no gating context (DAG flows, tests).
+    pub turn_id: u64,
 }
 
 impl Default for ToolLoopOptions {
     fn default() -> Self {
-        Self { parallel: true, max_rounds: 8 }
+        Self { parallel: true, max_rounds: 8, turn_id: 0 }
     }
 }
 
@@ -314,7 +353,8 @@ pub async fn run_tool_loop(
             "executing tool-call batch"
         );
 
-        let results = execute_batch(registry, session_id, &batch, cancel, opts.parallel).await;
+        let results =
+            execute_batch(registry, session_id, &batch, cancel, opts.parallel, opts.turn_id).await;
 
         // Pairing invariant: exactly one result per tool_call_id, batch
         // order — appended under ONE history-lock acquisition so a
@@ -344,10 +384,11 @@ pub(crate) async fn execute_batch(
     batch: &[ToolCall],
     cancel: &CancellationToken,
     parallel: bool,
+    turn_id: u64,
 ) -> Vec<Value> {
     let futs: Vec<_> = batch
         .iter()
-        .map(|call| execute_one(registry, session_id, call, cancel))
+        .map(|call| execute_one(registry, session_id, call, cancel, turn_id))
         .collect();
     if parallel {
         futures::future::join_all(futs).await
@@ -365,6 +406,7 @@ async fn execute_one(
     session_id: &str,
     call: &ToolCall,
     cancel: &CancellationToken,
+    turn_id: u64,
 ) -> Value {
     let name = call.function.name.as_str();
 
@@ -413,6 +455,7 @@ async fn execute_one(
         };
         let handler = Arc::clone(&item.handler);
         let timeout = item.timeout;
+        let run_llm = item.run_llm;
         let reg = Arc::clone(registry);
         let (sid, cid, fname) = (
             session_id.to_string(),
@@ -427,7 +470,7 @@ async fn execute_one(
                     "error": format!("async function '{fname}' timed out after {timeout:?}")
                 }),
             };
-            reg.deliver_async(&sid, &cid, &fname, true, outcome);
+            reg.deliver_async(&sid, turn_id, &cid, &fname, true, run_llm, outcome);
         });
         registry.in_flight_async.write().insert(
             call.id.clone(),
@@ -699,7 +742,7 @@ mod tests {
         let batch = vec![call("c1", "slow", "{}"), call("c2", "fast", "{}")];
         let token = CancellationToken::new();
 
-        let _ = execute_batch(&reg, "s", &batch, &token, false).await;
+        let _ = execute_batch(&reg, "s", &batch, &token, false, 0).await;
         assert_eq!(
             *order.lock(),
             vec!["slow_start", "slow_end", "fast_start"],
@@ -707,7 +750,7 @@ mod tests {
         );
 
         order.lock().clear();
-        let _ = execute_batch(&reg, "s", &batch, &token, true).await;
+        let _ = execute_batch(&reg, "s", &batch, &token, true, 0).await;
         assert_eq!(
             *order.lock(),
             vec!["slow_start", "fast_start", "slow_end"],
@@ -734,11 +777,11 @@ mod tests {
         let token = CancellationToken::new();
 
         let out =
-            execute_batch(&reg, "s", &[call("c1", "hang", "{}")], &token, true).await;
+            execute_batch(&reg, "s", &[call("c1", "hang", "{}")], &token, true, 0).await;
         assert!(out[0]["error"].as_str().unwrap().contains("timed out"));
 
         let out =
-            execute_batch(&reg, "s", &[call("c2", "typed", "{not json")], &token, true).await;
+            execute_batch(&reg, "s", &[call("c2", "typed", "{not json")], &token, true, 0).await;
         assert!(out[0]["error"].as_str().unwrap().contains("Invalid JSON arguments"));
     }
 
@@ -761,7 +804,7 @@ mod tests {
             t2.cancel();
         });
         let started = std::time::Instant::now();
-        let out = execute_batch(&reg, "s", &[call("c1", "slow", "{}")], &token, true).await;
+        let out = execute_batch(&reg, "s", &[call("c1", "slow", "{}")], &token, true, 0).await;
         assert!(out[0]["error"].as_str().unwrap().contains("cancelled by interruption"));
         assert!(started.elapsed() < Duration::from_secs(5), "cancel must be prompt");
     }
@@ -781,17 +824,18 @@ mod tests {
             )
             .asynchronous(),
         );
-        let finals: Arc<parking_lot::Mutex<Vec<(String, String, bool, Value)>>> =
+        let finals: Arc<parking_lot::Mutex<Vec<AsyncToolResult>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
         let sink_store = Arc::clone(&finals);
-        reg.set_async_sink(Arc::new(move |_sid, cid, name, is_final, v| {
-            sink_store.lock().push((cid, name, is_final, v));
+        reg.set_async_sink(Arc::new(move |r: AsyncToolResult| {
+            sink_store.lock().push(r);
         }));
 
         let token = CancellationToken::new();
         // The ack returns IMMEDIATELY (well under the 40ms handler).
         let started = std::time::Instant::now();
-        let out = execute_batch(&reg, "s", &[call("c9", "lookup", "{}")], &token, true).await;
+        // turn_id 7 must round-trip to the sink for turn-id gating (S3).
+        let out = execute_batch(&reg, "s", &[call("c9", "lookup", "{}")], &token, true, 7).await;
         assert!(started.elapsed() < Duration::from_millis(35), "started ack must not wait");
         assert_eq!(out[0]["status"], "started");
 
@@ -800,11 +844,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(120)).await;
         let finals = finals.lock();
         assert_eq!(finals.len(), 1, "exactly one final");
-        let (cid, name, is_final, v) = &finals[0];
-        assert_eq!(cid, "c9");
-        assert_eq!(name, "lookup");
-        assert!(is_final);
-        assert_eq!(v["answer"], 42);
+        let r = &finals[0];
+        assert_eq!(r.tool_call_id, "c9");
+        assert_eq!(r.name, "lookup");
+        assert_eq!(r.turn_id, 7, "the spawning turn id must reach the sink");
+        assert!(r.run_llm, "default async tool runs the follow-up");
+        assert!(r.is_final);
+        assert_eq!(r.value["answer"], 42);
     }
 
     #[tokio::test]
@@ -824,11 +870,11 @@ mod tests {
         );
         let finals = Arc::new(AtomicUsize::new(0));
         let fcount = Arc::clone(&finals);
-        reg.set_async_sink(Arc::new(move |_s, _c, _n, _f, _v| {
+        reg.set_async_sink(Arc::new(move |_r: AsyncToolResult| {
             fcount.fetch_add(1, Ordering::SeqCst);
         }));
         let token = CancellationToken::new();
-        let _ = execute_batch(&reg, "s", &[call("c1", "eternal", "{}")], &token, true).await;
+        let _ = execute_batch(&reg, "s", &[call("c1", "eternal", "{}")], &token, true, 0).await;
 
         // The LLM calls the builtin to cancel it.
         let out = execute_batch(
@@ -837,6 +883,7 @@ mod tests {
             &[call("c2", CANCEL_ASYNC_TOOL_NAME, r#"{"tool_call_id":"c1"}"#)],
             &token,
             true,
+            0,
         )
         .await;
         assert_eq!(out[0]["cancelled"], true);
@@ -857,7 +904,7 @@ mod tests {
         let llm = client(&url, Arc::clone(&reg));
         let token = CancellationToken::new();
         let first = llm.complete("s1", "go", None, &token, None).await.unwrap();
-        let opts = ToolLoopOptions { parallel: true, max_rounds: 3 };
+        let opts = ToolLoopOptions { parallel: true, max_rounds: 3, turn_id: 0 };
         let resp = run_tool_loop(&llm, &reg, "s1", first, None, &token, opts).await.unwrap();
         assert!(
             resp.tool_calls.is_empty(),

@@ -284,8 +284,10 @@ impl FlowManager {
             // Flow handlers run through the SAME registry/batch machinery as
             // B-G4 (timeouts, terminal results, cancellation); transitions
             // are captured into pending_transition by the wrappers.
+            // turn_id 0: DAG-flow async tools are not turn-id-gated (the flow
+            // executor owns its own turn lifecycle).
             let results =
-                execute_batch(&self.registry, &self.session_id, &batch, cancel, true).await;
+                execute_batch(&self.registry, &self.session_id, &batch, cancel, true, 0).await;
             let rendered: Vec<(String, String)> = batch
                 .iter()
                 .zip(results)

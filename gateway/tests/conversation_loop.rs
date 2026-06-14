@@ -865,6 +865,84 @@ async fn p2_reasoning_token_ceiling_clamps_reasoning_tier() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// S3 async tools (REALTIME_REASONING.md §5): a late async result is recorded to
+// history and turn-id-gated — volunteered while the spawning turn is still the
+// latest, suppressed once the conversation has moved on (M6).
+// ──────────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+#[serial_test::serial]
+async fn s3_async_result_volunteered_when_idle_gated_when_superseded() {
+    use waav_gateway::core::llm::AsyncToolResult;
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let st = LlmMockState::default();
+    *st.reply.lock() = "Here is your async result.".to_string();
+    let url = start_llm_mock(st.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+    let cfg = ConversationConfig {
+        latency_filler: LatencyFiller::Off,
+        ..conv_config(url, false)
+    };
+    let orch = Arc::new(ConversationOrchestrator::new("s3-async", cfg, vm.clone()).expect("orch"));
+
+    // Turn 0 runs and ends → next_turn_id advances to 1, line goes idle.
+    orch.run_turn("hello").await.ok();
+
+    // CASE A — async final for the STILL-LATEST turn 0, line idle → VOLUNTEERED.
+    reset_tts_stats();
+    let before = st.requests.lock().len();
+    orch.handle_async_final(AsyncToolResult {
+        session_id: "s3-async".into(),
+        turn_id: 0,
+        tool_call_id: "call-1".into(),
+        name: "lookup".into(),
+        is_final: true,
+        run_llm: true,
+        value: serde_json::json!({ "answer": 42 }),
+    })
+    .await;
+    let spoken = TTS_STATS.spoken.lock().clone();
+    assert!(
+        spoken.iter().any(|s| s.contains("Here is your async result")),
+        "idle + still-latest turn ⇒ the async result is volunteered: {spoken:?}"
+    );
+    // The follow-up inference must have run AND carried the recorded result note.
+    let reqs = st.requests.lock().clone();
+    assert!(reqs.len() > before, "a follow-up inference must have run");
+    assert!(
+        reqs.last().unwrap().to_string().contains("Async tool 'lookup' completed"),
+        "the async result must be recorded into the conversation context"
+    );
+
+    // CASE B — a NEW turn starts (conversation moves on), then the OLD async final
+    // arrives → SUPERSEDED ⇒ recorded but NOT spoken (never talks over the topic).
+    orch.run_turn("completely different question").await.ok();
+    reset_tts_stats();
+    orch.handle_async_final(AsyncToolResult {
+        session_id: "s3-async".into(),
+        turn_id: 0, // stale: spawned in turn 0, but the conversation moved on
+        tool_call_id: "call-2".into(),
+        name: "lookup".into(),
+        is_final: true,
+        run_llm: true,
+        value: serde_json::json!({ "answer": 7 }),
+    })
+    .await;
+    let spoken_b = TTS_STATS.spoken.lock().clone();
+    assert!(
+        spoken_b.is_empty(),
+        "a superseded async result must NOT talk over the new topic: {spoken_b:?}"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // TEST 3: multi-turn history is preserved (turn 2 includes turn 1).
 // ──────────────────────────────────────────────────────────────────────────────
 #[tokio::test]

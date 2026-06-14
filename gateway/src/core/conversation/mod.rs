@@ -431,6 +431,26 @@ fn build_reasoning_tier(base: &Arc<LlmClient>, config: &ConversationConfig) -> O
     )))
 }
 
+/// S3 (M6): may an async-tool result be VOLUNTEERED now? Only when the line is
+/// idle (`!turn_active`) and the spawning turn is still the latest — i.e. no new
+/// turn has begun since the tool was spawned (`next_turn_id == spawn + 1`, since
+/// `begin_turn` hands out `spawn` then advances `next` to `spawn + 1`). Any newer
+/// turn ⇒ a new topic ⇒ record-only (never talk over it).
+fn followup_allowed(spawn_turn_id: u64, next_turn_id: u64, turn_active: bool) -> bool {
+    !turn_active && next_turn_id == spawn_turn_id.saturating_add(1)
+}
+
+/// S3: char-boundary-safe truncation for the history note (avoids unbounded
+/// tool output bloating the context); appends an ellipsis when clipped.
+fn truncate_for_note(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
 /// A speculative LLM turn started on a turn-complete PREDICTION, before the
 /// provider's speech_final. History is staged (never mutated); the reply is
 /// held (no TTS) until the final confirms the transcript.
@@ -649,6 +669,126 @@ impl ConversationOrchestrator {
             .speak_if_epoch(msg, true, allow_interruption, epoch)
             .await;
         false
+    }
+
+    /// S3 (REALTIME_REASONING.md §5): wire the async-tool final sink. When an
+    /// async tool (`cancel_on_interruption=false`) delivers its result, it lands
+    /// here. Captures a `Weak<Self>` so the detached delivery task can re-enter
+    /// the orchestrator without keeping it alive past teardown. The fast and
+    /// reasoning tiers SHARE one registry, so wiring once covers both.
+    pub fn wire_async_sink(self: &Arc<Self>) {
+        let Some(registry) = self.llm.functions() else {
+            return; // no tools registered → nothing to wire
+        };
+        let weak = Arc::downgrade(self);
+        registry.set_async_sink(Arc::new(move |r: crate::core::llm::AsyncToolResult| {
+            let weak = weak.clone();
+            tokio::spawn(async move {
+                if let Some(this) = weak.upgrade() {
+                    this.handle_async_final(r).await;
+                }
+            });
+        }));
+    }
+
+    /// S3: an async tool delivered a result (the public entry point — also wired
+    /// automatically via [`Self::wire_async_sink`]). ALWAYS records it to history
+    /// (the model must see the result on its next turn — it is never lost), then,
+    /// turn-id-gated, optionally VOLUNTEERS it: the bot speaks a follow-up only
+    /// while the spawning turn is still the latest and the line is idle (M6 — a
+    /// stale RAG answer must never talk over a new topic).
+    pub async fn handle_async_final(&self, r: crate::core::llm::AsyncToolResult) {
+        if !r.is_final {
+            return; // progress updates are not volunteered
+        }
+        // Record-to-history (always): a compact, model-readable note.
+        let note = format!(
+            "(Async tool '{}' completed. Result: {})",
+            r.name,
+            truncate_for_note(&r.value.to_string(), 600)
+        );
+        self.llm
+            .append_context(
+                &r.session_id,
+                vec![crate::core::llm::ChatMessage::system(note)],
+            )
+            .await;
+
+        // run_llm=false ⇒ record-only (chain tools without re-inference).
+        if !r.run_llm {
+            crate::core::metrics::bridge::record_degraded("conversation", "async_record_only");
+            return;
+        }
+        // Turn-id gate + turn install, ATOMIC under the turn lock so a real user
+        // turn that starts concurrently is never preempted.
+        match self.try_begin_followup_turn(r.turn_id) {
+            None => {
+                // Superseded (new topic) or mid-turn — do not talk over it. The
+                // result is already in history for the next natural turn.
+                crate::core::metrics::bridge::record_degraded(
+                    "conversation",
+                    "async_followup_gated",
+                );
+                debug!(
+                    session = %self.session_id,
+                    tool = %r.name,
+                    spawn_turn = r.turn_id,
+                    "S3: async result gated (conversation moved on) — recorded, not spoken"
+                );
+            }
+            Some((id, token)) => {
+                self.speak_async_followup(id, token).await;
+            }
+        }
+    }
+
+    /// S3: install a follow-up turn for an async result IFF the conversation has
+    /// not moved on since the tool was spawned — done under the turn lock so the
+    /// decision and the install are atomic (no race with a real user turn).
+    /// Returns the new turn's `(id, token)`, or `None` to record-only.
+    fn try_begin_followup_turn(&self, spawn_turn_id: u64) -> Option<(u64, CancellationToken)> {
+        let mut guard = self.turn.lock();
+        let next = self.next_turn_id.load(std::sync::atomic::Ordering::SeqCst);
+        if !followup_allowed(spawn_turn_id, next, guard.is_some()) {
+            return None;
+        }
+        let id = self
+            .next_turn_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let token = CancellationToken::new();
+        *guard = Some((id, token.clone()));
+        Some((id, token))
+    }
+
+    /// S3: speak the async-tool follow-up. Completes from the (just-augmented)
+    /// history and speaks the result as an ordinary interruptible turn — a
+    /// barge-in cancels it like any other (its token lives in `self.turn`).
+    async fn speak_async_followup(&self, id: u64, token: CancellationToken) {
+        let epoch = self.voice_manager.clear_epoch();
+        let result = self
+            .llm
+            .continue_from_history(&self.session_id, self.config.api_key.as_deref(), &token, None)
+            .await;
+        match result {
+            Ok(resp) if !resp.content.trim().is_empty() => {
+                let text = if self.config.strip_markdown {
+                    crate::core::text::strip_markdown_for_tts(&resp.content)
+                } else {
+                    resp.content
+                };
+                crate::core::metrics::bridge::record_degraded("conversation", "async_followup_spoke");
+                let _ = self
+                    .voice_manager
+                    .speak_if_epoch(&text, true, self.config.allow_interruption, epoch)
+                    .await;
+            }
+            Ok(_) => debug!(session = %self.session_id, "S3 follow-up produced no content"),
+            Err(LlmError::Cancelled) => {
+                debug!(session = %self.session_id, "S3 follow-up cancelled (barge-in)")
+            }
+            Err(e) => warn!(session = %self.session_id, error = %e, "S3 follow-up inference failed"),
+        }
+        self.end_turn(id);
     }
 
     /// Cancel any in-flight LLM turn. Returns true if one was running.
@@ -1050,6 +1190,9 @@ impl ConversationOrchestrator {
                 // can no longer run away on a billing gateway.
                 let tool_opts = crate::core::llm::ToolLoopOptions {
                     max_rounds: self.config.max_llm_calls_per_turn as usize,
+                    // S3: stamp this turn onto any async tool spawned in the loop,
+                    // so its later final is turn-id-gated before being volunteered.
+                    turn_id: id,
                     ..Default::default()
                 };
                 crate::core::llm::run_tool_loop(
@@ -1713,6 +1856,29 @@ mod tests {
         for m in ["gpt-4o-mini", "llama3.2:1b", "claude-haiku-4-5", "gemini-3-flash"] {
             assert!(!is_reasoning_model(m), "{m} is not a reasoning model");
         }
+    }
+
+    #[test]
+    fn s3_followup_allowed_only_when_idle_and_still_latest_turn() {
+        // Tool spawned in turn 5; begin_turn handed out 5 and advanced next→6.
+        // Idle + next==6 ⇒ still the latest turn ⇒ volunteer.
+        assert!(followup_allowed(5, 6, false));
+        // A turn is currently active ⇒ never talk over it.
+        assert!(!followup_allowed(5, 6, true));
+        // A newer turn has since started (next advanced past 6) ⇒ new topic.
+        assert!(!followup_allowed(5, 7, false));
+        assert!(!followup_allowed(5, 99, false));
+        // Degenerate / impossible (next behind spawn) ⇒ never.
+        assert!(!followup_allowed(5, 5, false));
+    }
+
+    #[test]
+    fn s3_truncate_for_note_is_char_safe_and_bounded() {
+        assert_eq!(truncate_for_note("short", 600), "short");
+        let long: String = "é".repeat(1000); // multi-byte chars
+        let out = truncate_for_note(&long, 600);
+        assert_eq!(out.chars().count(), 601, "600 chars + ellipsis");
+        assert!(out.ends_with('…'));
     }
 
     #[test]

@@ -533,6 +533,10 @@ async fn initialize_conversation_loop(
 
     let orchestrator = Arc::new(orchestrator);
 
+    // S3 (REALTIME_REASONING.md §5): wire the async-tool final sink so an async
+    // tool's result is recorded to history and (turn-id-gated) volunteered.
+    orchestrator.wire_async_sink();
+
     // P1.2b eager end-of-turn: a smart-turn PREDICTION (turn-complete before
     // the provider's speech_final) starts a held+staged speculative LLM turn.
     // A-G0: the per-session turn-policy controller. Policy improvements land
