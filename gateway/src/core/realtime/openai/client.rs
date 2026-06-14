@@ -205,6 +205,10 @@ impl OpenAIRealtime {
 
     /// Build the initial session configuration.
     fn build_session_config(&self) -> SessionConfig {
+        let reasoning = self
+            .config
+            .reasoning_effort
+            .and_then(super::messages::RealtimeReasoning::from_effort);
         SessionConfig {
             modalities: Some(vec!["text".to_string(), "audio".to_string()]),
             voice: Some(self.voice.as_str().to_string()),
@@ -253,7 +257,17 @@ impl OpenAIRealtime {
                     .collect()
             }),
             tool_choice: self.config.tool_choice.clone(),
-            temperature: self.config.temperature,
+            // S2S: the cascade reasoning dial mapped onto the realtime session
+            // (Off ⇒ nothing — fail-safe for non-reasoning realtime models).
+            reasoning: reasoning.clone(),
+            // A reasoning realtime session REJECTS an explicit temperature (must be
+            // unset/default with reasoning enabled) — suppress it to avoid a 400 on
+            // session.update, mirroring the cascade Anthropic thinking rule.
+            temperature: if reasoning.is_some() {
+                None
+            } else {
+                self.config.temperature
+            },
             max_response_output_tokens: self.config.max_response_output_tokens.map(|t| {
                 if t < 0 {
                     super::messages::MaxTokens::Infinite("inf".to_string())
@@ -261,12 +275,6 @@ impl OpenAIRealtime {
                     super::messages::MaxTokens::Number(t)
                 }
             }),
-            // S2S: the cascade reasoning dial mapped onto the realtime session
-            // (Off ⇒ nothing — fail-safe for non-reasoning realtime models).
-            reasoning: self
-                .config
-                .reasoning_effort
-                .and_then(super::messages::RealtimeReasoning::from_effort),
         }
     }
 
@@ -1504,6 +1512,40 @@ mod tests {
             !mk(Some(TurnDetectionConfig::None)).emits_user_turn_frames(),
             "explicit None (manual) ⇒ the gateway drives turns"
         );
+    }
+
+    #[test]
+    fn s2s_reasoning_suppresses_temperature() {
+        use crate::core::llm::ReasoningEffort;
+        // A reasoning realtime session REJECTS temperature → it must be dropped.
+        let c = OpenAIRealtime::new(RealtimeConfig {
+            provider: "openai".into(),
+            api_key: "k".into(),
+            model: "gpt-realtime-2".into(),
+            temperature: Some(0.7),
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..Default::default()
+        })
+        .unwrap();
+        let sc = c.build_session_config();
+        assert!(sc.reasoning.is_some(), "reasoning effort mapped onto the session");
+        assert!(
+            sc.temperature.is_none(),
+            "temperature must be suppressed when reasoning is enabled (else session.update 400)"
+        );
+
+        // No reasoning → temperature flows through unchanged.
+        let c2 = OpenAIRealtime::new(RealtimeConfig {
+            provider: "openai".into(),
+            api_key: "k".into(),
+            model: "gpt-4o-realtime-preview".into(),
+            temperature: Some(0.7),
+            ..Default::default()
+        })
+        .unwrap();
+        let sc2 = c2.build_session_config();
+        assert!(sc2.reasoning.is_none());
+        assert!(sc2.temperature.is_some(), "no reasoning ⇒ temperature kept");
     }
 
     #[test]

@@ -264,8 +264,12 @@ impl ConversationWebSocketConfig {
                 .reasoning_budget_ms
                 .unwrap_or(crate::core::conversation::DEFAULT_REASONING_BUDGET_MS),
             degradation_message: self.degradation_message.clone(),
+            // A pure tool-call turn needs ≥1 round to execute its tools and
+            // re-infer; 0 would silently abort every tool turn into dead air, so
+            // floor an explicit value at 1 (mirrors the barge_in_min_words clamp).
             max_llm_calls_per_turn: self
                 .max_llm_calls_per_turn
+                .map(|n| n.max(1))
                 .unwrap_or(crate::core::conversation::DEFAULT_MAX_LLM_CALLS_PER_TURN),
             max_reasoning_tokens: self.max_reasoning_tokens,
         }

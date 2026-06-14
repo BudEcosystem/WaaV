@@ -111,20 +111,10 @@ impl ReasoningEffort {
     }
 
     /// The minimum effort a model can actually honor. Adaptive-thinking-only
-    /// families (Opus 4.7/4.8, Gemini Fable/Mythos, Fable-5) cannot be driven to
-    /// zero reasoning → floor at `Low` so the echoed value is honest. Everything
-    /// else floors at `Off`.
+    /// families cannot be driven to zero reasoning → floor at `Low` so the echoed
+    /// value is honest. Everything else floors at `Off`.
     pub fn floor_for_model(model: &str) -> Self {
-        let m = model.to_ascii_lowercase();
-        let adaptive_only = m.contains("opus-4-7")
-            || m.contains("opus-4.7")
-            || m.contains("opus-4-8")
-            || m.contains("opus-4.8")
-            || m.contains("gemini-fable")
-            || m.contains("gemini-mythos")
-            || m.contains("fable-5")
-            || m.contains("gemini-3-mythos");
-        if adaptive_only { Self::Low } else { Self::Off }
+        if is_adaptive_reasoning_only(model) { Self::Low } else { Self::Off }
     }
 
     /// Raise `self` to at least `floor`.
@@ -146,11 +136,13 @@ impl ReasoningEffort {
 /// Below this, the API 400s — so we don't emit the enabled form (see render).
 const ANTHROPIC_MIN_THINKING_BUDGET: u32 = 1024;
 
-/// Whether an Anthropic model is adaptive-thinking-ONLY (Opus 4.7/4.8, Fable 5):
-/// these REJECT `thinking:{type:"enabled",budget_tokens}` with a 400 and only
-/// honor their built-in adaptive thinking — so we emit no thinking block at all
-/// (the model thinks adaptively by default; budget can't control it).
-fn is_anthropic_adaptive_only(model: &str) -> bool {
+/// SINGLE source of truth for the adaptive-thinking-ONLY model families (Opus
+/// 4.7/4.8, Gemini Fable/Mythos, Fable-5, claude-fable). These cannot be driven
+/// to zero reasoning and REJECT an explicit `thinking:{type:"enabled",budget}`
+/// (Anthropic) — they only honor their built-in adaptive thinking. Both the D1
+/// floor (`floor_for_model`) and the Anthropic render gate
+/// (`is_anthropic_adaptive_only`) derive from this list so they can never drift.
+pub(crate) fn is_adaptive_reasoning_only(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
     m.contains("opus-4-7")
         || m.contains("opus-4.7")
@@ -158,6 +150,16 @@ fn is_anthropic_adaptive_only(model: &str) -> bool {
         || m.contains("opus-4.8")
         || m.contains("fable-5")
         || m.contains("claude-fable")
+        || m.contains("gemini-fable")
+        || m.contains("gemini-mythos")
+        || m.contains("gemini-3-mythos")
+}
+
+/// Whether an Anthropic model is adaptive-thinking-ONLY → emit no thinking block.
+/// (The Anthropic render only runs for Anthropic models, so the gemini entries in
+/// the shared list are inert here.)
+fn is_anthropic_adaptive_only(model: &str) -> bool {
+    is_adaptive_reasoning_only(model)
 }
 
 /// Anthropic extended-thinking budget per effort. The caller MUST further clamp
@@ -652,34 +654,36 @@ impl LlmAdapter for AnthropicAdapter {
         if let Some(sys) = system {
             obj.insert("system".into(), json!(sys));
         }
-        if let Some(t) = cfg.temperature {
-            obj.insert("temperature".into(), json!(t));
-        }
-        if let Some(p) = cfg.top_p {
-            obj.insert("top_p".into(), json!(p));
-        }
         // D1: Anthropic extended thinking (brutal-review hardened). `Off`/`None`
-        // → nothing. EXACTLY ONE param. The `enabled` form requires
-        // `1024 <= budget_tokens < max_tokens`; the voice cap (256) makes that
-        // jointly unsatisfiable, and adaptive-only models (Opus 4.7/4.8, Fable 5)
-        // reject the `enabled` form entirely. So: adaptive-only → emit nothing
-        // (model thinks adaptively by default); otherwise emit `enabled` ONLY when
-        // a valid budget (>= 1024 and < max_tokens) fits — else emit nothing
-        // rather than a guaranteed 400.
-        if let Some(effort) = cfg.reasoning_effort {
-            if effort != ReasoningEffort::Off && !is_anthropic_adaptive_only(&cfg.model) {
-                let max_tok = cfg.max_tokens.unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS);
-                let budget = anthropic_budget_tokens(effort).min(max_tok.saturating_sub(1));
-                if budget >= ANTHROPIC_MIN_THINKING_BUDGET {
-                    obj.insert(
-                        "thinking".into(),
-                        json!({ "type": "enabled", "budget_tokens": budget }),
-                    );
-                }
-                // else: budget can't satisfy [1024, max_tokens) — skip thinking
-                // (no 400). A reasoning Anthropic model on voice needs a higher
-                // explicit max_tokens to actually think.
+        // → nothing. The `enabled` form requires `1024 <= budget_tokens <
+        // max_tokens`; the voice cap (256) makes that jointly unsatisfiable, and
+        // adaptive-only models reject the `enabled` form entirely. So:
+        // adaptive-only → nothing (model thinks adaptively by default); otherwise
+        // emit `enabled` ONLY when a valid budget fits — else nothing rather than
+        // a guaranteed 400. Computed FIRST because thinking is INCOMPATIBLE with
+        // sampling params (temperature/top_p), which we then suppress.
+        let thinking_block: Option<Value> = cfg.reasoning_effort.and_then(|effort| {
+            if effort == ReasoningEffort::Off || is_anthropic_adaptive_only(&cfg.model) {
+                return None;
             }
+            let max_tok = cfg.max_tokens.unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS);
+            let budget = anthropic_budget_tokens(effort).min(max_tok.saturating_sub(1));
+            (budget >= ANTHROPIC_MIN_THINKING_BUDGET)
+                .then(|| json!({ "type": "enabled", "budget_tokens": budget }))
+        });
+        // Sampling params are a hard 400 WITH extended thinking enabled
+        // (temperature must be unset/1.0; top_p/top_k unsupported) — so emit them
+        // ONLY when no thinking block is sent.
+        if thinking_block.is_none() {
+            if let Some(t) = cfg.temperature {
+                obj.insert("temperature".into(), json!(t));
+            }
+            if let Some(p) = cfg.top_p {
+                obj.insert("top_p".into(), json!(p));
+            }
+        }
+        if let Some(thinking) = thinking_block {
+            obj.insert("thinking".into(), thinking);
         }
         if let Some(stop) = &cfg.stop {
             obj.insert("stop_sequences".into(), json!(stop));
@@ -1385,6 +1389,41 @@ mod tests {
         c.reasoning_effort = None;
         let r = AnthropicAdapter.render_request(&convo(), &c, false, None);
         assert!(r.body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn anthropic_thinking_suppresses_temperature_and_top_p() {
+        // Sampling params + extended thinking is a hard 400. When a thinking block
+        // is emitted, temperature/top_p must be dropped (review fix).
+        let mut c = cfg(Some(AdapterKind::Anthropic));
+        c.model = "claude-sonnet-4-5".to_string();
+        c.max_tokens = Some(4000);
+        c.temperature = Some(0.7);
+        c.top_p = Some(0.9);
+        c.reasoning_effort = Some(ReasoningEffort::High);
+        let r = AnthropicAdapter.render_request(&convo(), &c, false, None);
+        assert_eq!(r.body["thinking"]["type"], "enabled", "thinking is on");
+        assert!(
+            r.body.get("temperature").is_none(),
+            "temperature must be suppressed when thinking is enabled (else 400)"
+        );
+        assert!(
+            r.body.get("top_p").is_none(),
+            "top_p must be suppressed when thinking is enabled (else 400)"
+        );
+
+        // No thinking (effort suppressed by a low max_tokens) → sampling params stay.
+        c.max_tokens = Some(256);
+        let r = AnthropicAdapter.render_request(&convo(), &c, false, None);
+        assert!(r.body.get("thinking").is_none());
+        assert!(
+            (r.body["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-3,
+            "no thinking ⇒ temperature kept"
+        );
+        assert!(
+            (r.body["top_p"].as_f64().unwrap() - 0.9).abs() < 1e-3,
+            "no thinking ⇒ top_p kept"
+        );
     }
 
     #[test]

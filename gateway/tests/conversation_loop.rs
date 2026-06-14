@@ -763,6 +763,15 @@ async fn p1_fast_tier_failure_degrades_to_reasoning() {
         1,
         "the reasoning tier served the degraded turn"
     );
+    // The degraded fallback CONTINUES from history — the failed fast tier already
+    // staged the user message, so it must appear EXACTLY ONCE in the fallback
+    // request (no duplicate-user-turn context pollution).
+    let body = reason.requests.lock()[0].to_string();
+    assert_eq!(
+        body.matches("hi there").count(),
+        1,
+        "the user message must not be duplicated in the fallback request: {body}"
+    );
 }
 
 /// Two-tier P1.b: a reasoner that streams NO audio within its first-audio budget

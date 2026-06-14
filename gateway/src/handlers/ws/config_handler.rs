@@ -515,6 +515,47 @@ async fn emit_reasoning_config_warnings(
                 .await;
         }
     }
+    // Reasoning-tier sub-knobs are INERT without a `reasoning_model`:
+    // build_reasoning_tier returns None, so select_tier can never reach the
+    // reasoning tier (route="always" silently runs the FAST model every turn).
+    // Surface it instead of silently ignoring. (reasoning_effort is deliberately
+    // excluded — it also tunes the fast tier, so it is NOT inert.)
+    if conv_config.reasoning_model.is_none() {
+        let mut inert: Vec<&str> = Vec::new();
+        if conv_config.reasoning_route == crate::core::conversation::RoutingMode::Always {
+            inert.push("reasoning_route");
+        }
+        if conv_config.reasoning_base_url.is_some() {
+            inert.push("reasoning_base_url");
+        }
+        if conv_config.reasoning_api_key.is_some() {
+            inert.push("reasoning_api_key");
+        }
+        if conv_config.reasoning_provider_kind.is_some() {
+            inert.push("reasoning_provider_kind");
+        }
+        if conv_config.reasoning_budget_ms.is_some() {
+            inert.push("reasoning_budget_ms");
+        }
+        if conv_config.max_reasoning_tokens.is_some() {
+            inert.push("max_reasoning_tokens");
+        }
+        if !inert.is_empty() {
+            warn!(fields = ?inert, "reasoning-tier fields set without reasoning_model — inert");
+            let _ = message_tx
+                .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
+                    code: "reasoning_tier_without_model".to_string(),
+                    message: format!(
+                        "these reasoning-tier fields are ignored because no `reasoning_model` is \
+                         set, so every turn uses the fast `model`: {}. Set `reasoning_model` to \
+                         enable the two-tier router.",
+                        inert.join(", ")
+                    ),
+                    detail: Some(serde_json::json!({ "ignored_fields": inert })),
+                }))
+                .await;
+        }
+    }
 }
 
 /// the orchestrator. Returns `Ok(true)` when the loop is active.

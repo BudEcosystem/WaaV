@@ -147,16 +147,24 @@ pub struct ConversationConfig {
     /// call-me-again loop on a billing gateway. Default
     /// [`DEFAULT_MAX_LLM_CALLS_PER_TURN`].
     pub max_llm_calls_per_turn: u32,
-    /// P2: hard ceiling on the reasoning tier's output tokens (thinking + answer)
-    /// — the single most direct $ lever, since reasoning models bill every
-    /// thinking token. Clamps the reasoning tier's `max_tokens` to at most this
-    /// (the fast tier is unaffected). `None` = no extra clamp beyond `max_tokens`.
+    /// P2: the reasoning tier's output-token budget (thinking + answer) — the
+    /// single most direct $ lever, since reasoning models bill every thinking
+    /// token. When set it is the reasoning tier's `max_tokens` (a cost ceiling);
+    /// `None` ⇒ the reasoning tier defaults to [`REASONING_DEFAULT_MAX_TOKENS`]
+    /// (or an explicit global `max_tokens` if larger intent), NEVER the fast
+    /// tier's voice cap. The fast tier is unaffected.
     pub max_reasoning_tokens: Option<u32>,
 }
 
 /// P2: default per-turn LLM re-inference ceiling. Matches the built-in tool-loop
 /// bound (`ToolLoopOptions::max_rounds`) so the default preserves prior behavior.
 pub const DEFAULT_MAX_LLM_CALLS_PER_TURN: u32 = 8;
+
+/// The reasoning tier's default output budget when neither `max_reasoning_tokens`
+/// nor a global `max_tokens` is set. Generous enough to clear Anthropic's 1024
+/// thinking floor (+ answer headroom) and give o-series usable reasoning room —
+/// the reasoning tier is decoupled from the fast tier's 256 voice cap.
+pub const REASONING_DEFAULT_MAX_TOKENS: u32 = 4096;
 
 /// P1: default reasoning-tier first-audio budget (ms). Generous enough not to
 /// truncate legitimate deep reasoning, tight enough that a *stuck* reasoner
@@ -294,6 +302,11 @@ pub fn is_reasoning_model(model: &str) -> bool {
         || m.contains("-thinking")
         || m.contains("reasoner")
         || m.contains("qwq")
+        // Adaptive-thinking-only families (opus-4.x, gemini-fable/mythos, fable-5)
+        // reason by construction — the clamp already floors them above Off, so the
+        // eager-disable + advisories must treat them as reasoning models too.
+        || crate::core::llm::ReasoningEffort::floor_for_model(model)
+            != crate::core::llm::ReasoningEffort::Off
 }
 
 /// D3: the built-in action-phrase pool when the operator supplies none. Action
@@ -419,6 +432,15 @@ pub struct ConversationOrchestrator {
 /// S1/S2: build the reasoning tier (sharing `base.histories`) when configured.
 fn build_reasoning_tier(base: &Arc<LlmClient>, config: &ConversationConfig) -> Option<Arc<LlmClient>> {
     let model = config.reasoning_model.clone()?;
+    // The reasoning tier needs room to ACTUALLY think — independent of the fast
+    // tier's voice max_tokens cap (256), which on Anthropic suppresses the
+    // thinking block entirely (it needs budget ≥ 1024 < max_tokens). Default to a
+    // generous reasoning budget; an explicit P2 ceiling (max_reasoning_tokens) or
+    // an explicit global max_tokens override it (the P2 ceiling stays the value).
+    let reasoning_max_tokens = config
+        .max_reasoning_tokens
+        .or(config.max_tokens)
+        .unwrap_or(REASONING_DEFAULT_MAX_TOKENS);
     Some(Arc::new(base.with_tier_overrides(
         model,
         config.reasoning_base_url.clone(),
@@ -426,8 +448,7 @@ fn build_reasoning_tier(base: &Arc<LlmClient>, config: &ConversationConfig) -> O
         config.reasoning_provider_kind,
         // The reasoning tier wants to actually reason — let it (no forced Off).
         config.reasoning_effort.or(Some(crate::core::llm::ReasoningEffort::Low)),
-        // P2: clamp the reasoning tier's output-token budget to the cost ceiling.
-        config.max_reasoning_tokens,
+        Some(reasoning_max_tokens),
     )))
 }
 
@@ -590,36 +611,48 @@ impl ConversationOrchestrator {
     /// either way, so a fatal-stop is never silent.
     async fn speak_degraded(
         &self,
-        transcript: &str,
         primary_is_reasoning: bool,
         epoch: usize,
         allow_interruption: bool,
         token: &CancellationToken,
+        spoke: bool,
     ) -> bool {
         // A real barge-in already cleared this turn — degrading would talk over
         // the caller. The epoch guard below is the final backstop.
         if token.is_cancelled() {
             return false;
         }
+        // A REAL answer already streamed to TTS this turn (mid-stream provider
+        // error after partial audio) — degrading would talk over it. The masking
+        // filler never sets `spoke`, so degrade-after-filler still recovers.
+        if spoke {
+            return false;
+        }
         // The masking filler (if any) has served its purpose; stop it so it
         // cannot fire on top of the degraded answer.
         self.abort_masking();
 
-        // Rung 1: the other tier. A fresh token — the primary's token may have
-        // been cancelled to stop a stuck reasoner.
+        // Rung 1: the other tier. The failed primary already STAGED the user
+        // message into the shared history (prepare_messages runs at request
+        // time), so the fallback CONTINUES from history — never re-appending the
+        // user turn (no duplicate) — and resolves its OWN credential (None
+        // per-call key, so a cross-provider reasoning tier uses reasoning_api_key,
+        // not the fast key). Time-boxed so a stuck fallback can't reintroduce the
+        // dead air P1 exists to remove.
         if let Some(fallback) = self.fallback_tier(primary_is_reasoning) {
             let fb_token = CancellationToken::new();
-            match fallback
-                .complete(
-                    &self.session_id,
-                    transcript,
-                    self.config.api_key.as_deref(),
-                    &fb_token,
-                    None,
-                )
-                .await
-            {
-                Ok(resp) if !resp.content.trim().is_empty() => {
+            let bound_ms = if self.config.reasoning_budget_ms > 0 {
+                self.config.reasoning_budget_ms
+            } else {
+                DEFAULT_REASONING_BUDGET_MS
+            };
+            let fb_result = tokio::time::timeout(
+                Duration::from_millis(bound_ms),
+                fallback.continue_from_history(&self.session_id, None, &fb_token, None),
+            )
+            .await;
+            match fb_result {
+                Ok(Ok(resp)) if !resp.content.trim().is_empty() => {
                     let text = if self.config.strip_markdown {
                         crate::core::text::strip_markdown_for_tts(&resp.content)
                     } else {
@@ -644,11 +677,18 @@ impl ConversationOrchestrator {
                         .await;
                     return true; // recovered on the fallback tier
                 }
-                other => {
+                Ok(other) => {
                     debug!(
                         session = %self.session_id,
                         ok = other.is_ok(),
                         "P1: fallback tier also failed/empty — using canned apology"
+                    );
+                }
+                Err(_elapsed) => {
+                    fb_token.cancel(); // stop the stuck fallback request
+                    warn!(
+                        session = %self.session_id,
+                        bound_ms, "P1: fallback tier exceeded its budget — using canned apology"
                     );
                 }
             }
@@ -701,14 +741,16 @@ impl ConversationOrchestrator {
         if !r.is_final {
             return; // progress updates are not volunteered
         }
-        // Record-to-history (always): a compact, model-readable note.
+        // Record-to-history (always): a compact, model-readable note. Inserted
+        // PAIRING-SAFE so it can never wedge between a concurrent turn's
+        // assistant{tool_calls} and its tool_result (strict-provider 400 brick).
         let note = format!(
             "(Async tool '{}' completed. Result: {})",
             r.name,
             truncate_for_note(&r.value.to_string(), 600)
         );
         self.llm
-            .append_context(
+            .append_context_pairing_safe(
                 &r.session_id,
                 vec![crate::core::llm::ChatMessage::system(note)],
             )
@@ -716,7 +758,7 @@ impl ConversationOrchestrator {
 
         // run_llm=false ⇒ record-only (chain tools without re-inference).
         if !r.run_llm {
-            crate::core::metrics::bridge::record_degraded("conversation", "async_record_only");
+            crate::core::metrics::bridge::record_async_tool("record_only");
             return;
         }
         // Turn-id gate + turn install, ATOMIC under the turn lock so a real user
@@ -725,10 +767,7 @@ impl ConversationOrchestrator {
             None => {
                 // Superseded (new topic) or mid-turn — do not talk over it. The
                 // result is already in history for the next natural turn.
-                crate::core::metrics::bridge::record_degraded(
-                    "conversation",
-                    "async_followup_gated",
-                );
+                crate::core::metrics::bridge::record_async_tool("gated");
                 debug!(
                     session = %self.session_id,
                     tool = %r.name,
@@ -776,7 +815,7 @@ impl ConversationOrchestrator {
                 } else {
                     resp.content
                 };
-                crate::core::metrics::bridge::record_degraded("conversation", "async_followup_spoke");
+                crate::core::metrics::bridge::record_async_tool("spoke");
                 let _ = self
                     .voice_manager
                     .speak_if_epoch(&text, true, self.config.allow_interruption, epoch)
@@ -1284,8 +1323,14 @@ impl ConversationOrchestrator {
                 // apology rather than leaving the caller on a stuck reasoner. A
                 // deliberate budget cancel is never an error to surface, so this
                 // path always completes Ok (the apology covers the worst case).
-                self.speak_degraded(transcript, is_reasoning, epoch, allow_interruption, &token)
-                    .await;
+                self.speak_degraded(
+                    is_reasoning,
+                    epoch,
+                    allow_interruption,
+                    &token,
+                    spoke.load(std::sync::atomic::Ordering::Acquire),
+                )
+                .await;
                 Ok(())
             }
             Err(LlmError::Cancelled) => {
@@ -1317,7 +1362,13 @@ impl ConversationOrchestrator {
                 // already been spoken, so the stop is never silent).
                 warn!(session = %self.session_id, error = %e, "P1: LLM turn failed — degrading");
                 if self
-                    .speak_degraded(transcript, is_reasoning, epoch, allow_interruption, &token)
+                    .speak_degraded(
+                        is_reasoning,
+                        epoch,
+                        allow_interruption,
+                        &token,
+                        spoke.load(std::sync::atomic::Ordering::Acquire),
+                    )
                     .await
                 {
                     Ok(())
@@ -1850,7 +1901,21 @@ mod tests {
 
     #[test]
     fn is_reasoning_model_matrix() {
-        for m in ["o1-mini", "o3", "o4-mini", "deepseek-r1:1.5b", "gpt-5-thinking", "qwq-32b"] {
+        for m in [
+            "o1-mini",
+            "o3",
+            "o4-mini",
+            "deepseek-r1:1.5b",
+            "gpt-5-thinking",
+            "qwq-32b",
+            // Adaptive-thinking-only families: the clamp floors them above Off, so
+            // is_reasoning_model must also classify them (eager-disable + advisory).
+            "claude-opus-4-8",
+            "claude-opus-4.7",
+            "gemini-fable",
+            "gemini-3-mythos",
+            "fable-5",
+        ] {
             assert!(is_reasoning_model(m), "{m} is a reasoning model");
         }
         for m in ["gpt-4o-mini", "llama3.2:1b", "claude-haiku-4-5", "gemini-3-flash"] {

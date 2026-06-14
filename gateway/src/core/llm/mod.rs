@@ -579,6 +579,25 @@ impl ConversationHistory {
         }
     }
 
+    /// Insert a context message WITHOUT breaking an open `tool_use` pairing.
+    /// If the tail is an `assistant{tool_calls}` still awaiting its tool results
+    /// (e.g. an async-tool note landing mid-tool-loop), insert BEFORE that
+    /// assistant message so the imminent `tool_result` still immediately follows
+    /// its `tool_use` — strict providers (Anthropic) 400 otherwise. Else append.
+    pub fn add_pairing_safe(&mut self, message: ChatMessage) {
+        let tail_is_open_tool_use = self.messages.last().is_some_and(|m| {
+            m.role == MessageRole::Assistant
+                && m.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty())
+        });
+        if tail_is_open_tool_use {
+            self.version = self.version.wrapping_add(1);
+            let idx = self.messages.len() - 1;
+            self.messages.insert(idx, message);
+        } else {
+            self.add(message);
+        }
+    }
+
     pub fn messages(&self) -> &[ChatMessage] {
         &self.messages
     }
@@ -716,7 +735,7 @@ impl LlmClient {
         api_key: Option<String>,
         provider_kind: Option<AdapterKind>,
         reasoning_effort: Option<ReasoningEffort>,
-        max_tokens_clamp: Option<u32>,
+        max_tokens_override: Option<u32>,
     ) -> Self {
         let mut config = self.config.clone();
         config.model = model;
@@ -729,10 +748,12 @@ impl LlmClient {
         // The reasoning tier may use its own vendor; otherwise inherit.
         config.provider_kind = provider_kind.or(config.provider_kind);
         config.reasoning_effort = reasoning_effort;
-        // P2: a reasoning-token ceiling clamps the priciest tier's output budget
-        // (thinking + answer) to at most the configured cap — never raises it.
-        if let Some(ceil) = max_tokens_clamp {
-            config.max_tokens = Some(config.max_tokens.map_or(ceil, |existing| existing.min(ceil)));
+        // The reasoning tier's output budget is set EXPLICITLY by the caller
+        // (build_reasoning_tier computes a think-capable value bounded by the P2
+        // ceiling) — it must NOT inherit the fast tier's voice max_tokens cap,
+        // which would suppress Anthropic's thinking block entirely.
+        if let Some(mt) = max_tokens_override {
+            config.max_tokens = Some(mt);
         }
         let kind = adapter::select_adapter(&config).kind();
         Self {
@@ -1328,6 +1349,20 @@ impl LlmClient {
         }
     }
 
+    /// S3: append context messages pairing-safely — used for async-tool result
+    /// notes, which can land while a (different) turn's tool loop has an open
+    /// `assistant{tool_calls}` awaiting results. Inserts before any such open
+    /// tool_use so the pairing the tool loop is about to complete stays intact.
+    pub async fn append_context_pairing_safe(&self, session_id: &str, messages: Vec<ChatMessage>) {
+        let mut histories = self.histories.write().await;
+        let history = histories
+            .entry(session_id.to_string())
+            .or_insert_with(|| ConversationHistory::new(self.config.max_history));
+        for m in messages {
+            history.add_pairing_safe(m);
+        }
+    }
+
     /// REPLACE a session's context wholesale (B-G3 flows: RESET strategy).
     pub async fn set_context(&self, session_id: &str, messages: Vec<ChatMessage>) {
         let mut histories = self.histories.write().await;
@@ -1534,6 +1569,41 @@ mod tests {
         history.add(ChatMessage::user("Great"));
         assert!(history.messages.len() <= 6);
         assert_eq!(history.messages[0].role, MessageRole::System);
+    }
+
+    #[test]
+    fn add_pairing_safe_inserts_before_open_tool_use() {
+        let mut h = ConversationHistory::new(20);
+        h.add(ChatMessage::user("book a flight"));
+        // An assistant turn with an OPEN tool_use (awaiting its tool result).
+        let mut asst = ChatMessage::assistant("");
+        asst.tool_calls = Some(vec![ToolCall {
+            id: "c1".into(),
+            call_type: "function".into(),
+            function: FunctionCall { name: "book".into(), arguments: "{}".into() },
+        }]);
+        h.add(asst);
+
+        // An async-tool note lands mid-tool-loop: it must NOT wedge between the
+        // tool_use and its imminent tool_result (strict-provider 400).
+        h.add_pairing_safe(ChatMessage::system("async note"));
+        let msgs = h.messages();
+        let last = msgs.last().unwrap();
+        assert_eq!(last.role, MessageRole::Assistant);
+        assert!(
+            last.tool_calls.as_ref().is_some_and(|t| !t.is_empty()),
+            "the open tool_use must stay at the tail so its result still pairs"
+        );
+        assert_eq!(msgs[msgs.len() - 2].role, MessageRole::System, "note inserted before it");
+
+        // Close the pairing with a tool result; now the tail is NOT an open
+        // tool_use, so add_pairing_safe appends normally.
+        let mut tool = ChatMessage::user("");
+        tool.role = MessageRole::Tool;
+        tool.tool_call_id = Some("c1".into());
+        h.add(tool);
+        h.add_pairing_safe(ChatMessage::system("second note"));
+        assert_eq!(h.messages().last().unwrap().role, MessageRole::System, "appended at tail");
     }
 
     #[test]

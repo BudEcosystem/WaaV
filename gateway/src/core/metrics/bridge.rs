@@ -506,6 +506,13 @@ pub fn record_degraded(component: &'static str, reason: &'static str) {
     counter!("waav_degraded_total", "component" => component, "reason" => reason).increment(1);
 }
 
+/// S3 async-tool lifecycle counter (`spoke` | `record_only` | `gated`). These are
+/// NORMAL outcomes — kept OFF `waav_degraded_total` so degradation alerting is not
+/// polluted by healthy async-tool operation.
+pub fn record_async_tool(outcome: &'static str) {
+    counter!("waav_async_tool_total", "outcome" => outcome).increment(1);
+}
+
 /// Observe a per-DAG-node wall time (ms) on `waav_dag_node_ms`.
 ///
 /// Cardinality guard: node ids are operator-authored but still free-form
