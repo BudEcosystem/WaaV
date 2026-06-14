@@ -868,9 +868,25 @@ impl ConversationOrchestrator {
     /// here. Captures a `Weak<Self>` so the detached delivery task can re-enter
     /// the orchestrator without keeping it alive past teardown. The fast and
     /// reasoning tiers SHARE one registry, so wiring once covers both.
+    ///
+    /// REACHABILITY (FOLLOWUP §2.4): the WS conversation config has NO tool-
+    /// registration surface today (`LlmClient::with_functions` has no conv-path
+    /// caller), so on the conversation path `self.llm.functions()` is `None` and
+    /// this is a NO-OP — async tools are currently reachable only via the DAG LLM
+    /// node. Wiring the full webhook-tools surface onto the conversation config is
+    /// a scoped opt-in feature (SSRF resolve-and-pin, cross-vendor tool rendering)
+    /// gated on an operator request, deferred per the follow-up plan. The sink
+    /// machinery below is correct and unit-tested for when that surface lands.
     pub fn wire_async_sink(self: &Arc<Self>) {
         let Some(registry) = self.llm.functions() else {
-            return; // no tools registered → nothing to wire
+            // Honest no-op (not a silent one): no registry ⇒ no async tools on
+            // this path. See the reachability note above.
+            debug!(
+                session = %self.session_id,
+                "S3 async-tool sink not wired: no tool registry on the conversation path \
+                 (async tools are DAG-only today — FOLLOWUP §2.4)"
+            );
+            return;
         };
         let weak = Arc::downgrade(self);
         registry.set_async_sink(Arc::new(move |r: crate::core::llm::AsyncToolResult| {
