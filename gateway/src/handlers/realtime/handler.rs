@@ -667,6 +667,7 @@ async fn handle_session_update(
         temperature: config.temperature,
         max_response_output_tokens: config.max_response_tokens,
         modalities: config.modalities,
+        reasoning_effort: config.reasoning_effort, // S2S
         ..Default::default()
     };
 
@@ -758,6 +759,7 @@ fn build_realtime_config(api_key: String, config: &RealtimeSessionConfig) -> Rea
         turn_detection,
         tools,
         modalities: config.modalities.clone(),
+        reasoning_effort: config.reasoning_effort, // S2S
         ..Default::default()
     }
 }

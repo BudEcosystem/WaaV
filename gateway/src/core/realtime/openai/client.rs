@@ -261,6 +261,12 @@ impl OpenAIRealtime {
                     super::messages::MaxTokens::Number(t)
                 }
             }),
+            // S2S: the cascade reasoning dial mapped onto the realtime session
+            // (Off ⇒ nothing — fail-safe for non-reasoning realtime models).
+            reasoning: self
+                .config
+                .reasoning_effort
+                .and_then(super::messages::RealtimeReasoning::from_effort),
         }
     }
 

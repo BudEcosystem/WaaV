@@ -86,6 +86,31 @@ pub struct SessionConfig {
     /// Maximum response output tokens
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_response_output_tokens: Option<MaxTokens>,
+
+    /// S2S (REALTIME_REASONING.md §6): reasoning effort for reasoning-capable
+    /// realtime models (e.g. gpt-realtime-2). Omitted for non-reasoning models
+    /// (they reject the field) — the same fail-safe as the cascade `Off` rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<RealtimeReasoning>,
+}
+
+/// S2S: native realtime reasoning control mapped from the cascade `ReasoningEffort`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RealtimeReasoning {
+    /// `"minimal" | "low" | "medium" | "high"` — never emitted for `Off`.
+    pub effort: String,
+}
+
+impl RealtimeReasoning {
+    /// Map the cascade dial to the realtime field. `Off`/`None` ⇒ `None` (send
+    /// nothing — a non-reasoning realtime model 400s on the field, exactly like
+    /// the cascade adapter's no-param rule for `Off`).
+    pub fn from_effort(effort: crate::core::llm::ReasoningEffort) -> Option<Self> {
+        use crate::core::llm::ReasoningEffort;
+        (effort != ReasoningEffort::Off).then(|| Self {
+            effort: effort.as_str().to_string(),
+        })
+    }
 }
 
 /// Maximum tokens configuration.
@@ -824,11 +849,47 @@ mod tests {
                 tool_choice: None,
                 temperature: None,
                 max_response_output_tokens: None,
+                reasoning: None,
             },
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("session.update"));
         assert!(json.contains("alloy"));
+        // S2S: with no reasoning effort, the field is omitted entirely.
+        assert!(!json.contains("reasoning"));
+    }
+
+    #[test]
+    fn s2s_reasoning_maps_effort_off_omits_field() {
+        use crate::core::llm::ReasoningEffort;
+        // Off / None ⇒ no field (a non-reasoning realtime model rejects it).
+        assert_eq!(RealtimeReasoning::from_effort(ReasoningEffort::Off), None);
+        // A real effort ⇒ the native reasoning.effort string.
+        assert_eq!(
+            RealtimeReasoning::from_effort(ReasoningEffort::Low),
+            Some(RealtimeReasoning { effort: "low".to_string() })
+        );
+        assert_eq!(
+            RealtimeReasoning::from_effort(ReasoningEffort::High),
+            Some(RealtimeReasoning { effort: "high".to_string() })
+        );
+        // And it serializes under the `reasoning.effort` shape.
+        let cfg = SessionConfig {
+            modalities: None,
+            instructions: None,
+            voice: None,
+            input_audio_format: None,
+            output_audio_format: None,
+            input_audio_transcription: None,
+            turn_detection: None,
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_response_output_tokens: None,
+            reasoning: RealtimeReasoning::from_effort(ReasoningEffort::Low),
+        };
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["reasoning"]["effort"], "low");
     }
 
     #[test]

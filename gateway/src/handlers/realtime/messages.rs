@@ -128,6 +128,12 @@ pub struct RealtimeSessionConfig {
     /// Output audio format override
     #[serde(default)]
     pub output_audio_format: Option<String>,
+
+    /// S2S (REALTIME_REASONING.md §6): reasoning effort for reasoning-capable
+    /// realtime models (e.g. gpt-realtime-2). `minimal|low|medium|high`; `off`
+    /// (or omitted) sends nothing — recommended start for production voice: `low`.
+    #[serde(default)]
+    pub reasoning_effort: Option<crate::core::llm::ReasoningEffort>,
 }
 
 /// Turn detection configuration
