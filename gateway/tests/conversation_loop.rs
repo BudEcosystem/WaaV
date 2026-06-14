@@ -593,6 +593,67 @@ async fn latency_filler_does_not_poison_interruptibility() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// S1/S2 two-tier: complex turns route to the reasoning model, simple turns stay
+// on the fast model (both sharing history).
+// ──────────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+#[serial_test::serial]
+async fn two_tier_routes_complex_to_reasoning_simple_to_fast() {
+    use waav_gateway::core::conversation::RoutingMode;
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    // Two endpoints with distinct replies so we can see which tier ran.
+    let fast_state = LlmMockState::default();
+    *fast_state.reply.lock() = "Fast reply.".to_string();
+    let fast_url = start_llm_mock(fast_state.clone()).await;
+    let reason_state = LlmMockState::default();
+    *reason_state.reply.lock() = "Reasoned reply.".to_string();
+    let reason_url = start_llm_mock(reason_state.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+
+    let cfg = ConversationConfig {
+        reasoning_model: Some("reasoning-mock".to_string()),
+        reasoning_base_url: Some(reason_url),
+        reasoning_route: RoutingMode::Auto,
+        latency_filler: LatencyFiller::Off, // isolate routing from masking
+        ..conv_config(fast_url, false)
+    };
+    let orch =
+        Arc::new(ConversationOrchestrator::new("session-2tier", cfg, vm.clone()).expect("orch"));
+
+    // Simple turn → fast tier; complex turn → reasoning tier.
+    orch.run_turn("hi there").await.ok();
+    orch.run_turn("can you calculate my refund").await.ok();
+
+    let spoken = TTS_STATS.spoken.lock().clone();
+    assert!(
+        spoken.iter().any(|s| s.contains("Fast reply")),
+        "the simple turn must run on the fast tier: {spoken:?}"
+    );
+    assert!(
+        spoken.iter().any(|s| s.contains("Reasoned reply")),
+        "the complex turn must escalate to the reasoning tier: {spoken:?}"
+    );
+    assert_eq!(
+        reason_state.requests.lock().len(),
+        1,
+        "exactly the one complex turn hit the reasoning endpoint"
+    );
+    assert_eq!(
+        fast_state.requests.lock().len(),
+        1,
+        "exactly the one simple turn hit the fast endpoint"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // TEST 3: multi-turn history is preserved (turn 2 includes turn 1).
 // ──────────────────────────────────────────────────────────────────────────────
 #[tokio::test]

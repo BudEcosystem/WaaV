@@ -116,6 +116,20 @@ pub struct ConversationConfig {
     pub latency_filler_after_ms: Option<u64>,
     /// D3: custom masking phrases. Empty = the built-in action-phrase pool.
     pub latency_filler_phrases: Vec<String>,
+    /// S1/S2 (REALTIME_REASONING.md §5): optional slow/reasoning tier. When set,
+    /// complex turns are escalated to this model (sharing the conversation
+    /// history) while the fast `model` handles the rest and the D3 filler masks
+    /// the reasoning latency. `None` = single-tier.
+    pub reasoning_model: Option<String>,
+    /// S1/S2: reasoning-tier base URL (defaults to `base_url` — e.g. one ollama
+    /// endpoint serving both a fast and a reasoning model).
+    pub reasoning_base_url: Option<String>,
+    /// S1/S2: reasoning-tier API key (defaults to `api_key`).
+    pub reasoning_api_key: Option<String>,
+    /// S1/S2: reasoning-tier vendor wire format (defaults to `provider_kind`).
+    pub reasoning_provider_kind: Option<crate::core::llm::AdapterKind>,
+    /// S2: how to route turns between the fast and reasoning tiers.
+    pub reasoning_route: RoutingMode,
 }
 
 impl Default for ConversationConfig {
@@ -141,6 +155,11 @@ impl Default for ConversationConfig {
             latency_filler: LatencyFiller::default(),
             latency_filler_after_ms: None,
             latency_filler_phrases: Vec::new(),
+            reasoning_model: None,
+            reasoning_base_url: None,
+            reasoning_api_key: None,
+            reasoning_provider_kind: None,
+            reasoning_route: RoutingMode::default(),
         }
     }
 }
@@ -177,6 +196,49 @@ impl LatencyFiller {
     pub fn enabled(self) -> bool {
         !matches!(self, LatencyFiller::Off)
     }
+}
+
+/// S2 (REALTIME_REASONING.md §5): when a `reasoning_model` is configured, how to
+/// route each turn between the fast `model` and the slow reasoning tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum RoutingMode {
+    /// (Default) A cheap heuristic escalates only complex turns to the reasoning
+    /// tier; everything else stays on the fast model (lowest latency + cost).
+    #[default]
+    Auto,
+    /// Always escalate to the reasoning tier (the fast model only ever speaks the
+    /// masking opener).
+    Always,
+}
+
+/// S2: cheap per-turn escalation heuristic — does this user turn look like it
+/// needs the reasoning tier (multi-step math/logic/analysis, or a long ask)?
+/// Single-pass lowercase scan; no model call (single-digit µs). The design's
+/// fallback when no trained classifier exists.
+pub fn turn_needs_reasoning(transcript: &str) -> bool {
+    let t = transcript.to_lowercase();
+    const HARD: &[&str] = &[
+        "calculate",
+        "compute",
+        "how many",
+        "how much",
+        "why ",
+        "explain",
+        "compare",
+        "step by step",
+        "reason",
+        "prove",
+        "analy", // analyze/analysis
+        "percent",
+        "interest",
+        "refund",
+        "what's the total",
+        "work out",
+        "figure out",
+    ];
+    t.split_whitespace().count() > 28 || HARD.iter().any(|k| t.contains(k))
 }
 
 /// Cheap heuristic (single &str scan): is this model id known to do extended
@@ -310,6 +372,22 @@ pub struct ConversationOrchestrator {
     /// D3: round-robin index into the filler phrase pool (gentle rotation so the
     /// same phrase doesn't repeat back-to-back).
     masking_phrase_idx: Arc<std::sync::atomic::AtomicUsize>,
+    /// S1/S2: the slow reasoning tier, sharing history with `llm`. `None` =
+    /// single-tier. Built from `config.reasoning_model` via `with_tier_overrides`.
+    reasoning_llm: Option<Arc<LlmClient>>,
+}
+
+/// S1/S2: build the reasoning tier (sharing `base.histories`) when configured.
+fn build_reasoning_tier(base: &Arc<LlmClient>, config: &ConversationConfig) -> Option<Arc<LlmClient>> {
+    let model = config.reasoning_model.clone()?;
+    Some(Arc::new(base.with_tier_overrides(
+        model,
+        config.reasoning_base_url.clone(),
+        config.reasoning_api_key.clone(),
+        config.reasoning_provider_kind,
+        // The reasoning tier wants to actually reason — let it (no forced Off).
+        config.reasoning_effort.or(Some(crate::core::llm::ReasoningEffort::Low)),
+    )))
 }
 
 /// A speculative LLM turn started on a turn-complete PREDICTION, before the
@@ -344,11 +422,18 @@ impl ConversationOrchestrator {
     ) -> Result<Self, ConversationOrchestratorError> {
         validate_llm_url(&config.base_url)
             .map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
+        // S1/S2: the reasoning tier's base_url is ALSO client-supplied — validate
+        // it for SSRF before it is ever used for a request.
+        if let Some(rb) = &config.reasoning_base_url {
+            validate_llm_url(rb).map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
+        }
 
         let llm = Arc::new(LlmClient::new(config.to_client_config()));
+        let reasoning_llm = build_reasoning_tier(&llm, &config);
         Ok(Self {
             session_id: session_id.into(),
             llm,
+            reasoning_llm,
             voice_manager,
             config: Arc::new(config),
             turn: Arc::new(SyncMutex::new(None)),
@@ -373,9 +458,11 @@ impl ConversationOrchestrator {
         llm: Arc<LlmClient>,
         voice_manager: Arc<VoiceManager>,
     ) -> Self {
+        let reasoning_llm = build_reasoning_tier(&llm, &config);
         Self {
             session_id: session_id.into(),
             llm,
+            reasoning_llm,
             voice_manager,
             config: Arc::new(config),
             turn: Arc::new(SyncMutex::new(None)),
@@ -393,6 +480,24 @@ impl ConversationOrchestrator {
 
     /// The shared LLM client (for history inspection / cleanup).
     pub fn llm(&self) -> &Arc<LlmClient> {
+        &self.llm
+    }
+
+    /// S2: pick the LLM tier for this turn. The reasoning tier is used only when
+    /// configured AND (route=Always OR the heuristic flags the turn complex);
+    /// otherwise the fast `model`. Both tiers SHARE history, so escalation
+    /// continues the same conversation.
+    fn select_tier(&self, transcript: &str) -> &Arc<LlmClient> {
+        if let Some(reasoning) = &self.reasoning_llm {
+            let escalate = match self.config.reasoning_route {
+                RoutingMode::Always => true,
+                RoutingMode::Auto => turn_needs_reasoning(transcript),
+            };
+            if escalate {
+                debug!(session = %self.session_id, "S2: escalating turn to the reasoning tier");
+                return reasoning;
+            }
+        }
         &self.llm
     }
 
@@ -504,6 +609,9 @@ impl ConversationOrchestrator {
     /// once. Cancellation (barge-in/teardown) aborts promptly.
     pub async fn run_turn(&self, transcript: &str) -> Result<(), ConversationOrchestratorError> {
         let (id, token) = self.begin_turn();
+        // S2: select the fast or reasoning tier for this turn (both share
+        // history; the D3 filler masks the reasoning tier's latency).
+        let llm = self.select_tier(transcript);
         // Barge-in clear epoch (review wf_85659e16 #5): captured ONCE at
         // turn start; any clear during the turn invalidates every later
         // sentence enqueue of this turn — checked under the TTS lock, so a
@@ -699,8 +807,7 @@ impl ConversationOrchestrator {
             (None, None)
         };
 
-        let result = self
-            .llm
+        let result = llm
             .complete(
                 &self.session_id,
                 transcript,
@@ -728,7 +835,7 @@ impl ConversationOrchestrator {
         let result = match result {
             Ok(response)
                 if !response.tool_calls.is_empty()
-                    && self.llm.functions().is_some_and(|r| !r.is_empty()) =>
+                    && llm.functions().is_some_and(|r| !r.is_empty()) =>
             {
                 // The initial inference COMPLETED (recorded with its
                 // preamble): the streamed accumulator is spent — without
@@ -742,9 +849,9 @@ impl ConversationOrchestrator {
                 // the bot permanently silent after "let me check...").
                 ran_tool_loop = true;
                 let registry =
-                    Arc::clone(self.llm.functions().expect("guarded by condition"));
+                    Arc::clone(llm.functions().expect("guarded by condition"));
                 crate::core::llm::run_tool_loop(
-                    &self.llm,
+                    llm,
                     &registry,
                     &self.session_id,
                     response,
@@ -1346,6 +1453,28 @@ fn validate_llm_url(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_needs_reasoning_heuristic() {
+        // Complex asks escalate.
+        for t in [
+            "can you calculate my refund",
+            "why is the sky blue",
+            "explain how interest works",
+            "compare these two plans step by step",
+            "what's the total of these items",
+        ] {
+            assert!(turn_needs_reasoning(t), "{t:?} should escalate");
+        }
+        // Trivial chit-chat stays on the fast tier.
+        for t in ["hi there", "are you open today", "thanks, bye", "yes please"] {
+            assert!(!turn_needs_reasoning(t), "{t:?} should stay fast");
+        }
+        // A long ask escalates on length alone.
+        let long = format!("i want to {}understand this", "really ".repeat(30));
+        assert!(turn_needs_reasoning(&long));
+        assert_eq!(RoutingMode::default(), RoutingMode::Auto);
+    }
 
     #[test]
     fn is_reasoning_model_matrix() {

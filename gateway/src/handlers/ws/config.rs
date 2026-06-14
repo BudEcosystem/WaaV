@@ -164,6 +164,32 @@ pub struct ConversationWebSocketConfig {
     /// Empty = the built-in pool. Pre-rendered at session start at the call's rate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub latency_filler_phrases: Vec<String>,
+
+    /// S1/S2 (REALTIME_REASONING.md §5): optional slow REASONING tier. Set this
+    /// to a smart-but-slow model (e.g. `o3`, `deepseek-r1`) and keep `model` a
+    /// FAST model — complex turns escalate to the reasoning tier (sharing the
+    /// conversation history) while the fast model handles the rest and the D3
+    /// filler masks the latency. Omitted = single-tier. The ONE field that turns
+    /// two-tier on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(example = "o3"))]
+    pub reasoning_model: Option<String>,
+    /// S1/S2: reasoning-tier base URL (defaults to `base_url` — one endpoint can
+    /// serve both a fast and a reasoning model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_base_url: Option<String>,
+    /// S1/S2: reasoning-tier API key (literal or `${ENV_VAR}`; defaults to `api_key`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_api_key: Option<String>,
+    /// S1/S2: reasoning-tier vendor wire format (defaults to `provider_kind`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, example = "openai"))]
+    pub reasoning_provider_kind: Option<crate::core::llm::AdapterKind>,
+    /// S2: route turns between tiers — `auto` (default; a heuristic escalates only
+    /// complex turns) or `always` (every turn uses the reasoning tier).
+    #[serde(default)]
+    #[cfg_attr(feature = "openapi", schema(example = "auto"))]
+    pub reasoning_route: crate::core::conversation::RoutingMode,
 }
 
 fn default_strip_markdown() -> bool {
@@ -206,6 +232,11 @@ impl ConversationWebSocketConfig {
             latency_filler: self.latency_filler,
             latency_filler_after_ms: self.latency_filler_after_ms,
             latency_filler_phrases: self.latency_filler_phrases.clone(),
+            reasoning_model: self.reasoning_model.clone(),
+            reasoning_base_url: self.reasoning_base_url.clone(),
+            reasoning_api_key: self.reasoning_api_key.clone(),
+            reasoning_provider_kind: self.reasoning_provider_kind,
+            reasoning_route: self.reasoning_route,
         }
     }
 }

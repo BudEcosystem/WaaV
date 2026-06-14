@@ -108,6 +108,7 @@ use crate::handlers::{
         ConversationWebSocketConfig,
         crate::core::llm::ReasoningEffort,
         crate::core::conversation::LatencyFiller,
+        crate::core::conversation::RoutingMode,
         Pronunciation,
         // Standardized advanced-feature vocabulary (carried across the dispatch boundary)
         SttFeatures,

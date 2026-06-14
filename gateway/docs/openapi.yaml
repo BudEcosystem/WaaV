@@ -712,6 +712,18 @@ components:
             LLM vendor wire format (B-G1): `"openai"` (default) | `"anthropic"` |
             `"gemini"`. Omitted = OpenAI-compatible, with canonical-host inference.
           example: anthropic
+        reasoning_api_key:
+          type:
+          - string
+          - 'null'
+          description: 'S1/S2: reasoning-tier API key (literal or `${ENV_VAR}`; defaults to `api_key`).'
+        reasoning_base_url:
+          type:
+          - string
+          - 'null'
+          description: |-
+            S1/S2: reasoning-tier base URL (defaults to `base_url` — one endpoint can
+            serve both a fast and a reasoning model).
         reasoning_effort:
           oneOf:
           - type: 'null'
@@ -723,6 +735,29 @@ components:
               adaptive-only model can't go below its floor; the applied/floor values
               are echoed back in the config-ack). Omitted = vendor default. Keep a
               FAST, non-reasoning model on the spoken path for realtime latency.
+        reasoning_model:
+          type:
+          - string
+          - 'null'
+          description: |-
+            S1/S2 (REALTIME_REASONING.md §5): optional slow REASONING tier. Set this
+            to a smart-but-slow model (e.g. `o3`, `deepseek-r1`) and keep `model` a
+            FAST model — complex turns escalate to the reasoning tier (sharing the
+            conversation history) while the fast model handles the rest and the D3
+            filler masks the latency. Omitted = single-tier. The ONE field that turns
+            two-tier on.
+          example: o3
+        reasoning_provider_kind:
+          type:
+          - string
+          - 'null'
+          description: 'S1/S2: reasoning-tier vendor wire format (defaults to `provider_kind`).'
+          example: openai
+        reasoning_route:
+          $ref: '#/components/schemas/RoutingMode'
+          description: |-
+            S2: route turns between tiers — `auto` (default; a heuristic escalates only
+            complex turns) or `always` (every turn uses the reasoning tier).
         streaming:
           type: boolean
           description: Stream tokens to TTS as they arrive (default true).
@@ -1797,10 +1832,14 @@ components:
         because some 2026 models are adaptive-thinking-only and have a floor — the
         resolved value is echoed back to the client so the floor is observable.
 
-        Cascade (Chat-Completions) wire forms, EXACTLY ONE param per vendor:
-        - OpenAI: flat string `reasoning_effort` (`Off`→`"none"`);
-        - Anthropic: `thinking { type:"enabled", budget_tokens }` (`Off`→omit);
-        - Gemini: `generationConfig.thinkingConfig.thinkingBudget` (`Off`→`0`) —
+        Cascade (Chat-Completions) wire forms, AT MOST ONE param per vendor. `Off`/
+        `None` emit NOTHING on every vendor: a non-reasoning model 400s on any
+        thinking param (live-verified against ollama "does not support thinking"),
+        so the safe floor is to send no param at all rather than an explicit zero.
+        - OpenAI: flat string `reasoning_effort` (`Off`→omit);
+        - Anthropic: `thinking { type:"enabled", budget_tokens }` (`Off`→omit;
+          adaptive-only models that reject the param also omit);
+        - Gemini: `generationConfig.thinkingConfig.thinkingBudget` (`Off`→omit) —
           never paired with `thinkingLevel` (that 400s).
       enum:
       - off
@@ -1985,6 +2024,14 @@ components:
           description: Number of current participants in the room
           example: 2
           minimum: 0
+    RoutingMode:
+      type: string
+      description: |-
+        S2 (REALTIME_REASONING.md §5): when a `reasoning_model` is configured, how to
+        route each turn between the fast `model` and the slow reasoning tier.
+      enum:
+      - auto
+      - always
     SIPTransferErrorResponse:
       type: object
       description: |-

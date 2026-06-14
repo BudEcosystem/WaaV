@@ -63,10 +63,14 @@ impl AdapterKind {
 /// because some 2026 models are adaptive-thinking-only and have a floor — the
 /// resolved value is echoed back to the client so the floor is observable.
 ///
-/// Cascade (Chat-Completions) wire forms, EXACTLY ONE param per vendor:
-/// - OpenAI: flat string `reasoning_effort` (`Off`→`"none"`);
-/// - Anthropic: `thinking { type:"enabled", budget_tokens }` (`Off`→omit);
-/// - Gemini: `generationConfig.thinkingConfig.thinkingBudget` (`Off`→`0`) —
+/// Cascade (Chat-Completions) wire forms, AT MOST ONE param per vendor. `Off`/
+/// `None` emit NOTHING on every vendor: a non-reasoning model 400s on any
+/// thinking param (live-verified against ollama "does not support thinking"),
+/// so the safe floor is to send no param at all rather than an explicit zero.
+/// - OpenAI: flat string `reasoning_effort` (`Off`→omit);
+/// - Anthropic: `thinking { type:"enabled", budget_tokens }` (`Off`→omit;
+///   adaptive-only models that reject the param also omit);
+/// - Gemini: `generationConfig.thinkingConfig.thinkingBudget` (`Off`→omit) —
 ///   never paired with `thinkingLevel` (that 400s).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1323,8 +1327,8 @@ mod tests {
 
     #[test]
     fn openai_maps_reasoning_effort_flat_string() {
-        // Some(Low) → flat top-level `reasoning_effort: "low"`; Off → "none";
-        // None → key absent. EXACTLY ONE param: never a nested reasoning object.
+        // Some(Low) → flat top-level `reasoning_effort: "low"`; Off → key absent;
+        // None → key absent. AT MOST ONE param: never a nested reasoning object.
         let mut c = cfg(None);
         c.reasoning_effort = Some(ReasoningEffort::Low);
         let r = OpenAiAdapter.render_request(&convo(), &c, false, None);

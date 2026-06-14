@@ -704,6 +704,40 @@ impl LlmClient {
         }
     }
 
+    /// S1/S2 (REALTIME_REASONING.md §5): clone this client as a second TIER —
+    /// a different model/endpoint/effort — while SHARING the per-session history
+    /// (the canonical context is vendor-neutral, so the fast tier and the slow
+    /// reasoning tier see the SAME conversation; an escalated turn continues it
+    /// rather than starting fresh). Overrides that are `None` inherit the base.
+    pub fn with_tier_overrides(
+        &self,
+        model: String,
+        base_url: Option<String>,
+        api_key: Option<String>,
+        provider_kind: Option<AdapterKind>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Self {
+        let mut config = self.config.clone();
+        config.model = model;
+        if let Some(b) = base_url {
+            config.base_url = b;
+        }
+        if let Some(k) = api_key {
+            config.api_key = Some(k);
+        }
+        // The reasoning tier may use its own vendor; otherwise inherit.
+        config.provider_kind = provider_kind.or(config.provider_kind);
+        config.reasoning_effort = reasoning_effort;
+        let kind = adapter::select_adapter(&config).kind();
+        Self {
+            adapter: adapter::adapter_for(kind),
+            config,
+            client: self.client.clone(),
+            histories: Arc::clone(&self.histories),
+            functions: self.functions.clone(),
+        }
+    }
+
     /// The active vendor adapter kind.
     pub fn adapter_kind(&self) -> AdapterKind {
         self.adapter.kind()

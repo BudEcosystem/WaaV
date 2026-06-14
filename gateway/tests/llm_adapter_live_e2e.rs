@@ -163,6 +163,69 @@ async fn d1_reasoning_effort_live_ollama() {
     eprintln!("[live d1] fast={:?} reason={:?}", r.content, r2.content);
 }
 
+/// S1/S2 LIVE (credential-free, ollama): the two tiers (fast llama + reasoning
+/// deepseek-r1) built via with_tier_overrides SHARE conversation history — an
+/// escalated turn continues the same conversation rather than starting fresh.
+#[tokio::test]
+async fn s2_two_tier_shares_history_live_ollama() {
+    let Some(base) = ollama_base() else { return };
+    let fast = LlmClient::new(LlmClientConfig {
+        base_url: base,
+        model: "llama3.2:1b".into(),
+        api_key: Some("ollama".into()),
+        system_prompt: Some("Answer in one short sentence.".into()),
+        // A reasoning model spends tokens on its <think> block before answering;
+        // a tiny fast-tuned budget is wholly consumed by reasoning and yields empty
+        // content. The reasoning tier needs token headroom (real-world tuning note).
+        max_tokens: Some(512),
+        streaming: false,
+        ..Default::default()
+    });
+    // Reasoning tier shares the fast tier's per-session history.
+    let reasoning = fast.with_tier_overrides(
+        "deepseek-r1:1.5b".into(),
+        None,
+        None,
+        None,
+        Some(ReasoningEffort::Low),
+    );
+    let cancel = CancellationToken::new();
+
+    // Turn 1 on the FAST tier seeds a fact into the conversation history.
+    fast.complete("2tier", "My name is Waav. Reply with just OK.", None, &cancel, None)
+        .await
+        .expect("fast tier turn 1");
+    // Turn 2 ESCALATED to the reasoning tier — runs live against the real model
+    // (proves the escalated round-trip works end to end).
+    let r = reasoning
+        .complete("2tier", "What is my name? Reply with one word.", None, &cancel, None)
+        .await
+        .expect("reasoning tier turn 2");
+    eprintln!("[live s2] reasoning tier replied: {:?}", r.content);
+
+    // DETERMINISTIC proof of the shared-history Arc (independent of model quality):
+    // both tiers observe the SAME conversation, and the reasoning tier sees the
+    // fast tier's turn-1 message — i.e. an escalated turn continues, not restarts.
+    let fast_hist = fast.history_snapshot("2tier").await;
+    let reason_hist = reasoning.history_snapshot("2tier").await;
+    assert_eq!(
+        fast_hist.len(),
+        reason_hist.len(),
+        "both tiers must observe the one shared history (same Arc)"
+    );
+    assert!(
+        fast_hist.len() >= 4,
+        "two completed turns ⇒ ≥4 messages, got {}: {fast_hist:?}",
+        fast_hist.len()
+    );
+    assert!(
+        reason_hist
+            .iter()
+            .any(|m| m.content.as_deref().is_some_and(|c| c.contains("My name is Waav"))),
+        "the reasoning tier must see the fast tier's turn-1 message in shared history: {reason_hist:?}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // B-G4 LIVE gate: a real parallel 2-tool call (`get_weather` + `get_time`)
 // through the server-side tool loop — exactly one follow-up inference whose
