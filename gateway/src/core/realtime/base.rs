@@ -25,7 +25,7 @@ use thiserror::Error;
 // =============================================================================
 
 /// Errors that can occur during realtime operations.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum RealtimeError {
     /// Connection to the provider failed
     #[error("Connection failed: {0}")]

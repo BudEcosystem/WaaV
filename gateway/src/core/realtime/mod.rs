@@ -50,6 +50,7 @@
 mod base;
 pub mod hume;
 pub mod openai;
+pub mod scaffold;
 
 pub use base::{
     AudioOutputCallback, BaseRealtime, BoxedRealtime, ConnectionState, FunctionCallCallback,
