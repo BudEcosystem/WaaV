@@ -457,6 +457,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_is_synchronously_ready() {
+        // Review finding #1: after connect().await returns Ok, the session MUST be
+        // ready (the consumer sends audio immediately) — no polling.
+        let (proto, obs) = MockProtocol::new(ProtocolCaps::default(), vec![vec![]]);
+        let mut s = RealtimeSession::from_parts(proto, cfg()).unwrap();
+        s.connect().await.unwrap();
+        assert!(s.is_ready(), "must be ready immediately after connect()");
+        assert_eq!(s.get_connection_state(), ConnectionState::Connected);
+        // session config was sent before readiness was signaled
+        assert!(obs.sent_text().contains(&"session_update".to_string()));
+        s.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn state_changing_methods_fail_fast_when_not_connected() {
+        // Review finding #6: sends before connect must error, not silently buffer.
+        let (proto, _o) = MockProtocol::new(ProtocolCaps::default(), vec![vec![]]);
+        let mut s = RealtimeSession::from_parts(proto, cfg()).unwrap();
+        assert!(matches!(
+            s.create_response().await,
+            Err(crate::core::realtime::RealtimeError::NotConnected)
+        ));
+        assert!(matches!(
+            s.cancel_response().await,
+            Err(crate::core::realtime::RealtimeError::NotConnected)
+        ));
+        assert!(matches!(
+            s.send_text("hi").await,
+            Err(crate::core::realtime::RealtimeError::NotConnected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn server_interruption_emits_cancel_then_truncate() {
+        // Review finding #5: InterruptedByServer must cancel + truncate, not no-op.
+        let script = vec![
+            Step::Text("audio:96".into()), // playback: item1, 2ms received
+            Step::Text("interrupt".into()),
+        ];
+        let (proto, obs) = MockProtocol::new(ProtocolCaps::default(), vec![script]);
+        let mut s = RealtimeSession::from_parts(proto, cfg()).unwrap();
+        s.connect().await.unwrap();
+        until(|| {
+            let w = obs.sent_text();
+            w.iter().any(|x| x == "cancel") && w.iter().any(|x| x.starts_with("truncate:item1:"))
+        })
+        .await;
+        s.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn truncate_noop_when_provider_lacks_support() {
         let caps = ProtocolCaps {
             supports_truncate: false,

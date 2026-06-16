@@ -43,8 +43,12 @@ const MIN_STABLE_CONNECTION: Duration = Duration::from_secs(5);
 const MAX_CONSECUTIVE_QUICK_FAILURES: u32 = 3;
 
 /// Playback position of the currently-streaming assistant item (for truncate).
+/// `first_delta` anchors WALL-CLOCK elapsed so a barge-in truncates to what the
+/// user ACTUALLY heard — `min(elapsed, received)` — never beyond received audio
+/// (the OpenAI API 400s on over-truncate). Matches `openai/client.rs`.
 struct ItemPlayback {
     item_id: String,
+    first_delta: Instant,
     duration_ms: u64,
 }
 
@@ -141,6 +145,7 @@ impl DispatchCtx {
                         _ => {
                             *pb = Some(ItemPlayback {
                                 item_id: item_id.clone().unwrap_or_default(),
+                                first_delta: Instant::now(),
                                 duration_ms: chunk_ms,
                             });
                         }
@@ -266,7 +271,12 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
     }
 
     /// Serialize one wire message and queue it for the supervisor to send.
+    /// Fails fast when not connected (e.g. mid-reconnect) rather than silently
+    /// buffering frames the live socket will never carry (review finding #6).
     async fn push_wire(&self, wire: P::Wire) -> RealtimeResult<()> {
+        if !self.connected.load(Ordering::SeqCst) {
+            return Err(RealtimeError::NotConnected);
+        }
         let frame = self.protocol.serialize(&wire)?;
         let guard = self.out_tx.lock().await;
         let tx = guard.as_ref().ok_or(RealtimeError::NotConnected)?;
@@ -299,11 +309,16 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
         resilience: Option<ResilienceHandles>,
         ctx: DispatchCtx,
         reconnection_cb: Arc<Mutex<Option<ReconnectionCallback>>>,
+        ready_tx: Option<tokio::sync::oneshot::Sender<RealtimeResult<()>>>,
     ) {
         let provider_id = protocol.provider_id();
         let mut attempt: u32 = 0;
         let mut quick_failures: u32 = 0;
         let mut is_reconnect = false;
+        // Resolves `connect()` on the FIRST successful connect (or a terminal
+        // failure before ever connecting) — the sync-readiness contract the
+        // consumer relies on (review finding #1).
+        let mut ready_tx = ready_tx;
 
         'outer: loop {
             // ── (re)connect ──
@@ -311,42 +326,57 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(provider = provider_id, error = %e, "connect_spec failed");
+                    Self::signal_ready(&mut ready_tx, Err(RealtimeError::ConnectionFailed(e.to_string())));
                     break 'outer;
                 }
             };
 
-            // Resilience: a tripped breaker DEFERS the dial (storm control) — don't
-            // hammer a known-down provider. Back off and re-evaluate next tick.
-            if let Some(r) = &resilience {
-                if !r.breaker.allow_request() {
-                    tracing::warn!(provider = provider_id, "circuit breaker open; deferring dial");
-                    crate::core::metrics::bridge::record_reconnect(provider_id, "circuit_open");
-                    if !Self::should_continue(&intentional_disconnect, &reconnect_cfg, attempt) {
-                        break 'outer;
+            // Resilience participates ONLY on RECONNECT dials (matches the proven
+            // OpenAI loop): a NEW session must not be deferred by an open breaker
+            // nor consume a governor permit (review finding #3).
+            if is_reconnect {
+                if let Some(r) = &resilience {
+                    if !r.breaker.allow_request() {
+                        tracing::warn!(provider = provider_id, "circuit breaker open; deferring dial");
+                        crate::core::metrics::bridge::record_reconnect(provider_id, "circuit_open");
+                        if !Self::should_continue(&intentional_disconnect, &reconnect_cfg, attempt) {
+                            break 'outer;
+                        }
+                        attempt += 1;
+                        tokio::time::sleep(Duration::from_millis(
+                            reconnect_cfg.calculate_delay(attempt),
+                        ))
+                        .await;
+                        continue 'outer;
                     }
-                    attempt += 1;
-                    tokio::time::sleep(Duration::from_millis(
-                        reconnect_cfg.calculate_delay(attempt),
-                    ))
-                    .await;
-                    continue 'outer;
                 }
             }
-            // Hold a governor permit across the dial (process-wide concurrency cap).
-            let _permit = match &resilience {
-                Some(r) => Some(r.governor.acquire().await),
-                None => None,
-            };
 
             let resumption = ctx.resumption.read().await.clone();
-            let mut transport = match factory.connect(spec).await {
+            // The governor permit is scoped to the DIAL ONLY (not the backoff
+            // sleep), and only on reconnects (review findings #2, #3).
+            let dial = {
+                let _permit = if is_reconnect {
+                    match &resilience {
+                        Some(r) => Some(r.governor.acquire().await),
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                factory.connect(spec).await
+            };
+            let mut transport = match dial {
                 Ok(t) => t,
                 Err(e) => {
-                    if let Some(r) = &resilience {
-                        r.breaker.record_failure();
+                    if is_reconnect {
+                        if let Some(r) = &resilience {
+                            r.breaker.record_failure();
+                        }
                     }
                     tracing::warn!(provider = provider_id, error = %e, attempt, "dial failed");
                     if !Self::should_continue(&intentional_disconnect, &reconnect_cfg, attempt) {
+                        Self::signal_ready(&mut ready_tx, Err(RealtimeError::ConnectionFailed(e.to_string())));
                         Self::notify_reconnect(&reconnection_cb, attempt, false, Some(e.to_string())).await;
                         break 'outer;
                     }
@@ -355,7 +385,6 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
                     continue 'outer;
                 }
             };
-            drop(_permit);
             let connected_at = Instant::now();
 
             // Send session config; replay context on reconnect.
@@ -373,14 +402,16 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
                         }
                     }
                 }
+                if let Some(r) = &resilience {
+                    r.breaker.record_success();
+                }
                 Self::notify_reconnect(&reconnection_cb, attempt, true, None).await;
-            }
-            if let Some(r) = &resilience {
-                r.breaker.record_success();
             }
             crate::core::metrics::bridge::record_reconnect(provider_id, "connected");
             connected.store(true, Ordering::SeqCst);
             *state.write().unwrap() = ConnectionState::Connected;
+            // First connect succeeded → unblock connect().
+            Self::signal_ready(&mut ready_tx, Ok(()));
             attempt = 0;
 
             // ── inner loop: pump outbound + dispatch inbound ──
@@ -401,7 +432,34 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
                     inbound = transport.recv() => match inbound {
                         Some(Ok(frame)) => {
                             for ev in protocol.map_server_event(frame.as_inbound()) {
-                                ctx.dispatch(ev).await;
+                                // A SERVER-side barge-in must cancel + truncate
+                                // server state to what the user actually heard
+                                // (review finding #5). The supervisor — not the
+                                // dispatcher — does this because only it holds the
+                                // protocol + transport.
+                                if matches!(ev, S2sEvent::InterruptedByServer) {
+                                    let target = {
+                                        let mut pb = ctx.playback.lock().unwrap();
+                                        pb.take().map(|p| {
+                                            let elapsed = p.first_delta.elapsed().as_millis() as u64;
+                                            (p.item_id, clamp_truncate_ms(elapsed, p.duration_ms))
+                                        })
+                                    };
+                                    for w in protocol.cancel_response() {
+                                        if let Ok(f) = protocol.serialize(&w) {
+                                            let _ = transport.send(f).await;
+                                        }
+                                    }
+                                    if let Some((item, end)) = target {
+                                        for w in protocol.truncate(&item, end) {
+                                            if let Ok(f) = protocol.serialize(&w) {
+                                                let _ = transport.send(f).await;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    ctx.dispatch(ev).await;
+                                }
                             }
                         }
                         Some(Err(e)) => {
@@ -447,6 +505,17 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
         }
     }
 
+    /// Resolve the one-shot readiness signal exactly once (first connect or
+    /// terminal pre-connect failure).
+    fn signal_ready(
+        tx: &mut Option<tokio::sync::oneshot::Sender<RealtimeResult<()>>>,
+        result: RealtimeResult<()>,
+    ) {
+        if let Some(s) = tx.take() {
+            let _ = s.send(result);
+        }
+    }
+
     fn should_continue(
         intentional: &AtomicBool,
         cfg: &ReconnectionConfig,
@@ -488,6 +557,7 @@ impl<P: RealtimeProtocol> BaseRealtime for RealtimeSession<P> {
 
         let (tx, rx) = mpsc::channel::<OutFrame>(OUT_CHANNEL_CAPACITY);
         *self.out_tx.lock().await = Some(tx);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
         let handle = tokio::spawn(Self::supervisor(
             self.protocol.clone(),
@@ -501,9 +571,18 @@ impl<P: RealtimeProtocol> BaseRealtime for RealtimeSession<P> {
             self.resilience.clone(),
             self.cb.clone(),
             self.reconnection_cb.clone(),
+            Some(ready_tx),
         ));
         *self.connection_handle.lock().await = Some(handle);
-        Ok(())
+        // Block until the first connect succeeds (or terminally fails) so a caller
+        // that sends audio immediately after `connect().await` sees `is_ready()`
+        // (the sync-readiness contract — review finding #1).
+        match ready_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(RealtimeError::ConnectionFailed(
+                "supervisor exited before connecting".into(),
+            )),
+        }
     }
 
     async fn disconnect(&mut self) -> RealtimeResult<()> {
@@ -639,8 +718,10 @@ impl<P: RealtimeProtocol> BaseRealtime for RealtimeSession<P> {
         let target = {
             let mut pb = self.cb.playback.lock().unwrap();
             pb.take().map(|p| {
-                // Without per-chunk wall-clock we clamp to received duration.
-                let end = clamp_truncate_ms(p.duration_ms, p.duration_ms);
+                // Clamp to what the user ACTUALLY heard: min(wall-clock elapsed
+                // since the first audio delta, received duration).
+                let elapsed_ms = p.first_delta.elapsed().as_millis() as u64;
+                let end = clamp_truncate_ms(elapsed_ms, p.duration_ms);
                 (p.item_id, end)
             })
         };
