@@ -916,6 +916,73 @@ impl RealtimeProviderNode {
         &self.provider
     }
 
+    /// Build the [`RealtimeConfig`] for this node from its `config` blob.
+    ///
+    /// The HTTP `/realtime` path plumbs the FULL feature surface to the provider
+    /// (turn_detection / input_audio_noise_reduction / input_audio_transcription /
+    /// tools / reasoning_effort / instructions / voice / temperature /
+    /// max_response_output_tokens / modalities). A realtime provider used AS A DAG
+    /// NODE gets the same surface here: the node's `config` JSON (set via
+    /// [`with_config`](Self::with_config)) is deserialized straight into a
+    /// `RealtimeConfig` (every field is `#[serde(default)]`, so a partial — or
+    /// absent — config just leaves the rest at default), THEN the authoritative
+    /// fields are overridden so the config JSON can never subvert provider/credential
+    /// resolution:
+    /// - `provider` ← the node's provider (the registry key the node was built with);
+    /// - `model` ← the node's `with_model` when set & non-empty, else whatever the
+    ///   config JSON supplied (kept so providers that require a model still get one);
+    /// - `api_key` ← [`resolve_node_credential`] (env/`${VAR}`-indirection + literal),
+    ///   falling back to whatever the config deserialized (an empty key is rejected by
+    ///   the OpenAI realtime provider — review wf_d43814c3 #10).
+    ///
+    /// SECURITY (SSRF): `realtime_endpoint_override` is FORCED to `None` — it is a
+    /// server-config-only upstream redirect (see [`RealtimeConfig::realtime_endpoint_override`])
+    /// and must never be reachable from a DAG definition's untrusted `config` blob, the
+    /// same invariant the HTTP converter holds.
+    pub(crate) fn build_node_realtime_config(&self) -> RealtimeConfig {
+        // A Null config (the default when no `with_config`) is NOT valid input to
+        // `from_value` for a struct — map it to the plain default first.
+        let mut realtime_config: RealtimeConfig = if self.config.is_null() {
+            RealtimeConfig::default()
+        } else {
+            // A single malformed field would otherwise SILENTLY drop the whole
+            // feature surface to defaults — log it so a misconfigured node config is
+            // diagnosable (review wf_2b7f9856 #3).
+            serde_json::from_value(self.config.clone()).unwrap_or_else(|e| {
+                tracing::warn!(
+                    node_id = %self.id,
+                    provider = %self.provider,
+                    error = %e,
+                    "realtime DAG node `config` failed to deserialize into RealtimeConfig; \
+                     using defaults (feature surface dropped — check the node config JSON)"
+                );
+                RealtimeConfig::default()
+            })
+        };
+
+        realtime_config.provider = self.provider.clone();
+        if let Some(m) = self.model.clone()
+            && !m.is_empty()
+        {
+            realtime_config.model = m;
+        }
+        // Credential resolution WINS over any `api_key` the config JSON carried, but
+        // fall back to the deserialized key if the resolver found nothing.
+        if let Some(key) = resolve_node_credential(&self.config, "api_key") {
+            realtime_config.api_key = key;
+        }
+        // SSRF: never let a DAG `config` redirect the gateway's upstream connection.
+        // Clear BOTH redirect vectors: `realtime_endpoint_override` (the
+        // server-config-only override) AND `endpoint` (azure resource / inworld
+        // session-id / speechmatics URL — also a connection redirect). A DAG node
+        // that needs a provider endpoint must get it from trusted server config,
+        // exactly as the HTTP path injects `azure_openai_endpoint`. (Review
+        // wf_2b7f9856 #1 — endpoint was previously left settable from the blob.)
+        realtime_config.realtime_endpoint_override = None;
+        realtime_config.endpoint = None;
+        realtime_config
+    }
+
     /// B-G2: get-or-create the persistent session for this node, run one
     /// turn through it, stream audio to the cascade sink, return the
     /// assistant transcript as the node's data output.
@@ -1012,14 +1079,12 @@ impl RealtimeProviderNode {
     /// transcripts → the per-turn slot, `response.done` → the turn notify.
     async fn create_session(&self, ctx: &DAGContext) -> DAGResult<Arc<SessionRealtime>> {
         let registry = crate::plugin::global_registry();
-        let realtime_config = RealtimeConfig {
-            model: self.model.clone().unwrap_or_default(),
-            provider: self.provider.clone(),
-            // review wf_d43814c3 #10: source the key (node config or env);
-            // an empty api_key is rejected by the OpenAI realtime provider.
-            api_key: resolve_node_credential(&self.config, "api_key").unwrap_or_default(),
-            ..Default::default()
-        };
+        // Plumb the FULL feature surface (turn_detection / noise reduction /
+        // transcription / tools / reasoning_effort / instructions / voice /
+        // temperature / max tokens / modalities) from the node's `config`, then
+        // override provider/model/api_key authoritatively. See
+        // [`build_node_realtime_config`](Self::build_node_realtime_config).
+        let realtime_config = self.build_node_realtime_config();
         let realtime = registry
             .create_realtime(&self.provider, realtime_config)
             .map_err(|e| DAGError::RealtimeProviderError {
@@ -1523,6 +1588,136 @@ mod tests {
         assert!(caps.contains(&NodeCapability::TextInput));
         assert!(caps.contains(&NodeCapability::AudioOutput));
         assert!(caps.contains(&NodeCapability::TextOutput));
+    }
+
+    /// A realtime provider used AS A DAG NODE must receive the SAME full feature
+    /// surface the HTTP `/realtime` path plumbs. Before this, `create_session`
+    /// built a MINIMAL `RealtimeConfig` (model/provider/api_key only) so
+    /// turn_detection / noise reduction / transcription / tools / reasoning /
+    /// instructions / voice / temperature / max-tokens / modalities were ALL
+    /// dropped. This asserts the node's `config` blob flows through into the
+    /// `RealtimeConfig` that `create_session` hands the provider.
+    #[test]
+    fn realtime_node_plumbs_full_feature_surface_from_config() {
+        use crate::core::realtime::TurnDetectionConfig;
+
+        let node = RealtimeProviderNode::new("rt-full", "openai")
+            .with_model("gpt-4o-realtime-preview")
+            .with_config(serde_json::json!({
+                "api_key": "sk-literal",
+                "turn_detection": { "type": "server_vad", "threshold": 0.6 },
+                "input_audio_noise_reduction": "near_field",
+                "input_audio_transcription": { "model": "whisper-1" },
+                "instructions": "X",
+                "voice": "alloy",
+                "temperature": 0.5,
+                "max_response_output_tokens": 256,
+                "modalities": ["audio", "text"],
+                "reasoning_effort": "low",
+                "tools": [{
+                    "type": "function",
+                    "function": { "name": "get_weather", "description": "d" }
+                }],
+            }));
+
+        let cfg = node.build_node_realtime_config();
+
+        // Authoritative overrides win.
+        assert_eq!(cfg.provider, "openai");
+        assert_eq!(cfg.model, "gpt-4o-realtime-preview");
+        assert_eq!(cfg.api_key, "sk-literal");
+
+        // The full feature surface flowed through from the config blob.
+        assert!(
+            matches!(
+                cfg.turn_detection,
+                Some(TurnDetectionConfig::ServerVad { threshold: Some(t), .. }) if (t - 0.6).abs() < 1e-6
+            ),
+            "turn_detection not plumbed: {:?}",
+            cfg.turn_detection
+        );
+        assert_eq!(cfg.input_audio_noise_reduction.as_deref(), Some("near_field"));
+        assert_eq!(
+            cfg.input_audio_transcription.as_ref().map(|t| t.model.as_str()),
+            Some("whisper-1")
+        );
+        assert_eq!(cfg.instructions.as_deref(), Some("X"));
+        assert_eq!(cfg.voice.as_deref(), Some("alloy"));
+        assert_eq!(cfg.temperature, Some(0.5));
+        assert_eq!(cfg.max_response_output_tokens, Some(256));
+        assert_eq!(
+            cfg.modalities,
+            Some(vec!["audio".to_string(), "text".to_string()])
+        );
+        assert_eq!(
+            cfg.reasoning_effort,
+            Some(crate::core::llm::ReasoningEffort::Low)
+        );
+        let tools = cfg.tools.expect("tools plumbed");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "get_weather");
+    }
+
+    /// `with_model` (when set & non-empty) WINS over a `model` in the config blob;
+    /// the node's provider always wins over any `provider` in the blob; and a
+    /// config blob can NEVER set `realtime_endpoint_override` (SSRF: it is
+    /// server-config-only). Also: a Null config (no `with_config`) deserializes to
+    /// `RealtimeConfig::default()` rather than erroring.
+    #[test]
+    fn realtime_node_config_cannot_override_authoritative_fields_or_ssrf() {
+        // Null config → default (no panic / error path).
+        let bare = RealtimeProviderNode::new("rt-null", "openai");
+        let cfg = bare.build_node_realtime_config();
+        assert_eq!(cfg.provider, "openai");
+        assert!(cfg.api_key.is_empty());
+        assert!(cfg.realtime_endpoint_override.is_none());
+
+        // A malicious blob tries to hijack provider/model/endpoint.
+        let node = RealtimeProviderNode::new("rt-evil", "openai")
+            .with_model("authoritative-model")
+            .with_config(serde_json::json!({
+                "provider": "attacker",
+                "model": "ignored-by-with_model",
+                "realtime_endpoint_override": "wss://attacker.example/exfil",
+                "endpoint": "wss://attacker.example/exfil2",
+            }));
+        let cfg = node.build_node_realtime_config();
+        assert_eq!(cfg.provider, "openai", "node provider must win over config blob");
+        assert_eq!(
+            cfg.model, "authoritative-model",
+            "with_model must win over config blob"
+        );
+        assert!(
+            cfg.realtime_endpoint_override.is_none(),
+            "SSRF: config blob must NOT set the upstream override"
+        );
+        assert!(
+            cfg.endpoint.is_none(),
+            "SSRF: config blob must NOT set `endpoint` (also a redirect vector)"
+        );
+
+        // Empty with_model must NOT clobber a model supplied by the config blob.
+        let node = RealtimeProviderNode::new("rt-empty-model", "openai")
+            .with_model("")
+            .with_config(serde_json::json!({ "model": "from-config" }));
+        assert_eq!(node.build_node_realtime_config().model, "from-config");
+    }
+
+    /// `${ENV_VAR}` credential indirection works through the node config, and the
+    /// resolved key wins over any literal `api_key` in the blob.
+    #[test]
+    fn realtime_node_resolves_env_credential() {
+        // SAFETY: single-threaded test; unique var name avoids cross-test races.
+        unsafe {
+            std::env::set_var("WAAV_TEST_RT_API_KEY", "sk-from-env");
+        }
+        let node = RealtimeProviderNode::new("rt-env", "openai").with_config(serde_json::json!({
+            "api_key": "${WAAV_TEST_RT_API_KEY}",
+        }));
+        assert_eq!(node.build_node_realtime_config().api_key, "sk-from-env");
+        unsafe {
+            std::env::remove_var("WAAV_TEST_RT_API_KEY");
+        }
     }
 }
 

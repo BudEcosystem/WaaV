@@ -173,7 +173,17 @@ fn rand_jitter(range: f64) -> f64 {
 /// Base configuration for realtime providers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RealtimeConfig {
-    /// API key for authentication
+    /// API key for authentication.
+    ///
+    /// `#[serde(default)]` so the WHOLE struct is deserialize-friendly from a
+    /// partial config blob (every other field already defaults). Without it,
+    /// `serde_json::from_value` on a config that omits `api_key` (e.g. a DAG node
+    /// whose credential comes from the env via `${VAR}` resolution, or any
+    /// feature-only blob) fails on the missing field and silently drops the entire
+    /// feature surface. The credential is always set authoritatively AFTER
+    /// deserialization (HTTP path: `build_realtime_config`; DAG path:
+    /// `RealtimeProviderNode::build_node_realtime_config`).
+    #[serde(default)]
     pub api_key: String,
 
     /// Provider name (e.g., "openai")
