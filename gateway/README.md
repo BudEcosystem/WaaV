@@ -14,7 +14,7 @@ A high-performance real-time voice processing server built in Rust that provides
 - **70+ Cloud Providers**: Comprehensive coverage of global and regional STT/TTS services
   - **STT (27 providers)**: Deepgram, Google Cloud, Azure, ElevenLabs, OpenAI, AssemblyAI, Cartesia, AWS Transcribe, IBM Watson, Groq, Gnani, Sarvam AI, Speechmatics, Gladia, Rev AI, Phonexia, Yandex, Tinkoff, SberDevices, Bhashini, iFlytek, Alibaba Cloud, Baidu, Tencent, Huawei, NAVER CLOVA, and more
   - **TTS (32 providers)**: Deepgram, ElevenLabs, Google Cloud, Azure, OpenAI, Cartesia, AWS Polly, IBM Watson, Hume AI, LMNT, Play.ht, Murf.ai, WellSaid Labs, Resemble AI, Speechify, Unreal Speech, Smallest.ai, and regional providers
-  - **Realtime (2 providers)**: OpenAI `gpt-realtime` (GA Realtime API), Hume EVI (48 emotion dimensions)
+  - **Realtime / Speech-to-Speech (12 providers)**: OpenAI `gpt-realtime` (GA), Hume EVI, Azure OpenAI Realtime, xAI Grok, Inworld, Deepgram Voice Agent, ElevenLabs Conversational AI, Gemini Live, Ultravox, AWS Nova Sonic, Speechmatics Flow, Yandex — on a shared `RealtimeSession<P>` scaffold (reconnect/replay resilience + barge-in), usable via `/realtime` or as a persistent DAG node
 - **Regional Language Support**: India (22 languages), China (25+ with dialects), Southeast Asia (Thai, Vietnamese, Indonesian)
 - **Audio-Disabled Mode**: Development mode without API keys
 
@@ -278,7 +278,7 @@ flowchart TB
         direction LR
         STT_CAP["STTCapability<br/>27 providers"]
         TTS_CAP["TTSCapability<br/>32 providers"]
-        RT_CAP["RealtimeCapability<br/>2 providers"]
+        RT_CAP["RealtimeCapability<br/>12 providers"]
         PROC_CAP["AudioProcessor<br/>VAD, Noise Filter"]
         MW_CAP["Middleware<br/>Auth, Rate Limit"]
         WS_CAP["WSHandler<br/>Custom Messages"]
@@ -320,7 +320,7 @@ graph TB
     subgraph Providers["Provider System (70+ providers)"]
         STT["STT Providers<br/>(27)"]
         TTS["TTS Providers<br/>(32)"]
-        RT["Realtime Providers<br/>(2)"]
+        RT["Realtime Providers<br/>(12)"]
     end
 
     subgraph STTList["STT Providers (27)"]
