@@ -196,6 +196,34 @@ pub fn merge_config(
             .and_then(|p| p.openai_api_key.clone())
     );
 
+    // Azure OpenAI Realtime (OpenAI-protocol clone): api-key + resource/endpoint.
+    let azure_openai_api_key = get_credential!(
+        "AZURE_OPENAI_API_KEY",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.azure_openai_api_key.clone())
+    );
+    let azure_openai_endpoint = get_credential!(
+        "AZURE_OPENAI_ENDPOINT",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.azure_openai_endpoint.clone())
+    );
+
+    // Grok / xAI Realtime (OpenAI GA-compatible wire).
+    let grok_api_key = get_credential!(
+        "GROK_API_KEY",
+        yaml.providers.as_ref().and_then(|p| p.grok_api_key.clone())
+    );
+
+    // Inworld Realtime (OpenAI GA wire).
+    let inworld_api_key = get_credential!(
+        "INWORLD_API_KEY",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.inworld_api_key.clone())
+    );
+
     // AssemblyAI API key (streaming STT)
     let assemblyai_api_key = get_credential!(
         "ASSEMBLYAI_API_KEY",
@@ -614,6 +642,10 @@ pub fn merge_config(
         azure_speech_region,
         cartesia_api_key,
         openai_api_key,
+        azure_openai_api_key,
+        azure_openai_endpoint,
+        grok_api_key,
+        inworld_api_key,
         assemblyai_api_key,
         hume_api_key,
         lmnt_api_key,

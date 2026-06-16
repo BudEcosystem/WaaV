@@ -80,6 +80,16 @@ impl ServerConfig {
         // OpenAI API key (used for STT, TTS, and Realtime API)
         let openai_api_key = env::var("OPENAI_API_KEY").ok();
 
+        // Azure OpenAI Realtime (OpenAI-protocol clone): api-key header + resource.
+        let azure_openai_api_key = env::var("AZURE_OPENAI_API_KEY").ok();
+        let azure_openai_endpoint = env::var("AZURE_OPENAI_ENDPOINT").ok();
+
+        // Grok / xAI Realtime (OpenAI GA-compatible wire, Bearer auth).
+        let grok_api_key = env::var("GROK_API_KEY").ok();
+
+        // Inworld Realtime (OpenAI GA wire, Bearer auth).
+        let inworld_api_key = env::var("INWORLD_API_KEY").ok();
+
         // AssemblyAI API key (used for streaming STT)
         let assemblyai_api_key = env::var("ASSEMBLYAI_API_KEY").ok();
 
@@ -270,6 +280,10 @@ impl ServerConfig {
             azure_speech_region,
             cartesia_api_key,
             openai_api_key,
+            azure_openai_api_key,
+            azure_openai_endpoint,
+            grok_api_key,
+            inworld_api_key,
             assemblyai_api_key,
             hume_api_key,
             lmnt_api_key,

@@ -176,6 +176,18 @@ pub struct ServerConfig {
     pub cartesia_api_key: Option<String>,
     /// OpenAI API key for STT (Whisper), TTS, and Realtime API
     pub openai_api_key: Option<String>,
+    /// Azure OpenAI Realtime API key (sent as the `api-key` header). The realtime
+    /// wire is the OpenAI GA wire reused by delegation; only the endpoint + auth
+    /// differ. Distinct from `azure_speech_subscription_key` (Speech Services).
+    pub azure_openai_api_key: Option<String>,
+    /// Azure OpenAI resource/endpoint for the Realtime API — either a bare
+    /// resource name (`my-resource`) or a full host/URL
+    /// (`https://my-resource.openai.azure.com`). Required for the `azure` realtime provider.
+    pub azure_openai_endpoint: Option<String>,
+    /// Grok / xAI Realtime API key (Bearer auth). OpenAI GA-compatible wire.
+    pub grok_api_key: Option<String>,
+    /// Inworld Realtime API key (Bearer auth). OpenAI GA wire reused by delegation.
+    pub inworld_api_key: Option<String>,
     /// AssemblyAI API key for streaming STT
     pub assemblyai_api_key: Option<String>,
     /// Hume AI API key for TTS (Octave) and EVI (Empathic Voice Interface)
@@ -306,6 +318,15 @@ impl Drop for ServerConfig {
             key.zeroize();
         }
         if let Some(ref mut key) = self.openai_api_key {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.azure_openai_api_key {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.grok_api_key {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.inworld_api_key {
             key.zeroize();
         }
         if let Some(ref mut key) = self.assemblyai_api_key {
@@ -744,6 +765,10 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -818,6 +843,10 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -881,6 +910,10 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -947,6 +980,10 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1013,6 +1050,10 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1085,6 +1126,10 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1144,6 +1189,10 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1205,6 +1254,10 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1267,6 +1320,10 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1328,6 +1385,10 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1399,6 +1460,10 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1464,6 +1529,10 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1528,6 +1597,10 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1592,6 +1665,10 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1661,6 +1738,10 @@ mod tests {
             azure_speech_region: Some("westus2".to_string()),
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1724,6 +1805,10 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1790,6 +1875,10 @@ mod tests {
             azure_speech_region: Some("westeurope".to_string()),
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1851,6 +1940,10 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,

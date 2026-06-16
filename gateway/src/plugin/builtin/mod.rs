@@ -18,10 +18,14 @@
 //!   Tinkoff, SberDevices, Bhashini, iFlytek, Alibaba Cloud, Baidu, Tencent,
 //!   Huawei Cloud, NAVER CLOVA, Zalo AI, FPT.AI, Viettel AI, Prosa.ai, NECTEC
 //!
-//! ## Realtime Providers (2)
-//! - OpenAI, Hume EVI
+//! ## Realtime Providers (5)
+//! - OpenAI, Hume EVI, Azure OpenAI, Grok/xAI, Inworld
+//!   (Azure/Grok/Inworld are OpenAI-protocol clones reusing the GA wire.)
 
-use crate::core::realtime::{BaseRealtime, HumeEVI, OpenAIRealtime, RealtimeConfig, RealtimeError};
+use crate::core::realtime::{
+    AzureRealtime, BaseRealtime, GrokRealtime, HumeEVI, InworldRealtime, OpenAIRealtime,
+    RealtimeConfig, RealtimeError,
+};
 use crate::core::stt::{
     AmiVoiceSTT, AssemblyAISTT, AwsTranscribeSTT, AzureSTT, BaiduStt, BaseSTT, BhashiniStt,
     CartesiaSTT, DashScopeStt, DeepgramSTT, ElevenLabsSTT, FptStt, GladiaSTT, GnaniSTT, GoogleSTT,
@@ -1266,6 +1270,26 @@ fn hume_evi_realtime_metadata() -> ProviderMetadata {
         .with_features(["full-duplex", "emotion-analysis", "prosody-scores"])
 }
 
+fn azure_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("azure", "Azure OpenAI Realtime")
+        .with_description("Azure OpenAI Realtime — OpenAI GA wire on the Azure endpoint (api-key auth)")
+        .with_aliases(["azure-openai", "azure_openai"])
+        .with_features(["full-duplex", "function-calling", "turn-detection"])
+}
+
+fn grok_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("grok", "Grok / xAI Realtime")
+        .with_description("xAI Grok Realtime — OpenAI GA-compatible wire (endpoint best-known)")
+        .with_alias("xai")
+        .with_features(["full-duplex", "function-calling", "turn-detection"])
+}
+
+fn inworld_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("inworld", "Inworld Realtime")
+        .with_description("Inworld Realtime — OpenAI GA wire (endpoint best-known)")
+        .with_features(["full-duplex", "function-calling", "turn-detection"])
+}
+
 // ============================================================================
 // STT Factory Functions
 // ============================================================================
@@ -1562,6 +1586,18 @@ fn create_hume_evi_realtime(
     config: RealtimeConfig,
 ) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
     Ok(Box::new(HumeEVI::new(config)?))
+}
+
+fn create_azure_realtime(config: RealtimeConfig) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(AzureRealtime::new(config)?))
+}
+
+fn create_grok_realtime(config: RealtimeConfig) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(GrokRealtime::new(config)?))
+}
+
+fn create_inworld_realtime(config: RealtimeConfig) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(InworldRealtime::new(config)?))
 }
 
 // ============================================================================
@@ -1916,6 +1952,20 @@ inventory::submit! {
         .with_aliases(&["hume_evi", "hume-evi", "evi"])
 }
 
+inventory::submit! {
+    PluginConstructor::realtime("azure", azure_realtime_metadata, create_azure_realtime)
+        .with_aliases(&["azure-openai", "azure_openai"])
+}
+
+inventory::submit! {
+    PluginConstructor::realtime("grok", grok_realtime_metadata, create_grok_realtime)
+        .with_aliases(&["xai"])
+}
+
+inventory::submit! {
+    PluginConstructor::realtime("inworld", inworld_realtime_metadata, create_inworld_realtime)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::plugin::registry::global_registry;
@@ -2079,10 +2129,17 @@ mod tests {
     fn test_builtin_realtime_providers_registered() {
         let registry = global_registry();
 
-        // Both realtime providers should be registered
+        // All 5 realtime providers should be registered.
         assert!(registry.has_realtime_provider("openai"));
         assert!(registry.has_realtime_provider("hume"));
         assert!(registry.has_realtime_provider("evi")); // alias
+        // OpenAI-protocol clones.
+        assert!(registry.has_realtime_provider("azure"));
+        assert!(registry.has_realtime_provider("azure-openai")); // alias
+        assert!(registry.has_realtime_provider("azure_openai")); // alias
+        assert!(registry.has_realtime_provider("grok"));
+        assert!(registry.has_realtime_provider("xai")); // alias
+        assert!(registry.has_realtime_provider("inworld"));
     }
 
     #[test]

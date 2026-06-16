@@ -121,6 +121,14 @@ pub struct ProvidersYaml {
     pub cartesia_api_key: Option<String>,
     /// OpenAI API key for STT (Whisper), TTS, and Realtime API
     pub openai_api_key: Option<String>,
+    /// Azure OpenAI Realtime API key (api-key header)
+    pub azure_openai_api_key: Option<String>,
+    /// Azure OpenAI resource/endpoint for the Realtime API
+    pub azure_openai_endpoint: Option<String>,
+    /// Grok / xAI Realtime API key (Bearer auth)
+    pub grok_api_key: Option<String>,
+    /// Inworld Realtime API key (Bearer auth)
+    pub inworld_api_key: Option<String>,
     /// AssemblyAI API key for streaming STT
     pub assemblyai_api_key: Option<String>,
     /// Hume AI API key for TTS (Octave) and EVI

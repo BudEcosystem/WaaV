@@ -34,16 +34,21 @@ use crate::core::realtime::scaffold::{
 /// The OpenAI Realtime protocol. Stateless: model/voice/audio_format are the only
 /// provider-specific config the wire mappings need (everything else is read from
 /// the [`RealtimeConfig`] passed back into `build_session_config`).
+///
+/// `pub(crate)` (struct + fields) so the OpenAI-PROTOCOL CLONES (Azure / Grok /
+/// Inworld realtime) can EMBED it and DELEGATE every wire method to it — the GA
+/// wire is then byte-identical for the shared parts (only the endpoint/auth and
+/// the rare bootstrap event differ).
 pub struct OpenAiProtocol {
-    model: OpenAIRealtimeModel,
-    voice: OpenAIRealtimeVoice,
-    audio_format: OpenAIRealtimeAudioFormat,
+    pub(crate) model: OpenAIRealtimeModel,
+    pub(crate) voice: OpenAIRealtimeVoice,
+    pub(crate) audio_format: OpenAIRealtimeAudioFormat,
     /// review wf_d43814c3 #7: OpenAI's `session.turn_detection` defaults to server
     /// VAD ON, and WaaV OMITS the field when `config.turn_detection` is None
     /// (`skip_serializing_if`), so the server STILL runs VAD and produces turn
     /// frames. Server VAD is therefore on UNLESS the config explicitly selects the
     /// `None` (manual) variant. Computed once at `from_config`.
-    emits_user_turn_frames: bool,
+    pub(crate) emits_user_turn_frames: bool,
 }
 
 impl OpenAiProtocol {

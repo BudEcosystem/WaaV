@@ -472,6 +472,12 @@ async fn handle_config(
     let api_key = match provider_name.to_lowercase().as_str() {
         "openai" => app_state.config.openai_api_key.clone(),
         "hume" => app_state.config.hume_api_key.clone(),
+        // OpenAI-protocol clones (own credentials, GA wire reused by delegation).
+        "azure" | "azure-openai" | "azure_openai" => {
+            app_state.config.azure_openai_api_key.clone()
+        }
+        "grok" | "xai" => app_state.config.grok_api_key.clone(),
+        "inworld" => app_state.config.inworld_api_key.clone(),
         _ => None,
     };
 
@@ -488,7 +494,15 @@ async fn handle_config(
     };
 
     // Build realtime config from session config
-    let realtime_config = build_realtime_config(api_key, &config);
+    let mut realtime_config = build_realtime_config(api_key, &config);
+    // Azure OpenAI Realtime needs the server-configured resource/endpoint (the
+    // `<resource>.openai.azure.com` host) — it is NOT a client-session field.
+    if matches!(
+        provider_name.to_lowercase().as_str(),
+        "azure" | "azure-openai" | "azure_openai"
+    ) {
+        realtime_config.endpoint = app_state.config.azure_openai_endpoint.clone();
+    }
 
     // Create provider
     let mut provider = match create_realtime_provider(provider_name, realtime_config) {

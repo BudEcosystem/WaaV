@@ -241,6 +241,14 @@ pub struct RealtimeConfig {
     #[serde(default)]
     pub input_audio_noise_reduction: Option<String>,
 
+    /// Provider endpoint / resource override. Used by OpenAI-protocol CLONES that
+    /// reuse the GA wire on a DIFFERENT host: Azure OpenAI Realtime reads its
+    /// resource here (the `<resource>.openai.azure.com` host, or a full `wss://…`
+    /// base URL). OpenAI itself ignores it (the URL is fixed). `None` ⇒ the clone
+    /// falls back to its documented default host.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+
     /// Reconnection configuration for automatic reconnection on connection loss.
     #[serde(default)]
     pub reconnection: Option<ReconnectionConfig>,

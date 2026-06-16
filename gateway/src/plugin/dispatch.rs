@@ -197,6 +197,12 @@ impl BuiltinTTSProvider {
 pub enum BuiltinRealtimeProvider {
     OpenAI = 0,
     Hume = 1,
+    /// Azure OpenAI Realtime — OpenAI-protocol clone (GA wire, `api-key` header).
+    Azure = 2,
+    /// Grok / xAI Realtime — OpenAI-protocol clone (GA-compatible wire).
+    Grok = 3,
+    /// Inworld Realtime — OpenAI-protocol clone (GA wire).
+    Inworld = 4,
 }
 
 impl BuiltinRealtimeProvider {
@@ -206,6 +212,9 @@ impl BuiltinRealtimeProvider {
         match self {
             Self::OpenAI => "openai",
             Self::Hume => "hume",
+            Self::Azure => "azure",
+            Self::Grok => "grok",
+            Self::Inworld => "inworld",
         }
     }
 }
@@ -426,10 +435,18 @@ pub static REALTIME_PROVIDER_MAP: phf::Map<&'static str, BuiltinRealtimeProvider
     // Primary names
     "openai" => BuiltinRealtimeProvider::OpenAI,
     "hume" => BuiltinRealtimeProvider::Hume,
+    "azure" => BuiltinRealtimeProvider::Azure,
+    "grok" => BuiltinRealtimeProvider::Grok,
+    "inworld" => BuiltinRealtimeProvider::Inworld,
     // Aliases
     "hume_evi" => BuiltinRealtimeProvider::Hume,
     "hume-evi" => BuiltinRealtimeProvider::Hume,
     "evi" => BuiltinRealtimeProvider::Hume,
+    // Azure OpenAI Realtime aliases.
+    "azure-openai" => BuiltinRealtimeProvider::Azure,
+    "azure_openai" => BuiltinRealtimeProvider::Azure,
+    // xAI alias.
+    "xai" => BuiltinRealtimeProvider::Grok,
 };
 
 // =============================================================================
@@ -547,7 +564,7 @@ pub const BUILTIN_STT_COUNT: usize = 25;
 pub const BUILTIN_TTS_COUNT: usize = 29;
 
 /// Number of built-in Realtime providers
-pub const BUILTIN_REALTIME_COUNT: usize = 2;
+pub const BUILTIN_REALTIME_COUNT: usize = 5;
 
 /// Total number of built-in providers
 pub const TOTAL_BUILTIN_PROVIDERS: usize =
@@ -620,7 +637,8 @@ pub const BUILTIN_TTS_NAMES: [&str; BUILTIN_TTS_COUNT] = [
 ];
 
 /// All built-in Realtime provider names (canonical only, no aliases)
-pub const BUILTIN_REALTIME_NAMES: [&str; BUILTIN_REALTIME_COUNT] = ["openai", "hume"];
+pub const BUILTIN_REALTIME_NAMES: [&str; BUILTIN_REALTIME_COUNT] =
+    ["openai", "hume", "azure", "grok", "inworld"];
 
 #[cfg(test)]
 mod tests {

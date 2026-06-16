@@ -64,7 +64,9 @@
 mod client;
 mod config;
 mod messages;
-mod protocol;
+// `pub(crate)` so the OpenAI-PROTOCOL CLONES (Azure / Grok / Inworld realtime)
+// can embed `OpenAiProtocol` and delegate the GA wire to it.
+pub(crate) mod protocol;
 
 pub use client::OpenAIRealtime;
 pub use config::{

@@ -48,7 +48,10 @@
 //! ```
 
 mod base;
+pub mod azure;
+pub mod grok;
 pub mod hume;
+pub mod inworld;
 pub mod openai;
 pub mod scaffold;
 
@@ -61,10 +64,13 @@ pub use base::{
     SpeechEvent, SpeechEventCallback, ToolDefinition, TranscriptCallback, TranscriptResult,
     TranscriptRole, TurnDetectionConfig, clamp_truncate_ms, run_barge_in_sequence,
 };
+pub use azure::{AzureProtocol, AzureRealtime};
+pub use grok::{GrokProtocol, GrokRealtime};
 pub use hume::{
     EVIVersion, HUME_EVI_DEFAULT_SAMPLE_RATE, HUME_EVI_WEBSOCKET_URL, HumeEVI, HumeEVIConfig,
     ProsodyScores,
 };
+pub use inworld::{InworldProtocol, InworldRealtime};
 pub use openai::{
     Modality, OPENAI_REALTIME_SAMPLE_RATE, OPENAI_REALTIME_URL, OpenAIRealtime,
     OpenAIRealtimeAudioFormat, OpenAIRealtimeModel, OpenAIRealtimeVoice,
@@ -138,8 +144,11 @@ pub fn create_realtime_provider_from_enum(
 }
 
 /// Get list of supported realtime providers.
+///
+/// `azure`/`grok`/`inworld` are OpenAI-PROTOCOL CLONES (they reuse the GA wire via
+/// the embedded [`OpenAiProtocol`](openai::OpenAiProtocol) by delegation).
 pub fn get_supported_realtime_providers() -> Vec<&'static str> {
-    vec!["openai", "hume"]
+    vec!["openai", "hume", "azure", "grok", "inworld"]
 }
 
 #[cfg(test)]
@@ -176,7 +185,11 @@ mod tests {
         let providers = get_supported_realtime_providers();
         assert!(providers.contains(&"openai"));
         assert!(providers.contains(&"hume"));
-        assert_eq!(providers.len(), 2);
+        // OpenAI-protocol clones.
+        assert!(providers.contains(&"azure"));
+        assert!(providers.contains(&"grok"));
+        assert!(providers.contains(&"inworld"));
+        assert_eq!(providers.len(), 5);
     }
 
     #[test]
