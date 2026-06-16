@@ -133,6 +133,8 @@ pub struct ProvidersYaml {
     pub gemini_api_key: Option<String>,
     /// Ultravox API key for the Ultravox hosted S2S realtime provider (`X-API-Key`)
     pub ultravox_api_key: Option<String>,
+    /// Speechmatics API key (JWT / temp-token) — STT/TTS + Flow (Voice AI) realtime
+    pub speechmatics_api_key: Option<String>,
     /// AssemblyAI API key for streaming STT
     pub assemblyai_api_key: Option<String>,
     /// Hume AI API key for TTS (Octave) and EVI

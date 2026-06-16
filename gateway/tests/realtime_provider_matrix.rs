@@ -24,7 +24,7 @@ use waav_gateway::core::realtime::{
 /// set so adding/removing a provider without updating the matrix fails loudly.
 ///
 /// BUMP THIS (and `valid_config_for`) WHEN YOU ADD A REALTIME PROVIDER.
-const EXPECTED_PROVIDERS: [&str; 10] = [
+const EXPECTED_PROVIDERS: [&str; 11] = [
     "openai",
     "hume",
     "azure",
@@ -35,6 +35,7 @@ const EXPECTED_PROVIDERS: [&str; 10] = [
     "gemini",
     "ultravox",
     "nova_sonic",
+    "speechmatics",
 ];
 
 /// The realtime providers that do NOT authenticate with an api-key, so the
@@ -137,6 +138,15 @@ fn valid_config_for(name: &str) -> RealtimeConfig {
         "nova_sonic" => RealtimeConfig {
             model: "amazon.nova-sonic-v1:0".to_string(),
             voice: Some("matthew".to_string()),
+            ..base
+        },
+        // Speechmatics Flow: `from_config` needs a non-empty api key (the Bearer
+        // JWT / temporary token — supplied by `base`); the model maps to the
+        // portal `template_id` (defaults to "default" when omitted). A descriptive
+        // template id + agent voice are supplied.
+        "speechmatics" => RealtimeConfig {
+            model: "flow-service-assistant-amelia".to_string(),
+            voice: Some("amelia".to_string()),
             ..base
         },
         // Hume EVI: only the api key is required (defaults: V3, Linear16, 44.1 kHz).
@@ -256,8 +266,8 @@ fn realtime_provider_registry_count_guardrail() {
     );
     assert_eq!(
         get_supported_realtime_providers().len(),
-        10,
-        "expected EXACTLY 10 realtime providers; bump this when you add a realtime provider"
+        11,
+        "expected EXACTLY 11 realtime providers; bump this when you add a realtime provider"
     );
 }
 

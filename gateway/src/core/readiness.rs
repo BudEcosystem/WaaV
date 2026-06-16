@@ -243,6 +243,7 @@ mod tests {
             inworld_api_key: None,
             gemini_api_key: None,
             ultravox_api_key: None,
+            speechmatics_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,

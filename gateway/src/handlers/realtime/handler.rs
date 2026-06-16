@@ -503,6 +503,10 @@ async fn handle_config(
         // transport resolves SigV4 credentials at connect (exactly like the AWS
         // Transcribe STT provider).
         "nova_sonic" | "nova-sonic" | "aws" => Some(String::new()),
+        // Speechmatics Flow (Voice AI) uses the dedicated Speechmatics API key,
+        // passed as the `Authorization: Bearer <token>` value (a JWT / temporary
+        // token). The same credential the Speechmatics STT/TTS providers use.
+        "speechmatics" | "flow" => app_state.config.speechmatics_api_key.clone(),
         _ => None,
     };
 

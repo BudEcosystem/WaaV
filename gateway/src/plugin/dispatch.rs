@@ -221,6 +221,10 @@ pub enum BuiltinRealtimeProvider {
     /// `InvokeModelWithBidirectionalStream` HTTP/2 event stream, NOT a WebSocket;
     /// auth is AWS SigV4 via the `aws-config` default chain, NO api-key).
     NovaSonic = 9,
+    /// Speechmatics Flow (Voice AI) — conversational speech-to-speech on
+    /// Speechmatics' streaming STT (raw-PCM binary frames + JSON control, its own
+    /// protocol; template-driven agents; auth `Authorization: Bearer <token>`).
+    Speechmatics = 10,
 }
 
 impl BuiltinRealtimeProvider {
@@ -238,6 +242,7 @@ impl BuiltinRealtimeProvider {
             Self::Gemini => "gemini",
             Self::Ultravox => "ultravox",
             Self::NovaSonic => "nova_sonic",
+            Self::Speechmatics => "speechmatics",
         }
     }
 }
@@ -489,6 +494,9 @@ pub static REALTIME_PROVIDER_MAP: phf::Map<&'static str, BuiltinRealtimeProvider
     "nova_sonic" => BuiltinRealtimeProvider::NovaSonic,
     "nova-sonic" => BuiltinRealtimeProvider::NovaSonic,
     "aws" => BuiltinRealtimeProvider::NovaSonic,
+    // Speechmatics Flow (Voice AI; raw-PCM binary + JSON control).
+    "speechmatics" => BuiltinRealtimeProvider::Speechmatics,
+    "flow" => BuiltinRealtimeProvider::Speechmatics,
 };
 
 // =============================================================================
@@ -606,7 +614,7 @@ pub const BUILTIN_STT_COUNT: usize = 25;
 pub const BUILTIN_TTS_COUNT: usize = 29;
 
 /// Number of built-in Realtime providers
-pub const BUILTIN_REALTIME_COUNT: usize = 10;
+pub const BUILTIN_REALTIME_COUNT: usize = 11;
 
 /// Total number of built-in providers
 pub const TOTAL_BUILTIN_PROVIDERS: usize =
@@ -690,6 +698,7 @@ pub const BUILTIN_REALTIME_NAMES: [&str; BUILTIN_REALTIME_COUNT] = [
     "gemini",
     "ultravox",
     "nova_sonic",
+    "speechmatics",
 ];
 
 #[cfg(test)]
@@ -860,6 +869,19 @@ mod tests {
         assert_eq!(
             resolve_realtime_provider("aws"),
             Some(BuiltinRealtimeProvider::NovaSonic)
+        );
+        // Speechmatics Flow (Voice AI) + alias (case-insensitive).
+        assert_eq!(
+            resolve_realtime_provider("speechmatics"),
+            Some(BuiltinRealtimeProvider::Speechmatics)
+        );
+        assert_eq!(
+            resolve_realtime_provider("SPEECHMATICS"),
+            Some(BuiltinRealtimeProvider::Speechmatics)
+        );
+        assert_eq!(
+            resolve_realtime_provider("flow"),
+            Some(BuiltinRealtimeProvider::Speechmatics)
         );
         assert_eq!(resolve_realtime_provider("unknown"), None);
     }

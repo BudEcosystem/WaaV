@@ -195,6 +195,10 @@ pub struct ServerConfig {
     /// Ultravox API key (used for the Ultravox hosted S2S realtime provider; sent
     /// as the `X-API-Key` header on the REST create-call that mints the WS join url).
     pub ultravox_api_key: Option<String>,
+    /// Speechmatics API key (a JWT / temporary token). Shared by Speechmatics STT,
+    /// TTS, and the Flow (Voice AI) realtime provider; for Flow it is passed as the
+    /// `Authorization: Bearer <token>` value. Also read from `SPEECHMATICS_API_KEY`.
+    pub speechmatics_api_key: Option<String>,
     /// AssemblyAI API key for streaming STT
     pub assemblyai_api_key: Option<String>,
     /// Hume AI API key for TTS (Octave) and EVI (Empathic Voice Interface)
@@ -340,6 +344,9 @@ impl Drop for ServerConfig {
             key.zeroize();
         }
         if let Some(ref mut key) = self.ultravox_api_key {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.speechmatics_api_key {
             key.zeroize();
         }
         if let Some(ref mut key) = self.assemblyai_api_key {
@@ -784,6 +791,7 @@ mod tests {
             inworld_api_key: None,
             gemini_api_key: None,
             ultravox_api_key: None,
+            speechmatics_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -864,6 +872,7 @@ mod tests {
             inworld_api_key: None,
             gemini_api_key: None,
             ultravox_api_key: None,
+            speechmatics_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -933,6 +942,7 @@ mod tests {
             inworld_api_key: None,
             gemini_api_key: None,
             ultravox_api_key: None,
+            speechmatics_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1005,6 +1015,7 @@ mod tests {
             inworld_api_key: None,
             gemini_api_key: None,
             ultravox_api_key: None,
+            speechmatics_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1077,6 +1088,7 @@ mod tests {
             inworld_api_key: None,
             gemini_api_key: None,
             ultravox_api_key: None,
+            speechmatics_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1155,6 +1167,7 @@ mod tests {
             inworld_api_key: None,
             gemini_api_key: None,
             ultravox_api_key: None,
+            speechmatics_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1220,6 +1233,7 @@ mod tests {
             inworld_api_key: None,
             gemini_api_key: None,
             ultravox_api_key: None,
+            speechmatics_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1287,6 +1301,7 @@ mod tests {
             inworld_api_key: None,
             gemini_api_key: None,
             ultravox_api_key: None,
+            speechmatics_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1355,6 +1370,7 @@ mod tests {
             inworld_api_key: None,
             gemini_api_key: None,
             ultravox_api_key: None,
+            speechmatics_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1422,6 +1438,7 @@ mod tests {
             inworld_api_key: None,
             gemini_api_key: None,
             ultravox_api_key: None,
+            speechmatics_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1499,6 +1516,7 @@ mod tests {
             inworld_api_key: None,
             gemini_api_key: None,
             ultravox_api_key: None,
+            speechmatics_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1570,6 +1588,7 @@ mod tests {
             inworld_api_key: None,
             gemini_api_key: None,
             ultravox_api_key: None,
+            speechmatics_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1640,6 +1659,7 @@ mod tests {
             inworld_api_key: None,
             gemini_api_key: None,
             ultravox_api_key: None,
+            speechmatics_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1710,6 +1730,7 @@ mod tests {
             inworld_api_key: None,
             gemini_api_key: None,
             ultravox_api_key: None,
+            speechmatics_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1785,6 +1806,7 @@ mod tests {
             inworld_api_key: None,
             gemini_api_key: None,
             ultravox_api_key: None,
+            speechmatics_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1854,6 +1876,7 @@ mod tests {
             inworld_api_key: None,
             gemini_api_key: None,
             ultravox_api_key: None,
+            speechmatics_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1926,6 +1949,7 @@ mod tests {
             inworld_api_key: None,
             gemini_api_key: None,
             ultravox_api_key: None,
+            speechmatics_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1993,6 +2017,7 @@ mod tests {
             inworld_api_key: None,
             gemini_api_key: None,
             ultravox_api_key: None,
+            speechmatics_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,

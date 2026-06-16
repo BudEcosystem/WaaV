@@ -240,6 +240,15 @@ pub fn merge_config(
             .and_then(|p| p.ultravox_api_key.clone())
     );
 
+    // Speechmatics API key (JWT / temp-token) — STT/TTS + Flow (Voice AI) realtime
+    // (`Authorization: Bearer <token>`).
+    let speechmatics_api_key = get_credential!(
+        "SPEECHMATICS_API_KEY",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.speechmatics_api_key.clone())
+    );
+
     // AssemblyAI API key (streaming STT)
     let assemblyai_api_key = get_credential!(
         "ASSEMBLYAI_API_KEY",
@@ -664,6 +673,7 @@ pub fn merge_config(
         inworld_api_key,
         gemini_api_key,
         ultravox_api_key,
+        speechmatics_api_key,
         assemblyai_api_key,
         hume_api_key,
         lmnt_api_key,

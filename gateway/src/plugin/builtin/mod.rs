@@ -18,7 +18,7 @@
 //!   Tinkoff, SberDevices, Bhashini, iFlytek, Alibaba Cloud, Baidu, Tencent,
 //!   Huawei Cloud, NAVER CLOVA, Zalo AI, FPT.AI, Viettel AI, Prosa.ai, NECTEC
 //!
-//! ## Realtime Providers (10)
+//! ## Realtime Providers (11)
 //! - OpenAI, Hume EVI, Azure OpenAI, Grok/xAI, Inworld, Deepgram Voice Agent,
 //!   ElevenLabs Conversational AI, Google Gemini Live, Ultravox, AWS Nova Sonic
 //!   (Azure/Grok/Inworld are OpenAI-protocol clones reusing the GA wire;
@@ -35,7 +35,7 @@
 use crate::core::realtime::{
     AzureRealtime, BaseRealtime, DeepgramRealtime, ElevenLabsRealtime, GeminiRealtime, GrokRealtime,
     HumeEVI, InworldRealtime, NovaSonicRealtime, OpenAIRealtime, RealtimeConfig, RealtimeError,
-    UltravoxRealtime,
+    SpeechmaticsRealtime, UltravoxRealtime,
 };
 use crate::core::stt::{
     AmiVoiceSTT, AssemblyAISTT, AwsTranscribeSTT, AzureSTT, BaiduStt, BaseSTT, BhashiniStt,
@@ -1355,6 +1355,16 @@ fn nova_sonic_realtime_metadata() -> ProviderMetadata {
         .with_features(["full-duplex", "function-calling", "turn-detection", "barge-in"])
 }
 
+fn speechmatics_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("speechmatics", "Speechmatics Flow")
+        .with_description(
+            "Speechmatics Flow (Voice AI) — conversational speech-to-speech on Speechmatics' streaming STT (RAW PCM binary audio both ways + JSON control, 16k; template-driven agents; auth Authorization: Bearer <JWT/temp-token>; server VAD)",
+        )
+        .with_models(["default", "flow-service-assistant-amelia"])
+        .with_aliases(["flow"])
+        .with_features(["full-duplex", "function-calling", "turn-detection", "barge-in"])
+}
+
 // ============================================================================
 // STT Factory Functions
 // ============================================================================
@@ -1691,6 +1701,12 @@ fn create_nova_sonic_realtime(
     config: RealtimeConfig,
 ) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
     Ok(Box::new(NovaSonicRealtime::new(config)?))
+}
+
+fn create_speechmatics_realtime(
+    config: RealtimeConfig,
+) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(SpeechmaticsRealtime::new(config)?))
 }
 
 // ============================================================================
@@ -2084,6 +2100,11 @@ inventory::submit! {
         .with_aliases(&["nova-sonic", "aws"])
 }
 
+inventory::submit! {
+    PluginConstructor::realtime("speechmatics", speechmatics_realtime_metadata, create_speechmatics_realtime)
+        .with_aliases(&["flow"])
+}
+
 #[cfg(test)]
 mod tests {
     use crate::plugin::registry::global_registry;
@@ -2276,6 +2297,9 @@ mod tests {
         assert!(registry.has_realtime_provider("nova_sonic"));
         assert!(registry.has_realtime_provider("nova-sonic")); // alias
         assert!(registry.has_realtime_provider("aws")); // alias
+        // Speechmatics Flow (S2S, raw-PCM binary + JSON control; template-driven).
+        assert!(registry.has_realtime_provider("speechmatics"));
+        assert!(registry.has_realtime_provider("flow")); // alias
     }
 
     #[test]

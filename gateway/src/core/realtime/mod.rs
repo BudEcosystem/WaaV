@@ -58,6 +58,7 @@ pub mod inworld;
 pub mod nova_sonic;
 pub mod openai;
 pub mod scaffold;
+pub mod speechmatics;
 pub mod ultravox;
 
 pub use base::{
@@ -84,6 +85,7 @@ pub use openai::{
     Modality, OPENAI_REALTIME_SAMPLE_RATE, OPENAI_REALTIME_URL, OpenAIRealtime,
     OpenAIRealtimeAudioFormat, OpenAIRealtimeModel, OpenAIRealtimeVoice,
 };
+pub use speechmatics::{SpeechmaticsProtocol, SpeechmaticsRealtime};
 pub use ultravox::{UltravoxProtocol, UltravoxRealtime};
 
 /// Supported realtime providers.
@@ -171,6 +173,10 @@ pub fn create_realtime_provider_from_enum(
 /// events on its own [`NovaSonicProtocol`]; the FIRST `BedrockBidi` provider (an
 /// Amazon Bedrock `InvokeModelWithBidirectionalStream` HTTP/2 event stream, NOT a
 /// WebSocket; auth is AWS SigV4 via the `aws-config` default chain — NO api-key).
+/// `speechmatics` is Speechmatics Flow (Voice AI) — raw-PCM binary on its own
+/// [`SpeechmaticsProtocol`] (Deepgram-shaped wire: binary audio in/out + JSON
+/// control); template-driven agents, auth via `Authorization: Bearer <token>`
+/// (a Speechmatics JWT / temporary token).
 pub fn get_supported_realtime_providers() -> Vec<&'static str> {
     vec![
         "openai",
@@ -183,6 +189,7 @@ pub fn get_supported_realtime_providers() -> Vec<&'static str> {
         "gemini",
         "ultravox",
         "nova_sonic",
+        "speechmatics",
     ]
 }
 
@@ -234,7 +241,9 @@ mod tests {
         assert!(providers.contains(&"ultravox"));
         // AWS Nova Sonic (S2S, base64-PCM+JSON; the first BedrockBidi provider).
         assert!(providers.contains(&"nova_sonic"));
-        assert_eq!(providers.len(), 10);
+        // Speechmatics Flow (S2S, raw-PCM binary + JSON control; template-driven).
+        assert!(providers.contains(&"speechmatics"));
+        assert_eq!(providers.len(), 11);
     }
 
     #[test]

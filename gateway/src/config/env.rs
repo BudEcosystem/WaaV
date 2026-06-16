@@ -96,6 +96,10 @@ impl ServerConfig {
         // Ultravox hosted S2S realtime (`X-API-Key` create-call auth).
         let ultravox_api_key = env::var("ULTRAVOX_API_KEY").ok();
 
+        // Speechmatics API key (JWT / temp-token), shared by STT/TTS + the Flow
+        // (Voice AI) realtime provider (`Authorization: Bearer <token>`).
+        let speechmatics_api_key = env::var("SPEECHMATICS_API_KEY").ok();
+
         // AssemblyAI API key (used for streaming STT)
         let assemblyai_api_key = env::var("ASSEMBLYAI_API_KEY").ok();
 
@@ -292,6 +296,7 @@ impl ServerConfig {
             inworld_api_key,
             gemini_api_key,
             ultravox_api_key,
+            speechmatics_api_key,
             assemblyai_api_key,
             hume_api_key,
             lmnt_api_key,
