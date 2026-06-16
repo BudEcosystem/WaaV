@@ -216,6 +216,11 @@ pub enum BuiltinRealtimeProvider {
     /// own protocol, the FIRST `RestThenWebSocket` provider — a REST create-call
     /// mints a pre-authed `joinUrl` the WS then connects).
     Ultravox = 8,
+    /// AWS Nova Sonic — Amazon's speech-to-speech model (base64-PCM + JSON events;
+    /// its own protocol, the FIRST `BedrockBidi` provider — an Amazon Bedrock
+    /// `InvokeModelWithBidirectionalStream` HTTP/2 event stream, NOT a WebSocket;
+    /// auth is AWS SigV4 via the `aws-config` default chain, NO api-key).
+    NovaSonic = 9,
 }
 
 impl BuiltinRealtimeProvider {
@@ -232,6 +237,7 @@ impl BuiltinRealtimeProvider {
             Self::ElevenLabs => "elevenlabs",
             Self::Gemini => "gemini",
             Self::Ultravox => "ultravox",
+            Self::NovaSonic => "nova_sonic",
         }
     }
 }
@@ -479,6 +485,10 @@ pub static REALTIME_PROVIDER_MAP: phf::Map<&'static str, BuiltinRealtimeProvider
     // Ultravox (hosted S2S model API; RestThenWebSocket).
     "ultravox" => BuiltinRealtimeProvider::Ultravox,
     "fixie" => BuiltinRealtimeProvider::Ultravox,
+    // AWS Nova Sonic (Amazon Bedrock bidirectional stream; BedrockBidi).
+    "nova_sonic" => BuiltinRealtimeProvider::NovaSonic,
+    "nova-sonic" => BuiltinRealtimeProvider::NovaSonic,
+    "aws" => BuiltinRealtimeProvider::NovaSonic,
 };
 
 // =============================================================================
@@ -596,7 +606,7 @@ pub const BUILTIN_STT_COUNT: usize = 25;
 pub const BUILTIN_TTS_COUNT: usize = 29;
 
 /// Number of built-in Realtime providers
-pub const BUILTIN_REALTIME_COUNT: usize = 9;
+pub const BUILTIN_REALTIME_COUNT: usize = 10;
 
 /// Total number of built-in providers
 pub const TOTAL_BUILTIN_PROVIDERS: usize =
@@ -679,6 +689,7 @@ pub const BUILTIN_REALTIME_NAMES: [&str; BUILTIN_REALTIME_COUNT] = [
     "elevenlabs",
     "gemini",
     "ultravox",
+    "nova_sonic",
 ];
 
 #[cfg(test)]
@@ -832,6 +843,23 @@ mod tests {
         assert_eq!(
             resolve_realtime_provider("fixie"),
             Some(BuiltinRealtimeProvider::Ultravox)
+        );
+        // AWS Nova Sonic (BedrockBidi) + aliases (case-insensitive).
+        assert_eq!(
+            resolve_realtime_provider("nova_sonic"),
+            Some(BuiltinRealtimeProvider::NovaSonic)
+        );
+        assert_eq!(
+            resolve_realtime_provider("NOVA_SONIC"),
+            Some(BuiltinRealtimeProvider::NovaSonic)
+        );
+        assert_eq!(
+            resolve_realtime_provider("nova-sonic"),
+            Some(BuiltinRealtimeProvider::NovaSonic)
+        );
+        assert_eq!(
+            resolve_realtime_provider("aws"),
+            Some(BuiltinRealtimeProvider::NovaSonic)
         );
         assert_eq!(resolve_realtime_provider("unknown"), None);
     }

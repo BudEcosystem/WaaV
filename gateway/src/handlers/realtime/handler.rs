@@ -495,6 +495,14 @@ async fn handle_config(
         // Ultravox (hosted S2S model API) uses the dedicated Ultravox API key
         // (the `X-API-Key` create-call header).
         "ultravox" | "fixie" => app_state.config.ultravox_api_key.clone(),
+        // AWS Nova Sonic (Amazon Bedrock S2S) authenticates with AWS credentials
+        // via the `aws-config` default chain (env / shared config / IAM role), NOT
+        // an api-key — so there is NO `nova_sonic_api_key` config field. Supply a
+        // present-but-empty key so the "missing_api_key" guard below is satisfied;
+        // `NovaSonicProtocol::from_config` ignores `cfg.api_key` entirely and the
+        // transport resolves SigV4 credentials at connect (exactly like the AWS
+        // Transcribe STT provider).
+        "nova_sonic" | "nova-sonic" | "aws" => Some(String::new()),
         _ => None,
     };
 

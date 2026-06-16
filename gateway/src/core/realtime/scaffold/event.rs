@@ -79,8 +79,8 @@ impl Default for ProtocolCaps {
 }
 
 /// How the driver should open (and re-open) the transport for a provider.
-/// Extensible: WebSocket + `RestThenWebSocket` today; `BedrockBidi`
-/// (AWS Nova Sonic) lands in a later phase behind the same `RealtimeTransportFactory`.
+/// Extensible: WebSocket + `RestThenWebSocket` + `BedrockBidi` (AWS Nova Sonic),
+/// each behind the same `RealtimeTransportFactory`.
 #[derive(Debug, Clone)]
 pub enum ConnectSpec {
     /// A direct WebSocket upgrade with explicit request headers.
@@ -112,6 +112,31 @@ pub enum ConnectSpec {
         /// The TOP-LEVEL field name in the JSON response holding the `wss://…` url
         /// to connect (Ultravox: `"joinUrl"`).
         join_url_pointer: String,
+    },
+    /// THE AWS NOVA SONIC PATTERN: an Amazon Bedrock
+    /// `InvokeModelWithBidirectionalStream` HTTP/2 bidi EVENT STREAM (NOT a
+    /// WebSocket). The transport factory
+    /// ([`BedrockBidiTransportFactory`](super::transport::BedrockBidiTransportFactory))
+    /// builds an `aws-sdk-bedrockruntime` `Client` from the standard
+    /// [`aws-config`] default credential chain (env / shared config / IAM role —
+    /// exactly like `AwsTranscribeTransport`, so NO credentials live in this
+    /// spec), opens the bidi stream for `model_id`, and frames each
+    /// [`OutFrame::Text`] JSON event into a `BidirectionalInputPayloadPart`
+    /// (input half) / unframes each `BidirectionalOutputPayloadPart` back to
+    /// [`OutFrame::Text`] (output half). The audio is base64 INSIDE the JSON
+    /// events (the Bedrock stream is event-framed; [`OutFrame::Binary`] is unused).
+    ///
+    /// Auth is AWS SigV4 via the default chain — there is NO api-key field here
+    /// (the Nova Sonic protocol does not require one; credentials are resolved at
+    /// connect by `aws-config`). Re-dialing on reconnect rebuilds the bidi stream.
+    ///
+    /// [`aws-config`]: https://docs.rs/aws-config
+    BedrockBidi {
+        /// The Bedrock model id (Nova Sonic: `amazon.nova-sonic-v1:0`).
+        model_id: String,
+        /// AWS region (e.g. `us-east-1`). `None` ⇒ resolved from the environment
+        /// (`AWS_REGION` / shared config) by the `aws-config` default chain.
+        region: Option<String>,
     },
 }
 

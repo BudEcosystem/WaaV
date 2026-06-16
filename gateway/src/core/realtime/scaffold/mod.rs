@@ -22,6 +22,6 @@ pub use event::{ConnectSpec, Inbound, OutFrame, ProtocolCaps, S2sEvent};
 pub use protocol::RealtimeProtocol;
 pub use session::RealtimeSession;
 pub use transport::{
-    RealtimeTransport, RealtimeTransportFactory, RestHandshakeWsTransportFactory, WsTextTransport,
-    WsTransportFactory,
+    BedrockBidiTransportFactory, RealtimeTransport, RealtimeTransportFactory,
+    RestHandshakeWsTransportFactory, WsTextTransport, WsTransportFactory,
 };

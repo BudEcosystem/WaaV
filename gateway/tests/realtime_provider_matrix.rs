@@ -24,7 +24,7 @@ use waav_gateway::core::realtime::{
 /// set so adding/removing a provider without updating the matrix fails loudly.
 ///
 /// BUMP THIS (and `valid_config_for`) WHEN YOU ADD A REALTIME PROVIDER.
-const EXPECTED_PROVIDERS: [&str; 9] = [
+const EXPECTED_PROVIDERS: [&str; 10] = [
     "openai",
     "hume",
     "azure",
@@ -34,7 +34,18 @@ const EXPECTED_PROVIDERS: [&str; 9] = [
     "elevenlabs",
     "gemini",
     "ultravox",
+    "nova_sonic",
 ];
+
+/// The realtime providers that do NOT authenticate with an api-key, so the
+/// "rejects an empty api_key" invariant (assertion #3 below) does NOT apply.
+///
+/// `nova_sonic` (AWS Nova Sonic) auths via the `aws-config` default credential
+/// chain (env / shared config / IAM role), so its `from_config` deliberately does
+/// NOT require a non-empty `api_key` — it constructs fine with an empty key (the
+/// transport resolves SigV4 credentials at connect). Every OTHER provider DOES
+/// reject an empty key, so this skip-set stays as small as possible.
+const KEYLESS_PROVIDERS: [&str; 1] = ["nova_sonic"];
 
 /// Build a [`RealtimeConfig`] that SUCCESSFULLY constructs `name`'s provider.
 ///
@@ -118,6 +129,16 @@ fn valid_config_for(name: &str) -> RealtimeConfig {
             voice: Some("Mark".to_string()),
             ..base
         },
+        // AWS Nova Sonic: auths via the AWS credential chain (NOT an api-key), so
+        // `from_config` requires NO key; the model defaults to
+        // `amazon.nova-sonic-v1:0` when omitted. A descriptive model + a Nova Sonic
+        // voiceId are supplied. (The base api-key is harmless — from_config ignores
+        // it — and is what lets the construction assertions share `base`.)
+        "nova_sonic" => RealtimeConfig {
+            model: "amazon.nova-sonic-v1:0".to_string(),
+            voice: Some("matthew".to_string()),
+            ..base
+        },
         // Hume EVI: only the api key is required (defaults: V3, Linear16, 44.1 kHz).
         // Catch-all so a NEWLY-added provider still gets a sane api-key-only config;
         // if it needs more, the matrix's "creates" assertion fails loudly and points
@@ -153,18 +174,36 @@ async fn realtime_provider_matrix_uniform_invariants() {
             "[{name}] must create case-insensitively (tried {upper:?})"
         );
 
-        // 3. REJECTS an empty api key — every provider validates the key first
-        //    (openai/azure/grok/inworld ⇒ AuthenticationFailed via the embedded
-        //    OpenAI protocol, deepgram ⇒ AuthenticationFailed, hume ⇒
+        // 3. REJECTS an empty api key — every KEY-BASED provider validates the key
+        //    first (openai/azure/grok/inworld ⇒ AuthenticationFailed via the
+        //    embedded OpenAI protocol, deepgram ⇒ AuthenticationFailed, hume ⇒
         //    InvalidConfiguration). The uniform contract is simply `is_err()`.
-        let empty_key = RealtimeConfig {
-            api_key: String::new(),
-            ..valid_config_for(name)
-        };
-        assert!(
-            create_realtime_provider(name, empty_key).is_err(),
-            "[{name}] must reject an empty api_key"
-        );
+        //
+        //    EXCEPTION: the KEYLESS providers (nova_sonic — AWS Nova Sonic auths via
+        //    the aws-config credential chain, NOT an api-key) deliberately construct
+        //    fine with an empty key, so the empty-key-reject does not apply to them.
+        //    They are skipped here (the skip-set is kept minimal); their
+        //    construction is still exercised by assertions #1, #2, #4, #5.
+        if !KEYLESS_PROVIDERS.contains(&name) {
+            let empty_key = RealtimeConfig {
+                api_key: String::new(),
+                ..valid_config_for(name)
+            };
+            assert!(
+                create_realtime_provider(name, empty_key).is_err(),
+                "[{name}] must reject an empty api_key"
+            );
+        } else {
+            // The keyless provider must instead CONSTRUCT with an empty key.
+            let empty_key = RealtimeConfig {
+                api_key: String::new(),
+                ..valid_config_for(name)
+            };
+            assert!(
+                create_realtime_provider(name, empty_key).is_ok(),
+                "[{name}] is keyless (AWS creds) and must construct with an empty api_key"
+            );
+        }
 
         // 4 & 5 operate on the freshly-created provider.
         let provider = create_realtime_provider(name, valid_config_for(name))
@@ -217,8 +256,8 @@ fn realtime_provider_registry_count_guardrail() {
     );
     assert_eq!(
         get_supported_realtime_providers().len(),
-        9,
-        "expected EXACTLY 9 realtime providers; bump this when you add a realtime provider"
+        10,
+        "expected EXACTLY 10 realtime providers; bump this when you add a realtime provider"
     );
 }
 

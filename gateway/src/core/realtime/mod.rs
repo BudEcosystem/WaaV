@@ -55,6 +55,7 @@ pub mod gemini;
 pub mod grok;
 pub mod hume;
 pub mod inworld;
+pub mod nova_sonic;
 pub mod openai;
 pub mod scaffold;
 pub mod ultravox;
@@ -78,6 +79,7 @@ pub use hume::{
     ProsodyScores,
 };
 pub use inworld::{InworldProtocol, InworldRealtime};
+pub use nova_sonic::{NovaSonicProtocol, NovaSonicRealtime};
 pub use openai::{
     Modality, OPENAI_REALTIME_SAMPLE_RATE, OPENAI_REALTIME_URL, OpenAIRealtime,
     OpenAIRealtimeAudioFormat, OpenAIRealtimeModel, OpenAIRealtimeVoice,
@@ -165,6 +167,10 @@ pub fn create_realtime_provider_from_enum(
 /// `ultravox` is the hosted Ultravox S2S model API — raw-PCM binary on its own
 /// [`UltravoxProtocol`]; the FIRST `RestThenWebSocket` provider (a REST
 /// create-call mints a pre-authed `joinUrl` the WS then connects).
+/// `nova_sonic` is AWS Nova Sonic (`amazon.nova-sonic-v1:0`) — base64-PCM + JSON
+/// events on its own [`NovaSonicProtocol`]; the FIRST `BedrockBidi` provider (an
+/// Amazon Bedrock `InvokeModelWithBidirectionalStream` HTTP/2 event stream, NOT a
+/// WebSocket; auth is AWS SigV4 via the `aws-config` default chain — NO api-key).
 pub fn get_supported_realtime_providers() -> Vec<&'static str> {
     vec![
         "openai",
@@ -176,6 +182,7 @@ pub fn get_supported_realtime_providers() -> Vec<&'static str> {
         "elevenlabs",
         "gemini",
         "ultravox",
+        "nova_sonic",
     ]
 }
 
@@ -225,7 +232,9 @@ mod tests {
         assert!(providers.contains(&"gemini"));
         // Ultravox (S2S, raw-PCM binary; the first RestThenWebSocket provider).
         assert!(providers.contains(&"ultravox"));
-        assert_eq!(providers.len(), 9);
+        // AWS Nova Sonic (S2S, base64-PCM+JSON; the first BedrockBidi provider).
+        assert!(providers.contains(&"nova_sonic"));
+        assert_eq!(providers.len(), 10);
     }
 
     #[test]

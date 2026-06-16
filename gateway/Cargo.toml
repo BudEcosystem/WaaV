@@ -235,6 +235,9 @@ async-stream = "0.3"
 aws-config = { version = "1.5", features = ["behavior-version-latest"] }
 aws-sdk-transcribestreaming = "1.62"
 aws-sdk-polly = "1.61"
+# AWS Bedrock Runtime — drives Nova Sonic's `InvokeModelWithBidirectionalStream`
+# (HTTP/2 bidi event stream; the same SDK family as transcribestreaming above).
+aws-sdk-bedrockruntime = "1.62"
 aws-credential-types = "1.2"
 aws-types = "1.3"
 aws-smithy-types = "1.3"

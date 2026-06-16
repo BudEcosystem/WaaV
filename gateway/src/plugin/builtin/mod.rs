@@ -18,20 +18,24 @@
 //!   Tinkoff, SberDevices, Bhashini, iFlytek, Alibaba Cloud, Baidu, Tencent,
 //!   Huawei Cloud, NAVER CLOVA, Zalo AI, FPT.AI, Viettel AI, Prosa.ai, NECTEC
 //!
-//! ## Realtime Providers (9)
+//! ## Realtime Providers (10)
 //! - OpenAI, Hume EVI, Azure OpenAI, Grok/xAI, Inworld, Deepgram Voice Agent,
-//!   ElevenLabs Conversational AI, Google Gemini Live, Ultravox
+//!   ElevenLabs Conversational AI, Google Gemini Live, Ultravox, AWS Nova Sonic
 //!   (Azure/Grok/Inworld are OpenAI-protocol clones reusing the GA wire;
 //!   Deepgram Voice Agent is speech-to-speech with raw linear16 binary frames;
 //!   ElevenLabs Conversational AI is speech-to-speech with base64+JSON frames;
 //!   Gemini Live is speech-to-speech with base64+JSON, MULTI-FRAME serverContent
 //!   parts + session resumption;
 //!   Ultravox is speech-to-speech with raw-PCM binary frames + a RestThenWebSocket
-//!   connect handshake.)
+//!   connect handshake;
+//!   AWS Nova Sonic is speech-to-speech with base64-PCM+JSON events over an Amazon
+//!   Bedrock bidirectional HTTP/2 stream — the first BedrockBidi provider, AWS
+//!   SigV4 via aws-config, NO api-key.)
 
 use crate::core::realtime::{
     AzureRealtime, BaseRealtime, DeepgramRealtime, ElevenLabsRealtime, GeminiRealtime, GrokRealtime,
-    HumeEVI, InworldRealtime, OpenAIRealtime, RealtimeConfig, RealtimeError, UltravoxRealtime,
+    HumeEVI, InworldRealtime, NovaSonicRealtime, OpenAIRealtime, RealtimeConfig, RealtimeError,
+    UltravoxRealtime,
 };
 use crate::core::stt::{
     AmiVoiceSTT, AssemblyAISTT, AwsTranscribeSTT, AzureSTT, BaiduStt, BaseSTT, BhashiniStt,
@@ -1341,6 +1345,16 @@ fn ultravox_realtime_metadata() -> ProviderMetadata {
         .with_features(["full-duplex", "function-calling", "turn-detection", "barge-in"])
 }
 
+fn nova_sonic_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("nova_sonic", "AWS Nova Sonic")
+        .with_description(
+            "AWS Nova Sonic — Amazon's speech-to-speech model (base64-PCM + JSON events, 16k in / 24k out; BedrockBidi: an Amazon Bedrock InvokeModelWithBidirectionalStream HTTP/2 event stream; AWS SigV4 via aws-config, NO api-key; server VAD)",
+        )
+        .with_models(["amazon.nova-sonic-v1:0"])
+        .with_aliases(["nova-sonic", "aws"])
+        .with_features(["full-duplex", "function-calling", "turn-detection", "barge-in"])
+}
+
 // ============================================================================
 // STT Factory Functions
 // ============================================================================
@@ -1671,6 +1685,12 @@ fn create_ultravox_realtime(
     config: RealtimeConfig,
 ) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
     Ok(Box::new(UltravoxRealtime::new(config)?))
+}
+
+fn create_nova_sonic_realtime(
+    config: RealtimeConfig,
+) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(NovaSonicRealtime::new(config)?))
 }
 
 // ============================================================================
@@ -2059,6 +2079,11 @@ inventory::submit! {
         .with_aliases(&["fixie"])
 }
 
+inventory::submit! {
+    PluginConstructor::realtime("nova_sonic", nova_sonic_realtime_metadata, create_nova_sonic_realtime)
+        .with_aliases(&["nova-sonic", "aws"])
+}
+
 #[cfg(test)]
 mod tests {
     use crate::plugin::registry::global_registry;
@@ -2222,7 +2247,7 @@ mod tests {
     fn test_builtin_realtime_providers_registered() {
         let registry = global_registry();
 
-        // All 9 realtime providers should be registered.
+        // All 10 realtime providers should be registered.
         assert!(registry.has_realtime_provider("openai"));
         assert!(registry.has_realtime_provider("hume"));
         assert!(registry.has_realtime_provider("evi")); // alias
@@ -2247,6 +2272,10 @@ mod tests {
         // Ultravox (S2S, raw-PCM binary; RestThenWebSocket).
         assert!(registry.has_realtime_provider("ultravox"));
         assert!(registry.has_realtime_provider("fixie")); // alias
+        // AWS Nova Sonic (S2S, base64-PCM+JSON; BedrockBidi; AWS creds, no api-key).
+        assert!(registry.has_realtime_provider("nova_sonic"));
+        assert!(registry.has_realtime_provider("nova-sonic")); // alias
+        assert!(registry.has_realtime_provider("aws")); // alias
     }
 
     #[test]
