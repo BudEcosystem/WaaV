@@ -2327,8 +2327,26 @@ async fn register_dag_stream_driver(
                         crate::core::turn::TurnEvent::Stopped { turn_id, transcript } => {
                             Some((turn_id, transcript))
                         }
-                        // Started/barge-in has no DAG-side action today (the
-                        // DAG has no cancellable bot turn at this layer).
+                        // Started/barge-in has no DAG-side action today. ROOT
+                        // CAUSE (traced, review wc023gbbz#1): DAG turns execute
+                        // SERIALLY — the STT provider's result-forwarding loop
+                        // (`while recv { callback(result).await }`,
+                        // e.g. stt/deepgram.rs:1109) awaits THIS callback, whose
+                        // `executor.execute_from(..).await` below runs the whole
+                        // turn. So a barge-in's STT result QUEUES behind the
+                        // in-flight turn and this `Started` cannot even fire until
+                        // the prior turn's response completes (≤ its done/30s).
+                        // A persistent S2S node (B-G2) therefore streams its full
+                        // response before barge-in is processed. Closing this is
+                        // NOT the naive "fire ctx.cancel_token here" (the event
+                        // never arrives mid-turn, and clone_for_branch SHARES the
+                        // token so cancelling it poisons the session template): it
+                        // needs the turn to run as a SPAWNED, per-turn-child-token
+                        // cancellable task so the next Started can cancel it — an
+                        // architectural change affecting ALL DAG paths (LLM/TTS
+                        // too), out of scope for the B-G2 wiring. Cascade/
+                        // conversation path handles barge-in in its orchestrator,
+                        // not here.
                         _ => None,
                     })
                 else {
