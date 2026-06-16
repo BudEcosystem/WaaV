@@ -715,7 +715,9 @@ mod tests {
     fn connect_spec_has_ga_headers_only() {
         let p = proto(&base_cfg());
         let spec = p.connect_spec(&base_cfg()).unwrap();
-        let ConnectSpec::WebSocket { url, headers } = spec;
+        let ConnectSpec::WebSocket { url, headers } = spec else {
+            panic!("expected ConnectSpec::WebSocket")
+        };
         assert!(url.contains("wss://api.openai.com"));
         assert!(url.contains("gpt-4o-realtime-preview"));
         let names: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();

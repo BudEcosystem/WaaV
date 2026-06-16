@@ -402,7 +402,9 @@ mod tests {
     #[test]
     fn connect_spec_uses_query_param_auth_no_header() {
         let p = proto(&base_cfg());
-        let ConnectSpec::WebSocket { url, headers } = p.connect_spec(&base_cfg()).unwrap();
+        let ConnectSpec::WebSocket { url, headers } = p.connect_spec(&base_cfg()).unwrap() else {
+            panic!("expected ConnectSpec::WebSocket")
+        };
         assert!(url.starts_with(HUME_EVI_WEBSOCKET_URL_PREFIX));
         assert!(url.contains("api_key=hume-key"));
         assert!(url.contains("evi_version=3"));

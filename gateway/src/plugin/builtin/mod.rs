@@ -18,18 +18,20 @@
 //!   Tinkoff, SberDevices, Bhashini, iFlytek, Alibaba Cloud, Baidu, Tencent,
 //!   Huawei Cloud, NAVER CLOVA, Zalo AI, FPT.AI, Viettel AI, Prosa.ai, NECTEC
 //!
-//! ## Realtime Providers (8)
+//! ## Realtime Providers (9)
 //! - OpenAI, Hume EVI, Azure OpenAI, Grok/xAI, Inworld, Deepgram Voice Agent,
-//!   ElevenLabs Conversational AI, Google Gemini Live
+//!   ElevenLabs Conversational AI, Google Gemini Live, Ultravox
 //!   (Azure/Grok/Inworld are OpenAI-protocol clones reusing the GA wire;
 //!   Deepgram Voice Agent is speech-to-speech with raw linear16 binary frames;
 //!   ElevenLabs Conversational AI is speech-to-speech with base64+JSON frames;
 //!   Gemini Live is speech-to-speech with base64+JSON, MULTI-FRAME serverContent
-//!   parts + session resumption.)
+//!   parts + session resumption;
+//!   Ultravox is speech-to-speech with raw-PCM binary frames + a RestThenWebSocket
+//!   connect handshake.)
 
 use crate::core::realtime::{
     AzureRealtime, BaseRealtime, DeepgramRealtime, ElevenLabsRealtime, GeminiRealtime, GrokRealtime,
-    HumeEVI, InworldRealtime, OpenAIRealtime, RealtimeConfig, RealtimeError,
+    HumeEVI, InworldRealtime, OpenAIRealtime, RealtimeConfig, RealtimeError, UltravoxRealtime,
 };
 use crate::core::stt::{
     AmiVoiceSTT, AssemblyAISTT, AwsTranscribeSTT, AzureSTT, BaiduStt, BaseSTT, BhashiniStt,
@@ -1329,6 +1331,16 @@ fn gemini_realtime_metadata() -> ProviderMetadata {
         ])
 }
 
+fn ultravox_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("ultravox", "Ultravox Realtime")
+        .with_description(
+            "Ultravox — hosted speech-to-speech model API (RAW PCM binary, 16k in / 24k out; RestThenWebSocket: a REST create-call mints a pre-authed joinUrl; server VAD)",
+        )
+        .with_models(["fixie-ai/ultravox"])
+        .with_aliases(["fixie"])
+        .with_features(["full-duplex", "function-calling", "turn-detection", "barge-in"])
+}
+
 // ============================================================================
 // STT Factory Functions
 // ============================================================================
@@ -1653,6 +1665,12 @@ fn create_elevenlabs_realtime(
 
 fn create_gemini_realtime(config: RealtimeConfig) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
     Ok(Box::new(GeminiRealtime::new(config)?))
+}
+
+fn create_ultravox_realtime(
+    config: RealtimeConfig,
+) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(UltravoxRealtime::new(config)?))
 }
 
 // ============================================================================
@@ -2036,6 +2054,11 @@ inventory::submit! {
         .with_aliases(&["gemini-live", "google"])
 }
 
+inventory::submit! {
+    PluginConstructor::realtime("ultravox", ultravox_realtime_metadata, create_ultravox_realtime)
+        .with_aliases(&["fixie"])
+}
+
 #[cfg(test)]
 mod tests {
     use crate::plugin::registry::global_registry;
@@ -2199,7 +2222,7 @@ mod tests {
     fn test_builtin_realtime_providers_registered() {
         let registry = global_registry();
 
-        // All 8 realtime providers should be registered.
+        // All 9 realtime providers should be registered.
         assert!(registry.has_realtime_provider("openai"));
         assert!(registry.has_realtime_provider("hume"));
         assert!(registry.has_realtime_provider("evi")); // alias
@@ -2221,6 +2244,9 @@ mod tests {
         assert!(registry.has_realtime_provider("gemini"));
         assert!(registry.has_realtime_provider("gemini-live")); // alias
         assert!(registry.has_realtime_provider("google")); // alias
+        // Ultravox (S2S, raw-PCM binary; RestThenWebSocket).
+        assert!(registry.has_realtime_provider("ultravox"));
+        assert!(registry.has_realtime_provider("fixie")); // alias
     }
 
     #[test]

@@ -201,7 +201,9 @@ mod tests {
             ..base_cfg()
         };
         let p = proto(&cfg);
-        let ConnectSpec::WebSocket { url, headers } = p.connect_spec(&cfg).unwrap();
+        let ConnectSpec::WebSocket { url, headers } = p.connect_spec(&cfg).unwrap() else {
+            panic!("expected ConnectSpec::WebSocket")
+        };
         assert_eq!(
             url,
             "wss://api.inworld.ai/api/v1/realtime/session?key=sess-abc123&protocol=realtime"

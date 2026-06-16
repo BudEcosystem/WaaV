@@ -131,6 +131,8 @@ pub struct ProvidersYaml {
     pub inworld_api_key: Option<String>,
     /// Google Gemini API key for the Gemini Live (BidiGenerateContent) S2S provider
     pub gemini_api_key: Option<String>,
+    /// Ultravox API key for the Ultravox hosted S2S realtime provider (`X-API-Key`)
+    pub ultravox_api_key: Option<String>,
     /// AssemblyAI API key for streaming STT
     pub assemblyai_api_key: Option<String>,
     /// Hume AI API key for TTS (Octave) and EVI

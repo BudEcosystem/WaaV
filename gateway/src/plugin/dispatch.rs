@@ -212,6 +212,10 @@ pub enum BuiltinRealtimeProvider {
     /// Google Gemini Live (BidiGenerateContent) — speech-to-speech (base64+JSON;
     /// its own protocol, MULTI-FRAME `serverContent` + session resumption).
     Gemini = 7,
+    /// Ultravox — hosted speech-to-speech model API (raw-PCM binary frames; its
+    /// own protocol, the FIRST `RestThenWebSocket` provider — a REST create-call
+    /// mints a pre-authed `joinUrl` the WS then connects).
+    Ultravox = 8,
 }
 
 impl BuiltinRealtimeProvider {
@@ -227,6 +231,7 @@ impl BuiltinRealtimeProvider {
             Self::Deepgram => "deepgram",
             Self::ElevenLabs => "elevenlabs",
             Self::Gemini => "gemini",
+            Self::Ultravox => "ultravox",
         }
     }
 }
@@ -471,6 +476,9 @@ pub static REALTIME_PROVIDER_MAP: phf::Map<&'static str, BuiltinRealtimeProvider
     "gemini" => BuiltinRealtimeProvider::Gemini,
     "gemini-live" => BuiltinRealtimeProvider::Gemini,
     "google" => BuiltinRealtimeProvider::Gemini,
+    // Ultravox (hosted S2S model API; RestThenWebSocket).
+    "ultravox" => BuiltinRealtimeProvider::Ultravox,
+    "fixie" => BuiltinRealtimeProvider::Ultravox,
 };
 
 // =============================================================================
@@ -588,7 +596,7 @@ pub const BUILTIN_STT_COUNT: usize = 25;
 pub const BUILTIN_TTS_COUNT: usize = 29;
 
 /// Number of built-in Realtime providers
-pub const BUILTIN_REALTIME_COUNT: usize = 8;
+pub const BUILTIN_REALTIME_COUNT: usize = 9;
 
 /// Total number of built-in providers
 pub const TOTAL_BUILTIN_PROVIDERS: usize =
@@ -661,8 +669,17 @@ pub const BUILTIN_TTS_NAMES: [&str; BUILTIN_TTS_COUNT] = [
 ];
 
 /// All built-in Realtime provider names (canonical only, no aliases)
-pub const BUILTIN_REALTIME_NAMES: [&str; BUILTIN_REALTIME_COUNT] =
-    ["openai", "hume", "azure", "grok", "inworld", "deepgram", "elevenlabs", "gemini"];
+pub const BUILTIN_REALTIME_NAMES: [&str; BUILTIN_REALTIME_COUNT] = [
+    "openai",
+    "hume",
+    "azure",
+    "grok",
+    "inworld",
+    "deepgram",
+    "elevenlabs",
+    "gemini",
+    "ultravox",
+];
 
 #[cfg(test)]
 mod tests {
@@ -802,6 +819,19 @@ mod tests {
         assert_eq!(
             resolve_realtime_provider("google"),
             Some(BuiltinRealtimeProvider::Gemini)
+        );
+        // Ultravox (hosted S2S model API; RestThenWebSocket) + alias (case-insensitive).
+        assert_eq!(
+            resolve_realtime_provider("ultravox"),
+            Some(BuiltinRealtimeProvider::Ultravox)
+        );
+        assert_eq!(
+            resolve_realtime_provider("ULTRAVOX"),
+            Some(BuiltinRealtimeProvider::Ultravox)
+        );
+        assert_eq!(
+            resolve_realtime_provider("fixie"),
+            Some(BuiltinRealtimeProvider::Ultravox)
         );
         assert_eq!(resolve_realtime_provider("unknown"), None);
     }

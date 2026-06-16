@@ -232,6 +232,14 @@ pub fn merge_config(
             .and_then(|p| p.gemini_api_key.clone())
     );
 
+    // Ultravox hosted S2S realtime (`X-API-Key` create-call auth).
+    let ultravox_api_key = get_credential!(
+        "ULTRAVOX_API_KEY",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.ultravox_api_key.clone())
+    );
+
     // AssemblyAI API key (streaming STT)
     let assemblyai_api_key = get_credential!(
         "ASSEMBLYAI_API_KEY",
@@ -655,6 +663,7 @@ pub fn merge_config(
         grok_api_key,
         inworld_api_key,
         gemini_api_key,
+        ultravox_api_key,
         assemblyai_api_key,
         hume_api_key,
         lmnt_api_key,

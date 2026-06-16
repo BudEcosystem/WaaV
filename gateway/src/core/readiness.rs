@@ -242,6 +242,7 @@ mod tests {
             grok_api_key: None,
             inworld_api_key: None,
             gemini_api_key: None,
+            ultravox_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,

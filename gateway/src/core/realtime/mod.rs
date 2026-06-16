@@ -57,6 +57,7 @@ pub mod hume;
 pub mod inworld;
 pub mod openai;
 pub mod scaffold;
+pub mod ultravox;
 
 pub use base::{
     AudioOutputCallback, BaseRealtime, BoxedRealtime, ConnectionState, FunctionCallCallback,
@@ -81,6 +82,7 @@ pub use openai::{
     Modality, OPENAI_REALTIME_SAMPLE_RATE, OPENAI_REALTIME_URL, OpenAIRealtime,
     OpenAIRealtimeAudioFormat, OpenAIRealtimeModel, OpenAIRealtimeVoice,
 };
+pub use ultravox::{UltravoxProtocol, UltravoxRealtime};
 
 /// Supported realtime providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +162,9 @@ pub fn create_realtime_provider_from_enum(
 /// `gemini` is Google Gemini Live (BidiGenerateContent, S2S) — base64+JSON on its
 /// own [`GeminiProtocol`]; the MULTI-FRAME `serverContent` + session-resumption
 /// provider the scaffold was designed for.
+/// `ultravox` is the hosted Ultravox S2S model API — raw-PCM binary on its own
+/// [`UltravoxProtocol`]; the FIRST `RestThenWebSocket` provider (a REST
+/// create-call mints a pre-authed `joinUrl` the WS then connects).
 pub fn get_supported_realtime_providers() -> Vec<&'static str> {
     vec![
         "openai",
@@ -170,6 +175,7 @@ pub fn get_supported_realtime_providers() -> Vec<&'static str> {
         "deepgram",
         "elevenlabs",
         "gemini",
+        "ultravox",
     ]
 }
 
@@ -217,7 +223,9 @@ mod tests {
         assert!(providers.contains(&"elevenlabs"));
         // Google Gemini Live (S2S, base64+JSON, MULTI-FRAME serverContent; not a clone).
         assert!(providers.contains(&"gemini"));
-        assert_eq!(providers.len(), 8);
+        // Ultravox (S2S, raw-PCM binary; the first RestThenWebSocket provider).
+        assert!(providers.contains(&"ultravox"));
+        assert_eq!(providers.len(), 9);
     }
 
     #[test]

@@ -263,7 +263,9 @@ mod tests {
     #[test]
     fn connect_spec_uses_azure_url_and_api_key_header() {
         let p = proto(&base_cfg());
-        let ConnectSpec::WebSocket { url, headers } = p.connect_spec(&base_cfg()).unwrap();
+        let ConnectSpec::WebSocket { url, headers } = p.connect_spec(&base_cfg()).unwrap() else {
+            panic!("expected ConnectSpec::WebSocket")
+        };
         assert_eq!(
             url,
             "wss://my-resource.openai.azure.com/openai/v1/realtime?deployment=gpt-realtime-deploy"
@@ -291,7 +293,9 @@ mod tests {
             ..base_cfg()
         };
         let p = proto(&cfg);
-        let ConnectSpec::WebSocket { url, .. } = p.connect_spec(&cfg).unwrap();
+        let ConnectSpec::WebSocket { url, .. } = p.connect_spec(&cfg).unwrap() else {
+            panic!("expected ConnectSpec::WebSocket")
+        };
         assert_eq!(
             url,
             "wss://contoso.openai.azure.com/openai/v1/realtime?deployment=gpt-realtime-deploy"

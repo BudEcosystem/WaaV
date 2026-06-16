@@ -406,7 +406,9 @@ mod tests {
     #[test]
     fn connect_spec_uses_agent_url_and_token_auth() {
         let p = proto(&base_cfg());
-        let ConnectSpec::WebSocket { url, headers } = p.connect_spec(&base_cfg()).unwrap();
+        let ConnectSpec::WebSocket { url, headers } = p.connect_spec(&base_cfg()).unwrap() else {
+            panic!("expected ConnectSpec::WebSocket")
+        };
         assert_eq!(url, "wss://agent.deepgram.com/v1/agent/converse");
         let auth = headers
             .iter()

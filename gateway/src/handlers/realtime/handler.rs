@@ -492,6 +492,9 @@ async fn handle_config(
         // API key (the `?key=` query param) — distinct from `google_credentials`
         // (the service-account JSON for Google STT/TTS).
         "gemini" | "gemini-live" | "google" => app_state.config.gemini_api_key.clone(),
+        // Ultravox (hosted S2S model API) uses the dedicated Ultravox API key
+        // (the `X-API-Key` create-call header).
+        "ultravox" | "fixie" => app_state.config.ultravox_api_key.clone(),
         _ => None,
     };
 

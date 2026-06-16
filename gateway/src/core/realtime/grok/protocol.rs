@@ -201,7 +201,9 @@ mod tests {
     #[test]
     fn connect_spec_uses_xai_url_and_bearer() {
         let p = proto(&base_cfg());
-        let ConnectSpec::WebSocket { url, headers } = p.connect_spec(&base_cfg()).unwrap();
+        let ConnectSpec::WebSocket { url, headers } = p.connect_spec(&base_cfg()).unwrap() else {
+            panic!("expected ConnectSpec::WebSocket")
+        };
         assert_eq!(url, "wss://api.x.ai/v1/realtime?model=grok-realtime");
         let auth = headers
             .iter()

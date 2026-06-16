@@ -79,8 +79,8 @@ impl Default for ProtocolCaps {
 }
 
 /// How the driver should open (and re-open) the transport for a provider.
-/// Extensible: WebSocket today; `RestThenWebSocket` (Ultravox) and `BedrockBidi`
-/// (AWS Nova Sonic) land in later phases behind the same `RealtimeTransportFactory`.
+/// Extensible: WebSocket + `RestThenWebSocket` today; `BedrockBidi`
+/// (AWS Nova Sonic) lands in a later phase behind the same `RealtimeTransportFactory`.
 #[derive(Debug, Clone)]
 pub enum ConnectSpec {
     /// A direct WebSocket upgrade with explicit request headers.
@@ -89,6 +89,29 @@ pub enum ConnectSpec {
         url: String,
         /// Extra request headers (Authorization, api-key, Sec-WebSocket-Protocol…).
         headers: Vec<(String, String)>,
+    },
+    /// THE ULTRAVOX PATTERN: a REST "create call" handshake first, then a plain
+    /// WebSocket connect to the join URL the handshake returns.
+    ///
+    /// The transport factory ([`RestHandshakeWsTransportFactory`]) does an HTTP
+    /// `POST create_url` with `headers` + `body` (a JSON string), parses the JSON
+    /// response, extracts the WS url at `join_url_pointer` (a TOP-LEVEL response
+    /// field name, e.g. `"joinUrl"`), then opens a `WsTextTransport` to that url
+    /// with NO extra headers (the join url is pre-authed). Re-dialing on
+    /// reconnect re-runs the create-call (a fresh single-use join url each time).
+    ///
+    /// [`RestHandshakeWsTransportFactory`]:
+    /// super::transport::RestHandshakeWsTransportFactory
+    RestThenWebSocket {
+        /// The REST endpoint that mints a call (Ultravox: `https://api.ultravox.ai/api/calls`).
+        create_url: String,
+        /// Request headers for the POST (Ultravox: the `X-API-Key` auth header).
+        headers: Vec<(String, String)>,
+        /// The POST body, a pre-serialized JSON string (the create-call payload).
+        body: String,
+        /// The TOP-LEVEL field name in the JSON response holding the `wss://…` url
+        /// to connect (Ultravox: `"joinUrl"`).
+        join_url_pointer: String,
     },
 }
 

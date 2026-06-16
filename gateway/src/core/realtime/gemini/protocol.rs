@@ -546,7 +546,9 @@ mod tests {
     #[test]
     fn connect_spec_puts_key_in_query_not_header() {
         let p = proto(&base_cfg());
-        let ConnectSpec::WebSocket { url, headers } = p.connect_spec(&base_cfg()).unwrap();
+        let ConnectSpec::WebSocket { url, headers } = p.connect_spec(&base_cfg()).unwrap() else {
+            panic!("expected ConnectSpec::WebSocket")
+        };
         assert!(
             url.starts_with(GEMINI_LIVE_URL),
             "URL must be the BidiGenerateContent endpoint: {url}"

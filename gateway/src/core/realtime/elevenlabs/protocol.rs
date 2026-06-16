@@ -374,7 +374,9 @@ mod tests {
             ..Default::default()
         };
         let p = ElevenLabsProtocol::from_config(&cfg).unwrap();
-        let ConnectSpec::WebSocket { url, .. } = p.connect_spec(&cfg).unwrap();
+        let ConnectSpec::WebSocket { url, .. } = p.connect_spec(&cfg).unwrap() else {
+            panic!("expected ConnectSpec::WebSocket")
+        };
         assert!(url.contains("agent_id=agent_from_endpoint"));
     }
 
@@ -382,7 +384,9 @@ mod tests {
     #[test]
     fn connect_spec_uses_convai_url_and_xi_api_key() {
         let p = proto(&base_cfg());
-        let ConnectSpec::WebSocket { url, headers } = p.connect_spec(&base_cfg()).unwrap();
+        let ConnectSpec::WebSocket { url, headers } = p.connect_spec(&base_cfg()).unwrap() else {
+            panic!("expected ConnectSpec::WebSocket")
+        };
         assert_eq!(
             url,
             "wss://api.elevenlabs.io/v1/convai/conversation?agent_id=agent_abc123"
