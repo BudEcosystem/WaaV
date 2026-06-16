@@ -275,6 +275,14 @@ use tokio::sync::mpsc;
 /// memory — same order as the Transcribe audio channel.
 const BEDROCK_INPUT_CHANNEL_DEPTH: usize = 64;
 
+/// Bounds the whole Bedrock dial (aws-config load + bidi-stream open). Without it,
+/// a MISCONFIGURED deployment (no AWS creds/region ⇒ the default chain stalls on
+/// slow IMDS timeouts) would slow-fail the client over many backoff retries instead
+/// of surfacing a prompt error. Mirrors the connection timeout `AwsTranscribeTransport`
+/// applies (the in-tree precedent this transport structurally copies). A correct
+/// deployment (creds+region present) completes the dial in well under this bound.
+const BEDROCK_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// PURE helper (unit-testable WITHOUT AWS creds): wrap one outbound Nova Sonic
 /// event JSON string into the Bedrock SDK's input payload union event. This is
 /// the exact transform `send()` applies — the `bytes` blob of a
@@ -406,45 +414,56 @@ impl RealtimeTransportFactory for BedrockBidiTransportFactory {
             ));
         };
 
-        // Build the AWS config + Bedrock client from the DEFAULT credential chain
-        // (env / shared config / IAM role), exactly like AwsTranscribeTransport.
-        // Region: the spec's, else resolved by the loader from the environment.
-        let mut loader = aws_config::defaults(BehaviorVersion::latest());
-        if let Some(r) = region {
-            loader = loader.region(aws_config::Region::new(r));
-        }
-        let aws_config = loader.load().await;
-        let client = BedrockClient::new(&aws_config);
-
-        // The input half: a bounded channel whose receiver drives an async stream
-        // of union events; the sender is the transport's `send()` surface. (Same
-        // channel-fed `async_stream` Transcribe attaches as its audio input — here
-        // it is the outbound-frame path.)
-        let (input_tx, mut input_rx) = mpsc::channel::<BidiInputEvent>(BEDROCK_INPUT_CHANNEL_DEPTH);
-        let input_stream = async_stream::stream! {
-            while let Some(event) = input_rx.recv().await {
-                yield Ok::<BidiInputEvent, BidiInputError>(event);
+        // Bound the WHOLE dial (config load + stream open) so a misconfigured
+        // deployment fails fast with a clear error instead of stalling the client
+        // across slow IMDS-timeout backoff retries (see BEDROCK_CONNECT_TIMEOUT).
+        tokio::time::timeout(BEDROCK_CONNECT_TIMEOUT, async move {
+            // Build the AWS config + Bedrock client from the DEFAULT credential chain
+            // (env / shared config / IAM role), exactly like AwsTranscribeTransport.
+            // Region: the spec's, else resolved by the loader from the environment.
+            let mut loader = aws_config::defaults(BehaviorVersion::latest());
+            if let Some(r) = region {
+                loader = loader.region(aws_config::Region::new(r));
             }
-        };
+            let aws_config = loader.load().await;
+            let client = BedrockClient::new(&aws_config);
 
-        // Open the bidi stream. `.body(stream.into())` + `.send()` mirrors
-        // Transcribe's `.audio_stream(stream.into()).send_with(&client)`.
-        let output = client
-            .invoke_model_with_bidirectional_stream()
-            .model_id(model_id)
-            .body(input_stream.into())
-            .send()
-            .await
-            .map_err(|e| {
-                RealtimeError::ConnectionFailed(format!(
-                    "failed to open Bedrock bidirectional stream: {e}"
-                ))
-            })?;
+            // The input half: a bounded channel whose receiver drives an async stream
+            // of union events; the sender is the transport's `send()` surface. (Same
+            // channel-fed `async_stream` Transcribe attaches as its audio input — here
+            // it is the outbound-frame path.)
+            let (input_tx, mut input_rx) = mpsc::channel::<BidiInputEvent>(BEDROCK_INPUT_CHANNEL_DEPTH);
+            let input_stream = async_stream::stream! {
+                while let Some(event) = input_rx.recv().await {
+                    yield Ok::<BidiInputEvent, BidiInputError>(event);
+                }
+            };
 
-        Ok(Box::new(BedrockBidiTransport {
-            input_tx,
-            output_rx: output.body,
-        }))
+            // Open the bidi stream. `.body(stream.into())` + `.send()` mirrors
+            // Transcribe's `.audio_stream(stream.into()).send_with(&client)`.
+            let output = client
+                .invoke_model_with_bidirectional_stream()
+                .model_id(model_id)
+                .body(input_stream.into())
+                .send()
+                .await
+                .map_err(|e| {
+                    RealtimeError::ConnectionFailed(format!(
+                        "failed to open Bedrock bidirectional stream: {e}"
+                    ))
+                })?;
+
+            Ok(Box::new(BedrockBidiTransport {
+                input_tx,
+                output_rx: output.body,
+            }) as Box<dyn RealtimeTransport>)
+        })
+        .await
+        .map_err(|_| {
+            RealtimeError::ConnectionFailed(
+                "Bedrock connect timed out (check AWS credentials/region)".to_string(),
+            )
+        })?
     }
 }
 
