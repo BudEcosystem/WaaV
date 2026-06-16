@@ -270,6 +270,31 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
         *self.state.write().unwrap() = s;
     }
 
+    /// Borrow the per-provider protocol (lets a provider newtype expose its own
+    /// inherent accessors — e.g. `OpenAIRealtime::model()` — by delegating).
+    pub(crate) fn protocol(&self) -> &P {
+        &self.protocol
+    }
+
+    /// Borrow the session's config (lets a provider newtype delegate config-derived
+    /// inherent methods — e.g. `build_session_config()` / reconnection accessors).
+    pub(crate) fn config(&self) -> &RealtimeConfig {
+        &self.config
+    }
+
+    /// The shared circuit breaker this session feeds, if injected (W-D2 metrics /
+    /// tests). Mirrors the bespoke `resilience_breaker()` accessor.
+    pub(crate) fn resilience_breaker(
+        &self,
+    ) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.as_ref().map(|r| &r.breaker)
+    }
+
+    /// Read the current session id (post-`session.created`).
+    pub(crate) async fn session_id(&self) -> Option<String> {
+        self.cb.session_id.read().await.clone()
+    }
+
     /// Serialize one wire message and queue it for the supervisor to send.
     /// Fails fast when not connected (e.g. mid-reconnect) rather than silently
     /// buffering frames the live socket will never carry (review finding #6).

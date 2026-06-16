@@ -88,7 +88,7 @@ async fn test_openai_realtime_model_configuration() {
         ..Default::default()
     };
     let realtime = OpenAIRealtime::new(config).unwrap();
-    assert_eq!(realtime.model(), OpenAIRealtimeModel::Gpt4oRealtimePreview);
+    assert_eq!(realtime.model(), OpenAIRealtimeModel::GptRealtime);
 
     // Test mini model
     let config = RealtimeConfig {
@@ -163,7 +163,7 @@ fn test_openai_realtime_default_configuration() {
         realtime.get_connection_state(),
         ConnectionState::Disconnected
     );
-    assert_eq!(realtime.model(), OpenAIRealtimeModel::Gpt4oRealtimePreview);
+    assert_eq!(realtime.model(), OpenAIRealtimeModel::GptRealtime);
     assert_eq!(realtime.voice(), OpenAIRealtimeVoice::Alloy);
 }
 

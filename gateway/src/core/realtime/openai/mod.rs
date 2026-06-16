@@ -64,6 +64,7 @@
 mod client;
 mod config;
 mod messages;
+mod protocol;
 
 pub use client::OpenAIRealtime;
 pub use config::{
