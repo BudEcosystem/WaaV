@@ -188,6 +188,10 @@ pub struct ServerConfig {
     pub grok_api_key: Option<String>,
     /// Inworld Realtime API key (Bearer auth). OpenAI GA wire reused by delegation.
     pub inworld_api_key: Option<String>,
+    /// Google Gemini API key (used for the Gemini Live BidiGenerateContent S2S
+    /// realtime provider; passed as the `?key=` query param). Distinct from
+    /// `google_credentials` (the service-account JSON used by Google STT/TTS).
+    pub gemini_api_key: Option<String>,
     /// AssemblyAI API key for streaming STT
     pub assemblyai_api_key: Option<String>,
     /// Hume AI API key for TTS (Octave) and EVI (Empathic Voice Interface)
@@ -327,6 +331,9 @@ impl Drop for ServerConfig {
             key.zeroize();
         }
         if let Some(ref mut key) = self.inworld_api_key {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.gemini_api_key {
             key.zeroize();
         }
         if let Some(ref mut key) = self.assemblyai_api_key {
@@ -769,6 +776,7 @@ mod tests {
             azure_openai_endpoint: None,
             grok_api_key: None,
             inworld_api_key: None,
+            gemini_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -847,6 +855,7 @@ mod tests {
             azure_openai_endpoint: None,
             grok_api_key: None,
             inworld_api_key: None,
+            gemini_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -914,6 +923,7 @@ mod tests {
             azure_openai_endpoint: None,
             grok_api_key: None,
             inworld_api_key: None,
+            gemini_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -984,6 +994,7 @@ mod tests {
             azure_openai_endpoint: None,
             grok_api_key: None,
             inworld_api_key: None,
+            gemini_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1054,6 +1065,7 @@ mod tests {
             azure_openai_endpoint: None,
             grok_api_key: None,
             inworld_api_key: None,
+            gemini_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1130,6 +1142,7 @@ mod tests {
             azure_openai_endpoint: None,
             grok_api_key: None,
             inworld_api_key: None,
+            gemini_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1193,6 +1206,7 @@ mod tests {
             azure_openai_endpoint: None,
             grok_api_key: None,
             inworld_api_key: None,
+            gemini_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1258,6 +1272,7 @@ mod tests {
             azure_openai_endpoint: None,
             grok_api_key: None,
             inworld_api_key: None,
+            gemini_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1324,6 +1339,7 @@ mod tests {
             azure_openai_endpoint: None,
             grok_api_key: None,
             inworld_api_key: None,
+            gemini_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1389,6 +1405,7 @@ mod tests {
             azure_openai_endpoint: None,
             grok_api_key: None,
             inworld_api_key: None,
+            gemini_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1464,6 +1481,7 @@ mod tests {
             azure_openai_endpoint: None,
             grok_api_key: None,
             inworld_api_key: None,
+            gemini_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1533,6 +1551,7 @@ mod tests {
             azure_openai_endpoint: None,
             grok_api_key: None,
             inworld_api_key: None,
+            gemini_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1601,6 +1620,7 @@ mod tests {
             azure_openai_endpoint: None,
             grok_api_key: None,
             inworld_api_key: None,
+            gemini_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1669,6 +1689,7 @@ mod tests {
             azure_openai_endpoint: None,
             grok_api_key: None,
             inworld_api_key: None,
+            gemini_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1742,6 +1763,7 @@ mod tests {
             azure_openai_endpoint: None,
             grok_api_key: None,
             inworld_api_key: None,
+            gemini_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1809,6 +1831,7 @@ mod tests {
             azure_openai_endpoint: None,
             grok_api_key: None,
             inworld_api_key: None,
+            gemini_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1879,6 +1902,7 @@ mod tests {
             azure_openai_endpoint: None,
             grok_api_key: None,
             inworld_api_key: None,
+            gemini_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1944,6 +1968,7 @@ mod tests {
             azure_openai_endpoint: None,
             grok_api_key: None,
             inworld_api_key: None,
+            gemini_api_key: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,

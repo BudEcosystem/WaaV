@@ -51,6 +51,7 @@ mod base;
 pub mod azure;
 pub mod deepgram;
 pub mod elevenlabs;
+pub mod gemini;
 pub mod grok;
 pub mod hume;
 pub mod inworld;
@@ -69,6 +70,7 @@ pub use base::{
 pub use azure::{AzureProtocol, AzureRealtime};
 pub use deepgram::{DeepgramProtocol, DeepgramRealtime};
 pub use elevenlabs::{ElevenLabsProtocol, ElevenLabsRealtime};
+pub use gemini::{GeminiProtocol, GeminiRealtime};
 pub use grok::{GrokProtocol, GrokRealtime};
 pub use hume::{
     EVIVersion, HUME_EVI_DEFAULT_SAMPLE_RATE, HUME_EVI_WEBSOCKET_URL, HumeEVI, HumeEVIConfig,
@@ -155,6 +157,9 @@ pub fn create_realtime_provider_from_enum(
 /// provider on the scaffold (its own [`DeepgramProtocol`], not an OpenAI clone).
 /// `elevenlabs` is Conversational AI (S2S) — base64+JSON on its own
 /// [`ElevenLabsProtocol`] (the OpenAI-family wire shape, not a clone).
+/// `gemini` is Google Gemini Live (BidiGenerateContent, S2S) — base64+JSON on its
+/// own [`GeminiProtocol`]; the MULTI-FRAME `serverContent` + session-resumption
+/// provider the scaffold was designed for.
 pub fn get_supported_realtime_providers() -> Vec<&'static str> {
     vec![
         "openai",
@@ -164,6 +169,7 @@ pub fn get_supported_realtime_providers() -> Vec<&'static str> {
         "inworld",
         "deepgram",
         "elevenlabs",
+        "gemini",
     ]
 }
 
@@ -209,7 +215,9 @@ mod tests {
         assert!(providers.contains(&"deepgram"));
         // ElevenLabs Conversational AI (S2S, base64+JSON; not a clone).
         assert!(providers.contains(&"elevenlabs"));
-        assert_eq!(providers.len(), 7);
+        // Google Gemini Live (S2S, base64+JSON, MULTI-FRAME serverContent; not a clone).
+        assert!(providers.contains(&"gemini"));
+        assert_eq!(providers.len(), 8);
     }
 
     #[test]

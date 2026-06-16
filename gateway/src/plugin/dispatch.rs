@@ -209,6 +209,9 @@ pub enum BuiltinRealtimeProvider {
     /// ElevenLabs Conversational AI — speech-to-speech (base64+JSON; its own
     /// protocol, the OpenAI-family wire shape, NOT an OpenAI clone).
     ElevenLabs = 6,
+    /// Google Gemini Live (BidiGenerateContent) — speech-to-speech (base64+JSON;
+    /// its own protocol, MULTI-FRAME `serverContent` + session resumption).
+    Gemini = 7,
 }
 
 impl BuiltinRealtimeProvider {
@@ -223,6 +226,7 @@ impl BuiltinRealtimeProvider {
             Self::Inworld => "inworld",
             Self::Deepgram => "deepgram",
             Self::ElevenLabs => "elevenlabs",
+            Self::Gemini => "gemini",
         }
     }
 }
@@ -463,6 +467,10 @@ pub static REALTIME_PROVIDER_MAP: phf::Map<&'static str, BuiltinRealtimeProvider
     "elevenlabs" => BuiltinRealtimeProvider::ElevenLabs,
     "elevenlabs-convai" => BuiltinRealtimeProvider::ElevenLabs,
     "11labs" => BuiltinRealtimeProvider::ElevenLabs,
+    // Google Gemini Live (BidiGenerateContent).
+    "gemini" => BuiltinRealtimeProvider::Gemini,
+    "gemini-live" => BuiltinRealtimeProvider::Gemini,
+    "google" => BuiltinRealtimeProvider::Gemini,
 };
 
 // =============================================================================
@@ -580,7 +588,7 @@ pub const BUILTIN_STT_COUNT: usize = 25;
 pub const BUILTIN_TTS_COUNT: usize = 29;
 
 /// Number of built-in Realtime providers
-pub const BUILTIN_REALTIME_COUNT: usize = 7;
+pub const BUILTIN_REALTIME_COUNT: usize = 8;
 
 /// Total number of built-in providers
 pub const TOTAL_BUILTIN_PROVIDERS: usize =
@@ -654,7 +662,7 @@ pub const BUILTIN_TTS_NAMES: [&str; BUILTIN_TTS_COUNT] = [
 
 /// All built-in Realtime provider names (canonical only, no aliases)
 pub const BUILTIN_REALTIME_NAMES: [&str; BUILTIN_REALTIME_COUNT] =
-    ["openai", "hume", "azure", "grok", "inworld", "deepgram", "elevenlabs"];
+    ["openai", "hume", "azure", "grok", "inworld", "deepgram", "elevenlabs", "gemini"];
 
 #[cfg(test)]
 mod tests {
@@ -777,6 +785,23 @@ mod tests {
         assert_eq!(
             resolve_realtime_provider("11labs"),
             Some(BuiltinRealtimeProvider::ElevenLabs)
+        );
+        // Google Gemini Live + aliases (case-insensitive).
+        assert_eq!(
+            resolve_realtime_provider("gemini"),
+            Some(BuiltinRealtimeProvider::Gemini)
+        );
+        assert_eq!(
+            resolve_realtime_provider("GEMINI"),
+            Some(BuiltinRealtimeProvider::Gemini)
+        );
+        assert_eq!(
+            resolve_realtime_provider("gemini-live"),
+            Some(BuiltinRealtimeProvider::Gemini)
+        );
+        assert_eq!(
+            resolve_realtime_provider("google"),
+            Some(BuiltinRealtimeProvider::Gemini)
         );
         assert_eq!(resolve_realtime_provider("unknown"), None);
     }

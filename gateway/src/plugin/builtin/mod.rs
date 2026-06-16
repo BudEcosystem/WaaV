@@ -18,16 +18,18 @@
 //!   Tinkoff, SberDevices, Bhashini, iFlytek, Alibaba Cloud, Baidu, Tencent,
 //!   Huawei Cloud, NAVER CLOVA, Zalo AI, FPT.AI, Viettel AI, Prosa.ai, NECTEC
 //!
-//! ## Realtime Providers (7)
+//! ## Realtime Providers (8)
 //! - OpenAI, Hume EVI, Azure OpenAI, Grok/xAI, Inworld, Deepgram Voice Agent,
-//!   ElevenLabs Conversational AI
+//!   ElevenLabs Conversational AI, Google Gemini Live
 //!   (Azure/Grok/Inworld are OpenAI-protocol clones reusing the GA wire;
 //!   Deepgram Voice Agent is speech-to-speech with raw linear16 binary frames;
-//!   ElevenLabs Conversational AI is speech-to-speech with base64+JSON frames.)
+//!   ElevenLabs Conversational AI is speech-to-speech with base64+JSON frames;
+//!   Gemini Live is speech-to-speech with base64+JSON, MULTI-FRAME serverContent
+//!   parts + session resumption.)
 
 use crate::core::realtime::{
-    AzureRealtime, BaseRealtime, DeepgramRealtime, ElevenLabsRealtime, GrokRealtime, HumeEVI,
-    InworldRealtime, OpenAIRealtime, RealtimeConfig, RealtimeError,
+    AzureRealtime, BaseRealtime, DeepgramRealtime, ElevenLabsRealtime, GeminiRealtime, GrokRealtime,
+    HumeEVI, InworldRealtime, OpenAIRealtime, RealtimeConfig, RealtimeError,
 };
 use crate::core::stt::{
     AmiVoiceSTT, AssemblyAISTT, AwsTranscribeSTT, AzureSTT, BaiduStt, BaseSTT, BhashiniStt,
@@ -1311,6 +1313,22 @@ fn elevenlabs_realtime_metadata() -> ProviderMetadata {
         .with_features(["full-duplex", "function-calling", "turn-detection", "barge-in"])
 }
 
+fn gemini_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("gemini", "Google Gemini Live")
+        .with_description(
+            "Google Gemini Live (BidiGenerateContent) — speech-to-speech (base64+JSON, 16k in / 24k out; MULTI-FRAME serverContent; session resumption; server VAD)",
+        )
+        .with_models(["gemini-2.0-flash-live-001"])
+        .with_aliases(["gemini-live", "google"])
+        .with_features([
+            "full-duplex",
+            "function-calling",
+            "turn-detection",
+            "barge-in",
+            "session-resumption",
+        ])
+}
+
 // ============================================================================
 // STT Factory Functions
 // ============================================================================
@@ -1631,6 +1649,10 @@ fn create_elevenlabs_realtime(
     config: RealtimeConfig,
 ) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
     Ok(Box::new(ElevenLabsRealtime::new(config)?))
+}
+
+fn create_gemini_realtime(config: RealtimeConfig) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(GeminiRealtime::new(config)?))
 }
 
 // ============================================================================
@@ -2009,6 +2031,11 @@ inventory::submit! {
         .with_aliases(&["elevenlabs-convai", "11labs"])
 }
 
+inventory::submit! {
+    PluginConstructor::realtime("gemini", gemini_realtime_metadata, create_gemini_realtime)
+        .with_aliases(&["gemini-live", "google"])
+}
+
 #[cfg(test)]
 mod tests {
     use crate::plugin::registry::global_registry;
@@ -2172,7 +2199,7 @@ mod tests {
     fn test_builtin_realtime_providers_registered() {
         let registry = global_registry();
 
-        // All 6 realtime providers should be registered.
+        // All 8 realtime providers should be registered.
         assert!(registry.has_realtime_provider("openai"));
         assert!(registry.has_realtime_provider("hume"));
         assert!(registry.has_realtime_provider("evi")); // alias
@@ -2187,6 +2214,13 @@ mod tests {
         assert!(registry.has_realtime_provider("deepgram"));
         assert!(registry.has_realtime_provider("deepgram-agent")); // alias
         assert!(registry.has_realtime_provider("deepgram_voice_agent")); // alias
+        // ElevenLabs Conversational AI (S2S, base64+JSON).
+        assert!(registry.has_realtime_provider("elevenlabs"));
+        assert!(registry.has_realtime_provider("11labs")); // alias
+        // Google Gemini Live (S2S, base64+JSON, MULTI-FRAME serverContent).
+        assert!(registry.has_realtime_provider("gemini"));
+        assert!(registry.has_realtime_provider("gemini-live")); // alias
+        assert!(registry.has_realtime_provider("google")); // alias
     }
 
     #[test]

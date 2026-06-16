@@ -224,6 +224,14 @@ pub fn merge_config(
             .and_then(|p| p.inworld_api_key.clone())
     );
 
+    // Google Gemini Live (BidiGenerateContent S2S; `?key=` query auth).
+    let gemini_api_key = get_credential!(
+        "GEMINI_API_KEY",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.gemini_api_key.clone())
+    );
+
     // AssemblyAI API key (streaming STT)
     let assemblyai_api_key = get_credential!(
         "ASSEMBLYAI_API_KEY",
@@ -646,6 +654,7 @@ pub fn merge_config(
         azure_openai_endpoint,
         grok_api_key,
         inworld_api_key,
+        gemini_api_key,
         assemblyai_api_key,
         hume_api_key,
         lmnt_api_key,

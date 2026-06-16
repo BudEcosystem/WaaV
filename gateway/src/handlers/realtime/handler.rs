@@ -488,6 +488,10 @@ async fn handle_config(
         "elevenlabs" | "elevenlabs-convai" | "11labs" => {
             app_state.config.elevenlabs_api_key.clone()
         }
+        // Google Gemini Live (BidiGenerateContent S2S) uses the dedicated Gemini
+        // API key (the `?key=` query param) — distinct from `google_credentials`
+        // (the service-account JSON for Google STT/TTS).
+        "gemini" | "gemini-live" | "google" => app_state.config.gemini_api_key.clone(),
         _ => None,
     };
 

@@ -90,6 +90,9 @@ impl ServerConfig {
         // Inworld Realtime (OpenAI GA wire, Bearer auth).
         let inworld_api_key = env::var("INWORLD_API_KEY").ok();
 
+        // Google Gemini Live (BidiGenerateContent S2S; `?key=` query auth).
+        let gemini_api_key = env::var("GEMINI_API_KEY").ok();
+
         // AssemblyAI API key (used for streaming STT)
         let assemblyai_api_key = env::var("ASSEMBLYAI_API_KEY").ok();
 
@@ -284,6 +287,7 @@ impl ServerConfig {
             azure_openai_endpoint,
             grok_api_key,
             inworld_api_key,
+            gemini_api_key,
             assemblyai_api_key,
             hume_api_key,
             lmnt_api_key,

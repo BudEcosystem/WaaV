@@ -24,8 +24,8 @@ use waav_gateway::core::realtime::{
 /// set so adding/removing a provider without updating the matrix fails loudly.
 ///
 /// BUMP THIS (and `valid_config_for`) WHEN YOU ADD A REALTIME PROVIDER.
-const EXPECTED_PROVIDERS: [&str; 7] =
-    ["openai", "hume", "azure", "grok", "inworld", "deepgram", "elevenlabs"];
+const EXPECTED_PROVIDERS: [&str; 8] =
+    ["openai", "hume", "azure", "grok", "inworld", "deepgram", "elevenlabs", "gemini"];
 
 /// Build a [`RealtimeConfig`] that SUCCESSFULLY constructs `name`'s provider.
 ///
@@ -91,6 +91,14 @@ fn valid_config_for(name: &str) -> RealtimeConfig {
         // InvalidConfiguration. A descriptive agent id is supplied.
         "elevenlabs" => RealtimeConfig {
             model: "agent_test123".to_string(),
+            ..base
+        },
+        // Gemini Live: `from_config` only needs a non-empty api key; the model
+        // defaults to the current Live model when omitted. A descriptive Live
+        // model + a Gemini prebuilt voice are supplied.
+        "gemini" => RealtimeConfig {
+            model: "gemini-2.0-flash-live-001".to_string(),
+            voice: Some("Puck".to_string()),
             ..base
         },
         // Hume EVI: only the api key is required (defaults: V3, Linear16, 44.1 kHz).
@@ -192,8 +200,8 @@ fn realtime_provider_registry_count_guardrail() {
     );
     assert_eq!(
         get_supported_realtime_providers().len(),
-        7,
-        "expected EXACTLY 7 realtime providers; bump this when you add a realtime provider"
+        8,
+        "expected EXACTLY 8 realtime providers; bump this when you add a realtime provider"
     );
 }
 
