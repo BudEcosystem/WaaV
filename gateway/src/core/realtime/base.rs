@@ -249,6 +249,29 @@ pub struct RealtimeConfig {
     #[serde(default)]
     pub endpoint: Option<String>,
 
+    /// SERVER-CONFIG-ONLY realtime upstream URL override (SSRF-safe). When `Some`
+    /// and it starts with `ws://`/`wss://`, every WebSocket provider's
+    /// [`connect_spec`](crate::core::realtime::scaffold::RealtimeProtocol::connect_spec)
+    /// dials THIS url VERBATIM instead of the provider's documented host (the
+    /// provider's normal auth headers/query are still attached; a query-key
+    /// provider — gemini/hume — appends its `?key=`/`?api_key=` auth query when the
+    /// override carries no query of its own). Supports pointing a provider at a
+    /// PROXY / a SELF-HOSTED or GOV-CLOUD deployment / a local MOCK for testing.
+    ///
+    /// SECURITY: this is populated EXCLUSIVELY from the server's trusted
+    /// configuration (the `<PROVIDER>_REALTIME_URL` env vars →
+    /// [`ServerConfig::realtime_endpoint_overrides`](crate::config::ServerConfig::realtime_endpoint_overrides),
+    /// injected by the realtime handler). It is NEVER read from the untrusted
+    /// client `RealtimeSessionConfig` — the converter
+    /// (`handlers::realtime::build_realtime_config`) must not copy any
+    /// client-supplied endpoint here — so a connecting client cannot redirect the
+    /// gateway's upstream connection (no Server-Side Request Forgery). Distinct
+    /// from [`endpoint`](Self::endpoint), which carries azure's resource / inworld's
+    /// session id; the override is a SEPARATE field that WINS over `endpoint` when
+    /// set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realtime_endpoint_override: Option<String>,
+
     /// Reconnection configuration for automatic reconnection on connection loss.
     #[serde(default)]
     pub reconnection: Option<ReconnectionConfig>,

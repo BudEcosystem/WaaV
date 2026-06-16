@@ -141,6 +141,9 @@ fn rich_config_for(name: &str) -> RealtimeConfig {
         // Provider-side input-audio noise reduction.
         input_audio_noise_reduction: Some("near_field".to_string()),
         endpoint: None,
+        // SERVER-CONFIG-ONLY upstream override (off by default; set per-provider
+        // in the override-honoring cases below to prove it wins over the host).
+        realtime_endpoint_override: None,
         reconnection: None,
     };
 

@@ -179,6 +179,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: crate::config::PluginConfig::default(),
             dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
@@ -285,6 +286,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: crate::config::PluginConfig::default(),
             dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };

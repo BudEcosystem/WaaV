@@ -76,6 +76,7 @@ fn create_test_config_with_livekit() -> ServerConfig {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     }
@@ -142,6 +143,7 @@ fn create_test_config_without_livekit() -> ServerConfig {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     }

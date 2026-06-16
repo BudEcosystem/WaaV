@@ -100,6 +100,12 @@ impl ServerConfig {
         // (Voice AI) realtime provider (`Authorization: Bearer <token>`).
         let speechmatics_api_key = env::var("SPEECHMATICS_API_KEY").ok();
 
+        // SERVER-SIDE per-provider realtime upstream URL overrides (SSRF-safe).
+        // `<PROVIDER>_REALTIME_URL` → the matching realtime provider's connect URL.
+        // For proxies / self-hosted / gov-cloud / local mock testing. TRUSTED
+        // server config only — never sourced from a client request.
+        let realtime_endpoint_overrides = read_realtime_endpoint_overrides();
+
         // AssemblyAI API key (used for streaming STT)
         let assemblyai_api_key = env::var("ASSEMBLYAI_API_KEY").ok();
 
@@ -339,8 +345,43 @@ impl ServerConfig {
             sip_max_participants,
             plugins,
             dag_timeouts,
+            realtime_endpoint_overrides,
         })
     }
+}
+
+/// Provider-name → env-var pairs for the SERVER-SIDE realtime upstream URL
+/// overrides. The provider names are the canonical realtime provider ids (the
+/// keys looked up by the realtime handler).
+pub(crate) const REALTIME_ENDPOINT_OVERRIDE_ENVS: &[(&str, &str)] = &[
+    ("openai", "OPENAI_REALTIME_URL"),
+    ("azure", "AZURE_REALTIME_URL"),
+    ("grok", "GROK_REALTIME_URL"),
+    ("inworld", "INWORLD_REALTIME_URL"),
+    ("deepgram", "DEEPGRAM_REALTIME_URL"),
+    ("elevenlabs", "ELEVENLABS_REALTIME_URL"),
+    ("gemini", "GEMINI_REALTIME_URL"),
+    ("ultravox", "ULTRAVOX_REALTIME_URL"),
+    ("hume", "HUME_REALTIME_URL"),
+    ("speechmatics", "SPEECHMATICS_REALTIME_URL"),
+];
+
+/// Read the `<PROVIDER>_REALTIME_URL` env vars into the provider-keyed override
+/// map. Only NON-EMPTY values are stored (an empty/unset var = no override, so
+/// the provider keeps its default host). The value is used verbatim by the
+/// provider's `connect_spec` (which itself ignores anything that is not a
+/// `ws://`/`wss://` url), so no scheme validation is needed here.
+pub(crate) fn read_realtime_endpoint_overrides() -> std::collections::HashMap<String, String> {
+    REALTIME_ENDPOINT_OVERRIDE_ENVS
+        .iter()
+        .filter_map(|(provider, var)| {
+            env::var(var)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(|v| (provider.to_string(), v))
+        })
+        .collect()
 }
 
 /// Parse SIP configuration from environment variables
@@ -460,6 +501,43 @@ mod tests {
             env::remove_var("SIP_HOOKS_JSON");
             env::remove_var("SIP_HOOK_SECRET");
             env::remove_var("RECORDING_S3_PREFIX");
+        }
+    }
+
+    /// `read_realtime_endpoint_overrides` maps each `<PROVIDER>_REALTIME_URL` env
+    /// var to its CANONICAL provider key, stores only non-empty values, and is
+    /// empty when nothing is set.
+    #[test]
+    #[serial]
+    fn test_realtime_endpoint_overrides_from_env() {
+        // Clean slate.
+        unsafe {
+            for (_, var) in REALTIME_ENDPOINT_OVERRIDE_ENVS {
+                env::remove_var(var);
+            }
+        }
+        assert!(
+            read_realtime_endpoint_overrides().is_empty(),
+            "no env vars set ⇒ empty map"
+        );
+
+        unsafe {
+            env::set_var("OPENAI_REALTIME_URL", "ws://127.0.0.1:9001/x");
+            env::set_var("GEMINI_REALTIME_URL", "wss://proxy.example/gem");
+            // Blank value must be ignored (treated as unset).
+            env::set_var("DEEPGRAM_REALTIME_URL", "   ");
+        }
+        let map = read_realtime_endpoint_overrides();
+        assert_eq!(map.get("openai").map(String::as_str), Some("ws://127.0.0.1:9001/x"));
+        assert_eq!(map.get("gemini").map(String::as_str), Some("wss://proxy.example/gem"));
+        assert!(map.get("deepgram").is_none(), "blank value ⇒ no override");
+        assert!(map.get("hume").is_none(), "unset ⇒ no override");
+        assert_eq!(map.len(), 2);
+
+        unsafe {
+            for (_, var) in REALTIME_ENDPOINT_OVERRIDE_ENVS {
+                env::remove_var(var);
+            }
         }
     }
 

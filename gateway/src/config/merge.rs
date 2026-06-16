@@ -557,6 +557,11 @@ pub fn merge_config(
         })
         .unwrap_or(3);
 
+    // SERVER-SIDE realtime upstream URL overrides (`<PROVIDER>_REALTIME_URL`).
+    // Env-only (TRUSTED config; not a YAML/client surface) — same reader as
+    // `ServerConfig::from_env`. SSRF-safe (see the field docs).
+    let realtime_endpoint_overrides = super::env::read_realtime_endpoint_overrides();
+
     // Plugin configuration (backward compatible: enabled by default)
     let plugins_enabled = yaml
         .plugins
@@ -715,6 +720,7 @@ pub fn merge_config(
         sip_max_participants,
         plugins,
         dag_timeouts,
+        realtime_endpoint_overrides,
     })
 }
 

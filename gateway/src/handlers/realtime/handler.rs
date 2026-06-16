@@ -533,6 +533,21 @@ async fn handle_config(
         realtime_config.endpoint = app_state.config.azure_openai_endpoint.clone();
     }
 
+    // SERVER-CONFIG-ONLY realtime upstream URL override (SSRF-safe). Injected from
+    // the TRUSTED server config (`<PROVIDER>_REALTIME_URL` env vars →
+    // `ServerConfig::realtime_endpoint_overrides`), keyed by the CANONICAL provider
+    // name (so aliases like `azure-openai` / `11labs` / `gemini-live` resolve to
+    // the same override). It is DELIBERATELY set here and NOT inside
+    // `build_realtime_config` (the client→config converter), so the untrusted
+    // client `RealtimeSessionConfig` can never influence which upstream the gateway
+    // dials. When set + `ws://`/`wss://`, the provider's `connect_spec` uses it
+    // verbatim (proxy / self-hosted / gov-cloud / local mock).
+    if let Some(override_url) = canonical_realtime_provider(provider_name)
+        .and_then(|canon| app_state.config.realtime_endpoint_overrides.get(canon))
+    {
+        realtime_config.realtime_endpoint_override = Some(override_url.clone());
+    }
+
     // Create provider
     let mut provider = match create_realtime_provider(provider_name, realtime_config) {
         Ok(p) => p,
@@ -754,12 +769,41 @@ async fn handle_session_update(
     true
 }
 
+/// Map a client-supplied realtime provider name (incl. its accepted aliases) to
+/// the CANONICAL provider id used as the key in
+/// [`ServerConfig::realtime_endpoint_overrides`](crate::config::ServerConfig::realtime_endpoint_overrides).
+/// Returns `None` for providers that have no WS endpoint override (e.g.
+/// `nova_sonic`, which is a Bedrock HTTP/2 stream, or an unknown name). The alias
+/// set mirrors the api-key resolution `match` above so an override applies
+/// regardless of which alias the client used.
+fn canonical_realtime_provider(provider_name: &str) -> Option<&'static str> {
+    match provider_name.to_lowercase().as_str() {
+        "openai" => Some("openai"),
+        "azure" | "azure-openai" | "azure_openai" => Some("azure"),
+        "grok" | "xai" => Some("grok"),
+        "inworld" => Some("inworld"),
+        "deepgram" | "deepgram-agent" | "deepgram_voice_agent" => Some("deepgram"),
+        "elevenlabs" | "elevenlabs-convai" | "11labs" => Some("elevenlabs"),
+        "gemini" | "gemini-live" | "google" => Some("gemini"),
+        "ultravox" | "fixie" => Some("ultravox"),
+        "hume" => Some("hume"),
+        "speechmatics" | "flow" => Some("speechmatics"),
+        _ => None,
+    }
+}
+
 /// Build RealtimeConfig from session config.
 ///
 /// `pub` + re-exported (`handlers::realtime::build_realtime_config`) so the
 /// config-plumbing integration proof (`tests/realtime_full_integration.rs`) can
 /// exercise the REAL `RealtimeSessionConfig -> RealtimeConfig` converter instead
 /// of an in-test mirror that could silently drift from this mapping.
+///
+/// SECURITY: this converter does NOT populate
+/// [`RealtimeConfig::realtime_endpoint_override`](crate::core::realtime::RealtimeConfig::realtime_endpoint_override)
+/// — `RealtimeSessionConfig` (the untrusted client message) carries no endpoint
+/// field, and the upstream override is injected SEPARATELY by the handler from
+/// trusted server config only. Keep it that way (no SSRF via client input).
 pub fn build_realtime_config(api_key: String, config: &RealtimeSessionConfig) -> RealtimeConfig {
     use crate::core::realtime::{InputTranscriptionConfig, TurnDetectionConfig};
 
@@ -861,6 +905,57 @@ mod tests {
         assert_eq!(realtime_config.voice.as_deref(), Some("alloy"));
         assert_eq!(realtime_config.instructions.as_deref(), Some("Be helpful"));
         assert_eq!(realtime_config.temperature, Some(0.8));
+    }
+
+    /// SECURITY (SSRF): the client→config converter MUST NEVER populate
+    /// `realtime_endpoint_override`. The untrusted `RealtimeSessionConfig` has no
+    /// endpoint field, and the upstream override is injected SEPARATELY by the
+    /// handler from trusted server config only. A client cannot redirect the
+    /// gateway's upstream connection. (If someone adds a client endpoint field
+    /// that flows here, this test fails — that is the point.)
+    #[test]
+    fn build_realtime_config_never_sets_endpoint_override_from_client() {
+        // A fully-populated client config (every client-settable field) must still
+        // leave BOTH server-injected endpoint fields untouched.
+        let session_config = RealtimeSessionConfig {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-realtime".to_string()),
+            voice: Some("alloy".to_string()),
+            instructions: Some("hi".to_string()),
+            transcribe_input: Some(true),
+            transcription_model: Some("whisper-1".to_string()),
+            input_audio_format: Some("pcm16".to_string()),
+            output_audio_format: Some("pcm16".to_string()),
+            modalities: Some(vec!["audio".to_string()]),
+            ..Default::default()
+        };
+        let realtime_config = build_realtime_config("test-key".to_string(), &session_config);
+        assert!(
+            realtime_config.realtime_endpoint_override.is_none(),
+            "client input must NEVER set realtime_endpoint_override (SSRF guard)"
+        );
+        assert!(
+            realtime_config.endpoint.is_none(),
+            "client input must NEVER set `endpoint` either (server-injected only)"
+        );
+    }
+
+    /// The override is keyed by the CANONICAL provider id, so every accepted alias
+    /// resolves to the same server-config override (and non-WS providers map to
+    /// `None`).
+    #[test]
+    fn canonical_realtime_provider_maps_aliases() {
+        assert_eq!(canonical_realtime_provider("azure-openai"), Some("azure"));
+        assert_eq!(canonical_realtime_provider("azure_openai"), Some("azure"));
+        assert_eq!(canonical_realtime_provider("xai"), Some("grok"));
+        assert_eq!(canonical_realtime_provider("11labs"), Some("elevenlabs"));
+        assert_eq!(canonical_realtime_provider("gemini-live"), Some("gemini"));
+        assert_eq!(canonical_realtime_provider("fixie"), Some("ultravox"));
+        assert_eq!(canonical_realtime_provider("flow"), Some("speechmatics"));
+        assert_eq!(canonical_realtime_provider("hume"), Some("hume"));
+        // nova_sonic is a Bedrock HTTP/2 stream — NO ws endpoint override.
+        assert_eq!(canonical_realtime_provider("nova_sonic"), None);
+        assert_eq!(canonical_realtime_provider("bogus"), None);
     }
 
     #[test]

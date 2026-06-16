@@ -177,6 +177,26 @@ impl RealtimeProtocol for UltravoxProtocol {
     }
 
     fn connect_spec(&self, cfg: &RealtimeConfig) -> RealtimeResult<ConnectSpec> {
+        // SERVER-CONFIG `realtime_endpoint_override` (proxy / self-hosted / gov-cloud
+        // / local mock) WINS when set — and BYPASSES the REST create-call entirely:
+        // Ultravox normally mints a single-use `joinUrl` via `POST /api/calls`, but a
+        // proxy/mock can't faithfully serve that REST handshake, so we treat the
+        // override as a pre-authed join url and open a PLAIN WebSocket to it directly
+        // (NO create-call, NO extra headers — same as a real `joinUrl`). The entire
+        // call config normally sent in the REST body is dropped on this path (the
+        // override target owns session config). SSRF-safe: never client-settable.
+        if let Some(join_url) = cfg
+            .realtime_endpoint_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| s.starts_with("ws://") || s.starts_with("wss://"))
+        {
+            return Ok(ConnectSpec::WebSocket {
+                url: join_url.to_string(),
+                headers: Vec::new(),
+            });
+        }
+
         // The REST create-call spec: POST the call config; the factory extracts
         // the `joinUrl` and connects it. Auth is the `X-API-Key` header on the
         // POST (NOT on the WS — the join url is pre-authed).
@@ -429,6 +449,26 @@ mod tests {
         assert_eq!(v["voice"], "Mark");
         assert_eq!(v["medium"]["serverWebSocket"]["inputSampleRate"], 16000);
         assert_eq!(v["medium"]["serverWebSocket"]["outputSampleRate"], 24000);
+    }
+
+    /// SERVER-CONFIG `realtime_endpoint_override` WINS and changes the connect
+    /// SHAPE: it BYPASSES the REST create-call and yields a PLAIN `WebSocket`
+    /// straight to the override (a pre-authed join url / mock), with NO extra
+    /// headers — vs the normal `RestThenWebSocket`. This is the documented
+    /// limitation for pointing Ultravox at a mock that can't serve the create-call.
+    /// Server-config-only (never client-settable).
+    #[test]
+    fn connect_spec_override_bypasses_rest_create_call() {
+        let cfg = RealtimeConfig {
+            realtime_endpoint_override: Some("ws://127.0.0.1:9008/join".into()),
+            ..base_cfg()
+        };
+        let spec = proto(&cfg).connect_spec(&cfg).unwrap();
+        let ConnectSpec::WebSocket { url, headers } = spec else {
+            panic!("override must yield a PLAIN WebSocket (no REST handshake), got {spec:?}");
+        };
+        assert_eq!(url, "ws://127.0.0.1:9008/join");
+        assert!(headers.is_empty(), "join url is pre-authed: no extra headers");
     }
 
     /// create_call_body skips optional fields when absent (no instructions ⇒ no

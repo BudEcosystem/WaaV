@@ -298,6 +298,24 @@ pub struct ServerConfig {
     /// DAG timeout configuration for pipeline execution (optional)
     /// Only used when the `dag-routing` feature is enabled
     pub dag_timeouts: DAGTimeoutsConfig,
+
+    /// SERVER-SIDE realtime upstream URL overrides, keyed by realtime provider
+    /// name (`openai`, `azure`, `grok`, `inworld`, `deepgram`, `elevenlabs`,
+    /// `gemini`, `ultravox`, `hume`, `speechmatics`). Read at config load from the
+    /// `<PROVIDER>_REALTIME_URL` env vars (e.g. `OPENAI_REALTIME_URL`). When a
+    /// provider has an entry whose value starts with `ws://`/`wss://`, the realtime
+    /// handler injects it into that session's
+    /// [`RealtimeConfig::realtime_endpoint_override`](crate::core::realtime::RealtimeConfig::realtime_endpoint_override)
+    /// and the provider's `connect_spec` dials it VERBATIM instead of its default
+    /// host. Use cases: a PROXY, a SELF-HOSTED / GOV-CLOUD deployment, or a local
+    /// MOCK upstream for credential-free testing.
+    ///
+    /// SECURITY: this is TRUSTED server configuration only. It is NEVER derived
+    /// from a client's `RealtimeSessionConfig` (clients cannot set an endpoint at
+    /// all — the field does not exist on the client message), so a connecting
+    /// client cannot point the gateway at an attacker-chosen upstream (no SSRF).
+    /// Not a secret (URLs), so it is not zeroized on drop.
+    pub realtime_endpoint_overrides: HashMap<String, String>,
 }
 
 /// Implement Drop to zeroize all secret fields when ServerConfig is dropped.
@@ -829,6 +847,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         }
@@ -910,6 +929,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -980,6 +1000,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1053,6 +1074,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1126,6 +1148,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1205,6 +1228,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1271,6 +1295,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1342,6 +1367,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1408,6 +1434,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1485,6 +1512,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1554,6 +1582,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1626,6 +1655,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1697,6 +1727,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1768,6 +1799,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1844,6 +1876,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1914,6 +1947,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1987,6 +2021,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -2055,6 +2090,7 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };

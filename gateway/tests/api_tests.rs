@@ -74,6 +74,7 @@ async fn test_health_check() {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     };
@@ -169,6 +170,7 @@ async fn test_speak_endpoint_missing_api_key() {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     };
@@ -270,6 +272,7 @@ async fn test_speak_endpoint_empty_text() {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     };
@@ -378,6 +381,7 @@ async fn test_speak_endpoint_with_pronunciations() {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     };
@@ -488,6 +492,7 @@ async fn test_speak_endpoint_invalid_provider() {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
     };

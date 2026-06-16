@@ -66,8 +66,17 @@ impl RealtimeProtocol for GrokProtocol {
         // path (`xai-client-secret.<token>`); sending an unrecognized `realtime`
         // subprotocol with Bearer auth can get the upgrade rejected by a strict
         // server. (Review wf_0f21536d #3.) Not yet live-probed (no xAI key).
+        // SERVER-CONFIG `realtime_endpoint_override` (proxy / self-hosted / mock)
+        // WINS over the xAI host when set — Bearer auth rides along unchanged.
+        // SSRF-safe: never client-settable (see `apply_endpoint_override`).
+        let default_url = format!("{GROK_REALTIME_URL}?model={}", self.model);
+        let url = crate::core::realtime::scaffold::apply_endpoint_override(
+            &default_url,
+            cfg.realtime_endpoint_override.as_deref(),
+            None,
+        );
         Ok(ConnectSpec::WebSocket {
-            url: format!("{GROK_REALTIME_URL}?model={}", self.model),
+            url,
             headers: vec![(
                 "Authorization".to_string(),
                 format!("Bearer {}", cfg.api_key),
@@ -215,6 +224,21 @@ mod tests {
             !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("api-key")),
             "xAI uses Bearer, not the Azure api-key header"
         );
+    }
+
+    /// SERVER-CONFIG `realtime_endpoint_override` WINS over the xAI host VERBATIM;
+    /// Bearer auth rides along. Server-config-only (never client-settable).
+    #[test]
+    fn connect_spec_honors_server_endpoint_override() {
+        let cfg = RealtimeConfig {
+            realtime_endpoint_override: Some("ws://127.0.0.1:9003/grok".into()),
+            ..base_cfg()
+        };
+        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap() else {
+            panic!("expected WebSocket")
+        };
+        assert_eq!(url, "ws://127.0.0.1:9003/grok");
+        assert!(headers.iter().any(|(k, v)| k == "Authorization" && v == "Bearer xaikey"));
     }
 
     /// map_server_event override: xAI `conversation.created` ⇒ [SessionReady],

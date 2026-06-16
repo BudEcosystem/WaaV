@@ -66,6 +66,26 @@ impl RealtimeProtocol for InworldProtocol {
         // Inworld's REST session-create handshake — a Phase-5 `RestHandshake`
         // transport follow-up), so the session id must be supplied out-of-band via
         // `endpoint`. Without it, fail loudly rather than dial a dead URL.
+        let auth = format!("Basic {}", BASE64_STANDARD.encode(cfg.api_key.as_bytes()));
+
+        // SERVER-CONFIG `realtime_endpoint_override` (proxy / self-hosted / gov-cloud
+        // / local mock) WINS over the documented host. It is a SEPARATE field from
+        // `endpoint` (the session id): when set we dial it VERBATIM and DON'T require
+        // a minted session id — the override target (a proxy/mock) owns session
+        // routing. The Basic-auth header rides along unchanged. SSRF-safe: never
+        // client-settable (see `apply_endpoint_override`).
+        if let Some(override_url) = cfg
+            .realtime_endpoint_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| s.starts_with("ws://") || s.starts_with("wss://"))
+        {
+            return Ok(ConnectSpec::WebSocket {
+                url: override_url.to_string(),
+                headers: vec![("Authorization".to_string(), auth)],
+            });
+        }
+
         let session = cfg
             .endpoint
             .as_deref()
@@ -79,7 +99,6 @@ impl RealtimeProtocol for InworldProtocol {
                         .to_string(),
                 )
             })?;
-        let auth = format!("Basic {}", BASE64_STANDARD.encode(cfg.api_key.as_bytes()));
         Ok(ConnectSpec::WebSocket {
             url: format!("{INWORLD_REALTIME_URL}?key={session}&protocol=realtime"),
             headers: vec![("Authorization".to_string(), auth)],
@@ -219,6 +238,24 @@ mod tests {
             !headers.iter().any(|(k, _)| k == "Sec-WebSocket-Protocol"),
             "Inworld server-side Basic auth uses NO WS subprotocol header"
         );
+    }
+
+    /// SERVER-CONFIG `realtime_endpoint_override` WINS VERBATIM and BYPASSES the
+    /// minted-session-id requirement (the override target — a proxy/mock — owns
+    /// session routing). NOTE there is NO `endpoint` here, yet connect_spec
+    /// SUCCEEDS (vs `connect_spec_requires_session_id`). Basic auth rides along.
+    /// Server-config-only (never client-settable).
+    #[test]
+    fn connect_spec_honors_server_endpoint_override_without_session_id() {
+        let cfg = RealtimeConfig {
+            realtime_endpoint_override: Some("ws://127.0.0.1:9004/inworld".into()),
+            ..base_cfg() // no `endpoint` / session id
+        };
+        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap() else {
+            panic!("expected WebSocket")
+        };
+        assert_eq!(url, "ws://127.0.0.1:9004/inworld");
+        assert!(headers.iter().any(|(k, v)| k == "Authorization" && v == "Basic aW5rZXk="));
     }
 
     /// Inworld bootstraps with session.created (like OpenAI) — delegated mapping.

@@ -140,6 +140,106 @@ pub enum ConnectSpec {
     },
 }
 
+/// Apply a SERVER-CONFIG-ONLY realtime endpoint override (SSRF-safe) to a
+/// provider's default connect URL.
+///
+/// `override_url` is
+/// [`RealtimeConfig::realtime_endpoint_override`](super::super::base::RealtimeConfig::realtime_endpoint_override),
+/// sourced ONLY from the trusted server config (the `<PROVIDER>_REALTIME_URL`
+/// env vars), NEVER from the untrusted client request. The contract:
+///
+/// - `None` / blank / a value that does NOT start with `ws://`|`wss://`
+///   ⇒ return `default_url` unchanged (a malformed/non-ws override is ignored so
+///   it can never downgrade to an unintended scheme).
+/// - a `ws://`|`wss://` override ⇒ use it VERBATIM. EXCEPTION: when the provider
+///   carries its auth in the URL QUERY (gemini's `?key=`, hume's `?api_key=` —
+///   pass `auth_query = Some("key=…")`) and the override URL has NO `?` of its
+///   own, the auth query is appended so the mock/proxy still receives a
+///   well-formed connect URL. Header-auth providers pass `auth_query = None`
+///   (their headers ride along untouched).
+///
+/// This lets any provider be pointed at a proxy / self-hosted / gov-cloud
+/// deployment / local mock by SERVER configuration alone.
+pub fn apply_endpoint_override(
+    default_url: &str,
+    override_url: Option<&str>,
+    auth_query: Option<&str>,
+) -> String {
+    let ov = match override_url.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(o) if o.starts_with("ws://") || o.starts_with("wss://") => o,
+        // Unset, blank, or non-ws scheme ⇒ keep the provider's default (no
+        // silent scheme downgrade, no SSRF via a bogus override).
+        _ => return default_url.to_string(),
+    };
+    match auth_query {
+        // Query-key provider whose override lacks a query ⇒ append the auth query.
+        Some(q) if !q.is_empty() && !ov.contains('?') => format!("{ov}?{q}"),
+        _ => ov.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod endpoint_override_tests {
+    use super::apply_endpoint_override;
+
+    #[test]
+    fn unset_keeps_default() {
+        assert_eq!(
+            apply_endpoint_override("wss://api.example.com/v1", None, None),
+            "wss://api.example.com/v1"
+        );
+        assert_eq!(
+            apply_endpoint_override("wss://api.example.com/v1", Some("   "), None),
+            "wss://api.example.com/v1"
+        );
+    }
+
+    #[test]
+    fn non_ws_override_is_ignored() {
+        // An http(s) or bogus override must NOT replace a wss default.
+        assert_eq!(
+            apply_endpoint_override("wss://api.example.com/v1", Some("http://evil"), None),
+            "wss://api.example.com/v1"
+        );
+        assert_eq!(
+            apply_endpoint_override("wss://api.example.com/v1", Some("not-a-url"), None),
+            "wss://api.example.com/v1"
+        );
+    }
+
+    #[test]
+    fn ws_override_used_verbatim() {
+        assert_eq!(
+            apply_endpoint_override("wss://api.example.com/v1", Some("ws://127.0.0.1:9/x"), None),
+            "ws://127.0.0.1:9/x"
+        );
+    }
+
+    #[test]
+    fn query_key_appended_when_override_has_no_query() {
+        assert_eq!(
+            apply_endpoint_override(
+                "wss://gen.example.com/ws?key=K",
+                Some("ws://127.0.0.1:9"),
+                Some("key=K")
+            ),
+            "ws://127.0.0.1:9?key=K"
+        );
+    }
+
+    #[test]
+    fn query_key_not_appended_when_override_already_has_query() {
+        assert_eq!(
+            apply_endpoint_override(
+                "wss://gen.example.com/ws?key=K",
+                Some("ws://127.0.0.1:9/join?token=abc"),
+                Some("key=K")
+            ),
+            "ws://127.0.0.1:9/join?token=abc"
+        );
+    }
+}
+
 /// The normalized realtime server event. Every provider's `map_server_event`
 /// lowers raw wire payloads to a `Vec` of these (a Vec because some providers —
 /// e.g. Gemini — bundle several logical frames into one wire message). The
