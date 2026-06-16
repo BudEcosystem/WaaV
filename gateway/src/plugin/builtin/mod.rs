@@ -18,7 +18,7 @@
 //!   Tinkoff, SberDevices, Bhashini, iFlytek, Alibaba Cloud, Baidu, Tencent,
 //!   Huawei Cloud, NAVER CLOVA, Zalo AI, FPT.AI, Viettel AI, Prosa.ai, NECTEC
 //!
-//! ## Realtime Providers (11)
+//! ## Realtime Providers (12)
 //! - OpenAI, Hume EVI, Azure OpenAI, Grok/xAI, Inworld, Deepgram Voice Agent,
 //!   ElevenLabs Conversational AI, Google Gemini Live, Ultravox, AWS Nova Sonic
 //!   (Azure/Grok/Inworld are OpenAI-protocol clones reusing the GA wire;
@@ -35,7 +35,7 @@
 use crate::core::realtime::{
     AzureRealtime, BaseRealtime, DeepgramRealtime, ElevenLabsRealtime, GeminiRealtime, GrokRealtime,
     HumeEVI, InworldRealtime, NovaSonicRealtime, OpenAIRealtime, RealtimeConfig, RealtimeError,
-    SpeechmaticsRealtime, UltravoxRealtime,
+    SpeechmaticsRealtime, UltravoxRealtime, YandexRealtime,
 };
 use crate::core::stt::{
     AmiVoiceSTT, AssemblyAISTT, AwsTranscribeSTT, AzureSTT, BaiduStt, BaseSTT, BhashiniStt,
@@ -1365,6 +1365,16 @@ fn speechmatics_realtime_metadata() -> ProviderMetadata {
         .with_features(["full-duplex", "function-calling", "turn-detection", "barge-in"])
 }
 
+fn yandex_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("yandex", "Yandex Cloud AI Studio Realtime")
+        .with_description(
+            "Yandex Cloud AI Studio Realtime — OpenAI-protocol clone (GA wire reused by delegation, base64-PCM in JSON both ways; wss://ai.api.cloud.yandex.net/v1/realtime?model=gpt://<folder>/speech-realtime-250923; auth Authorization: Bearer <IAM-token/static-API-key>; folder id required; server VAD)",
+        )
+        .with_models(["speech-realtime-250923"])
+        .with_aliases(["yandexgpt", "yandex-cloud"])
+        .with_features(["full-duplex", "function-calling", "turn-detection", "barge-in"])
+}
+
 // ============================================================================
 // STT Factory Functions
 // ============================================================================
@@ -1707,6 +1717,10 @@ fn create_speechmatics_realtime(
     config: RealtimeConfig,
 ) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
     Ok(Box::new(SpeechmaticsRealtime::new(config)?))
+}
+
+fn create_yandex_realtime(config: RealtimeConfig) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(YandexRealtime::new(config)?))
 }
 
 // ============================================================================
@@ -2105,6 +2119,11 @@ inventory::submit! {
         .with_aliases(&["flow"])
 }
 
+inventory::submit! {
+    PluginConstructor::realtime("yandex", yandex_realtime_metadata, create_yandex_realtime)
+        .with_aliases(&["yandexgpt", "yandex-cloud"])
+}
+
 #[cfg(test)]
 mod tests {
     use crate::plugin::registry::global_registry;
@@ -2268,7 +2287,7 @@ mod tests {
     fn test_builtin_realtime_providers_registered() {
         let registry = global_registry();
 
-        // All 10 realtime providers should be registered.
+        // All 12 realtime providers should be registered.
         assert!(registry.has_realtime_provider("openai"));
         assert!(registry.has_realtime_provider("hume"));
         assert!(registry.has_realtime_provider("evi")); // alias
@@ -2300,6 +2319,10 @@ mod tests {
         // Speechmatics Flow (S2S, raw-PCM binary + JSON control; template-driven).
         assert!(registry.has_realtime_provider("speechmatics"));
         assert!(registry.has_realtime_provider("flow")); // alias
+        // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone; GA wire, Bearer).
+        assert!(registry.has_realtime_provider("yandex"));
+        assert!(registry.has_realtime_provider("yandexgpt")); // alias
+        assert!(registry.has_realtime_provider("yandex-cloud")); // alias
     }
 
     #[test]

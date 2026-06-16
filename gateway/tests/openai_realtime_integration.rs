@@ -33,7 +33,8 @@ fn test_openai_in_supported_realtime_providers() {
     assert!(providers.contains(&"ultravox"));
     assert!(providers.contains(&"nova_sonic"));
     assert!(providers.contains(&"speechmatics"));
-    assert_eq!(providers.len(), 11); // OpenAI, Hume + Azure/Grok/Inworld clones + Deepgram VA + ElevenLabs ConvAI + Gemini Live + Ultravox + AWS Nova Sonic + Speechmatics Flow (S2S)
+    assert!(providers.contains(&"yandex"));
+    assert_eq!(providers.len(), 12); // OpenAI, Hume + Azure/Grok/Inworld/Yandex clones + Deepgram VA + ElevenLabs ConvAI + Gemini Live + Ultravox + AWS Nova Sonic + Speechmatics Flow (S2S)
 }
 
 /// Test provider creation via string name

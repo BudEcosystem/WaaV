@@ -199,6 +199,15 @@ pub struct ServerConfig {
     /// TTS, and the Flow (Voice AI) realtime provider; for Flow it is passed as the
     /// `Authorization: Bearer <token>` value. Also read from `SPEECHMATICS_API_KEY`.
     pub speechmatics_api_key: Option<String>,
+    /// Yandex Cloud AI Studio Realtime API key — a Yandex IAM token or a static API
+    /// key, sent as the `Authorization: Bearer <token>` value. Used by the `yandex`
+    /// realtime provider (an OpenAI-protocol clone). Read from `YANDEX_API_KEY`.
+    pub yandex_api_key: Option<String>,
+    /// Yandex Cloud folder id (the `<FOLDER_ID>` in the `gpt://<FOLDER_ID>/<model>`
+    /// model URI) for the `yandex` realtime provider. Required for `yandex`; the
+    /// realtime handler injects it into the provider's `endpoint` slot (mirroring
+    /// the Azure resource injection). Read from `YANDEX_FOLDER_ID`.
+    pub yandex_folder_id: Option<String>,
     /// AssemblyAI API key for streaming STT
     pub assemblyai_api_key: Option<String>,
     /// Hume AI API key for TTS (Octave) and EVI (Empathic Voice Interface)
@@ -365,6 +374,9 @@ impl Drop for ServerConfig {
             key.zeroize();
         }
         if let Some(ref mut key) = self.speechmatics_api_key {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.yandex_api_key {
             key.zeroize();
         }
         if let Some(ref mut key) = self.assemblyai_api_key {
@@ -810,6 +822,8 @@ mod tests {
             gemini_api_key: None,
             ultravox_api_key: None,
             speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -892,6 +906,8 @@ mod tests {
             gemini_api_key: None,
             ultravox_api_key: None,
             speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -963,6 +979,8 @@ mod tests {
             gemini_api_key: None,
             ultravox_api_key: None,
             speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1037,6 +1055,8 @@ mod tests {
             gemini_api_key: None,
             ultravox_api_key: None,
             speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1111,6 +1131,8 @@ mod tests {
             gemini_api_key: None,
             ultravox_api_key: None,
             speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1191,6 +1213,8 @@ mod tests {
             gemini_api_key: None,
             ultravox_api_key: None,
             speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1258,6 +1282,8 @@ mod tests {
             gemini_api_key: None,
             ultravox_api_key: None,
             speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1327,6 +1353,8 @@ mod tests {
             gemini_api_key: None,
             ultravox_api_key: None,
             speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1397,6 +1425,8 @@ mod tests {
             gemini_api_key: None,
             ultravox_api_key: None,
             speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1466,6 +1496,8 @@ mod tests {
             gemini_api_key: None,
             ultravox_api_key: None,
             speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1545,6 +1577,8 @@ mod tests {
             gemini_api_key: None,
             ultravox_api_key: None,
             speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1618,6 +1652,8 @@ mod tests {
             gemini_api_key: None,
             ultravox_api_key: None,
             speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1690,6 +1726,8 @@ mod tests {
             gemini_api_key: None,
             ultravox_api_key: None,
             speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1762,6 +1800,8 @@ mod tests {
             gemini_api_key: None,
             ultravox_api_key: None,
             speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1839,6 +1879,8 @@ mod tests {
             gemini_api_key: None,
             ultravox_api_key: None,
             speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1910,6 +1952,8 @@ mod tests {
             gemini_api_key: None,
             ultravox_api_key: None,
             speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1984,6 +2028,8 @@ mod tests {
             gemini_api_key: None,
             ultravox_api_key: None,
             speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -2053,6 +2099,8 @@ mod tests {
             gemini_api_key: None,
             ultravox_api_key: None,
             speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,

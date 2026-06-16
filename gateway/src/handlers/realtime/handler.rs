@@ -507,6 +507,10 @@ async fn handle_config(
         // passed as the `Authorization: Bearer <token>` value (a JWT / temporary
         // token). The same credential the Speechmatics STT/TTS providers use.
         "speechmatics" | "flow" => app_state.config.speechmatics_api_key.clone(),
+        // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone) uses the dedicated
+        // Yandex API key (a Yandex IAM token / static API key), passed as the
+        // `Authorization: Bearer <token>` value. The folder id is injected below.
+        "yandex" | "yandexgpt" | "yandex-cloud" => app_state.config.yandex_api_key.clone(),
         _ => None,
     };
 
@@ -531,6 +535,16 @@ async fn handle_config(
         "azure" | "azure-openai" | "azure_openai"
     ) {
         realtime_config.endpoint = app_state.config.azure_openai_endpoint.clone();
+    }
+    // Yandex Cloud AI Studio Realtime needs the server-configured FOLDER ID (the
+    // `<folder>` in the `gpt://<folder>/<model>` model URI) — it is NOT a client
+    // session field. Injected into the provider's `endpoint` slot (mirroring the
+    // Azure resource injection above); `YandexProtocol::from_config` reads it there.
+    if matches!(
+        provider_name.to_lowercase().as_str(),
+        "yandex" | "yandexgpt" | "yandex-cloud"
+    ) {
+        realtime_config.endpoint = app_state.config.yandex_folder_id.clone();
     }
 
     // SERVER-CONFIG-ONLY realtime upstream URL override (SSRF-safe). Injected from
@@ -788,6 +802,7 @@ fn canonical_realtime_provider(provider_name: &str) -> Option<&'static str> {
         "ultravox" | "fixie" => Some("ultravox"),
         "hume" => Some("hume"),
         "speechmatics" | "flow" => Some("speechmatics"),
+        "yandex" | "yandexgpt" | "yandex-cloud" => Some("yandex"),
         _ => None,
     }
 }

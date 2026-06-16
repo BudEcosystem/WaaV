@@ -135,6 +135,10 @@ pub struct ProvidersYaml {
     pub ultravox_api_key: Option<String>,
     /// Speechmatics API key (JWT / temp-token) — STT/TTS + Flow (Voice AI) realtime
     pub speechmatics_api_key: Option<String>,
+    /// Yandex Cloud AI Studio Realtime API key (IAM token / static API key, Bearer auth)
+    pub yandex_api_key: Option<String>,
+    /// Yandex Cloud folder id for the `yandex` realtime provider (gpt://<folder>/<model>)
+    pub yandex_folder_id: Option<String>,
     /// AssemblyAI API key for streaming STT
     pub assemblyai_api_key: Option<String>,
     /// Hume AI API key for TTS (Octave) and EVI

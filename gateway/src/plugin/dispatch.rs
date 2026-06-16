@@ -225,6 +225,10 @@ pub enum BuiltinRealtimeProvider {
     /// Speechmatics' streaming STT (raw-PCM binary frames + JSON control, its own
     /// protocol; template-driven agents; auth `Authorization: Bearer <token>`).
     Speechmatics = 10,
+    /// Yandex Cloud AI Studio Realtime — OpenAI-protocol clone (GA wire reused by
+    /// delegation; the `wss://ai.api.cloud.yandex.net/v1/realtime?model=gpt://…`
+    /// host + Bearer auth — a Yandex IAM token / static API key).
+    Yandex = 11,
 }
 
 impl BuiltinRealtimeProvider {
@@ -243,6 +247,7 @@ impl BuiltinRealtimeProvider {
             Self::Ultravox => "ultravox",
             Self::NovaSonic => "nova_sonic",
             Self::Speechmatics => "speechmatics",
+            Self::Yandex => "yandex",
         }
     }
 }
@@ -497,6 +502,10 @@ pub static REALTIME_PROVIDER_MAP: phf::Map<&'static str, BuiltinRealtimeProvider
     // Speechmatics Flow (Voice AI; raw-PCM binary + JSON control).
     "speechmatics" => BuiltinRealtimeProvider::Speechmatics,
     "flow" => BuiltinRealtimeProvider::Speechmatics,
+    // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone; GA wire, Bearer auth).
+    "yandex" => BuiltinRealtimeProvider::Yandex,
+    "yandexgpt" => BuiltinRealtimeProvider::Yandex,
+    "yandex-cloud" => BuiltinRealtimeProvider::Yandex,
 };
 
 // =============================================================================
@@ -614,7 +623,7 @@ pub const BUILTIN_STT_COUNT: usize = 25;
 pub const BUILTIN_TTS_COUNT: usize = 29;
 
 /// Number of built-in Realtime providers
-pub const BUILTIN_REALTIME_COUNT: usize = 11;
+pub const BUILTIN_REALTIME_COUNT: usize = 12;
 
 /// Total number of built-in providers
 pub const TOTAL_BUILTIN_PROVIDERS: usize =
@@ -699,6 +708,7 @@ pub const BUILTIN_REALTIME_NAMES: [&str; BUILTIN_REALTIME_COUNT] = [
     "ultravox",
     "nova_sonic",
     "speechmatics",
+    "yandex",
 ];
 
 #[cfg(test)]
@@ -882,6 +892,24 @@ mod tests {
         assert_eq!(
             resolve_realtime_provider("flow"),
             Some(BuiltinRealtimeProvider::Speechmatics)
+        );
+        // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone) + aliases
+        // (case-insensitive).
+        assert_eq!(
+            resolve_realtime_provider("yandex"),
+            Some(BuiltinRealtimeProvider::Yandex)
+        );
+        assert_eq!(
+            resolve_realtime_provider("YANDEX"),
+            Some(BuiltinRealtimeProvider::Yandex)
+        );
+        assert_eq!(
+            resolve_realtime_provider("yandexgpt"),
+            Some(BuiltinRealtimeProvider::Yandex)
+        );
+        assert_eq!(
+            resolve_realtime_provider("yandex-cloud"),
+            Some(BuiltinRealtimeProvider::Yandex)
         );
         assert_eq!(resolve_realtime_provider("unknown"), None);
     }

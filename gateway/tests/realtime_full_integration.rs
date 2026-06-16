@@ -6,7 +6,7 @@
 //! `realtime_provider_matrix.rs` proves the *minimal* uniform contract (creates
 //! from a valid config, case-insensitive name, rejects an empty key, sane
 //! `get_provider_info`, not-ready-before-connect). THIS file proves the much
-//! stronger claim the goal demands: that **every** one of the 11 realtime
+//! stronger claim the goal demands: that **every** one of the 12 realtime
 //! providers is *fully integrated with the rest of the system* — it reaches each
 //! provider through the SAME registry call the live `/realtime` handler uses
 //! (`plugin::global_registry().create_realtime`), carrying the COMPLETE feature
@@ -48,7 +48,7 @@
 //!
 //! Construction + config plumbing + the registry/handler wiring + feature
 //! compatibility are **pure / local** (no socket): they are PROVEN here for all
-//! 11 providers without any vendor key. The audio round-trip (actually
+//! 12 providers without any vendor key. The audio round-trip (actually
 //! connecting the WebSocket / Bedrock bidi stream and exchanging audio) is the
 //! ONLY remaining step that needs a live key; it is covered live for
 //! openai/deepgram/elevenlabs and remains key-gated for the other 8.
@@ -67,7 +67,7 @@ use waav_gateway::plugin::global_registry;
 /// The realtime fleet this proof covers, in the registry's own order. Pinned so a
 /// future provider added without updating this proof fails loudly (the count
 /// guardrail below).
-const EXPECTED_REALTIME: [&str; 11] = [
+const EXPECTED_REALTIME: [&str; 12] = [
     "openai",
     "hume",
     "azure",
@@ -79,6 +79,7 @@ const EXPECTED_REALTIME: [&str; 11] = [
     "ultravox",
     "nova_sonic",
     "speechmatics",
+    "yandex",
 ];
 
 /// Providers that do NOT authenticate with an api-key. `nova_sonic` (AWS Nova
@@ -210,6 +211,15 @@ fn rich_config_for(name: &str) -> RealtimeConfig {
             voice: Some("amelia".to_string()),
             ..base
         },
+        // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone): needs the folder
+        // id in `endpoint` (the handler injects `yandex_folder_id` there) to build
+        // the `gpt://<folder>/<model>` URI; the model is a bare name → wrapped.
+        "yandex" => RealtimeConfig {
+            model: "speech-realtime-250923".to_string(),
+            voice: Some("alena".to_string()),
+            endpoint: Some("b1gfolder123".to_string()),
+            ..base
+        },
         // Hume EVI: only the api key is required; full surface is harmless.
         _ => RealtimeConfig {
             model: "hume-evi".to_string(),
@@ -227,8 +237,8 @@ async fn every_provider_constructs_through_the_real_registry_with_the_full_featu
     let providers = get_supported_realtime_providers();
     assert_eq!(
         providers.len(),
-        11,
-        "expected exactly 11 realtime providers on the shared scaffold"
+        12,
+        "expected exactly 12 realtime providers on the shared scaffold"
     );
 
     let registry = global_registry();
@@ -509,23 +519,23 @@ fn session_config_disables_input_transcription_when_requested() {
 /// TASK 2 (6): IMPACT-ANALYSIS assertion.
 ///
 /// Adding the realtime fleet must NOT have disturbed the cascade STT/TTS
-/// registries. We assert (a) the realtime list is EXACTLY the 11, AND (b) stable
+/// registries. We assert (a) the realtime list is EXACTLY the 12, AND (b) stable
 /// sentinels still register in the STT and TTS provider sets — proving the
 /// additive realtime work (new `core/realtime/` providers + additive
 /// `RealtimeConfig` fields + the `ConnectSpec` enum) left the cascade paths
 /// untouched.
 #[test]
 fn realtime_additions_did_not_disturb_the_cascade_registries() {
-    // (a) The realtime registry is EXACTLY the 11, by sorted-set + length.
+    // (a) The realtime registry is EXACTLY the 12, by sorted-set + length.
     let mut actual = get_supported_realtime_providers();
     actual.sort_unstable();
     let mut expected = EXPECTED_REALTIME.to_vec();
     expected.sort_unstable();
     assert_eq!(
         actual, expected,
-        "the realtime registry drifted from the expected 11"
+        "the realtime registry drifted from the expected 12"
     );
-    assert_eq!(get_supported_realtime_providers().len(), 11);
+    assert_eq!(get_supported_realtime_providers().len(), 12);
 
     // (b) The cascade STT registry still carries its stable sentinels (the same
     //     providers that the 6295-test regression + the live cascade exercise).

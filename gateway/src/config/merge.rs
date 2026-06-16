@@ -261,6 +261,22 @@ pub fn merge_config(
             .and_then(|p| p.speechmatics_api_key.clone())
     );
 
+    // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone; GA wire, Bearer auth).
+    // The key is a Yandex IAM token / static API key; the folder id (non-secret,
+    // like azure's endpoint) builds the `gpt://<folder>/<model>` connect URI.
+    let yandex_api_key = get_credential!(
+        "YANDEX_API_KEY",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.yandex_api_key.clone())
+    );
+    let yandex_folder_id = get_credential!(
+        "YANDEX_FOLDER_ID",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.yandex_folder_id.clone())
+    );
+
     // AssemblyAI API key (streaming STT)
     let assemblyai_api_key = get_credential!(
         "ASSEMBLYAI_API_KEY",
@@ -693,6 +709,8 @@ pub fn merge_config(
         gemini_api_key,
         ultravox_api_key,
         speechmatics_api_key,
+        yandex_api_key,
+        yandex_folder_id,
         assemblyai_api_key,
         hume_api_key,
         lmnt_api_key,

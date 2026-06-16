@@ -24,7 +24,7 @@ use waav_gateway::core::realtime::{
 /// set so adding/removing a provider without updating the matrix fails loudly.
 ///
 /// BUMP THIS (and `valid_config_for`) WHEN YOU ADD A REALTIME PROVIDER.
-const EXPECTED_PROVIDERS: [&str; 11] = [
+const EXPECTED_PROVIDERS: [&str; 12] = [
     "openai",
     "hume",
     "azure",
@@ -36,6 +36,7 @@ const EXPECTED_PROVIDERS: [&str; 11] = [
     "ultravox",
     "nova_sonic",
     "speechmatics",
+    "yandex",
 ];
 
 /// The realtime providers that do NOT authenticate with an api-key, so the
@@ -147,6 +148,17 @@ fn valid_config_for(name: &str) -> RealtimeConfig {
         "speechmatics" => RealtimeConfig {
             model: "flow-service-assistant-amelia".to_string(),
             voice: Some("amelia".to_string()),
+            ..base
+        },
+        // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone): `from_config`
+        // needs a non-empty api key (the Bearer IAM token / API key — `base`) AND
+        // the folder id in `endpoint` (the handler injects `yandex_folder_id` there)
+        // to build the `gpt://<folder>/<model>` URI. The model defaults to
+        // `speech-realtime-250923` when a bare name is omitted; a Yandex voice is set.
+        "yandex" => RealtimeConfig {
+            model: "speech-realtime-250923".to_string(),
+            voice: Some("alena".to_string()),
+            endpoint: Some("b1gfolder123".to_string()),
             ..base
         },
         // Hume EVI: only the api key is required (defaults: V3, Linear16, 44.1 kHz).
@@ -266,8 +278,8 @@ fn realtime_provider_registry_count_guardrail() {
     );
     assert_eq!(
         get_supported_realtime_providers().len(),
-        11,
-        "expected EXACTLY 11 realtime providers; bump this when you add a realtime provider"
+        12,
+        "expected EXACTLY 12 realtime providers; bump this when you add a realtime provider"
     );
 }
 

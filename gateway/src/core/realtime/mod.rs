@@ -60,6 +60,7 @@ pub mod openai;
 pub mod scaffold;
 pub mod speechmatics;
 pub mod ultravox;
+pub mod yandex;
 
 pub use base::{
     AudioOutputCallback, BaseRealtime, BoxedRealtime, ConnectionState, FunctionCallCallback,
@@ -87,6 +88,7 @@ pub use openai::{
 };
 pub use speechmatics::{SpeechmaticsProtocol, SpeechmaticsRealtime};
 pub use ultravox::{UltravoxProtocol, UltravoxRealtime};
+pub use yandex::{YandexProtocol, YandexRealtime};
 
 /// Supported realtime providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +179,11 @@ pub fn create_realtime_provider_from_enum(
 /// [`SpeechmaticsProtocol`] (Deepgram-shaped wire: binary audio in/out + JSON
 /// control); template-driven agents, auth via `Authorization: Bearer <token>`
 /// (a Speechmatics JWT / temporary token).
+/// `yandex` is Yandex Cloud AI Studio's Realtime API — an OpenAI-PROTOCOL CLONE
+/// (GA wire reused via the embedded [`OpenAiProtocol`](openai::OpenAiProtocol) by
+/// delegation, like azure/grok/inworld); it differs only in the host
+/// (`wss://ai.api.cloud.yandex.net/v1/realtime?model=gpt://<folder>/<model>`) +
+/// Bearer auth (a Yandex IAM token / static API key).
 pub fn get_supported_realtime_providers() -> Vec<&'static str> {
     vec![
         "openai",
@@ -190,6 +197,7 @@ pub fn get_supported_realtime_providers() -> Vec<&'static str> {
         "ultravox",
         "nova_sonic",
         "speechmatics",
+        "yandex",
     ]
 }
 
@@ -243,7 +251,9 @@ mod tests {
         assert!(providers.contains(&"nova_sonic"));
         // Speechmatics Flow (S2S, raw-PCM binary + JSON control; template-driven).
         assert!(providers.contains(&"speechmatics"));
-        assert_eq!(providers.len(), 11);
+        // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone; GA wire, Bearer).
+        assert!(providers.contains(&"yandex"));
+        assert_eq!(providers.len(), 12);
     }
 
     #[test]

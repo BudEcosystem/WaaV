@@ -121,6 +121,12 @@ impl ServerConfig {
         // (Voice AI) realtime provider (`Authorization: Bearer <token>`).
         let speechmatics_api_key = cred_env!("SPEECHMATICS_API_KEY");
 
+        // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone; GA wire, Bearer
+        // auth). The key is a Yandex IAM token or a static API key; the folder id
+        // (NOT a secret — like azure's endpoint) builds the `gpt://<folder>/…` URI.
+        let yandex_api_key = cred_env!("YANDEX_API_KEY");
+        let yandex_folder_id = env::var("YANDEX_FOLDER_ID").ok();
+
         // SERVER-SIDE per-provider realtime upstream URL overrides (SSRF-safe).
         // `<PROVIDER>_REALTIME_URL` → the matching realtime provider's connect URL.
         // For proxies / self-hosted / gov-cloud / local mock testing. TRUSTED
@@ -324,6 +330,8 @@ impl ServerConfig {
             gemini_api_key,
             ultravox_api_key,
             speechmatics_api_key,
+            yandex_api_key,
+            yandex_folder_id,
             assemblyai_api_key,
             hume_api_key,
             lmnt_api_key,
@@ -385,6 +393,7 @@ pub(crate) const REALTIME_ENDPOINT_OVERRIDE_ENVS: &[(&str, &str)] = &[
     ("ultravox", "ULTRAVOX_REALTIME_URL"),
     ("hume", "HUME_REALTIME_URL"),
     ("speechmatics", "SPEECHMATICS_REALTIME_URL"),
+    ("yandex", "YANDEX_REALTIME_URL"),
 ];
 
 /// Read the `<PROVIDER>_REALTIME_URL` env vars into the provider-keyed override

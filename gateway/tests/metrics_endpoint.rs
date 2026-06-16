@@ -59,6 +59,8 @@ fn config_with_openai() -> ServerConfig {
         gemini_api_key: None,
         ultravox_api_key: None,
         speechmatics_api_key: None,
+        yandex_api_key: None,
+        yandex_folder_id: None,
         assemblyai_api_key: None,
         hume_api_key: None,
         lmnt_api_key: None,
