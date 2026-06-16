@@ -754,8 +754,13 @@ async fn handle_session_update(
     true
 }
 
-/// Build RealtimeConfig from session config
-fn build_realtime_config(api_key: String, config: &RealtimeSessionConfig) -> RealtimeConfig {
+/// Build RealtimeConfig from session config.
+///
+/// `pub` + re-exported (`handlers::realtime::build_realtime_config`) so the
+/// config-plumbing integration proof (`tests/realtime_full_integration.rs`) can
+/// exercise the REAL `RealtimeSessionConfig -> RealtimeConfig` converter instead
+/// of an in-test mirror that could silently drift from this mapping.
+pub fn build_realtime_config(api_key: String, config: &RealtimeSessionConfig) -> RealtimeConfig {
     use crate::core::realtime::{InputTranscriptionConfig, TurnDetectionConfig};
 
     let turn_detection = config.turn_detection.as_ref().map(|td| match td {
