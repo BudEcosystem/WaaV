@@ -123,7 +123,7 @@ export class BudSTT extends BasePipeline {
    */
   private handleSpeechEnd(_duration: number): void {
     this.emitter.emit('listening', { listening: false, timestamp: Date.now() });
-    this.session.flush();
+    this.session.audioEnd();
   }
 
   /**
@@ -209,7 +209,7 @@ export class BudSTT extends BasePipeline {
     this.isListening = false;
 
     // Flush any remaining audio
-    this.session.flush();
+    this.session.audioEnd();
   }
 
   /**
@@ -266,7 +266,7 @@ export class BudSTT extends BasePipeline {
    * Flush pending audio and finalize transcription
    */
   flush(): void {
-    this.session.flush();
+    this.session.audioEnd();
   }
 
   /**

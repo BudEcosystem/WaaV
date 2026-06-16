@@ -11,21 +11,29 @@ import type { ReconnectState } from './reconnect.js';
  * STT transcript event
  */
 export interface TranscriptEvent {
-  /** Transcribed text */
+  /** Transcribed text (gateway `transcript` field) */
   text: string;
   /** Whether this is a final result */
   isFinal: boolean;
+  /** Whether speech has ended (gateway `is_speech_final`) */
+  isSpeechFinal: boolean;
   /** Confidence score (0-1) */
   confidence?: number;
-  /** Speaker ID for diarization */
+  /**
+   * The FULL accumulated segment text, present only on a speech_final whose
+   * segment spans multiple finals. Prefer this over `text` when displaying
+   * per-final text (gateway `segment_transcript`).
+   */
+  segmentTranscript?: string;
+  /** Speaker ID for diarization (reserved; not yet emitted on /ws) */
   speakerId?: number;
-  /** Detected language */
+  /** Detected language (reserved; not yet emitted on /ws) */
   language?: string;
-  /** Start time in seconds */
+  /** Start time in seconds (reserved; not yet emitted on /ws) */
   startTime?: number;
-  /** End time in seconds */
+  /** End time in seconds (reserved; not yet emitted on /ws) */
   endTime?: number;
-  /** Word-level details */
+  /** Word-level details (reserved; not yet emitted on /ws) */
   words?: Array<{
     word: string;
     start: number;
@@ -61,18 +69,22 @@ export interface AudioEvent {
  * Session ready event
  */
 export interface ReadyEvent {
-  /** Session ID */
-  sessionId?: string;
-  /** Whether STT is ready */
-  sttReady: boolean;
-  /** Whether TTS is ready */
-  ttsReady: boolean;
-  /** Whether LiveKit is connected */
-  livekitConnected: boolean;
-  /** Server version */
-  serverVersion?: string;
-  /** Available capabilities */
-  capabilities: string[];
+  /** Unique stream/session identifier assigned by the gateway */
+  streamId: string;
+  /**
+   * Wire-protocol version reported by the gateway (e.g. "1.0"). The SDK
+   * asserts this matches its own PROTOCOL_VERSION and emits a typed error
+   * event on mismatch.
+   */
+  protocolVersion?: string;
+  /** LiveKit room name that was created (if LiveKit was requested) */
+  livekitRoomName?: string;
+  /** LiveKit URL to connect to (if LiveKit was requested) */
+  livekitUrl?: string;
+  /** Identity of the AI agent participant in the room */
+  waavParticipantIdentity?: string;
+  /** Display name of the AI agent participant */
+  waavParticipantName?: string;
   /** Original message for advanced use */
   raw: ReadyMessage;
 }

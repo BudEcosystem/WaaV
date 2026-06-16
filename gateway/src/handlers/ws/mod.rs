@@ -420,6 +420,7 @@ pub mod audio_handler;
 pub mod command_handler;
 pub mod config;
 pub mod config_handler;
+pub mod config_lint;
 pub mod error;
 pub mod handler;
 pub mod messages;

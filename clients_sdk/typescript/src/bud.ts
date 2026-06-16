@@ -14,13 +14,41 @@ import { getMetricsCollector, resetMetricsCollector } from './metrics/collector.
 import { SLOTracker } from './metrics/slo.js';
 import type { SLOThreshold, SLOStatus } from './types/metrics.js';
 
+/** Default gateway URL when neither config nor env provides one. */
+export const DEFAULT_GATEWAY_URL = 'http://127.0.0.1:3009';
+
+/** Env var the SDK reads for the gateway URL (e.g. ws://127.0.0.1:3009). */
+export const GATEWAY_URL_ENV = 'WAAV_GATEWAY_URL';
+
+/**
+ * Read the gateway URL from the environment (`WAAV_GATEWAY_URL`) if available.
+ * Safe in browser bundles where `process` is undefined.
+ */
+function readGatewayEnvUrl(): string | undefined {
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+  const value = env?.[GATEWAY_URL_ENV];
+  return value && value.trim() !== '' ? value.trim() : undefined;
+}
+
+/** Normalise an ws/wss URL to http/https (REST uses http); pass others through. */
+function normalizeHttpUrl(url: string): string {
+  if (url.startsWith('ws://')) return 'http://' + url.slice('ws://'.length);
+  if (url.startsWith('wss://')) return 'https://' + url.slice('wss://'.length);
+  return url;
+}
+
 /**
  * BudClient configuration
  */
 export interface BudClientConfig {
-  /** Base URL for REST API (e.g., "http://localhost:3001") */
-  baseUrl: string;
-  /** WebSocket URL (e.g., "ws://localhost:3001/ws"). Defaults to baseUrl with /ws path */
+  /**
+   * Base URL for the gateway REST API (e.g., "http://127.0.0.1:3009").
+   * Optional: defaults to the `WAAV_GATEWAY_URL` env var when set, otherwise
+   * "http://127.0.0.1:3009". An ws/wss URL is also accepted and normalised to
+   * http/https for REST.
+   */
+  baseUrl?: string;
+  /** WebSocket URL (e.g., "ws://127.0.0.1:3009/ws"). Defaults to baseUrl with /ws path */
   wsUrl?: string;
   /** API key for authentication */
   apiKey?: string;
@@ -73,6 +101,8 @@ export class BudClient {
   private config: BudClientConfig;
   private restClient: RestClient;
   private wsUrl: string;
+  /** Resolved gateway base URL (http/https). */
+  private baseUrl: string;
   private sloTracker: SLOTracker;
   private activePipelines: Set<BudSTT | BudTTS | BudTalk | BudTranscribe> = new Set();
 
@@ -129,15 +159,20 @@ export class BudClient {
    */
   readonly rest: RestClient;
 
-  constructor(config: BudClientConfig) {
-    this.config = config;
+  constructor(config: BudClientConfig = {}) {
+    // Resolve the gateway base URL: explicit config wins, then the
+    // WAAV_GATEWAY_URL env var, then the local default. An ws/wss URL is
+    // normalised to http/https so REST calls work.
+    const baseUrl = normalizeHttpUrl(config.baseUrl ?? readGatewayEnvUrl() ?? DEFAULT_GATEWAY_URL);
+    this.baseUrl = baseUrl;
+    this.config = { ...config, baseUrl };
 
     // Derive WebSocket URL from base URL if not provided
-    this.wsUrl = config.wsUrl ?? this.deriveWsUrl(config.baseUrl);
+    this.wsUrl = config.wsUrl ?? this.deriveWsUrl(baseUrl);
 
     // Initialize REST client
     this.restClient = new RestClient({
-      baseUrl: config.baseUrl,
+      baseUrl,
       apiKey: config.apiKey,
       timeout: config.timeout,
       fetch: config.fetch,
@@ -198,7 +233,7 @@ export class BudClient {
           url: this.wsUrl,
           apiKey: this.config.apiKey,
           features: this.config.features,
-          restBaseUrl: this.config.baseUrl,
+          restBaseUrl: this.baseUrl,
           ...config,
         });
         this.activePipelines.add(pipeline);

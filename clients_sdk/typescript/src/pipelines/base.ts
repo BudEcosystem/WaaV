@@ -160,13 +160,13 @@ export abstract class BasePipeline {
    * Stop current operation
    */
   stop(): void {
-    this.session.stop();
+    this.session.clear();
   }
 
   /**
    * Interrupt current operation
    */
   interrupt(): void {
-    this.session.interrupt();
+    this.session.clear();
   }
 }

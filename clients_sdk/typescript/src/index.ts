@@ -207,8 +207,13 @@ export {
   deserializeMessage,
   createConfigMessage,
   createSpeakMessage,
+  createClearMessage,
+  createAudioEndMessage,
+  createSendMessageMessage,
 } from './ws/index.js';
 export type {
+  SDKConfigMessage,
+  SDKOutgoingMessage,
   SessionConfig as WSSessionConfig,
   SessionState,
   WebSocketConnectionOptions,
@@ -236,7 +241,7 @@ export * from './audio/index.js';
 export * from './pipelines/index.js';
 
 // Main Client
-export { BudClient, createBudClient } from './bud.js';
+export { BudClient, createBudClient, DEFAULT_GATEWAY_URL, GATEWAY_URL_ENV } from './bud.js';
 export type { BudClientConfig } from './bud.js';
 
 // Version

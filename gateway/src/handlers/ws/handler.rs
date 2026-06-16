@@ -649,6 +649,29 @@ async fn process_message(
                 return true;
             }
 
+            // P0 gw-enforce: surface unknown / wrong-nested `config` keys that
+            // serde silently dropped as a non-fatal `config_warning` advisory,
+            // so the SDK-typo bug class (e.g. a misnested `turn_detection`) fails
+            // LOUDLY instead of vanishing. Cheap and config-only: we re-parse the
+            // (already size-capped) text to a `Value` ONLY for a config message;
+            // every other message kind skips this entirely.
+            if matches!(incoming_msg, IncomingMessage::Config { .. }) {
+                match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(raw_value) => {
+                        super::config_lint::warn_unknown_config_keys(
+                            &raw_value,
+                            &incoming_msg,
+                            message_tx,
+                        )
+                        .await;
+                    }
+                    // The typed parse already succeeded above, so a Value parse
+                    // failing here is not expected; skip the lint rather than
+                    // disturb a session that is otherwise valid.
+                    Err(e) => debug!("config lint: raw Value re-parse failed: {e}"),
+                }
+            }
+
             handle_incoming_message(incoming_msg, state, message_tx, app_state).await
         }
         Message::Binary(data) => {

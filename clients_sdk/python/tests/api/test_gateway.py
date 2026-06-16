@@ -1,15 +1,45 @@
-"""Test gateway connectivity."""
+"""Test gateway connectivity.
 
+Targets ``WAAV_GATEWAY_URL`` (default ``ws://127.0.0.1:3009``) so a developer
+can point the suite at any gateway. These are LIVE tests: when no gateway is
+reachable they SKIP (instead of failing), so ``pytest -k "not e2e"`` stays green
+on a machine with no gateway running.
+"""
+
+import os
 import pytest
 import httpx
 import asyncio
 import websockets
 import json
 
-BASE_URL = "http://localhost:3001"
-WS_URL = "ws://localhost:3001"
+# Env-configurable gateway URL (plan P0 item 5). Default to the live port 3009.
+WS_URL = os.environ.get("WAAV_GATEWAY_URL", "ws://127.0.0.1:3009").rstrip("/")
+BASE_URL = WS_URL.replace("ws://", "http://").replace("wss://", "https://")
 
 
+_gateway_up: bool | None = None
+
+
+def _check_gateway() -> bool:
+    """Cached check that a gateway is reachable (200 or 429 == running)."""
+    global _gateway_up
+    if _gateway_up is not None:
+        return _gateway_up
+    try:
+        resp = httpx.get(f"{BASE_URL}/livez", timeout=3.0)
+        _gateway_up = resp.status_code in (200, 429)
+    except Exception:
+        _gateway_up = False
+    return _gateway_up
+
+
+skip_no_gateway = pytest.mark.skipif(
+    not _check_gateway(), reason=f"Gateway not reachable at {BASE_URL}"
+)
+
+
+@skip_no_gateway
 class TestGatewayHealth:
     """Test basic gateway health and REST endpoints."""
 
@@ -20,7 +50,8 @@ class TestGatewayHealth:
             pytest.skip("Rate limited")
         assert response.status_code == 200
         data = response.json()
-        assert data.get("status") == "OK"
+        # Gateway returns lowercase "ok" (messages.rs); accept any case.
+        assert (data.get("status") or "").lower() == "ok"
 
     def test_voices_endpoint(self):
         """Test voices endpoint returns data."""
@@ -53,6 +84,7 @@ class TestGatewayHealth:
         assert response.status_code == 400
 
 
+@skip_no_gateway
 class TestWebSocketEndpoints:
     """Test WebSocket endpoints connectivity."""
 

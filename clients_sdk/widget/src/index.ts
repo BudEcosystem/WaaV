@@ -18,7 +18,8 @@
  */
 
 import { BudWidget, defineWidget } from './widget';
-import { mergeConfig } from './config';
+import { mergeConfig, parseConfigFromAttributes } from './config';
+import { buildConfigMessage } from './websocket';
 import type {
   WidgetConfig,
   WidgetState,
@@ -28,6 +29,7 @@ import type {
   WidgetEventMap,
   STTConfig,
   TTSConfig,
+  ConversationConfig,
   FeatureFlags,
 } from './types';
 
@@ -35,7 +37,7 @@ import type {
 defineWidget();
 
 // Export everything for programmatic usage
-export { BudWidget, defineWidget, mergeConfig };
+export { BudWidget, defineWidget, mergeConfig, parseConfigFromAttributes, buildConfigMessage };
 export type {
   WidgetConfig,
   WidgetState,
@@ -45,6 +47,7 @@ export type {
   WidgetEventMap,
   STTConfig,
   TTSConfig,
+  ConversationConfig,
   FeatureFlags,
 };
 

@@ -3,15 +3,16 @@
  * High-level WebSocket session with automatic reconnection, message handling, and metrics
  */
 
-import { ConnectionError } from '../errors/index.js';
+import { ConnectionError, RateLimitError } from '../errors/index.js';
 import type { STTConfig, TTSConfig, LiveKitConfig } from '../types/config.js';
 import type { FeatureFlags } from '../types/features.js';
-import type { IncomingMessage, OutgoingMessage, STTResultMessage, TTSAudioMessage, ReadyMessage, ErrorMessage } from '../types/messages.js';
+import type { IncomingMessage, STTResultMessage, TTSAudioMessage, ReadyMessage, ErrorMessage } from '../types/messages.js';
+import { PROTOCOL_VERSION } from '../types/messages.js';
 import type { MetricsSummary } from '../types/metrics.js';
 import { getMetricsCollector, MetricsCollector } from '../metrics/collector.js';
 import { WebSocketConnection, type ConnectionState } from './connection.js';
 import { ReconnectStrategy, type ReconnectConfig } from './reconnect.js';
-import { createConfigMessage, createSpeakMessage, createPingMessage, createStopMessage, createFlushMessage, createInterruptMessage } from './messages.js';
+import { createConfigMessage, createSpeakMessage, createClearMessage, createAudioEndMessage, createSendMessageMessage, type SDKOutgoingMessage } from './messages.js';
 import { MessageQueue, type MessageQueueConfig } from './queue.js';
 import { SessionEventEmitter, type SessionEventMap, type SessionEventHandler, type TranscriptEvent, type AudioEvent, type ReadyEvent, type SessionErrorEvent } from './events.js';
 
@@ -39,10 +40,29 @@ export interface SessionConfig {
   livekit?: LiveKitConfig;
   /** Feature flags */
   features?: FeatureFlags;
-  /** Ping interval in milliseconds (default: 30000, 0 to disable) */
+  /**
+   * @deprecated No longer used. Keepalive is handled by native WebSocket
+   * ping/pong frames (the `ws` lib and browsers manage this automatically);
+   * the SDK no longer sends a JSON ping. Kept only for backward compatibility.
+   */
   pingInterval?: number;
   /** Whether to auto-send config on connect (default: true) */
   autoConfig?: boolean;
+  /**
+   * Behaviour when the gateway rate-limits the WebSocket upgrade (HTTP 429).
+   * The gateway uses a per-IP token bucket that applies to WS upgrades, so a
+   * burst of connects can be throttled. On 429 the SDK retries with jittered
+   * exponential backoff, honouring any `Retry-After` header. Set
+   * `maxRetries: 0` to disable and surface the RateLimitError immediately.
+   */
+  rateLimitRetry?: {
+    /** Max retry attempts after the initial connect (default: 5) */
+    maxRetries?: number;
+    /** Base delay in ms when no Retry-After is provided (default: 500) */
+    baseDelayMs?: number;
+    /** Cap on any single backoff delay in ms (default: 20000) */
+    maxDelayMs?: number;
+  };
 }
 
 /**
@@ -61,8 +81,6 @@ export class WebSocketSession {
   private emitter: SessionEventEmitter;
   private metrics: MetricsCollector;
   private state: SessionState = 'disconnected';
-  private pingIntervalId: ReturnType<typeof setInterval> | null = null;
-  private lastPingTime: number | null = null;
   private sessionId: string | null = null;
   private readyReceived = false;
   private lastReadyEvent: ReadyEvent | null = null;
@@ -156,10 +174,10 @@ export class WebSocketSession {
       timestamp: Date.now(),
     });
 
-    // Start ping interval
-    if (this.config.pingInterval !== 0) {
-      this.startPingInterval();
-    }
+    // NOTE: Keepalive is handled by NATIVE WebSocket ping/pong frames, which the
+    // `ws` library (Node) and browsers manage automatically. We deliberately do
+    // NOT send a JSON {type:'ping'} — the gateway has no such op and would emit a
+    // parse-error every interval. (Removed in P0; see SDK_STANDARDIZATION_PLAN.)
 
     // Send queued messages
     this.flushQueue();
@@ -179,7 +197,6 @@ export class WebSocketSession {
     this.metrics.setWSState('disconnected');
     this.readyReceived = false;
     this.lastReadyEvent = null;
-    this.stopPingInterval();
 
     this.emitter.emit('close', { code, reason });
     this.emitter.emit('connectionState', {
@@ -233,19 +250,7 @@ export class WebSocketSession {
         this.handleErrorMessage(message as ErrorMessage);
         break;
       case 'pong':
-        this.handlePong(message as { type: 'pong'; timestamp: number; serverTime?: number });
-        break;
-      case 'speaking_started':
-        this.emitter.emit('speaking', { speaking: true, timestamp: Date.now() });
-        break;
-      case 'speaking_finished':
-        this.emitter.emit('speaking', { speaking: false, timestamp: Date.now() });
-        break;
-      case 'listening_started':
-        this.emitter.emit('listening', { listening: true, timestamp: Date.now() });
-        break;
-      case 'listening_stopped':
-        this.emitter.emit('listening', { listening: false, timestamp: Date.now() });
+        this.handlePong(message as { type: 'pong'; timestamp: number; server_time?: number });
         break;
     }
   }
@@ -255,20 +260,39 @@ export class WebSocketSession {
    */
   private handleReady(message: ReadyMessage): void {
     this.readyReceived = true;
-    this.sessionId = message.sessionId ?? null;
+    this.sessionId = message.stream_id ?? null;
 
     const event: ReadyEvent = {
-      sessionId: message.sessionId,
-      sttReady: message.sttReady ?? false,
-      ttsReady: message.ttsReady ?? false,
-      livekitConnected: message.livekitConnected ?? false,
-      serverVersion: message.serverVersion,
-      capabilities: message.capabilities ?? [],
+      streamId: message.stream_id,
       raw: message,
     };
+    if (message.protocol_version !== undefined) event.protocolVersion = message.protocol_version;
+    if (message.livekit_room_name !== undefined) event.livekitRoomName = message.livekit_room_name;
+    if (message.livekit_url !== undefined) event.livekitUrl = message.livekit_url;
+    if (message.waav_participant_identity !== undefined)
+      event.waavParticipantIdentity = message.waav_participant_identity;
+    if (message.waav_participant_name !== undefined)
+      event.waavParticipantName = message.waav_participant_name;
 
     // Store the event for later retrieval by waitForReady()
     this.lastReadyEvent = event;
+
+    // Assert the wire-protocol version matches. A mismatch means the gateway's
+    // message contract has drifted from what this SDK expects, so surface it
+    // loudly as a typed error event (recoverable) instead of letting fields
+    // silently break (plan W-K1).
+    if (message.protocol_version !== undefined && message.protocol_version !== PROTOCOL_VERSION) {
+      this.emitter.emit('error', {
+        code: 'PROTOCOL_VERSION_MISMATCH',
+        message: `Gateway protocol_version "${message.protocol_version}" does not match SDK PROTOCOL_VERSION "${PROTOCOL_VERSION}". The wire contract may have changed; upgrade @bud-foundry/sdk.`,
+        recoverable: true,
+        raw: {
+          type: 'error',
+          code: 'PROTOCOL_VERSION_MISMATCH',
+          message: `protocol_version mismatch: gateway=${message.protocol_version} sdk=${PROTOCOL_VERSION}`,
+        },
+      });
+    }
 
     this.emitter.emit('ready', event);
   }
@@ -277,22 +301,21 @@ export class WebSocketSession {
    * Handle STT result message
    */
   private handleSTTResult(message: STTResultMessage): void {
-    if (message.isFinal) {
+    if (message.is_final) {
       this.metrics.increment('stt.transcriptions');
-      this.metrics.increment('stt.characters', message.text.length);
+      this.metrics.increment('stt.characters', message.transcript.length);
     }
 
     const event: TranscriptEvent = {
-      text: message.text,
-      isFinal: message.isFinal,
+      text: message.transcript,
+      isFinal: message.is_final,
+      isSpeechFinal: message.is_speech_final,
       confidence: message.confidence,
-      speakerId: message.speakerId,
-      language: message.language,
-      startTime: message.startTime,
-      endTime: message.endTime,
-      words: message.words,
       raw: message,
     };
+    if (message.segment_transcript !== undefined) {
+      event.segmentTranscript = message.segment_transcript;
+    }
 
     this.emitter.emit('transcript', event);
   }
@@ -311,12 +334,12 @@ export class WebSocketSession {
     const event: AudioEvent = {
       audio: bytes.buffer,
       format: message.format ?? 'linear16',
-      sampleRate: message.sampleRate ?? 24000,
-      duration: message.duration,
-      isFinal: message.isFinal ?? false,
-      sequence: message.sequence,
+      sampleRate: message.sample_rate ?? 24000,
+      isFinal: message.is_final ?? false,
       raw: message,
     };
+    if (message.duration !== undefined) event.duration = message.duration;
+    if (message.sequence !== undefined) event.sequence = message.sequence;
 
     this.emitter.emit('audio', event);
   }
@@ -326,12 +349,12 @@ export class WebSocketSession {
    */
   private handleErrorMessage(message: ErrorMessage): void {
     const event: SessionErrorEvent = {
-      code: message.code,
+      code: message.code ?? 'UNKNOWN',
       message: message.message,
-      details: message.details,
       recoverable: message.recoverable ?? false,
       raw: message,
     };
+    if (message.details !== undefined) event.details = message.details;
 
     this.emitter.emit('error', event);
   }
@@ -339,11 +362,13 @@ export class WebSocketSession {
   /**
    * Handle pong message
    */
-  private handlePong(message: { type: 'pong'; timestamp: number; serverTime?: number }): void {
-    if (this.lastPingTime) {
-      const latency = Date.now() - this.lastPingTime;
-      this.emitter.emit('pong', { latency, serverTime: message.serverTime });
-    }
+  private handlePong(message: { type: 'pong'; timestamp: number; server_time?: number }): void {
+    // The gateway may echo a pong in response to an application-level message;
+    // surface round-trip latency relative to that message's own timestamp.
+    const latency = Date.now() - message.timestamp;
+    const event: { latency: number; serverTime?: number } = { latency };
+    if (message.server_time !== undefined) event.serverTime = message.server_time;
+    this.emitter.emit('pong', event);
   }
 
   /**
@@ -368,31 +393,6 @@ export class WebSocketSession {
   }
 
   /**
-   * Start ping interval
-   */
-  private startPingInterval(): void {
-    const interval = this.config.pingInterval ?? 30000;
-    if (interval <= 0) return;
-
-    this.pingIntervalId = setInterval(() => {
-      if (this.connection.isConnected()) {
-        this.lastPingTime = Date.now();
-        this.connection.send(createPingMessage());
-      }
-    }, interval);
-  }
-
-  /**
-   * Stop ping interval
-   */
-  private stopPingInterval(): void {
-    if (this.pingIntervalId) {
-      clearInterval(this.pingIntervalId);
-      this.pingIntervalId = null;
-    }
-  }
-
-  /**
    * Flush queued messages
    */
   private flushQueue(): void {
@@ -400,7 +400,7 @@ export class WebSocketSession {
     for (const { message, binaryData } of messages) {
       if (binaryData) {
         this.connection.sendBinary(binaryData);
-      } else {
+      } else if (message) {
         this.connection.send(message);
       }
     }
@@ -442,10 +442,51 @@ export class WebSocketSession {
       timestamp: Date.now(),
     });
 
-    await this.connection.connect();
+    const maxRetries = this.config.rateLimitRetry?.maxRetries ?? 5;
+    const baseDelayMs = this.config.rateLimitRetry?.baseDelayMs ?? 500;
+    const maxDelayMs = this.config.rateLimitRetry?.maxDelayMs ?? 20000;
+
+    let attempt = 0;
+    // Retry loop that only triggers on a typed 429 RateLimitError. All other
+    // errors propagate immediately.
+    for (;;) {
+      try {
+        await this.connection.connect();
+        break;
+      } catch (err) {
+        if (err instanceof RateLimitError && attempt < maxRetries) {
+          this.metrics.increment('ws.rateLimited');
+          const delay = this.computeBackoffMs(err.retryAfterMs, attempt, baseDelayMs, maxDelayMs);
+          this.emitter.emit('reconnect', {
+            state: { attempt: attempt + 1, delay, lastConnectedAt: null, reconnecting: true, exhausted: false },
+            event: 'reconnecting',
+          });
+          attempt++;
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          continue;
+        }
+        this.state = 'disconnected';
+        this.metrics.setWSState('disconnected');
+        throw err;
+      }
+    }
 
     const duration = Date.now() - startTime;
     this.metrics.record('ws.connect', duration);
+  }
+
+  /**
+   * Compute a jittered backoff delay for a rate-limited (429) connect attempt.
+   * Honours an explicit Retry-After when present; otherwise uses capped
+   * exponential backoff. A small random jitter (±20%) avoids a thundering herd
+   * of clients all retrying in lockstep.
+   */
+  private computeBackoffMs(retryAfterMs: number | undefined, attempt: number, baseDelayMs: number, maxDelayMs: number): number {
+    const base = retryAfterMs !== undefined
+      ? retryAfterMs
+      : Math.min(baseDelayMs * Math.pow(2, attempt), maxDelayMs);
+    const jitter = base * 0.2 * (Math.random() * 2 - 1);
+    return Math.max(0, Math.round(Math.min(base + jitter, maxDelayMs)));
   }
 
   /**
@@ -453,7 +494,6 @@ export class WebSocketSession {
    */
   async disconnect(): Promise<void> {
     this.reconnectStrategy?.abort();
-    this.stopPingInterval();
     await this.connection.close();
   }
 
@@ -488,7 +528,7 @@ export class WebSocketSession {
   /**
    * Send a message
    */
-  send(message: OutgoingMessage): void {
+  send(message: SDKOutgoingMessage): void {
     this.metrics.increment('ws.sent');
 
     if (this.connection.isConnected()) {
@@ -507,13 +547,13 @@ export class WebSocketSession {
     // which would corrupt the data. We need to extract just the portion we're using.
     let buffer: ArrayBuffer;
     if (data instanceof Uint8Array) {
-      if (data.byteOffset === 0 && data.byteLength === data.buffer.byteLength) {
-        // Uint8Array uses the whole buffer, safe to use directly
-        buffer = data.buffer;
-      } else {
-        // Uint8Array is a view into a larger buffer, need to copy the slice
-        buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-      }
+      // Always copy out the exact slice into a fresh ArrayBuffer. This both
+      // avoids sending a larger backing buffer when the view is a window, and
+      // narrows ArrayBufferLike (which may be a SharedArrayBuffer) to a plain
+      // ArrayBuffer for the WS send path.
+      const copy = new Uint8Array(data.byteLength);
+      copy.set(data);
+      buffer = copy.buffer;
     } else {
       buffer = data;
     }
@@ -523,7 +563,8 @@ export class WebSocketSession {
     if (this.connection.isConnected()) {
       this.connection.sendBinary(buffer);
     } else {
-      this.queue.enqueue({ type: 'audio' }, buffer);
+      // Raw binary audio frame — no JSON message wrapper.
+      this.queue.enqueue(undefined, buffer);
     }
   }
 
@@ -545,24 +586,50 @@ export class WebSocketSession {
   }
 
   /**
-   * Stop current operation
+   * Barge-in / cancel: stop the bot's current TTS playback immediately.
+   * Sends the gateway `clear` op.
+   */
+  clear(): void {
+    this.send(createClearMessage());
+  }
+
+  /**
+   * Finalize: tell the gateway the inbound audio stream has ended so it
+   * flushes any pending transcript. Sends the gateway `audio_end` op.
+   */
+  audioEnd(): void {
+    this.send(createAudioEndMessage());
+  }
+
+  /**
+   * Send a data-channel message (gateway `send_message` op).
+   */
+  sendMessage(message: string, role: string, options?: { topic?: string; debug?: Record<string, unknown> }): void {
+    this.send(createSendMessageMessage(message, role, options));
+  }
+
+  /**
+   * @deprecated Use {@link clear} (barge-in/cancel). The gateway has no `stop`
+   * op; this now maps to `clear`.
    */
   stop(): void {
-    this.send(createStopMessage());
+    this.clear();
   }
 
   /**
-   * Flush pending audio
+   * @deprecated Use {@link audioEnd} (finalize). The gateway has no `flush`
+   * op; this now maps to `audio_end`.
    */
   flush(): void {
-    this.send(createFlushMessage());
+    this.audioEnd();
   }
 
   /**
-   * Interrupt current operation
+   * @deprecated Use {@link clear} (barge-in). The gateway has no `interrupt`
+   * op; this now maps to `clear`.
    */
   interrupt(): void {
-    this.send(createInterruptMessage());
+    this.clear();
   }
 
   /**
@@ -643,7 +710,7 @@ export class WebSocketSession {
 
       const timeoutId = setTimeout(() => {
         this.off('ready', handler);
-        reject(new ConnectionError('Timeout waiting for ready state', { timeout }));
+        reject(new ConnectionError('Timeout waiting for ready state', { context: { timeout } }));
       }, timeout);
 
       this.once('ready', handler);

@@ -2,7 +2,7 @@
  * REST Client for Bud Foundry Gateway
  */
 
-import { APIError, TimeoutError } from '../errors/index.js';
+import { APIError, TimeoutError, RateLimitError } from '../errors/index.js';
 import { getMetricsCollector } from '../metrics/collector.js';
 import type { Voice, VoiceListResponse, TTSSynthesisResult } from '../types/tts.js';
 import type { LiveKitTokenRequest, LiveKitTokenResponse, RoomInfo, RoomListResponse } from '../types/livekit.js';
@@ -91,6 +91,11 @@ export class RestClient {
       this.metrics.record('ws.connect', duration); // Reusing metric for REST timing
 
       if (!response.ok) {
+        // Surface the per-IP rate limit as a typed, retryable error carrying
+        // the parsed Retry-After delay.
+        if (response.status === 429) {
+          throw RateLimitError.fromResponse(response, { url });
+        }
         throw await APIError.fromResponse(response, { method });
       }
 
@@ -119,7 +124,8 @@ export class RestClient {
     } catch (err) {
       clearTimeout(timeoutId);
 
-      if (err instanceof APIError) {
+      // Preserve already-typed SDK errors (APIError, RateLimitError, etc.).
+      if (err instanceof APIError || err instanceof RateLimitError) {
         throw err;
       }
 
@@ -216,32 +222,30 @@ export class RestClient {
    * Generate a LiveKit participant token
    */
   async createLiveKitToken(request: LiveKitTokenRequest): Promise<LiveKitTokenResponse> {
+    // Gateway TokenRequest (handlers/livekit/token.rs) accepts exactly:
+    //   { room_name, participant_name, participant_identity }
+    // The previous body sent `identity`/`name`, so the required
+    // `participant_identity`/`participant_name` were missing and the token
+    // call 422'd. Send the correct field names.
     const body = {
       room_name: request.roomName,
-      identity: request.identity,
-      name: request.name,
-      ttl: request.ttl,
-      metadata: request.metadata,
-      room_options: request.roomOptions
-        ? {
-            auto_create: request.roomOptions.autoCreate,
-            empty_timeout: request.roomOptions.emptyTimeout,
-            max_participants: request.roomOptions.maxParticipants,
-          }
-        : undefined,
-      permissions: request.permissions
-        ? {
-            can_publish: request.permissions.canPublish,
-            can_subscribe: request.permissions.canSubscribe,
-            can_publish_data: request.permissions.canPublishData,
-            can_publish_sources: request.permissions.canPublishSources,
-            hidden: request.permissions.hidden,
-            recorder: request.permissions.recorder,
-          }
-        : undefined,
+      participant_identity: request.participantIdentity,
+      participant_name: request.participantName,
     };
 
-    return this.request<LiveKitTokenResponse>('POST', '/livekit/token', { body });
+    const wire = await this.request<{
+      token: string;
+      room_name: string;
+      participant_identity: string;
+      livekit_url: string;
+    }>('POST', '/livekit/token', { body });
+
+    return {
+      token: wire.token,
+      roomName: wire.room_name,
+      participantIdentity: wire.participant_identity,
+      livekitUrl: wire.livekit_url,
+    };
   }
 
   /**

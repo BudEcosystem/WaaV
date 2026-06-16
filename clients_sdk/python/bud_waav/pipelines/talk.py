@@ -5,7 +5,10 @@ BudTalk - Bidirectional voice pipeline
 from typing import Any, AsyncIterator, Callable, Optional, Union
 from dataclasses import dataclass
 
-from ..types import STTConfig, TTSConfig, STTResult, AudioEvent, FeatureFlags, AudioFeatures, DAGConfig
+from ..types import (
+    STTConfig, TTSConfig, STTResult, AudioEvent, FeatureFlags, AudioFeatures,
+    DAGConfig, ConversationConfig,
+)
 from ..ws.session import WebSocketSession, SessionMetrics, ReconnectConfig
 
 
@@ -59,6 +62,7 @@ class BudTalk:
         reconnect: Optional[ReconnectConfig] = None,
         audio_features: Optional[AudioFeatures] = None,
         dag_config: Optional[DAGConfig] = None,
+        conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
     ) -> "TalkSession":
         """
@@ -125,6 +129,7 @@ class BudTalk:
             reconnect=reconnect,
             audio_features=audio_features,
             dag_config=dag_config,
+            conversation_config=conversation_config,
             stream_id=stream_id,
         )
 
@@ -137,6 +142,7 @@ class BudTalk:
         reconnect: Optional[ReconnectConfig] = None,
         audio_features: Optional[AudioFeatures] = None,
         dag_config: Optional[DAGConfig] = None,
+        conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
     ) -> "TalkSession":
         """
@@ -163,6 +169,7 @@ class BudTalk:
             reconnect=reconnect,
             audio_features=audio_features,
             dag_config=dag_config,
+            conversation_config=conversation_config,
             stream_id=stream_id,
         )
         await session.connect()
@@ -183,6 +190,7 @@ class TalkSession:
         reconnect: Optional[ReconnectConfig] = None,
         audio_features: Optional[AudioFeatures] = None,
         dag_config: Optional[DAGConfig] = None,
+        conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
     ):
         """
@@ -214,6 +222,7 @@ class TalkSession:
             reconnect=reconnect,
             audio_features=audio_features,
             dag_config=dag_config,
+            conversation_config=conversation_config,
             stream_id=stream_id,
         )
 

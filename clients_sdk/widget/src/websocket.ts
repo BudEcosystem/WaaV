@@ -4,6 +4,131 @@
 
 import type { WidgetConfig, TranscriptResult, WidgetMetrics } from './types';
 
+/**
+ * Build the `/ws` `config` envelope from a WidgetConfig.
+ *
+ * This is the single source of truth for what the widget puts on the wire and is
+ * exported (pure, side-effect-free) so it can be unit-tested without a live socket.
+ *
+ * Wire contract (gateway handlers/ws/config.rs + messages.rs):
+ *  - The envelope is FLAT: stt_config / tts_config / conversation_config (no
+ *    top-level audio_features or realtime_config — those are NON-KEYS on /ws and
+ *    are silently dropped by the gateway).
+ *  - ML turn detection nests under `stt_config.turn_detection`
+ *    ({enabled, threshold?, eager?}); silence_ms/prefix_padding_ms are not /ws keys.
+ *  - The built-in LLM loop (so the bot talks back) is driven by `conversation_config`
+ *    ({base_url, model, ...}); without it the gateway only does raw STT/TTS.
+ *  - Realtime/S2S is a SEPARATE /realtime endpoint and is intentionally not sent here.
+ */
+export function buildConfigMessage(config: WidgetConfig): Record<string, unknown> {
+  const message: Record<string, unknown> = {
+    type: 'config',
+    audio: true,
+  };
+
+  // STT configuration (turn_detection nests HERE, per gateway config.rs:345).
+  if (config.stt) {
+    const sttConfig: Record<string, unknown> = {
+      provider: config.stt.provider,
+      language: config.stt.language || 'en-US',
+      sample_rate: config.stt.sampleRate || 16000,
+      channels: config.stt.channels || 1,
+      encoding: config.stt.encoding || 'linear16',
+      model: config.stt.model || 'nova-3',
+      punctuation: config.features?.punctuation ?? true,
+    };
+
+    // ML turn detection -> stt_config.turn_detection (gateway TurnDetectionWsConfig:
+    // only enabled/threshold/eager are wire keys).
+    const td = config.audioFeatures?.turnDetection;
+    if (td) {
+      const turnDetection: Record<string, unknown> = { enabled: td.enabled };
+      if (td.threshold !== undefined) {
+        turnDetection.threshold = td.threshold;
+      }
+      if (td.eager !== undefined) {
+        turnDetection.eager = td.eager;
+      }
+      sttConfig.turn_detection = turnDetection;
+    }
+
+    message.stt_config = sttConfig;
+  }
+
+  // TTS configuration with emotion support.
+  if (config.tts) {
+    const ttsConfig: Record<string, unknown> = {
+      provider: config.tts.provider,
+      voice_id: config.tts.voiceId || config.tts.voice,
+      sample_rate: config.tts.sampleRate || 24000,
+      model: config.tts.model,
+    };
+
+    if (config.tts.emotion) {
+      if (config.tts.emotion.emotion !== undefined) {
+        ttsConfig.emotion = config.tts.emotion.emotion;
+      }
+      if (config.tts.emotion.intensity !== undefined) {
+        ttsConfig.emotion_intensity = config.tts.emotion.intensity;
+      }
+      if (config.tts.emotion.deliveryStyle !== undefined) {
+        ttsConfig.delivery_style = config.tts.emotion.deliveryStyle;
+      }
+      if (config.tts.emotion.description !== undefined) {
+        ttsConfig.emotion_description = config.tts.emotion.description;
+      }
+    }
+
+    message.tts_config = ttsConfig;
+  }
+
+  // Conversation-loop (LLM) configuration -> conversation_config. This is what
+  // makes the bot TALK BACK (STT -> LLM -> TTS). base_url + model are required.
+  if (config.conversation) {
+    const conv = config.conversation;
+    const conversationConfig: Record<string, unknown> = {
+      base_url: conv.baseUrl,
+      model: conv.model,
+    };
+    if (conv.systemPrompt !== undefined) {
+      conversationConfig.system_prompt = conv.systemPrompt;
+    }
+    if (conv.apiKey !== undefined) {
+      conversationConfig.api_key = conv.apiKey;
+    }
+    if (conv.temperature !== undefined) {
+      conversationConfig.temperature = conv.temperature;
+    }
+    if (conv.maxTokens !== undefined) {
+      conversationConfig.max_tokens = conv.maxTokens;
+    }
+    if (conv.streaming !== undefined) {
+      conversationConfig.streaming = conv.streaming;
+    }
+    if (conv.allowInterruption !== undefined) {
+      conversationConfig.allow_interruption = conv.allowInterruption;
+    }
+    if (conv.eagerEot !== undefined) {
+      conversationConfig.eager_eot = conv.eagerEot;
+    }
+    if (conv.bargeInMinWords !== undefined) {
+      conversationConfig.barge_in_min_words = conv.bargeInMinWords;
+    }
+    if (conv.reasoningEffort !== undefined) {
+      conversationConfig.reasoning_effort = conv.reasoningEffort;
+    }
+    if (conv.latencyFiller !== undefined) {
+      conversationConfig.latency_filler = conv.latencyFiller;
+    }
+    if (conv.reasoningModel !== undefined) {
+      conversationConfig.reasoning_model = conv.reasoningModel;
+    }
+    message.conversation_config = conversationConfig;
+  }
+
+  return message;
+}
+
 export type MessageHandler = {
   onReady: (streamId: string) => void;
   onTranscript: (result: TranscriptResult) => void;
@@ -135,129 +260,10 @@ export class WidgetWebSocket {
   private sendConfig(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-    const config: Record<string, unknown> = {
-      type: 'config',
-      audio: true,
-    };
-
-    // STT configuration
-    if (this.config.stt) {
-      config.stt_config = {
-        provider: this.config.stt.provider,
-        language: this.config.stt.language || 'en-US',
-        sample_rate: this.config.stt.sampleRate || 16000,
-        channels: this.config.stt.channels || 1,
-        encoding: this.config.stt.encoding || 'linear16',
-        model: this.config.stt.model || 'nova-3',
-        punctuation: this.config.features?.punctuation ?? true,
-      };
-    }
-
-    // TTS configuration with emotion support
-    if (this.config.tts) {
-      const ttsConfig: Record<string, unknown> = {
-        provider: this.config.tts.provider,
-        voice_id: this.config.tts.voiceId || this.config.tts.voice,
-        sample_rate: this.config.tts.sampleRate || 24000,
-        model: this.config.tts.model,
-      };
-
-      // Add emotion settings if configured
-      if (this.config.tts.emotion) {
-        if (this.config.tts.emotion.emotion !== undefined) {
-          ttsConfig.emotion = this.config.tts.emotion.emotion;
-        }
-        if (this.config.tts.emotion.intensity !== undefined) {
-          ttsConfig.emotion_intensity = this.config.tts.emotion.intensity;
-        }
-        if (this.config.tts.emotion.deliveryStyle !== undefined) {
-          ttsConfig.delivery_style = this.config.tts.emotion.deliveryStyle;
-        }
-        if (this.config.tts.emotion.description !== undefined) {
-          ttsConfig.emotion_description = this.config.tts.emotion.description;
-        }
-      }
-
-      config.tts_config = ttsConfig;
-    }
-
-    // Audio features configuration
-    if (this.config.audioFeatures) {
-      const audioFeatures: Record<string, unknown> = {};
-
-      // Turn detection
-      if (this.config.audioFeatures.turnDetection) {
-        audioFeatures.turn_detection = {
-          enabled: this.config.audioFeatures.turnDetection.enabled,
-          threshold: this.config.audioFeatures.turnDetection.threshold,
-          silence_ms: this.config.audioFeatures.turnDetection.silenceMs,
-          prefix_padding_ms: this.config.audioFeatures.turnDetection.prefixPaddingMs,
-        };
-      }
-
-      // Noise filtering (matches Python SDK naming)
-      if (this.config.audioFeatures.noiseFilter) {
-        audioFeatures.noise_filtering = {
-          enabled: this.config.audioFeatures.noiseFilter.enabled,
-          strength: this.config.audioFeatures.noiseFilter.strength,
-        };
-      }
-
-      // VAD (Voice Activity Detection)
-      if (this.config.audioFeatures.vad) {
-        audioFeatures.vad = {
-          enabled: this.config.audioFeatures.vad.enabled,
-          threshold: this.config.audioFeatures.vad.threshold,
-          silence_ms: this.config.audioFeatures.vad.silenceMs,
-        };
-      }
-
-      if (Object.keys(audioFeatures).length > 0) {
-        config.audio_features = audioFeatures;
-      }
-    }
-
-    // Realtime configuration (OpenAI Realtime API / Hume EVI)
-    if (this.config.realtime) {
-      const realtimeConfig: Record<string, unknown> = {
-        provider: this.config.realtime.provider,
-        model: this.config.realtime.model,
-        system_prompt: this.config.realtime.systemPrompt,
-        voice_id: this.config.realtime.voiceId,
-        temperature: this.config.realtime.temperature,
-        max_tokens: this.config.realtime.maxTokens,
-      };
-
-      // Hume EVI specific fields
-      if (this.config.realtime.eviVersion !== undefined) {
-        realtimeConfig.evi_version = this.config.realtime.eviVersion;
-      }
-      if (this.config.realtime.verboseTranscription !== undefined) {
-        realtimeConfig.verbose_transcription = this.config.realtime.verboseTranscription;
-      }
-      if (this.config.realtime.resumedChatGroupId !== undefined) {
-        realtimeConfig.resumed_chat_group_id = this.config.realtime.resumedChatGroupId;
-      }
-
-      // OpenAI Realtime specific fields
-      if (this.config.realtime.inputAudioTranscription !== undefined) {
-        realtimeConfig.input_audio_transcription = {
-          model: this.config.realtime.inputAudioTranscription.model,
-        };
-      }
-
-      // Turn detection for realtime mode
-      if (this.config.realtime.turnDetection !== undefined) {
-        realtimeConfig.turn_detection = {
-          enabled: this.config.realtime.turnDetection.enabled,
-          threshold: this.config.realtime.turnDetection.threshold,
-          silence_ms: this.config.realtime.turnDetection.silenceMs,
-          prefix_padding_ms: this.config.realtime.turnDetection.prefixPaddingMs,
-        };
-      }
-
-      config.realtime_config = realtimeConfig;
-    }
+    // Single source of truth for the /ws config envelope (see buildConfigMessage).
+    // turn_detection nests in stt_config; conversation_config drives the LLM loop;
+    // NO top-level audio_features/realtime_config (non-keys, silently dropped).
+    const config = buildConfigMessage(this.config);
 
     this.configSentTime = performance.now();
     this.send(config);
@@ -331,10 +337,6 @@ export class WidgetWebSocket {
 
         case 'error':
           this.handlers.onError(new Error(data.message || 'Unknown error'));
-          break;
-
-        case 'pong':
-          // Handle pong for latency measurement
           break;
       }
     } catch (e) {
@@ -461,13 +463,6 @@ export class WidgetWebSocket {
 
   clear(): void {
     this.send({ type: 'clear' });
-  }
-
-  ping(): void {
-    this.send({
-      type: 'ping',
-      timestamp: Date.now(),
-    });
   }
 
   get connected(): boolean {

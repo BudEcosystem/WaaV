@@ -207,7 +207,7 @@ export class BudTalk extends BasePipeline {
     this.e2eLatencyStart = Date.now();
 
     // Flush to finalize transcription
-    this.session.flush();
+    this.session.audioEnd();
   }
 
   /**
@@ -354,7 +354,7 @@ export class BudTalk extends BasePipeline {
 
     this.recorder.stop();
     this.isListening = false;
-    this.session.flush();
+    this.session.audioEnd();
   }
 
   /**

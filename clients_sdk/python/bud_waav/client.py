@@ -3,14 +3,18 @@ BudClient - Main entry point for Bud WaaV SDK
 """
 
 import weakref
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from .rest.client import RestClient
 from .pipelines.stt import BudSTT
 from .pipelines.tts import BudTTS
-from .pipelines.talk import BudTalk
+from .pipelines.talk import BudTalk, TalkSession
 from .pipelines.transcribe import BudTranscribe
 from .pipelines.realtime import BudRealtime, RealtimeConfig
+from .types import (
+    STTConfig, TTSConfig, ConversationConfig, AudioFeatures, TurnDetectionConfig,
+)
+from .ws.session import ReconnectConfig
 
 
 class BudClient:
@@ -146,6 +150,73 @@ class BudClient:
             if self.api_key:
                 config.api_key = self.api_key
         return BudRealtime(config)
+
+    def agent(
+        self,
+        stt: Optional[Union[STTConfig, dict[str, Any]]] = None,
+        tts: Optional[Union[TTSConfig, dict[str, Any]]] = None,
+        llm: Optional[Union[ConversationConfig, dict[str, Any]]] = None,
+        turn: Optional[dict[str, Any]] = None,
+        reconnect: Optional[ReconnectConfig] = None,
+        stream_id: Optional[str] = None,
+    ) -> TalkSession:
+        """Create the flagship agent loop (STT -> built-in LLM -> TTS) in a few lines.
+
+        This is the ONLY SDK entry point that reaches the gateway's built-in
+        conversation loop. It serializes ``conversation_config`` (the LLM loop +
+        reasoning stack) and nests turn detection into ``stt_config.turn_detection``.
+
+        Args:
+            stt: STT configuration (typed or dict).
+            tts: TTS configuration (typed or dict).
+            llm: Conversation/LLM-loop configuration. A dict is coerced to
+                :class:`ConversationConfig` — it MUST carry ``base_url`` and
+                ``model``; reasoning/latency/barge-in knobs are optional.
+            turn: Turn-detection knobs, e.g. ``{"enabled": True, "threshold": 0.6,
+                "eager_eot": True}``. ``eager_eot`` is forwarded to
+                ``conversation_config.eager_eot`` (the gateway requires both).
+            reconnect: Reconnection configuration.
+            stream_id: Optional stream ID for session tracking.
+
+        Returns:
+            An unconnected :class:`TalkSession`. ``await session.connect()`` (or
+            use it as an async context manager) then iterate events
+            (``transcript`` | ``audio`` | ``message`` | ``error``).
+
+        Example:
+            >>> session = bud.agent(
+            ...     stt={"provider": "deepgram", "language": "en-US"},
+            ...     tts={"provider": "deepgram", "voice_id": "aura-asteria-en"},
+            ...     llm={"base_url": "http://localhost:11434/v1", "model": "llama3.2:1b",
+            ...          "reasoning_effort": "minimal", "latency_filler": "auto"},
+            ...     turn={"eager_eot": True},
+            ... )
+            >>> async with session as call:
+            ...     await call.send_audio(pcm)
+            ...     async for ev in call:
+            ...         ...
+        """
+        conversation_config: Optional[ConversationConfig] = None
+        if llm is not None:
+            conversation_config = llm if isinstance(llm, ConversationConfig) else ConversationConfig(**llm)
+
+        # Map turn={} to AudioFeatures.turn_detection (nested into stt_config.turn_detection
+        # on the wire) and forward eager_eot to the conversation loop.
+        audio_features: Optional[AudioFeatures] = None
+        if turn is not None:
+            td_kwargs = {k: v for k, v in turn.items() if k != "eager_eot"}
+            audio_features = AudioFeatures(turn_detection=TurnDetectionConfig(**td_kwargs))
+            if turn.get("eager_eot") and conversation_config is not None and conversation_config.eager_eot is None:
+                conversation_config.eager_eot = True
+
+        return self._talk.create(
+            stt=stt,
+            tts=tts,
+            reconnect=reconnect,
+            audio_features=audio_features,
+            conversation_config=conversation_config,
+            stream_id=stream_id,
+        )
 
     async def health(self) -> dict[str, Any]:
         """

@@ -76,7 +76,7 @@ export interface EmotionConfig {
 
 /**
  * STT (Speech-to-Text) Configuration
- * Maps to Sayna's STTWebSocketConfig in src/handlers/ws/config.rs
+ * Maps to the gateway STTWebSocketConfig in src/handlers/ws/config.rs
  */
 export interface STTConfig {
   /** Provider name (e.g., "deepgram", "google", "elevenlabs", "microsoft-azure", "cartesia") */
@@ -115,7 +115,7 @@ export interface STTConfig {
 
 /**
  * TTS (Text-to-Speech) Configuration
- * Maps to Sayna's TTSWebSocketConfig in src/handlers/ws/config.rs
+ * Maps to the gateway TTSWebSocketConfig in src/handlers/ws/config.rs
  */
 export interface TTSConfig {
   /** Provider name (e.g., "deepgram", "elevenlabs", "google", "azure", "cartesia") */
@@ -186,17 +186,17 @@ export interface Pronunciation {
 
 /**
  * LiveKit Configuration
- * Maps to Sayna's LiveKitWebSocketConfig in src/handlers/ws/config.rs
+ * Maps to the gateway LiveKitWebSocketConfig in src/handlers/ws/config.rs
  */
 export interface LiveKitConfig {
   /** Room name to join or create */
   roomName: string;
   /** Enable recording for this session */
   enableRecording?: boolean;
-  /** Sayna AI participant identity (defaults to "sayna-ai") */
-  saynaParticipantIdentity?: string;
-  /** Sayna AI participant display name (defaults to "Sayna AI") */
-  saynaParticipantName?: string;
+  /** WaaV AI participant identity (defaults to "waav-ai") */
+  waavParticipantIdentity?: string;
+  /** WaaV AI participant display name (defaults to "WaaV AI") */
+  waavParticipantName?: string;
   /** List of participant identities to listen to for audio tracks and data messages */
   listenParticipants?: string[];
 }
@@ -411,7 +411,7 @@ export function getDominantEmotion(
   scores: ProsodyScores
 ): { name: string; score: number } | null {
   const top = getTopEmotions(scores, 1);
-  return top.length > 0 ? top[0] : null;
+  return top[0] ?? null;
 }
 
 /**

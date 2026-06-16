@@ -8,10 +8,16 @@
 export interface LiveKitTokenRequest {
   /** Room name to join */
   roomName: string;
-  /** Participant identity */
-  identity: string;
-  /** Participant display name */
-  name?: string;
+  /**
+   * Participant identity. Sent on the wire as `participant_identity`
+   * (the gateway's TokenRequest field name).
+   */
+  participantIdentity: string;
+  /**
+   * Participant display name. Sent on the wire as `participant_name`
+   * (the gateway's TokenRequest field name).
+   */
+  participantName: string;
   /** Token validity in seconds (default: 3600) */
   ttl?: number;
   /** Participant metadata (JSON string) */
@@ -48,12 +54,12 @@ export interface LiveKitTokenRequest {
 export interface LiveKitTokenResponse {
   /** JWT token for connecting to LiveKit */
   token: string;
-  /** Room name */
+  /** Room name (gateway `room_name`) */
   roomName: string;
-  /** Participant identity */
-  identity: string;
-  /** LiveKit server URL */
-  url?: string;
+  /** Participant identity (gateway `participant_identity`) */
+  participantIdentity: string;
+  /** LiveKit server URL (gateway `livekit_url`) */
+  livekitUrl: string;
 }
 
 /**

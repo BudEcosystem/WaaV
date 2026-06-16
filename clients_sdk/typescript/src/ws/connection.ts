@@ -3,9 +3,28 @@
  * Low-level WebSocket connection management
  */
 
-import { ConnectionError, TimeoutError } from '../errors/index.js';
-import type { IncomingMessage, OutgoingMessage } from '../types/messages.js';
-import { serializeMessage, deserializeMessage } from './messages.js';
+import { ConnectionError, TimeoutError, RateLimitError, parseRetryAfterMs } from '../errors/index.js';
+import type { IncomingMessage } from '../types/messages.js';
+import { serializeMessage, deserializeMessage, type SDKOutgoingMessage } from './messages.js';
+
+/**
+ * Minimal shape of the Node `ws` library's `unexpected-response` event payload.
+ * Browsers do not expose the failing HTTP response for a WebSocket upgrade, so
+ * 429 detection at connect time is only available under Node (`ws`).
+ */
+interface UpgradeResponseLike {
+  statusCode?: number;
+  headers?: Record<string, string | string[] | undefined>;
+}
+
+/** Duck-typed EventEmitter `.on` present on the `ws` library's WebSocket. */
+interface WsEventEmitterLike {
+  on(event: string, listener: (...args: unknown[]) => void): unknown;
+}
+
+function hasOn(ws: unknown): ws is WsEventEmitterLike {
+  return typeof (ws as { on?: unknown })?.on === 'function';
+}
 
 /**
  * WebSocket connection options
@@ -51,6 +70,8 @@ export class WebSocketConnection {
   private connectPromise: Promise<void> | null = null;
   private connectResolve: (() => void) | null = null;
   private connectReject: ((error: Error) => void) | null = null;
+  /** Captured HTTP 429 from the `ws` upgrade, if the gateway rate-limited us. */
+  private rateLimit: { retryAfterMs?: number; retryAfter?: string } | null = null;
 
   constructor(options: WebSocketConnectionOptions) {
     this.url = options.url;
@@ -131,8 +152,30 @@ export class WebSocketConnection {
       }, this.timeout);
 
       try {
+        this.rateLimit = null;
         this.ws = new this.WebSocketImpl(this.url, this.protocols);
         this.ws.binaryType = 'arraybuffer';
+
+        // Under Node (`ws`), the HTTP upgrade response is exposed via the
+        // `unexpected-response` event. Capture a 429 + Retry-After so the
+        // handshake failure can be surfaced as a typed RateLimitError instead
+        // of an opaque ConnectionError. (Browsers cannot see this.)
+        if (hasOn(this.ws)) {
+          this.ws.on('unexpected-response', (...args: unknown[]) => {
+            const res = args[1] as UpgradeResponseLike | undefined;
+            if (res?.statusCode === 429) {
+              const headers = res.headers ?? {};
+              const raw = headers['retry-after'] ?? headers['Retry-After'];
+              const retryAfter = Array.isArray(raw) ? raw[0] : raw;
+              this.rateLimit = {};
+              if (retryAfter !== undefined) {
+                this.rateLimit.retryAfter = retryAfter;
+                const ms = parseRetryAfterMs(retryAfter);
+                if (ms !== undefined) this.rateLimit.retryAfterMs = ms;
+              }
+            }
+          });
+        }
 
         this.ws.onopen = () => {
           this.state = 'connected';
@@ -146,17 +189,12 @@ export class WebSocketConnection {
           this.handlers.onClose?.(event.code, event.reason);
 
           if (wasConnecting) {
-            safeReject(new ConnectionError(`Connection closed during handshake: ${event.reason || 'Unknown reason'}`, {
-              url: this.url,
-              code: event.code,
-            }));
+            safeReject(this.handshakeError(`Connection closed during handshake: ${event.reason || 'Unknown reason'}`, event.code, event.reason));
           }
         };
 
         this.ws.onerror = () => {
-          const error = new ConnectionError('WebSocket error occurred', {
-            url: this.url,
-          });
+          const error = this.handshakeError('WebSocket error occurred');
           this.handlers.onError?.(error);
 
           if (this.state === 'connecting') {
@@ -178,6 +216,26 @@ export class WebSocketConnection {
     });
 
     return this.connectPromise;
+  }
+
+  /**
+   * Build the error to reject a failed handshake with. If a 429 was captured
+   * from the upgrade response, returns a typed RateLimitError (carrying the
+   * parsed Retry-After); otherwise a generic ConnectionError.
+   */
+  private handshakeError(message: string, closeCode?: number, closeReason?: string): ConnectionError | RateLimitError {
+    if (this.rateLimit) {
+      const rl = this.rateLimit;
+      return new RateLimitError('WebSocket upgrade rate-limited by gateway (HTTP 429)', {
+        url: this.url,
+        ...(rl.retryAfterMs !== undefined ? { retryAfterMs: rl.retryAfterMs } : {}),
+        ...(rl.retryAfter !== undefined ? { retryAfter: rl.retryAfter } : {}),
+      });
+    }
+    const ctx: Record<string, unknown> = {};
+    if (closeCode !== undefined) ctx.closeCode = closeCode;
+    if (closeReason !== undefined) ctx.closeReason = closeReason;
+    return new ConnectionError(message, { url: this.url, context: ctx });
   }
 
   /**
@@ -206,7 +264,7 @@ export class WebSocketConnection {
    * Send a message
    * @returns true if sent successfully, false if not connected
    */
-  send(message: OutgoingMessage): boolean {
+  send(message: SDKOutgoingMessage): boolean {
     if (!this.isConnected()) {
       return false;
     }
@@ -265,12 +323,13 @@ export class WebSocketConnection {
         resolve();
       }, 5000);
 
-      const originalOnClose = this.ws!.onclose;
-      this.ws!.onclose = (event) => {
+      const wsRef = this.ws!;
+      const originalOnClose = wsRef.onclose;
+      wsRef.onclose = (event) => {
         clearTimeout(closeTimeout);
         this.state = 'disconnected';
         if (originalOnClose) {
-          originalOnClose.call(this.ws, event);
+          originalOnClose.call(wsRef, event);
         }
         resolve();
       };

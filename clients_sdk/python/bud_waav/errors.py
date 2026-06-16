@@ -125,6 +125,31 @@ class APIError(BudError):
         )
 
 
+class RateLimitError(BudError):
+    """Server returned HTTP 429 (Too Many Requests).
+
+    The WaaV gateway applies a per-IP token bucket to REST AND WebSocket
+    upgrades. This typed error carries the parsed ``Retry-After`` (seconds) so
+    callers can back off deterministically instead of parsing an opaque string.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        retry_after: Optional[float] = None,
+        url: Optional[str] = None,
+        cause: Optional[Exception] = None,
+    ):
+        super().__init__(
+            message,
+            code="RATE_LIMITED",
+            cause=cause,
+            context={"retry_after": retry_after, "url": url},
+        )
+        self.retry_after = retry_after
+        self.url = url
+
+
 class STTError(BudError):
     """Speech-to-Text error."""
 

@@ -234,7 +234,8 @@ function detectCycles(dag: DAGDefinition): { hasCycle: boolean; cyclePath?: stri
     if (!visited.has(node.id)) {
       if (dfs(node.id)) {
         // Extract the cycle from the path
-        const cycleStart = path.indexOf(path[path.length - 1]);
+        const last = path[path.length - 1];
+        const cycleStart = last !== undefined ? path.indexOf(last) : 0;
         return {
           hasCycle: true,
           cyclePath: path.slice(cycleStart),

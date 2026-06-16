@@ -37,6 +37,18 @@ export type TTSProvider =
 /** Realtime providers */
 export type RealtimeProvider = 'openai-realtime' | 'hume-evi';
 
+/**
+ * Reasoning/thinking-effort dial for the conversation LLM.
+ * Mapped server-side to each vendor's native thinking control (gateway config.rs reasoning_effort).
+ */
+export type ReasoningEffort = 'off' | 'minimal' | 'low' | 'medium' | 'high';
+
+/**
+ * Latency-masking mode for slow LLM/reasoning turns.
+ * 'auto' speaks one short filler phrase when first audio is slow (gateway config.rs latency_filler).
+ */
+export type LatencyFiller = 'off' | 'auto' | 'aggressive';
+
 // =============================================================================
 // Emotion System
 // =============================================================================
@@ -105,11 +117,22 @@ export interface EmotionConfig {
 // Audio Features
 // =============================================================================
 
-/** Turn detection configuration */
+/**
+ * ML turn-detection configuration.
+ *
+ * Maps to the gateway's `stt_config.turn_detection` (provider-agnostic smart-turn
+ * detector). The gateway accepts only `enabled`, `threshold`, and `eager`
+ * (gateway config.rs TurnDetectionWsConfig); `silenceMs`/`prefixPaddingMs` are
+ * NOT wire keys on /ws and are intentionally not serialized.
+ */
 export interface TurnDetectionConfig {
   enabled: boolean;
   threshold?: number; // 0.0-1.0
-  silenceMs?: number; // Silence duration
+  /** Eager end-of-turn: start the LLM speculatively on a turn-complete prediction. */
+  eager?: boolean;
+  /** @deprecated Not a /ws wire key; ignored when sending stt_config.turn_detection. */
+  silenceMs?: number;
+  /** @deprecated Not a /ws wire key; ignored when sending stt_config.turn_detection. */
   prefixPaddingMs?: number;
 }
 
@@ -139,8 +162,14 @@ export interface WidgetConfig {
   stt?: STTConfig;
   /** TTS configuration */
   tts?: TTSConfig;
-  /** Realtime configuration (for audio-to-audio mode) */
+  /** Realtime configuration (for the separate /realtime S2S endpoint; NOT sent on /ws) */
   realtime?: RealtimeConfig;
+  /**
+   * Conversation-loop (LLM) configuration. When present, the gateway runs the
+   * built-in STT -> LLM -> TTS loop so the bot talks back. Serialized to the
+   * gateway `conversation_config` envelope.
+   */
+  conversation?: ConversationConfig;
   /** UI theme */
   theme?: 'light' | 'dark' | 'auto';
   /** Widget position */
@@ -201,6 +230,43 @@ export interface AudioFeatures {
   turnDetection?: TurnDetectionConfig;
   noiseFilter?: NoiseFilterConfig;
   vad?: VADConfig;
+}
+
+/**
+ * Conversation-loop (LLM) configuration -> gateway `conversation_config`.
+ *
+ * Drives the built-in STT -> LLM -> TTS loop. `baseUrl` + `model` are required
+ * by the gateway (ConversationWebSocketConfig); everything else is optional and
+ * maps 1:1 to the conversation_config fields, including the REALTIME_REASONING
+ * dials (reasoningEffort, reasoningModel, latencyFiller, eagerEot).
+ */
+export interface ConversationConfig {
+  /** OpenAI-compatible base URL, e.g. "http://localhost:11434/v1" (required). */
+  baseUrl: string;
+  /** Model identifier, e.g. "qwen2.5:7b-instruct" (required). */
+  model: string;
+  /** Optional system prompt seeding the conversation. */
+  systemPrompt?: string;
+  /** API key (literal or "${ENV_VAR}"); falls back to OPENAI_API_KEY server-side. */
+  apiKey?: string;
+  /** Sampling temperature. */
+  temperature?: number;
+  /** Max tokens per completion. */
+  maxTokens?: number;
+  /** Stream tokens to TTS as they arrive (gateway default true). */
+  streaming?: boolean;
+  /** Whether the bot's speech is interruptible / barge-in (gateway default true). */
+  allowInterruption?: boolean;
+  /** Eager end-of-turn: start the LLM speculatively on a turn-complete prediction. */
+  eagerEot?: boolean;
+  /** While the bot speaks, require >= N words to interrupt it. */
+  bargeInMinWords?: number;
+  /** Reasoning/thinking-effort dial. */
+  reasoningEffort?: ReasoningEffort;
+  /** Latency-masking mode for slow first audio. */
+  latencyFiller?: LatencyFiller;
+  /** Optional slow REASONING-tier model (keep `model` fast). */
+  reasoningModel?: string;
 }
 
 export interface FeatureFlags {

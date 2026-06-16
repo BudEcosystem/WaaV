@@ -67,6 +67,12 @@ from .types import (
     EmotionIntensityLevel,
     EmotionConfig,
     intensity_to_number,
+    # Conversation / agent-loop types (built-in LLM loop + reasoning)
+    ConversationConfig,
+    ReasoningEffort,
+    LatencyFiller,
+    RoutingMode,
+    MuteStrategy,
     # DAG routing types
     DAGNodeType,
     OutputDestination,
@@ -124,6 +130,7 @@ from .errors import (
     TimeoutError,
     ReconnectError,
     APIError,
+    RateLimitError,
     STTError,
     TranscriptionError,
     TTSError,
@@ -183,6 +190,12 @@ __all__ = [
     "EmotionIntensityLevel",
     "EmotionConfig",
     "intensity_to_number",
+    # Conversation / agent-loop types (built-in LLM loop + reasoning)
+    "ConversationConfig",
+    "ReasoningEffort",
+    "LatencyFiller",
+    "RoutingMode",
+    "MuteStrategy",
     # DAG routing types
     "DAGNodeType",
     "OutputDestination",
@@ -259,6 +272,7 @@ __all__ = [
     "TimeoutError",
     "ReconnectError",
     "APIError",
+    "RateLimitError",
     "STTError",
     "TranscriptionError",
     "TTSError",

@@ -24,6 +24,11 @@ from bud_waav import (
     Emotion,
     EmotionIntensityLevel,
     DeliveryStyle,
+    ConversationConfig,
+    ReasoningEffort,
+    LatencyFiller,
+    MuteStrategy,
+    RateLimitError,
 )
 from bud_waav.ws.session import WebSocketSession, ReconnectConfig
 from bud_waav.rest.client import RestClient
@@ -285,6 +290,284 @@ class TestWebSocketConfigMessage:
         assert session.audio_features.turn_detection.enabled is True
         assert session.audio_features.noise_filtering.enabled is True
         assert session.audio_features.vad.enabled is True
+
+
+# =============================================================================
+# P0 wire-contract fixes (SDK_STANDARDIZATION_PLAN Phase 1)
+# =============================================================================
+
+
+async def _capture_config(session) -> dict:
+    """Drive ``_send_config`` through a mock socket and return the parsed JSON."""
+    sent = []
+
+    async def mock_send(data):
+        sent.append(data)
+
+    session._ws = MagicMock()
+    session._ws.send = mock_send
+    await session._send_config()
+    assert len(sent) == 1
+    return json.loads(sent[0])
+
+
+class TestP0TurnDetectionNesting:
+    """turn_detection must nest into stt_config.turn_detection (config.rs:345)."""
+
+    @pytest.mark.asyncio
+    async def test_turn_detection_nested_in_stt_config(self):
+        session = WebSocketSession(
+            url="ws://localhost:3009/ws",
+            stt_config=STTConfig(provider="deepgram"),
+            audio_features=AudioFeatures(
+                turn_detection=TurnDetectionConfig(enabled=True, threshold=0.6),
+            ),
+        )
+        config = await _capture_config(session)
+        # Lives nested, NOT at the top level.
+        assert "turn_detection" not in config
+        assert config["stt_config"]["turn_detection"] == {"enabled": True, "threshold": 0.6}
+
+    @pytest.mark.asyncio
+    async def test_turn_detection_omitted_when_disabled(self):
+        session = WebSocketSession(
+            url="ws://localhost:3009/ws",
+            stt_config=STTConfig(provider="deepgram"),
+            audio_features=AudioFeatures(
+                turn_detection=TurnDetectionConfig(enabled=False),
+            ),
+        )
+        config = await _capture_config(session)
+        assert "turn_detection" not in config["stt_config"]
+
+    @pytest.mark.asyncio
+    async def test_noise_and_vad_not_serialized_as_dead_keys(self):
+        """noise/vad have NO /ws wire field yet — must NOT be sent (no dead no-op)."""
+        session = WebSocketSession(
+            url="ws://localhost:3009/ws",
+            stt_config=STTConfig(provider="deepgram"),
+            audio_features=AudioFeatures(
+                noise_filtering=NoiseFilterConfig(enabled=True, strength="high"),
+                vad=ExtendedVADConfig(enabled=True),
+            ),
+        )
+        config = await _capture_config(session)
+        # No top-level audio_features / noise / vad keys anywhere.
+        assert "audio_features" not in config
+        assert "noise_filtering" not in config and "noise" not in config
+        assert "vad" not in config
+        assert "noise_filtering" not in config["stt_config"]
+        assert "vad" not in config["stt_config"]
+
+
+class TestP0ConversationConfig:
+    """conversation_config (the LLM loop + reasoning) must serialize (config.rs:53-217)."""
+
+    @pytest.mark.asyncio
+    async def test_conversation_config_serialized(self):
+        conv = ConversationConfig(
+            base_url="http://127.0.0.1:11434/v1",
+            model="llama3.2:1b",
+            system_prompt="You are concise.",
+            reasoning_effort=ReasoningEffort.MINIMAL,
+            reasoning_model="o3",
+            latency_filler=LatencyFiller.AUTO,
+            eager_eot=True,
+            mute_strategy=MuteStrategy.UNTIL_FIRST_BOT_COMPLETE,
+            barge_in_min_words=3,
+        )
+        session = WebSocketSession(
+            url="ws://localhost:3009/ws",
+            stt_config=STTConfig(provider="deepgram"),
+            conversation_config=conv,
+        )
+        config = await _capture_config(session)
+        cc = config["conversation_config"]
+        assert cc["base_url"] == "http://127.0.0.1:11434/v1"
+        assert cc["model"] == "llama3.2:1b"
+        assert cc["system_prompt"] == "You are concise."
+        # Enums serialize as their string value (the gateway's typed vocabulary).
+        assert cc["reasoning_effort"] == "minimal"
+        assert cc["reasoning_model"] == "o3"
+        assert cc["latency_filler"] == "auto"
+        assert cc["eager_eot"] is True
+        assert cc["mute_strategy"] == "until_first_bot_complete"
+        assert cc["barge_in_min_words"] == 3
+
+    @pytest.mark.asyncio
+    async def test_conversation_config_omits_unset_optionals(self):
+        """Only base_url+model required; unset optionals must NOT be sent."""
+        session = WebSocketSession(
+            url="ws://localhost:3009/ws",
+            stt_config=STTConfig(provider="deepgram"),
+            conversation_config=ConversationConfig(
+                base_url="http://127.0.0.1:11434/v1", model="llama3.2:1b",
+            ),
+        )
+        config = await _capture_config(session)
+        cc = config["conversation_config"]
+        assert set(cc.keys()) == {"base_url", "model"}
+
+    @pytest.mark.asyncio
+    async def test_no_conversation_config_when_not_set(self):
+        session = WebSocketSession(
+            url="ws://localhost:3009/ws",
+            stt_config=STTConfig(provider="deepgram"),
+        )
+        config = await _capture_config(session)
+        assert "conversation_config" not in config
+
+
+class TestP0NestedFeatures:
+    """~20 typed STT/TTS fields must nest under features{} so they reach the wire."""
+
+    @pytest.mark.asyncio
+    async def test_stt_features_nested(self):
+        session = WebSocketSession(
+            url="ws://localhost:3009/ws",
+            stt_config=STTConfig(
+                provider="deepgram",
+                diarize=True,
+                smart_format=True,
+                interim_results=True,
+                profanity_filter=True,
+                keywords=["WaaV", "Deepgram"],
+                custom_vocabulary=["Accubits"],
+            ),
+        )
+        config = await _capture_config(session)
+        feats = config["stt_config"]["features"]
+        assert feats["diarization"] is True
+        assert feats["smart_format"] is True
+        assert feats["interim_results"] is True
+        assert feats["profanity_filter"] is True
+        assert feats["keyterms"] == ["WaaV", "Deepgram"]
+        # custom_vocabulary has no canonical field -> extras passthrough.
+        assert config["stt_config"]["extras"] == {"custom_vocabulary": ["Accubits"]}
+        # The advanced fields must NOT leak as flat top-level stt_config keys.
+        assert "diarize" not in config["stt_config"]
+        assert "keywords" not in config["stt_config"]
+
+    @pytest.mark.asyncio
+    async def test_tts_features_and_extras_nested(self):
+        session = WebSocketSession(
+            url="ws://localhost:3009/ws",
+            stt_config=STTConfig(provider="deepgram"),
+            tts_config=TTSConfig(
+                provider="elevenlabs",
+                voice_id="rachel",
+                model="eleven_turbo_v2",
+                stability=0.7,
+                similarity_boost=0.8,
+                style=0.3,
+                use_speaker_boost=True,
+                acting_instructions="whispered fearfully",
+                instant_mode=True,
+                trailing_silence=0.5,
+            ),
+        )
+        config = await _capture_config(session)
+        feats = config["tts_config"]["features"]
+        assert feats["stability"] == 0.7
+        assert feats["similarity_boost"] == 0.8
+        assert feats["style"] == 0.3
+        assert feats["use_speaker_boost"] is True
+        extras = config["tts_config"]["extras"]
+        assert extras["acting_instructions"] == "whispered fearfully"
+        assert extras["instant_mode"] is True
+        assert extras["trailing_silence"] == 0.5
+        # Must NOT leak as flat top-level keys.
+        assert "stability" not in config["tts_config"]
+        assert "acting_instructions" not in config["tts_config"]
+
+
+class TestP0TranscriptMapping:
+    """The exact gateway stt_result wire must surface through the SDK deserializer."""
+
+    @pytest.mark.asyncio
+    async def test_transcript_field_mapping_through_deserializer(self):
+        # Feed the EXACT gateway wire frame to the SDK's own receive loop and
+        # assert the SDK surfaces the text via STTResult (not raw msg access).
+        session = WebSocketSession(url="ws://localhost:3009/ws")
+        results = []
+        session.on("transcript", lambda r: results.append(r))
+
+        wire = json.dumps({
+            "type": "stt_result",
+            "transcript": "hello world",
+            "is_final": True,
+            "is_speech_final": True,
+            "confidence": 0.97,
+        })
+
+        async def one_message():
+            yield wire
+
+        session._ws = one_message()
+        session._connected = True
+        await session._receive_loop()
+
+        assert len(results) == 1
+        assert results[0].text == "hello world"
+        assert results[0].is_final is True
+        assert results[0].is_speech_final is True
+        assert results[0].confidence == 0.97
+
+
+class TestP0RateLimitError:
+    """WS-connect 429 must classify into a typed RateLimitError with Retry-After."""
+
+    def test_classify_429_with_retry_after(self):
+        class _Resp:
+            status_code = 429
+            headers = {"retry-after": "7"}
+
+        class _Exc(Exception):
+            response = _Resp()
+
+        err = WebSocketSession._classify_connect_error(_Exc("boom"), "ws://x/ws")
+        assert isinstance(err, RateLimitError)
+        assert err.retry_after == 7.0
+        assert err.url == "ws://x/ws"
+
+    def test_classify_non_429_is_connection_error(self):
+        from bud_waav.errors import ConnectionError as BudConnectionError
+
+        err = WebSocketSession._classify_connect_error(RuntimeError("dns"), "ws://x/ws")
+        assert isinstance(err, BudConnectionError)
+        assert not isinstance(err, RateLimitError)
+
+
+class TestP0ProtocolVersion:
+    """The ready envelope's protocol_version must be captured (plan W-K1)."""
+
+    @pytest.mark.asyncio
+    async def test_protocol_version_captured_on_ready(self):
+        session = WebSocketSession(url="ws://localhost:3009/ws")
+        wire = json.dumps({
+            "type": "ready",
+            "protocol_version": "1.0",
+            "stream_id": "abc-123",
+        })
+
+        async def one_message():
+            yield wire
+
+        session._ws = one_message()
+        session._connected = True
+        await session._receive_loop()
+
+        assert session.stream_id == "abc-123"
+        assert session.protocol_version == "1.0"
+
+
+class TestP0NoJsonPing:
+    """The dead JSON {type:ping} keepalive (a non-existent gateway op) is removed."""
+
+    def test_session_has_no_json_ping_method(self):
+        # Native WS ping frames are auto-sent by the websockets lib; a JSON ping
+        # causes a gateway parse-error, so the method must be gone.
+        assert not hasattr(WebSocketSession, "ping")
 
 
 # =============================================================================

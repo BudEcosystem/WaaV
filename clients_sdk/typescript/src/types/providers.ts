@@ -456,15 +456,15 @@ export function getProvidersWithFeature(
   switch (type) {
     case 'stt':
       return STT_PROVIDERS.filter(
-        (p) => (STT_CAPABILITIES[p] as Record<string, unknown>)[feature] === true
+        (p) => (STT_CAPABILITIES[p] as unknown as Record<string, unknown>)[feature] === true
       );
     case 'tts':
       return TTS_PROVIDERS.filter(
-        (p) => (TTS_CAPABILITIES[p] as Record<string, unknown>)[feature] === true
+        (p) => (TTS_CAPABILITIES[p] as unknown as Record<string, unknown>)[feature] === true
       );
     case 'realtime':
       return REALTIME_PROVIDERS.filter(
-        (p) => (REALTIME_CAPABILITIES[p] as Record<string, unknown>)[feature] === true
+        (p) => (REALTIME_CAPABILITIES[p] as unknown as Record<string, unknown>)[feature] === true
       );
     default:
       return [];
@@ -476,7 +476,7 @@ export function getProvidersWithFeature(
  */
 export function getDefaultModel(provider: string, type: 'stt' | 'tts' | 'realtime'): string {
   const caps = getProviderCapabilities(provider, type);
-  if ('models' in caps && caps.models.length > 0) {
+  if ('models' in caps && caps.models[0] !== undefined) {
     return caps.models[0];
   }
   throw new Error(`No default model for ${type} provider: ${provider}`);
@@ -487,7 +487,7 @@ export function getDefaultModel(provider: string, type: 'stt' | 'tts' | 'realtim
  */
 export function getDefaultVoice(provider: TTSProvider): string {
   const caps = TTS_CAPABILITIES[provider];
-  if (caps.voices.length > 0) {
+  if (caps.voices[0] !== undefined) {
     return caps.voices[0];
   }
   throw new Error(`No default voice for TTS provider: ${provider}`);

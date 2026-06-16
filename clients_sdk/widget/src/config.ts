@@ -9,12 +9,15 @@ import type {
   FeatureFlags,
   EmotionConfig,
   RealtimeConfig,
+  ConversationConfig,
   AudioFeatures,
   STTProvider,
   TTSProvider,
   RealtimeProvider,
   EmotionType,
   DeliveryStyle,
+  ReasoningEffort,
+  LatencyFiller,
 } from './types';
 
 /**
@@ -22,7 +25,7 @@ import type {
  */
 export function parseConfigFromAttributes(element: HTMLElement): WidgetConfig {
   const config: WidgetConfig = {
-    gatewayUrl: element.dataset.gatewayUrl || 'ws://localhost:3001/ws',
+    gatewayUrl: element.dataset.gatewayUrl || 'ws://localhost:3009/ws',
     apiKey: element.dataset.apiKey || element.dataset.authToken,
     theme: parseTheme(element.dataset.theme),
     position: parsePosition(element.dataset.position),
@@ -84,6 +87,40 @@ export function parseConfigFromAttributes(element: HTMLElement): WidgetConfig {
     };
   }
 
+  // Parse conversation-loop (LLM) config — drives the gateway STT->LLM->TTS loop
+  // so the bot talks back. Requires at least a base URL + model.
+  const llmBaseUrl = element.dataset.llmBaseUrl;
+  const llmModel = element.dataset.llmModel;
+  if (llmBaseUrl && llmModel) {
+    config.conversation = {
+      baseUrl: llmBaseUrl,
+      model: llmModel,
+      systemPrompt: element.dataset.llmSystemPrompt,
+      apiKey: element.dataset.llmApiKey,
+      temperature: element.dataset.llmTemperature
+        ? parseFloat(element.dataset.llmTemperature)
+        : undefined,
+      maxTokens: element.dataset.llmMaxTokens
+        ? parseInt(element.dataset.llmMaxTokens, 10)
+        : undefined,
+      streaming:
+        element.dataset.llmStreaming !== undefined
+          ? element.dataset.llmStreaming !== 'false'
+          : undefined,
+      allowInterruption:
+        element.dataset.llmAllowInterruption !== undefined
+          ? element.dataset.llmAllowInterruption !== 'false'
+          : undefined,
+      eagerEot: element.dataset.llmEagerEot === 'true' || undefined,
+      bargeInMinWords: element.dataset.llmBargeInMinWords
+        ? parseInt(element.dataset.llmBargeInMinWords, 10)
+        : undefined,
+      reasoningEffort: element.dataset.llmReasoningEffort as ReasoningEffort | undefined,
+      latencyFiller: element.dataset.llmLatencyFiller as LatencyFiller | undefined,
+      reasoningModel: element.dataset.llmReasoningModel,
+    };
+  }
+
   // Parse feature flags
   config.features = {
     vad: element.dataset.vad !== 'false',
@@ -132,12 +169,7 @@ function parseAudioFeatures(element: HTMLElement): AudioFeatures {
       threshold: element.dataset.turnDetectionThreshold
         ? parseFloat(element.dataset.turnDetectionThreshold)
         : undefined,
-      silenceMs: element.dataset.turnDetectionSilenceMs
-        ? parseInt(element.dataset.turnDetectionSilenceMs, 10)
-        : undefined,
-      prefixPaddingMs: element.dataset.turnDetectionPrefixPaddingMs
-        ? parseInt(element.dataset.turnDetectionPrefixPaddingMs, 10)
-        : undefined,
+      eager: element.dataset.turnDetectionEager === 'true' || undefined,
     };
   }
 
@@ -207,7 +239,7 @@ function parseMode(value: string | undefined): 'push-to-talk' | 'vad' | 'realtim
  */
 export function mergeConfig(config: Partial<WidgetConfig>): WidgetConfig {
   return {
-    gatewayUrl: config.gatewayUrl || 'ws://localhost:3001/ws',
+    gatewayUrl: config.gatewayUrl || 'ws://localhost:3009/ws',
     apiKey: config.apiKey,
     theme: config.theme || 'auto',
     position: config.position || 'bottom-right',
@@ -226,6 +258,7 @@ export function mergeConfig(config: Partial<WidgetConfig>): WidgetConfig {
       sampleRate: 24000,
     },
     realtime: config.realtime,
+    conversation: config.conversation,
     features: {
       vad: config.features?.vad ?? true,
       noiseCancellation: config.features?.noiseCancellation ?? false,

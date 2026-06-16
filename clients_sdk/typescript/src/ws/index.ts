@@ -25,9 +25,8 @@ export {
   deserializeMessage,
   createConfigMessage,
   createSpeakMessage,
-  createPingMessage,
-  createAudioMessage,
-  createStopMessage,
-  createFlushMessage,
-  createInterruptMessage,
+  createClearMessage,
+  createAudioEndMessage,
+  createSendMessageMessage,
 } from './messages.js';
+export type { SDKConfigMessage, SDKOutgoingMessage } from './messages.js';

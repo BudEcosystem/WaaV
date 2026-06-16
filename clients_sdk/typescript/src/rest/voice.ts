@@ -91,7 +91,9 @@ export async function cloneVoice(
 
   // Append audio files
   for (let i = 0; i < request.audioFiles.length; i++) {
-    const blob = new Blob([request.audioFiles[i]], { type: 'audio/wav' });
+    const file = request.audioFiles[i];
+    if (file === undefined) continue;
+    const blob = new Blob([file], { type: 'audio/wav' });
     formData.append(`audio_${i}`, blob, `audio_${i}.wav`);
   }
 

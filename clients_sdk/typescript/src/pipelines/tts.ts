@@ -250,7 +250,7 @@ export class BudTTS extends BasePipeline {
    * Stop current speech
    */
   stopSpeaking(): void {
-    this.session.interrupt();
+    this.session.clear();
     this.player?.stop();
     this.speakQueue = [];
     this.isSpeaking = false;

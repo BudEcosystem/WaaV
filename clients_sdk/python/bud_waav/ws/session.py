@@ -15,9 +15,14 @@ from websockets.asyncio.client import ClientConnection
 
 from ..types import (
     STTConfig, TTSConfig, STTResult, TranscriptEvent, AudioEvent,
-    AudioFeatures, DAGConfig, intensity_to_number,
+    AudioFeatures, DAGConfig, ConversationConfig, intensity_to_number,
 )
-from ..errors import ConnectionError, ReconnectError, TimeoutError
+from ..errors import ConnectionError, ReconnectError, TimeoutError, RateLimitError
+
+# Protocol version the gateway emits on `ready` (messages.rs PROTOCOL_VERSION, plan
+# W-K1). We assert the MAJOR matches so a breaking wire change surfaces as an
+# explicit mismatch instead of silent field drift.
+PROTOCOL_VERSION = "1.0"
 
 
 @dataclass
@@ -182,8 +187,10 @@ class WebSocketSession:
         livekit_config: Optional[dict[str, Any]] = None,
         audio_features: Optional[AudioFeatures] = None,
         dag_config: Optional[DAGConfig] = None,
+        conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
         reconnect: Optional[ReconnectConfig] = None,
+        audio: bool = True,
     ):
         """
         Initialize WebSocket session.
@@ -194,8 +201,14 @@ class WebSocketSession:
             stt_config: STT configuration
             tts_config: TTS configuration
             livekit_config: LiveKit configuration
-            audio_features: Audio features (turn detection, noise filter, VAD) - client-side
+            audio_features: Audio features. Only ``turn_detection`` is serialized
+                (nested into ``stt_config.turn_detection``, its real wire home);
+                ``noise_filtering``/``vad`` have NO /ws wire field yet and are
+                intentionally NOT sent (see SDK_STANDARDIZATION_PLAN P4).
             dag_config: DAG routing configuration
+            conversation_config: Built-in LLM conversation-loop configuration
+                (reasoning, latency filler, barge-in, etc.). Serialized into the
+                ``conversation_config`` block of the config message.
             stream_id: Optional stream ID for session tracking
             reconnect: Reconnection configuration
         """
@@ -206,11 +219,16 @@ class WebSocketSession:
         self.livekit_config = livekit_config
         self.audio_features = audio_features
         self.dag_config = dag_config
+        self.conversation_config = conversation_config
+        # When False, the gateway skips STT/TTS provider construction and reaches
+        # `ready` immediately (config-only session). Default True (a voice session).
+        self.audio = audio
         self.requested_stream_id = stream_id
         self.reconnect_config = reconnect or ReconnectConfig()
 
         self._ws: Optional[ClientConnection] = None
         self._stream_id: Optional[str] = None
+        self._protocol_version: Optional[str] = None
         self._connected = False
         self._connecting = False
         self._closed = False
@@ -244,6 +262,11 @@ class WebSocketSession:
     def stream_id(self) -> Optional[str]:
         """Get the stream ID."""
         return self._stream_id
+
+    @property
+    def protocol_version(self) -> Optional[str]:
+        """Gateway wire-protocol version from the `ready` envelope (plan W-K1)."""
+        return self._protocol_version
 
     def on(self, event: str, handler: Callable[..., Any]) -> None:
         """
@@ -320,14 +343,82 @@ class WebSocketSession:
             self._message_queue = asyncio.Queue()
         return self._message_queue
 
-    async def connect(self, timeout: float = 10.0) -> None:
+    @staticmethod
+    def _classify_connect_error(e: Exception, url: str) -> Exception:
+        """Map a raw websockets connect failure to a typed SDK error.
+
+        The WaaV gateway applies a per-IP token bucket to the WS upgrade, so a
+        429 is common and must be a typed :class:`RateLimitError` carrying
+        ``Retry-After`` (not an opaque ConnectionError) so callers can back off.
+        """
+        status = None
+        headers: dict[str, Any] = {}
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            status = getattr(resp, "status_code", None)
+            headers = getattr(resp, "headers", {}) or {}
+        # websockets<14 used status_code directly on the exception.
+        if status is None:
+            status = getattr(e, "status_code", None)
+        if status == 429:
+            retry_after: Optional[float] = None
+            try:
+                ra = headers.get("retry-after") if hasattr(headers, "get") else None
+                if ra is not None:
+                    retry_after = float(ra)
+            except (TypeError, ValueError):
+                retry_after = None
+            return RateLimitError(
+                message=f"Rate limited (429) connecting to {url}",
+                retry_after=retry_after,
+                url=url,
+                cause=e,
+            )
+        return ConnectionError(
+            message=f"Failed to connect to {url}: {e}",
+            url=url,
+            cause=e,
+        )
+
+    async def _open_ws(self, timeout: float) -> ClientConnection:
+        """Open the raw WebSocket, classifying timeouts and 429s into typed errors."""
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        try:
+            return await asyncio.wait_for(
+                websockets.connect(self.url, additional_headers=headers),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                message=f"WebSocket connection timed out after {timeout}s",
+                timeout_ms=int(timeout * 1000),
+                operation="connect",
+            )
+        except (TimeoutError, RateLimitError, ConnectionError):
+            raise
+        except Exception as e:
+            raise self._classify_connect_error(e, self.url)
+
+    async def connect(
+        self,
+        timeout: float = 10.0,
+        max_rate_limit_retries: int = 3,
+    ) -> None:
         """
         Connect to the WebSocket server.
 
+        On HTTP 429 (the gateway's per-IP token bucket) the connect is retried
+        with jittered backoff honoring the ``Retry-After`` header, then re-raised
+        as a typed :class:`RateLimitError` if still throttled.
+
         Args:
             timeout: Connection timeout in seconds
+            max_rate_limit_retries: Number of 429 backoff retries before giving up
 
         Raises:
+            RateLimitError: If still rate-limited (429) after all retries
             ConnectionError: If connection fails
             TimeoutError: If connection times out
         """
@@ -341,30 +432,21 @@ class WebSocketSession:
             start_time = time.monotonic()
 
             try:
-                headers = {}
-                if self.api_key:
-                    headers["Authorization"] = f"Bearer {self.api_key}"
-
-                try:
-                    self._ws = await asyncio.wait_for(
-                        websockets.connect(
-                            self.url,
-                            additional_headers=headers,
-                        ),
-                        timeout=timeout,
-                    )
-                except asyncio.TimeoutError:
-                    raise TimeoutError(
-                        message=f"WebSocket connection timed out after {timeout}s",
-                        timeout_ms=int(timeout * 1000),
-                        operation="connect",
-                    )
-                except Exception as e:
-                    raise ConnectionError(
-                        message=f"Failed to connect to {self.url}: {e}",
-                        url=self.url,
-                        cause=e,
-                    )
+                # 429-aware connect with jittered backoff on the WS upgrade.
+                attempt = 0
+                while True:
+                    try:
+                        self._ws = await self._open_ws(timeout)
+                        break
+                    except RateLimitError as rle:
+                        if attempt >= max_rate_limit_retries:
+                            raise
+                        # Honor Retry-After when present, else exponential base;
+                        # add +-20% jitter to avoid a synchronized retry storm.
+                        base = rle.retry_after if rle.retry_after else min(2 ** attempt, 15)
+                        jitter = base * 0.2 * (random.random() * 2 - 1)
+                        await asyncio.sleep(max(0.0, base + jitter))
+                        attempt += 1
 
                 connect_time = (time.monotonic() - start_time) * 1000
                 self._metrics.record_ws_connect(connect_time)
@@ -408,7 +490,7 @@ class WebSocketSession:
         """
         config: dict[str, Any] = {
             "type": "config",
-            "audio": True,
+            "audio": self.audio,
         }
 
         # Include stream_id if requested
@@ -428,9 +510,45 @@ class WebSocketSession:
             # Include API key if provided (gateway allows per-request override)
             if self.api_key:
                 stt_dict["api_key"] = self.api_key
+
+            # Advanced STT features → stt_config.features{} (canonical SttFeatures,
+            # gateway/src/core/stt/standard.rs). Flat-on-top was silently dropped;
+            # nesting here makes the ~20 already-typed fields actually reach the wire.
+            stt_features: dict[str, Any] = {}
+            if self.stt_config.interim_results is not None:
+                stt_features["interim_results"] = self.stt_config.interim_results
+            if self.stt_config.diarize:
+                stt_features["diarization"] = self.stt_config.diarize
+            if self.stt_config.smart_format is not None:
+                stt_features["smart_format"] = self.stt_config.smart_format
+            if self.stt_config.profanity_filter:
+                stt_features["profanity_filter"] = self.stt_config.profanity_filter
+            if self.stt_config.keywords:
+                # SttFeatures models boost terms as `keyterms`.
+                stt_features["keyterms"] = list(self.stt_config.keywords)
+            if stt_features:
+                stt_dict["features"] = stt_features
+
+            # custom_vocabulary has NO canonical SttFeatures field — route it
+            # through the open `extras` passthrough so it still reaches the provider.
+            if self.stt_config.custom_vocabulary:
+                stt_dict["extras"] = {
+                    "custom_vocabulary": list(self.stt_config.custom_vocabulary)
+                }
+
+            # ML turn detection → stt_config.turn_detection (config.rs:345). This is
+            # the REAL wire home for turn_detection (it was a dead no-op before).
+            td = self.audio_features.turn_detection if self.audio_features else None
+            if td is not None and td.enabled:
+                stt_dict["turn_detection"] = {
+                    "enabled": True,
+                    "threshold": td.threshold,
+                }
+
             config["stt_config"] = stt_dict
-        else:
-            # Gateway requires stt_config when audio=true - provide minimal default
+        elif self.audio:
+            # Gateway requires stt_config when audio=true - provide minimal default.
+            # Skipped for audio=false (config-only) sessions.
             config["stt_config"] = {
                 "provider": "deepgram",
                 "language": "en-US",
@@ -466,9 +584,48 @@ class WebSocketSession:
                 tts_dict["delivery_style"] = self.tts_config.delivery_style.value if hasattr(self.tts_config.delivery_style, 'value') else str(self.tts_config.delivery_style)
             if self.tts_config.emotion_description is not None:
                 tts_dict["emotion_description"] = self.tts_config.emotion_description
+
+            # Advanced TTS features → tts_config.features{} (canonical TtsFeatures,
+            # gateway/src/core/tts/standard.rs). These were typed but never sent.
+            tts_features: dict[str, Any] = {}
+            if self.tts_config.speed is not None:
+                # Also carried as top-level speaking_rate; mirror into features so
+                # providers that read TtsFeatures.speed honor it too.
+                tts_features["speed"] = self.tts_config.speed
+            if self.tts_config.pitch is not None:
+                tts_features["pitch"] = self.tts_config.pitch
+            if self.tts_config.volume is not None:
+                tts_features["volume"] = self.tts_config.volume
+            if self.tts_config.stability is not None:
+                tts_features["stability"] = self.tts_config.stability
+            if self.tts_config.similarity_boost is not None:
+                tts_features["similarity_boost"] = self.tts_config.similarity_boost
+            if self.tts_config.style is not None:
+                tts_features["style"] = self.tts_config.style
+            if self.tts_config.use_speaker_boost is not None:
+                tts_features["use_speaker_boost"] = self.tts_config.use_speaker_boost
+            if tts_features:
+                tts_dict["features"] = tts_features
+
+            # Hume-specific knobs have NO canonical TtsFeatures field — route them
+            # through the open `extras` passthrough (acting_instructions, instant_mode,
+            # trailing_silence, voice_description).
+            tts_extras: dict[str, Any] = {}
+            if self.tts_config.acting_instructions is not None:
+                tts_extras["acting_instructions"] = self.tts_config.acting_instructions
+            if self.tts_config.instant_mode is not None:
+                tts_extras["instant_mode"] = self.tts_config.instant_mode
+            if self.tts_config.trailing_silence is not None:
+                tts_extras["trailing_silence"] = self.tts_config.trailing_silence
+            if self.tts_config.voice_description is not None:
+                tts_extras["voice_description"] = self.tts_config.voice_description
+            if tts_extras:
+                tts_dict["extras"] = tts_extras
+
             config["tts_config"] = tts_dict
-        else:
-            # Gateway requires tts_config when audio=true - provide minimal default
+        elif self.audio:
+            # Gateway requires tts_config when audio=true - provide minimal default.
+            # Skipped for audio=false (config-only) sessions.
             config["tts_config"] = {
                 "provider": "deepgram",
                 "model": "aura-asteria-en",
@@ -491,6 +648,35 @@ class WebSocketSession:
             if self.dag_config.timeout_ms != 30000:
                 dag_dict["timeout_ms"] = self.dag_config.timeout_ms
             config["dag_config"] = dag_dict
+
+        # Built-in conversation loop → conversation_config (config.rs:53-217).
+        # The entire LLM loop + reasoning stack was 0% reachable before this.
+        if self.conversation_config is not None:
+            conv = self.conversation_config
+            conv_dict: dict[str, Any] = {
+                # base_url + model are required by the gateway.
+                "base_url": conv.base_url,
+                "model": conv.model,
+            }
+            # Emit every OTHER field only when explicitly set (None = let the
+            # gateway apply its own default). Pydantic enum values are already
+            # coerced to str via use_enum_values=True on the model.
+            optional_fields = (
+                "system_prompt", "api_key", "temperature", "max_tokens",
+                "streaming", "max_history", "allow_interruption", "eager_eot",
+                "provider_kind", "barge_in_min_words", "summarize_target_tokens",
+                "mute_strategy", "strip_markdown", "user_idle_timeout_ms",
+                "reasoning_effort", "latency_filler", "latency_filler_after_ms",
+                "latency_filler_phrases", "reasoning_model", "reasoning_base_url",
+                "reasoning_api_key", "reasoning_provider_kind", "reasoning_route",
+                "reasoning_budget_ms", "degradation_message",
+                "max_llm_calls_per_turn", "max_reasoning_tokens",
+            )
+            for fname in optional_fields:
+                value = getattr(conv, fname, None)
+                if value is not None:
+                    conv_dict[fname] = value
+            config["conversation_config"] = conv_dict
 
         self._config_sent_time = time.monotonic()
         await self._send_json(config)
@@ -542,6 +728,22 @@ class WebSocketSession:
 
                     if msg_type == "ready":
                         self._stream_id = data.get("stream_id")
+                        # Capture + drift-check the wire protocol version (plan W-K1).
+                        # The gateway emits this specifically so SDKs detect a
+                        # breaking contract change instead of silent field drift.
+                        self._protocol_version = data.get("protocol_version")
+                        if (
+                            self._protocol_version is not None
+                            and self._protocol_version.split(".")[0]
+                            != PROTOCOL_VERSION.split(".")[0]
+                        ):
+                            import sys
+                            print(
+                                "WaaV protocol version mismatch: gateway sent "
+                                f"{self._protocol_version!r}, SDK expects "
+                                f"{PROTOCOL_VERSION!r}. Update bud-waav.",
+                                file=sys.stderr,
+                            )
                         self._get_ready_event().set()
 
                     elif msg_type == "stt_result":
@@ -654,6 +856,19 @@ class WebSocketSession:
                         # Plugin-specific response
                         self._emit("plugin_response", data)
                         await self._get_message_queue().put({"type": "plugin_response", "data": data})
+
+                    elif msg_type == "config_warning":
+                        # Non-fatal gateway advisory (e.g. reasoning_model_on_voice_path,
+                        # emotion_ignored_for_provider). Surface it as a typed warning so a
+                        # silent server-side degrade becomes visible to the developer.
+                        self._emit("config_warning", data)
+                        await self._get_message_queue().put({"type": "config_warning", "data": data})
+
+                    elif msg_type is not None:
+                        # Forward-compat: never silently drop an unrecognized server
+                        # message — surface it so new gateway events are observable.
+                        self._emit("server_message", data)
+                        await self._get_message_queue().put({"type": "server_message", "data": data})
 
         except websockets.ConnectionClosed:
             self._connected = False
@@ -826,13 +1041,6 @@ class WebSocketSession:
             "type": "custom",
             "message_type": message_type,
             "payload": payload,
-        })
-
-    async def ping(self) -> None:
-        """Send a ping message."""
-        await self._send_json({
-            "type": "ping",
-            "timestamp": int(time.time() * 1000),
         })
 
     def get_metrics(self) -> SessionMetrics:

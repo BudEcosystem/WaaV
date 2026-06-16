@@ -379,6 +379,159 @@ class EmotionConfig(BaseModel):
     """Free-form description (for providers like Hume)"""
 
 
+# =============================================================================
+# Conversation / Agent-loop Types (built-in LLM loop + REALTIME_REASONING)
+# =============================================================================
+
+
+class ReasoningEffort(str, Enum):
+    """Reasoning / thinking-effort dial (REALTIME_REASONING D1).
+
+    Mapped server-side to each vendor's native thinking control and clamped to
+    the model's floor. Keep a FAST, non-reasoning model on the spoken path for
+    realtime latency.
+    """
+
+    OFF = "off"
+    MINIMAL = "minimal"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class LatencyFiller(str, Enum):
+    """Latency-masking mode (REALTIME_REASONING D3).
+
+    ``auto`` (default) speaks ONE short action phrase when first audio is slow,
+    keeping the line alive while the real answer streams in behind it.
+    """
+
+    OFF = "off"
+    AUTO = "auto"
+    AGGRESSIVE = "aggressive"
+
+
+class RoutingMode(str, Enum):
+    """Two-tier reasoning routing (REALTIME_REASONING S2)."""
+
+    AUTO = "auto"
+    ALWAYS = "always"
+
+
+class MuteStrategy(str, Enum):
+    """User-mute strategy (conversation A-G5).
+
+    While active, USER INPUT is suppressed (bot/lifecycle signals always flow).
+    """
+
+    ALWAYS_WHILE_BOT_SPEAKS = "always_while_bot_speaks"
+    UNTIL_FIRST_BOT_COMPLETE = "until_first_bot_complete"
+    FIRST_SPEECH_ONLY = "first_speech_only"
+
+
+class ConversationConfig(BaseModel):
+    """Built-in conversation-loop configuration for the gateway (config.rs:53-217).
+
+    When attached to a WS session, the gateway wires up an automatic
+    conversation loop: each finalized STT turn drives an OpenAI-compatible LLM
+    and the reply is streamed to TTS, with per-session history and barge-in.
+    Serialized into the ``conversation_config`` block of the ``config`` message.
+
+    ``base_url`` and ``model`` are the only required fields (mirrors the gateway
+    ``ConversationWebSocketConfig``); every other field is optional and only
+    sent when set, so the gateway applies its own defaults.
+    """
+
+    model_config = ConfigDict(use_enum_values=True)
+
+    base_url: str
+    """OpenAI-compatible base URL for the LLM (e.g. 'https://api.openai.com/v1')."""
+
+    model: str
+    """Model identifier (e.g. 'gpt-4o-mini', 'llama3.2:1b')."""
+
+    system_prompt: Optional[str] = None
+    """Optional system prompt seeding the conversation."""
+
+    api_key: Optional[str] = None
+    """API key (literal or '${ENV_VAR}'); falls back to OPENAI_API_KEY server-side."""
+
+    temperature: Optional[float] = None
+    """Sampling temperature."""
+
+    max_tokens: Optional[int] = None
+    """Max tokens per completion."""
+
+    streaming: Optional[bool] = None
+    """Stream tokens to TTS as they arrive (gateway default true)."""
+
+    max_history: Optional[int] = None
+    """Max retained history messages (gateway default 20)."""
+
+    allow_interruption: Optional[bool] = None
+    """Whether the bot's speech is interruptible / barge-in (gateway default true)."""
+
+    eager_eot: Optional[bool] = None
+    """Eager end-of-turn: start the LLM speculatively on a turn-complete prediction."""
+
+    provider_kind: Optional[str] = None
+    """LLM vendor wire format: 'openai' (default) | 'anthropic' | 'gemini'."""
+
+    barge_in_min_words: Optional[int] = None
+    """While the bot speaks, require >= N words to interrupt it (values < 2 clamp to 2)."""
+
+    summarize_target_tokens: Optional[int] = None
+    """Token-aware context compaction threshold (0/omitted = off)."""
+
+    mute_strategy: Optional[Union[MuteStrategy, str]] = None
+    """User-mute strategy (suppress user input while active)."""
+
+    strip_markdown: Optional[bool] = None
+    """Strip markdown from LLM sentences before TTS (gateway default true)."""
+
+    user_idle_timeout_ms: Optional[int] = None
+    """Idle re-engagement after this many ms of silence (0/omitted = off)."""
+
+    reasoning_effort: Optional[Union[ReasoningEffort, str]] = None
+    """Reasoning/thinking-effort dial: off | minimal | low | medium | high."""
+
+    latency_filler: Optional[Union[LatencyFiller, str]] = None
+    """Latency-masking mode: off | auto | aggressive."""
+
+    latency_filler_after_ms: Optional[int] = None
+    """Override the masking wait threshold in ms."""
+
+    latency_filler_phrases: Optional[list[str]] = None
+    """Custom masking phrases (empty = built-in pool)."""
+
+    reasoning_model: Optional[str] = None
+    """Optional slow REASONING tier model (e.g. 'o3', 'deepseek-r1'); turns two-tier on."""
+
+    reasoning_base_url: Optional[str] = None
+    """Reasoning-tier base URL (defaults to base_url)."""
+
+    reasoning_api_key: Optional[str] = None
+    """Reasoning-tier API key (defaults to api_key)."""
+
+    reasoning_provider_kind: Optional[str] = None
+    """Reasoning-tier vendor wire format (defaults to provider_kind)."""
+
+    reasoning_route: Optional[Union[RoutingMode, str]] = None
+    """Route turns between tiers: 'auto' (default) or 'always'."""
+
+    reasoning_budget_ms: Optional[int] = None
+    """Reasoning-tier max-silence-gap budget in ms (gateway default 15000; 0 disables)."""
+
+    degradation_message: Optional[str] = None
+    """Spoken line used when EVERY LLM tier fails."""
+
+    max_llm_calls_per_turn: Optional[int] = None
+    """Per-turn ceiling on LLM re-inference rounds (tool-call loop; gateway default 8)."""
+
+    max_reasoning_tokens: Optional[int] = None
+    """Hard ceiling on the reasoning tier's output tokens."""
+
+
 class STTConfig(BaseModel):
     """STT (Speech-to-Text) configuration."""
 

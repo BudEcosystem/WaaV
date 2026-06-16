@@ -7,6 +7,8 @@ import type {
   IncomingMessage,
   OutgoingMessage,
   SpeakMessage,
+  SendMessageMessage,
+  ClearMessage,
   ReadyMessage,
   STTResultMessage,
   TTSAudioMessage,
@@ -141,19 +143,37 @@ function toWireFormat(message: SDKOutgoingMessage): Record<string, unknown> {
       return configToWire(message as SDKConfigMessage);
     case 'speak':
       return speakToWire(message as SpeakMessage);
-    case 'ping':
-      return { type: 'ping', timestamp: Date.now() };
-    case 'audio':
-      return { type: 'audio' }; // Binary audio handled separately
-    case 'stop':
-      return { type: 'stop' };
-    case 'flush':
-      return { type: 'flush' };
-    case 'interrupt':
-      return { type: 'interrupt' };
+    case 'clear':
+      // Barge-in / cancel current TTS playback (gateway op `clear`).
+      return { type: 'clear' };
+    case 'audio_end':
+      // Finalize: tell the gateway the audio stream has ended so it flushes
+      // any pending transcript (gateway op `audio_end`).
+      return { type: 'audio_end' };
+    case 'send_message':
+      return sendMessageToWire(message as SendMessageMessage);
+    case 'sip_transfer':
+      return {
+        type: 'sip_transfer',
+        transfer_to: (message as { transfer_to: string }).transfer_to,
+      };
     default:
       return { type: (message as { type: string }).type };
   }
+}
+
+/**
+ * Convert a send_message (data channel) message to wire format
+ */
+function sendMessageToWire(message: SendMessageMessage): Record<string, unknown> {
+  const wire: Record<string, unknown> = {
+    type: 'send_message',
+    message: message.message,
+    role: message.role,
+  };
+  if (message.topic !== undefined) wire.topic = message.topic;
+  if (message.debug !== undefined) wire.debug = message.debug;
+  return wire;
 }
 
 /**
@@ -269,12 +289,17 @@ function ttsConfigToWire(config: TTSConfig): Record<string, unknown> {
  * Convert LiveKit config to wire format
  */
 function livekitConfigToWire(config: LiveKitConfig): Record<string, unknown> {
-  return {
+  const wire: Record<string, unknown> = {
     room_name: config.roomName,
-    identity: config.identity,
-    name: config.name,
-    metadata: config.metadata,
   };
+  if (config.enableRecording !== undefined) wire.enable_recording = config.enableRecording;
+  if (config.waavParticipantIdentity !== undefined)
+    wire.waav_participant_identity = config.waavParticipantIdentity;
+  if (config.waavParticipantName !== undefined)
+    wire.waav_participant_name = config.waavParticipantName;
+  if (config.listenParticipants !== undefined)
+    wire.listen_participants = config.listenParticipants;
+  return wire;
 }
 
 /**
@@ -340,17 +365,11 @@ function fromWireFormat(wire: Record<string, unknown>): IncomingMessage {
       return pongFromWire(wire);
     case 'session_update':
       return sessionUpdateFromWire(wire);
-    case 'speaking_started':
-      return { type: 'speaking_started' };
-    case 'speaking_finished':
-      return { type: 'speaking_finished' };
-    case 'listening_started':
-      return { type: 'listening_started' };
-    case 'listening_stopped':
-      return { type: 'listening_stopped' };
     default:
-      // Return generic message for unknown types
-      return { type, ...wire } as IncomingMessage;
+      // Return generic message for unknown types (e.g. tts_playback_complete,
+      // message, participant_disconnected, sip_transfer_error). These already
+      // arrive in the gateway's snake_case wire shape, so pass them through.
+      return { ...wire, type } as IncomingMessage;
   }
 }
 
@@ -358,62 +377,64 @@ function fromWireFormat(wire: Record<string, unknown>): IncomingMessage {
  * Convert ready message from wire format
  */
 function readyFromWire(wire: Record<string, unknown>): ReadyMessage {
-  return {
+  // Gateway wire shape (handlers/ws/messages.rs OutgoingMessage::Ready):
+  // { type, protocol_version, stream_id, livekit_room_name?, livekit_url?,
+  //   waav_participant_identity?, waav_participant_name? }
+  const msg: ReadyMessage = {
     type: 'ready',
-    sessionId: asString(wire.session_id),
-    sttReady: asBoolean(wire.stt_ready),
-    ttsReady: asBoolean(wire.tts_ready),
-    livekitConnected: asBoolean(wire.livekit_connected),
-    serverVersion: asString(wire.server_version),
-    capabilities: asStringArray(wire.capabilities),
+    stream_id: asStringRequired(wire.stream_id, 'stream_id'),
+    protocol_version: asString(wire.protocol_version),
   };
+  const livekitRoomName = asString(wire.livekit_room_name);
+  if (livekitRoomName !== undefined) msg.livekit_room_name = livekitRoomName;
+  const livekitUrl = asString(wire.livekit_url);
+  if (livekitUrl !== undefined) msg.livekit_url = livekitUrl;
+  const pId = asString(wire.waav_participant_identity);
+  if (pId !== undefined) msg.waav_participant_identity = pId;
+  const pName = asString(wire.waav_participant_name);
+  if (pName !== undefined) msg.waav_participant_name = pName;
+  return msg;
 }
 
 /**
  * Convert STT result message from wire format
  */
 function sttResultFromWire(wire: Record<string, unknown>): STTResultMessage {
-  // Safely parse words array with validation
-  let words: STTResultMessage['words'];
-  if (Array.isArray(wire.words)) {
-    words = wire.words
-      .filter((w): w is Record<string, unknown> => w !== null && typeof w === 'object')
-      .map((w) => ({
-        word: asStringRequired(w.word, 'word.word'),
-        start: asNumberRequired(w.start, 'word.start'),
-        end: asNumberRequired(w.end, 'word.end'),
-        confidence: asNumber(w.confidence),
-        speakerId: asNumber(w.speaker_id),
-      }));
-  }
-
-  return {
+  // Gateway wire shape (handlers/ws/messages.rs OutgoingMessage::STTResult):
+  // { type, transcript, is_final, is_speech_final, confidence, segment_transcript? }
+  // NOTE: the field is `transcript`, NOT `text` — reading `text` was the bug that
+  // made every transcript come back empty.
+  const msg: STTResultMessage = {
     type: 'stt_result',
-    text: asStringRequired(wire.text, 'text'),
-    isFinal: asBooleanRequired(wire.is_final, 'is_final'),
-    confidence: asNumber(wire.confidence),
-    speakerId: asNumber(wire.speaker_id),
-    language: asString(wire.language),
-    startTime: asNumber(wire.start_time),
-    endTime: asNumber(wire.end_time),
-    words,
-    channelIndex: asNumber(wire.channel_index),
+    transcript: asStringRequired(wire.transcript, 'transcript'),
+    is_final: asBooleanRequired(wire.is_final, 'is_final'),
+    is_speech_final: asBooleanRequired(wire.is_speech_final, 'is_speech_final'),
+    confidence: asNumberRequired(wire.confidence, 'confidence'),
   };
+  const segment = asString(wire.segment_transcript);
+  if (segment !== undefined) msg.segment_transcript = segment;
+  return msg;
 }
 
 /**
  * Convert TTS audio message from wire format
  */
 function ttsAudioFromWire(wire: Record<string, unknown>): TTSAudioMessage {
-  return {
+  const msg: TTSAudioMessage = {
     type: 'tts_audio',
     audio: asStringRequired(wire.audio, 'audio'), // Base64 encoded
-    format: asString(wire.format),
-    sampleRate: asNumber(wire.sample_rate),
-    duration: asNumber(wire.duration),
-    isFinal: asBoolean(wire.is_final),
-    sequence: asNumber(wire.sequence),
   };
+  const format = asString(wire.format);
+  if (format !== undefined) msg.format = format;
+  const sampleRate = asNumber(wire.sample_rate);
+  if (sampleRate !== undefined) msg.sample_rate = sampleRate;
+  const duration = asNumber(wire.duration);
+  if (duration !== undefined) msg.duration = duration;
+  const isFinal = asBoolean(wire.is_final);
+  if (isFinal !== undefined) msg.is_final = isFinal;
+  const sequence = asNumber(wire.sequence);
+  if (sequence !== undefined) msg.sequence = sequence;
+  return msg;
 }
 
 /**
@@ -433,11 +454,13 @@ function errorFromWire(wire: Record<string, unknown>): ErrorMessage {
  * Convert pong message from wire format
  */
 function pongFromWire(wire: Record<string, unknown>): PongMessage {
-  return {
+  const msg: PongMessage = {
     type: 'pong',
     timestamp: asNumberRequired(wire.timestamp, 'timestamp'),
-    serverTime: asNumber(wire.server_time),
   };
+  const serverTime = asNumber(wire.server_time);
+  if (serverTime !== undefined) msg.server_time = serverTime;
+  return msg;
 }
 
 /**
@@ -448,7 +471,7 @@ function sessionUpdateFromWire(wire: Record<string, unknown>): SessionUpdateMess
     type: 'session_update',
     field: asStringRequired(wire.field, 'field'),
     value: wire.value, // Any value type allowed
-    previousValue: wire.previous_value, // Any value type allowed
+    previous_value: wire.previous_value, // Any value type allowed
   };
 }
 
@@ -490,36 +513,34 @@ export function createSpeakMessage(text: string, options?: {
 }
 
 /**
- * Create a ping message
+ * Create a clear message (barge-in / cancel current TTS playback).
+ * This is the gateway's `clear` op — the correct way to interrupt the bot.
  */
-export function createPingMessage(): OutgoingMessage {
-  return { type: 'ping' };
+export function createClearMessage(): ClearMessage {
+  return { type: 'clear' };
 }
 
 /**
- * Create an audio message marker
+ * Create an audio_end message (finalize).
+ * Tells the gateway the audio stream has ended so it flushes any pending
+ * transcript. This is the gateway's `audio_end` op.
  */
-export function createAudioMessage(): OutgoingMessage {
-  return { type: 'audio' };
+export function createAudioEndMessage(): OutgoingMessage {
+  return { type: 'audio_end' };
 }
 
 /**
- * Create a stop message
+ * Create a send_message (data-channel) message.
  */
-export function createStopMessage(): OutgoingMessage {
-  return { type: 'stop' };
-}
-
-/**
- * Create a flush message
- */
-export function createFlushMessage(): OutgoingMessage {
-  return { type: 'flush' };
-}
-
-/**
- * Create an interrupt message
- */
-export function createInterruptMessage(): OutgoingMessage {
-  return { type: 'interrupt' };
+export function createSendMessageMessage(
+  message: string,
+  role: string,
+  options?: { topic?: string; debug?: Record<string, unknown> }
+): SendMessageMessage {
+  return {
+    type: 'send_message',
+    message,
+    role,
+    ...options,
+  };
 }
