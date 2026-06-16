@@ -808,7 +808,7 @@ pub fn build_realtime_config(api_key: String, config: &RealtimeSessionConfig) ->
     use crate::core::realtime::{InputTranscriptionConfig, TurnDetectionConfig};
 
     let turn_detection = config.turn_detection.as_ref().map(|td| match td {
-        super::messages::TurnDetectionConfig::ServerVad {
+        crate::handlers::realtime::messages::TurnDetectionConfig::ServerVad {
             threshold,
             silence_duration_ms,
             prefix_padding_ms,
@@ -819,14 +819,14 @@ pub fn build_realtime_config(api_key: String, config: &RealtimeSessionConfig) ->
             create_response: Some(true),
             interrupt_response: Some(true),
         },
-        super::messages::TurnDetectionConfig::Semantic { eagerness } => {
+        crate::handlers::realtime::messages::TurnDetectionConfig::Semantic { eagerness } => {
             TurnDetectionConfig::SemanticVad {
                 eagerness: eagerness.clone(),
                 create_response: Some(true),
                 interrupt_response: Some(true),
             }
         }
-        super::messages::TurnDetectionConfig::Manual => TurnDetectionConfig::None,
+        crate::handlers::realtime::messages::TurnDetectionConfig::Manual => TurnDetectionConfig::None,
     });
 
     let tools = config.tools.as_ref().map(|tools| {
@@ -967,5 +967,75 @@ mod tests {
     fn test_default_model() {
         // GA default — the Beta-era preview is retired (see DEFAULT_MODEL).
         assert_eq!(DEFAULT_MODEL, "gpt-realtime");
+    }
+
+    /// Full-surface round-trip: a `RealtimeSessionConfig` carrying EVERY feature
+    /// (turn detection, tools, transcription, noise reduction, reasoning effort,
+    /// modalities, audio formats, temperature, max tokens) must convert through
+    /// `build_realtime_config` AND then construct a provider for EVERY supported
+    /// realtime provider without panicking — the exact two-step the live handler
+    /// runs before connect. Bug class: a feature field that converts fine for
+    /// OpenAI but trips a sibling provider's `from_config` (a panic / hard error
+    /// on a field it should ignore), which would otherwise only surface live.
+    #[test]
+    fn full_feature_config_round_trips_for_every_provider() {
+        let session_config = RealtimeSessionConfig {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-realtime".to_string()),
+            voice: Some("alloy".to_string()),
+            instructions: Some("Be concise and helpful.".to_string()),
+            temperature: Some(0.7),
+            max_response_tokens: Some(2048),
+            turn_detection: Some(crate::handlers::realtime::messages::TurnDetectionConfig::ServerVad {
+                threshold: Some(0.55),
+                silence_duration_ms: Some(700),
+                prefix_padding_ms: Some(120),
+            }),
+            tools: Some(vec![crate::handlers::realtime::messages::ToolConfig {
+                tool_type: "function".to_string(),
+                function: crate::handlers::realtime::messages::FunctionConfig {
+                    name: "get_weather".to_string(),
+                    description: Some("Look up the weather".to_string()),
+                    parameters: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                        "required": ["city"]
+                    })),
+                },
+            }]),
+            modalities: Some(vec!["audio".to_string(), "text".to_string()]),
+            transcribe_input: Some(true),
+            transcription_model: Some("whisper-1".to_string()),
+            input_audio_format: Some("pcm16".to_string()),
+            output_audio_format: Some("pcm16".to_string()),
+            reasoning_effort: Some(crate::core::llm::ReasoningEffort::Low),
+            input_audio_noise_reduction: Some("near_field".to_string()),
+        };
+
+        // Step 1: the client→config converter must carry the full surface through
+        // and (SSRF) never set the server-only endpoint fields.
+        let mut realtime_config =
+            build_realtime_config("test-key".to_string(), &session_config);
+        assert!(realtime_config.turn_detection.is_some());
+        assert!(realtime_config.tools.is_some());
+        assert!(realtime_config.input_audio_transcription.is_some());
+        assert_eq!(
+            realtime_config.input_audio_noise_reduction.as_deref(),
+            Some("near_field")
+        );
+        assert_eq!(realtime_config.reasoning_effort, Some(crate::core::llm::ReasoningEffort::Low));
+        assert!(realtime_config.realtime_endpoint_override.is_none());
+
+        // Step 2: that config must construct EVERY provider (offline, no connect).
+        // Azure needs its resource endpoint (server-injected in production).
+        realtime_config.endpoint = Some("https://my-resource.openai.azure.com".to_string());
+        for provider in get_supported_realtime_providers() {
+            let result = create_realtime_provider(provider, realtime_config.clone());
+            assert!(
+                result.is_ok(),
+                "full-feature config must construct `{provider}`, got {:?}",
+                result.err()
+            );
+        }
     }
 }

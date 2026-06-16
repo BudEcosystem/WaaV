@@ -23,6 +23,23 @@ impl ServerConfig {
     /// - Authentication configuration is invalid
     /// - JWT signing key file doesn't exist
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+        // Read a CREDENTIAL env var, treating an empty/whitespace/placeholder
+        // value as UNSET (`None`). A bare `env::var(..).ok()` returns `Some("")`
+        // for an exported-but-empty var (e.g. `HUME_API_KEY=""`), which then
+        // satisfies the realtime handler's `Some(_)` missing-key guard and drives
+        // an attempted connect (observed live: Hume → HTTP 429) instead of a clean
+        // "API key not configured" error. The same `is_placeholder_credential`
+        // filter the YAML/merge path uses applies here so empty == unset across
+        // every credential source. NON-credential vars (regions, endpoints, URLs)
+        // keep plain `.ok()` — an empty string there is not a secret-presence
+        // signal and some (e.g. AWS region) legitimately tolerate it.
+        macro_rules! cred_env {
+            ($var:expr) => {
+                env::var($var)
+                    .ok()
+                    .filter(|v: &String| !super::utils::is_placeholder_credential(v))
+            };
+        }
         // Server configuration
         let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
         let port = env::var("PORT")
@@ -57,48 +74,52 @@ impl ServerConfig {
             env::var("LIVEKIT_URL").unwrap_or_else(|_| "ws://localhost:7880".to_string());
         let livekit_public_url =
             env::var("LIVEKIT_PUBLIC_URL").unwrap_or_else(|_| "http://localhost:7880".to_string());
-        let livekit_api_key = env::var("LIVEKIT_API_KEY").ok();
-        let livekit_api_secret = env::var("LIVEKIT_API_SECRET").ok();
+        // Credentials: an empty/placeholder env value ⇒ None (review wf_e8eaad72 #1).
+        let livekit_api_key = cred_env!("LIVEKIT_API_KEY");
+        let livekit_api_secret = cred_env!("LIVEKIT_API_SECRET");
 
-        // Provider API keys
-        let deepgram_api_key = env::var("DEEPGRAM_API_KEY").ok();
-        let elevenlabs_api_key = env::var("ELEVENLABS_API_KEY").ok();
+        // Provider API keys (empty/placeholder env value ⇒ None — see `cred_env!`).
+        let deepgram_api_key = cred_env!("DEEPGRAM_API_KEY");
+        let elevenlabs_api_key = cred_env!("ELEVENLABS_API_KEY");
         // Google credentials can be:
         // - Path to service account JSON file (GOOGLE_APPLICATION_CREDENTIALS)
         // - Inline JSON content (for secrets management systems)
         // - Empty/None to use Application Default Credentials
-        let google_credentials = env::var("GOOGLE_APPLICATION_CREDENTIALS").ok();
+        // An empty value here means "use ADC" — identical to unset — so the
+        // empty⇒None normalization is correct (and the `get_api_key` google arm
+        // already exempts google from placeholder rejection for the ADC case).
+        let google_credentials = cred_env!("GOOGLE_APPLICATION_CREDENTIALS");
 
         // Azure Speech Services configuration
         // The subscription key is tied to a specific Azure region
-        let azure_speech_subscription_key = env::var("AZURE_SPEECH_SUBSCRIPTION_KEY").ok();
+        let azure_speech_subscription_key = cred_env!("AZURE_SPEECH_SUBSCRIPTION_KEY");
         let azure_speech_region = env::var("AZURE_SPEECH_REGION").ok();
 
         // Cartesia API key (used for both STT and TTS)
-        let cartesia_api_key = env::var("CARTESIA_API_KEY").ok();
+        let cartesia_api_key = cred_env!("CARTESIA_API_KEY");
 
         // OpenAI API key (used for STT, TTS, and Realtime API)
-        let openai_api_key = env::var("OPENAI_API_KEY").ok();
+        let openai_api_key = cred_env!("OPENAI_API_KEY");
 
         // Azure OpenAI Realtime (OpenAI-protocol clone): api-key header + resource.
-        let azure_openai_api_key = env::var("AZURE_OPENAI_API_KEY").ok();
+        let azure_openai_api_key = cred_env!("AZURE_OPENAI_API_KEY");
         let azure_openai_endpoint = env::var("AZURE_OPENAI_ENDPOINT").ok();
 
         // Grok / xAI Realtime (OpenAI GA-compatible wire, Bearer auth).
-        let grok_api_key = env::var("GROK_API_KEY").ok();
+        let grok_api_key = cred_env!("GROK_API_KEY");
 
         // Inworld Realtime (OpenAI GA wire, Bearer auth).
-        let inworld_api_key = env::var("INWORLD_API_KEY").ok();
+        let inworld_api_key = cred_env!("INWORLD_API_KEY");
 
         // Google Gemini Live (BidiGenerateContent S2S; `?key=` query auth).
-        let gemini_api_key = env::var("GEMINI_API_KEY").ok();
+        let gemini_api_key = cred_env!("GEMINI_API_KEY");
 
         // Ultravox hosted S2S realtime (`X-API-Key` create-call auth).
-        let ultravox_api_key = env::var("ULTRAVOX_API_KEY").ok();
+        let ultravox_api_key = cred_env!("ULTRAVOX_API_KEY");
 
         // Speechmatics API key (JWT / temp-token), shared by STT/TTS + the Flow
         // (Voice AI) realtime provider (`Authorization: Bearer <token>`).
-        let speechmatics_api_key = env::var("SPEECHMATICS_API_KEY").ok();
+        let speechmatics_api_key = cred_env!("SPEECHMATICS_API_KEY");
 
         // SERVER-SIDE per-provider realtime upstream URL overrides (SSRF-safe).
         // `<PROVIDER>_REALTIME_URL` → the matching realtime provider's connect URL.
@@ -107,42 +128,42 @@ impl ServerConfig {
         let realtime_endpoint_overrides = read_realtime_endpoint_overrides();
 
         // AssemblyAI API key (used for streaming STT)
-        let assemblyai_api_key = env::var("ASSEMBLYAI_API_KEY").ok();
+        let assemblyai_api_key = cred_env!("ASSEMBLYAI_API_KEY");
 
         // Hume AI API key (used for TTS and EVI)
-        let hume_api_key = env::var("HUME_API_KEY").ok();
+        let hume_api_key = cred_env!("HUME_API_KEY");
 
         // LMNT API key (used for TTS and voice cloning)
-        let lmnt_api_key = env::var("LMNT_API_KEY").ok();
+        let lmnt_api_key = cred_env!("LMNT_API_KEY");
 
         // Groq API key (used for ultra-fast Whisper STT)
-        let groq_api_key = env::var("GROQ_API_KEY").ok();
+        let groq_api_key = cred_env!("GROQ_API_KEY");
 
         // Play.ht credentials (used for TTS with voice cloning)
-        let playht_api_key = env::var("PLAYHT_API_KEY").ok();
-        let playht_user_id = env::var("PLAYHT_USER_ID").ok();
+        let playht_api_key = cred_env!("PLAYHT_API_KEY");
+        let playht_user_id = cred_env!("PLAYHT_USER_ID");
 
         // IBM Watson credentials (used for STT/TTS)
-        let ibm_watson_api_key = env::var("IBM_WATSON_API_KEY").ok();
-        let ibm_watson_instance_id = env::var("IBM_WATSON_INSTANCE_ID").ok();
+        let ibm_watson_api_key = cred_env!("IBM_WATSON_API_KEY");
+        let ibm_watson_instance_id = cred_env!("IBM_WATSON_INSTANCE_ID");
         let ibm_watson_region = env::var("IBM_WATSON_REGION").ok();
 
         // AWS credentials (used for Transcribe/Polly)
-        let aws_access_key_id = env::var("AWS_ACCESS_KEY_ID").ok();
-        let aws_secret_access_key = env::var("AWS_SECRET_ACCESS_KEY").ok();
+        let aws_access_key_id = cred_env!("AWS_ACCESS_KEY_ID");
+        let aws_secret_access_key = cred_env!("AWS_SECRET_ACCESS_KEY");
         let aws_region = env::var("AWS_REGION").ok();
 
         // Gnani.ai credentials (used for Indic STT/TTS)
-        let gnani_token = env::var("GNANI_TOKEN").ok();
-        let gnani_access_key = env::var("GNANI_ACCESS_KEY").ok();
+        let gnani_token = cred_env!("GNANI_TOKEN");
+        let gnani_access_key = cred_env!("GNANI_ACCESS_KEY");
         let gnani_certificate_path = env::var("GNANI_CERTIFICATE_PATH").ok().map(PathBuf::from);
 
         // LiveKit recording S3 configuration
         let recording_s3_bucket = env::var("RECORDING_S3_BUCKET").ok();
         let recording_s3_region = env::var("RECORDING_S3_REGION").ok();
         let recording_s3_endpoint = env::var("RECORDING_S3_ENDPOINT").ok();
-        let recording_s3_access_key = env::var("RECORDING_S3_ACCESS_KEY").ok();
-        let recording_s3_secret_key = env::var("RECORDING_S3_SECRET_KEY").ok();
+        let recording_s3_access_key = cred_env!("RECORDING_S3_ACCESS_KEY");
+        let recording_s3_secret_key = cred_env!("RECORDING_S3_SECRET_KEY");
         let recording_s3_prefix = env::var("RECORDING_S3_PREFIX").ok();
 
         // Cache configuration
@@ -502,6 +523,42 @@ mod tests {
             env::remove_var("SIP_HOOK_SECRET");
             env::remove_var("RECORDING_S3_PREFIX");
         }
+    }
+
+    /// `from_env` is the LIVE entrypoint (no `--config`). An exported-but-empty
+    /// credential env var (`HUME_API_KEY=""`) must resolve to `None`, not
+    /// `Some("")` — otherwise the realtime handler's `Some(_)` missing-key guard
+    /// passes and it dials the provider (observed live: Hume 429) instead of
+    /// returning a clean "API key not configured" error (review: empty-key nit).
+    #[test]
+    #[serial]
+    fn test_from_env_empty_credential_resolves_to_none() {
+        cleanup_env_vars();
+        unsafe {
+            env::remove_var("HUME_API_KEY");
+            env::remove_var("OPENAI_API_KEY");
+            env::set_var("HUME_API_KEY", "");
+            env::set_var("OPENAI_API_KEY", "   "); // whitespace-only
+        }
+        let config = ServerConfig::from_env().expect("from_env");
+        assert_eq!(config.hume_api_key, None, "empty env credential ⇒ None");
+        assert_eq!(
+            config.openai_api_key, None,
+            "whitespace-only env credential ⇒ None"
+        );
+
+        // A real key still survives (no over-eager nulling).
+        unsafe {
+            env::set_var("HUME_API_KEY", "hk-real");
+        }
+        let config = ServerConfig::from_env().expect("from_env");
+        assert_eq!(config.hume_api_key, Some("hk-real".to_string()));
+
+        unsafe {
+            env::remove_var("HUME_API_KEY");
+            env::remove_var("OPENAI_API_KEY");
+        }
+        cleanup_env_vars();
     }
 
     /// `read_realtime_endpoint_overrides` maps each `<PROVIDER>_REALTIME_URL` env

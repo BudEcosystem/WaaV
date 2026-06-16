@@ -2249,19 +2249,49 @@ providers:
         cleanup_env_vars();
     }
 
-    /// P0.2 defense-in-depth: the env path does NOT merge-filter, so a
-    /// placeholder arriving via env must still be rejected by get_api_key.
+    /// A placeholder credential is rejected via BOTH seams (review: empty/
+    /// placeholder-key consistency):
+    ///
+    /// 1. `from_env` now filters empty/placeholder env values to `None` (the same
+    ///    `is_placeholder_credential` filter the YAML/merge path uses — the env
+    ///    path used to leak the placeholder/`Some("")` through), so the env
+    ///    placeholder surfaces as "not configured" (unset).
+    /// 2. Defense-in-depth: a placeholder reaching `get_api_key` by ANOTHER route
+    ///    (e.g. a directly-constructed `ServerConfig` that bypasses `from_env`)
+    ///    is STILL rejected with a "placeholder" error — never handed to a
+    ///    provider (observed live: Deepgram 401 with the literal placeholder).
     #[test]
     #[serial]
     fn test_get_api_key_rejects_placeholder_value() {
         cleanup_env_vars();
+
+        // (1) Env placeholder ⇒ filtered to None ⇒ "not configured" (now uniform
+        // with the merge path; previously this returned a "placeholder" error
+        // because the env value was passed through unfiltered).
         unsafe {
             env::set_var("DEEPGRAM_API_KEY", "your-deepgram-api-key");
         }
         let config = ServerConfig::from_env().unwrap();
+        assert_eq!(
+            config.deepgram_api_key, None,
+            "env placeholder credential must resolve to None (filtered, not leaked)"
+        );
         let err = config.get_api_key("deepgram").unwrap_err();
-        assert!(err.contains("placeholder"), "got: {err}");
+        assert!(
+            err.contains("not configured") || err.contains("placeholder"),
+            "env placeholder ⇒ key unset, got: {err}"
+        );
         cleanup_env_vars();
+
+        // (2) Defense-in-depth: a placeholder that bypasses `from_env`/merge
+        // filtering (direct field set) is still caught by `get_api_key`.
+        let mut direct = test_config();
+        direct.deepgram_api_key = Some("your-deepgram-api-key".to_string());
+        let err = direct.get_api_key("deepgram").unwrap_err();
+        assert!(
+            err.contains("placeholder"),
+            "directly-injected placeholder must be rejected by get_api_key, got: {err}"
+        );
     }
 
     #[test]

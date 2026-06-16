@@ -2099,6 +2099,21 @@ async fn initialize_dag_routing(
     let (output_tx, mut output_rx) = mpsc::channel::<DagOutput>(64);
     let dag_context = dag_context.with_output_tx(output_tx.clone());
 
+    // B-G2 STAGING (intentionally NOT wired): the persistent realtime-session
+    // path (`RealtimeProviderNode::execute_session_scoped`) activates only when a
+    // `RealtimeSessionMap` resource is inserted here under
+    // `crate::dag::nodes::realtime_sessions_key()`. It is deliberately absent: the
+    // persistent path has no bounded teardown for its upstream WebSocket (the
+    // `RealtimeSession` supervisor is an untracked spawn; there is no
+    // session-end `disconnect()` like the HTTP `/realtime` handler and the legacy
+    // per-turn DAG path both do). Inserting the map here would orphan a live
+    // socket on a wedged `voice_manager.stop()` and hide it from the D-G4
+    // dangling-task audit. Production therefore uses the legacy per-turn path
+    // (connect + disconnect each turn — clean + bounded). Wire this ONLY after
+    // adding a teardown owner that disconnects every session in the map at
+    // session end (e.g. in `handle_disconnect`, before the task_tracker audit).
+    // See `RealtimeProviderNode::execute` and `SessionRealtime` for the full note.
+
     {
         let message_tx = message_tx.clone();
         let livekit_client = livekit_client.cloned();

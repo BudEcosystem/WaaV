@@ -44,9 +44,15 @@ pub fn merge_config(
     }
 
     // Helper macro for CREDENTIALS: same YAML > ENV precedence, but a
-    // placeholder YAML value (the shipped "your-…-api-key" style) is treated as
-    // UNSET so the `# ENV:` fallback documented in config.yaml actually applies.
-    // Real YAML values keep their existing precedence over env untouched.
+    // placeholder YAML value (the shipped "your-…-api-key" style) — AND an
+    // empty-string value from EITHER YAML or env — is treated as UNSET so the
+    // `# ENV:` fallback documented in config.yaml actually applies and the
+    // handler's missing-key guard fires cleanly. `is_placeholder_credential`
+    // already classifies an empty/whitespace string as a placeholder, so the
+    // YAML branch handled empty; the env fallback previously did NOT, leaking
+    // `Some("")` to the handler (e.g. `HUME_API_KEY=""` → an attempted connect /
+    // HTTP 429 instead of "API key not configured"). Run the env value through
+    // the SAME placeholder/empty filter. Real values keep their precedence.
     macro_rules! get_credential {
         ($env_var:expr, $yaml_value:expr) => {
             $yaml_value
@@ -62,7 +68,13 @@ pub fn merge_config(
                         true
                     }
                 })
-                .or_else(|| env::var($env_var).ok())
+                .or_else(|| {
+                    env::var($env_var)
+                        .ok()
+                        // Empty / placeholder env credential = unset (review: hume
+                        // empty-key 429). Keeps `Some("")` from reaching handlers.
+                        .filter(|v: &String| !super::utils::is_placeholder_credential(v))
+                })
         };
     }
 
@@ -361,14 +373,16 @@ pub fn merge_config(
         yaml.recording.as_ref().and_then(|r| r.s3_endpoint.clone())
     );
 
-    let recording_s3_access_key = get_optional!(
+    // S3 creds are credentials — empty/placeholder ⇒ None (review wf_e8eaad72 #1,
+    // consistency with the other credential fields + the from_env path).
+    let recording_s3_access_key = get_credential!(
         "RECORDING_S3_ACCESS_KEY",
         yaml.recording
             .as_ref()
             .and_then(|r| r.s3_access_key.clone())
     );
 
-    let recording_s3_secret_key = get_optional!(
+    let recording_s3_secret_key = get_credential!(
         "RECORDING_S3_SECRET_KEY",
         yaml.recording
             .as_ref()
@@ -871,6 +885,70 @@ mod tests {
             env::remove_var("SIP_HOOK_SECRET");
             env::remove_var("RECORDING_S3_PREFIX");
         }
+    }
+
+    /// Empty-key consistency (review: hume empty-key 429). An EMPTY-string
+    /// credential — whether it arrives from YAML or from an exported-but-empty
+    /// env var — must resolve to `None` so the realtime handler's missing-key
+    /// guard returns a clean "API key not configured" error instead of dialing
+    /// the provider with `Some("")` (the YAML branch already handled empty via
+    /// `is_placeholder_credential`; the env fallback used to leak `Some("")`).
+    #[test]
+    #[serial]
+    fn empty_credential_from_yaml_or_env_resolves_to_none() {
+        cleanup_env_vars();
+        unsafe {
+            env::remove_var("HUME_API_KEY");
+        }
+
+        // 1) YAML empty string, no env ⇒ None.
+        let yaml = YamlConfig {
+            providers: Some(super::super::yaml::ProvidersYaml {
+                hume_api_key: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_config(Some(yaml)).unwrap().hume_api_key,
+            None,
+            "empty YAML credential must merge to None"
+        );
+
+        // 2) Exported-but-empty env var, no YAML ⇒ None (the bug: was Some("")).
+        unsafe {
+            env::set_var("HUME_API_KEY", "");
+        }
+        assert_eq!(
+            merge_config(None).unwrap().hume_api_key,
+            None,
+            "empty env credential must merge to None"
+        );
+
+        // 3) Whitespace-only env var ⇒ None.
+        unsafe {
+            env::set_var("HUME_API_KEY", "   ");
+        }
+        assert_eq!(
+            merge_config(None).unwrap().hume_api_key,
+            None,
+            "whitespace-only env credential must merge to None"
+        );
+
+        // 4) A REAL key still flows through untouched (no false-positive nulling).
+        unsafe {
+            env::set_var("HUME_API_KEY", "hk-real-secret");
+        }
+        assert_eq!(
+            merge_config(None).unwrap().hume_api_key,
+            Some("hk-real-secret".to_string()),
+            "a real env credential must survive the empty/placeholder filter"
+        );
+
+        unsafe {
+            env::remove_var("HUME_API_KEY");
+        }
+        cleanup_env_vars();
     }
 
     #[test]

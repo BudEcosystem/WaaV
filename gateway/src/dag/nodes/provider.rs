@@ -850,6 +850,25 @@ impl DAGNode for TTSProviderNode {
 /// being rebuilt per `execute()` (the old request-scoped behavior cost a
 /// full WS handshake + session.update on every utterance and discarded all
 /// server-side conversation state).
+///
+/// STAGING STATUS (do NOT wire into production DAG-init yet — review wf B-G2):
+/// this path is fully functional per-turn but has NO bounded teardown hook.
+/// A persistent `SessionRealtime` keeps a live upstream WebSocket owned by the
+/// `RealtimeSession` supervisor task, which is spawned via a bare `tokio::spawn`
+/// (see `core::realtime::scaffold::session`) and is therefore NOT registered
+/// with the session `task_tracker`. Both sibling PRODUCTION realtime paths close
+/// the socket explicitly at session end — the HTTP `/realtime` handler calls
+/// `provider.disconnect().await`, and the legacy request-scoped DAG path below
+/// disconnects per turn. This persistent path has no equivalent: cleanup relies
+/// solely on the [`RealtimeSessionMap`] Arc reaching refcount 0 (drop cascade →
+/// `out_tx` drop → the supervisor notices on its next `select!` and closes the
+/// socket), which is (a) unbounded + off the teardown critical path (no graceful
+/// upstream close, invisible to the D-G4 dangling-task audit) and (b) fragile to
+/// any lingering `DAGContext` clone — e.g. a wedged `voice_manager.stop()` (the
+/// WS handler bounds it with a warn-and-continue timeout) would orphan the
+/// socket. Until a teardown hook disconnects every session in the map (and/or the
+/// supervisor is tracked), keep the legacy per-turn path in production. See the
+/// caller gate in [`RealtimeProviderNode::execute`] and the staging note there.
 pub struct SessionRealtime {
     /// The connected provider (locked per turn — one in-flight response).
     pub provider: tokio::sync::Mutex<crate::core::realtime::BoxedRealtime>,
@@ -862,8 +881,15 @@ pub struct SessionRealtime {
 }
 
 /// Shared across every per-turn `DAGContext` clone (the map itself is the
-/// stable resource; entries are created on first use per node id). Inserted
-/// at DAG-init under [`resource_keys::REALTIME_PROVIDER_PREFIX`]`sessions`.
+/// stable resource; entries are created on first use per node id). When present
+/// under [`resource_keys::REALTIME_PROVIDER_PREFIX`]`sessions` (the key from
+/// [`realtime_sessions_key`]) the node takes the persistent path.
+///
+/// STAGING: this resource is intentionally NOT inserted by the production
+/// DAG-init path (`initialize_dag_routing`) — see [`SessionRealtime`] for why
+/// (no bounded teardown for the persistent socket). It is inserted only by the
+/// B-G2 test that exercises the persistent path. Production therefore runs the
+/// legacy per-turn path, which connects + disconnects each turn (clean + bounded).
 pub type RealtimeSessionMap = parking_lot::Mutex<
     std::collections::HashMap<String, Arc<SessionRealtime>>,
 >;
@@ -1215,10 +1241,21 @@ impl DAGNode for RealtimeProviderNode {
         );
 
         // B-G2: session-scoped path. When the session map resource is
-        // present (every gateway DAG session — inserted at init) AND the
-        // cascade output sink is attached, the provider persists across
-        // turns and its audio rides DagOutput::Audio — byte-for-byte the
-        // same downstream contract as cascade TTS (S2S is a drop-in).
+        // present AND the cascade output sink is attached, the provider
+        // persists across turns and its audio rides DagOutput::Audio —
+        // byte-for-byte the same downstream contract as cascade TTS (S2S is a
+        // drop-in).
+        //
+        // STAGING (review wf B-G2): the production DAG-init path
+        // (`initialize_dag_routing`) deliberately does NOT insert this resource,
+        // so production falls through to the legacy per-turn path below. The
+        // persistent path has no bounded teardown for its upstream socket (the
+        // `RealtimeSession` supervisor is an untracked `tokio::spawn`, and unlike
+        // the HTTP `/realtime` handler + the legacy path there is no explicit
+        // `disconnect()` at session end — see [`SessionRealtime`]). It is gated
+        // behind the resource so it activates ONLY where a teardown owner inserts
+        // the map (today: the B-G2 test). Wire it into production only once a
+        // teardown hook disconnects every session in the map.
         if let Some(sessions) = ctx.get_resource_as::<RealtimeSessionMap>(&realtime_sessions_key())
             && ctx.output_tx.is_some()
         {
@@ -1912,5 +1949,158 @@ mod session_realtime_tests {
             }
         }
         assert_eq!(sink_audio, 2, "one audio chunk per turn through DagOutput::Audio");
+    }
+
+    /// Connect counter for the legacy-path staging test (separate static so it
+    /// never races the B-G2 test's `CONNECTS`).
+    static LEGACY_CONNECTS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Mock S2S whose `create_response` drives the LEGACY request-scoped path's
+    /// channel collection (a final transcript completes a text turn) and counts
+    /// connects to prove per-turn reconnect.
+    struct MockS2SLegacy {
+        transcript_cb: Option<RtTranscriptCb>,
+        turn: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl BaseRealtime for MockS2SLegacy {
+        fn new(_c: RealtimeConfig) -> RealtimeResult<Self> {
+            Ok(Self { transcript_cb: None, turn: 0 })
+        }
+        async fn connect(&mut self) -> RealtimeResult<()> {
+            LEGACY_CONNECTS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn get_connection_state(&self) -> RtConn {
+            RtConn::Connected
+        }
+        async fn send_audio(&mut self, _a: bytes::Bytes) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn send_text(&mut self, _t: &str) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn create_response(&mut self) -> RealtimeResult<()> {
+            self.turn += 1;
+            if let Some(cb) = &self.transcript_cb {
+                cb(crate::core::realtime::TranscriptResult {
+                    text: format!("legacy {}", self.turn),
+                    role: TranscriptRole::Assistant,
+                    is_final: true,
+                    item_id: None,
+                })
+                .await;
+            }
+            Ok(())
+        }
+        async fn cancel_response(&mut self) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn commit_audio_buffer(&mut self) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn clear_audio_buffer(&mut self) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_transcript(&mut self, c: RtTranscriptCb) -> RealtimeResult<()> {
+            self.transcript_cb = Some(c);
+            Ok(())
+        }
+        fn on_audio(&mut self, _c: RtAudioCb) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_error(
+            &mut self,
+            _c: crate::core::realtime::RealtimeErrorCallback,
+        ) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_function_call(
+            &mut self,
+            _c: crate::core::realtime::FunctionCallCallback,
+        ) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_speech_event(
+            &mut self,
+            _c: crate::core::realtime::SpeechEventCallback,
+        ) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_response_done(
+            &mut self,
+            _c: crate::core::realtime::ResponseDoneCallback,
+        ) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_reconnection(
+            &mut self,
+            _c: crate::core::realtime::ReconnectionCallback,
+        ) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn update_session(&mut self, _c: RealtimeConfig) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn submit_function_result(&mut self, _i: &str, _r: &str) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn get_provider_info(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+    }
+
+    /// B-G2 STAGING LOCK: a PRODUCTION-LIKE context (output sink attached, but
+    /// NO `RealtimeSessionMap` resource — exactly how `initialize_dag_routing`
+    /// builds it) must run the LEGACY request-scoped path, which connects +
+    /// disconnects PER TURN. This pins the decision that B-G2 is deliberately
+    /// gated OFF in production (no bounded teardown for the persistent socket —
+    /// see `SessionRealtime`). If someone inserts the resource at init (wiring
+    /// B-G2) without a teardown owner, the persistent test covers that path; this
+    /// test guards the default. Two turns ⇒ TWO connects (not one).
+    #[tokio::test]
+    async fn production_like_context_without_session_map_uses_legacy_per_turn_path() {
+        crate::plugin::global_registry().register_realtime(
+            "mock-s2s-legacy",
+            Arc::new(|c| Ok(Box::new(MockS2SLegacy::new(c)?) as Box<dyn BaseRealtime>)),
+            crate::plugin::ProviderMetadata {
+                name: "mock-s2s-legacy".into(),
+                display_name: "Mock S2S Legacy".into(),
+                description: "test".into(),
+                ..Default::default()
+            },
+        );
+        LEGACY_CONNECTS.store(0, Ordering::SeqCst);
+
+        // Production-like: an output sink IS attached (W-O1), but the session-map
+        // resource is intentionally absent — the B-G2 gate needs BOTH.
+        let (output_tx, _output_rx) = tokio::sync::mpsc::channel::<DagOutput>(16);
+        let mut ctx = DAGContext::new("legacy-rt".to_string());
+        ctx.set_output_tx(output_tx);
+        assert!(
+            ctx.get_resource_as::<RealtimeSessionMap>(&realtime_sessions_key()).is_none(),
+            "production builds the context WITHOUT the session-map resource (staging)"
+        );
+
+        let node = RealtimeProviderNode::new("rt-legacy", "mock-s2s-legacy");
+        let out = node.execute(DAGData::Text("turn one".into()), &mut ctx).await.expect("turn 1");
+        assert!(matches!(&out, DAGData::Text(t) if t == "legacy 1"), "got {out:?}");
+        let out = node.execute(DAGData::Text("turn two".into()), &mut ctx).await.expect("turn 2");
+        // Each legacy turn builds a FRESH provider, so the per-provider turn
+        // counter restarts at 1 — proving the session is NOT reused.
+        assert!(matches!(&out, DAGData::Text(t) if t == "legacy 1"), "got {out:?}");
+
+        assert_eq!(
+            LEGACY_CONNECTS.load(Ordering::SeqCst),
+            2,
+            "legacy path connects PER turn (B-G2 persistent path is gated off in production)"
+        );
     }
 }
