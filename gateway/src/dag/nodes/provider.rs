@@ -1246,15 +1246,14 @@ impl DAGNode for RealtimeProviderNode {
         // Get realtime provider from registry
         let registry = crate::plugin::global_registry();
 
-        // Build realtime configuration
-        let realtime_config = RealtimeConfig {
-            model: self.model.clone().unwrap_or_default(),
-            provider: self.provider.clone(),
-            // review wf_d43814c3 #10: source the key (node config or env);
-            // an empty api_key is rejected by the OpenAI realtime provider.
-            api_key: resolve_node_credential(&self.config, "api_key").unwrap_or_default(),
-            ..Default::default()
-        };
+        // Build realtime configuration — the SAME full-feature-surface builder the
+        // session-scoped path uses, so the PRODUCTION legacy path (this one — the
+        // session-scoped B-G2 path needs a RealtimeSessionMap not yet inserted by
+        // the production DAG init) ALSO plumbs turn_detection / noise / transcribe /
+        // tools / reasoning / instructions / voice from the node config — not just
+        // model/provider/api_key. (Review wf_2b7f9856 #2: the plumbing now takes
+        // effect in the path production actually runs.)
+        let realtime_config = self.build_node_realtime_config();
 
         // Create realtime provider
         let mut realtime = match registry.create_realtime(&self.provider, realtime_config) {
