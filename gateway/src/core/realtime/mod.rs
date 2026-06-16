@@ -50,6 +50,7 @@
 mod base;
 pub mod azure;
 pub mod deepgram;
+pub mod elevenlabs;
 pub mod grok;
 pub mod hume;
 pub mod inworld;
@@ -67,6 +68,7 @@ pub use base::{
 };
 pub use azure::{AzureProtocol, AzureRealtime};
 pub use deepgram::{DeepgramProtocol, DeepgramRealtime};
+pub use elevenlabs::{ElevenLabsProtocol, ElevenLabsRealtime};
 pub use grok::{GrokProtocol, GrokRealtime};
 pub use hume::{
     EVIVersion, HUME_EVI_DEFAULT_SAMPLE_RATE, HUME_EVI_WEBSOCKET_URL, HumeEVI, HumeEVIConfig,
@@ -151,8 +153,18 @@ pub fn create_realtime_provider_from_enum(
 /// the embedded [`OpenAiProtocol`](openai::OpenAiProtocol) by delegation).
 /// `deepgram` is the Voice Agent (S2S) provider — the first RAW-binary-frame
 /// provider on the scaffold (its own [`DeepgramProtocol`], not an OpenAI clone).
+/// `elevenlabs` is Conversational AI (S2S) — base64+JSON on its own
+/// [`ElevenLabsProtocol`] (the OpenAI-family wire shape, not a clone).
 pub fn get_supported_realtime_providers() -> Vec<&'static str> {
-    vec!["openai", "hume", "azure", "grok", "inworld", "deepgram"]
+    vec![
+        "openai",
+        "hume",
+        "azure",
+        "grok",
+        "inworld",
+        "deepgram",
+        "elevenlabs",
+    ]
 }
 
 #[cfg(test)]
@@ -195,7 +207,9 @@ mod tests {
         assert!(providers.contains(&"inworld"));
         // Deepgram Voice Agent (S2S, raw-binary frames; not a clone).
         assert!(providers.contains(&"deepgram"));
-        assert_eq!(providers.len(), 6);
+        // ElevenLabs Conversational AI (S2S, base64+JSON; not a clone).
+        assert!(providers.contains(&"elevenlabs"));
+        assert_eq!(providers.len(), 7);
     }
 
     #[test]

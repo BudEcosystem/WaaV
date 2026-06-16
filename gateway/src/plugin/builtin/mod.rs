@@ -18,15 +18,16 @@
 //!   Tinkoff, SberDevices, Bhashini, iFlytek, Alibaba Cloud, Baidu, Tencent,
 //!   Huawei Cloud, NAVER CLOVA, Zalo AI, FPT.AI, Viettel AI, Prosa.ai, NECTEC
 //!
-//! ## Realtime Providers (5)
-//! - OpenAI, Hume EVI, Azure OpenAI, Grok/xAI, Inworld, Deepgram Voice Agent
+//! ## Realtime Providers (7)
+//! - OpenAI, Hume EVI, Azure OpenAI, Grok/xAI, Inworld, Deepgram Voice Agent,
+//!   ElevenLabs Conversational AI
 //!   (Azure/Grok/Inworld are OpenAI-protocol clones reusing the GA wire;
-//!   Deepgram Voice Agent is speech-to-speech with raw linear16 binary frames.)
+//!   Deepgram Voice Agent is speech-to-speech with raw linear16 binary frames;
+//!   ElevenLabs Conversational AI is speech-to-speech with base64+JSON frames.)
 
 use crate::core::realtime::{
-    AzureRealtime, BaseRealtime, DeepgramRealtime, GrokRealtime, HumeEVI, InworldRealtime,
-    OpenAIRealtime,
-    RealtimeConfig, RealtimeError,
+    AzureRealtime, BaseRealtime, DeepgramRealtime, ElevenLabsRealtime, GrokRealtime, HumeEVI,
+    InworldRealtime, OpenAIRealtime, RealtimeConfig, RealtimeError,
 };
 use crate::core::stt::{
     AmiVoiceSTT, AssemblyAISTT, AwsTranscribeSTT, AzureSTT, BaiduStt, BaseSTT, BhashiniStt,
@@ -1301,6 +1302,15 @@ fn deepgram_realtime_metadata() -> ProviderMetadata {
         .with_features(["full-duplex", "function-calling", "turn-detection", "barge-in"])
 }
 
+fn elevenlabs_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("elevenlabs", "ElevenLabs Conversational AI")
+        .with_description(
+            "ElevenLabs Conversational AI — speech-to-speech (base64+JSON, pcm_16000; pre-created agent; server VAD)",
+        )
+        .with_aliases(["elevenlabs-convai", "11labs"])
+        .with_features(["full-duplex", "function-calling", "turn-detection", "barge-in"])
+}
+
 // ============================================================================
 // STT Factory Functions
 // ============================================================================
@@ -1615,6 +1625,12 @@ fn create_deepgram_realtime(
     config: RealtimeConfig,
 ) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
     Ok(Box::new(DeepgramRealtime::new(config)?))
+}
+
+fn create_elevenlabs_realtime(
+    config: RealtimeConfig,
+) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(ElevenLabsRealtime::new(config)?))
 }
 
 // ============================================================================
@@ -1986,6 +2002,11 @@ inventory::submit! {
 inventory::submit! {
     PluginConstructor::realtime("deepgram", deepgram_realtime_metadata, create_deepgram_realtime)
         .with_aliases(&["deepgram-agent", "deepgram_voice_agent"])
+}
+
+inventory::submit! {
+    PluginConstructor::realtime("elevenlabs", elevenlabs_realtime_metadata, create_elevenlabs_realtime)
+        .with_aliases(&["elevenlabs-convai", "11labs"])
 }
 
 #[cfg(test)]

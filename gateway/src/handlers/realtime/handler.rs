@@ -483,6 +483,11 @@ async fn handle_config(
         "deepgram" | "deepgram-agent" | "deepgram_voice_agent" => {
             app_state.config.deepgram_api_key.clone()
         }
+        // ElevenLabs Conversational AI (S2S) reuses the EXISTING elevenlabs
+        // credential (shared with ElevenLabs STT/TTS — no new config field).
+        "elevenlabs" | "elevenlabs-convai" | "11labs" => {
+            app_state.config.elevenlabs_api_key.clone()
+        }
         _ => None,
     };
 

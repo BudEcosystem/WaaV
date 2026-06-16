@@ -99,7 +99,9 @@ impl RealtimeTransportFactory for MockFactory {
 /// tiny command language so tests can script server events:
 /// `session:<id>` · `tx:user|asst:interim|final:<text>` · `audio:<n>` ·
 /// `done:<rid>` · `call:<id>:<name>:<args>` · `track:<id>:<name>` ·
-/// `speech:start|stop` · `interrupt` · `resume:<h>` · `err:<msg>` · `multi:<a>;;<b>`.
+/// `speech:start|stop` · `interrupt` · `resume:<h>` · `send:<text>` (an
+/// inbound-triggered OUTBOUND frame — the ping→pong keystone) · `err:<msg>` ·
+/// `multi:<a>;;<b>`.
 pub struct MockProtocol {
     caps: ProtocolCaps,
     scripts: Arc<Mutex<VecDeque<Vec<Step>>>>,
@@ -162,6 +164,10 @@ impl MockProtocol {
                 item_id: None,
             }),
             ["interrupt"] => S2sEvent::InterruptedByServer,
+            // Inbound-triggered OUTBOUND frame: the keystone ping→pong path. The
+            // driver must SEND this (not call a callback) — proven by the
+            // `inbound_command_triggers_outbound_send_frame` test below.
+            ["send", text] => S2sEvent::SendFrame(OutFrame::Text(text.to_string())),
             ["resume", h] => S2sEvent::ResumptionHandle(h.to_string()),
             ["err", msg] => S2sEvent::Error(RealtimeError::ProviderError(msg.to_string())),
             _ => S2sEvent::Ignore,
@@ -504,6 +510,22 @@ mod tests {
             w.iter().any(|x| x == "cancel") && w.iter().any(|x| x.starts_with("truncate:item1:"))
         })
         .await;
+        s.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inbound_command_triggers_outbound_send_frame() {
+        // THE KEYSTONE GATE (Task A): an inbound event that maps to
+        // `S2sEvent::SendFrame` must be SENT by the driver on the outbound path
+        // (ConvAI server `ping` → client `pong`), NOT delivered to a callback.
+        // The MockObserver records every frame the transport sent, so seeing
+        // "pong" there proves the supervisor routed SendFrame to `transport.send`.
+        let script = vec![Step::Text("send:pong".into())];
+        let (proto, obs) = MockProtocol::new(ProtocolCaps::default(), vec![script]);
+        let mut s = RealtimeSession::from_parts(proto, cfg()).unwrap();
+        s.connect().await.unwrap();
+        // The pong shows up among the sent text frames (alongside session_update).
+        until(|| obs.sent_text().iter().any(|w| w == "pong")).await;
         s.disconnect().await.unwrap();
     }
 

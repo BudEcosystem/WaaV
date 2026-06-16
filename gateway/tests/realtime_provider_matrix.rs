@@ -24,7 +24,8 @@ use waav_gateway::core::realtime::{
 /// set so adding/removing a provider without updating the matrix fails loudly.
 ///
 /// BUMP THIS (and `valid_config_for`) WHEN YOU ADD A REALTIME PROVIDER.
-const EXPECTED_PROVIDERS: [&str; 6] = ["openai", "hume", "azure", "grok", "inworld", "deepgram"];
+const EXPECTED_PROVIDERS: [&str; 7] =
+    ["openai", "hume", "azure", "grok", "inworld", "deepgram", "elevenlabs"];
 
 /// Build a [`RealtimeConfig`] that SUCCESSFULLY constructs `name`'s provider.
 ///
@@ -83,6 +84,13 @@ fn valid_config_for(name: &str) -> RealtimeConfig {
         "deepgram" => RealtimeConfig {
             model: "gpt-4o-mini".to_string(),
             voice: Some("aura-2-thalia-en".to_string()),
+            ..base
+        },
+        // ElevenLabs ConvAI: the agent IS the model — `from_config` REQUIRES a
+        // non-empty `model` (the pre-created agent_id) or it errors with
+        // InvalidConfiguration. A descriptive agent id is supplied.
+        "elevenlabs" => RealtimeConfig {
+            model: "agent_test123".to_string(),
             ..base
         },
         // Hume EVI: only the api key is required (defaults: V3, Linear16, 44.1 kHz).
@@ -184,8 +192,8 @@ fn realtime_provider_registry_count_guardrail() {
     );
     assert_eq!(
         get_supported_realtime_providers().len(),
-        6,
-        "expected EXACTLY 6 realtime providers; bump this when you add a realtime provider"
+        7,
+        "expected EXACTLY 7 realtime providers; bump this when you add a realtime provider"
     );
 }
 

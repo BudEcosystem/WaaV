@@ -28,7 +28,8 @@ fn test_openai_in_supported_realtime_providers() {
     assert!(providers.contains(&"grok"));
     assert!(providers.contains(&"inworld"));
     assert!(providers.contains(&"deepgram"));
-    assert_eq!(providers.len(), 6); // OpenAI, Hume + Azure/Grok/Inworld clones + Deepgram VA (S2S)
+    assert!(providers.contains(&"elevenlabs"));
+    assert_eq!(providers.len(), 7); // OpenAI, Hume + Azure/Grok/Inworld clones + Deepgram VA + ElevenLabs ConvAI (S2S)
 }
 
 /// Test provider creation via string name

@@ -131,6 +131,10 @@ pub enum S2sEvent {
     InterruptedByServer,
     /// A resumption handle to carry across reconnects (Gemini session-resumption).
     ResumptionHandle(String),
+    /// An outbound frame the driver must send in response to an inbound event
+    /// (e.g. ElevenLabs ConvAI ping→pong); the dispatcher routes it to the
+    /// transport instead of a callback.
+    SendFrame(OutFrame),
     /// A provider error. Drives `on_error`; `fatal` exits the receive loop.
     Error(RealtimeError),
     /// Nothing actionable (keepalive, rate-limits, unknown event).

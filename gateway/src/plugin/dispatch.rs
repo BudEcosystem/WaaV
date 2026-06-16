@@ -206,6 +206,9 @@ pub enum BuiltinRealtimeProvider {
     /// Deepgram Voice Agent — speech-to-speech (raw linear16 binary frames; its
     /// own protocol, NOT an OpenAI clone).
     Deepgram = 5,
+    /// ElevenLabs Conversational AI — speech-to-speech (base64+JSON; its own
+    /// protocol, the OpenAI-family wire shape, NOT an OpenAI clone).
+    ElevenLabs = 6,
 }
 
 impl BuiltinRealtimeProvider {
@@ -219,6 +222,7 @@ impl BuiltinRealtimeProvider {
             Self::Grok => "grok",
             Self::Inworld => "inworld",
             Self::Deepgram => "deepgram",
+            Self::ElevenLabs => "elevenlabs",
         }
     }
 }
@@ -455,6 +459,10 @@ pub static REALTIME_PROVIDER_MAP: phf::Map<&'static str, BuiltinRealtimeProvider
     // Deepgram Voice Agent aliases.
     "deepgram-agent" => BuiltinRealtimeProvider::Deepgram,
     "deepgram_voice_agent" => BuiltinRealtimeProvider::Deepgram,
+    // ElevenLabs Conversational AI.
+    "elevenlabs" => BuiltinRealtimeProvider::ElevenLabs,
+    "elevenlabs-convai" => BuiltinRealtimeProvider::ElevenLabs,
+    "11labs" => BuiltinRealtimeProvider::ElevenLabs,
 };
 
 // =============================================================================
@@ -572,7 +580,7 @@ pub const BUILTIN_STT_COUNT: usize = 25;
 pub const BUILTIN_TTS_COUNT: usize = 29;
 
 /// Number of built-in Realtime providers
-pub const BUILTIN_REALTIME_COUNT: usize = 6;
+pub const BUILTIN_REALTIME_COUNT: usize = 7;
 
 /// Total number of built-in providers
 pub const TOTAL_BUILTIN_PROVIDERS: usize =
@@ -646,7 +654,7 @@ pub const BUILTIN_TTS_NAMES: [&str; BUILTIN_TTS_COUNT] = [
 
 /// All built-in Realtime provider names (canonical only, no aliases)
 pub const BUILTIN_REALTIME_NAMES: [&str; BUILTIN_REALTIME_COUNT] =
-    ["openai", "hume", "azure", "grok", "inworld", "deepgram"];
+    ["openai", "hume", "azure", "grok", "inworld", "deepgram", "elevenlabs"];
 
 #[cfg(test)]
 mod tests {
@@ -752,6 +760,23 @@ mod tests {
         assert_eq!(
             resolve_realtime_provider("deepgram_voice_agent"),
             Some(BuiltinRealtimeProvider::Deepgram)
+        );
+        // ElevenLabs Conversational AI + aliases (case-insensitive).
+        assert_eq!(
+            resolve_realtime_provider("elevenlabs"),
+            Some(BuiltinRealtimeProvider::ElevenLabs)
+        );
+        assert_eq!(
+            resolve_realtime_provider("ELEVENLABS"),
+            Some(BuiltinRealtimeProvider::ElevenLabs)
+        );
+        assert_eq!(
+            resolve_realtime_provider("elevenlabs-convai"),
+            Some(BuiltinRealtimeProvider::ElevenLabs)
+        );
+        assert_eq!(
+            resolve_realtime_provider("11labs"),
+            Some(BuiltinRealtimeProvider::ElevenLabs)
         );
         assert_eq!(resolve_realtime_provider("unknown"), None);
     }

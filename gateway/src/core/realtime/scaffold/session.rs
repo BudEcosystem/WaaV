@@ -196,6 +196,11 @@ impl DispatchCtx {
             S2sEvent::ResumptionHandle(h) => {
                 *self.resumption.write().await = Some(h);
             }
+            // Routed to the outbound path by the supervisor BEFORE dispatch (it
+            // owns the out channel); it is not a user-facing callback event, so
+            // reaching the dispatcher is a no-op (defensive — the supervisor's
+            // `SendFrame` interception means this arm is never hit in practice).
+            S2sEvent::SendFrame(_) => {}
             S2sEvent::Error(e) => {
                 let cb = self.error_cb.lock().await.clone();
                 if let Some(cb) = cb {
@@ -457,6 +462,24 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
                     inbound = transport.recv() => match inbound {
                         Some(Ok(frame)) => {
                             for ev in protocol.map_server_event(frame.as_inbound()) {
+                                // An inbound-triggered outbound frame (e.g. ConvAI
+                                // ping→pong): send it on the transport DIRECTLY, exactly
+                                // like the InterruptedByServer cancel/truncate sends just
+                                // below. NOT via the out_tx channel: THIS supervisor task
+                                // is itself the sole consumer of out_rx, so routing a
+                                // frame through the bounded channel from inside the
+                                // inbound arm would self-deadlock under sustained
+                                // outbound backpressure (the inbound arm parks on
+                                // out_tx.send awaiting capacity only the outbound arm can
+                                // free, but select! runs one arm at a time) — and even
+                                // short of that it delays the keepalive behind buffered
+                                // audio (review wf_8a8e9d20 #1). The protocol already
+                                // produced a serialized `OutFrame`. Best-effort: a send
+                                // after a drop must not panic — just drop it.
+                                if let S2sEvent::SendFrame(frame) = ev {
+                                    let _ = transport.send(frame).await;
+                                    continue;
+                                }
                                 // A SERVER-side barge-in must cancel + truncate
                                 // server state to what the user actually heard
                                 // (review finding #5). The supervisor — not the
