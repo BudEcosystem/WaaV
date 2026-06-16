@@ -43,7 +43,8 @@ impl AzureProtocol {
     /// Build the Azure realtime `wss://` URL from the resource + deployment +
     /// api-version. Accepts either a bare resource name (`myres`) or a full
     /// host/URL (`https://myres.openai.azure.com`, `wss://…`, `myres.openai.azure.com`)
-    /// in `resource`, normalizing to the `wss://…/openai/realtime?…` form.
+    /// in `resource`, normalizing to the `wss://…/openai/v1/realtime?…` GA form
+    /// (matches `AZURE_REALTIME_PATH` + the connect_spec tests).
     fn build_url(&self) -> String {
         let r = self.resource.trim();
         // Derive the host: strip any scheme + trailing slash; if it already looks
