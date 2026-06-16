@@ -203,6 +203,9 @@ pub enum BuiltinRealtimeProvider {
     Grok = 3,
     /// Inworld Realtime — OpenAI-protocol clone (GA wire).
     Inworld = 4,
+    /// Deepgram Voice Agent — speech-to-speech (raw linear16 binary frames; its
+    /// own protocol, NOT an OpenAI clone).
+    Deepgram = 5,
 }
 
 impl BuiltinRealtimeProvider {
@@ -215,6 +218,7 @@ impl BuiltinRealtimeProvider {
             Self::Azure => "azure",
             Self::Grok => "grok",
             Self::Inworld => "inworld",
+            Self::Deepgram => "deepgram",
         }
     }
 }
@@ -438,6 +442,7 @@ pub static REALTIME_PROVIDER_MAP: phf::Map<&'static str, BuiltinRealtimeProvider
     "azure" => BuiltinRealtimeProvider::Azure,
     "grok" => BuiltinRealtimeProvider::Grok,
     "inworld" => BuiltinRealtimeProvider::Inworld,
+    "deepgram" => BuiltinRealtimeProvider::Deepgram,
     // Aliases
     "hume_evi" => BuiltinRealtimeProvider::Hume,
     "hume-evi" => BuiltinRealtimeProvider::Hume,
@@ -447,6 +452,9 @@ pub static REALTIME_PROVIDER_MAP: phf::Map<&'static str, BuiltinRealtimeProvider
     "azure_openai" => BuiltinRealtimeProvider::Azure,
     // xAI alias.
     "xai" => BuiltinRealtimeProvider::Grok,
+    // Deepgram Voice Agent aliases.
+    "deepgram-agent" => BuiltinRealtimeProvider::Deepgram,
+    "deepgram_voice_agent" => BuiltinRealtimeProvider::Deepgram,
 };
 
 // =============================================================================
@@ -564,7 +572,7 @@ pub const BUILTIN_STT_COUNT: usize = 25;
 pub const BUILTIN_TTS_COUNT: usize = 29;
 
 /// Number of built-in Realtime providers
-pub const BUILTIN_REALTIME_COUNT: usize = 5;
+pub const BUILTIN_REALTIME_COUNT: usize = 6;
 
 /// Total number of built-in providers
 pub const TOTAL_BUILTIN_PROVIDERS: usize =
@@ -638,7 +646,7 @@ pub const BUILTIN_TTS_NAMES: [&str; BUILTIN_TTS_COUNT] = [
 
 /// All built-in Realtime provider names (canonical only, no aliases)
 pub const BUILTIN_REALTIME_NAMES: [&str; BUILTIN_REALTIME_COUNT] =
-    ["openai", "hume", "azure", "grok", "inworld"];
+    ["openai", "hume", "azure", "grok", "inworld", "deepgram"];
 
 #[cfg(test)]
 mod tests {
@@ -727,6 +735,23 @@ mod tests {
         assert_eq!(
             resolve_realtime_provider("evi"),
             Some(BuiltinRealtimeProvider::Hume)
+        );
+        // Deepgram Voice Agent + aliases (case-insensitive).
+        assert_eq!(
+            resolve_realtime_provider("deepgram"),
+            Some(BuiltinRealtimeProvider::Deepgram)
+        );
+        assert_eq!(
+            resolve_realtime_provider("DEEPGRAM"),
+            Some(BuiltinRealtimeProvider::Deepgram)
+        );
+        assert_eq!(
+            resolve_realtime_provider("deepgram-agent"),
+            Some(BuiltinRealtimeProvider::Deepgram)
+        );
+        assert_eq!(
+            resolve_realtime_provider("deepgram_voice_agent"),
+            Some(BuiltinRealtimeProvider::Deepgram)
         );
         assert_eq!(resolve_realtime_provider("unknown"), None);
     }

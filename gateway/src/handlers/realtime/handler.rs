@@ -478,6 +478,11 @@ async fn handle_config(
         }
         "grok" | "xai" => app_state.config.grok_api_key.clone(),
         "inworld" => app_state.config.inworld_api_key.clone(),
+        // Deepgram Voice Agent (S2S) reuses the EXISTING deepgram credential
+        // (shared with Deepgram STT/TTS — no new config field).
+        "deepgram" | "deepgram-agent" | "deepgram_voice_agent" => {
+            app_state.config.deepgram_api_key.clone()
+        }
         _ => None,
     };
 

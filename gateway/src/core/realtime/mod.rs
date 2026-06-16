@@ -49,6 +49,7 @@
 
 mod base;
 pub mod azure;
+pub mod deepgram;
 pub mod grok;
 pub mod hume;
 pub mod inworld;
@@ -65,6 +66,7 @@ pub use base::{
     TranscriptRole, TurnDetectionConfig, clamp_truncate_ms, run_barge_in_sequence,
 };
 pub use azure::{AzureProtocol, AzureRealtime};
+pub use deepgram::{DeepgramProtocol, DeepgramRealtime};
 pub use grok::{GrokProtocol, GrokRealtime};
 pub use hume::{
     EVIVersion, HUME_EVI_DEFAULT_SAMPLE_RATE, HUME_EVI_WEBSOCKET_URL, HumeEVI, HumeEVIConfig,
@@ -147,8 +149,10 @@ pub fn create_realtime_provider_from_enum(
 ///
 /// `azure`/`grok`/`inworld` are OpenAI-PROTOCOL CLONES (they reuse the GA wire via
 /// the embedded [`OpenAiProtocol`](openai::OpenAiProtocol) by delegation).
+/// `deepgram` is the Voice Agent (S2S) provider — the first RAW-binary-frame
+/// provider on the scaffold (its own [`DeepgramProtocol`], not an OpenAI clone).
 pub fn get_supported_realtime_providers() -> Vec<&'static str> {
-    vec!["openai", "hume", "azure", "grok", "inworld"]
+    vec!["openai", "hume", "azure", "grok", "inworld", "deepgram"]
 }
 
 #[cfg(test)]
@@ -189,7 +193,9 @@ mod tests {
         assert!(providers.contains(&"azure"));
         assert!(providers.contains(&"grok"));
         assert!(providers.contains(&"inworld"));
-        assert_eq!(providers.len(), 5);
+        // Deepgram Voice Agent (S2S, raw-binary frames; not a clone).
+        assert!(providers.contains(&"deepgram"));
+        assert_eq!(providers.len(), 6);
     }
 
     #[test]

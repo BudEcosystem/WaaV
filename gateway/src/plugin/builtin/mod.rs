@@ -19,11 +19,13 @@
 //!   Huawei Cloud, NAVER CLOVA, Zalo AI, FPT.AI, Viettel AI, Prosa.ai, NECTEC
 //!
 //! ## Realtime Providers (5)
-//! - OpenAI, Hume EVI, Azure OpenAI, Grok/xAI, Inworld
-//!   (Azure/Grok/Inworld are OpenAI-protocol clones reusing the GA wire.)
+//! - OpenAI, Hume EVI, Azure OpenAI, Grok/xAI, Inworld, Deepgram Voice Agent
+//!   (Azure/Grok/Inworld are OpenAI-protocol clones reusing the GA wire;
+//!   Deepgram Voice Agent is speech-to-speech with raw linear16 binary frames.)
 
 use crate::core::realtime::{
-    AzureRealtime, BaseRealtime, GrokRealtime, HumeEVI, InworldRealtime, OpenAIRealtime,
+    AzureRealtime, BaseRealtime, DeepgramRealtime, GrokRealtime, HumeEVI, InworldRealtime,
+    OpenAIRealtime,
     RealtimeConfig, RealtimeError,
 };
 use crate::core::stt::{
@@ -1290,6 +1292,15 @@ fn inworld_realtime_metadata() -> ProviderMetadata {
         .with_features(["full-duplex", "function-calling", "turn-detection"])
 }
 
+fn deepgram_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("deepgram", "Deepgram Voice Agent")
+        .with_description(
+            "Deepgram Voice Agent — speech-to-speech (raw linear16 binary frames; server VAD)",
+        )
+        .with_aliases(["deepgram-agent", "deepgram_voice_agent"])
+        .with_features(["full-duplex", "function-calling", "turn-detection", "barge-in"])
+}
+
 // ============================================================================
 // STT Factory Functions
 // ============================================================================
@@ -1598,6 +1609,12 @@ fn create_grok_realtime(config: RealtimeConfig) -> Result<Box<dyn BaseRealtime>,
 
 fn create_inworld_realtime(config: RealtimeConfig) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
     Ok(Box::new(InworldRealtime::new(config)?))
+}
+
+fn create_deepgram_realtime(
+    config: RealtimeConfig,
+) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(DeepgramRealtime::new(config)?))
 }
 
 // ============================================================================
@@ -1966,6 +1983,11 @@ inventory::submit! {
     PluginConstructor::realtime("inworld", inworld_realtime_metadata, create_inworld_realtime)
 }
 
+inventory::submit! {
+    PluginConstructor::realtime("deepgram", deepgram_realtime_metadata, create_deepgram_realtime)
+        .with_aliases(&["deepgram-agent", "deepgram_voice_agent"])
+}
+
 #[cfg(test)]
 mod tests {
     use crate::plugin::registry::global_registry;
@@ -2129,7 +2151,7 @@ mod tests {
     fn test_builtin_realtime_providers_registered() {
         let registry = global_registry();
 
-        // All 5 realtime providers should be registered.
+        // All 6 realtime providers should be registered.
         assert!(registry.has_realtime_provider("openai"));
         assert!(registry.has_realtime_provider("hume"));
         assert!(registry.has_realtime_provider("evi")); // alias
@@ -2140,6 +2162,10 @@ mod tests {
         assert!(registry.has_realtime_provider("grok"));
         assert!(registry.has_realtime_provider("xai")); // alias
         assert!(registry.has_realtime_provider("inworld"));
+        // Deepgram Voice Agent (S2S, raw-binary frames).
+        assert!(registry.has_realtime_provider("deepgram"));
+        assert!(registry.has_realtime_provider("deepgram-agent")); // alias
+        assert!(registry.has_realtime_provider("deepgram_voice_agent")); // alias
     }
 
     #[test]
