@@ -363,6 +363,42 @@ async fn run_voice_socket_session(
         }
     }
 
+    // B-G2: disconnect every PERSISTENT realtime (S2S) session BEFORE the D-G4
+    // audit. Each session's upstream WebSocket is owned by a `RealtimeSession`
+    // supervisor spawned OFF the task_tracker, so the audit below cannot reach it
+    // — this is its explicit, bounded teardown owner (aborts the supervisor +
+    // closes the socket gracefully). The map lives in the session's DAGContext;
+    // extract the `Arc` under a short read lock, then drop the lock before
+    // awaiting the (bounded) disconnects. No-op when there is no DAG / no
+    // persistent realtime node. Gated on `dag-routing`: the `dag` module, the
+    // `dag_context` field, and the `dag::nodes` symbols below only exist under
+    // that feature (mirrors the gated `initialize_dag_routing` that inserts the
+    // map). The block is self-contained, so no `cfg(not(...))` no-op is needed.
+    #[cfg(feature = "dag-routing")]
+    {
+        let sessions = {
+            let guard = state.read().await;
+            guard.dag_context.as_ref().and_then(|c| {
+                c.get_resource_as::<crate::dag::nodes::RealtimeSessionMap>(
+                    &crate::dag::nodes::realtime_sessions_key(),
+                )
+            })
+        };
+        if let Some(sessions) = sessions {
+            let closed = crate::dag::nodes::disconnect_realtime_sessions(
+                &sessions,
+                crate::core::observability::DEFAULT_TEARDOWN_GRACE,
+            )
+            .await;
+            if closed > 0 {
+                info!(
+                    count = closed,
+                    "B-G2: disconnected persistent realtime session(s) at teardown"
+                );
+            }
+        }
+    }
+
     // D-G4 (Pipecat `_print_dangling_tasks` parity): cancel the session's
     // tracked tasks (LiveKit audio forwarder, DAG output drain) and warn about
     // any that RESIST cancellation. These loops block on a recv whose sender

@@ -328,6 +328,7 @@ pub async fn handle_config_message(
             message_tx,
             app_state.core_state.profiler.clone(),
             egress_audio.clone(),
+            Some(app_state.core_state.resilience().clone()),
         )
         .await
         {
@@ -2038,6 +2039,7 @@ async fn initialize_dag_routing(
     message_tx: &mpsc::Sender<MessageRoute>,
     profiler: Arc<crate::core::observability::LatencyProfiler>,
     egress_audio: Option<Arc<EgressAudio>>,
+    resilience: Option<Arc<crate::core::resilience::ResilienceRegistry>>,
 ) -> Result<bool, String> {
     // Get DAG definition from template or inline
     let dag_definition: DAGDefinition = if let Some(ref def) = dag_config.definition {
@@ -2097,22 +2099,35 @@ async fn initialize_dag_routing(
     // ── Output sink + drain task (W-O1) ─────────────────────────────────────────
     // Output nodes push `DagOutput`s here; the drain task maps them to LiveKit / WS.
     let (output_tx, mut output_rx) = mpsc::channel::<DagOutput>(64);
-    let dag_context = dag_context.with_output_tx(output_tx.clone());
+    let mut dag_context = dag_context.with_output_tx(output_tx.clone());
 
-    // B-G2 STAGING (intentionally NOT wired): the persistent realtime-session
-    // path (`RealtimeProviderNode::execute_session_scoped`) activates only when a
-    // `RealtimeSessionMap` resource is inserted here under
-    // `crate::dag::nodes::realtime_sessions_key()`. It is deliberately absent: the
-    // persistent path has no bounded teardown for its upstream WebSocket (the
-    // `RealtimeSession` supervisor is an untracked spawn; there is no
-    // session-end `disconnect()` like the HTTP `/realtime` handler and the legacy
-    // per-turn DAG path both do). Inserting the map here would orphan a live
-    // socket on a wedged `voice_manager.stop()` and hide it from the D-G4
-    // dangling-task audit. Production therefore uses the legacy per-turn path
-    // (connect + disconnect each turn — clean + bounded). Wire this ONLY after
-    // adding a teardown owner that disconnects every session in the map at
-    // session end (e.g. in `handle_disconnect`, before the task_tracker audit).
-    // See `RealtimeProviderNode::execute` and `SessionRealtime` for the full note.
+    // B-G2: insert the persistent realtime-session map so a `RealtimeProviderNode`
+    // reuses ONE upstream WebSocket across turns (retaining server-side
+    // conversation state) instead of paying a full WS handshake + session.update
+    // per utterance. The bounded teardown owner is `handle_disconnect`, which
+    // calls `crate::dag::nodes::disconnect_realtime_sessions` on this map BEFORE
+    // the D-G4 task-tracker audit (the persistent `RealtimeSession` supervisor is
+    // an untracked spawn the audit cannot reach, so it needs an explicit close).
+    // The map must be set BEFORE `dag_context` is cloned into the connection state
+    // below, so the teardown path reaches the SAME `Arc<RealtimeSessionMap>` via
+    // `state.dag_context`. A caller without this resource (direct executor use,
+    // unit tests) still falls back to the legacy per-turn path.
+    {
+        let realtime_sessions: std::sync::Arc<crate::dag::nodes::RealtimeSessionMap> =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        dag_context.set_resource(
+            crate::dag::nodes::realtime_sessions_key(),
+            realtime_sessions,
+        );
+        // Wire the SHARED resilience registry so a persistent realtime node
+        // attaches the SAME per-provider circuit breaker + reconnect governor the
+        // HTTP `/realtime` path does (process-wide storm control / cross-session
+        // FATAL tripping — W-D1/W-D2). Without it the session-long persistent
+        // socket would auto-reconnect with no shared breaker (bug wc023gbbz #3).
+        if let Some(resilience) = resilience {
+            dag_context.set_resource(crate::dag::nodes::realtime_resilience_key(), resilience);
+        }
+    }
 
     {
         let message_tx = message_tx.clone();

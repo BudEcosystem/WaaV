@@ -851,24 +851,21 @@ impl DAGNode for TTSProviderNode {
 /// full WS handshake + session.update on every utterance and discarded all
 /// server-side conversation state).
 ///
-/// STAGING STATUS (do NOT wire into production DAG-init yet — review wf B-G2):
-/// this path is fully functional per-turn but has NO bounded teardown hook.
-/// A persistent `SessionRealtime` keeps a live upstream WebSocket owned by the
-/// `RealtimeSession` supervisor task, which is spawned via a bare `tokio::spawn`
-/// (see `core::realtime::scaffold::session`) and is therefore NOT registered
-/// with the session `task_tracker`. Both sibling PRODUCTION realtime paths close
-/// the socket explicitly at session end — the HTTP `/realtime` handler calls
-/// `provider.disconnect().await`, and the legacy request-scoped DAG path below
-/// disconnects per turn. This persistent path has no equivalent: cleanup relies
-/// solely on the [`RealtimeSessionMap`] Arc reaching refcount 0 (drop cascade →
-/// `out_tx` drop → the supervisor notices on its next `select!` and closes the
-/// socket), which is (a) unbounded + off the teardown critical path (no graceful
-/// upstream close, invisible to the D-G4 dangling-task audit) and (b) fragile to
-/// any lingering `DAGContext` clone — e.g. a wedged `voice_manager.stop()` (the
-/// WS handler bounds it with a warn-and-continue timeout) would orphan the
-/// socket. Until a teardown hook disconnects every session in the map (and/or the
-/// supervisor is tracked), keep the legacy per-turn path in production. See the
-/// caller gate in [`RealtimeProviderNode::execute`] and the staging note there.
+/// LIFECYCLE: the persistent `SessionRealtime` keeps a live upstream WebSocket
+/// owned by the `RealtimeSession` supervisor task, spawned via a bare
+/// `tokio::spawn` (see `core::realtime::scaffold::session`) and therefore NOT on
+/// the session `task_tracker` — so the D-G4 dangling-task audit cannot reach it.
+/// Its bounded teardown owner is [`disconnect_realtime_sessions`], called from
+/// the WS `handle_disconnect` at session end (before the D-G4 audit): it
+/// `disconnect().await`s every session in the map (aborting each supervisor +
+/// closing each socket gracefully), each bounded by a grace so a wedged provider
+/// cannot stall teardown. This mirrors the two sibling realtime paths — the HTTP
+/// `/realtime` handler calls `provider.disconnect().await`, and the legacy
+/// request-scoped DAG path disconnects per turn. With that owner in place the
+/// persistent path is WIRED into production DAG-init (`initialize_dag_routing`
+/// inserts the [`RealtimeSessionMap`]); the drop-cascade is now only a backstop,
+/// not the primary cleanup. See the caller gate in
+/// [`RealtimeProviderNode::execute`].
 pub struct SessionRealtime {
     /// The connected provider (locked per turn — one in-flight response).
     pub provider: tokio::sync::Mutex<crate::core::realtime::BoxedRealtime>,
@@ -885,11 +882,13 @@ pub struct SessionRealtime {
 /// under [`resource_keys::REALTIME_PROVIDER_PREFIX`]`sessions` (the key from
 /// [`realtime_sessions_key`]) the node takes the persistent path.
 ///
-/// STAGING: this resource is intentionally NOT inserted by the production
-/// DAG-init path (`initialize_dag_routing`) — see [`SessionRealtime`] for why
-/// (no bounded teardown for the persistent socket). It is inserted only by the
-/// B-G2 test that exercises the persistent path. Production therefore runs the
-/// legacy per-turn path, which connects + disconnects each turn (clean + bounded).
+/// PRODUCTION: `initialize_dag_routing` inserts this resource into the DAG
+/// context, so a `RealtimeProviderNode` takes the PERSISTENT path (one upstream
+/// WS reused across turns, server-side conversation state retained) instead of
+/// reconnecting per turn. Its bounded teardown owner is
+/// [`disconnect_realtime_sessions`] (called from `handle_disconnect`). A caller
+/// that builds a context WITHOUT this resource (direct executor use, unit tests)
+/// falls back to the legacy per-turn path — both are supported.
 pub type RealtimeSessionMap = parking_lot::Mutex<
     std::collections::HashMap<String, Arc<SessionRealtime>>,
 >;
@@ -900,6 +899,69 @@ pub fn realtime_sessions_key() -> String {
         "{}sessions",
         crate::dag::context::resource_keys::REALTIME_PROVIDER_PREFIX
     )
+}
+
+/// Resource key for the shared [`crate::core::resilience::ResilienceRegistry`].
+/// `initialize_dag_routing` inserts it so a PERSISTENT realtime DAG node wires
+/// the SAME per-provider circuit breaker + reconnect governor the HTTP
+/// `/realtime` handler does (process-wide storm control + cross-session FATAL
+/// tripping — W-D1/W-D2). Absent for non-DAG-init callers (the supervisor then
+/// no-ops every resilience arm).
+pub fn realtime_resilience_key() -> String {
+    format!(
+        "{}resilience",
+        crate::dag::context::resource_keys::REALTIME_PROVIDER_PREFIX
+    )
+}
+
+/// B-G2 teardown owner: disconnect every persistent realtime session in the map,
+/// each bounded by `per_session_grace`, and clear the map. Called once at session
+/// end ([`handle_disconnect`](crate::handlers::ws), BEFORE the D-G4 task-tracker
+/// audit) so the persistent upstream WebSocket each session owns is closed
+/// DETERMINISTICALLY and GRACEFULLY — the bounded teardown the persistent path
+/// always required. The `RealtimeSession` supervisor is an untracked spawn (off
+/// the session `task_tracker`), so the D-G4 audit would NOT reach it; this is its
+/// explicit owner. Returns the number of sessions closed.
+///
+/// Bounded + best-effort: a wedged provider (turn-mutex contention or a hung
+/// `disconnect()`) is abandoned after `per_session_grace` with a warning rather
+/// than stalling teardown — same discipline as the voice-manager teardown budget.
+/// The map is DRAINED first (under the sync lock, never held across an await), so
+/// every `DAGContext` clone that shares the `Arc<RealtimeSessionMap>` sees it
+/// empty afterward and a late node turn re-creates a fresh session if needed.
+pub async fn disconnect_realtime_sessions(
+    sessions: &RealtimeSessionMap,
+    per_session_grace: Duration,
+) -> usize {
+    // Drain under the parking_lot guard so we own the Arcs and never hold the
+    // (non-Send) guard across an await below.
+    let drained: Vec<(String, Arc<SessionRealtime>)> = {
+        let mut g = sessions.lock();
+        g.drain().collect()
+    };
+    let mut closed = 0usize;
+    for (node_id, session) in drained {
+        // Bound lock-acquire + disconnect TOGETHER: a turn still holding the
+        // provider mutex must not let teardown hang.
+        let disc = async {
+            let mut provider = session.provider.lock().await;
+            provider.disconnect().await
+        };
+        match tokio::time::timeout(per_session_grace, disc).await {
+            Ok(Ok(())) => closed += 1,
+            Ok(Err(e)) => warn!(
+                node_id = %node_id,
+                error = %e,
+                "B-G2: realtime session disconnect failed at teardown"
+            ),
+            Err(_) => warn!(
+                node_id = %node_id,
+                grace_ms = per_session_grace.as_millis() as u64,
+                "B-G2: realtime session disconnect exceeded grace at teardown"
+            ),
+        }
+    }
+    closed
 }
 
 /// Realtime provider node
@@ -1128,6 +1190,21 @@ impl RealtimeProviderNode {
         {
             let mut provider = session.provider.lock().await;
 
+            // Wire the SHARED per-provider resilience handles (circuit breaker +
+            // reconnect governor) — the SAME ones the HTTP `/realtime` handler
+            // injects — so this PERSISTENT DAG session participates in
+            // process-wide reconnect storm control + cross-session FATAL tripping
+            // on a bad/flapping upstream (W-D1/W-D2). The persistent socket lives
+            // session-long and auto-reconnects, so without this a bad-cred upstream
+            // would flap unbounded-by-turn with no shared breaker protection.
+            // Present in production (inserted by `initialize_dag_routing`); absent
+            // for non-DAG-init callers, where the supervisor no-ops resilience.
+            if let Some(reg) = ctx.get_resource_as::<crate::core::resilience::ResilienceRegistry>(
+                &realtime_resilience_key(),
+            ) {
+                provider.set_resilience(reg.handles_for(&self.provider));
+            }
+
             // Audio → the cascade sink: downstream cannot tell S2S from TTS.
             let output_tx = ctx.output_tx.clone().expect("checked by caller");
             let audio_cb: AudioOutputCallback = Arc::new(move |audio: RealtimeAudioData| {
@@ -1246,16 +1323,12 @@ impl DAGNode for RealtimeProviderNode {
         // byte-for-byte the same downstream contract as cascade TTS (S2S is a
         // drop-in).
         //
-        // STAGING (review wf B-G2): the production DAG-init path
-        // (`initialize_dag_routing`) deliberately does NOT insert this resource,
-        // so production falls through to the legacy per-turn path below. The
-        // persistent path has no bounded teardown for its upstream socket (the
-        // `RealtimeSession` supervisor is an untracked `tokio::spawn`, and unlike
-        // the HTTP `/realtime` handler + the legacy path there is no explicit
-        // `disconnect()` at session end — see [`SessionRealtime`]). It is gated
-        // behind the resource so it activates ONLY where a teardown owner inserts
-        // the map (today: the B-G2 test). Wire it into production only once a
-        // teardown hook disconnects every session in the map.
+        // PRODUCTION: `initialize_dag_routing` inserts the `RealtimeSessionMap`,
+        // so a DAG session takes THIS path; its bounded teardown owner is
+        // `disconnect_realtime_sessions`, called from `handle_disconnect` at
+        // session end (before the D-G4 audit) to close every persistent socket
+        // gracefully. A caller WITHOUT the resource (direct executor use, unit
+        // tests, no sink) falls through to the legacy per-turn path below.
         if let Some(sessions) = ctx.get_resource_as::<RealtimeSessionMap>(&realtime_sessions_key())
             && ctx.output_tx.is_some()
         {
@@ -1768,6 +1841,12 @@ mod session_realtime_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static CONNECTS: AtomicUsize = AtomicUsize::new(0);
+    /// Counts `disconnect()` calls on the B-G2 mock so the teardown test can
+    /// prove `disconnect_realtime_sessions` actually closes each session.
+    static DISCONNECTS: AtomicUsize = AtomicUsize::new(0);
+    /// Counts `set_resilience()` calls so the resilience-wiring test can prove
+    /// the persistent path attaches the shared breaker/governor.
+    static RESILIENCE_WIRED: AtomicUsize = AtomicUsize::new(0);
 
     /// Mock S2S provider: `create_response` immediately emits one audio
     /// chunk, a finalized assistant transcript, and response-done.
@@ -1788,7 +1867,11 @@ mod session_realtime_tests {
             Ok(())
         }
         async fn disconnect(&mut self) -> RealtimeResult<()> {
+            DISCONNECTS.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+        fn set_resilience(&mut self, _r: crate::core::resilience::ResilienceHandles) {
+            RESILIENCE_WIRED.fetch_add(1, Ordering::SeqCst);
         }
         fn is_ready(&self) -> bool {
             true
@@ -1903,6 +1986,7 @@ mod session_realtime_tests {
             },
         );
         CONNECTS.store(0, Ordering::SeqCst);
+        RESILIENCE_WIRED.store(0, Ordering::SeqCst);
 
         let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<DagOutput>(16);
         let mut ctx = DAGContext::new("session-rt".to_string());
@@ -1910,6 +1994,13 @@ mod session_realtime_tests {
         let sessions: Arc<RealtimeSessionMap> =
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         ctx.set_resource(realtime_sessions_key(), Arc::clone(&sessions));
+        // Mirror production: `initialize_dag_routing` inserts BOTH the session
+        // map AND the shared resilience registry (bug wc023gbbz#3), so a
+        // persistent node attaches the breaker/governor on connect.
+        ctx.set_resource(
+            realtime_resilience_key(),
+            Arc::new(crate::core::resilience::ResilienceRegistry::new(4)),
+        );
 
         let node = RealtimeProviderNode::new("rt1", "mock-s2s-bg2");
         let started = std::time::Instant::now();
@@ -1949,6 +2040,63 @@ mod session_realtime_tests {
             }
         }
         assert_eq!(sink_audio, 2, "one audio chunk per turn through DagOutput::Audio");
+
+        // create_session wired the shared resilience handles exactly once (on the
+        // single connect) — proving bug wc023gbbz#3's fix on the production-shaped
+        // path: the persistent session attaches the breaker/governor, not just the
+        // HTTP `/realtime` path.
+        assert_eq!(
+            RESILIENCE_WIRED.load(Ordering::SeqCst),
+            1,
+            "the persistent session must attach the shared breaker/governor on connect"
+        );
+    }
+
+    /// B-G2 teardown owner: `disconnect_realtime_sessions` must `disconnect()`
+    /// EVERY persistent session in the map (the bounded upstream close
+    /// `handle_disconnect` invokes at session end) and DRAIN the map. Without it
+    /// the untracked supervisor + its socket would leak past the D-G4 audit
+    /// (which cannot see an off-tracker spawn) and rely on the fragile
+    /// drop-cascade. The session is built directly (not via `node.execute`) so
+    /// this isolates the teardown helper and never touches the shared `CONNECTS`.
+    #[tokio::test]
+    async fn teardown_disconnects_all_persistent_sessions_and_drains_map() {
+        DISCONNECTS.store(0, Ordering::SeqCst);
+
+        // Two persistent sessions in the map (proves it closes ALL, not just one).
+        let sessions: Arc<RealtimeSessionMap> =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        for id in ["rt-a", "rt-b"] {
+            let mock = MockS2S::new(RealtimeConfig::default()).unwrap();
+            let (done_tx, _) = tokio::sync::watch::channel(0u64);
+            let session = Arc::new(SessionRealtime {
+                provider: tokio::sync::Mutex::new(
+                    Box::new(mock) as crate::core::realtime::BoxedRealtime,
+                ),
+                response_done_tx: done_tx,
+                last_transcript: parking_lot::Mutex::new(String::new()),
+            });
+            sessions.lock().insert(id.to_string(), session);
+        }
+        assert_eq!(sessions.lock().len(), 2, "two persistent sessions staged");
+
+        let closed = disconnect_realtime_sessions(
+            &sessions,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(closed, 2, "both sessions reported closed");
+        assert_eq!(
+            DISCONNECTS.load(Ordering::SeqCst),
+            2,
+            "disconnect() was actually invoked on each provider"
+        );
+        assert_eq!(
+            sessions.lock().len(),
+            0,
+            "the map is drained so late DAGContext clones see no stale sessions"
+        );
     }
 
     /// Connect counter for the legacy-path staging test (separate static so it
@@ -2057,16 +2205,16 @@ mod session_realtime_tests {
         }
     }
 
-    /// B-G2 STAGING LOCK: a PRODUCTION-LIKE context (output sink attached, but
-    /// NO `RealtimeSessionMap` resource — exactly how `initialize_dag_routing`
-    /// builds it) must run the LEGACY request-scoped path, which connects +
-    /// disconnects PER TURN. This pins the decision that B-G2 is deliberately
-    /// gated OFF in production (no bounded teardown for the persistent socket —
-    /// see `SessionRealtime`). If someone inserts the resource at init (wiring
-    /// B-G2) without a teardown owner, the persistent test covers that path; this
-    /// test guards the default. Two turns ⇒ TWO connects (not one).
+    /// B-G2 FALLBACK: a context with an output sink but NO `RealtimeSessionMap`
+    /// resource (direct executor use, unit tests, any non-DAG-init caller) must
+    /// run the LEGACY request-scoped path, which connects + disconnects PER TURN.
+    /// The gate needs BOTH the sink AND the resource; production DAG-init now
+    /// inserts the resource (B-G2 wired, with `disconnect_realtime_sessions` as
+    /// the teardown owner), so production takes the PERSISTENT path — proven by
+    /// `realtime_session_persists_*`. This test guards the resource-absent
+    /// fallback: two turns ⇒ TWO connects (not one).
     #[tokio::test]
-    async fn production_like_context_without_session_map_uses_legacy_per_turn_path() {
+    async fn context_without_session_map_uses_legacy_per_turn_path() {
         crate::plugin::global_registry().register_realtime(
             "mock-s2s-legacy",
             Arc::new(|c| Ok(Box::new(MockS2SLegacy::new(c)?) as Box<dyn BaseRealtime>)),
@@ -2079,14 +2227,14 @@ mod session_realtime_tests {
         );
         LEGACY_CONNECTS.store(0, Ordering::SeqCst);
 
-        // Production-like: an output sink IS attached (W-O1), but the session-map
-        // resource is intentionally absent — the B-G2 gate needs BOTH.
+        // Fallback: an output sink IS attached (W-O1), but the session-map
+        // resource is absent — the B-G2 gate needs BOTH, so this runs legacy.
         let (output_tx, _output_rx) = tokio::sync::mpsc::channel::<DagOutput>(16);
         let mut ctx = DAGContext::new("legacy-rt".to_string());
         ctx.set_output_tx(output_tx);
         assert!(
             ctx.get_resource_as::<RealtimeSessionMap>(&realtime_sessions_key()).is_none(),
-            "production builds the context WITHOUT the session-map resource (staging)"
+            "this fallback context is built WITHOUT the session-map resource"
         );
 
         let node = RealtimeProviderNode::new("rt-legacy", "mock-s2s-legacy");
@@ -2100,7 +2248,7 @@ mod session_realtime_tests {
         assert_eq!(
             LEGACY_CONNECTS.load(Ordering::SeqCst),
             2,
-            "legacy path connects PER turn (B-G2 persistent path is gated off in production)"
+            "legacy fallback connects PER turn (no session-map resource → no persistence)"
         );
     }
 }

@@ -22,7 +22,8 @@ pub use output::{AudioOutputNode, TextOutputNode, WebhookOutputNode};
 pub use processor::ProcessorNode;
 pub use provider::{
     RealtimeProviderNode, RealtimeSessionMap, STTProviderNode, SessionRealtime,
-    TTSProviderNode, realtime_sessions_key,
+    TTSProviderNode, disconnect_realtime_sessions, realtime_resilience_key,
+    realtime_sessions_key,
 };
 pub use router::{JoinNode, RouterNode, SplitNode};
 pub use transform::{PassthroughNode, TransformNode};
