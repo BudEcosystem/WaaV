@@ -22,8 +22,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::auth::Auth;
 use crate::core::realtime::{
-    BaseRealtime, RealtimeAudioData, RealtimeConfig, RealtimeError, TranscriptResult,
-    TranscriptRole, create_realtime_provider, get_supported_realtime_providers,
+    BaseRealtime, RealtimeAudioData, RealtimeConfig, RealtimeError, ReconnectionEvent,
+    TranscriptResult, TranscriptRole, create_realtime_provider, get_supported_realtime_providers,
 };
 use crate::state::AppState;
 
@@ -691,6 +691,40 @@ async fn handle_config(
                         RealtimeOutgoingMessage::ResponseDone { response_id },
                     ))
                     .await;
+            })
+        }))
+        .ok();
+
+    // On a TERMINAL reconnection give-up — the provider supervisor exhausted its
+    // retry budget or hit the quick-failure cutoff — the upstream session can
+    // NEVER recover. Surface that to the CLIENT and close the socket. Otherwise
+    // the connection is held open with client audio silently dropped
+    // (`is_ready()` is false), and because a continuously-streaming client
+    // resets the handler's idle timer on every inbound frame, the ~5-min idle
+    // timeout NEVER fires — the session hangs open indefinitely with no error
+    // (review wf_fb932e8d: "dead session never surfaced"). A SUCCESSFUL
+    // reconnect (`success == true`) is intentionally silent: playback resumes.
+    let tx_clone = message_tx.clone();
+    provider
+        .on_reconnection(Arc::new(move |event: ReconnectionEvent| {
+            let tx = tx_clone.clone();
+            Box::pin(async move {
+                if event.success {
+                    return;
+                }
+                let _ = tx
+                    .send(RealtimeMessageRoute::Outgoing(
+                        RealtimeOutgoingMessage::Error {
+                            code: Some("connection_lost".to_string()),
+                            message: event.error.unwrap_or_else(|| {
+                                "Realtime provider connection lost and could not be re-established"
+                                    .to_string()
+                            }),
+                        },
+                    ))
+                    .await;
+                // Terminally dead — tell the sender task to close the client WS.
+                let _ = tx.send(RealtimeMessageRoute::Close).await;
             })
         }))
         .ok();

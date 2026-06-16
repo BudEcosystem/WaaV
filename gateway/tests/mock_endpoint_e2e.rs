@@ -289,8 +289,7 @@ async fn drive_and_capture(stt: &mut dyn waav_gateway::core::stt::BaseSTT) -> St
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
     stt.disconnect().await.ok();
-    let g = best.lock().await.clone();
-    g
+    best.lock().await.clone()
 }
 
 /// iFlytek mock: client streams audio as JSON `Message::Text` (base64 inside), so we trigger on the
@@ -721,8 +720,7 @@ async fn drive_rest_and_capture(stt: &mut dyn waav_gateway::core::stt::BaseSTT) 
         let _ = stt.send_audio(bytes::Bytes::from(vec![0u8; 1280])).await;
     }
     stt.disconnect().await.ok();
-    let g = best.lock().await.clone();
-    g
+    best.lock().await.clone()
 }
 
 /// Generic axum HTTP mock: serve `body` on `path` (one POST route). Returns the bound port.

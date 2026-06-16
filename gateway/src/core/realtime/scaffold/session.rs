@@ -523,6 +523,29 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
             connected.store(false, Ordering::SeqCst);
             transport.close().await;
 
+            // D-G2: feed the SHARED, per-provider circuit breaker this
+            // connection's measured lifetime, so a bad-credential
+            // "handshake-OK-then-server-immediately-drops" signature fast-trips
+            // the breaker FATAL gateway-wide and OTHER live sessions of the same
+            // provider defer their reconnect dials (the cross-session protection
+            // the generic STT/WS path already gets via
+            // `reconnectable_stream.rs` / `deepgram.rs`, which the realtime path
+            // was missing). A STABLE (>= min_stable_duration) close resets the
+            // streak AND clears FATAL (the creds work now); the breaker no-ops
+            // on an intentional/client close (a normal short hangup is not a
+            // failure signal). This is INDEPENDENT of — and complements — the
+            // LOCAL per-session quick-failure cutoff below, which bounds only
+            // THIS session's reconnect storm. `record_failure`/`record_success`
+            // (the failure-rate window) already fire on dial-fail / reconnect;
+            // this drives the orthogonal FATAL quick-failure counter. (review
+            // wf_fb932e8d #2)
+            if let Some(r) = &resilience {
+                r.breaker.record_connection_closed(
+                    connected_at.elapsed(),
+                    intentional_disconnect.load(Ordering::SeqCst),
+                );
+            }
+
             if intentional_disconnect.load(Ordering::SeqCst) {
                 *state.write().unwrap() = ConnectionState::Disconnected;
                 break 'outer;

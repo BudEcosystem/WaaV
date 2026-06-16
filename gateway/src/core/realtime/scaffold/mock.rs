@@ -363,8 +363,13 @@ mod tests {
         .unwrap();
         s.connect().await.unwrap();
         until(|| seen.lock().unwrap().len() >= 3).await;
-        let v = seen.lock().unwrap();
-        assert_eq!(v.as_slice(), &["He".to_string(), "Hello".to_string(), "Hello.".to_string()]);
+        // Scope the std::Mutex guard to this statement so it drops BEFORE the
+        // `.await` below (clippy::await_holding_lock; the guard is otherwise
+        // benign here — `disconnect()` never touches `seen`).
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &["He".to_string(), "Hello".to_string(), "Hello.".to_string()]
+        );
         s.disconnect().await.unwrap();
     }
 
@@ -459,6 +464,65 @@ mod tests {
         until(|| s.get_connection_state() == ConnectionState::Failed).await;
         // Stopped at the cutoff (3 quick failures), not hammering forever.
         assert!(obs.connect_count() <= 4, "connects={}", obs.connect_count());
+        s.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handshake_then_immediate_close_trips_shared_breaker_fatal() {
+        use crate::core::resilience::{
+            CircuitBreaker, CircuitBreakerConfig, ReconnectGovernor, ResilienceHandles,
+        };
+        use std::sync::Arc;
+        // Each connection: the DIAL succeeds, then the server immediately closes
+        // (recv → None) inside MIN_STABLE_CONNECTION — the bad-credential
+        // "handshake-OK-then-drop" signature. This is DISTINCT from `Step::Error`
+        // (a dial failure → `record_failure`, the failure-rate window): it
+        // exercises the connection-ended `record_connection_closed` feed that
+        // drives the SHARED per-provider breaker's FATAL fast-trip (review
+        // wf_fb932e8d #2). Without that feed the LOCAL cutoff still bounds THIS
+        // session's storm, but other sessions of the same provider would get NO
+        // cross-session protection (the breaker's `quick_failures` would stay 0).
+        let scripts = vec![
+            vec![Step::Close],
+            vec![Step::Close],
+            vec![Step::Close],
+            vec![Step::Close],
+        ];
+        let mut c = cfg();
+        c.reconnection = Some(crate::core::realtime::base::ReconnectionConfig {
+            initial_delay_ms: 1,
+            max_delay_ms: 2,
+            ..Default::default()
+        });
+        let (proto, _obs) = MockProtocol::new(ProtocolCaps::default(), scripts);
+        let mut s = RealtimeSession::from_parts(proto, c).unwrap();
+
+        // Inject a SHARED breaker (default config = 3 quick failures, 5s stable)
+        // and keep a handle so we can assert its cross-session FATAL state — the
+        // exact state a SECOND session of this provider would observe.
+        let breaker = Arc::new(CircuitBreaker::with_label(
+            CircuitBreakerConfig::default(),
+            "mock-realtime",
+        ));
+        s.set_resilience(ResilienceHandles {
+            governor: Arc::new(ReconnectGovernor::new(4)),
+            breaker: breaker.clone(),
+        });
+
+        assert!(
+            !breaker.is_permanently_failed(),
+            "breaker must start healthy"
+        );
+        s.connect().await.unwrap();
+        until(|| s.get_connection_state() == ConnectionState::Failed).await;
+        // The realtime path now feeds the breaker its sub-stable server-side
+        // closes, so the per-provider breaker trips FATAL — a second session of
+        // this provider would now defer its reconnect dials (the cross-session
+        // protection that was missing before the fix).
+        assert!(
+            breaker.is_permanently_failed(),
+            "shared breaker must trip FATAL after the handshake-then-drop storm"
+        );
         s.disconnect().await.unwrap();
     }
 

@@ -15,6 +15,13 @@
 //! (e) SSRF — loopback `endpoint_override` without `WAAV_ALLOW_LOOPBACK_ENDPOINTS`
 //!     fails at connect.
 
+// `env_guard()` returns a process-global `MutexGuard` that each test holds for
+// its whole body to serialize mutation of the shared `WAAV_ALLOW_LOOPBACK_*`
+// env flag (parallel tests would otherwise race on it). Holding that guard
+// across the test's `.await`s is the INTENDED behavior, so the
+// `await_holding_lock` lint is suppressed file-wide here.
+#![allow(clippy::await_holding_lock)]
+
 mod mock_providers;
 
 use std::future::Future;
