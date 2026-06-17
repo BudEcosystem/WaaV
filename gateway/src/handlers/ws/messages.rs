@@ -294,6 +294,19 @@ pub enum OutgoingMessage {
         /// `ready` frame.
         #[serde(skip_serializing_if = "Option::is_none")]
         resolved_alias: Option<Box<crate::core::alias::ResolvedAliasEcho>>,
+        /// D8 negotiated uplink transport codec ACTUALLY in effect (`linear16` | `opus`). Present
+        /// only when the client requested a non-default `stt_config.audio_in_codec`, so the SDK can
+        /// detect a downgrade: it asked `opus` but a gateway without the `opus-codec` feature echoes
+        /// `linear16` here (and emits a `config_warning`). Absent = linear16 (the default).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(example = "opus"))]
+        audio_in_codec: Option<String>,
+        /// D8 negotiated downlink transport codec ACTUALLY in effect (`linear16` | `opus`) for TTS
+        /// egress. Present only when the client requested a non-default `tts_config.audio_out_codec`.
+        /// Same downgrade semantics as [`Self::Ready::audio_in_codec`].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(example = "opus"))]
+        audio_out_codec: Option<String>,
     },
     #[serde(rename = "stt_result")]
     STTResult {
@@ -652,6 +665,8 @@ mod tests {
             waav_participant_identity: Some("waav-ai".to_string()),
             waav_participant_name: Some("WaaV AI".to_string()),
             resolved_alias: None,
+            audio_in_codec: None,
+            audio_out_codec: None,
         };
 
         let json = serde_json::to_string(&ready).expect("Should serialize");
@@ -673,6 +688,8 @@ mod tests {
             waav_participant_identity: None,
             waav_participant_name: None,
             resolved_alias: None,
+            audio_in_codec: None,
+            audio_out_codec: None,
         };
 
         let json = serde_json::to_string(&ready).expect("Should serialize");
@@ -693,6 +710,8 @@ mod tests {
             waav_participant_identity: None,
             waav_participant_name: None,
             resolved_alias: None,
+            audio_in_codec: None,
+            audio_out_codec: None,
         };
 
         let json = serde_json::to_string(&ready).expect("Should serialize");
@@ -717,6 +736,8 @@ mod tests {
             waav_participant_identity: None,
             waav_participant_name: None,
             resolved_alias: None,
+            audio_in_codec: None,
+            audio_out_codec: None,
         };
 
         let json = serde_json::to_string(&ready).expect("Should serialize");
@@ -734,6 +755,8 @@ mod tests {
             waav_participant_identity: None,
             waav_participant_name: None,
             resolved_alias: None,
+            audio_in_codec: None,
+            audio_out_codec: None,
         };
 
         let json = serde_json::to_string(&ready).expect("Should serialize");
@@ -747,6 +770,42 @@ mod tests {
             stream_id_pos < room_pos,
             "stream_id should appear before livekit_room_name in JSON"
         );
+    }
+
+    #[test]
+    fn test_ready_message_echoes_negotiated_codecs() {
+        // D8: when the client requested a transport codec, `ready` echoes the EFFECTIVE one so the
+        // SDK can detect a downgrade; absent fields mean default linear16 (no new wire surface).
+        let with_opus = OutgoingMessage::Ready {
+            protocol_version: PROTOCOL_VERSION.to_string(),
+            stream_id: "codec-stream".to_string(),
+            livekit_room_name: None,
+            livekit_url: None,
+            waav_participant_identity: None,
+            waav_participant_name: None,
+            resolved_alias: None,
+            audio_in_codec: Some("opus".to_string()),
+            audio_out_codec: Some("linear16".to_string()),
+        };
+        let json = serde_json::to_string(&with_opus).expect("serialize");
+        assert!(json.contains(r#""audio_in_codec":"opus""#), "got {json}");
+        assert!(json.contains(r#""audio_out_codec":"linear16""#), "got {json}");
+
+        // Default session (no codec requested) omits both fields entirely.
+        let default = OutgoingMessage::Ready {
+            protocol_version: PROTOCOL_VERSION.to_string(),
+            stream_id: "default-stream".to_string(),
+            livekit_room_name: None,
+            livekit_url: None,
+            waav_participant_identity: None,
+            waav_participant_name: None,
+            resolved_alias: None,
+            audio_in_codec: None,
+            audio_out_codec: None,
+        };
+        let json = serde_json::to_string(&default).expect("serialize");
+        assert!(!json.contains("audio_in_codec"), "got {json}");
+        assert!(!json.contains("audio_out_codec"), "got {json}");
     }
 
     #[test]

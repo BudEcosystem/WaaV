@@ -315,6 +315,15 @@ pub struct STTWebSocketConfig {
     #[serde(default = "default_stt_encoding")]
     #[cfg_attr(feature = "openapi", schema(example = "linear16"))]
     pub encoding: String,
+    /// D8 uplink TRANSPORT codec the gateway decodes BEFORE handing PCM to the provider:
+    /// `linear16` (default — raw PCM, no decode) | `opus` (one opus packet per WS binary frame,
+    /// decoded to PCM16 @ `sample_rate`). Distinct from `encoding`, which some providers
+    /// (Alibaba/Reverie) use to ACCEPT opus straight through — this one means "the GATEWAY decodes".
+    /// Negotiated: an `opus` request on a gateway built without the `opus-codec` feature degrades to
+    /// `linear16` (a `config_warning` is emitted) and the effective codec is echoed in `ready`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(example = "opus"))]
+    pub audio_in_codec: Option<String>,
     /// Model to use for transcription. Optional — defaults to empty, letting the provider pick its
     /// own default model (each provider maps an empty model to its recommended default).
     #[serde(default)]
@@ -547,6 +556,17 @@ pub struct TTSWebSocketConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(example = 48000))]
     pub client_playback_rate: Option<u32>,
+    /// D8 downlink TRANSPORT codec for TTS egress: `linear16` (default — raw PCM16 frames) | `opus`
+    /// (the gateway encodes each normalized PCM16 chunk to one opus packet per WS binary frame; the
+    /// client decodes before playout). Encodes from the C-G5-normalized PCM16 stream and reuses
+    /// `audio_out_chunk_ms` as the opus frame size (default 20ms) + `client_playback_rate` as the opus
+    /// rate (constrained to {8,12,16,24,48}kHz; default 48000 when opus). A non-PCM provider stream
+    /// (mp3/ogg) falls back to passthrough + warns. Negotiated: an `opus` request on a gateway without
+    /// the `opus-codec` feature degrades to `linear16` (`config_warning`) and the effective codec is
+    /// echoed in `ready`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(example = "opus"))]
+    pub audio_out_codec: Option<String>,
     /// Connection timeout in seconds
     #[cfg_attr(feature = "openapi", schema(example = 30))]
     pub connection_timeout: Option<u64>,
@@ -970,6 +990,7 @@ mod config_tests {
             extras: Default::default(),
             turn_detection: None,
             translation: None,
+            audio_in_codec: None,
         }
     }
 

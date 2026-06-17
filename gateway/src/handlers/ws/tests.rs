@@ -22,6 +22,7 @@ fn test_ws_config_serialization() {
         extras: Default::default(),
             turn_detection: None,
         translation: None,
+        audio_in_codec: None,
     };
 
     let json = serde_json::to_string(&stt_ws_config).unwrap();
@@ -50,6 +51,7 @@ fn test_ws_config_serialization() {
         voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
+        audio_out_codec: None,
     };
 
     let json = serde_json::to_string(&tts_ws_config).unwrap();
@@ -78,6 +80,7 @@ fn test_incoming_message_serialization() {
             extras: Default::default(),
             turn_detection: None,
             translation: None,
+            audio_in_codec: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -99,6 +102,7 @@ fn test_incoming_message_serialization() {
             voice_descriptor: None,
             features: Default::default(),
             extras: Default::default(),
+            audio_out_codec: None,
         }),
         livekit: None,
         dag_config: None,
@@ -312,6 +316,8 @@ fn test_outgoing_message_serialization() {
         waav_participant_identity: None,
         waav_participant_name: None,
         resolved_alias: None,
+        audio_in_codec: None,
+        audio_out_codec: None,
     };
     let json = serde_json::to_string(&ready_msg).unwrap();
     assert!(json.contains("\"type\":\"ready\""));
@@ -325,6 +331,8 @@ fn test_outgoing_message_serialization() {
         waav_participant_identity: Some("waav-ai".to_string()),
         waav_participant_name: Some("WaaV AI".to_string()),
         resolved_alias: None,
+        audio_in_codec: None,
+        audio_out_codec: None,
     };
     let json_with_livekit = serde_json::to_string(&ready_msg_with_livekit).unwrap();
     assert!(json_with_livekit.contains("\"type\":\"ready\""));
@@ -407,6 +415,7 @@ fn test_stt_ws_config_conversion() {
         extras: Default::default(),
             turn_detection: None,
         translation: None,
+        audio_in_codec: None,
     };
 
     let api_key = "test_api_key".to_string();
@@ -442,6 +451,7 @@ fn test_tts_ws_config_conversion_with_all_values() {
         voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
+        audio_out_codec: None,
     };
 
     let api_key = "test_api_key".to_string();
@@ -479,6 +489,7 @@ fn test_tts_ws_config_conversion_with_defaults() {
         voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
+        audio_out_codec: None,
     };
 
     let api_key = "test_api_key".to_string();
@@ -545,6 +556,7 @@ fn test_livekit_ws_config_conversion() {
         voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
+        audio_out_codec: None,
     };
 
     let livekit_url = "wss://test-livekit.com".to_string();
@@ -592,6 +604,7 @@ fn test_livekit_config_with_empty_listen_participants() {
         voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
+        audio_out_codec: None,
     };
 
     let livekit_config = livekit_ws_config.to_livekit_config(
@@ -637,6 +650,7 @@ fn test_livekit_config_with_listen_participants() {
         voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
+        audio_out_codec: None,
     };
 
     let livekit_config = livekit_ws_config.to_livekit_config(
@@ -752,6 +766,7 @@ fn test_incoming_message_config_with_livekit() {
             extras: Default::default(),
             turn_detection: None,
             translation: None,
+            audio_in_codec: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -773,6 +788,7 @@ fn test_incoming_message_config_with_livekit() {
             voice_descriptor: None,
             features: Default::default(),
             extras: Default::default(),
+            audio_out_codec: None,
         }),
         livekit: Some(LiveKitWebSocketConfig {
             room_name: "test-room".to_string(),
@@ -811,6 +827,7 @@ fn test_incoming_message_config_without_livekit() {
             extras: Default::default(),
             turn_detection: None,
             translation: None,
+            audio_in_codec: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -832,6 +849,7 @@ fn test_incoming_message_config_without_livekit() {
             voice_descriptor: None,
             features: Default::default(),
             extras: Default::default(),
+            audio_out_codec: None,
         }),
         livekit: None,
         dag_config: None,
@@ -1103,6 +1121,7 @@ fn test_tts_ws_config_conversion_mixed_values() {
         voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
+        audio_out_codec: None,
     };
 
     let api_key = "test_api_key".to_string();
@@ -1138,6 +1157,7 @@ fn test_config_message_without_livekit_routing() {
             extras: Default::default(),
             turn_detection: None,
             translation: None,
+            audio_in_codec: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -1159,6 +1179,7 @@ fn test_config_message_without_livekit_routing() {
             voice_descriptor: None,
             features: Default::default(),
             extras: Default::default(),
+            audio_out_codec: None,
         }),
         livekit: None, // No LiveKit configuration
         dag_config: None,
@@ -1202,6 +1223,7 @@ fn test_config_message_with_livekit_routing() {
             extras: Default::default(),
             turn_detection: None,
             translation: None,
+            audio_in_codec: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -1223,6 +1245,7 @@ fn test_config_message_with_livekit_routing() {
             voice_descriptor: None,
             features: Default::default(),
             extras: Default::default(),
+            audio_out_codec: None,
         }),
         livekit: Some(LiveKitWebSocketConfig {
             room_name: "test-room".to_string(),
@@ -1476,6 +1499,7 @@ fn test_config_message_audio_default() {
             extras: Default::default(),
             turn_detection: None,
             translation: None,
+            audio_in_codec: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -1497,6 +1521,7 @@ fn test_config_message_audio_default() {
             voice_descriptor: None,
             features: Default::default(),
             extras: Default::default(),
+            audio_out_codec: None,
         }),
         livekit: None,
         dag_config: None,
@@ -1599,6 +1624,7 @@ fn tts_cfg(provider_rate: Option<u32>, client_rate: Option<u32>) -> TTSWebSocket
         voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
+        audio_out_codec: None,
     }
 }
 

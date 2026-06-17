@@ -344,6 +344,7 @@ fn default_alias_stt() -> STTWebSocketConfig {
         extras: Default::default(),
         translation: None,
         turn_detection: None,
+        audio_in_codec: None,
     }
 }
 
@@ -371,6 +372,7 @@ fn default_alias_tts() -> TTSWebSocketConfig {
         voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
+        audio_out_codec: None,
     }
 }
 

@@ -109,6 +109,7 @@ fn client_field_overrides_alias_default() {
         extras: Default::default(),
         turn_detection: None,
         translation: None,
+        audio_in_codec: None,
     });
     let mut tts = Some(TTSWebSocketConfig {
         provider: String::new(), // empty → alias fills elevenlabs
@@ -130,6 +131,7 @@ fn client_field_overrides_alias_default() {
         voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
+        audio_out_codec: None,
     });
     let (mut conv, mut dag) = (None, None);
 

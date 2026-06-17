@@ -7,6 +7,11 @@
 //! - [`AudioRingBuffer`] - Pre-allocated ring buffer for audio samples
 
 pub mod ring_buffer;
+// D8 transport-codec negotiation (linear16 | opus) — ALWAYS built. The negotiation/degrade layer
+// is libopus-free; the real encode/decode lives under the `opus-codec` feature (`opus_codec`).
+pub mod codec;
+#[cfg(feature = "opus-codec")]
+pub mod opus_codec;
 // The single streaming resampler (C-G5) — ALWAYS built: TTS egress
 // `client_playback_rate` is part of the session API in every build.
 pub mod output_chunker;
@@ -15,6 +20,7 @@ pub mod playback_queue;
 pub mod resampler;
 pub mod vad;
 
+pub use codec::{AudioCodec, CodecNegotiation, negotiate as negotiate_codec};
 pub use ring_buffer::AudioRingBuffer;
 pub use output_chunker::{DEFAULT_AUDIO_OUT_CHUNK_MS, OutputChunker};
 pub use playback_pump::{DEFAULT_PLAYBACK_LEAD, PlaybackEnqueuer, PlaybackPump, PlaybackSink};

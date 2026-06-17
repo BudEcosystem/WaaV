@@ -460,6 +460,11 @@ pub async fn handle_config_message(
         false
     };
 
+    // D8: negotiate the uplink/downlink transport codecs (linear16|opus) and emit any downgrade
+    // warning, so the `ready` echo tells the SDK exactly what to send/decode.
+    let (audio_in_codec, audio_out_codec) =
+        negotiate_audio_codecs(stt_ws_config.as_ref(), tts_ws_config.as_ref(), message_tx).await;
+
     // Send ready message with optional LiveKit room information
     let _ = message_tx
         .send(MessageRoute::Outgoing(OutgoingMessage::Ready {
@@ -470,6 +475,8 @@ pub async fn handle_config_message(
             waav_participant_identity: waav_identity,
             waav_participant_name: waav_name,
             resolved_alias: resolved_alias.map(Box::new),
+            audio_in_codec,
+            audio_out_codec,
         }))
         .await;
 
@@ -674,6 +681,43 @@ async fn emit_language_config_warnings(
             }))
             .await;
     }
+}
+
+/// D8: negotiate the uplink/downlink transport codecs (`linear16` | `opus`) for the session. Emits a
+/// `config_warning` for any downgrade (opus requested on a build without the `opus-codec` feature, or
+/// an unknown token) and returns the EFFECTIVE codec tokens to echo in `ready` as
+/// `(audio_in, audio_out)` — each `Some` only when the client explicitly set that codec field, so a
+/// default linear16 session adds no new wire fields. NEVER errors: an opus request always degrades
+/// cleanly to linear16.
+async fn negotiate_audio_codecs(
+    stt_ws_config: Option<&STTWebSocketConfig>,
+    tts_ws_config: Option<&TTSWebSocketConfig>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) -> (Option<String>, Option<String>) {
+    use crate::core::audio::codec::negotiate;
+
+    let uplink = negotiate(stt_ws_config.and_then(|s| s.audio_in_codec.as_deref()), "uplink");
+    let downlink = negotiate(tts_ws_config.and_then(|t| t.audio_out_codec.as_deref()), "downlink");
+
+    for (side, neg) in [("uplink", &uplink), ("downlink", &downlink)] {
+        if let Some(message) = neg.warning.clone() {
+            warn!(side = side, "audio codec advisory: {message}");
+            crate::core::metrics::bridge::record_degraded("audio_codec", side);
+            let _ = message_tx
+                .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
+                    code: "audio_codec_unsupported_or_degraded".to_string(),
+                    message,
+                    detail: Some(serde_json::json!({
+                        "side": side,
+                        "requested": neg.requested.as_str(),
+                        "effective": neg.effective.as_str(),
+                    })),
+                }))
+                .await;
+        }
+    }
+
+    (uplink.echo_value(), downlink.echo_value())
 }
 
 /// P4 voice-descriptor resolution: when a [`TTSWebSocketConfig`] carries a
@@ -1964,6 +2008,7 @@ async fn initialize_livekit_client(
         voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
+        audio_out_codec: None,
     };
 
     let tts_config_for_livekit = tts_config.unwrap_or(&default_tts_config);

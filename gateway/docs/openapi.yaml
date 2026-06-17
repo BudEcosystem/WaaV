@@ -1882,6 +1882,25 @@ components:
         - stream_id
         - type
         properties:
+          audio_in_codec:
+            type:
+            - string
+            - 'null'
+            description: |-
+              D8 negotiated uplink transport codec ACTUALLY in effect (`linear16` | `opus`). Present
+              only when the client requested a non-default `stt_config.audio_in_codec`, so the SDK can
+              detect a downgrade: it asked `opus` but a gateway without the `opus-codec` feature echoes
+              `linear16` here (and emits a `config_warning`). Absent = linear16 (the default).
+            example: opus
+          audio_out_codec:
+            type:
+            - string
+            - 'null'
+            description: |-
+              D8 negotiated downlink transport codec ACTUALLY in effect (`linear16` | `opus`) for TTS
+              egress. Present only when the client requested a non-default `tts_config.audio_out_codec`.
+              Same downgrade semantics as [`Self::Ready::audio_in_codec`].
+            example: opus
           livekit_room_name:
             type:
             - string
@@ -2653,6 +2672,18 @@ components:
           - string
           - 'null'
           description: Optional API key for this provider (overrides server config)
+        audio_in_codec:
+          type:
+          - string
+          - 'null'
+          description: |-
+            D8 uplink TRANSPORT codec the gateway decodes BEFORE handing PCM to the provider:
+            `linear16` (default — raw PCM, no decode) | `opus` (one opus packet per WS binary frame,
+            decoded to PCM16 @ `sample_rate`). Distinct from `encoding`, which some providers
+            (Alibaba/Reverie) use to ACCEPT opus straight through — this one means "the GATEWAY decodes".
+            Negotiated: an `opus` request on a gateway built without the `opus-codec` feature degrades to
+            `linear16` (a `config_warning` is emitted) and the effective codec is echoed in `ready`.
+          example: opus
         channels:
           type: integer
           format: int32
@@ -2927,6 +2958,20 @@ components:
             (legacy). LiveKit egress already frames at 10ms internally.
           example: 20
           minimum: 0
+        audio_out_codec:
+          type:
+          - string
+          - 'null'
+          description: |-
+            D8 downlink TRANSPORT codec for TTS egress: `linear16` (default — raw PCM16 frames) | `opus`
+            (the gateway encodes each normalized PCM16 chunk to one opus packet per WS binary frame; the
+            client decodes before playout). Encodes from the C-G5-normalized PCM16 stream and reuses
+            `audio_out_chunk_ms` as the opus frame size (default 20ms) + `client_playback_rate` as the opus
+            rate (constrained to {8,12,16,24,48}kHz; default 48000 when opus). A non-PCM provider stream
+            (mp3/ogg) falls back to passthrough + warns. Negotiated: an `opus` request on a gateway without
+            the `opus-codec` feature degrades to `linear16` (`config_warning`) and the effective codec is
+            echoed in `ready`.
+          example: opus
         client_playback_rate:
           type:
           - integer

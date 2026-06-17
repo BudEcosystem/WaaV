@@ -72,6 +72,11 @@ simd-scalar-only = []
 # Core Features
 # =============================================================================
 turn-detect = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
+# D8 full-duplex opus transport codec for /ws audio. OFF by default: the always-built negotiation
+# layer (core/audio/codec.rs) degrades an opus request to linear16 when this feature is absent, so
+# the default build carries zero libopus dependency. Enabling it pulls `opus` (vendored libopus,
+# built offline via CMake) and compiles the real encode/decode (core/audio/opus_codec.rs).
+opus-codec = ["dep:opus"]
 plugins-dynamic = ["dep:libloading", "dep:abi_stable", "dep:waav-plugin-api"]  # Dynamic plugin loading with FFI-safe types
 noise-filter = [
     "dep:deep_filter",
@@ -261,6 +266,7 @@ rtrb = { version = "0.3", optional = true }  # Lock-free ring buffer for inter-n
 # Smart Turn dependencies (audio-based turn detection)
 mel_spec = { version = "0.3", optional = true }  # Whisper-compatible mel spectrogram extraction
 rubato = { version = "0.16" }  # High-quality audio resampling (C-G5 resampler is core: TTS egress client_playback_rate works in every build)
+opus = { version = "0.3", optional = true }  # D8 opus transport codec (opus-codec feature; → audiopus_sys vendored libopus, built offline via CMake)
 realfft = { version = "3.4", optional = true }  # FFT for mel spectrogram (fallback)
 
 # Silero VAD dependencies
