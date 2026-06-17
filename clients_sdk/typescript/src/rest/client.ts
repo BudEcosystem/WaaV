@@ -4,6 +4,8 @@
 
 import { APIError, TimeoutError, RateLimitError } from '../errors/index.js';
 import { getMetricsCollector } from '../metrics/collector.js';
+import { cloneVoice, cloneVoiceAndWait, getClonedVoiceStatus } from './voice.js';
+import type { VoiceCloneRequest, VoiceCloneResponse } from '../types/voice.js';
 import type { Voice, VoiceListResponse, TTSSynthesisResult } from '../types/tts.js';
 import type { LiveKitTokenRequest, LiveKitTokenResponse, RoomInfo, RoomListResponse } from '../types/livekit.js';
 import type { SIPHook, SIPHookListResponse, SIPHookCreateRequest, SIPHookCreateResponse } from '../types/sip.js';
@@ -169,6 +171,39 @@ export class RestClient {
       return response;
     }
     return response.voices;
+  }
+
+  /**
+   * Voice-cloning helpers (P4): `client.voices.clone({...})` + poll-until-ready.
+   *
+   * Clone a voice from samples and get back a usable TTS `voiceId`:
+   * ```ts
+   * const { voiceId, status } = await client.voices.clone({
+   *   provider: 'elevenlabs', name: 'My Voice', audioFiles: [wavBuffer],
+   * });
+   * // const ready = await client.voices.cloneAndWait({ ... });
+   * ```
+   * `clone` POSTs the canonical gateway `VoiceCloneRequest` body; the returned
+   * `voiceId` is directly usable as a TTS `voiceId` once `status === 'ready'`.
+   */
+  get voices() {
+    const baseUrl = this.baseUrl;
+    const apiKey = this.apiKey;
+    return {
+      /** Clone a voice (`POST /voices/clone`) → {@link VoiceCloneResponse}. */
+      clone: (request: VoiceCloneRequest): Promise<VoiceCloneResponse> =>
+        cloneVoice(baseUrl, request, apiKey),
+      /** Clone and resolve once terminal (`ready`/`failed`); see {@link cloneVoiceAndWait}. */
+      cloneAndWait: (request: VoiceCloneRequest): Promise<VoiceCloneResponse> =>
+        cloneVoiceAndWait(baseUrl, request, apiKey),
+      /**
+       * Get a cloned voice's status. NOTE: the gateway exposes no `GET /voices/{id}`
+       * status endpoint this phase, so this 404s until added — use the `status`
+       * from `clone(...)` (or the provider's API) meanwhile.
+       */
+      getCloneStatus: (voiceId: string): Promise<VoiceCloneResponse> =>
+        getClonedVoiceStatus(baseUrl, voiceId, apiKey),
+    };
   }
 
   // ============================================================================

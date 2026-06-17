@@ -165,6 +165,10 @@ class BudTalk:
                     provider=tts.get("provider", "deepgram"),
                     voice=tts.get("voice"),
                     voice_id=tts.get("voice_id"),
+                    # P4: thread the abstract voice descriptor through the dict path
+                    # (pydantic coerces a nested dict to VoiceDescriptor). Without
+                    # this, an explicit field list here would silently DROP it.
+                    voice_descriptor=tts.get("voice_descriptor"),
                     model=tts.get("model"),
                     sample_rate=tts.get("sample_rate", 24000),
                 )

@@ -8,6 +8,7 @@ export type { RestClientOptions } from './client.js';
 // Voice cloning and recording API
 export {
   cloneVoice,
+  cloneVoiceAndWait,
   listClonedVoices,
   deleteClonedVoice,
   getClonedVoiceStatus,

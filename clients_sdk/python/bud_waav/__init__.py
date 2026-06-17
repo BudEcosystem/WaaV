@@ -69,6 +69,10 @@ from .types import (
     EmotionIntensityLevel,
     EmotionConfig,
     intensity_to_number,
+    # Voice descriptor (abstract voice selection, resolved server-side; P4)
+    VoiceDescriptor,
+    VoiceGender,
+    VoiceAge,
     # Conversation / agent-loop types (built-in LLM loop + reasoning)
     ConversationConfig,
     ReasoningEffort,
@@ -118,6 +122,7 @@ from .types import (
     REALTIME_DEFAULTS,
     # Voice cloning types
     VoiceCloneProvider,
+    CloneMode,
     VoiceCloneRequest,
     VoiceCloneStatus,
     VoiceCloneResponse,
@@ -164,6 +169,7 @@ from .pipelines import (
     StateChangeEvent,
 )
 from .rest import RestClient
+from .voices import VoicesAPI, CloneResult
 from .ws import WebSocketSession, SessionMetrics, ReconnectConfig, MessageQueue, QueueConfig, QueueStats
 from .audio import AudioProcessor, VADConfig as AudioVADConfig, VADFrame, VADState, VoiceActivityDetector
 from .metrics.slo import SLOTracker, SLODefinition, SLOViolation, SLOComparison
@@ -196,6 +202,10 @@ __all__ = [
     "EmotionIntensityLevel",
     "EmotionConfig",
     "intensity_to_number",
+    # Voice descriptor (abstract voice selection, resolved server-side; P4)
+    "VoiceDescriptor",
+    "VoiceGender",
+    "VoiceAge",
     # Conversation / agent-loop types (built-in LLM loop + reasoning)
     "ConversationConfig",
     "ReasoningEffort",
@@ -243,11 +253,14 @@ __all__ = [
     "RealtimeAudioChunk",
     "VOICE_DEFAULTS",
     "REALTIME_DEFAULTS",
-    # Voice cloning types
+    # Voice cloning types + helpers
     "VoiceCloneProvider",
+    "CloneMode",
     "VoiceCloneRequest",
     "VoiceCloneStatus",
     "VoiceCloneResponse",
+    "VoicesAPI",
+    "CloneResult",
     # Hume EVI types
     "HumeEVIVersion",
     "HumeEVIConfig",

@@ -49,9 +49,12 @@ class TestVoiceCloning:
         assert payload["name"] == "My Voice"
         assert payload["provider"] == "elevenlabs"
         assert payload["description"] == "A cloned voice"
-        # Check audio files are base64 encoded
-        assert len(payload["audio_files"]) == 2
-        assert payload["audio_files"][0] == base64.b64encode(audio_data[0]).decode()
+        # P4: the canonical gateway wire field is `audio_samples` (base64-encoded).
+        # `audio_files` bytes are encoded into it (the old `audio_files` wire key
+        # was wrong and silently dropped server-side).
+        assert len(payload["audio_samples"]) == 2
+        assert payload["audio_samples"][0] == base64.b64encode(audio_data[0]).decode()
+        assert payload["mode"] == "instant"
 
     @pytest.mark.asyncio
     async def test_list_cloned_voices(self, client):

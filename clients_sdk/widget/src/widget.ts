@@ -67,6 +67,14 @@ export class BudWidget extends HTMLElement {
       'data-stt-provider',
       'data-tts-provider',
       'data-tts-voice',
+      // P4 abstract voice selection: `data-voice-*` is resolved to a concrete
+      // provider voice_id server-side, so re-parse when any descriptor changes.
+      'data-voice-gender',
+      'data-voice-locale',
+      'data-voice-accent',
+      'data-voice-age',
+      'data-voice-style',
+      'data-voice-name-hint',
       // Flagship one-tag conversation loop: re-parse when the LLM target changes
       // so a talking bot can be configured declaratively after mount.
       'data-llm-base-url',

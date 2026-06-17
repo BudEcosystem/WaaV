@@ -36,6 +36,7 @@ export type LatencyFiller = 'off' | 'auto' | 'aggressive';
  * Matches Python SDK's Emotion enum for cross-SDK consistency.
  */
 export type EmotionType =
+  // Original 22.
   | 'neutral'
   | 'happy'
   | 'sad'
@@ -57,11 +58,38 @@ export type EmotionType =
   | 'proud'
   | 'embarrassed'
   | 'content'
-  | 'bored';
+  | 'bored'
+  // P4 widened affective states (gateway Emotion 22 → 44).
+  | 'amazed'
+  | 'amused'
+  | 'affectionate'
+  | 'intrigued'
+  | 'flirtatious'
+  | 'frustrated'
+  | 'annoyed'
+  | 'determined'
+  | 'reassuring'
+  | 'sympathetic'
+  | 'nostalgic'
+  | 'serene'
+  | 'terrified'
+  | 'ecstatic'
+  | 'skeptical'
+  | 'relieved'
+  | 'panicked'
+  | 'concerned'
+  | 'apologetic'
+  | 'resigned'
+  | 'wistful'
+  | 'contemplative'
+  // Forward-compat: accept any raw token the gateway may resolve.
+  | (string & {});
 
 /**
  * Delivery styles for TTS.
  * Matches Python SDK's DeliveryStyle enum for cross-SDK consistency.
+ * P4 promoted `soft`/`cheerful`/`serious` to {@link EmotionType}; they are KEPT here
+ * as backward-compatible cross-enum aliases (the gateway still accepts them).
  */
 export type DeliveryStyle =
   | 'normal'
@@ -78,7 +106,55 @@ export type DeliveryStyle =
   | 'loud'
   | 'cheerful'
   | 'serious'
-  | 'formal';
+  | 'formal'
+  // P4 scenario / narration framings.
+  | 'newscast'
+  | 'newscast_casual'
+  | 'newscast_formal'
+  | 'customer_service'
+  | 'assistant'
+  | 'chat'
+  | 'advertisement_upbeat'
+  | 'sports_commentary'
+  | 'sports_commentary_excited'
+  | 'documentary_narration'
+  | 'narration_professional'
+  | 'narration_relaxed'
+  | 'poetry_reading'
+  | 'lyrical'
+  | 'gentle'
+  // Forward-compat: accept any raw token the gateway may resolve.
+  | (string & {});
+
+/** Desired voice gender for {@link VoiceDescriptor} (gateway `Gender`). */
+export type VoiceGender = 'male' | 'female' | 'neutral';
+
+/** Desired voice age band for {@link VoiceDescriptor} (gateway `Age`). */
+export type VoiceAge = 'young' | 'middle_aged' | 'old';
+
+/**
+ * Abstract, provider-agnostic voice selection (P4).
+ *
+ * Mirrors the gateway `VoiceDescriptor`. Describe the voice you WANT (gender /
+ * locale / accent / age / style / name hint) via `data-voice-*` attributes and the
+ * gateway resolves it to a concrete provider `voiceId` server-side. Used ONLY when
+ * no explicit `voiceId`/`voice` is set — a raw `voiceId` ALWAYS wins. Serialized
+ * under `tts_config.voice_descriptor` (snake_case object); only-set fields emitted.
+ */
+export interface VoiceDescriptor {
+  /** `male` | `female` | `neutral` (`data-voice-gender`). */
+  gender?: VoiceGender;
+  /** BCP-47 locale: `en-US`, `hi-IN`, … (`data-voice-locale`). */
+  locale?: string;
+  /** Free accent string: `american`, `british`, … (`data-voice-accent`). */
+  accent?: string;
+  /** `young` | `middle_aged` | `old` (`data-voice-age`). */
+  age?: VoiceAge;
+  /** Free timbre/style: `warm`, `bright`, … (`data-voice-style`). */
+  style?: string;
+  /** Preferred voice name (`asteria`, `jenny`); substring-matched (`data-voice-name-hint`). */
+  nameHint?: string;
+}
 
 /** Emotion intensity */
 export type EmotionIntensity = 'low' | 'medium' | 'high' | number;
@@ -184,6 +260,13 @@ export interface TTSConfig {
   provider: TTSProvider;
   voice?: string;
   voiceId?: string;
+  /**
+   * Abstract voice selection (gender/locale/accent/age/style/nameHint) resolved to
+   * a concrete provider `voiceId` server-side (P4, `data-voice-*`). Used ONLY when
+   * no `voiceId`/`voice` is set — a raw `voiceId` always wins. Serialized under
+   * `tts_config.voice_descriptor` on the wire.
+   */
+  voiceDescriptor?: VoiceDescriptor;
   model?: string;
   sampleRate?: number;
   /** Emotion configuration */

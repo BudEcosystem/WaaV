@@ -480,6 +480,13 @@ class Emotion(str, Enum):
     """
     Standardized emotions supported across TTS providers.
     Each emotion maps to provider-specific formats (SSML, audio tags, natural language, etc.)
+
+    Mirrors the gateway ``Emotion`` value space 1:1
+    (``gateway/src/core/emotion/types.rs``; widened 22 → 44 in P4). The wire field
+    (``tts_config.emotion``) stays a free ``str`` — an unrecognized token is still
+    forwarded and resolved server-side (or warned), never a hard error — so a bare
+    ``str`` is accepted anywhere this enum is, for forward-compat. Old variants are
+    NEVER removed (that would break callers; the gateway resolves them).
     """
 
     NEUTRAL = "neutral"
@@ -505,11 +512,44 @@ class Emotion(str, Enum):
     CONTENT = "content"
     BORED = "bored"
 
+    # P4 widened affective states (researched across Azure-DragonHD / Cartesia-Sonic3
+    # / Hume; each has a direct provider token). AFFECTIVE STATES (what the speaker
+    # FEELS), distinct from DeliveryStyle (the delivery MECHANISM).
+    AMAZED = "amazed"
+    AMUSED = "amused"
+    AFFECTIONATE = "affectionate"
+    INTRIGUED = "intrigued"
+    FLIRTATIOUS = "flirtatious"
+    FRUSTRATED = "frustrated"
+    ANNOYED = "annoyed"
+    DETERMINED = "determined"
+    REASSURING = "reassuring"
+    SYMPATHETIC = "sympathetic"
+    NOSTALGIC = "nostalgic"
+    SERENE = "serene"
+    TERRIFIED = "terrified"
+    ECSTATIC = "ecstatic"
+    SKEPTICAL = "skeptical"
+    RELIEVED = "relieved"
+    PANICKED = "panicked"
+    CONCERNED = "concerned"
+    APOLOGETIC = "apologetic"
+    RESIGNED = "resigned"
+    WISTFUL = "wistful"
+    CONTEMPLATIVE = "contemplative"
+
 
 class DeliveryStyle(str, Enum):
     """
     Delivery styles that modify how speech is expressed.
     These can be combined with emotions for nuanced expression.
+
+    Mirrors the gateway ``DeliveryStyle`` value space
+    (``gateway/src/core/emotion/types.rs``). The P4 gateway PROMOTED the affective
+    words ``soft``/``cheerful``/``serious`` to :class:`Emotion`, but still accepts
+    them here as backward-compatible cross-enum aliases (they resolve to a neutral
+    delivery mechanism while the feeling is captured by ``emotion``), so those old
+    variants are KEPT below. The wire field stays a free ``str`` (forward-compat).
     """
 
     NORMAL = "normal"
@@ -527,6 +567,24 @@ class DeliveryStyle(str, Enum):
     CHEERFUL = "cheerful"
     SERIOUS = "serious"
     FORMAL = "formal"
+
+    # P4 scenario / narration framings (map 1:1 to Azure express-as scenario styles
+    # and AWS Polly amazon:domain names; warn+default elsewhere).
+    NEWSCAST = "newscast"
+    NEWSCAST_CASUAL = "newscast_casual"
+    NEWSCAST_FORMAL = "newscast_formal"
+    CUSTOMER_SERVICE = "customer_service"
+    ASSISTANT = "assistant"
+    CHAT = "chat"
+    ADVERTISEMENT_UPBEAT = "advertisement_upbeat"
+    SPORTS_COMMENTARY = "sports_commentary"
+    SPORTS_COMMENTARY_EXCITED = "sports_commentary_excited"
+    DOCUMENTARY_NARRATION = "documentary_narration"
+    NARRATION_PROFESSIONAL = "narration_professional"
+    NARRATION_RELAXED = "narration_relaxed"
+    POETRY_READING = "poetry_reading"
+    LYRICAL = "lyrical"
+    GENTLE = "gentle"
 
 
 class EmotionIntensityLevel(str, Enum):
@@ -568,6 +626,84 @@ class EmotionConfig(BaseModel):
 
     description: Optional[str] = None
     """Free-form description (for providers like Hume)"""
+
+
+# =============================================================================
+# Voice Descriptor (P4 — abstract voice selection; resolved server-side)
+# =============================================================================
+
+
+class VoiceGender(str, Enum):
+    """Desired voice gender for :class:`VoiceDescriptor` (gateway ``Gender``)."""
+
+    MALE = "male"
+    FEMALE = "female"
+    NEUTRAL = "neutral"
+
+
+class VoiceAge(str, Enum):
+    """Desired voice age band for :class:`VoiceDescriptor` (gateway ``Age``)."""
+
+    YOUNG = "young"
+    MIDDLE_AGED = "middle_aged"
+    OLD = "old"
+
+
+class VoiceDescriptor(BaseModel):
+    """Abstract, provider-agnostic voice selection (P4).
+
+    Mirrors the gateway ``VoiceDescriptor`` (``gateway/src/core/voice/types.rs``).
+    Describe the voice you WANT (gender / locale / accent / age / style / name hint)
+    and the gateway resolves it to a concrete provider ``voice_id`` server-side —
+    so the same descriptor works across every TTS provider without hardcoding IDs.
+
+    Used ONLY when no explicit ``voice_id`` (or ``voice``) is supplied on the TTS
+    config — a raw ``voice_id`` ALWAYS wins. Serialized under
+    ``tts_config.voice_descriptor`` on the wire (snake_case object); every field is
+    optional and only sent when set.
+
+    Example::
+
+        TTSConfig(provider="deepgram",
+                  voice_descriptor=VoiceDescriptor(
+                      gender="female", locale="en-US", style="warm"))
+    """
+
+    model_config = ConfigDict(use_enum_values=True)
+
+    gender: Optional[Union[VoiceGender, str]] = None
+    """Desired gender: ``male`` | ``female`` | ``neutral``."""
+
+    locale: Optional[str] = None
+    """BCP-47 locale (preferred): ``en-US``, ``en-GB``, ``hi-IN``, …"""
+
+    accent: Optional[str] = None
+    """Free accent string when no ``locale`` is given: ``american``, ``british``, …"""
+
+    age: Optional[Union[VoiceAge, str]] = None
+    """Desired age band: ``young`` | ``middle_aged`` | ``old``."""
+
+    style: Optional[str] = None
+    """Free timbre/style matched against provider metadata: ``warm``, ``bright``, …"""
+
+    name_hint: Optional[str] = None
+    """Optional preferred voice name (``asteria``, ``jenny``); substring-matched."""
+
+    def is_set(self) -> bool:
+        """True if ANY field is set (i.e. resolution should be attempted)."""
+        return any(
+            v is not None and (not isinstance(v, str) or v.strip())
+            for v in (self.gender, self.locale, self.accent, self.age, self.style, self.name_hint)
+        )
+
+    def to_wire(self) -> dict[str, Any]:
+        """Serialize to the gateway ``voice_descriptor`` object (only-set fields)."""
+        wire: dict[str, Any] = {}
+        for key in ("gender", "locale", "accent", "age", "style", "name_hint"):
+            val = getattr(self, key)
+            if val is not None and (not isinstance(val, str) or val.strip()):
+                wire[key] = val
+        return wire
 
 
 # =============================================================================
@@ -777,6 +913,12 @@ class TTSConfig(BaseModel):
 
     voice_id: Optional[str] = None
     """Voice ID (provider-specific)"""
+
+    voice_descriptor: Optional["VoiceDescriptor"] = None
+    """Abstract voice selection (gender/locale/accent/age/style/name_hint) resolved
+    to a concrete provider voice_id server-side (P4). Used ONLY when no ``voice_id``
+    /``voice`` is set — a raw ``voice_id`` always wins. Serialized under
+    ``tts_config.voice_descriptor`` on the wire."""
 
     model: Optional[str] = None
     """Model to use (e.g., 'eleven_turbo_v2')"""
@@ -1370,61 +1512,114 @@ REALTIME_DEFAULTS: dict[str, dict[str, Any]] = {
 
 
 class VoiceCloneProvider(str, Enum):
-    """Provider for voice cloning operations."""
+    """Provider for voice cloning operations (gateway ``VoiceCloneProvider``).
+
+    The FULL set sourced 1:1 from ``gateway/src/handlers/voices.rs`` (P4 widened it
+    from the 2-provider SDK enum). A bare ``str`` is accepted by
+    :meth:`VoicesAPI.clone` for forward-compat.
+    """
 
     HUME = "hume"
     ELEVENLABS = "elevenlabs"
+    LMNT = "lmnt"
+    CARTESIA = "cartesia"
+    PLAYHT = "playht"
+    SPEECHIFY = "speechify"
+    RESEMBLE = "resemble"
+
+
+class CloneMode(str, Enum):
+    """Voice-clone mode (gateway ``CloneMode``).
+
+    - ``instant`` (default): IVC / clip clone; returns ``ready`` immediately or
+      near-instantly.
+    - ``professional``: async high-fidelity (ElevenLabs PVC / Resemble / PlayHT
+      PVC); the returned ``voice_id`` is polled until ``ready``.
+    """
+
+    INSTANT = "instant"
+    PROFESSIONAL = "professional"
 
 
 class VoiceCloneRequest(BaseModel):
-    """Request to clone a voice from audio samples or description."""
+    """Request to clone a voice from audio samples or description.
 
-    provider: VoiceCloneProvider
+    Mirrors the gateway ``VoiceCloneRequest`` (``POST /voices/clone``). ``provider``
+    and ``name`` are required; everything else is optional and only sent when set.
+    """
+
+    model_config = ConfigDict(use_enum_values=True)
+
+    provider: Union[VoiceCloneProvider, str]
     """Provider to use for voice cloning"""
 
     name: str
     """Name for the cloned voice"""
 
     description: Optional[str] = None
-    """Description of the voice (used by Hume for voice design)"""
+    """Description of the voice (used by Hume for voice design / ElevenLabs label)"""
 
     audio_samples: Optional[list[str]] = None
-    """Audio samples for cloning (base64-encoded). ElevenLabs: 1-2 min recommended"""
+    """Audio samples for cloning (base64-encoded or URLs). ElevenLabs: 1-2 min recommended"""
 
     sample_text: Optional[str] = None
     """Sample text for voice generation (Hume only)"""
 
     remove_background_noise: bool = False
-    """Remove background noise from samples (ElevenLabs only)"""
+    """Remove background noise from samples (ElevenLabs IVC / LMNT enhance)"""
 
     labels: Optional[dict[str, str]] = None
-    """Labels for the voice (ElevenLabs only)"""
+    """Flat labels for the voice (ElevenLabs)"""
+
+    mode: Union[CloneMode, str] = CloneMode.INSTANT
+    """Clone MODE: ``instant`` (default) or ``professional`` (async high-fidelity)"""
+
+    base_voice_id: Optional[str] = None
+    """Design-from-existing: the base voice to clone/derive from (provider-specific)"""
 
 
 class VoiceCloneStatus(str, Enum):
-    """Status of a cloned voice."""
+    """Canonical lifecycle status of a cloned voice (gateway ``CloneStatus``).
+
+    A ``ready`` ``voice_id`` is directly usable as a TTS ``voice_id``.
+    ``READY`` / ``FAILED`` are TERMINAL; the others mean the clone is still being
+    produced (poll until terminal). ``PROCESSING`` is KEPT as a backward-compatible
+    alias for the old SDK status (it maps onto the in-progress ``training`` state).
+    """
 
     READY = "ready"
-    PROCESSING = "processing"
+    VERIFYING = "verifying"
+    TRAINING = "training"
+    QUEUED = "queued"
     FAILED = "failed"
+    # Backward-compatible alias for the pre-P4 SDK status (in-progress).
+    PROCESSING = "processing"
+
+    @property
+    def is_terminal(self) -> bool:
+        """True once the clone has finished (ready or failed) — stop polling."""
+        return self in (VoiceCloneStatus.READY, VoiceCloneStatus.FAILED)
 
 
 class VoiceCloneResponse(BaseModel):
-    """Response from voice cloning operation."""
+    """Response from voice cloning operation (gateway ``VoiceCloneResponse``)."""
 
     voice_id: str
-    """Unique identifier for the cloned voice"""
+    """Unique identifier for the cloned voice (usable as a TTS voice_id once ready)"""
 
     name: str
     """Name of the cloned voice"""
 
-    provider: VoiceCloneProvider
+    provider: Union[VoiceCloneProvider, str]
     """Provider that created the voice"""
 
-    status: VoiceCloneStatus
-    """Status of the voice (ready, processing, failed)"""
+    status: Union[VoiceCloneStatus, str]
+    """Canonical status: ready | verifying | training | queued | failed"""
 
-    created_at: str
+    requires_verification: Optional[bool] = None
+    """Whether the voice still needs verification before use (ElevenLabs IVC)"""
+
+    created_at: Optional[str] = None
     """ISO 8601 timestamp when the voice was created"""
 
     metadata: Optional[dict[str, Any]] = None

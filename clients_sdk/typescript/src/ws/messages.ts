@@ -392,6 +392,21 @@ function ttsConfigToWire(config: TTSConfig): Record<string, unknown> {
   };
   // `voice` is a convenience alias for `voice_id`.
   setIfDefined(wire, 'voice_id', config.voiceId ?? config.voice);
+  // Abstract voice selection (P4): the gateway resolves a VoiceDescriptor to a
+  // concrete provider voice_id server-side. Sent under `voice_descriptor` as a
+  // snake_case object; a raw voice_id always wins, so the gateway only uses this
+  // when voice_id is absent. Only set fields are emitted.
+  if (config.voiceDescriptor !== undefined) {
+    const vd = config.voiceDescriptor;
+    const vdWire: Record<string, unknown> = {};
+    setIfDefined(vdWire, 'gender', vd.gender);
+    setIfDefined(vdWire, 'locale', vd.locale);
+    setIfDefined(vdWire, 'accent', vd.accent);
+    setIfDefined(vdWire, 'age', vd.age);
+    setIfDefined(vdWire, 'style', vd.style);
+    setIfDefined(vdWire, 'name_hint', vd.nameHint);
+    if (Object.keys(vdWire).length > 0) wire.voice_descriptor = vdWire;
+  }
   setIfDefined(wire, 'model', config.model);
   setIfDefined(wire, 'sample_rate', config.sampleRate);
   setIfDefined(wire, 'audio_format', config.audioFormat);

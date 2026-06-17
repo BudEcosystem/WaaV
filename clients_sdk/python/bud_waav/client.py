@@ -6,6 +6,7 @@ import weakref
 from typing import Any, Optional, Union
 
 from .rest.client import RestClient
+from .voices import VoicesAPI
 from .pipelines.stt import BudSTT
 from .pipelines.tts import BudTTS
 from .pipelines.talk import BudTalk, TalkSession
@@ -81,6 +82,9 @@ class BudClient:
             timeout=self.timeout,
         )
 
+        # Voice-cloning helper surface (P4): bud.voices.clone(...) + wait_until_ready.
+        self._voices = VoicesAPI(self._rest_client)
+
         # Initialize pipelines
         self._stt = BudSTT(url=self._ws_url, api_key=self.api_key)
         self._tts = BudTTS(url=self._ws_url, api_key=self.api_key, rest_client=self._rest_client)
@@ -114,6 +118,20 @@ class BudClient:
     def rest(self) -> RestClient:
         """Get the REST client for direct API access."""
         return self._rest_client
+
+    @property
+    def voices(self) -> VoicesAPI:
+        """Voice-cloning helpers (P4): ``bud.voices.clone(...)`` + ``wait_until_ready``.
+
+        Clone a voice from samples and get back a usable TTS ``voice_id``::
+
+            result = await bud.voices.clone(
+                provider="elevenlabs", name="My Voice", samples=[wav_bytes]
+            )
+            voice = await result.wait_until_ready()
+            # TTSConfig(provider="elevenlabs", voice_id=voice.voice_id)
+        """
+        return self._voices
 
     @property
     def realtime_url(self) -> str:

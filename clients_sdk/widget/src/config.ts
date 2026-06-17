@@ -11,6 +11,9 @@ import type {
   RealtimeProvider,
   EmotionType,
   DeliveryStyle,
+  VoiceDescriptor,
+  VoiceGender,
+  VoiceAge,
   ReasoningEffort,
   LatencyFiller,
   AdapterKind,
@@ -57,11 +60,18 @@ export function parseConfigFromAttributes(element: HTMLElement): WidgetConfig {
   const ttsProvider = element.dataset.ttsProvider;
   const ttsVoice = element.dataset.ttsVoice;
   const ttsVoiceId = element.dataset.ttsVoiceId;
-  if (ttsProvider || ttsVoice || ttsVoiceId) {
+  // Abstract voice selection (P4): `data-voice-gender` / `data-voice-locale` /
+  // `data-voice-accent` / `data-voice-age` / `data-voice-style` /
+  // `data-voice-name-hint`. The gateway resolves this to a concrete provider
+  // voice_id server-side, so `data-voice-gender="female"` alone is enough (no need
+  // to hardcode a provider voice id). A raw `data-tts-voice-id` always wins.
+  const voiceDescriptor = parseVoiceDescriptor(element);
+  if (ttsProvider || ttsVoice || ttsVoiceId || voiceDescriptor) {
     config.tts = {
       provider: (ttsProvider as TTSProvider | undefined) || 'deepgram',
       voice: ttsVoice,
       voiceId: ttsVoiceId,
+      voiceDescriptor,
       model: element.dataset.ttsModel,
       sampleRate: parseInt(element.dataset.ttsSampleRate || '24000', 10),
     };
@@ -223,6 +233,33 @@ function parseCsvAttr(value: string | undefined): string[] | undefined {
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
   return parts.length > 0 ? parts : undefined;
+}
+
+/**
+ * Parse an abstract {@link VoiceDescriptor} from `data-voice-*` attributes (P4).
+ *
+ * Returns `undefined` when none are present (so it never forces an empty descriptor
+ * onto the wire). The gateway resolves the descriptor to a concrete provider
+ * voice_id server-side; a raw `data-tts-voice-id` always wins.
+ */
+function parseVoiceDescriptor(element: HTMLElement): VoiceDescriptor | undefined {
+  const d = element.dataset;
+  const vd: VoiceDescriptor = {
+    gender: d.voiceGender as VoiceGender | undefined,
+    locale: d.voiceLocale,
+    accent: d.voiceAccent,
+    age: d.voiceAge as VoiceAge | undefined,
+    style: d.voiceStyle,
+    nameHint: d.voiceNameHint,
+  };
+  const hasAny =
+    vd.gender !== undefined ||
+    vd.locale !== undefined ||
+    vd.accent !== undefined ||
+    vd.age !== undefined ||
+    vd.style !== undefined ||
+    vd.nameHint !== undefined;
+  return hasAny ? vd : undefined;
 }
 
 /**

@@ -22,7 +22,14 @@ export type {
  * Standardized emotions supported across TTS providers.
  * Each emotion maps to provider-specific formats (SSML, audio tags, natural language, etc.)
  */
+/**
+ * Mirrors the gateway `Emotion` value space 1:1 (gateway/src/core/emotion/types.rs;
+ * widened 22 → 44 in P4). A bare `string` is also accepted on the wire so an
+ * unrecognized token is forwarded + resolved server-side (never a hard error);
+ * old variants are NEVER removed (the gateway resolves them).
+ */
 export type Emotion =
+  // Original 22.
   | 'neutral'
   | 'happy'
   | 'sad'
@@ -44,11 +51,40 @@ export type Emotion =
   | 'proud'
   | 'embarrassed'
   | 'content'
-  | 'bored';
+  | 'bored'
+  // P4 widened affective states (each has a direct provider token).
+  | 'amazed'
+  | 'amused'
+  | 'affectionate'
+  | 'intrigued'
+  | 'flirtatious'
+  | 'frustrated'
+  | 'annoyed'
+  | 'determined'
+  | 'reassuring'
+  | 'sympathetic'
+  | 'nostalgic'
+  | 'serene'
+  | 'terrified'
+  | 'ecstatic'
+  | 'skeptical'
+  | 'relieved'
+  | 'panicked'
+  | 'concerned'
+  | 'apologetic'
+  | 'resigned'
+  | 'wistful'
+  | 'contemplative'
+  // Forward-compat: accept any raw token the gateway may resolve.
+  | (string & {});
 
 /**
  * Delivery styles that modify how speech is expressed.
  * These can be combined with emotions for nuanced expression.
+ *
+ * Mirrors the gateway `DeliveryStyle` value space. P4 PROMOTED the affective words
+ * `soft`/`cheerful`/`serious` to {@link Emotion}, but the gateway still accepts them
+ * here as backward-compatible cross-enum aliases, so those old variants are KEPT.
  */
 export type DeliveryStyle =
   | 'normal'
@@ -65,7 +101,25 @@ export type DeliveryStyle =
   | 'loud'
   | 'cheerful'
   | 'serious'
-  | 'formal';
+  | 'formal'
+  // P4 scenario / narration framings (Azure express-as / AWS Polly amazon:domain).
+  | 'newscast'
+  | 'newscast_casual'
+  | 'newscast_formal'
+  | 'customer_service'
+  | 'assistant'
+  | 'chat'
+  | 'advertisement_upbeat'
+  | 'sports_commentary'
+  | 'sports_commentary_excited'
+  | 'documentary_narration'
+  | 'narration_professional'
+  | 'narration_relaxed'
+  | 'poetry_reading'
+  | 'lyrical'
+  | 'gentle'
+  // Forward-compat: accept any raw token the gateway may resolve.
+  | (string & {});
 
 /**
  * Emotion intensity presets.
@@ -88,6 +142,43 @@ export interface EmotionConfig {
   style?: DeliveryStyle;
   /** Free-form description (for providers like Hume that support natural language) */
   description?: string;
+}
+
+// =============================================================================
+// Voice Descriptor (P4 — abstract voice selection; resolved server-side)
+// =============================================================================
+
+/** Desired voice gender for {@link VoiceDescriptor} (gateway `Gender`). */
+export type VoiceGender = 'male' | 'female' | 'neutral';
+
+/** Desired voice age band for {@link VoiceDescriptor} (gateway `Age`). */
+export type VoiceAge = 'young' | 'middle_aged' | 'old';
+
+/**
+ * Abstract, provider-agnostic voice selection (P4).
+ *
+ * Mirrors the gateway `VoiceDescriptor` (gateway/src/core/voice/types.rs). Describe
+ * the voice you WANT (gender / locale / accent / age / style / name hint) and the
+ * gateway resolves it to a concrete provider `voiceId` server-side — so the same
+ * descriptor works across every TTS provider without hardcoding IDs.
+ *
+ * Used ONLY when no explicit `voiceId` (or `voice`) is set on the TTS config — a raw
+ * `voiceId` ALWAYS wins. Serialized under `tts_config.voice_descriptor` on the wire
+ * (snake_case object); every field is optional and only sent when set.
+ */
+export interface VoiceDescriptor {
+  /** Desired gender: `male` | `female` | `neutral`. */
+  gender?: VoiceGender;
+  /** BCP-47 locale (preferred): `en-US`, `en-GB`, `hi-IN`, … */
+  locale?: string;
+  /** Free accent string when no `locale` is given: `american`, `british`, … */
+  accent?: string;
+  /** Desired age band: `young` | `middle_aged` | `old`. */
+  age?: VoiceAge;
+  /** Free timbre/style matched against provider metadata: `warm`, `bright`, … */
+  style?: string;
+  /** Optional preferred voice name (`asteria`, `jenny`); substring-matched. */
+  nameHint?: string;
 }
 
 /**
@@ -183,6 +274,13 @@ export interface TTSConfig {
   voice?: string;
   /** Voice ID or name to use for synthesis */
   voiceId?: string;
+  /**
+   * Abstract voice selection (gender/locale/accent/age/style/nameHint) resolved to
+   * a concrete provider `voiceId` server-side (P4). Used ONLY when no `voiceId`
+   * /`voice` is set — a raw `voiceId` always wins. Serialized under
+   * `tts_config.voice_descriptor` on the wire.
+   */
+  voiceDescriptor?: VoiceDescriptor;
   /** Speaking rate (0.25 to 4.0, 1.0 is normal) */
   speakingRate?: number;
   /** Alias for speakingRate */

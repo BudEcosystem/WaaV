@@ -12,9 +12,22 @@ import {
   RecordingList,
   deserializeRecordingInfo,
   deserializeVoiceCloneResponse,
+  isTerminalCloneStatus,
   buildRecordingFilterQuery,
   buildVoiceCloneFilterQuery,
 } from '../types/voice';
+
+/** Base64-encode an ArrayBuffer (chunked to avoid call-stack limits on big buffers). */
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  const chunks: string[] = [];
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    chunks.push(String.fromCharCode(...chunk));
+  }
+  return btoa(chunks.join(''));
+}
 
 // =============================================================================
 // Error Handling
@@ -76,28 +89,31 @@ export async function cloneVoice(
   request: VoiceCloneRequest,
   apiKey?: string
 ): Promise<VoiceCloneResponse> {
-  // Create form data for multipart upload
-  const formData = new FormData();
-  formData.append('name', request.name);
-  formData.append('provider', request.provider);
-
-  if (request.description) {
-    formData.append('description', request.description);
-  }
-
-  if (request.labels) {
-    formData.append('labels', JSON.stringify(request.labels));
-  }
-
-  // Append audio files
-  for (let i = 0; i < request.audioFiles.length; i++) {
-    const file = request.audioFiles[i];
+  // Canonical gateway VoiceCloneRequest body (JSON). Samples go as a base64/URL
+  // string array under `audio_samples` (the gateway field) — `audioFiles`
+  // ArrayBuffers are base64-encoded into it. The old multipart `audio_N` upload was
+  // wrong and silently dropped server-side.
+  const samples: string[] = [...(request.audioSamples ?? [])];
+  for (const file of request.audioFiles ?? []) {
     if (file === undefined) continue;
-    const blob = new Blob([file], { type: 'audio/wav' });
-    formData.append(`audio_${i}`, blob, `audio_${i}.wav`);
+    samples.push(arrayBufferToBase64(file));
   }
 
-  const headers: HeadersInit = {};
+  const body: Record<string, unknown> = {
+    provider: request.provider,
+    name: request.name,
+    audio_samples: samples,
+    mode: request.mode ?? 'instant',
+    remove_background_noise: request.removeBackgroundNoise ?? false,
+  };
+  if (request.description !== undefined) body.description = request.description;
+  if (request.labels !== undefined) body.labels = request.labels;
+  if (request.baseVoiceId !== undefined) body.base_voice_id = request.baseVoiceId;
+  if (request.sampleText !== undefined) body.sample_text = request.sampleText;
+
+  const headers: HeadersInit = {
+    'Content-Type': 'application/json',
+  };
   if (apiKey) {
     headers['Authorization'] = `Bearer ${apiKey}`;
   }
@@ -105,10 +121,42 @@ export async function cloneVoice(
   const response = await fetch(`${baseUrl}/voices/clone`, {
     method: 'POST',
     headers,
-    body: formData,
+    body: JSON.stringify(body),
   });
 
   return handleResponse(response, deserializeVoiceCloneResponse);
+}
+
+/**
+ * Clone a voice and resolve once it reaches a terminal status (`ready`/`failed`).
+ *
+ * For an `instant` clone (already `ready`) this resolves immediately. For a
+ * still-running `professional` clone the gateway exposes no `GET /voices/{id}`
+ * status endpoint this phase, so this rejects with a clear error rather than spin —
+ * finish verification/training via the provider, then use the `voiceId` once ready.
+ *
+ * @returns The terminal {@link VoiceCloneResponse} (its `voiceId` is a usable TTS voiceId).
+ */
+export async function cloneVoiceAndWait(
+  baseUrl: string,
+  request: VoiceCloneRequest,
+  apiKey?: string
+): Promise<VoiceCloneResponse> {
+  const result = await cloneVoice(baseUrl, request, apiKey);
+  if (isTerminalCloneStatus(result.status)) {
+    if (result.status === 'ready') return result;
+    throw new VoiceAPIError(
+      `voice clone failed (voiceId=${result.voiceId}, provider=${result.provider})`,
+      0
+    );
+  }
+  // Non-terminal (queued/verifying/training): no gateway poll endpoint this phase.
+  throw new VoiceAPIError(
+    `voice clone is still '${result.status}' (voiceId=${result.voiceId}); the gateway ` +
+      'does not yet expose a clone-status endpoint to poll. Finish verification/training ' +
+      'via the provider, then use the voiceId as a TTS voiceId once ready.',
+    0
+  );
 }
 
 /**

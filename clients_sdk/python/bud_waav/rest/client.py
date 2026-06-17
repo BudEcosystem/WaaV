@@ -356,41 +356,68 @@ class RestClient:
     async def clone_voice(
         self,
         name: str,
-        audio_files: list[bytes],
         provider: str = "elevenlabs",
+        audio_samples: Optional[list[str]] = None,
+        audio_files: Optional[list[bytes]] = None,
         description: Optional[str] = None,
         labels: Optional[dict[str, str]] = None,
+        mode: str = "instant",
+        base_voice_id: Optional[str] = None,
+        remove_background_noise: bool = False,
+        sample_text: Optional[str] = None,
     ) -> dict[str, Any]:
         """
-        Clone a voice from audio samples.
+        Clone a voice via the gateway's canonical ``POST /voices/clone`` body.
+
+        Mirrors the gateway ``VoiceCloneRequest`` (P4). Supply samples either as
+        already-encoded ``audio_samples`` (base64 strings or URLs) OR as raw
+        ``audio_files`` (bytes, base64-encoded here). Returns the gateway
+        ``VoiceCloneResponse`` dict: ``{voice_id, name, provider, status, ...}`` —
+        a ``ready`` voice_id is directly usable as a TTS ``voice_id``.
 
         Args:
-            name: Name for the cloned voice.
-            audio_files: List of audio file data (bytes).
-            provider: Voice cloning provider (elevenlabs, playht, resemble).
-            description: Optional description for the voice.
-            labels: Optional labels/tags for the voice.
+            name: Name for the cloned voice (required).
+            provider: Voice-clone provider (hume, elevenlabs, lmnt, cartesia,
+                playht, speechify, resemble).
+            audio_samples: Samples as base64 strings or URLs (canonical wire field).
+            audio_files: Raw audio bytes (convenience; base64-encoded into
+                ``audio_samples``). Merged with ``audio_samples`` if both given.
+            description: Optional description (Hume design / ElevenLabs label).
+            labels: Optional flat labels (ElevenLabs).
+            mode: ``instant`` (default) or ``professional`` (async).
+            base_voice_id: Base voice to design/derive from (provider-specific).
+            remove_background_noise: Strip background noise (ElevenLabs IVC / LMNT).
+            sample_text: Sample text for voice generation (Hume only).
 
         Returns:
-            Created voice information with voice_id.
+            Created voice information with ``voice_id`` and ``status``.
 
         Raises:
-            APIError: If cloning fails.
+            APIError: If cloning fails (e.g. 400 invalid request, 401 missing key).
         """
         import base64
 
-        # Convert audio files to base64
-        audio_base64 = [base64.b64encode(audio).decode("utf-8") for audio in audio_files]
+        samples: list[str] = list(audio_samples or [])
+        if audio_files:
+            samples.extend(
+                base64.b64encode(audio).decode("utf-8") for audio in audio_files
+            )
 
         payload: dict[str, Any] = {
-            "name": name,
             "provider": provider,
-            "audio_files": audio_base64,
+            "name": name,
+            "audio_samples": samples,
+            "mode": mode,
+            "remove_background_noise": remove_background_noise,
         }
         if description:
             payload["description"] = description
         if labels:
             payload["labels"] = labels
+        if base_voice_id:
+            payload["base_voice_id"] = base_voice_id
+        if sample_text:
+            payload["sample_text"] = sample_text
 
         result: dict[str, Any] = await self.post("/voices/clone", json=payload)
         return result

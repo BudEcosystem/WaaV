@@ -87,6 +87,22 @@ export function buildConfigMessage(config: WidgetConfig): Record<string, unknown
       model: config.tts.model ?? '',
     };
 
+    // Abstract voice selection (P4): the gateway resolves a VoiceDescriptor to a
+    // concrete provider voice_id server-side. Sent under `voice_descriptor` as a
+    // snake_case object; a raw voice_id always wins, so the gateway only uses this
+    // when voice_id is absent. Only set fields are emitted.
+    const vd = config.tts.voiceDescriptor;
+    if (vd) {
+      const vdWire: Record<string, unknown> = {};
+      if (vd.gender !== undefined) vdWire.gender = vd.gender;
+      if (vd.locale !== undefined) vdWire.locale = vd.locale;
+      if (vd.accent !== undefined) vdWire.accent = vd.accent;
+      if (vd.age !== undefined) vdWire.age = vd.age;
+      if (vd.style !== undefined) vdWire.style = vd.style;
+      if (vd.nameHint !== undefined) vdWire.name_hint = vd.nameHint;
+      if (Object.keys(vdWire).length > 0) ttsConfig.voice_descriptor = vdWire;
+    }
+
     if (config.tts.emotion) {
       if (config.tts.emotion.emotion !== undefined) {
         ttsConfig.emotion = config.tts.emotion.emotion;

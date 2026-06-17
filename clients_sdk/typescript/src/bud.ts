@@ -363,6 +363,20 @@ export class BudClient {
   }
 
   /**
+   * Voice-cloning helpers (P4): `bud.voices.clone({...})` + poll-until-ready.
+   *
+   * ```ts
+   * const { voiceId, status } = await bud.voices.clone({
+   *   provider: 'elevenlabs', name: 'My Voice', audioFiles: [wavBuffer],
+   * });
+   * // use voiceId as a TTS voiceId once status === 'ready'
+   * ```
+   */
+  get voices() {
+    return this.restClient.voices;
+  }
+
+  /**
    * Generate LiveKit token
    */
   async createLiveKitToken(request: Parameters<RestClient['createLiveKitToken']>[0]) {

@@ -600,6 +600,15 @@ class WebSocketSession:
                 "voice_id": self.tts_config.voice_id or self.tts_config.voice,
                 "model": self.tts_config.model or "aura-asteria-en",
             }
+            # Abstract voice selection (P4): the gateway resolves a VoiceDescriptor
+            # to a concrete provider voice_id server-side. Sent under
+            # `tts_config.voice_descriptor` (snake_case object); a raw voice_id
+            # always wins, so the gateway only uses this when voice_id is absent.
+            vd = self.tts_config.voice_descriptor
+            if vd is not None:
+                vd_wire = vd.to_wire() if hasattr(vd, "to_wire") else dict(vd)
+                if vd_wire:
+                    tts_dict["voice_descriptor"] = vd_wire
             # Include optional TTS fields recognized by gateway
             if self.tts_config.sample_rate:
                 tts_dict["sample_rate"] = self.tts_config.sample_rate

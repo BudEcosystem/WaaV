@@ -41,6 +41,9 @@ export type {
   Emotion,
   DeliveryStyle,
   EmotionIntensityLevel,
+  VoiceDescriptor,
+  VoiceGender,
+  VoiceAge,
 } from './types/config.js';
 export {
   DEFAULT_STT_CONFIG,
@@ -209,6 +212,11 @@ export {
 
 // Voice cloning and recording types
 export type {
+  VoiceCloneProvider,
+  VoiceCloneRequest,
+  VoiceCloneResponse,
+  VoiceCloneStatus,
+  CloneMode,
   VoiceCloneFilter,
   RecordingStatus,
   RecordingFormat,
@@ -217,7 +225,7 @@ export type {
   RecordingDownloadOptions,
   RecordingList,
 } from './types/voice.js';
-export { VOICE_CLONE_PROVIDERS } from './types/voice.js';
+export { VOICE_CLONE_PROVIDERS, isTerminalCloneStatus } from './types/voice.js';
 
 // Errors
 export * from './errors/index.js';
