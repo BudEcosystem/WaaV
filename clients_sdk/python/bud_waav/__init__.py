@@ -137,6 +137,7 @@ from .errors import (
     SynthesisError,
     ConfigurationError,
 )
+from .config_mirror import ADAPTER_KINDS, SDK_CONFIG_REACH
 from .pipelines import (
     BudSTT,
     STTSession,
@@ -145,6 +146,7 @@ from .pipelines import (
     BudTalk,
     TalkSession,
     TalkEvent,
+    ConfigWarning,
     BudTranscribe,
     TranscribeSession,
     # Realtime pipeline
@@ -286,8 +288,12 @@ __all__ = [
     "BudTalk",
     "TalkSession",
     "TalkEvent",
+    "ConfigWarning",
     "BudTranscribe",
     "TranscribeSession",
+    # Drift-guarded config mirror surface
+    "SDK_CONFIG_REACH",
+    "ADAPTER_KINDS",
     # Realtime pipeline
     "BudRealtime",
     "RealtimeSession",

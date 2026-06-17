@@ -4,7 +4,7 @@ Bud Foundry pipelines
 
 from .stt import BudSTT, STTSession
 from .tts import BudTTS, TTSSession
-from .talk import BudTalk, TalkSession, TalkEvent
+from .talk import BudTalk, TalkSession, TalkEvent, ConfigWarning
 from .transcribe import BudTranscribe, TranscribeSession
 from .realtime import (
     BudRealtime,
@@ -27,6 +27,7 @@ __all__ = [
     "BudTalk",
     "TalkSession",
     "TalkEvent",
+    "ConfigWarning",
     "BudTranscribe",
     "TranscribeSession",
     # Realtime pipeline

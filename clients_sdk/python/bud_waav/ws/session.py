@@ -540,10 +540,20 @@ class WebSocketSession:
             # the REAL wire home for turn_detection (it was a dead no-op before).
             td = self.audio_features.turn_detection if self.audio_features else None
             if td is not None and td.enabled:
-                stt_dict["turn_detection"] = {
+                td_wire: dict[str, Any] = {
                     "enabled": True,
                     "threshold": td.threshold,
                 }
+                # Eager end-of-turn needs BOTH stt_config.turn_detection.eager AND
+                # conversation_config.eager_eot (config.rs:357-361). The SDK pairs
+                # them: when the conversation loop opts into eager_eot, set the
+                # detector's eager flag so the speculative-start path is armed.
+                if (
+                    self.conversation_config is not None
+                    and getattr(self.conversation_config, "eager_eot", None)
+                ):
+                    td_wire["eager"] = True
+                stt_dict["turn_detection"] = td_wire
 
             config["stt_config"] = stt_dict
         elif self.audio:
@@ -760,8 +770,16 @@ class WebSocketSession:
                             confidence=data.get("confidence"),
                             speaker_id=data.get("speaker_id"),
                         )
+                        # Carry the optional speaker role through the queue (the
+                        # gateway's cascade stt_result has no role, but a DAG
+                        # text_output / assistant echo may set role="assistant").
+                        # The Talk pipeline routes role="assistant" to a `bot_text`
+                        # event; the STTResult shape itself is unchanged.
+                        role = data.get("role")
                         self._emit("transcript", result)
-                        await self._get_message_queue().put({"type": "transcript", "result": result})
+                        await self._get_message_queue().put(
+                            {"type": "transcript", "result": result, "role": role}
+                        )
 
                     elif msg_type == "tts_audio":
                         # Base64 encoded audio

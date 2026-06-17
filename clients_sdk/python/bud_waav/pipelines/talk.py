@@ -13,26 +13,77 @@ from ..ws.session import WebSocketSession, SessionMetrics, ReconnectConfig
 
 
 @dataclass
+class ConfigWarning:
+    """A typed gateway ``config_warning`` advisory (SDK_STANDARDIZATION_PLAN P1 #3).
+
+    The gateway emits this when a setting is sub-optimal or ignored but the
+    session still starts (it is non-fatal — it NEVER closes the session). The SDK
+    surfaces it as a first-class ``warning`` event so a beginner learns e.g.
+    "emotion=excited was ignored by deepgram" or "you placed a reasoning model on
+    the spoken path" instead of hitting a silent no-op.
+
+    Source of truth: ``OutgoingMessage::ConfigWarning`` (gateway messages.rs) +
+    the emitters in ``handlers/ws/config_lint.rs``.
+    """
+
+    code: str
+    """Stable machine code, e.g. ``unknown_config_keys``,
+    ``reasoning_model_on_voice_path``, ``reasoning_effort_clamped``,
+    ``emotion_ignored_for_provider``."""
+
+    message: str
+    """Human-readable explanation plus a one-line fix."""
+
+    detail: Optional[dict[str, Any]] = None
+    """Optional structured detail, e.g. ``{"ignored_keys": ["..."]}`` or
+    ``{"applied": ..., "floor": ...}``. ``None`` when the gateway omits it."""
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "ConfigWarning":
+        """Parse a raw ``{type: config_warning, code, message, detail?}`` frame."""
+        return cls(
+            code=str(data.get("code", "")),
+            message=str(data.get("message", "")),
+            detail=data.get("detail"),
+        )
+
+
+@dataclass
 class TalkEvent:
-    """Event from a Talk session."""
+    """Event from a Talk session.
+
+    The unified ``__aiter__`` stream yields these. Beginners care about four
+    types: ``transcript`` (what the user said), ``bot_text`` (what the bot replied
+    in text, when the gateway exposes it), ``audio`` (the bot's spoken reply — the
+    primary bot output on ``/ws``), and ``warning`` (a typed config advisory).
+    """
 
     type: str
-    """Event type: transcript, audio, message, error, playback_complete, turn_completed, vad_event, audio_end"""
+    """Event type: transcript, bot_text, audio, warning, message, error,
+    playback_complete, turn_completed, vad_event, audio_end."""
 
     transcript: Optional[STTResult] = None
-    """Transcript result (if type is 'transcript')"""
+    """Transcript result (if type is 'transcript' or 'bot_text')."""
 
     audio: Optional[AudioEvent] = None
-    """Audio event (if type is 'audio')"""
+    """Audio event (if type is 'audio')."""
 
     message: Optional[dict[str, Any]] = None
-    """Message data (if type is 'message')"""
+    """Message data (if type is 'message')."""
 
     error: Optional[Exception] = None
-    """Error (if type is 'error')"""
+    """Error (if type is 'error')."""
+
+    warning: Optional[ConfigWarning] = None
+    """Typed gateway advisory (if type is 'warning')."""
 
     data: Optional[dict[str, Any]] = None
-    """Raw data payload (for turn_completed, vad_event, audio_end)"""
+    """Raw data payload (for turn_completed, vad_event, audio_end, warning)."""
+
+    @property
+    def text(self) -> Optional[str]:
+        """Convenience: the text of a ``transcript``/``bot_text`` event, if any."""
+        return self.transcript.text if self.transcript is not None else None
 
 
 class BudTalk:
@@ -237,11 +288,24 @@ class TalkSession:
         self._session.on("turn_completed", self._on_turn_completed)
         self._session.on("vad_event", self._on_vad_event)
         self._session.on("audio_end", self._on_audio_end)
+        self._session.on("config_warning", self._on_config_warning)
 
     def _on_transcript(self, result: STTResult) -> None:
-        """Handle transcript events."""
+        """Handle transcript events (the user's speech)."""
         event = TalkEvent(type="transcript", transcript=result)
         self._emit("transcript", result)
+        self._emit("event", event)
+
+    def _on_config_warning(self, data: dict[str, Any]) -> None:
+        """Surface a gateway ``config_warning`` as a typed ``warning`` event.
+
+        P1 deliverable #3: a beginner learns that e.g. ``emotion`` was ignored by
+        the provider, or that an unknown/misnested config key was dropped, instead
+        of hitting a silent no-op. Never fatal — the session keeps running.
+        """
+        warning = ConfigWarning.from_wire(data)
+        event = TalkEvent(type="warning", warning=warning, data=data)
+        self._emit("warning", warning)
         self._emit("event", event)
 
     def _on_audio(self, audio: AudioEvent) -> None:
@@ -396,14 +460,31 @@ class TalkSession:
         self._session.reset_metrics()
 
     async def __aiter__(self) -> AsyncIterator[TalkEvent]:
-        """Iterate over all events."""
+        """Iterate over the unified event stream.
+
+        Beginner-facing types: ``transcript`` (user speech), ``bot_text`` (the
+        bot's reply text when the gateway exposes it via an assistant-role
+        transcript), ``audio`` (the bot's spoken reply — the primary bot output on
+        ``/ws``), and ``warning`` (a typed gateway ``config_warning`` advisory).
+        Lifecycle types (``turn_completed``/``vad_event``/``audio_end``/
+        ``playback_complete``/``message``/``error``) flow through too.
+        """
         async for message in self._session:
             msg_type = message.get("type")
 
             if msg_type == "transcript":
-                yield TalkEvent(type="transcript", transcript=message["result"])
+                # role="assistant" (DAG text echo) → bot_text; otherwise user.
+                ev_type = "bot_text" if message.get("role") == "assistant" else "transcript"
+                yield TalkEvent(type=ev_type, transcript=message["result"])
             elif msg_type == "audio":
                 yield TalkEvent(type="audio", audio=message["audio"])
+            elif msg_type == "config_warning":
+                # P1 #3: surface the gateway advisory instead of swallowing it.
+                yield TalkEvent(
+                    type="warning",
+                    warning=ConfigWarning.from_wire(message.get("data", {})),
+                    data=message.get("data"),
+                )
             elif msg_type == "message":
                 yield TalkEvent(type="message", message=message["data"])
             elif msg_type == "error":

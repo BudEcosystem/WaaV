@@ -37,6 +37,10 @@ export type {
   TTSConfig,
   Pronunciation,
   LiveKitConfig,
+  SessionConfig,
+  Emotion,
+  DeliveryStyle,
+  EmotionIntensityLevel,
 } from './types/config.js';
 export {
   DEFAULT_STT_CONFIG,
@@ -44,6 +48,20 @@ export {
   createSTTConfig,
   createTTSConfig,
 } from './types/config.js';
+
+// Conversation / agent-loop config (the flagship LLM + reasoning surface).
+export type {
+  ConversationConfig,
+  AdapterKind,
+  ReasoningEffort,
+  LatencyFiller,
+  RoutingMode,
+  MuteStrategy,
+} from './types/conversation.js';
+export { conversationConfigToWire } from './types/conversation.js';
+
+// config_warning typed advisory.
+export type { ConfigWarningEvent, ConfigWarningCode, ConfigWarningMessage } from './types/warnings.js';
 
 export type {
   ConfigMessage,
@@ -227,6 +245,7 @@ export type {
   AudioEvent,
   ReadyEvent,
   SessionErrorEvent,
+  ConfigWarningEvent as WSConfigWarningEvent,
   ConnectionStateEvent,
   MetricsEvent,
   ReconnectEvent,
@@ -243,6 +262,10 @@ export * from './pipelines/index.js';
 // Main Client
 export { BudClient, createBudClient, DEFAULT_GATEWAY_URL, GATEWAY_URL_ENV } from './bud.js';
 export type { BudClientConfig } from './bud.js';
+
+// Agent (flagship conversation loop) — re-export for direct import.
+export { AgentSession, buildAgentSessionConfig } from './pipelines/agent.js';
+export type { AgentConfig, AgentTurnConfig } from './pipelines/agent.js';
 
 // Version
 export const VERSION = '0.1.0';

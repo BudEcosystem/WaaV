@@ -7,6 +7,7 @@ import { BudSTT, type BudSTTConfig } from './pipelines/stt.js';
 import { BudTTS, type BudTTSConfig } from './pipelines/tts.js';
 import { BudTalk, type BudTalkConfig } from './pipelines/talk.js';
 import { BudTranscribe, type BudTranscribeConfig } from './pipelines/transcribe.js';
+import { AgentSession, type AgentConfig } from './pipelines/agent.js';
 import { WebSocketSession, type SessionConfig } from './ws/session.js';
 import type { FeatureFlags, DEFAULT_FEATURE_FLAGS } from './types/features.js';
 import type { MetricsSummary } from './types/metrics.js';
@@ -188,6 +189,44 @@ export class BudClient {
     this.tts = this.createTTSFactory();
     this.talk = this.createTalkFactory();
     this.transcribe = this.createTranscribeFactory();
+  }
+
+  /**
+   * Create the flagship agent loop (STT → built-in LLM → TTS) in ~5 lines.
+   *
+   * This is the ONLY entry point that reaches the gateway's built-in
+   * conversation loop with reasoning + barge-in + latency masking. It
+   * serializes `conversation_config` and nests turn detection into
+   * `stt_config.turn_detection`. Returns an UNCONNECTED {@link AgentSession};
+   * subscribe to events, then `await agent.connect()`.
+   *
+   * @example
+   * ```typescript
+   * const agent = bud.agent({
+   *   stt: { provider: 'deepgram', language: 'en-US' },
+   *   tts: { provider: 'deepgram', voiceId: 'aura-asteria-en' },
+   *   llm: {
+   *     baseUrl: 'http://localhost:11434/v1',
+   *     model: 'llama3.2:1b',
+   *     reasoningEffort: 'minimal',
+   *     latencyFiller: 'auto',
+   *   },
+   *   turn: { eagerEot: true },
+   * });
+   * agent.on('transcript', (t) => console.log('user:', t.text));
+   * agent.on('audio', (a) => playback(a.audio));     // bot speech
+   * agent.on('configWarning', (w) => console.warn(w.code, w.message));
+   * await agent.connect();
+   * agent.sendAudio(pcm);
+   * ```
+   */
+  agent(config: AgentConfig): AgentSession {
+    // Thread the client's custom WebSocket impl (Node) unless the caller set one.
+    const merged: AgentConfig = { ...config };
+    if (merged.WebSocket === undefined && this.config.WebSocket !== undefined) {
+      merged.WebSocket = this.config.WebSocket;
+    }
+    return new AgentSession(merged, this.wsUrl, this.config.apiKey);
   }
 
   /**

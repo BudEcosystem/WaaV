@@ -15,9 +15,12 @@ import type {
   ErrorMessage,
   PongMessage,
   SessionUpdateMessage,
+  ConfigWarningMessage,
   MessageType,
 } from '../types/messages.js';
-import type { STTConfig, TTSConfig, LiveKitConfig } from '../types/config.js';
+import type { STTConfig, TTSConfig, LiveKitConfig, DAGConfig, ConversationConfig, TurnDetectionConfig } from '../types/config.js';
+import { conversationConfigToWire } from '../types/conversation.js';
+import { serializeDAGConfig } from '../types/dag.js';
 import type { FeatureFlags } from '../types/features.js';
 
 // ============================================================================
@@ -102,6 +105,9 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 /**
  * SDK-facing ConfigMessage with camelCase fields.
  * This is different from the wire format which uses snake_case.
+ *
+ * 1:1 with the gateway `/ws` config envelope: stt/tts/livekit/dag/conversation,
+ * plus turn detection (nested into `stt_config.turn_detection` on the wire).
  */
 export interface SDKConfigMessage {
   type: 'config';
@@ -110,6 +116,17 @@ export interface SDKConfigMessage {
   stt?: STTConfig;
   tts?: TTSConfig;
   livekit?: LiveKitConfig;
+  /** DAG routing configuration. */
+  dag?: DAGConfig;
+  /** Built-in conversation/agent loop (serialized into `conversation_config`). */
+  conversation?: ConversationConfig;
+  /** ML turn detection (nested into `stt_config.turn_detection`). */
+  turnDetection?: TurnDetectionConfig;
+  /**
+   * Legacy client feature flags. These are folded into the nested
+   * `stt_config.features{}` block (NOT emitted as a top-level `features` key,
+   * which the gateway does not recognize and silently drops).
+   */
   features?: FeatureFlags;
 }
 
@@ -177,7 +194,13 @@ function sendMessageToWire(message: SendMessageMessage): Record<string, unknown>
 }
 
 /**
- * Convert config message to wire format
+ * Convert config message to wire format.
+ *
+ * Mirrors the gateway `/ws` config envelope. The dead top-level `features` key
+ * (silently dropped by the gateway) is GONE: advanced STT/TTS features nest
+ * under `stt_config.features{}` / `tts_config.features{}`, turn detection nests
+ * under `stt_config.turn_detection`, and the conversation/DAG loops get their
+ * own blocks.
  */
 function configToWire(message: SDKConfigMessage): Record<string, unknown> {
   const wire: Record<string, unknown> = {
@@ -193,7 +216,9 @@ function configToWire(message: SDKConfigMessage): Record<string, unknown> {
   }
 
   if (message.stt) {
-    wire.stt_config = sttConfigToWire(message.stt);
+    // Turn detection + legacy feature flags fold INTO the STT block (their real
+    // wire home), never a top-level key.
+    wire.stt_config = sttConfigToWire(message.stt, message.turnDetection, message.features);
   }
 
   if (message.tts) {
@@ -204,83 +229,188 @@ function configToWire(message: SDKConfigMessage): Record<string, unknown> {
     wire.livekit = livekitConfigToWire(message.livekit);
   }
 
-  if (message.features) {
-    wire.features = featuresToWire(message.features);
+  if (message.dag) {
+    wire.dag_config = serializeDAGConfig(message.dag);
+  }
+
+  if (message.conversation) {
+    wire.conversation_config = conversationConfigToWire(message.conversation);
   }
 
   return wire;
 }
 
-/**
- * Convert STT config to wire format
- */
-function sttConfigToWire(config: STTConfig): Record<string, unknown> {
-  return {
-    provider: config.provider,
-    language: config.language,
-    model: config.model,
-    sample_rate: config.sampleRate,
-    encoding: config.encoding,
-    channels: config.channels,
-    interim_results: config.interimResults,
-    punctuate: config.punctuate,
-    profanity_filter: config.profanityFilter,
-    smart_format: config.smartFormat,
-    diarize: config.diarize,
-    keywords: config.keywords,
-    custom_vocabulary: config.customVocabulary,
-    endpointing: config.endpointing,
-    utterance_end_ms: config.utteranceEndMs,
-  };
+/** Assign `value` to `target[key]` only when it is not undefined. */
+function setIfDefined(target: Record<string, unknown>, key: string, value: unknown): void {
+  if (value !== undefined) target[key] = value;
 }
 
 /**
- * Convert TTS config to wire format
+ * Build the nested `stt_config.features{}` block from the canonical SttFeatures
+ * fields on STTConfig (+ legacy FeatureFlags), omitting anything unset. Returns
+ * undefined when no feature is set so the key is omitted entirely.
+ */
+function sttFeaturesToWire(config: STTConfig, features?: FeatureFlags): Record<string, unknown> | undefined {
+  const f: Record<string, unknown> = {};
+
+  // Canonical SttFeatures (gateway/src/core/stt/standard.rs).
+  setIfDefined(f, 'interim_results', config.interimResults);
+  // STTConfig.diarize → canonical `diarization`.
+  setIfDefined(f, 'diarization', config.diarize);
+  setIfDefined(f, 'word_timestamps', config.wordTimestamps);
+  setIfDefined(f, 'smart_format', config.smartFormat);
+  setIfDefined(f, 'profanity_filter', config.profanityFilter);
+  setIfDefined(f, 'filler_words', config.fillerWords);
+  setIfDefined(f, 'vad_events', config.vadEvents);
+  setIfDefined(f, 'endpointing_ms', config.endpointingMs ?? config.endpointing);
+  setIfDefined(f, 'utterance_end_ms', config.utteranceEndMsFeature ?? config.utteranceEndMs);
+  // STTConfig.keywords / .keyterms → canonical `keyterms`.
+  setIfDefined(f, 'keyterms', config.keyterms ?? config.keywords);
+  setIfDefined(f, 'redaction', config.redaction);
+  setIfDefined(f, 'language_detection', config.languageDetection);
+  setIfDefined(f, 'entity_detection', config.entityDetection);
+  setIfDefined(f, 'numerals', config.numerals);
+  setIfDefined(f, 'multichannel', config.multichannel);
+  setIfDefined(f, 'alternatives', config.alternatives);
+  setIfDefined(f, 'sentiment', config.sentiment);
+  setIfDefined(f, 'speech_begin_event', config.speechBeginEvent);
+
+  // Legacy top-level FeatureFlags map onto canonical SttFeatures, without
+  // overriding an explicit per-config value above.
+  if (features) {
+    if (f.interim_results === undefined && features.interimResults !== undefined) f.interim_results = features.interimResults;
+    if (f.diarization === undefined && features.speakerDiarization !== undefined) f.diarization = features.speakerDiarization;
+    if (f.smart_format === undefined && features.smartFormat !== undefined) f.smart_format = features.smartFormat;
+    if (f.profanity_filter === undefined && features.profanityFilter !== undefined) f.profanity_filter = features.profanityFilter;
+    if (f.word_timestamps === undefined && features.wordTimestamps !== undefined) f.word_timestamps = features.wordTimestamps;
+    if (f.filler_words === undefined && features.fillerWords !== undefined) f.filler_words = features.fillerWords;
+  }
+
+  return Object.keys(f).length > 0 ? f : undefined;
+}
+
+/**
+ * Convert STT config to wire format (`STTWebSocketConfig`). Advanced features
+ * nest under `features{}`, ML turn detection under `turn_detection`, and the
+ * no-canonical-field long tail (e.g. customVocabulary) under `extras`.
+ */
+function sttConfigToWire(
+  config: STTConfig,
+  turnDetection?: TurnDetectionConfig,
+  features?: FeatureFlags
+): Record<string, unknown> {
+  const wire: Record<string, unknown> = {
+    provider: config.provider,
+  };
+  // Required-ish top-level scalars (omit when unset; the gateway has serde
+  // defaults for encoding/model and language is required by the gateway).
+  setIfDefined(wire, 'language', config.language);
+  setIfDefined(wire, 'sample_rate', config.sampleRate);
+  setIfDefined(wire, 'channels', config.channels);
+  // STTConfig allows `punctuate` as a Deepgram-style alias of `punctuation`.
+  setIfDefined(wire, 'punctuation', config.punctuation ?? config.punctuate);
+  setIfDefined(wire, 'encoding', config.encoding);
+  setIfDefined(wire, 'model', config.model);
+  setIfDefined(wire, 'api_key', config.apiKey);
+
+  // Nested canonical features.
+  const featuresWire = sttFeaturesToWire(config, features);
+  if (featuresWire) wire.features = featuresWire;
+
+  // ML turn detection → stt_config.turn_detection (config.rs:345). Only the
+  // three real TurnDetectionWsConfig fields go on the wire; the silence/padding
+  // hints are client-side VAD only.
+  if (turnDetection && turnDetection.enabled) {
+    const td: Record<string, unknown> = { enabled: true };
+    setIfDefined(td, 'threshold', turnDetection.threshold);
+    setIfDefined(td, 'eager', turnDetection.eager);
+    wire.turn_detection = td;
+  }
+
+  // Open passthrough: explicit extras + the no-canonical-field customVocabulary.
+  const extras: Record<string, unknown> = { ...(config.extras ?? {}) };
+  if (config.customVocabulary !== undefined && extras.custom_vocabulary === undefined) {
+    extras.custom_vocabulary = config.customVocabulary;
+  }
+  if (Object.keys(extras).length > 0) wire.extras = extras;
+
+  return wire;
+}
+
+/**
+ * Build the nested `tts_config.features{}` block from the canonical TtsFeatures
+ * fields on TTSConfig, omitting anything unset.
+ */
+function ttsFeaturesToWire(config: TTSConfig): Record<string, unknown> | undefined {
+  const f: Record<string, unknown> = {};
+
+  // Canonical TtsFeatures (gateway/src/core/tts/standard.rs). speed/pitch/volume
+  // /stability/similarity_boost/style/use_speaker_boost are ALSO mirrored here so
+  // providers reading TtsFeatures honor them too.
+  setIfDefined(f, 'speed', config.speed);
+  setIfDefined(f, 'pitch', config.pitch);
+  setIfDefined(f, 'volume', config.volume);
+  setIfDefined(f, 'stability', config.stability);
+  setIfDefined(f, 'similarity_boost', config.similarityBoost);
+  setIfDefined(f, 'style', config.style);
+  setIfDefined(f, 'use_speaker_boost', config.useSpeakerBoost);
+  setIfDefined(f, 'instructions', config.instructions);
+  setIfDefined(f, 'ssml', config.ssml);
+  setIfDefined(f, 'language', config.language);
+  setIfDefined(f, 'word_timestamps', config.wordTimestamps);
+  setIfDefined(f, 'streaming', config.streaming);
+  setIfDefined(f, 'seed', config.seed);
+  setIfDefined(f, 'optimize_streaming_latency', config.optimizeStreamingLatency);
+  setIfDefined(f, 'include_timestamp_types', config.includeTimestampTypes);
+  setIfDefined(f, 'rate_percentage', config.ratePercentage);
+  setIfDefined(f, 'pitch_percentage', config.pitchPercentage);
+
+  return Object.keys(f).length > 0 ? f : undefined;
+}
+
+/**
+ * Convert TTS config to wire format (`TTSWebSocketConfig`). Advanced knobs nest
+ * under `features{}`; Hume-only knobs with no canonical field go under `extras`.
  */
 function ttsConfigToWire(config: TTSConfig): Record<string, unknown> {
   const wire: Record<string, unknown> = {
     provider: config.provider,
-    voice: config.voice,
-    voice_id: config.voiceId,
-    model: config.model,
-    sample_rate: config.sampleRate,
-    audio_format: config.audioFormat,
-    speed: config.speed,
-    pitch: config.pitch,
-    volume: config.volume,
-    stability: config.stability,
-    similarity_boost: config.similarityBoost,
-    style: config.style,
-    use_speaker_boost: config.useSpeakerBoost,
   };
+  // `voice` is a convenience alias for `voice_id`.
+  setIfDefined(wire, 'voice_id', config.voiceId ?? config.voice);
+  setIfDefined(wire, 'model', config.model);
+  setIfDefined(wire, 'sample_rate', config.sampleRate);
+  setIfDefined(wire, 'audio_format', config.audioFormat);
+  // Top-level egress rate is `speaking_rate` on TTSWebSocketConfig; accept the
+  // `speakingRate` field or fall back to the `speed` alias.
+  setIfDefined(wire, 'speaking_rate', config.speakingRate ?? config.speed);
+  setIfDefined(wire, 'audio_out_chunk_ms', config.audioOutChunkMs);
+  setIfDefined(wire, 'client_playback_rate', config.clientPlaybackRate);
+  setIfDefined(wire, 'connection_timeout', config.connectionTimeout);
+  setIfDefined(wire, 'request_timeout', config.requestTimeout);
+  setIfDefined(wire, 'api_key', config.apiKey);
 
-  // Emotion settings (Unified Emotion System)
-  if (config.emotion !== undefined) {
-    wire.emotion = config.emotion;
-  }
-  if (config.emotionIntensity !== undefined) {
-    wire.emotion_intensity = config.emotionIntensity;
-  }
-  if (config.deliveryStyle !== undefined) {
-    wire.delivery_style = config.deliveryStyle;
-  }
-  if (config.emotionDescription !== undefined) {
-    wire.emotion_description = config.emotionDescription;
+  if (config.pronunciations !== undefined) {
+    wire.pronunciations = config.pronunciations.map((p) => ({ from: p.from, to: p.to }));
   }
 
-  // Hume-specific settings
-  if (config.actingInstructions !== undefined) {
-    wire.acting_instructions = config.actingInstructions;
-  }
-  if (config.voiceDescription !== undefined) {
-    wire.voice_description = config.voiceDescription;
-  }
-  if (config.trailingSilence !== undefined) {
-    wire.trailing_silence = config.trailingSilence;
-  }
-  if (config.instantMode !== undefined) {
-    wire.instant_mode = config.instantMode;
-  }
+  // Emotion settings (Unified Emotion System).
+  setIfDefined(wire, 'emotion', config.emotion);
+  setIfDefined(wire, 'emotion_intensity', config.emotionIntensity);
+  setIfDefined(wire, 'delivery_style', config.deliveryStyle);
+  setIfDefined(wire, 'emotion_description', config.emotionDescription);
+
+  // Nested canonical features.
+  const featuresWire = ttsFeaturesToWire(config);
+  if (featuresWire) wire.features = featuresWire;
+
+  // Hume-only knobs with no canonical TtsFeatures field → extras passthrough.
+  const extras: Record<string, unknown> = { ...(config.extras ?? {}) };
+  if (config.actingInstructions !== undefined && extras.acting_instructions === undefined) extras.acting_instructions = config.actingInstructions;
+  if (config.voiceDescription !== undefined && extras.voice_description === undefined) extras.voice_description = config.voiceDescription;
+  if (config.trailingSilence !== undefined && extras.trailing_silence === undefined) extras.trailing_silence = config.trailingSilence;
+  if (config.instantMode !== undefined && extras.instant_mode === undefined) extras.instant_mode = config.instantMode;
+  if (Object.keys(extras).length > 0) wire.extras = extras;
 
   return wire;
 }
@@ -300,24 +430,6 @@ function livekitConfigToWire(config: LiveKitConfig): Record<string, unknown> {
   if (config.listenParticipants !== undefined)
     wire.listen_participants = config.listenParticipants;
   return wire;
-}
-
-/**
- * Convert features to wire format
- */
-function featuresToWire(features: FeatureFlags): Record<string, unknown> {
-  return {
-    vad: features.vad,
-    noise_cancellation: features.noiseCancellation,
-    speaker_diarization: features.speakerDiarization,
-    interim_results: features.interimResults,
-    punctuation: features.punctuation,
-    profanity_filter: features.profanityFilter,
-    smart_format: features.smartFormat,
-    word_timestamps: features.wordTimestamps,
-    echo_cancellation: features.echoCancellation,
-    filler_words: features.fillerWords,
-  };
 }
 
 /**
@@ -365,6 +477,8 @@ function fromWireFormat(wire: Record<string, unknown>): IncomingMessage {
       return pongFromWire(wire);
     case 'session_update':
       return sessionUpdateFromWire(wire);
+    case 'config_warning':
+      return configWarningFromWire(wire);
     default:
       // Return generic message for unknown types (e.g. tts_playback_complete,
       // message, participant_disconnected, sip_transfer_error). These already
@@ -476,21 +590,54 @@ function sessionUpdateFromWire(wire: Record<string, unknown>): SessionUpdateMess
 }
 
 /**
- * Create a config message
+ * Convert config_warning message from wire format. Gateway wire shape
+ * (handlers/ws/messages.rs OutgoingMessage::ConfigWarning):
+ * { type, code, message, detail? }. `detail` is arbitrary JSON.
+ */
+function configWarningFromWire(wire: Record<string, unknown>): ConfigWarningMessage {
+  const msg: ConfigWarningMessage = {
+    type: 'config_warning',
+    code: asStringRequired(wire.code, 'code'),
+    message: asStringRequired(wire.message, 'message'),
+  };
+  const detail = asRecord(wire.detail);
+  if (detail !== undefined) msg.detail = detail;
+  return msg;
+}
+
+/**
+ * Create a config message.
+ *
+ * `stt`/`tts`/`livekit`/`features` are positional for backward compatibility;
+ * the 1:1-mirror additions (dag / conversation / turnDetection / streamId /
+ * audio) are passed via the trailing `extra` options bag.
  */
 export function createConfigMessage(
   stt?: STTConfig,
   tts?: TTSConfig,
   livekit?: LiveKitConfig,
-  features?: FeatureFlags
+  features?: FeatureFlags,
+  extra?: {
+    dag?: DAGConfig;
+    conversation?: ConversationConfig;
+    turnDetection?: TurnDetectionConfig;
+    streamId?: string;
+    audio?: boolean;
+  }
 ): SDKConfigMessage {
-  return {
+  const msg: SDKConfigMessage = {
     type: 'config',
     stt,
     tts,
     livekit,
     features,
   };
+  if (extra?.dag !== undefined) msg.dag = extra.dag;
+  if (extra?.conversation !== undefined) msg.conversation = extra.conversation;
+  if (extra?.turnDetection !== undefined) msg.turnDetection = extra.turnDetection;
+  if (extra?.streamId !== undefined) msg.streamId = extra.streamId;
+  if (extra?.audio !== undefined) msg.audio = extra.audio;
+  return msg;
 }
 
 /**

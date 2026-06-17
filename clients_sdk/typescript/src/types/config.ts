@@ -1,3 +1,19 @@
+import type { DAGConfig } from './dag.js';
+import type { TurnDetectionConfig } from './audio-features.js';
+import type { ConversationConfig } from './conversation.js';
+
+// Re-export so the full config surface is importable from one place.
+export type { DAGConfig } from './dag.js';
+export type { TurnDetectionConfig } from './audio-features.js';
+export type {
+  ConversationConfig,
+  AdapterKind,
+  ReasoningEffort,
+  LatencyFiller,
+  RoutingMode,
+  MuteStrategy,
+} from './conversation.js';
+
 // =============================================================================
 // Emotion Types (Unified Emotion System)
 // =============================================================================
@@ -111,6 +127,49 @@ export interface STTConfig {
   endpointing?: number;
   /** Utterance end timeout in ms */
   utteranceEndMs?: number;
+
+  // ---------------------------------------------------------------------------
+  // Advanced STT features — 1:1 with the gateway canonical `SttFeatures`
+  // (gateway/src/core/stt/standard.rs). These nest under `stt_config.features{}`
+  // on the wire (see configToWire); flat-on-top was silently dropped pre-P1.
+  // ---------------------------------------------------------------------------
+  /** Per-word timestamps in the transcript. */
+  wordTimestamps?: boolean;
+  /** Emit filler words ("um", "uh") instead of suppressing them. */
+  fillerWords?: boolean;
+  /** Emit explicit VAD speech-start/stop events. */
+  vadEvents?: boolean;
+  /** Silence (ms) after speech before finalizing an utterance. */
+  endpointingMs?: number;
+  /** Hard cap (ms) on how long an utterance may run before a forced finalize. */
+  utteranceEndMsFeature?: number;
+  /** Boost recognition of these key terms / phrases (canonical `keyterms`). */
+  keyterms?: string[];
+  /** PII entity classes to redact from the transcript. */
+  redaction?: string[];
+  /** Auto-detect the spoken language. */
+  languageDetection?: boolean;
+  /** Tag named entities in the transcript. */
+  entityDetection?: boolean;
+  /** Render numerals as digits ("twenty" → "20"). */
+  numerals?: boolean;
+  /** Transcribe each audio channel independently. */
+  multichannel?: boolean;
+  /** Number of alternative transcripts to return (0-255). */
+  alternatives?: number;
+  /** Per-utterance sentiment analysis. */
+  sentiment?: boolean;
+  /** Emit a speech-begin event when speech first starts. */
+  speechBeginEvent?: boolean;
+
+  /**
+   * Open passthrough forwarded verbatim into the gateway `extras` map (never
+   * flagged by the gateway config linter — the escape hatch for provider-only
+   * knobs with no canonical field, e.g. `custom_vocabulary`).
+   */
+  extras?: Record<string, unknown>;
+  /** Per-session API key override (literal or '${ENV}'). */
+  apiKey?: string;
 }
 
 /**
@@ -172,6 +231,50 @@ export interface TTSConfig {
   trailingSilence?: number;
   /** Enable instant mode for lower latency (Hume) */
   instantMode?: boolean;
+
+  // ---------------------------------------------------------------------------
+  // Gateway egress / timing knobs (top-level on TTSWebSocketConfig, config.rs).
+  // ---------------------------------------------------------------------------
+  /** WS egress reframing: emit audio in chunks of this many ms. */
+  audioOutChunkMs?: number;
+  /** Resample the egress audio to this rate for client playback. */
+  clientPlaybackRate?: number;
+  /** Per-session API key override (literal or '${ENV}'). */
+  apiKey?: string;
+
+  // ---------------------------------------------------------------------------
+  // Advanced TTS features — 1:1 with the gateway canonical `TtsFeatures`
+  // (gateway/src/core/tts/standard.rs). These nest under `tts_config.features{}`
+  // on the wire (see configToWire). `speed`/`pitch`/`volume`/`stability`/
+  // `similarityBoost`/`style`/`useSpeakerBoost` above are ALSO mirrored here.
+  // ---------------------------------------------------------------------------
+  /** Natural-language acting instructions (canonical `instructions`; OpenAI/Hume). */
+  instructions?: string;
+  /** Treat the input text as SSML markup. */
+  ssml?: boolean;
+  /** Language hint for the TTS voice (provider-native code). */
+  language?: string;
+  /** Per-word timestamps in the synthesized audio stream. */
+  wordTimestamps?: boolean;
+  /** Stream audio as it is generated (vs. one-shot). */
+  streaming?: boolean;
+  /** Deterministic synthesis seed. */
+  seed?: number;
+  /** Latency/quality trade-off knob (ElevenLabs `optimize_streaming_latency`, 0-4). */
+  optimizeStreamingLatency?: number;
+  /** Which timestamp granularities to include (e.g. ["word","character"]). */
+  includeTimestampTypes?: string[];
+  /** Speaking-rate delta as a percentage (-100..100). */
+  ratePercentage?: number;
+  /** Pitch delta as a percentage (-100..100). */
+  pitchPercentage?: number;
+
+  /**
+   * Open passthrough forwarded verbatim into the gateway `extras` map (never
+   * flagged by the gateway config linter — the escape hatch for provider-only
+   * knobs with no canonical field).
+   */
+  extras?: Record<string, unknown>;
 }
 
 /**
@@ -202,19 +305,41 @@ export interface LiveKitConfig {
 }
 
 /**
- * Complete WebSocket session configuration
+ * Complete WebSocket session configuration — a 1:1 mirror of the gateway `/ws`
+ * config envelope (IncomingMessage::Config, gateway/src/handlers/ws/messages.rs).
+ *
+ * Every gateway config sub-block is reachable from here:
+ *   - sttConfig / ttsConfig / livekit / dag / conversation
+ *   - turnDetection (nested into stt_config.turn_detection on the wire)
+ *
+ * A drift-guard test (tests/unit/config-drift.test.ts) asserts this field set
+ * covers the openapi schema's config properties, so a new gateway field can
+ * never become silently unreachable again.
  */
 export interface SessionConfig {
-  /** Optional unique identifier for this WebSocket session */
+  /** Optional unique identifier for this WebSocket session (wire: stream_id). */
   streamId?: string;
-  /** Enable audio processing (STT/TTS). Defaults to true */
+  /** Enable audio processing (STT/TTS). Defaults to true. */
   audio?: boolean;
-  /** STT configuration (required when audio=true) */
+  /** STT configuration (required when audio=true). */
   sttConfig?: STTConfig;
-  /** TTS configuration (required when audio=true) */
+  /** TTS configuration (required when audio=true). */
   ttsConfig?: TTSConfig;
-  /** LiveKit configuration for real-time audio streaming */
+  /** LiveKit configuration for real-time audio streaming. */
   livekit?: LiveKitConfig;
+  /** DAG routing configuration (named template or inline definition). */
+  dag?: DAGConfig;
+  /**
+   * Built-in conversation/agent loop (LLM + reasoning + barge-in + latency
+   * filler). Serialized into `conversation_config`. This is the flagship
+   * surface; `bud.agent(...)` is the easy way to build it.
+   */
+  conversation?: ConversationConfig;
+  /**
+   * ML turn-detection. Nests into `stt_config.turn_detection` on the wire (its
+   * real home), NOT a top-level key.
+   */
+  turnDetection?: TurnDetectionConfig;
 }
 
 /**

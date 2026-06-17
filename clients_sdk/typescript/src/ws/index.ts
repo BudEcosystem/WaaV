@@ -14,6 +14,7 @@ export {
   type AudioEvent,
   type ReadyEvent,
   type SessionErrorEvent,
+  type ConfigWarningEvent,
   type ConnectionStateEvent,
   type MetricsEvent,
   type ReconnectEvent,

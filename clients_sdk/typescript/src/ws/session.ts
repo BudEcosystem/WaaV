@@ -4,9 +4,10 @@
  */
 
 import { ConnectionError, RateLimitError } from '../errors/index.js';
-import type { STTConfig, TTSConfig, LiveKitConfig } from '../types/config.js';
+import type { STTConfig, TTSConfig, LiveKitConfig, DAGConfig, ConversationConfig, TurnDetectionConfig } from '../types/config.js';
 import type { FeatureFlags } from '../types/features.js';
-import type { IncomingMessage, STTResultMessage, TTSAudioMessage, ReadyMessage, ErrorMessage } from '../types/messages.js';
+import type { IncomingMessage, STTResultMessage, TTSAudioMessage, ReadyMessage, ErrorMessage, ConfigWarningMessage } from '../types/messages.js';
+import type { ConfigWarningEvent } from '../types/warnings.js';
 import { PROTOCOL_VERSION } from '../types/messages.js';
 import type { MetricsSummary } from '../types/metrics.js';
 import { getMetricsCollector, MetricsCollector } from '../metrics/collector.js';
@@ -38,6 +39,19 @@ export interface SessionConfig {
   tts?: TTSConfig;
   /** LiveKit configuration */
   livekit?: LiveKitConfig;
+  /** DAG routing configuration. */
+  dag?: DAGConfig;
+  /**
+   * Built-in conversation/agent loop (LLM + reasoning + barge-in + latency
+   * filler). Serialized into `conversation_config`.
+   */
+  conversation?: ConversationConfig;
+  /** ML turn detection (nested into `stt_config.turn_detection`). */
+  turnDetection?: TurnDetectionConfig;
+  /** Stream identifier to request (wire: stream_id). */
+  streamId?: string;
+  /** Enable audio processing (STT/TTS). Defaults to true (gateway default). */
+  audio?: boolean;
   /** Feature flags */
   features?: FeatureFlags;
   /**
@@ -87,6 +101,9 @@ export class WebSocketSession {
   private sttConfig?: STTConfig;
   private ttsConfig?: TTSConfig;
   private livekitConfig?: LiveKitConfig;
+  private dagConfig?: DAGConfig;
+  private conversationConfig?: ConversationConfig;
+  private turnDetectionConfig?: TurnDetectionConfig;
   private featuresConfig?: FeatureFlags;
 
   constructor(config: SessionConfig) {
@@ -94,6 +111,9 @@ export class WebSocketSession {
     this.sttConfig = config.stt;
     this.ttsConfig = config.tts;
     this.livekitConfig = config.livekit;
+    this.dagConfig = config.dag;
+    this.conversationConfig = config.conversation;
+    this.turnDetectionConfig = config.turnDetection;
     this.featuresConfig = config.features;
 
     // Build WebSocket URL with auth
@@ -249,10 +269,30 @@ export class WebSocketSession {
       case 'error':
         this.handleErrorMessage(message as ErrorMessage);
         break;
+      case 'config_warning':
+        this.handleConfigWarning(message as ConfigWarningMessage);
+        break;
       case 'pong':
         this.handlePong(message as { type: 'pong'; timestamp: number; server_time?: number });
         break;
     }
+  }
+
+  /**
+   * Handle a non-fatal gateway config advisory. The session keeps running; we
+   * surface it as a typed `configWarning` event so a silent server-side degrade
+   * (unknown/misnested key, emotion ignored by the provider, reasoning model on
+   * the voice path) becomes visible to the developer.
+   */
+  private handleConfigWarning(message: ConfigWarningMessage): void {
+    this.metrics.increment('ws.configWarnings');
+    const event: ConfigWarningEvent = {
+      code: message.code,
+      message: message.message,
+      raw: message,
+    };
+    if (message.detail !== undefined) event.detail = message.detail;
+    this.emitter.emit('configWarning', event);
   }
 
   /**
@@ -407,15 +447,34 @@ export class WebSocketSession {
   }
 
   /**
-   * Send configuration message
+   * Send configuration message. Forwards the full 1:1 config surface: stt/tts/
+   * livekit/dag/conversation, plus turn detection (nested into
+   * stt_config.turn_detection by the serializer) and the audio/streamId knobs.
    */
   private sendConfig(): void {
-    if (this.sttConfig || this.ttsConfig || this.livekitConfig || this.featuresConfig) {
+    const hasConfig =
+      this.sttConfig ||
+      this.ttsConfig ||
+      this.livekitConfig ||
+      this.dagConfig ||
+      this.conversationConfig ||
+      this.turnDetectionConfig ||
+      this.featuresConfig ||
+      this.config.audio !== undefined ||
+      this.config.streamId !== undefined;
+    if (hasConfig) {
       const configMessage = createConfigMessage(
         this.sttConfig,
         this.ttsConfig,
         this.livekitConfig,
-        this.featuresConfig
+        this.featuresConfig,
+        {
+          dag: this.dagConfig,
+          conversation: this.conversationConfig,
+          turnDetection: this.turnDetectionConfig,
+          streamId: this.config.streamId,
+          audio: this.config.audio,
+        }
       );
       this.send(configMessage);
     }

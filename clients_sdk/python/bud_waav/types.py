@@ -13,53 +13,140 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class STTProvider(str, Enum):
-    """
-    Supported Speech-to-Text providers.
-    All 10 providers supported by the gateway.
+    """Speech-to-Text providers dispatchable by the gateway.
+
+    The FULL set (32) sourced 1:1 from the gateway's STT dispatch table
+    (``gateway/src/core/stt/standard.rs`` ``create_stt_standard`` +
+    ``plugin/dispatch.rs`` builtin registry). Accept a bare ``str`` anywhere a
+    provider is taken so a newly-added gateway provider is reachable before the
+    SDK enum is regenerated (forward-compat). Drift-guarded by
+    ``tests/unit/test_provider_enums.py`` against ``PROVIDER_DRIFT.md``.
     """
 
-    DEEPGRAM = "deepgram"
-    GOOGLE = "google"
-    AZURE = "azure"
-    CARTESIA = "cartesia"
-    GATEWAY = "gateway"
+    ALIBABA_CLOUD = "alibaba-cloud"
+    AMIVOICE = "amivoice"
     ASSEMBLYAI = "assemblyai"
     AWS_TRANSCRIBE = "aws-transcribe"
-    IBM_WATSON = "ibm-watson"
+    BAIDU = "baidu"
+    BHASHINI = "bhashini"
+    CARTESIA = "cartesia"
+    DEEPGRAM = "deepgram"
+    ELEVENLABS = "elevenlabs"
+    FPT_AI = "fpt-ai"
+    GLADIA = "gladia"
+    GNANI = "gnani"
+    GOOGLE = "google"
     GROQ = "groq"
-    OPENAI_WHISPER = "openai-whisper"
+    HUAWEI_CLOUD = "huawei-cloud"
+    IBM_WATSON = "ibm-watson"
+    IFLYTEK = "iflytek"
+    MICROSOFT_AZURE = "microsoft-azure"
+    NAVER_CLOVA = "naver-clova"
+    NECTEC = "nectec"
+    OPENAI = "openai"
+    PHONEXIA = "phonexia"
+    PROSA_AI = "prosa-ai"
+    REVAI = "revai"
+    REVERIE = "reverie"
+    SARVAM = "sarvam"
+    SBERDEVICES = "sberdevices"
+    SPEECHMATICS = "speechmatics"
+    TENCENT = "tencent"
+    TINKOFF = "tinkoff"
+    VIETTEL_AI = "viettel-ai"
+    YANDEX = "yandex"
 
 
 class TTSProvider(str, Enum):
-    """
-    Supported Text-to-Speech providers.
-    All 12 providers supported by the gateway.
+    """Text-to-Speech providers dispatchable by the gateway.
+
+    The FULL set (37) sourced 1:1 from the gateway's TTS dispatch table
+    (``gateway/src/core/tts/standard.rs`` ``create_tts_standard`` +
+    ``plugin/dispatch.rs`` builtin registry). Accept a bare ``str`` for
+    forward-compat. Drift-guarded against ``PROVIDER_DRIFT.md``.
     """
 
+    ACAPELA = "acapela"
+    ALIBABA_CLOUD = "alibaba-cloud"
+    AWS_POLLY = "aws-polly"
+    BAIDU = "baidu"
+    BHASHINI = "bhashini"
+    CARTESIA = "cartesia"
+    CEREPROC = "cereproc"
     DEEPGRAM = "deepgram"
     ELEVENLABS = "elevenlabs"
+    FPT_AI = "fpt-ai"
+    GNANI = "gnani"
     GOOGLE = "google"
-    AZURE = "azure"
-    CARTESIA = "cartesia"
-    OPENAI = "openai"
-    AWS_POLLY = "aws-polly"
-    IBM_WATSON = "ibm-watson"
+    HUAWEI_CLOUD = "huawei-cloud"
     HUME = "hume"
+    IBM_WATSON = "ibm-watson"
+    IFLYTEK = "iflytek"
     LMNT = "lmnt"
+    MICROSOFT_AZURE = "microsoft-azure"
+    MURF = "murf"
+    NAVER_CLOVA = "naver-clova"
+    NECTEC = "nectec"
+    OPENAI = "openai"
     PLAYHT = "playht"
-    KOKORO = "kokoro"
+    PROSA_AI = "prosa-ai"
+    RESEMBLE = "resemble"
+    REVERIE = "reverie"
+    SBERDEVICES = "sberdevices"
+    SMALLEST = "smallest"
+    SPEECHIFY = "speechify"
+    SPEECHMATICS = "speechmatics"
+    TENCENT = "tencent"
+    TINKOFF = "tinkoff"
+    UNREALSPEECH = "unrealspeech"
+    VIETTEL_AI = "viettel-ai"
+    WELLSAID = "wellsaid"
+    YANDEX = "yandex"
+    ZALO_AI = "zalo-ai"
 
 
 class RealtimeProvider(str, Enum):
+    """Realtime (speech-to-speech) providers dispatchable by the gateway.
+
+    The FULL set (12) sourced 1:1 from the gateway realtime registry
+    (``gateway/src/core/realtime/mod.rs`` ``get_supported_realtime_providers``
+    / ``plugin/dispatch.rs`` ``BUILTIN_REALTIME_NAMES``). Accept a bare ``str``
+    for forward-compat. Drift-guarded against ``PROVIDER_DRIFT.md``.
+
+    NOTE: the realtime names are the bare vendor tokens the gateway's
+    ``/realtime`` endpoint accepts (``openai``, ``hume``, …) — NOT the old
+    ``openai-realtime``/``hume-evi`` aliases the SDK shipped before P1.
     """
-    Supported Realtime (Audio-to-Audio) providers.
-    """
 
-    OPENAI_REALTIME = "openai-realtime"
-    HUME_EVI = "hume-evi"
+    OPENAI = "openai"
+    HUME = "hume"
+    AZURE = "azure"
+    GROK = "grok"
+    INWORLD = "inworld"
+    DEEPGRAM = "deepgram"
+    ELEVENLABS = "elevenlabs"
+    GEMINI = "gemini"
+    ULTRAVOX = "ultravox"
+    NOVA_SONIC = "nova_sonic"
+    SPEECHMATICS = "speechmatics"
+    YANDEX = "yandex"
+
+    # Backward-compatible aliases for the pre-P1 SDK names. The realtime
+    # pipeline (pipelines/realtime.py) historically used these; keep them
+    # resolvable so old user code keeps importing, but they map to the
+    # gateway-native tokens above (aliases are NOT re-listed by iteration).
+    OPENAI_REALTIME = "openai"
+    HUME_EVI = "hume"
 
 
-# Provider capability definitions
+# Provider capability hints (best-effort REFERENCE only — NOT authoritative).
+#
+# This is a small curated subset for the most-used providers; it is intentionally
+# NOT exhaustive across all 32/37/12 dispatchable providers. The authoritative,
+# always-current capability matrix lives gateway-side (SDK_STANDARDIZATION_PLAN
+# P3 `/capabilities`); ``get_provider_capabilities`` returns ``None`` for any
+# valid-but-uncatalogued provider rather than blocking it. Never gate a provider
+# on the presence of an entry here.
 STT_PROVIDER_CAPABILITIES: dict[STTProvider, dict[str, Any]] = {
     STTProvider.DEEPGRAM: {
         "streaming": True,
@@ -73,7 +160,7 @@ STT_PROVIDER_CAPABILITIES: dict[STTProvider, dict[str, Any]] = {
         "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh"],
         "models": ["default", "command_and_search", "phone_call", "video"],
     },
-    STTProvider.AZURE: {
+    STTProvider.MICROSOFT_AZURE: {
         "streaming": True,
         "diarization": True,
         "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh"],
@@ -85,11 +172,11 @@ STT_PROVIDER_CAPABILITIES: dict[STTProvider, dict[str, Any]] = {
         "languages": ["en"],
         "models": ["default"],
     },
-    STTProvider.GATEWAY: {
+    STTProvider.SARVAM: {
         "streaming": True,
-        "diarization": True,
-        "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh"],
-        "models": ["whisper-large-v3", "whisper-medium", "whisper-small"],
+        "diarization": False,
+        "languages": ["hi-IN", "en-IN", "ta-IN", "te-IN", "kn-IN", "ml-IN", "bn-IN"],
+        "models": ["saarika:v2"],
     },
     STTProvider.ASSEMBLYAI: {
         "streaming": True,
@@ -115,11 +202,11 @@ STT_PROVIDER_CAPABILITIES: dict[STTProvider, dict[str, Any]] = {
         "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh"],
         "models": ["whisper-large-v3-turbo"],
     },
-    STTProvider.OPENAI_WHISPER: {
+    STTProvider.OPENAI: {
         "streaming": False,
         "diarization": False,
         "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh"],
-        "models": ["whisper-1"],
+        "models": ["whisper-1", "gpt-4o-transcribe", "gpt-4o-mini-transcribe"],
     },
 }
 
@@ -149,7 +236,7 @@ TTS_PROVIDER_CAPABILITIES: dict[TTSProvider, dict[str, Any]] = {
         "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh"],
         "models": ["en-US-Studio-O", "en-US-Wavenet-D"],
     },
-    TTSProvider.AZURE: {
+    TTSProvider.MICROSOFT_AZURE: {
         "streaming": True,
         "ssml": True,
         "emotion": True,
@@ -213,26 +300,20 @@ TTS_PROVIDER_CAPABILITIES: dict[TTSProvider, dict[str, Any]] = {
         "languages": ["en"],
         "models": ["PlayHT2.0", "PlayHT2.0-turbo"],
     },
-    TTSProvider.KOKORO: {
-        "streaming": True,
-        "ssml": False,
-        "emotion": False,
-        "voice_cloning": False,
-        "languages": ["en", "ja", "ko", "zh"],
-        "models": ["kokoro-v1"],
-    },
 }
 
 
+# Realtime capability hints (best-effort REFERENCE subset; see the STT note above).
+# Keyed by the gateway-native realtime token (RealtimeProvider.OPENAI == "openai").
 REALTIME_PROVIDER_CAPABILITIES: dict[RealtimeProvider, dict[str, Any]] = {
-    RealtimeProvider.OPENAI_REALTIME: {
+    RealtimeProvider.OPENAI: {
         "function_calling": True,
         "vision": False,
         "emotion_detection": False,
-        "models": ["gpt-4o-realtime-preview", "gpt-4o-mini-realtime-preview"],
+        "models": ["gpt-realtime", "gpt-4o-realtime-preview", "gpt-4o-mini-realtime-preview"],
         "voices": ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"],
     },
-    RealtimeProvider.HUME_EVI: {
+    RealtimeProvider.HUME: {
         "function_calling": True,
         "vision": False,
         "emotion_detection": True,

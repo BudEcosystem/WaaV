@@ -627,14 +627,25 @@
   <!-- Load the Bud Widget -->
   <script src="../dist/bud-widget.min.js"></script>
 
-  <!-- Initialize the widget -->
+  <!-- Initialize the widget.
+
+       FLAGSHIP one-tag talking bot: data-llm-base-url + data-llm-model drive the
+       gateway STT -> LLM -> TTS loop so the bot talks back; data-stt-provider picks
+       the ear; a bare data-tts-voice picks the voice. The optional data-llm-*
+       reasoning / barge-in / latency-filler dials add realtime-reasoning in a few
+       more attributes (see clients_sdk/widget/src/config.ts for the full set). -->
   <bud-widget
     data-gateway-url="ws://localhost:3009/ws"
     data-theme="dark"
     data-position="bottom-right"
     data-show-metrics="true"
     data-stt-provider="deepgram"
-    data-tts-provider="elevenlabs">
+    data-tts-voice="aura-asteria-en"
+    data-llm-base-url="http://localhost:11434/v1"
+    data-llm-model="qwen2.5:7b-instruct"
+    data-llm-reasoning-effort="low"
+    data-llm-latency-filler="auto"
+    data-llm-barge-in-min-words="2">
   </bud-widget>
 
   <script>
@@ -655,6 +666,13 @@
 
     widget.addEventListener('error', (e) => {
       console.error('Widget error:', e.detail);
+    });
+
+    // Non-fatal gateway advisory: a config key was ignored (typo / wrong nesting)
+    // or a feature is a no-op (e.g. "emotion ignored by deepgram"). Surfacing this
+    // turns a silent server-side no-op into something a developer can actually see.
+    widget.addEventListener('configWarning', (e) => {
+      console.warn('Gateway config warning [' + e.detail.code + ']:', e.detail.message, e.detail.detail || '');
     });
 
     // Smooth scroll for navigation

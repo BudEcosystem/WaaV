@@ -2,7 +2,13 @@
  * WebSocket connection handler for widget
  */
 
-import type { WidgetConfig, TranscriptResult, WidgetMetrics } from './types';
+import type {
+  WidgetConfig,
+  TranscriptResult,
+  WidgetMetrics,
+  ConfigWarning,
+  ConversationConfig,
+} from './types';
 
 /**
  * Build the `/ws` `config` envelope from a WidgetConfig.
@@ -34,7 +40,11 @@ export function buildConfigMessage(config: WidgetConfig): Record<string, unknown
       sample_rate: config.stt.sampleRate || 16000,
       channels: config.stt.channels || 1,
       encoding: config.stt.encoding || 'linear16',
-      model: config.stt.model || 'nova-3',
+      // Empty model => the gateway picks the provider's recommended default
+      // (gateway config.rs: "each provider maps an empty model to its
+      // recommended default"). Provider-agnostic: a hardcoded deepgram model
+      // like "nova-3" would be wrong for openai/google/etc.
+      model: config.stt.model ?? '',
       punctuation: config.features?.punctuation ?? true,
     };
 
@@ -61,7 +71,12 @@ export function buildConfigMessage(config: WidgetConfig): Record<string, unknown
       provider: config.tts.provider,
       voice_id: config.tts.voiceId || config.tts.voice,
       sample_rate: config.tts.sampleRate || 24000,
-      model: config.tts.model,
+      // `model` is REQUIRED on the wire (gateway TTSWebSocketConfig has no serde
+      // default). Omitting it makes the gateway HARD-REJECT the whole config
+      // message ("missing field `model`") — which would silently break the bare
+      // `data-tts-voice` flagship path. An empty string is the gateway-blessed
+      // "use the provider's recommended default model" (gateway config.rs).
+      model: config.tts.model ?? '',
     };
 
     if (config.tts.emotion) {
@@ -84,49 +99,64 @@ export function buildConfigMessage(config: WidgetConfig): Record<string, unknown
 
   // Conversation-loop (LLM) configuration -> conversation_config. This is what
   // makes the bot TALK BACK (STT -> LLM -> TTS). base_url + model are required.
+  // Every optional field maps 1:1 to a gateway conversation_config key (snake
+  // case); the widget drift guard asserts this mapping stays complete.
   if (config.conversation) {
-    const conv = config.conversation;
-    const conversationConfig: Record<string, unknown> = {
-      base_url: conv.baseUrl,
-      model: conv.model,
-    };
-    if (conv.systemPrompt !== undefined) {
-      conversationConfig.system_prompt = conv.systemPrompt;
-    }
-    if (conv.apiKey !== undefined) {
-      conversationConfig.api_key = conv.apiKey;
-    }
-    if (conv.temperature !== undefined) {
-      conversationConfig.temperature = conv.temperature;
-    }
-    if (conv.maxTokens !== undefined) {
-      conversationConfig.max_tokens = conv.maxTokens;
-    }
-    if (conv.streaming !== undefined) {
-      conversationConfig.streaming = conv.streaming;
-    }
-    if (conv.allowInterruption !== undefined) {
-      conversationConfig.allow_interruption = conv.allowInterruption;
-    }
-    if (conv.eagerEot !== undefined) {
-      conversationConfig.eager_eot = conv.eagerEot;
-    }
-    if (conv.bargeInMinWords !== undefined) {
-      conversationConfig.barge_in_min_words = conv.bargeInMinWords;
-    }
-    if (conv.reasoningEffort !== undefined) {
-      conversationConfig.reasoning_effort = conv.reasoningEffort;
-    }
-    if (conv.latencyFiller !== undefined) {
-      conversationConfig.latency_filler = conv.latencyFiller;
-    }
-    if (conv.reasoningModel !== undefined) {
-      conversationConfig.reasoning_model = conv.reasoningModel;
-    }
-    message.conversation_config = conversationConfig;
+    message.conversation_config = buildConversationConfig(config.conversation);
   }
 
   return message;
+}
+
+/**
+ * Serialize a {@link ConversationConfig} to the gateway `conversation_config`
+ * envelope (camelCase -> snake_case). Pure; exported for unit tests.
+ *
+ * Only `base_url` + `model` are always present (gateway-required); every other
+ * field is emitted only when set, so an unspecified dial takes the gateway
+ * default. This is the 1:1 mirror of `ConversationWebSocketConfig`.
+ */
+export function buildConversationConfig(conv: ConversationConfig): Record<string, unknown> {
+  const out: Record<string, unknown> = {
+    base_url: conv.baseUrl,
+    model: conv.model,
+  };
+  // Core LLM
+  if (conv.systemPrompt !== undefined) out.system_prompt = conv.systemPrompt;
+  if (conv.apiKey !== undefined) out.api_key = conv.apiKey;
+  if (conv.temperature !== undefined) out.temperature = conv.temperature;
+  if (conv.maxTokens !== undefined) out.max_tokens = conv.maxTokens;
+  if (conv.streaming !== undefined) out.streaming = conv.streaming;
+  if (conv.maxHistory !== undefined) out.max_history = conv.maxHistory;
+  if (conv.allowInterruption !== undefined) out.allow_interruption = conv.allowInterruption;
+  if (conv.providerKind !== undefined) out.provider_kind = conv.providerKind;
+  if (conv.stripMarkdown !== undefined) out.strip_markdown = conv.stripMarkdown;
+  // Barge-in / mute
+  if (conv.eagerEot !== undefined) out.eager_eot = conv.eagerEot;
+  if (conv.bargeInMinWords !== undefined) out.barge_in_min_words = conv.bargeInMinWords;
+  if (conv.muteStrategy !== undefined) out.mute_strategy = conv.muteStrategy;
+  if (conv.userIdleTimeoutMs !== undefined) out.user_idle_timeout_ms = conv.userIdleTimeoutMs;
+  if (conv.summarizeTargetTokens !== undefined)
+    out.summarize_target_tokens = conv.summarizeTargetTokens;
+  // Latency filler
+  if (conv.latencyFiller !== undefined) out.latency_filler = conv.latencyFiller;
+  if (conv.latencyFillerAfterMs !== undefined)
+    out.latency_filler_after_ms = conv.latencyFillerAfterMs;
+  if (conv.latencyFillerPhrases !== undefined)
+    out.latency_filler_phrases = conv.latencyFillerPhrases;
+  // Reasoning tier
+  if (conv.reasoningEffort !== undefined) out.reasoning_effort = conv.reasoningEffort;
+  if (conv.reasoningModel !== undefined) out.reasoning_model = conv.reasoningModel;
+  if (conv.reasoningBaseUrl !== undefined) out.reasoning_base_url = conv.reasoningBaseUrl;
+  if (conv.reasoningApiKey !== undefined) out.reasoning_api_key = conv.reasoningApiKey;
+  if (conv.reasoningProviderKind !== undefined)
+    out.reasoning_provider_kind = conv.reasoningProviderKind;
+  if (conv.reasoningRoute !== undefined) out.reasoning_route = conv.reasoningRoute;
+  if (conv.reasoningBudgetMs !== undefined) out.reasoning_budget_ms = conv.reasoningBudgetMs;
+  if (conv.degradationMessage !== undefined) out.degradation_message = conv.degradationMessage;
+  if (conv.maxLlmCallsPerTurn !== undefined) out.max_llm_calls_per_turn = conv.maxLlmCallsPerTurn;
+  if (conv.maxReasoningTokens !== undefined) out.max_reasoning_tokens = conv.maxReasoningTokens;
+  return out;
 }
 
 export type MessageHandler = {
@@ -134,6 +164,8 @@ export type MessageHandler = {
   onTranscript: (result: TranscriptResult) => void;
   onAudio: (audio: ArrayBuffer, format: string, sampleRate: number, isFinal: boolean) => void;
   onPlaybackComplete: () => void;
+  /** Non-fatal gateway advisory (config_warning): a key was ignored / a feature no-ops. */
+  onConfigWarning: (warning: ConfigWarning) => void;
   onError: (error: Error) => void;
   onClose: () => void;
 };
@@ -334,6 +366,27 @@ export class WidgetWebSocket {
         case 'tts_playback_complete':
           this.handlers.onPlaybackComplete();
           break;
+
+        case 'config_warning': {
+          // Non-fatal gateway advisory (gateway handlers/ws/config_lint.rs):
+          // a config key was ignored (typo / wrong nesting) or a feature no-ops.
+          // Surface it so a developer learns the config was partially ignored
+          // instead of debugging a silent no-op. NEVER closes the session.
+          const warning: ConfigWarning = {
+            code: typeof data.code === 'string' ? data.code : 'unknown',
+            message: typeof data.message === 'string' ? data.message : '',
+            detail:
+              data.detail && typeof data.detail === 'object' ? data.detail : undefined,
+          };
+          // Loud-but-non-fatal: also log so it shows up in the console for the
+          // common case where no listener is attached.
+          console.warn(
+            `[bud-widget] gateway config_warning (${warning.code}): ${warning.message}`,
+            warning.detail ?? ''
+          );
+          this.handlers.onConfigWarning(warning);
+          break;
+        }
 
         case 'error':
           this.handlers.onError(new Error(data.message || 'Unknown error'));

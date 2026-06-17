@@ -157,31 +157,56 @@ class BudClient:
         tts: Optional[Union[TTSConfig, dict[str, Any]]] = None,
         llm: Optional[Union[ConversationConfig, dict[str, Any]]] = None,
         turn: Optional[dict[str, Any]] = None,
+        interrupt: bool = True,
         reconnect: Optional[ReconnectConfig] = None,
         stream_id: Optional[str] = None,
     ) -> TalkSession:
-        """Create the flagship agent loop (STT -> built-in LLM -> TTS) in a few lines.
+        """Create the flagship agent loop (STT -> built-in LLM -> TTS) in ~5 lines.
 
         This is the ONLY SDK entry point that reaches the gateway's built-in
         conversation loop. It serializes ``conversation_config`` (the LLM loop +
-        reasoning stack) and nests turn detection into ``stt_config.turn_detection``.
+        reasoning + latency-filler stack), nests turn detection into
+        ``stt_config.turn_detection``, applies sane beginner defaults, and yields
+        a single unified event stream (``transcript`` | ``bot_text`` | ``audio`` |
+        ``warning``).
+
+        Sane defaults applied (only when you did not set them explicitly):
+
+        * ``allow_interruption`` ← ``interrupt`` (barge-in on by default);
+        * ``strip_markdown`` ← ``True`` (spoken ``**asterisks**`` / URLs ruin TTS);
+        * ``latency_filler`` ← ``"auto"`` (keep the line alive while a slow/reasoning
+          turn streams in behind one short action phrase).
+
+        The bot's reply is spoken back as ``audio`` events (the gateway streams the
+        LLM reply straight to TTS on ``/ws``; there is no separate bot-text frame on
+        a plain cascade session — ``bot_text`` fires only when an assistant-role
+        transcript is exposed, e.g. via a DAG text node). Any gateway
+        ``config_warning`` (e.g. ``reasoning_model_on_voice_path``,
+        ``emotion_ignored_for_provider``, ``unknown_config_keys``) is surfaced as a
+        typed ``warning`` event — never a silent no-op.
 
         Args:
             stt: STT configuration (typed or dict).
             tts: TTS configuration (typed or dict).
             llm: Conversation/LLM-loop configuration. A dict is coerced to
                 :class:`ConversationConfig` — it MUST carry ``base_url`` and
-                ``model``; reasoning/latency/barge-in knobs are optional.
+                ``model`` (keep ``model`` FAST); reasoning/latency/barge-in knobs
+                are optional. Set ``reasoning_model`` to turn the two-tier reasoning
+                stack on.
             turn: Turn-detection knobs, e.g. ``{"enabled": True, "threshold": 0.6,
-                "eager_eot": True}``. ``eager_eot`` is forwarded to
-                ``conversation_config.eager_eot`` (the gateway requires both).
+                "eager": True}``. ``eager`` (alias ``eager_eot``) is forwarded to
+                BOTH ``stt_config.turn_detection.eager`` and
+                ``conversation_config.eager_eot`` (the gateway requires both for
+                eager end-of-turn).
+            interrupt: Whether the bot is interruptible / barge-in (default True).
+                Mapped to ``conversation_config.allow_interruption`` unless ``llm``
+                already set it.
             reconnect: Reconnection configuration.
             stream_id: Optional stream ID for session tracking.
 
         Returns:
             An unconnected :class:`TalkSession`. ``await session.connect()`` (or
-            use it as an async context manager) then iterate events
-            (``transcript`` | ``audio`` | ``message`` | ``error``).
+            use it as an async context manager) then iterate events.
 
         Example:
             >>> session = bud.agent(
@@ -189,25 +214,54 @@ class BudClient:
             ...     tts={"provider": "deepgram", "voice_id": "aura-asteria-en"},
             ...     llm={"base_url": "http://localhost:11434/v1", "model": "llama3.2:1b",
             ...          "reasoning_effort": "minimal", "latency_filler": "auto"},
-            ...     turn={"eager_eot": True},
+            ...     turn={"eager": True},
             ... )
             >>> async with session as call:
             ...     await call.send_audio(pcm)
             ...     async for ev in call:
-            ...         ...
+            ...         if ev.type == "transcript": print("user:", ev.text)
+            ...         elif ev.type == "audio":    play(ev.audio.audio)
+            ...         elif ev.type == "warning":  print("WARN", ev.warning.code, ev.warning.message)
         """
         conversation_config: Optional[ConversationConfig] = None
         if llm is not None:
-            conversation_config = llm if isinstance(llm, ConversationConfig) else ConversationConfig(**llm)
+            conversation_config = (
+                llm if isinstance(llm, ConversationConfig) else ConversationConfig(**llm)
+            )
 
-        # Map turn={} to AudioFeatures.turn_detection (nested into stt_config.turn_detection
-        # on the wire) and forward eager_eot to the conversation loop.
+        # Sane beginner defaults on the conversation loop (only fill when unset so
+        # an explicit caller value always wins — None means "let the gateway/SDK
+        # default apply", and these are the defaults that make a beginner agent
+        # feel right out of the box).
+        if conversation_config is not None:
+            if conversation_config.allow_interruption is None:
+                conversation_config.allow_interruption = interrupt
+            if conversation_config.strip_markdown is None:
+                conversation_config.strip_markdown = True
+            if conversation_config.latency_filler is None:
+                conversation_config.latency_filler = "auto"
+
+        # Map turn={} to AudioFeatures.turn_detection (nested into
+        # stt_config.turn_detection on the wire). Accept both ``eager`` (the wire
+        # field name) and ``eager_eot`` (the conversation-loop field name) as the
+        # beginner alias, and forward it to BOTH places the gateway needs.
         audio_features: Optional[AudioFeatures] = None
         if turn is not None:
-            td_kwargs = {k: v for k, v in turn.items() if k != "eager_eot"}
-            audio_features = AudioFeatures(turn_detection=TurnDetectionConfig(**td_kwargs))
-            if turn.get("eager_eot") and conversation_config is not None and conversation_config.eager_eot is None:
-                conversation_config.eager_eot = True
+            eager = bool(turn.get("eager") or turn.get("eager_eot"))
+            td_kwargs = {
+                k: v for k, v in turn.items() if k not in ("eager", "eager_eot")
+            }
+            # Default the master switch on when any turn config is supplied.
+            td_kwargs.setdefault("enabled", True)
+            td = TurnDetectionConfig(**td_kwargs)
+            audio_features = AudioFeatures(turn_detection=td)
+            if eager:
+                # TurnDetectionConfig has no `eager` field (it carries detector
+                # knobs only); the wire `turn_detection.eager` is set by the
+                # session from conversation_config.eager_eot pairing. Forward to
+                # the conversation loop, which the session serializes.
+                if conversation_config is not None and conversation_config.eager_eot is None:
+                    conversation_config.eager_eot = True
 
         return self._talk.create(
             stt=stt,

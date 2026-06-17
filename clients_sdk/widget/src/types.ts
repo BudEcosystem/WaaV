@@ -5,37 +5,15 @@
 // =============================================================================
 // Provider Types
 // =============================================================================
+//
+// The canonical provider value-space (32 STT / 37 TTS / 12 realtime) lives in
+// ./providers.ts as runtime const arrays sourced from the gateway dispatch
+// tables. Import the union TYPES for local use, and re-export them so existing
+// imports (`import { STTProvider } from './types'`) keep working while the
+// single source of truth stays in one place.
 
-/** All supported STT providers */
-export type STTProvider =
-  | 'deepgram'
-  | 'google'
-  | 'azure'
-  | 'cartesia'
-  | 'gateway'
-  | 'assemblyai'
-  | 'aws-transcribe'
-  | 'ibm-watson'
-  | 'groq'
-  | 'openai-whisper';
-
-/** All supported TTS providers */
-export type TTSProvider =
-  | 'deepgram'
-  | 'elevenlabs'
-  | 'google'
-  | 'azure'
-  | 'cartesia'
-  | 'openai'
-  | 'aws-polly'
-  | 'ibm-watson'
-  | 'hume'
-  | 'lmnt'
-  | 'playht'
-  | 'kokoro';
-
-/** Realtime providers */
-export type RealtimeProvider = 'openai-realtime' | 'hume-evi';
+import type { STTProvider, TTSProvider, RealtimeProvider } from './providers';
+export type { STTProvider, TTSProvider, RealtimeProvider } from './providers';
 
 /**
  * Reasoning/thinking-effort dial for the conversation LLM.
@@ -233,17 +211,42 @@ export interface AudioFeatures {
 }
 
 /**
+ * LLM adapter kind for `providerKind` / `reasoningProviderKind`.
+ *
+ * Mirrors the gateway `AdapterKind` enum (gateway/src/core/llm/adapter.rs:40,
+ * `serde(rename_all="lowercase")`). NOT a registered openapi schema (the gateway
+ * overrides it to a plain nullable string), so the union is authored here from
+ * adapter.rs. Omit => OpenAI-compatible with canonical-host inference.
+ */
+export type AdapterKind = 'openai' | 'anthropic' | 'gemini';
+
+/** Reasoning-tier routing mode (gateway `RoutingMode`; default auto). */
+export type RoutingMode = 'auto' | 'always';
+
+/**
+ * Mute/barge-in strategy while the bot speaks (gateway `mute_strategy`, an
+ * Option<String> typed by convention — these are the accepted values).
+ */
+export type MuteStrategy =
+  | 'always_while_bot_speaks'
+  | 'until_first_bot_complete'
+  | 'first_speech_only';
+
+/**
  * Conversation-loop (LLM) configuration -> gateway `conversation_config`.
  *
  * Drives the built-in STT -> LLM -> TTS loop. `baseUrl` + `model` are required
- * by the gateway (ConversationWebSocketConfig); everything else is optional and
- * maps 1:1 to the conversation_config fields, including the REALTIME_REASONING
- * dials (reasoningEffort, reasoningModel, latencyFiller, eagerEot).
+ * by the gateway (ConversationWebSocketConfig). This is a 1:1 mirror of all 29
+ * gateway fields (verified by the widget drift guard, `test/drift.test.mjs`):
+ * a gateway field added/renamed without a matching key here fails CI. Includes
+ * the REALTIME_REASONING two-tier dials (reasoningModel + reasoning* knobs) and
+ * the barge-in / latency-filler controls.
  */
 export interface ConversationConfig {
+  // --- Core LLM (required: baseUrl, model) ---
   /** OpenAI-compatible base URL, e.g. "http://localhost:11434/v1" (required). */
   baseUrl: string;
-  /** Model identifier, e.g. "qwen2.5:7b-instruct" (required). */
+  /** FAST model identifier, e.g. "qwen2.5:7b-instruct" (required). Keep this fast. */
   model: string;
   /** Optional system prompt seeding the conversation. */
   systemPrompt?: string;
@@ -255,18 +258,56 @@ export interface ConversationConfig {
   maxTokens?: number;
   /** Stream tokens to TTS as they arrive (gateway default true). */
   streaming?: boolean;
+  /** Conversation history window in turns (gateway default 20). */
+  maxHistory?: number;
   /** Whether the bot's speech is interruptible / barge-in (gateway default true). */
   allowInterruption?: boolean;
+  /** Force the LLM adapter kind; omit for OpenAI-compatible canonical-host inference. */
+  providerKind?: AdapterKind;
+  /** Strip markdown from spoken text (gateway default true). */
+  stripMarkdown?: boolean;
+
+  // --- Barge-in / mute (A-G group) ---
   /** Eager end-of-turn: start the LLM speculatively on a turn-complete prediction. */
   eagerEot?: boolean;
-  /** While the bot speaks, require >= N words to interrupt it. */
+  /** While the bot speaks, require >= N words to interrupt it (gateway clamps >=2). */
   bargeInMinWords?: number;
+  /** Which audio to mute/ignore while the bot speaks. */
+  muteStrategy?: MuteStrategy;
+  /** Speak a re-engagement prompt after the user is idle this many ms (0 = off). */
+  userIdleTimeoutMs?: number;
+  /** Summarize older history once it exceeds this many tokens (0 = off). */
+  summarizeTargetTokens?: number;
+
+  // --- Latency filler (D3) ---
+  /** Latency-masking mode for slow first audio (gateway default auto). */
+  latencyFiller?: LatencyFiller;
+  /** Only emit a filler if first audio is slower than this many ms. */
+  latencyFillerAfterMs?: number;
+  /** Custom filler phrases to choose from (overrides the built-in set). */
+  latencyFillerPhrases?: string[];
+
+  // --- Reasoning tier (D1/S1/S2 — two-tier) ---
   /** Reasoning/thinking-effort dial. */
   reasoningEffort?: ReasoningEffort;
-  /** Latency-masking mode for slow first audio. */
-  latencyFiller?: LatencyFiller;
-  /** Optional slow REASONING-tier model (keep `model` fast). */
+  /** Optional slow REASONING-tier model — the field that turns two-tier ON (keep `model` fast). */
   reasoningModel?: string;
+  /** Base URL for the reasoning model (defaults to baseUrl). */
+  reasoningBaseUrl?: string;
+  /** API key for the reasoning model (defaults to apiKey). */
+  reasoningApiKey?: string;
+  /** Force the reasoning adapter kind; omit for OpenAI-compatible inference. */
+  reasoningProviderKind?: AdapterKind;
+  /** When to route to the reasoning tier (gateway default auto). */
+  reasoningRoute?: RoutingMode;
+  /** Max ms to wait on the reasoning tier before falling back (default 15000, 0 = off). */
+  reasoningBudgetMs?: number;
+  /** Spoken when all tiers fail. */
+  degradationMessage?: string;
+  /** Cap LLM calls per turn (default 8, floored >=1). */
+  maxLlmCallsPerTurn?: number;
+  /** Cap reasoning-tier output tokens. */
+  maxReasoningTokens?: number;
 }
 
 export interface FeatureFlags {
@@ -285,6 +326,39 @@ export interface TranscriptResult {
   isFinal: boolean;
   confidence?: number;
   speakerId?: number;
+}
+
+/**
+ * A typed gateway advisory surfaced from an `OutgoingMessage::ConfigWarning`
+ * wire frame (gateway handlers/ws/messages.rs + config_lint.rs).
+ *
+ * The gateway deserializes the `config` envelope leniently: an unknown key (a
+ * typo like `diarizationn`, or a wrong-nesting mistake like `turn_detection` at
+ * the top level instead of under `stt_config`) is silently DROPPED — to the
+ * client that looks exactly like success even though the feature never took
+ * effect. Rather than fail forward-compat, the gateway emits this non-fatal
+ * advisory naming every ignored key (plus targeted nesting hints), and the
+ * widget surfaces it as a `configWarning` event so a developer LEARNS the
+ * config was partially ignored instead of debugging a silent no-op.
+ *
+ * `config_warning` NEVER closes the session; it is informational.
+ *
+ * Known `code` values:
+ *  - `"unknown_config_keys"` — keys serde dropped (typo / wrong nesting). The
+ *    `detail.ignored_keys` array lists the dotted paths.
+ *  - `"reasoning_model_on_voice_path"` — a reasoning model was placed on the
+ *    spoken path (high time-to-first-audio).
+ *  - `"reasoning_effort_clamped"` — effort was clamped up to a model's floor.
+ *  - `"emotion_ignored_for_provider"` / `"language_unsupported"` — a graceful
+ *    no-op (e.g. emotion sent to a provider that ignores it) surfaced loudly.
+ */
+export interface ConfigWarning {
+  /** Stable machine-readable code (e.g. "unknown_config_keys"). */
+  code: string;
+  /** Human-readable explanation + a one-line fix hint. */
+  message: string;
+  /** Optional free-form detail (e.g. `{ ignored_keys: ["stt_config.features.diarizationn"] }`). */
+  detail?: Record<string, unknown>;
 }
 
 export interface AudioChunk {
@@ -310,5 +384,7 @@ export interface WidgetEventMap {
   'audio': CustomEvent<AudioChunk>;
   'stateChange': CustomEvent<{ state: WidgetState; previousState: WidgetState }>;
   'metrics': CustomEvent<WidgetMetrics>;
+  /** Non-fatal gateway advisory: a config key was ignored / a feature is a no-op. */
+  'configWarning': CustomEvent<ConfigWarning>;
   'error': CustomEvent<Error>;
 }

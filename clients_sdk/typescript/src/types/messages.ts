@@ -324,6 +324,22 @@ export interface SIPTransferErrorMessage {
 }
 
 /**
+ * Non-fatal gateway config advisory (gateway OutgoingMessage::ConfigWarning,
+ * handlers/ws/messages.rs). Emitted when a config is accepted but something was
+ * silently degraded (unknown/misnested key, emotion ignored by provider,
+ * reasoning model on the voice path, ...). NEVER closes the session.
+ */
+export interface ConfigWarningMessage {
+  type: 'config_warning';
+  /** Stable machine code (e.g. "unknown_config_keys"). */
+  code: string;
+  /** Human-readable explanation + a one-line fix hint. */
+  message: string;
+  /** Optional free-form JSON detail (e.g. { ignored_keys: [...] }). */
+  detail?: Record<string, unknown>;
+}
+
+/**
  * Union type for all incoming messages (received by client from server)
  */
 export type IncomingMessage =
@@ -336,7 +352,8 @@ export type IncomingMessage =
   | PongMessage
   | SessionUpdateMessage
   | ErrorMessage
-  | SIPTransferErrorMessage;
+  | SIPTransferErrorMessage
+  | ConfigWarningMessage;
 
 /**
  * Common message type identifier
@@ -359,7 +376,8 @@ export type MessageType =
   | 'pong'
   | 'session_update'
   | 'error'
-  | 'sip_transfer_error';
+  | 'sip_transfer_error'
+  | 'config_warning';
 
 // ============================================================================
 // Message Serialization Helpers

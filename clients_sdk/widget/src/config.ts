@@ -4,11 +4,6 @@
 
 import type {
   WidgetConfig,
-  STTConfig,
-  TTSConfig,
-  FeatureFlags,
-  EmotionConfig,
-  RealtimeConfig,
   ConversationConfig,
   AudioFeatures,
   STTProvider,
@@ -18,6 +13,9 @@ import type {
   DeliveryStyle,
   ReasoningEffort,
   LatencyFiller,
+  AdapterKind,
+  MuteStrategy,
+  RoutingMode,
 } from './types';
 
 /**
@@ -47,13 +45,21 @@ export function parseConfigFromAttributes(element: HTMLElement): WidgetConfig {
     };
   }
 
-  // Parse TTS config with emotion support
+  // Parse TTS config with emotion support.
+  //
+  // Flagship one-tag ergonomics: a bare `data-tts-voice` (or `data-tts-voice-id`)
+  // is enough to make the bot speak — we default the provider to `deepgram` when
+  // only a voice is given, so `data-llm-* + data-stt-provider + data-tts-voice`
+  // produces a full talking loop in a single HTML tag. An explicit
+  // `data-tts-provider` always wins.
   const ttsProvider = element.dataset.ttsProvider;
-  if (ttsProvider) {
+  const ttsVoice = element.dataset.ttsVoice;
+  const ttsVoiceId = element.dataset.ttsVoiceId;
+  if (ttsProvider || ttsVoice || ttsVoiceId) {
     config.tts = {
-      provider: ttsProvider as TTSProvider,
-      voice: element.dataset.ttsVoice,
-      voiceId: element.dataset.ttsVoiceId,
+      provider: (ttsProvider as TTSProvider | undefined) || 'deepgram',
+      voice: ttsVoice,
+      voiceId: ttsVoiceId,
       model: element.dataset.ttsModel,
       sampleRate: parseInt(element.dataset.ttsSampleRate || '24000', 10),
     };
@@ -88,37 +94,14 @@ export function parseConfigFromAttributes(element: HTMLElement): WidgetConfig {
   }
 
   // Parse conversation-loop (LLM) config — drives the gateway STT->LLM->TTS loop
-  // so the bot talks back. Requires at least a base URL + model.
+  // so the bot talks back. Requires at least a base URL + model. This is the
+  // FLAGSHIP one-tag surface: `data-llm-base-url` + `data-llm-model` give a
+  // talking bot; the reasoning / barge-in / latency-filler dials below add
+  // realtime-reasoning in a few more attributes. Maps 1:1 to conversation_config.
   const llmBaseUrl = element.dataset.llmBaseUrl;
   const llmModel = element.dataset.llmModel;
   if (llmBaseUrl && llmModel) {
-    config.conversation = {
-      baseUrl: llmBaseUrl,
-      model: llmModel,
-      systemPrompt: element.dataset.llmSystemPrompt,
-      apiKey: element.dataset.llmApiKey,
-      temperature: element.dataset.llmTemperature
-        ? parseFloat(element.dataset.llmTemperature)
-        : undefined,
-      maxTokens: element.dataset.llmMaxTokens
-        ? parseInt(element.dataset.llmMaxTokens, 10)
-        : undefined,
-      streaming:
-        element.dataset.llmStreaming !== undefined
-          ? element.dataset.llmStreaming !== 'false'
-          : undefined,
-      allowInterruption:
-        element.dataset.llmAllowInterruption !== undefined
-          ? element.dataset.llmAllowInterruption !== 'false'
-          : undefined,
-      eagerEot: element.dataset.llmEagerEot === 'true' || undefined,
-      bargeInMinWords: element.dataset.llmBargeInMinWords
-        ? parseInt(element.dataset.llmBargeInMinWords, 10)
-        : undefined,
-      reasoningEffort: element.dataset.llmReasoningEffort as ReasoningEffort | undefined,
-      latencyFiller: element.dataset.llmLatencyFiller as LatencyFiller | undefined,
-      reasoningModel: element.dataset.llmReasoningModel,
-    };
+    config.conversation = parseConversationFromAttributes(element, llmBaseUrl, llmModel);
   }
 
   // Parse feature flags
@@ -137,6 +120,107 @@ export function parseConfigFromAttributes(element: HTMLElement): WidgetConfig {
   config.audioFeatures = parseAudioFeatures(element);
 
   return config;
+}
+
+/**
+ * Parse the conversation-loop (LLM) config from `data-llm-*` attributes.
+ *
+ * `baseUrl` + `model` are required (passed in by the caller after the presence
+ * check). Every other field maps 1:1 to a {@link ConversationConfig} key and is
+ * only set when its attribute is present, so an unspecified dial takes the
+ * gateway default. Exported-shaped as a module helper for testability.
+ */
+function parseConversationFromAttributes(
+  element: HTMLElement,
+  baseUrl: string,
+  model: string
+): ConversationConfig {
+  const d = element.dataset;
+  const conv: ConversationConfig = { baseUrl, model };
+
+  // Core LLM
+  if (d.llmSystemPrompt !== undefined) conv.systemPrompt = d.llmSystemPrompt;
+  if (d.llmApiKey !== undefined) conv.apiKey = d.llmApiKey;
+  const temperature = parseFloatAttr(d.llmTemperature);
+  if (temperature !== undefined) conv.temperature = temperature;
+  const maxTokens = parseIntAttr(d.llmMaxTokens);
+  if (maxTokens !== undefined) conv.maxTokens = maxTokens;
+  const streaming = parseBoolAttr(d.llmStreaming);
+  if (streaming !== undefined) conv.streaming = streaming;
+  const maxHistory = parseIntAttr(d.llmMaxHistory);
+  if (maxHistory !== undefined) conv.maxHistory = maxHistory;
+  const allowInterruption = parseBoolAttr(d.llmAllowInterruption);
+  if (allowInterruption !== undefined) conv.allowInterruption = allowInterruption;
+  if (d.llmProviderKind !== undefined) conv.providerKind = d.llmProviderKind as AdapterKind;
+  const stripMarkdown = parseBoolAttr(d.llmStripMarkdown);
+  if (stripMarkdown !== undefined) conv.stripMarkdown = stripMarkdown;
+
+  // Barge-in / mute
+  const eagerEot = parseBoolAttr(d.llmEagerEot);
+  if (eagerEot !== undefined) conv.eagerEot = eagerEot;
+  const bargeInMinWords = parseIntAttr(d.llmBargeInMinWords);
+  if (bargeInMinWords !== undefined) conv.bargeInMinWords = bargeInMinWords;
+  if (d.llmMuteStrategy !== undefined) conv.muteStrategy = d.llmMuteStrategy as MuteStrategy;
+  const userIdleTimeoutMs = parseIntAttr(d.llmUserIdleTimeoutMs);
+  if (userIdleTimeoutMs !== undefined) conv.userIdleTimeoutMs = userIdleTimeoutMs;
+  const summarizeTargetTokens = parseIntAttr(d.llmSummarizeTargetTokens);
+  if (summarizeTargetTokens !== undefined) conv.summarizeTargetTokens = summarizeTargetTokens;
+
+  // Latency filler
+  if (d.llmLatencyFiller !== undefined) conv.latencyFiller = d.llmLatencyFiller as LatencyFiller;
+  const latencyFillerAfterMs = parseIntAttr(d.llmLatencyFillerAfterMs);
+  if (latencyFillerAfterMs !== undefined) conv.latencyFillerAfterMs = latencyFillerAfterMs;
+  const latencyFillerPhrases = parseCsvAttr(d.llmLatencyFillerPhrases);
+  if (latencyFillerPhrases !== undefined) conv.latencyFillerPhrases = latencyFillerPhrases;
+
+  // Reasoning tier (two-tier)
+  if (d.llmReasoningEffort !== undefined)
+    conv.reasoningEffort = d.llmReasoningEffort as ReasoningEffort;
+  if (d.llmReasoningModel !== undefined) conv.reasoningModel = d.llmReasoningModel;
+  if (d.llmReasoningBaseUrl !== undefined) conv.reasoningBaseUrl = d.llmReasoningBaseUrl;
+  if (d.llmReasoningApiKey !== undefined) conv.reasoningApiKey = d.llmReasoningApiKey;
+  if (d.llmReasoningProviderKind !== undefined)
+    conv.reasoningProviderKind = d.llmReasoningProviderKind as AdapterKind;
+  if (d.llmReasoningRoute !== undefined) conv.reasoningRoute = d.llmReasoningRoute as RoutingMode;
+  const reasoningBudgetMs = parseIntAttr(d.llmReasoningBudgetMs);
+  if (reasoningBudgetMs !== undefined) conv.reasoningBudgetMs = reasoningBudgetMs;
+  if (d.llmDegradationMessage !== undefined) conv.degradationMessage = d.llmDegradationMessage;
+  const maxLlmCallsPerTurn = parseIntAttr(d.llmMaxLlmCallsPerTurn);
+  if (maxLlmCallsPerTurn !== undefined) conv.maxLlmCallsPerTurn = maxLlmCallsPerTurn;
+  const maxReasoningTokens = parseIntAttr(d.llmMaxReasoningTokens);
+  if (maxReasoningTokens !== undefined) conv.maxReasoningTokens = maxReasoningTokens;
+
+  return conv;
+}
+
+/** Parse an integer attribute; undefined when absent or non-numeric. */
+function parseIntAttr(value: string | undefined): number | undefined {
+  if (value === undefined || value === '') return undefined;
+  const n = parseInt(value, 10);
+  return Number.isNaN(n) ? undefined : n;
+}
+
+/** Parse a float attribute; undefined when absent or non-numeric. */
+function parseFloatAttr(value: string | undefined): number | undefined {
+  if (value === undefined || value === '') return undefined;
+  const n = parseFloat(value);
+  return Number.isNaN(n) ? undefined : n;
+}
+
+/** Parse a boolean attribute; undefined when absent ("false" => false, else true). */
+function parseBoolAttr(value: string | undefined): boolean | undefined {
+  if (value === undefined) return undefined;
+  return value !== 'false';
+}
+
+/** Parse a comma-separated attribute into a trimmed, non-empty string array. */
+function parseCsvAttr(value: string | undefined): string[] | undefined {
+  if (value === undefined) return undefined;
+  const parts = value
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return parts.length > 0 ? parts : undefined;
 }
 
 /**

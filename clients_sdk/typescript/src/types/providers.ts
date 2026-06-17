@@ -3,52 +3,114 @@
 // =============================================================================
 
 /**
- * STT (Speech-to-Text) providers supported by the WaaV gateway.
- * These map to the providers implemented in the Rust gateway.
+ * STT (Speech-to-Text) providers supported by the WaaV gateway (the canonical
+ * primary names from the gateway dispatch table, gateway/src/plugin/dispatch.rs
+ * STT_PROVIDER_MAP / get_supported_stt_providers). 32 providers.
+ *
+ * Kept in sync by the provider-enum drift guard (tests/unit/providers.test.ts).
  */
 export const STT_PROVIDERS = [
-  'deepgram',
-  'google',
-  'azure',
-  'cartesia',
-  'gateway',
+  'alibaba-cloud',
+  'amivoice',
   'assemblyai',
   'aws-transcribe',
-  'ibm-watson',
+  'baidu',
+  'bhashini',
+  'cartesia',
+  'deepgram',
+  'elevenlabs',
+  'fpt-ai',
+  'gladia',
+  'gnani',
+  'google',
   'groq',
-  'openai-whisper',
+  'huawei-cloud',
+  'ibm-watson',
+  'iflytek',
+  'microsoft-azure',
+  'naver-clova',
+  'nectec',
+  'openai',
+  'phonexia',
+  'prosa-ai',
+  'revai',
+  'reverie',
+  'sarvam',
+  'sberdevices',
+  'speechmatics',
+  'tencent',
+  'tinkoff',
+  'viettel-ai',
+  'yandex',
 ] as const;
 
 export type STTProvider = (typeof STT_PROVIDERS)[number];
 
 /**
- * TTS (Text-to-Speech) providers supported by the WaaV gateway.
- * These map to the providers implemented in the Rust gateway.
+ * TTS (Text-to-Speech) providers supported by the WaaV gateway (canonical
+ * primary names from the gateway dispatch table TTS_PROVIDER_MAP). 37 providers.
  */
 export const TTS_PROVIDERS = [
+  'acapela',
+  'alibaba-cloud',
+  'aws-polly',
+  'baidu',
+  'bhashini',
+  'cartesia',
+  'cereproc',
   'deepgram',
   'elevenlabs',
+  'fpt-ai',
+  'gnani',
   'google',
-  'azure',
-  'cartesia',
-  'openai',
-  'aws-polly',
-  'ibm-watson',
+  'huawei-cloud',
   'hume',
+  'ibm-watson',
+  'iflytek',
   'lmnt',
+  'microsoft-azure',
+  'murf',
+  'naver-clova',
+  'nectec',
+  'openai',
   'playht',
-  'kokoro',
+  'prosa-ai',
+  'resemble',
+  'reverie',
+  'sberdevices',
+  'smallest',
+  'speechify',
+  'speechmatics',
+  'tencent',
+  'tinkoff',
+  'unrealspeech',
+  'viettel-ai',
+  'wellsaid',
+  'yandex',
+  'zalo-ai',
 ] as const;
 
 export type TTSProvider = (typeof TTS_PROVIDERS)[number];
 
 /**
- * Realtime audio-to-audio providers for bidirectional conversation.
- * These providers support real-time speech with LLM integration.
+ * Realtime (speech-to-speech / S2S) providers for bidirectional conversation
+ * (canonical primary names from the gateway dispatch table REALTIME_PROVIDER_MAP
+ * / BuiltinRealtimeProvider enum). 12 providers — these are the gateway's
+ * `/realtime` providers, NOT the OpenAI-native names the old list used.
  */
 export const REALTIME_PROVIDERS = [
-  'openai-realtime',
-  'hume-evi',
+  'openai',
+  'hume',
+  'azure',
+  'grok',
+  'inworld',
+  'deepgram',
+  'elevenlabs',
+  'gemini',
+  'ultravox',
+  'nova_sonic',
+  'speechmatics',
+  'yandex',
 ] as const;
 
 export type RealtimeProvider = (typeof REALTIME_PROVIDERS)[number];
@@ -131,7 +193,11 @@ export type ProviderCapabilities = STTCapabilities | TTSCapabilities | RealtimeC
 // Provider Capability Database
 // =============================================================================
 
-const STT_CAPABILITIES: Record<STTProvider, STTCapabilities> = {
+// Capability hints are a CONVENIENCE database (not the source of truth — the
+// gateway is). It covers the commonly-used providers; unknown providers simply
+// have no entry (getProviderCapabilities returns undefined for them rather than
+// throwing, so a beginner using a less-common provider is never blocked).
+const STT_CAPABILITIES: Partial<Record<STTProvider, STTCapabilities>> = {
   deepgram: {
     streaming: true,
     languages: ['en-US', 'en-GB', 'es', 'fr', 'de', 'pt', 'it', 'nl', 'ja', 'ko', 'zh'],
@@ -154,7 +220,7 @@ const STT_CAPABILITIES: Record<STTProvider, STTCapabilities> = {
     supportsProfanityFilter: true,
     supportsSmartFormat: false,
   },
-  azure: {
+  'microsoft-azure': {
     streaming: true,
     languages: ['en-US', 'en-GB', 'es-ES', 'fr-FR', 'de-DE', 'pt-BR', 'it-IT', 'ja-JP', 'ko-KR', 'zh-CN'],
     models: ['whisper', 'conversation', 'dictation'],
@@ -169,17 +235,6 @@ const STT_CAPABILITIES: Record<STTProvider, STTCapabilities> = {
     streaming: true,
     languages: ['en-US'],
     models: ['sonic'],
-    supportsInterim: true,
-    supportsDiarization: false,
-    supportsWordTimestamps: true,
-    supportsPunctuation: true,
-    supportsProfanityFilter: false,
-    supportsSmartFormat: false,
-  },
-  gateway: {
-    streaming: true,
-    languages: ['en-US'],
-    models: ['local-whisper'],
     supportsInterim: true,
     supportsDiarization: false,
     supportsWordTimestamps: true,
@@ -231,10 +286,10 @@ const STT_CAPABILITIES: Record<STTProvider, STTCapabilities> = {
     supportsProfanityFilter: false,
     supportsSmartFormat: false,
   },
-  'openai-whisper': {
+  openai: {
     streaming: false,
     languages: ['en', 'es', 'fr', 'de', 'pt', 'it', 'nl', 'ja', 'ko', 'zh'],
-    models: ['whisper-1'],
+    models: ['whisper-1', 'gpt-4o-transcribe', 'gpt-4o-mini-transcribe'],
     supportsInterim: false,
     supportsDiarization: false,
     supportsWordTimestamps: true,
@@ -244,7 +299,7 @@ const STT_CAPABILITIES: Record<STTProvider, STTCapabilities> = {
   },
 };
 
-const TTS_CAPABILITIES: Record<TTSProvider, TTSCapabilities> = {
+const TTS_CAPABILITIES: Partial<Record<TTSProvider, TTSCapabilities>> = {
   deepgram: {
     streaming: true,
     voices: ['aura-asteria-en', 'aura-arcas-en', 'aura-helios-en', 'aura-luna-en', 'aura-orpheus-en'],
@@ -278,7 +333,7 @@ const TTS_CAPABILITIES: Record<TTSProvider, TTSCapabilities> = {
     maxCharacters: 5000,
     outputFormats: ['LINEAR16', 'MP3', 'OGG_OPUS'],
   },
-  azure: {
+  'microsoft-azure': {
     streaming: true,
     voices: ['en-US-JennyNeural', 'en-US-GuyNeural', 'en-US-AriaNeural', 'en-US-DavisNeural'],
     languages: ['en-US', 'en-GB', 'es-ES', 'fr-FR', 'de-DE', 'pt-BR', 'it-IT', 'ja-JP', 'ko-KR', 'zh-CN'],
@@ -366,30 +421,19 @@ const TTS_CAPABILITIES: Record<TTSProvider, TTSCapabilities> = {
     maxCharacters: 10000,
     outputFormats: ['mp3', 'wav'],
   },
-  kokoro: {
-    streaming: true,
-    voices: ['kokoro-default'],
-    languages: ['en', 'ja'],
-    supportsEmotion: false,
-    supportsSSML: false,
-    supportsVoiceCloning: false,
-    supportsPronunciations: false,
-    maxCharacters: 5000,
-    outputFormats: ['pcm'],
-  },
 };
 
-const REALTIME_CAPABILITIES: Record<RealtimeProvider, RealtimeCapabilities> = {
-  'openai-realtime': {
+const REALTIME_CAPABILITIES: Partial<Record<RealtimeProvider, RealtimeCapabilities>> = {
+  openai: {
     streaming: true,
     supportsInterruption: true,
     supportsFunctionCalling: true,
     supportsEmotion: false,
     supportsVAD: true,
-    models: ['gpt-4o-realtime-preview', 'gpt-4o-realtime-preview-2024-12-17'],
+    models: ['gpt-realtime', 'gpt-4o-realtime-preview', 'gpt-4o-realtime-preview-2024-12-17'],
     maxSessionDuration: 1800, // 30 minutes
   },
-  'hume-evi': {
+  hume: {
     streaming: true,
     supportsInterruption: true,
     supportsFunctionCalling: true,
@@ -402,14 +446,20 @@ const REALTIME_CAPABILITIES: Record<RealtimeProvider, RealtimeCapabilities> = {
 
 /**
  * Get capabilities for a provider.
+ *
+ * The capability database is a convenience subset (the gateway is the source of
+ * truth), so this returns `undefined` for a valid-but-uncatalogued provider
+ * rather than throwing — a beginner using a less-common provider is never
+ * blocked. It still throws for a genuinely unknown provider name / bad type.
+ *
  * @param provider - Provider name
  * @param type - Provider type ('stt', 'tts', or 'realtime')
- * @returns Provider capabilities
+ * @returns Provider capabilities, or undefined if not catalogued.
  */
 export function getProviderCapabilities(
   provider: string,
   type: 'stt' | 'tts' | 'realtime'
-): ProviderCapabilities {
+): ProviderCapabilities | undefined {
   switch (type) {
     case 'stt':
       if (!isValidSTTProvider(provider)) {
@@ -453,30 +503,26 @@ export function getProvidersWithFeature(
   feature: string,
   type: 'stt' | 'tts' | 'realtime'
 ): string[] {
+  const has = (caps: ProviderCapabilities | undefined): boolean =>
+    caps !== undefined && (caps as unknown as Record<string, unknown>)[feature] === true;
   switch (type) {
     case 'stt':
-      return STT_PROVIDERS.filter(
-        (p) => (STT_CAPABILITIES[p] as unknown as Record<string, unknown>)[feature] === true
-      );
+      return STT_PROVIDERS.filter((p) => has(STT_CAPABILITIES[p]));
     case 'tts':
-      return TTS_PROVIDERS.filter(
-        (p) => (TTS_CAPABILITIES[p] as unknown as Record<string, unknown>)[feature] === true
-      );
+      return TTS_PROVIDERS.filter((p) => has(TTS_CAPABILITIES[p]));
     case 'realtime':
-      return REALTIME_PROVIDERS.filter(
-        (p) => (REALTIME_CAPABILITIES[p] as unknown as Record<string, unknown>)[feature] === true
-      );
+      return REALTIME_PROVIDERS.filter((p) => has(REALTIME_CAPABILITIES[p]));
     default:
       return [];
   }
 }
 
 /**
- * Get default model for a provider.
+ * Get default model for a provider (from the convenience capability database).
  */
 export function getDefaultModel(provider: string, type: 'stt' | 'tts' | 'realtime'): string {
   const caps = getProviderCapabilities(provider, type);
-  if ('models' in caps && caps.models[0] !== undefined) {
+  if (caps && 'models' in caps && caps.models[0] !== undefined) {
     return caps.models[0];
   }
   throw new Error(`No default model for ${type} provider: ${provider}`);
@@ -487,7 +533,7 @@ export function getDefaultModel(provider: string, type: 'stt' | 'tts' | 'realtim
  */
 export function getDefaultVoice(provider: TTSProvider): string {
   const caps = TTS_CAPABILITIES[provider];
-  if (caps.voices[0] !== undefined) {
+  if (caps && caps.voices[0] !== undefined) {
     return caps.voices[0];
   }
   throw new Error(`No default voice for TTS provider: ${provider}`);

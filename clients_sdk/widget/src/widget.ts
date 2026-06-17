@@ -67,6 +67,10 @@ export class BudWidget extends HTMLElement {
       'data-stt-provider',
       'data-tts-provider',
       'data-tts-voice',
+      // Flagship one-tag conversation loop: re-parse when the LLM target changes
+      // so a talking bot can be configured declaratively after mount.
+      'data-llm-base-url',
+      'data-llm-model',
     ];
   }
 
@@ -270,6 +274,19 @@ export class BudWidget extends HTMLElement {
           if (this.state.is('speaking')) {
             this.state.transition('listening');
           }
+        },
+        onConfigWarning: (warning) => {
+          // Surface the gateway advisory as a typed, non-fatal event. A
+          // developer can listen for 'configWarning' to learn that a config key
+          // was ignored (typo / wrong nesting) or a feature no-ops — instead of
+          // debugging a silent no-op. Does NOT change widget state.
+          this.dispatchEvent(
+            new CustomEvent('configWarning', {
+              detail: warning,
+              bubbles: true,
+              composed: true,
+            })
+          );
         },
         onError: (error) => {
           this.handleError(error);

@@ -3,9 +3,12 @@
  * Type-safe event definitions for session callbacks
  */
 
-import type { STTResultMessage, ErrorMessage, TTSAudioMessage, ReadyMessage } from '../types/messages.js';
+import type { STTResultMessage, ErrorMessage, TTSAudioMessage, ReadyMessage, ConfigWarningMessage } from '../types/messages.js';
 import type { MetricsSummary } from '../types/metrics.js';
 import type { ReconnectState } from './reconnect.js';
+
+export type { ConfigWarningEvent, ConfigWarningCode } from '../types/warnings.js';
+import type { ConfigWarningEvent } from '../types/warnings.js';
 
 /**
  * STT transcript event
@@ -171,6 +174,13 @@ export interface SessionEventMap {
   audio: AudioEvent;
   /** Error occurred */
   error: SessionErrorEvent;
+  /**
+   * Non-fatal gateway config advisory (e.g. an unknown/misnested key, an
+   * emotion the provider ignores, a reasoning model on the voice path). The
+   * session keeps running; this surfaces a silent server-side degrade so a
+   * developer can see and fix it.
+   */
+  configWarning: ConfigWarningEvent;
   /** Connection state changed */
   connectionState: ConnectionStateEvent;
   /** Metrics updated */

@@ -19,7 +19,15 @@
 
 import { BudWidget, defineWidget } from './widget';
 import { mergeConfig, parseConfigFromAttributes } from './config';
-import { buildConfigMessage } from './websocket';
+import { buildConfigMessage, buildConversationConfig } from './websocket';
+import {
+  STT_PROVIDERS,
+  TTS_PROVIDERS,
+  REALTIME_PROVIDERS,
+  isValidSTTProvider,
+  isValidTTSProvider,
+  isValidRealtimeProvider,
+} from './providers';
 import type {
   WidgetConfig,
   WidgetState,
@@ -27,17 +35,40 @@ import type {
   AudioChunk,
   WidgetMetrics,
   WidgetEventMap,
+  ConfigWarning,
   STTConfig,
   TTSConfig,
   ConversationConfig,
   FeatureFlags,
+  STTProvider,
+  TTSProvider,
+  RealtimeProvider,
+  AdapterKind,
+  MuteStrategy,
+  RoutingMode,
+  ReasoningEffort,
+  LatencyFiller,
 } from './types';
 
 // Auto-register the custom element
 defineWidget();
 
 // Export everything for programmatic usage
-export { BudWidget, defineWidget, mergeConfig, parseConfigFromAttributes, buildConfigMessage };
+export {
+  BudWidget,
+  defineWidget,
+  mergeConfig,
+  parseConfigFromAttributes,
+  buildConfigMessage,
+  buildConversationConfig,
+  // Canonical provider value-space (mirrors the gateway dispatch tables).
+  STT_PROVIDERS,
+  TTS_PROVIDERS,
+  REALTIME_PROVIDERS,
+  isValidSTTProvider,
+  isValidTTSProvider,
+  isValidRealtimeProvider,
+};
 export type {
   WidgetConfig,
   WidgetState,
@@ -45,10 +76,19 @@ export type {
   AudioChunk,
   WidgetMetrics,
   WidgetEventMap,
+  ConfigWarning,
   STTConfig,
   TTSConfig,
   ConversationConfig,
   FeatureFlags,
+  STTProvider,
+  TTSProvider,
+  RealtimeProvider,
+  AdapterKind,
+  MuteStrategy,
+  RoutingMode,
+  ReasoningEffort,
+  LatencyFiller,
 };
 
 // Factory function for programmatic creation
