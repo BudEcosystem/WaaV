@@ -325,6 +325,10 @@ function sttConfigToWire(
   // STTConfig allows `punctuate` as a Deepgram-style alias of `punctuation`.
   setIfDefined(wire, 'punctuation', config.punctuation ?? config.punctuate);
   setIfDefined(wire, 'encoding', config.encoding);
+  // D8 uplink transport codec the GATEWAY decodes before STT (`opus` → one opus packet per binary
+  // frame). Distinct from `encoding`. Only set when the SDK will actually encode opus; the gateway
+  // echoes the effective codec in `ready` and degrades to linear16 if it can't.
+  setIfDefined(wire, 'audio_in_codec', config.audioInCodec);
   setIfDefined(wire, 'model', config.model);
   setIfDefined(wire, 'api_key', config.apiKey);
 
@@ -429,6 +433,10 @@ function ttsConfigToWire(config: TTSConfig): Record<string, unknown> {
   setIfDefined(wire, 'speaking_rate', config.speakingRate ?? config.speed);
   setIfDefined(wire, 'audio_out_chunk_ms', config.audioOutChunkMs);
   setIfDefined(wire, 'client_playback_rate', config.clientPlaybackRate);
+  // D8 downlink transport codec: `opus` → the gateway encodes each TTS PCM chunk to one opus packet
+  // per binary frame; the SDK decodes before playout. Only set when the SDK can decode opus; the
+  // gateway echoes the effective codec in `ready` and degrades to linear16 if it can't.
+  setIfDefined(wire, 'audio_out_codec', config.audioOutCodec);
   setIfDefined(wire, 'connection_timeout', config.connectionTimeout);
   setIfDefined(wire, 'request_timeout', config.requestTimeout);
   setIfDefined(wire, 'api_key', config.apiKey);
@@ -555,6 +563,12 @@ function readyFromWire(wire: Record<string, unknown>): ReadyMessage {
   if (wire.resolved_alias && typeof wire.resolved_alias === 'object') {
     msg.resolved_alias = wire.resolved_alias as ResolvedAlias;
   }
+  // D8: the negotiated transport codecs actually in effect (present only when the client requested a
+  // non-default codec) — lets the SDK detect a downgrade and send/decode the right format.
+  const audioInCodec = asString(wire.audio_in_codec);
+  if (audioInCodec !== undefined) msg.audio_in_codec = audioInCodec;
+  const audioOutCodec = asString(wire.audio_out_codec);
+  if (audioOutCodec !== undefined) msg.audio_out_codec = audioOutCodec;
   return msg;
 }
 

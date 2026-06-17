@@ -589,6 +589,10 @@ export class WebSocketSession {
     // P3: surface the resolved-alias echo so a developer SEES what their alias
     // (e.g. "support-bot") resolved to — and can re-point it server-side.
     if (message.resolved_alias !== undefined) event.resolvedAlias = message.resolved_alias;
+    // D8: surface the negotiated transport codecs so callers (and the opus wiring) can detect a
+    // downgrade — if `opus` was requested but the gateway echoes `linear16`, send/decode linear16.
+    if (message.audio_in_codec !== undefined) event.audioInCodec = message.audio_in_codec;
+    if (message.audio_out_codec !== undefined) event.audioOutCodec = message.audio_out_codec;
 
     // Store the event for later retrieval by waitForReady()
     this.lastReadyEvent = event;

@@ -922,6 +922,12 @@ class STTConfig(BaseModel):
     encoding: str = "linear16"
     """Audio encoding format"""
 
+    audio_in_codec: Optional[str] = None
+    """D8 uplink transport codec the gateway decodes before STT: ``"linear16"`` (default) | ``"opus"``.
+    Distinct from :attr:`encoding`. Opt-in (the Python SDK does not yet opus-encode, so set this only
+    if you encode opus yourself); the gateway echoes the effective codec on ``ready`` and degrades to
+    linear16 if its build lacks opus."""
+
     channels: int = 1
     """Number of audio channels"""
 
@@ -978,6 +984,11 @@ class TTSConfig(BaseModel):
 
     audio_format: str = "linear16"
     """Output audio format"""
+
+    audio_out_codec: Optional[str] = None
+    """D8 downlink transport codec for TTS egress: ``"linear16"`` (default) | ``"opus"``. The gateway
+    encodes each PCM chunk to one opus packet per binary frame. Opt-in (the Python SDK does not yet
+    opus-decode); the gateway echoes the effective codec on ``ready``."""
 
     speed: Optional[float] = None
     """Speech rate multiplier"""

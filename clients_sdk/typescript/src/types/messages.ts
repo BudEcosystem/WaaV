@@ -181,6 +181,10 @@ export interface ReadyMessage {
    * with zero client change.
    */
   resolved_alias?: ResolvedAlias;
+  /** D8 negotiated uplink transport codec in effect (`linear16` | `opus`); present only on request. */
+  audio_in_codec?: string;
+  /** D8 negotiated downlink transport codec in effect (`linear16` | `opus`); present only on request. */
+  audio_out_codec?: string;
 }
 
 /**

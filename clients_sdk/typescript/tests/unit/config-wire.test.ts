@@ -54,6 +54,25 @@ describe('STT config → wire (features nesting + turn_detection)', () => {
     expect(wire.stt_config.word_timestamps).toBeUndefined();
   });
 
+  it('D8: emits audio_in_codec on stt_config and audio_out_codec on tts_config only when set', () => {
+    const opus = wireOf({
+      type: 'config',
+      stt: { provider: 'deepgram', language: 'en-US', model: 'nova-3', audioInCodec: 'opus' },
+      tts: { provider: 'deepgram', model: 'aura-asteria-en', audioOutCodec: 'opus' },
+    });
+    expect(opus.stt_config.audio_in_codec).toBe('opus');
+    expect(opus.tts_config.audio_out_codec).toBe('opus');
+
+    // Omitted = no new wire surface (backward compatible / linear16 default).
+    const plain = wireOf({
+      type: 'config',
+      stt: { provider: 'deepgram', language: 'en-US', model: 'nova-3' },
+      tts: { provider: 'deepgram', model: 'aura-asteria-en' },
+    });
+    expect(plain.stt_config.audio_in_codec).toBeUndefined();
+    expect(plain.tts_config.audio_out_codec).toBeUndefined();
+  });
+
   it('nests turn detection under stt_config.turn_detection (its real wire home)', () => {
     const wire = wireOf({
       type: 'config',

@@ -324,6 +324,9 @@ class WebSocketSession:
         self._stream_id: Optional[str] = None
         self._protocol_version: Optional[str] = None
         self._resolved_alias: Optional[dict[str, Any]] = None
+        # D8: the transport codecs the gateway negotiated (set on `ready` only when requested).
+        self._audio_in_codec: Optional[str] = None
+        self._audio_out_codec: Optional[str] = None
         self._connected = False
         self._connecting = False
         self._closed = False
@@ -412,6 +415,24 @@ class WebSocketSession:
         what the alias became, and re-point it server-side with zero client change.
         """
         return self._resolved_alias
+
+    @property
+    def audio_in_codec(self) -> Optional[str]:
+        """D8 negotiated UPLINK transport codec in effect (``"linear16"`` | ``"opus"``).
+
+        Populated from the ``ready`` ack only when ``stt_config.audio_in_codec`` was requested.
+        If you asked for ``opus`` and this is ``"linear16"``, the gateway downgraded — send linear16.
+        """
+        return self._audio_in_codec
+
+    @property
+    def audio_out_codec(self) -> Optional[str]:
+        """D8 negotiated DOWNLINK transport codec for TTS egress (``"linear16"`` | ``"opus"``).
+
+        Populated from the ``ready`` ack only when ``tts_config.audio_out_codec`` was requested.
+        Same downgrade semantics as :attr:`audio_in_codec`.
+        """
+        return self._audio_out_codec
 
     def on(self, event: str, handler: Callable[..., Any]) -> None:
         """
@@ -900,6 +921,10 @@ class WebSocketSession:
                 "encoding": self.stt_config.encoding,
                 "model": self.stt_config.model or "nova-3",
             }
+            # D8 uplink transport codec (linear16|opus); only set when requested. The gateway echoes
+            # the effective codec on `ready` and degrades to linear16 if its build lacks opus.
+            if getattr(self.stt_config, "audio_in_codec", None):
+                stt_dict["audio_in_codec"] = self.stt_config.audio_in_codec
             # Include API key if provided (gateway allows per-request override)
             if self.api_key:
                 stt_dict["api_key"] = self.api_key
@@ -994,6 +1019,10 @@ class WebSocketSession:
                 tts_dict["audio_format"] = self.tts_config.audio_format
             if self.tts_config.speed is not None:
                 tts_dict["speaking_rate"] = self.tts_config.speed
+            # D8 downlink transport codec (linear16|opus); only set when requested. The gateway echoes
+            # the effective codec on `ready` and degrades to linear16 if its build lacks opus.
+            if getattr(self.tts_config, "audio_out_codec", None):
+                tts_dict["audio_out_codec"] = self.tts_config.audio_out_codec
             # Include API key if provided (gateway allows per-request override)
             if self.api_key:
                 tts_dict["api_key"] = self.api_key
@@ -1193,6 +1222,11 @@ class WebSocketSession:
                         # providers the gateway resolved `alias` to (no secrets), so
                         # a developer can SEE what e.g. "support-bot" became.
                         self._resolved_alias = data.get("resolved_alias")
+                        # D8: capture the negotiated transport codecs in effect. If we asked for
+                        # `opus` but the gateway echoes `linear16`, it downgraded (e.g. built without
+                        # opus) — callers should send/decode linear16.
+                        self._audio_in_codec = data.get("audio_in_codec")
+                        self._audio_out_codec = data.get("audio_out_codec")
                         # Capture + drift-check the wire protocol version (plan W-K1).
                         # The gateway emits this specifically so SDKs detect a
                         # breaking contract change instead of silent field drift.

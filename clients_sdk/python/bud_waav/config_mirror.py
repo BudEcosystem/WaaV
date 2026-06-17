@@ -78,6 +78,7 @@ SDK_CONFIG_REACH: dict[str, set[str]] = {
         "channels",  # STTConfig.channels
         "punctuation",  # STTConfig.punctuate (SDK alias)
         "encoding",  # STTConfig.encoding
+        "audio_in_codec",  # D8 STTConfig.audio_in_codec (uplink transport codec)
         "model",  # STTConfig.model
         "api_key",  # session api_key override
         "features",  # nested SttFeatures (see SttFeatures below)
@@ -127,6 +128,7 @@ SDK_CONFIG_REACH: dict[str, set[str]] = {
         "sample_rate",  # TTSConfig.sample_rate
         "audio_out_chunk_ms",  # TTSConfig.audio_out_chunk_ms
         "client_playback_rate",  # TTSConfig.client_playback_rate
+        "audio_out_codec",  # D8 TTSConfig.audio_out_codec (downlink transport codec)
         "connection_timeout",  # TTSConfig.connection_timeout
         "request_timeout",  # TTSConfig.request_timeout
         "model",  # TTSConfig.model

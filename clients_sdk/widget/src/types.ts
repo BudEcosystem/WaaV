@@ -255,6 +255,12 @@ export interface STTConfig {
   channels?: number;
   encoding?: string;
   /**
+   * D8 uplink transport codec the gateway decodes before STT (`'linear16'` | `'opus'`). Opt-in: the
+   * light widget does not yet WebCodecs-encode, so set this only if you encode opus yourself. The
+   * gateway echoes the effective codec in `ready` and degrades to linear16 if it can't.
+   */
+  audioInCodec?: 'linear16' | 'opus';
+  /**
    * Canonical in-stream translation (P5). Ask for translation with the same
    * canonical BCP-47 tokens as {@link language}; the gateway maps to each
    * provider's native code and emits `translations:[{lang,text}]` on the
@@ -287,6 +293,11 @@ export interface TTSConfig {
   voiceDescriptor?: VoiceDescriptor;
   model?: string;
   sampleRate?: number;
+  /**
+   * D8 downlink transport codec for TTS egress (`'linear16'` | `'opus'`). Opt-in (the light widget
+   * does not yet WebCodecs-decode). The gateway echoes the effective codec in `ready`.
+   */
+  audioOutCodec?: 'linear16' | 'opus';
   /** Emotion configuration */
   emotion?: EmotionConfig;
 }

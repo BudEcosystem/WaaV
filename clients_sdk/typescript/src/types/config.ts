@@ -236,6 +236,13 @@ export interface STTConfig {
   punctuate?: boolean;
   /** Encoding of the audio (default: "linear16") */
   encoding?: string;
+  /**
+   * D8 uplink transport codec the gateway decodes before STT: `"linear16"` (default) | `"opus"`.
+   * Prefer the higher-level capability negotiation (the SDK sets this only when it can encode opus
+   * via WebCodecs); the gateway echoes the effective codec in `ready` and degrades to linear16 if
+   * its build lacks opus. Distinct from {@link encoding}.
+   */
+  audioInCodec?: 'linear16' | 'opus';
   /** Model to use for transcription (e.g., "nova-2", "nova-3") */
   model?: string;
   /** Enable interim/partial results */
@@ -381,6 +388,13 @@ export interface TTSConfig {
   audioOutChunkMs?: number;
   /** Resample the egress audio to this rate for client playback. */
   clientPlaybackRate?: number;
+  /**
+   * D8 downlink transport codec for TTS egress: `"linear16"` (default) | `"opus"`. The gateway
+   * encodes each PCM chunk to one opus packet per binary frame; the SDK decodes before playout.
+   * Prefer the higher-level capability negotiation (set only when the SDK can decode opus via
+   * WebCodecs); the gateway echoes the effective codec in `ready` and degrades to linear16 otherwise.
+   */
+  audioOutCodec?: 'linear16' | 'opus';
   /** Per-session API key override (literal or '${ENV}'). */
   apiKey?: string;
 

@@ -119,6 +119,7 @@ test('drift: stt_config emits every gateway STTWebSocketConfig field', () => {
       sampleRate: 16000,
       channels: 1,
       encoding: 'linear16',
+      audioInCodec: 'opus',
       translation: { targetLanguages: ['hi-IN'], translateToEnglish: false },
     },
     features: { punctuation: true },
@@ -146,6 +147,7 @@ test('drift: tts_config emits the gateway TTSWebSocketConfig beginner fields', (
       voiceDescriptor: { gender: 'female', locale: 'en-US', style: 'warm' },
       model: 'aura-2',
       sampleRate: 24000,
+      audioOutCodec: 'opus',
       emotion: {
         emotion: 'happy',
         intensity: 'high',

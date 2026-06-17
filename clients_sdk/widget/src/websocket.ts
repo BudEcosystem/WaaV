@@ -55,6 +55,10 @@ export function buildConfigMessage(config: WidgetConfig): Record<string, unknown
       model: config.stt.model ?? '',
       punctuation: config.features?.punctuation ?? true,
     };
+    // D8 uplink transport codec (linear16|opus). Opt-in: only set when the embedder explicitly asks
+    // for opus (the light widget does not yet WebCodecs-encode, so it isn't auto-enabled). The
+    // gateway echoes the effective codec in `ready` and degrades to linear16 if it can't.
+    if (config.stt.audioInCodec) sttConfig.audio_in_codec = config.stt.audioInCodec;
 
     // ML turn detection -> stt_config.turn_detection (gateway TurnDetectionWsConfig:
     // only enabled/threshold/eager are wire keys).
@@ -110,6 +114,9 @@ export function buildConfigMessage(config: WidgetConfig): Record<string, unknown
       audio_out_chunk_ms: 20,
       client_playback_rate: sinkRate,
     };
+    // D8 downlink transport codec (linear16|opus). Opt-in (the light widget does not yet
+    // WebCodecs-decode, so it isn't auto-enabled); the gateway echoes the effective codec in `ready`.
+    if (config.tts.audioOutCodec) ttsConfig.audio_out_codec = config.tts.audioOutCodec;
 
     // Abstract voice selection (P4): the gateway resolves a VoiceDescriptor to a
     // concrete provider voice_id server-side. Sent under `voice_descriptor` as a
@@ -578,6 +585,14 @@ export class WidgetWebSocket {
         case 'ready':
           if (resolveConnect) {
             resolveConnect();
+          }
+          // D8: if we asked for opus but the gateway echoes linear16, it downgraded (e.g. built
+          // without opus). Surface it so the embedder knows audio is linear16 on the wire.
+          if (data.audio_in_codec && data.audio_in_codec !== (this.config.stt?.audioInCodec ?? 'linear16')) {
+            console.warn(`[bud-widget] uplink codec negotiated to '${data.audio_in_codec}' (requested '${this.config.stt?.audioInCodec}')`);
+          }
+          if (data.audio_out_codec && data.audio_out_codec !== (this.config.tts?.audioOutCodec ?? 'linear16')) {
+            console.warn(`[bud-widget] downlink codec negotiated to '${data.audio_out_codec}' (requested '${this.config.tts?.audioOutCodec}')`);
           }
           this.handlers.onReady(data.stream_id);
           break;

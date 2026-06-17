@@ -101,6 +101,18 @@ export interface ReadyEvent {
    * Present only when an `alias` was sent and recognized.
    */
   resolvedAlias?: ResolvedAlias;
+  /**
+   * D8 negotiated UPLINK transport codec actually in effect (`'linear16' | 'opus'`). Present only
+   * when the client requested a non-default `stt_config.audio_in_codec`. If you asked for `opus` and
+   * this comes back `'linear16'`, the gateway downgraded (e.g. built without opus) — send linear16.
+   */
+  audioInCodec?: string;
+  /**
+   * D8 negotiated DOWNLINK transport codec for TTS egress (`'linear16' | 'opus'`). Present only when
+   * the client requested a non-default `tts_config.audio_out_codec`. Same downgrade semantics as
+   * {@link audioInCodec} — decode opus only when this is `'opus'`.
+   */
+  audioOutCodec?: string;
   /** Original message for advanced use */
   raw: ReadyMessage;
 }

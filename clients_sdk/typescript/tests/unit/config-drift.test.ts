@@ -80,6 +80,8 @@ function schemaProps(yaml: string, schemaName: string): { props: string[]; requi
 const STT_SDK = new Set([
   'provider', 'language', 'sampleRate', 'channels', 'punctuation', 'punctuate',
   'encoding', 'model', 'apiKey', 'extras',
+  // D8 uplink transport codec (linear16|opus):
+  'audioInCodec',
   // features{} canonical surface (flattened onto STTConfig):
   'interimResults', 'diarize', 'wordTimestamps', 'smartFormat', 'profanityFilter',
   'fillerWords', 'vadEvents', 'endpointingMs', 'utteranceEndMsFeature', 'keyterms',
@@ -94,6 +96,8 @@ const STT_SDK = new Set([
 const TTS_SDK = new Set([
   'provider', 'voiceId', 'voice', 'speakingRate', 'audioFormat', 'sampleRate',
   'audioOutChunkMs', 'clientPlaybackRate', 'connectionTimeout', 'requestTimeout',
+  // D8 downlink transport codec (linear16|opus):
+  'audioOutCodec',
   'model', 'pronunciations', 'apiKey', 'emotion', 'emotionIntensity',
   'deliveryStyle', 'emotionDescription', 'extras',
   // P4 abstract voice selection (TTSConfig.voiceDescriptor):
