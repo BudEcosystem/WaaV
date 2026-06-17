@@ -12,6 +12,7 @@ import type {
   ReadyMessage,
   ResolvedAlias,
   STTResultMessage,
+  Translation,
   TTSAudioMessage,
   ErrorMessage,
   PongMessage,
@@ -574,6 +575,23 @@ function sttResultFromWire(wire: Record<string, unknown>): STTResultMessage {
   };
   const segment = asString(wire.segment_transcript);
   if (segment !== undefined) msg.segment_transcript = segment;
+  // P5: uniform translations:[{lang,text}] array, folded onto the transcript by
+  // the gateway (Speechmatics/Gladia/OpenAI-EN). Absent on non-translation sessions.
+  if (Array.isArray(wire.translations)) {
+    const translations: Translation[] = [];
+    for (const raw of wire.translations) {
+      const rec = asRecord(raw);
+      if (!rec) continue;
+      const t: Translation = {
+        lang: asString(rec.lang, '') ?? '',
+        text: asString(rec.text, '') ?? '',
+      };
+      const isPartial = asBoolean(rec.is_partial);
+      if (isPartial !== undefined) t.is_partial = isPartial;
+      translations.push(t);
+    }
+    if (translations.length > 0) msg.translations = translations;
+  }
   return msg;
 }
 

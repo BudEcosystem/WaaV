@@ -68,6 +68,7 @@ SDK_CONFIG_REACH: dict[str, set[str]] = {
         "livekit",
         "dag_config",
         "conversation_config",
+        "alias",  # P3 server-side alias name (ws/session.py::_send_config)
     },
     # ---- STTWebSocketConfig (config.rs:296) -----------------------------------
     "STTWebSocketConfig": {
@@ -82,13 +83,11 @@ SDK_CONFIG_REACH: dict[str, set[str]] = {
         "features",  # nested SttFeatures (see SttFeatures below)
         "extras",  # open passthrough (custom_vocabulary, …)
         "turn_detection",  # AudioFeatures.turn_detection (nested here)
-        # NOTE (P5): the SDK ALSO sends `stt_config.translation` (the canonical
-        # TranslationConfig — see STTConfig.translation + ws/session.py). It is
-        # intentionally NOT listed here yet: the drift guard is bidirectional and
-        # the committed gateway openapi.yaml STTWebSocketConfig has not been
-        # regenerated with `translation` (the gateway `/ws` `to_standard_stt`
-        # wiring lands in the same P5 gateway commit). Add `"translation"` here in
-        # lockstep with that openapi regen so the coverage direction stays green.
+        # P5: the canonical TranslationConfig the SDK sends as `stt_config.translation`
+        # (see STTConfig.translation + ws/session.py::_send_config). Landed in lockstep
+        # with the gateway openapi regen that added STTWebSocketConfig.translation, so
+        # the bidirectional drift guard stays green on both directions.
+        "translation",
     },
     # ---- TurnDetectionWsConfig (config.rs:351) --------------------------------
     "TurnDetectionWsConfig": {
@@ -137,6 +136,7 @@ SDK_CONFIG_REACH: dict[str, set[str]] = {
         "emotion_intensity",  # TTSConfig.emotion_intensity
         "delivery_style",  # TTSConfig.delivery_style
         "emotion_description",  # TTSConfig.emotion_description
+        "voice_descriptor",  # P4 abstract voice selection (TTSConfig.voice_descriptor)
         "features",  # nested TtsFeatures (see below)
         "extras",  # open passthrough (acting_instructions, instant_mode, …)
     },

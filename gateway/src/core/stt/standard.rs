@@ -156,6 +156,34 @@ impl TranslationConfig {
         out
     }
 
+    /// The CANONICAL BCP-47 target strings (`"es-ES"`, `"de-DE"`) PARALLEL to
+    /// [`target_iso639_1`](Self::target_iso639_1) — same dedup-by-ISO-code and
+    /// `cap`, index-aligned so `out[i]`'s ISO-639-1 form equals
+    /// `target_iso639_1(cap)[i]`. Used on the OUTPUT path: a provider that
+    /// echoes only the ISO code (Speechmatics `AddTranslation.language = "es"`)
+    /// can be upgraded back to the canonical BCP-47 the caller asked for. The EN
+    /// fast path maps to `["en-US"]` (the canonical home of `"en"`).
+    pub fn target_canonical(&self, cap: Option<usize>) -> Vec<&'static str> {
+        if self.wants_english() {
+            return vec![CanonicalLanguage::EnUs.as_bcp47()];
+        }
+        // De-dup by ISO key exactly like `target_iso639_1`, keeping the FIRST
+        // canonical locale seen for each ISO code (so the pairing is stable).
+        let mut seen_iso: Vec<&'static str> = Vec::new();
+        let mut out: Vec<&'static str> = Vec::new();
+        for c in &self.target_languages {
+            let code = c.iso639_1();
+            if !code.is_empty() && !seen_iso.contains(&code) {
+                seen_iso.push(code);
+                out.push(c.as_bcp47());
+            }
+        }
+        if let Some(n) = cap {
+            out.truncate(n);
+        }
+        out
+    }
+
     /// Degrade warnings (NEVER a 400) for a given provider, so the caller can surface a
     /// `config_warning` and proceed transcript-only / truncated. `streaming` selects the
     /// streaming-vs-batch capability matrix (AssemblyAI translation is batch-only).
@@ -665,6 +693,36 @@ mod tests {
             t.target_iso639_1(Some(SPEECHMATICS_MAX_TRANSLATION_TARGETS)).len(),
             5
         );
+    }
+
+    #[test]
+    fn translation_target_canonical_is_index_aligned_with_iso() {
+        // P5 OUTPUT mapping: target_canonical()[i].iso639_1 == target_iso639_1()[i],
+        // so a provider that echoes only the ISO code can be upgraded to canonical.
+        let t = TranslationConfig {
+            target_languages: vec![
+                CanonicalLanguage::EsEs,
+                CanonicalLanguage::DeDe,
+                CanonicalLanguage::EsMx, // same ISO "es" as EsEs → de-duped out
+            ],
+            translate_to_english: None,
+            partials: None,
+        };
+        let iso = t.target_iso639_1(None);
+        let canon = t.target_canonical(None);
+        assert_eq!(iso, vec!["es", "de"]); // EsMx de-duped (ISO "es" already seen)
+        assert_eq!(canon, vec!["es-ES", "de-DE"]);
+        assert_eq!(iso.len(), canon.len());
+        // The cap applies identically to both lists.
+        assert_eq!(t.target_iso639_1(Some(1)), vec!["es"]);
+        assert_eq!(t.target_canonical(Some(1)), vec!["es-ES"]);
+        // EN fast path → ["en"] / ["en-US"].
+        let en = TranslationConfig {
+            translate_to_english: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(en.target_iso639_1(None), vec!["en"]);
+        assert_eq!(en.target_canonical(None), vec!["en-US"]);
     }
 
     #[test]

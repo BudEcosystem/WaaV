@@ -154,6 +154,11 @@ struct GladiaTransport {
     bytes_sent: Arc<AtomicU64>,
     /// Fires once on the first successful connect, unblocking `connect`.
     connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// P5 translation output mapping: ISO-639-1 (what Gladia echoes on
+    /// `type:"translation"` `data.target_language`, e.g. `"es"`) → the canonical
+    /// BCP-47 string the caller requested (`"es-ES"`). Empty when no translation
+    /// was configured; a missing key falls back to the raw provider code.
+    translation_lang_map: std::collections::HashMap<String, String>,
 }
 
 #[async_trait::async_trait]
@@ -216,6 +221,36 @@ impl WsTransport for GladiaTransport {
                                     self.stats.write().await.update_with_result(&result);
                                     if let Some(callback) = self.on_result.read().await.as_ref() {
                                         callback(result).await;
+                                    }
+                                }
+                                Ok(ServerMessage::Translation(translation)) => {
+                                    // P5: fold Gladia's `type:"translation"` into the uniform
+                                    // translations[] array. Empty transcript so client egress
+                                    // merges only the translation; partial flag rides is_partial.
+                                    let translated =
+                                        translation.data.translated_utterance.text.clone();
+                                    if !translated.is_empty() {
+                                        let is_final = translation.data.is_final;
+                                        let lang = self
+                                            .translation_lang_map
+                                            .get(&translation.data.target_language)
+                                            .cloned()
+                                            .unwrap_or_else(|| {
+                                                translation.data.target_language.clone()
+                                            });
+                                        let mut result =
+                                            STTResult::new(String::new(), is_final, false, 0.0);
+                                        result.translations =
+                                            vec![crate::core::stt::standard::Translation {
+                                                lang,
+                                                text: translated,
+                                                is_partial: !is_final,
+                                            }];
+                                        if let Some(callback) =
+                                            self.on_result.read().await.as_ref()
+                                        {
+                                            callback(result).await;
+                                        }
                                     }
                                 }
                                 Ok(ServerMessage::Error(err)) => {
@@ -501,6 +536,22 @@ impl BaseSTT for GladiaSTT {
                             })?;
                         info!("Connected to Gladia STT (session: {})", init_response.id);
                         let (ws_sink, ws_stream) = ws_stream.split();
+                        // P5: ISO-639-1 -> canonical BCP-47 map, from the index-aligned
+                        // config lists, so `type:"translation"` frames carry canonical lang.
+                        let translation_lang_map: std::collections::HashMap<String, String> =
+                            gladia_config
+                                .realtime_processing
+                                .translation_target_languages
+                                .iter()
+                                .cloned()
+                                .zip(
+                                    gladia_config
+                                        .realtime_processing
+                                        .translation_target_canonical
+                                        .iter()
+                                        .cloned(),
+                                )
+                                .collect();
                         Ok(GladiaTransport {
                             ws_sink,
                             ws_stream,
@@ -511,6 +562,7 @@ impl BaseSTT for GladiaSTT {
                             stats,
                             bytes_sent,
                             connected_tx,
+                            translation_lang_map,
                         })
                     }
                 })

@@ -203,6 +203,23 @@ export interface ResolvedAlias {
 }
 
 /**
+ * One translated segment in the uniform gateway `translations` array (P5).
+ *
+ * The gateway folds Speechmatics `AddTranslation` / Gladia `type:"translation"` /
+ * the OpenAI-Groq English fast path into this single `{lang, text}` shape so the
+ * SDK reads ONE field regardless of provider. Mirrors gateway `Translation`
+ * (gateway/src/core/stt/standard.rs).
+ */
+export interface Translation {
+  /** Canonical target-language BCP-47 string (e.g. `es-ES`). */
+  lang: string;
+  /** The translated text for this segment. */
+  text: string;
+  /** `true` if this is a partial (interim) translation, `false`/omitted if final. */
+  is_partial?: boolean;
+}
+
+/**
  * STT result message containing transcription
  */
 export interface STTResultMessage {
@@ -221,6 +238,12 @@ export interface STTResultMessage {
    * per-final text should prefer this when present.
    */
   segment_transcript?: string;
+  /**
+   * Uniform, provider-agnostic in-stream translations merged onto this transcript
+   * (P5). Empty/absent unless a translation-capable provider returned a
+   * `translations:[{lang,text}]` array on this stt_result frame.
+   */
+  translations?: Translation[];
 }
 
 /**

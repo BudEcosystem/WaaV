@@ -15,9 +15,10 @@ use tracing::{debug, error, info};
 
 use super::config::SpeechmaticsSTTConfig;
 use super::messages::{
-    AddPartialTranscriptMessage, AddTranscriptMessage, AdditionalVocabWord, AudioFormat,
-    EndOfStreamMessage, ErrorMessage, PunctuationOverrides, Replacement, SpeakerDiarizationConfig,
-    StartRecognitionMessage, TranscriptFilteringConfig, TranscriptionConfig,
+    AddPartialTranscriptMessage, AddTranscriptMessage, AddTranslationMessage, AdditionalVocabWord,
+    AudioFormat, EndOfStreamMessage, ErrorMessage, PunctuationOverrides, Replacement,
+    SpeakerDiarizationConfig, StartRecognitionMessage, TranscriptFilteringConfig,
+    TranscriptionConfig,
 };
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
@@ -69,6 +70,11 @@ struct SpeechmaticsTransport {
     error_callback: Arc<RwLock<Option<STTErrorCallback>>>,
     /// Fires once after `StartRecognition` is (re)sent, unblocking `connect`.
     connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// P5 translation output mapping: ISO-639-1 (what Speechmatics echoes on
+    /// `AddTranslation.language`, e.g. `"es"`) → the canonical BCP-47 string the
+    /// caller requested (`"es-ES"`). Empty when no translation was configured; a
+    /// missing key falls back to the raw provider code.
+    translation_lang_map: Arc<std::collections::HashMap<String, String>>,
 }
 
 #[async_trait]
@@ -179,6 +185,34 @@ impl WsTransport for SpeechmaticsTransport {
     }
 }
 
+/// Fold a Speechmatics `AddTranslation`/`AddPartialTranslation` frame into the
+/// uniform [`STTResult`] carrying `translations[]{lang,text}` (P5). Returns `None`
+/// for an empty translation (nothing to emit). `lang_map` upgrades the provider's
+/// ISO-639-1 code back to the canonical BCP-47 the caller requested; an unknown
+/// code falls back to the raw provider value. The transcript is left empty (these
+/// frames carry no transcript text) so client egress merges only the translation;
+/// the partial flag rides `Translation::is_partial`, NOT `is_final`.
+fn translation_to_stt_result(
+    msg: &AddTranslationMessage,
+    lang_map: &std::collections::HashMap<String, String>,
+) -> Option<STTResult> {
+    let translated = msg.text();
+    if translated.is_empty() {
+        return None;
+    }
+    let lang = lang_map
+        .get(&msg.language)
+        .cloned()
+        .unwrap_or_else(|| msg.language.clone());
+    let mut result = STTResult::new(String::new(), !msg.is_partial(), false, 0.0);
+    result.translations = vec![crate::core::stt::standard::Translation {
+        lang,
+        text: translated,
+        is_partial: msg.is_partial(),
+    }];
+    Some(result)
+}
+
 impl SpeechmaticsTransport {
     /// Parse and route a Speechmatics text message. Returns `Some(outcome)` when the loop must
     /// exit (provider `Error` → Fatal), `None` to keep running.
@@ -223,6 +257,14 @@ impl SpeechmaticsTransport {
                             callback(result).await;
                         }
                     }
+                }
+            }
+            "AddTranslation" | "AddPartialTranslation" => {
+                if let Ok(msg) = serde_json::from_str::<AddTranslationMessage>(text)
+                    && let Some(result) = translation_to_stt_result(&msg, &self.translation_lang_map)
+                    && let Some(callback) = self.result_callback.read().await.as_ref()
+                {
+                    callback(result).await;
                 }
             }
             "EndOfTranscript" => {
@@ -486,6 +528,18 @@ impl BaseSTT for SpeechmaticsSTT {
         let start_recognition_json = serde_json::to_string(&start_msg)
             .map_err(|e| STTError::ProviderError(format!("Failed to serialize: {}", e)))?;
 
+        // P5 translation output mapping: ISO-639-1 (echoed on each AddTranslation
+        // frame) → the canonical BCP-47 string the caller requested. The two config
+        // lists are index-aligned (see SpeechmaticsSTTConfig::from_standard); zip them.
+        let translation_lang_map: std::collections::HashMap<String, String> = self
+            .config
+            .translation_target_languages
+            .iter()
+            .cloned()
+            .zip(self.config.translation_target_canonical.iter().cloned())
+            .collect();
+        let translation_lang_map = Arc::new(translation_lang_map);
+
         // Create channels for communication (bounded for backpressure on audio).
         let (ws_tx, ws_rx) = mpsc::channel::<Bytes>(32);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -504,6 +558,7 @@ impl BaseSTT for SpeechmaticsSTT {
         let error_callback = Arc::clone(&self.error_callback);
         let is_session_started = Arc::clone(&self.is_session_started);
         let seq_no = Arc::clone(&self.seq_no);
+        let translation_lang_map = Arc::clone(&translation_lang_map);
 
         // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor with
         // the shared process-global handles from CoreState (W-D1/W-D2 fleet adoption). When no
@@ -540,6 +595,7 @@ impl BaseSTT for SpeechmaticsSTT {
                     let error_callback = Arc::clone(&error_callback);
                     let is_session_started = Arc::clone(&is_session_started);
                     let seq_no = Arc::clone(&seq_no);
+                    let translation_lang_map = Arc::clone(&translation_lang_map);
                     async move {
                         // Derive the Host header from the ACTUAL dial URL — hardcoding the EU host
                         // broke every US-region session (dialing us.rt.speechmatics.com while
@@ -586,6 +642,7 @@ impl BaseSTT for SpeechmaticsSTT {
                             result_callback,
                             error_callback,
                             connected_tx,
+                            translation_lang_map,
                         })
                     }
                 })
@@ -742,6 +799,72 @@ mod tests {
         let config = STTConfig::default();
         let result = SpeechmaticsSTT::new(config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn add_translation_frame_yields_stt_result_with_translations() {
+        // P5: an AddTranslation frame must fold into an STTResult carrying the
+        // uniform translations[]{lang,text}; the ISO code is upgraded to canonical.
+        let frame = r#"{
+            "message": "AddTranslation",
+            "format": "2.9",
+            "language": "es",
+            "results": [
+                {"start_time": 0.0, "end_time": 0.5, "content": "hola"},
+                {"start_time": 0.6, "end_time": 1.0, "content": " mundo"}
+            ]
+        }"#;
+        let msg: AddTranslationMessage = serde_json::from_str(frame).unwrap();
+        assert_eq!(msg.text(), "hola mundo");
+        assert!(!msg.is_partial());
+
+        let mut lang_map = std::collections::HashMap::new();
+        lang_map.insert("es".to_string(), "es-ES".to_string());
+
+        let result = translation_to_stt_result(&msg, &lang_map).expect("non-empty translation");
+        assert_eq!(result.translations.len(), 1);
+        assert_eq!(result.translations[0].lang, "es-ES"); // upgraded from "es"
+        assert_eq!(result.translations[0].text, "hola mundo");
+        assert!(!result.translations[0].is_partial);
+        assert!(result.is_final); // final translation -> is_final true
+        assert!(result.transcript.is_empty()); // no transcript text on a translation frame
+
+        // The WS egress serializes translations:[{lang,text}] onto the stt_result frame.
+        let egress = crate::handlers::ws::messages::OutgoingMessage::STTResult {
+            transcript: result.transcript.clone(),
+            is_final: result.is_final,
+            is_speech_final: result.is_speech_final,
+            confidence: result.confidence,
+            segment_transcript: result.segment_transcript.clone(),
+            translations: result.translations.clone(),
+        };
+        let json = serde_json::to_string(&egress).unwrap();
+        assert!(json.contains("\"translations\":[{"));
+        assert!(json.contains("\"lang\":\"es-ES\""));
+        assert!(json.contains("\"text\":\"hola mundo\""));
+    }
+
+    #[test]
+    fn add_partial_translation_frame_is_partial_and_unknown_lang_passes_through() {
+        // Partial frame -> is_partial true; an unmapped ISO code falls back verbatim.
+        let frame = r#"{
+            "message": "AddPartialTranslation",
+            "language": "zz",
+            "results": [{"start_time": 0.0, "end_time": 0.3, "content": "x"}]
+        }"#;
+        let msg: AddTranslationMessage = serde_json::from_str(frame).unwrap();
+        assert!(msg.is_partial());
+
+        let lang_map = std::collections::HashMap::new(); // empty -> no upgrade
+        let result = translation_to_stt_result(&msg, &lang_map).expect("non-empty");
+        assert_eq!(result.translations[0].lang, "zz"); // raw provider code
+        assert!(result.translations[0].is_partial);
+        assert!(!result.is_final); // partial -> is_final false
+
+        // An empty translation yields nothing to emit.
+        let empty = r#"{"message":"AddTranslation","language":"es","results":[]}"#;
+        let empty_msg: AddTranslationMessage = serde_json::from_str(empty).unwrap();
+        assert!(translation_to_stt_result(&empty_msg, &lang_map).is_none());
     }
 
     // W-D1: disconnect() must record intent on the supervisor-shared flag so a client close racing

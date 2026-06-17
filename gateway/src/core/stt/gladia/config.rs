@@ -354,6 +354,13 @@ pub struct GladiaRealtimeProcessing {
     /// Target languages for translation
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub translation_target_languages: Vec<String>,
+    /// P5 translation OUTPUT mapping: canonical BCP-47 strings the caller asked
+    /// for, INDEX-ALIGNED to [`translation_target_languages`]'s ISO-639-1 codes.
+    /// Gateway-internal only — `#[serde(skip)]` keeps it out of the Gladia request
+    /// body. Used to upgrade the ISO code Gladia echoes on each `type:"translation"`
+    /// message back to the canonical `translations[].lang`.
+    #[serde(skip)]
+    pub translation_target_canonical: Vec<String>,
     /// Translation tuning options (`realtime_processing.translation_config`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub translation_config: Option<GladiaTranslationConfig>,
@@ -582,6 +589,13 @@ impl GladiaSTTConfig {
             if !targets.is_empty() {
                 cfg.realtime_processing.translation = true;
                 cfg.realtime_processing.translation_target_languages = targets;
+                // Index-aligned canonical BCP-47 list for the OUTPUT path (upgrade the
+                // ISO code Gladia echoes on `type:"translation"` back to canonical).
+                cfg.realtime_processing.translation_target_canonical = t
+                    .target_canonical(None)
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect();
                 if let Some(p) = t.partials {
                     cfg.messages_config.receive_partial_transcripts = p;
                 }

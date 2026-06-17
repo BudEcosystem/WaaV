@@ -313,6 +313,14 @@ pub enum OutgoingMessage {
         /// segment truth was previously not exposed on the wire at all).
         #[serde(skip_serializing_if = "Option::is_none")]
         segment_transcript: Option<String>,
+        /// Uniform, provider-agnostic in-stream translations merged onto this
+        /// transcript (P5). One `{lang, text}` entry per target language — the
+        /// canonical shape the gateway folds Speechmatics `AddTranslation`,
+        /// Gladia `type:"translation"`, and the Class-B EN fast path into so
+        /// SDKs read ONE field. Skipped on the wire when empty (the common
+        /// no-translation case), so non-translation sessions see no change.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        translations: Vec<crate::core::stt::standard::Translation>,
     },
     #[serde(rename = "message")]
     Message {
@@ -1034,7 +1042,8 @@ mod tests {
                 is_final: true,
                 is_speech_final: true,
                 confidence: 0.9,
-            segment_transcript: None,
+                segment_transcript: None,
+                translations: Vec::new(),
             }),
             MessageClass::Transcript,
         )
@@ -1075,7 +1084,8 @@ mod tests {
                 is_final: false,
                 is_speech_final: false,
                 confidence: 0.5,
-            segment_transcript: None,
+                segment_transcript: None,
+                translations: Vec::new(),
             }),
             MessageClass::Transcript,
         )

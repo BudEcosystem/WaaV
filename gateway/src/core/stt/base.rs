@@ -299,6 +299,15 @@ pub struct STTResult {
 
     /// Duration of the audio segment that produced this result (in seconds).
     pub audio_duration: Option<f64>,
+
+    /// Uniform, provider-agnostic in-stream translations merged onto this
+    /// transcript (P5). One entry per target language; `lang` is the canonical
+    /// BCP-47 string and `text` the translated segment. Populated by providers
+    /// with streaming translation (Speechmatics `AddTranslation`, Gladia
+    /// `type:"translation"`, the Class-B EN fast path); empty for everyone else,
+    /// so the field is additive and the existing construction sites are
+    /// unaffected. The WS egress skips it when empty.
+    pub translations: Vec<crate::core::stt::standard::Translation>,
 }
 
 impl STTResult {
@@ -336,6 +345,7 @@ impl STTResult {
             logprobs: None,
             detected_language: None,
             audio_duration: None,
+            translations: Vec::new(),
         }
     }
 
@@ -392,6 +402,7 @@ impl STTResult {
             logprobs,
             detected_language,
             audio_duration,
+            translations: Vec::new(),
         }
     }
 

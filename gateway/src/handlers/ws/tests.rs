@@ -339,13 +339,35 @@ fn test_outgoing_message_serialization() {
         is_final: true,
         is_speech_final: true,
         confidence: 0.95,
-            segment_transcript: None,
+        segment_transcript: None,
+        translations: Vec::new(),
     };
 
     let json = serde_json::to_string(&stt_msg).unwrap();
     assert!(json.contains("\"type\":\"stt_result\""));
     assert!(json.contains("Hello world"));
     assert!(json.contains("0.95"));
+    // Empty translations are skipped on the wire (no-translation sessions unchanged).
+    assert!(!json.contains("translations"));
+
+    // With translations populated, the uniform `translations:[{lang,text}]` array
+    // is serialized onto the stt_result frame.
+    let stt_with_translation = OutgoingMessage::STTResult {
+        transcript: "Hello world".to_string(),
+        is_final: true,
+        is_speech_final: true,
+        confidence: 0.95,
+        segment_transcript: None,
+        translations: vec![crate::core::stt::standard::Translation {
+            lang: "es-ES".to_string(),
+            text: "Hola mundo".to_string(),
+            is_partial: false,
+        }],
+    };
+    let json = serde_json::to_string(&stt_with_translation).unwrap();
+    assert!(json.contains("\"translations\":[{"));
+    assert!(json.contains("\"lang\":\"es-ES\""));
+    assert!(json.contains("\"text\":\"Hola mundo\""));
 
     // Test error message
     let error_msg = OutgoingMessage::Error {

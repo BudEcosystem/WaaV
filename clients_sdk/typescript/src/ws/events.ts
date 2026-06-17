@@ -44,6 +44,13 @@ export interface TranscriptEvent {
     confidence?: number;
     speakerId?: number;
   }>;
+  /**
+   * Uniform in-stream translations merged onto this transcript (P5). Empty
+   * unless a translation-capable provider (Speechmatics/Gladia/OpenAI EN fast
+   * path) returned a `translations:[{lang,text}]` array on this stt_result frame
+   * (gateway `translations`).
+   */
+  translations: Array<{ lang: string; text: string; isPartial?: boolean }>;
   /** Original message for advanced use */
   raw: STTResultMessage;
 }

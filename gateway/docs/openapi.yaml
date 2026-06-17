@@ -610,6 +610,350 @@ paths:
       - bearer_auth: []
 components:
   schemas:
+    Age:
+      type: string
+      description: |-
+        Canonical voice age band. ElevenLabs uses exactly `young`/`middle_aged`/`old`;
+        Azure roles are `YoungAdult*`/`OlderAdult*`/`Senior*` (Senior folds into `Old`).
+      enum:
+      - young
+      - middle_aged
+      - old
+    AliasKind:
+      type: string
+      description: |-
+        The kind of session an alias is intended for. Advisory only (the splice merges
+        whatever blocks are present); echoed back in the ready-ack so a developer sees what
+        the alias was meant to be.
+      enum:
+      - stt
+      - tts
+      - realtime
+      - agent
+      - dag
+    AliasLlm:
+      type: object
+      description: |-
+        Sparse LLM / conversation-loop defaults carried by an alias (the `[aliases.x.llm]`
+        block). Maps onto the public knobs of [`ConversationWebSocketConfig`].
+
+        SECURITY: `base_url` here is TRUSTED server config (it can only be set in
+        `config.yaml`), but when spliced it lands in `conversation_config.base_url` and is
+        validated by the SAME SSRF guard the conversation orchestrator applies to a
+        client-supplied base url — no bypass.
+      properties:
+        base_url:
+          type:
+          - string
+          - 'null'
+          description: OpenAI-compatible base URL for the LLM.
+          default: null
+        model:
+          type:
+          - string
+          - 'null'
+          description: Model identifier.
+          default: null
+        provider_kind:
+          type:
+          - string
+          - 'null'
+          description: |-
+            LLM vendor wire format (`openai|anthropic|gemini`).
+
+            `value_type = Option<String>` for the OpenAPI schema because `AdapterKind` does
+            not derive `ToSchema` (same approach `ConversationWebSocketConfig` uses).
+          default: null
+          example: openai
+        reasoning_effort:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/ReasoningEffort'
+            description: Reasoning effort dial (`minimal|low|medium|high`).
+          default: null
+        reasoning_model:
+          type:
+          - string
+          - 'null'
+          description: Two-tier reasoning model (escalation tier).
+          default: null
+        system_prompt:
+          type:
+          - string
+          - 'null'
+          description: Optional system prompt.
+          default: null
+      additionalProperties: false
+    AliasStt:
+      type: object
+      description: |-
+        Sparse STT defaults carried by an alias (the `[aliases.x.stt]` block).
+
+        Every field is optional: an alias supplies only the knobs it wants to fix; a client
+        field always overrides. Mirrors the public, provider-agnostic shape of
+        [`STTWebSocketConfig`].
+      properties:
+        language:
+          type:
+          - string
+          - 'null'
+          description: Canonical language token (e.g. `en-US`); resolved by the P2 language mapper.
+          default: null
+        model:
+          type:
+          - string
+          - 'null'
+          description: Provider model (e.g. `nova-3`). Empty/None lets the provider pick its default.
+          default: null
+        provider:
+          type:
+          - string
+          - 'null'
+          description: STT provider name (e.g. `deepgram`).
+          default: null
+      additionalProperties: false
+    AliasTts:
+      type: object
+      description: |-
+        Sparse TTS defaults carried by an alias (the `[aliases.x.tts]` block).
+
+        Mirrors the public, provider-agnostic shape of [`TTSWebSocketConfig`]. `emotion` is
+        the canonical emotion token (resolved by the emotion mapper downstream).
+      properties:
+        emotion:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/Emotion'
+            description: Canonical emotion token (e.g. `friendly`); resolved by the emotion mapper.
+          default: null
+        model:
+          type:
+          - string
+          - 'null'
+          description: Provider model (e.g. `eleven_turbo_v2`).
+          default: null
+        provider:
+          type:
+          - string
+          - 'null'
+          description: TTS provider name (e.g. `elevenlabs`).
+          default: null
+        voice:
+          type:
+          - string
+          - 'null'
+          description: Provider voice id / name.
+          default: null
+      additionalProperties: false
+    BatchFeatures:
+      type: object
+      description: |-
+        Batch-capable features the streaming path drops (Deepgram prerecorded / AssemblyAI async /
+        OpenAI verbose_json). Every field `Option`, additive, defaults to "don't request".
+      properties:
+        alternatives:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: N-best alternatives — a STREAMING GAP for Deepgram, enabled here (Deepgram `alternatives=N`).
+          minimum: 0
+        detect_language:
+          type:
+          - boolean
+          - 'null'
+          description: |-
+            Spoken-language detection — a STREAMING GAP for Deepgram, enabled here (Deepgram
+            `detect_language` / AssemblyAI `language_detection` / OpenAI verbose_json returns `language`).
+        intents:
+          type:
+          - boolean
+          - 'null'
+          description: 'Intent detection (Deepgram `intents`). AssemblyAI: no equiv→warn. OpenAI: unsupported→warn.'
+        paragraphs:
+          type:
+          - boolean
+          - 'null'
+          description: Paragraph formatting (Deepgram `paragraphs` / AssemblyAI response paragraphs).
+        summarize:
+          type:
+          - boolean
+          - 'null'
+          description: 'Summarization (Deepgram `summarize=v2` / AssemblyAI `summarization`). OpenAI: unsupported→warn.'
+        topics:
+          type:
+          - boolean
+          - 'null'
+          description: 'Topic detection (Deepgram `topics` / AssemblyAI `iab_categories`). OpenAI: unsupported→warn.'
+        utterances:
+          type:
+          - boolean
+          - 'null'
+          description: Utterance segmentation (Deepgram `utterances` / AssemblyAI `utterances`).
+    BatchJob:
+      type: object
+      description: |-
+        A uniform batch job: the shape returned by `POST /transcribe/batch` (job created) and
+        `GET /transcribe/batch/{job_id}` (poll).
+      required:
+      - job_id
+      - status
+      properties:
+        config_warnings:
+          type: array
+          items:
+            type: string
+          description: Non-fatal config warnings (degraded/omitted features) surfaced to the caller (never a 400).
+        error:
+          type:
+          - string
+          - 'null'
+          description: Error detail, present on `Error`.
+        job_id:
+          type: string
+          description: Gateway-issued job id (maps to the provider `request_id`/transcript id).
+        result:
+          description: Canonical transcript + features, present once `Completed`.
+        status:
+          $ref: '#/components/schemas/BatchStatus'
+          description: Current status.
+    BatchStatus:
+      type: string
+      description: |-
+        Provider-agnostic batch-job status. The canonical superset is AssemblyAI-aligned; Deepgram
+        (which has no status enum) maps `request_id`→`job_id` and the callback POST flips to `Completed`.
+      enum:
+      - queued
+      - processing
+      - completed
+      - error
+    CanonicalLanguage:
+      type: string
+      description: |-
+        A canonical, provider-agnostic language token.
+
+        Each variant is a curated region-qualified BCP-47 locale (or [`Auto`] for
+        detection). A developer passes one of these (or any alias spelling — see
+        [`super::resolve`]) and the per-provider mapper renders the correct native
+        notation. Carries [`as_bcp47`](Self::as_bcp47) (`"en-US"`),
+        [`iso639_1`](Self::iso639_1) (`"en"`), [`region`](Self::region) (`"US"`),
+        and [`lang_subtag`](Self::lang_subtag) (`"en"`/`"cmn"`/`"yue"`).
+
+        [`Auto`]: Self::Auto
+      enum:
+      - auto
+      - en-US
+      - en-GB
+      - en-IN
+      - en-AU
+      - en-ZA
+      - en-NZ
+      - es-ES
+      - es-MX
+      - es-US
+      - fr-FR
+      - fr-CA
+      - pt-BR
+      - pt-PT
+      - de-DE
+      - it-IT
+      - nl-NL
+      - ru-RU
+      - tr-TR
+      - pl-PL
+      - sv-SE
+      - nb-NO
+      - da-DK
+      - fi-FI
+      - uk-UA
+      - cs-CZ
+      - el-GR
+      - ro-RO
+      - hu-HU
+      - ja-JP
+      - ko-KR
+      - cmn-CN
+      - cmn-TW
+      - yue-HK
+      - hi-IN
+      - bn-IN
+      - ta-IN
+      - te-IN
+      - gu-IN
+      - kn-IN
+      - ml-IN
+      - mr-IN
+      - pa-IN
+      - or-IN
+      - ar-SA
+      - vi-VN
+      - th-TH
+      - id-ID
+      - ms-MY
+      - he-IL
+    CloneConsent:
+      type: object
+      description: |-
+        Consent/verification block. MANDATORY for Speechify (`full_name` + `email`);
+        the `verified` flag gates the ElevenLabs-PVC / Resemble verification step.
+      properties:
+        email:
+          type:
+          - string
+          - 'null'
+          description: Email of the consenting voice owner (Speechify requires this).
+        full_name:
+          type:
+          - string
+          - 'null'
+          description: Full name of the consenting voice owner (Speechify requires this).
+        statement:
+          type:
+          - string
+          - 'null'
+          description: Optional consent statement text.
+        verified:
+          type: boolean
+          description: Whether the caller affirms they own/represent the voice (gates PVC/Resemble).
+    CloneLabels:
+      type: object
+      description: |-
+        Structured labels for a cloned voice (canonical; the flat `labels` HashMap is
+        still accepted for backward compatibility and merged with these).
+      properties:
+        accent:
+          type:
+          - string
+          - 'null'
+        age:
+          type:
+          - string
+          - 'null'
+        gender:
+          type:
+          - string
+          - 'null'
+        language:
+          type:
+          - string
+          - 'null'
+    CloneMode:
+      type: string
+      description: |-
+        Voice-clone mode: instant (near-immediate, usable now) vs professional
+        (high-fidelity, ASYNC — returns a queued/training status to poll).
+      enum:
+      - instant
+      - professional
+    CloneStatus:
+      type: string
+      description: Canonical voice-clone lifecycle status (returned + polled).
+      enum:
+      - ready
+      - verifying
+      - training
+      - queued
+      - failed
     ConversationWebSocketConfig:
       type: object
       description: |-
@@ -910,11 +1254,23 @@ components:
       - professional
       - casual
       - storytelling
-      - soft
       - loud
-      - cheerful
-      - serious
       - formal
+      - newscast
+      - newscast_casual
+      - newscast_formal
+      - customer_service
+      - assistant
+      - chat
+      - advertisement_upbeat
+      - sports_commentary
+      - sports_commentary_excited
+      - documentary_narration
+      - narration_professional
+      - narration_relaxed
+      - poetry_reading
+      - lyrical
+      - gentle
     Emotion:
       type: string
       description: |-
@@ -970,6 +1326,28 @@ components:
       - embarrassed
       - content
       - bored
+      - amazed
+      - amused
+      - affectionate
+      - intrigued
+      - flirtatious
+      - frustrated
+      - annoyed
+      - determined
+      - reassuring
+      - sympathetic
+      - nostalgic
+      - serene
+      - terrified
+      - ecstatic
+      - skeptical
+      - relieved
+      - panicked
+      - concerned
+      - apologetic
+      - resigned
+      - wistful
+      - contemplative
     EmotionConfig:
       type: object
       description: |-
@@ -1063,6 +1441,15 @@ components:
         let intensity = EmotionIntensity::Named(IntensityLevel::High);
         assert_eq!(intensity.as_f32(), 1.0);
         ```
+    Gender:
+      type: string
+      description: |-
+        Canonical voice gender. Providers spell this `Female`/`Male`/`Neutral` (Google
+        `ssml_gender`), `"female"`/`"male"` (ElevenLabs labels), etc.
+      enum:
+      - male
+      - female
+      - neutral
     HealthResponse:
       type: object
       description: Health/liveness response.
@@ -1079,6 +1466,21 @@ components:
         required:
         - type
         properties:
+          alias:
+            type:
+            - string
+            - 'null'
+            description: |-
+              Optional server-side ALIAS name (P3). Resolves to a server-defined
+              `{stt, tts, llm}` / `dag_template` bundle BEFORE provider construction;
+              any explicit field above OVERRIDES the alias default. The client supplies
+              only the NAME — alias DEFINITIONS are server-config-only (`aliases:` in
+              `config.yaml`), so a client can never inject a backend url/credential
+              (SSRF-safe, mirroring `realtime_endpoint_overrides`). An unknown alias is
+              non-fatal: the session proceeds with the client config and a
+              `config_warning` (`alias_unknown`) is sent. The resolved concrete config is
+              echoed back on `ready` as `resolved_alias`.
+            example: support-bot
           audio:
             type:
             - boolean
@@ -1498,6 +1900,20 @@ components:
               version mismatch instead of silent field drift (plan W-K1 / exit E9). Always set
               to [`PROTOCOL_VERSION`] by the gateway at construction.
             example: '1.0'
+          resolved_alias:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/ResolvedAliasEcho'
+              description: |-
+                The CONCRETE config a server-side `alias` resolved to (P3), echoed so a
+                developer SEES what e.g. `support-bot` became (which STT/TTS/LLM providers)
+                and so SDK capability negotiation runs against the resolved providers.
+                Present only when the `config` message named an alias that was found. No
+                secrets are included (system prompt / api keys are omitted).
+
+                Boxed to keep the hot-path `OutgoingMessage` variants (stt_result / audio /
+                message) small — the echo is only ever present on the one-per-session
+                `ready` frame.
           stream_id:
             type: string
             description: |-
@@ -1550,6 +1966,17 @@ components:
           transcript:
             type: string
             description: Transcribed text
+          translations:
+            type: array
+            items:
+              $ref: '#/components/schemas/Translation'
+            description: |-
+              Uniform, provider-agnostic in-stream translations merged onto this
+              transcript (P5). One `{lang, text}` entry per target language — the
+              canonical shape the gateway folds Speechmatics `AddTranslation`,
+              Gladia `type:"translation"`, and the Class-B EN fast path into so
+              SDKs read ONE field. Skipped on the wire when empty (the common
+              no-translation case), so non-translation sessions see no change.
           type:
             type: string
             enum:
@@ -1967,6 +2394,45 @@ components:
           type: string
           description: Status of the removal operation
           example: removed
+    ResolvedAliasEcho:
+      type: object
+      description: |-
+        The concrete config an alias splice produced, returned so the caller can ECHO it in
+        the ready-ack (a developer SEES what `support-bot` became) and so SDK capability
+        negotiation runs against the resolved providers.
+      required:
+      - name
+      properties:
+        dag_template:
+          type:
+          - string
+          - 'null'
+          description: Resolved DAG template name, if the alias routes through one.
+        kind:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/AliasKind'
+            description: The alias kind (if declared).
+        llm:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/AliasLlm'
+            description: |-
+              Resolved LLM provider/model (post-merge, client-wins). The base URL is echoed so
+              a developer can confirm the upstream; no secret is included.
+        name:
+          type: string
+          description: The alias name that was resolved.
+        stt:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/AliasStt'
+            description: Resolved STT provider/model/language (post-merge, client-wins).
+        tts:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/AliasTts'
+            description: Resolved TTS provider/voice/model/emotion (post-merge, client-wins).
     RoomDetailsResponse:
       type: object
       description: |-
@@ -2231,6 +2697,16 @@ components:
           description: Sample rate of the audio in Hz
           example: 16000
           minimum: 0
+        translation:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/TranslationConfig'
+            description: |-
+              P5 canonical translation block: `{ target_languages: [CanonicalLanguage], translate_to_english?,
+              partials? }`. `None` = no translation. Threaded across the dispatch boundary via
+              [`Self::to_standard_stt`] so translation-capable providers (Speechmatics/Gladia side-channel,
+              OpenAI/Groq English fast path) emit `translations[]{lang,text}`; unsupported providers degrade
+              with a `config_warning`, never a 400.
         turn_detection:
           oneOf:
           - type: 'null'
@@ -2562,11 +3038,24 @@ components:
           format: float
           description: Speaking rate (0.25 to 4.0, 1.0 is normal)
           example: 1.0
+        voice_descriptor:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/VoiceDescriptor'
+            description: |-
+              Canonical voice DESCRIPTOR (P4): `{gender, locale/accent, style, age,
+              name_hint}` resolved SERVER-SIDE to a provider `voice_id` over the `/voices`
+              catalog when no raw `voice_id` is given. No match → provider default +
+              `config_warning` (never a 400). The resolved id is echoed back to the client.
         voice_id:
           type:
           - string
           - 'null'
-          description: Voice ID or name to use for synthesis
+          description: |-
+            Voice ID or name to use for synthesis.
+
+            ESCAPE HATCH: when set, this raw provider id is used VERBATIM and the
+            [`Self::voice_descriptor`] resolution is skipped.
           example: aura-asteria-en
     TokenRequest:
       type: object
@@ -2634,6 +3123,71 @@ components:
           type: string
           description: The generated JWT token for LiveKit
           example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+    Translation:
+      type: object
+      description: |-
+        One translated segment in the uniform gateway output (`translations: [{lang,text}]`).
+
+        `lang` is the canonical [`CanonicalLanguage`] BCP-47 string (e.g. `"es-ES"`); the gateway folds
+        Speechmatics `AddTranslation`/`AddPartialTranslation` (`.language` + `.results[].content`),
+        Gladia `type:"translation"` (`data.target_language` + `data.translated_utterance.text`), and
+        the Class-B `{text}` (lang = `"en-US"`) into this single shape so SDKs read ONE field.
+      required:
+      - lang
+      - text
+      properties:
+        is_partial:
+          type: boolean
+          description: '`true` if this is a partial (interim) translation, `false`/omitted if final.'
+        lang:
+          type: string
+          description: Canonical target-language BCP-47 string.
+        text:
+          type: string
+          description: The translated text for this segment.
+    TranslationConfig:
+      type: object
+      description: |-
+        Canonical, provider-agnostic in-stream / batch translation request (P5).
+
+        Reuses P2's [`CanonicalLanguage`] value space so a developer asks for translation with the
+        SAME language token (`es-ES`, `de-DE`, …) they use everywhere else, and the gateway maps it to
+        each provider's native code. `None` (the field is `Option<TranslationConfig>` on
+        [`StandardSTTConfig`]) means "no translation" — additive, so the existing construction sites
+        are unaffected, exactly like `features`/`extras` were added.
+
+        Two provider classes are folded into ONE canonical shape:
+          * **Class A** — arbitrary target languages via a side-channel (Speechmatics
+            `translation_config`, Gladia `realtime_processing.translation`, AssemblyAI batch).
+          * **Class B** — translate-the-whole-stream-to-ENGLISH fast path (OpenAI/Groq
+            `/audio/translations`); selected by [`translate_to_english`](Self::translate_to_english).
+
+        The gateway emits a uniform `translations: [{ lang, text }]` array merged onto the transcript
+        event regardless of provider. Unsupported providers **degrade with a `config_warning`, NEVER a
+        400** (see [`TranslationConfig::warnings_for`]).
+      properties:
+        partials:
+          type:
+          - boolean
+          - 'null'
+          description: |-
+            Emit partial (interim) translations where supported (Speechmatics `enable_partials`,
+            Gladia live). `None` = provider default (finals only).
+        target_languages:
+          type: array
+          items:
+            $ref: '#/components/schemas/CanonicalLanguage'
+          description: |-
+            Canonical target languages (region-qualified BCP-47 → provider-native via the per-provider
+            lang mappers / `.iso639_1()`). Capped per-provider (Speechmatics MAX 5 → warn + truncate).
+        translate_to_english:
+          type:
+          - boolean
+          - 'null'
+          description: |-
+            Fast path: translate the whole stream to ENGLISH (OpenAI/Groq `/audio/translations`
+            endpoint). When `Some(true)`, `target_languages` is ignored for Class-B providers; for
+            Class-A providers it is sugar for `target_languages = [en-US]`.
     TtsFeatures:
       type: object
       description: Canonical, provider-agnostic advanced TTS features. Every field is `Option`.
@@ -2851,6 +3405,197 @@ components:
           type: string
           description: URL to sample audio
           example: https://example.com/sample.mp3
+    VoiceCloneProvider:
+      type: string
+      description: Voice cloning provider selection.
+      enum:
+      - hume
+      - elevenlabs
+      - lmnt
+      - cartesia
+      - playht
+      - speechify
+      - resemble
+    VoiceCloneRequest:
+      type: object
+      description: Request body for voice cloning endpoint.
+      required:
+      - provider
+      - name
+      properties:
+        audio_samples:
+          type: array
+          items:
+            type: string
+          description: |-
+            Audio samples for voice cloning (base64-encoded).
+            ElevenLabs: Supports mp3, wav, m4a formats. 1-2 minutes recommended.
+            Hume: Optional - if provided, used for instant cloning; otherwise uses description.
+          example:
+          - base64_encoded_audio_data
+        base_voice_id:
+          type:
+          - string
+          - 'null'
+          description: 'Design-from-existing: the base voice to clone/derive from (provider-specific).'
+        consent:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/CloneConsent'
+            description: |-
+              Consent/verification block. MANDATORY for Speechify; the `verified` flag gates
+              the ElevenLabs-PVC / Resemble verification step.
+        description:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Description of the voice (used by Hume for voice design).
+            For ElevenLabs, this becomes the voice description label.
+          example: A warm, friendly voice with a slight accent
+        labels:
+          type:
+          - object
+          - 'null'
+          description: |-
+            Flat labels for the voice (ElevenLabs). Backward-compatible; merged with
+            the structured [`Self::structured_labels`].
+          additionalProperties:
+            type: string
+          propertyNames:
+            type: string
+        mode:
+          $ref: '#/components/schemas/CloneMode'
+          description: 'Clone MODE: `instant` (default) or `professional` (async high-fidelity).'
+        name:
+          type: string
+          description: Name for the cloned voice.
+          example: My Custom Voice
+        provider:
+          $ref: '#/components/schemas/VoiceCloneProvider'
+          description: Provider to use for voice cloning.
+        remove_background_noise:
+          type: boolean
+          description: Remove background noise from samples (ElevenLabs IVC / LMNT `enhance`).
+        sample_text:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Sample text for voice generation (Hume only).
+            Used when generating voice from description without audio samples.
+          example: Hello, this is a sample of my voice.
+        structured_labels:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/CloneLabels'
+            description: |-
+              Canonical structured labels `{language, accent, gender, age}` (preferred over
+              the flat `labels` map; the two are merged, structured winning on conflict).
+    VoiceCloneResponse:
+      type: object
+      description: Response from voice cloning endpoint.
+      required:
+      - voice_id
+      - name
+      - provider
+      - status
+      - created_at
+      properties:
+        created_at:
+          type: string
+          description: Timestamp when the voice was created.
+          example: 2026-01-06T12:00:00Z
+        metadata:
+          description: Additional metadata from the provider.
+        name:
+          type: string
+          description: Name of the cloned voice.
+          example: My Custom Voice
+        provider:
+          $ref: '#/components/schemas/VoiceCloneProvider'
+          description: Provider that created the voice.
+        requires_verification:
+          type:
+          - boolean
+          - 'null'
+          description: |-
+            Whether the provider flagged that this voice still needs verification before
+            it can be used (ElevenLabs IVC `requires_verification`).
+        status:
+          type: string
+          description: |-
+            Canonical lifecycle status: `ready` | `verifying` | `training` | `queued` |
+            `failed`. A `ready` voice_id is directly usable as a TTS `voice_id`.
+          example: ready
+        voice_id:
+          type: string
+          description: Unique identifier for the cloned voice.
+          example: voice_abc123
+    VoiceDescriptor:
+      type: object
+      description: |-
+        A canonical, provider-agnostic description of a desired voice. Resolved
+        SERVER-SIDE to a concrete provider `voice_id` over the `/voices` catalog.
+
+        All fields are optional; the resolver scores candidates on whichever are set.
+        The raw `TTSConfig.voice_id` (when present) ALWAYS wins — this descriptor only
+        drives resolution when no explicit `voice_id` was supplied.
+
+        # Example
+
+        ```rust
+        use waav_gateway::core::voice::{VoiceDescriptor, Gender};
+
+        let d = VoiceDescriptor {
+            gender: Some(Gender::Female),
+            locale: Some("en-US".to_string()),
+            style: Some("warm".to_string()),
+            ..Default::default()
+        };
+        assert!(d.is_set());
+        ```
+      properties:
+        accent:
+          type:
+          - string
+          - 'null'
+          description: Free accent string when no `locale` is given (`american`, `british`, …).
+          example: american
+        age:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/Age'
+            description: Desired age band.
+        gender:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/Gender'
+            description: Desired gender.
+        locale:
+          type:
+          - string
+          - 'null'
+          description: |-
+            BCP-47 locale (preferred): `en-US`, `en-GB`, `hi-IN`, … Used for exact-locale
+            and language-family scoring; the region also yields an accent string.
+          example: en-US
+        name_hint:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Optional preferred voice name (e.g. `asteria`, `jenny`). A substring match
+            against the voice name/id gives it the strongest score.
+          example: asteria
+        style:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Free descriptive timbre/style matched against provider metadata
+            (`warm`, `bright`, `deep`, `calm`, `confident`, `energetic`, …).
+          example: warm
   securitySchemes:
     bearer_auth:
       type: http

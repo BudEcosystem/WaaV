@@ -894,6 +894,7 @@ async fn initialize_conversation_loop(
                         is_speech_final: stt.is_speech_final,
                         confidence: stt.confidence,
                         segment_transcript: stt.segment_transcript.clone(),
+                        translations: stt.translations.clone(),
                     }))
                     .await;
 
@@ -1296,6 +1297,7 @@ async fn register_stt_callback(
                     is_speech_final: result.is_speech_final,
                     confidence: result.confidence,
                     segment_transcript: result.segment_transcript,
+                    translations: result.translations,
                 };
                 let _ = message_tx.send(MessageRoute::Outgoing(msg)).await;
             })
@@ -2563,6 +2565,7 @@ async fn register_dag_stream_driver(
                         is_speech_final: stt.is_speech_final,
                         confidence: stt.confidence,
                         segment_transcript: stt.segment_transcript.clone(),
+                        translations: stt.translations.clone(),
                     }))
                     .await;
 

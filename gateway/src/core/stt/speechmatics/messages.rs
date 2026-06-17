@@ -551,6 +551,62 @@ impl AddTranscriptMessage {
     }
 }
 
+/// One translated segment within an `AddTranslation`/`AddPartialTranslation` frame.
+///
+/// Speechmatics emits a `results` array per target language; each element carries
+/// the translated `content` plus timing. The gateway concatenates the `content`
+/// values (in order) into the single translated string for that language.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TranslationResult {
+    /// Start time in seconds from audio start.
+    #[serde(default)]
+    pub start_time: f64,
+    /// End time in seconds from audio start.
+    #[serde(default)]
+    pub end_time: f64,
+    /// The translated text fragment for this segment.
+    #[serde(default)]
+    pub content: String,
+    /// Speaker label (for diarization), when present.
+    #[serde(default)]
+    pub speaker: Option<String>,
+}
+
+/// `AddTranslation` (final) / `AddPartialTranslation` (interim) message.
+///
+/// The `language` field is the ISO-639-1 target code Speechmatics translated to
+/// (matching what the gateway requested via `translation_config.target_languages`).
+/// The translated string is `results[].content` joined in order. P5.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddTranslationMessage {
+    /// Message type identifier ("AddTranslation" or "AddPartialTranslation").
+    pub message: String,
+    /// API format version.
+    #[serde(default)]
+    pub format: Option<String>,
+    /// The target language this translation is in (ISO-639-1, e.g. "de", "es").
+    pub language: String,
+    /// Translated result segments.
+    #[serde(default)]
+    pub results: Vec<TranslationResult>,
+}
+
+impl AddTranslationMessage {
+    /// The full translated text for this frame (`results[].content` joined).
+    pub fn text(&self) -> String {
+        self.results
+            .iter()
+            .map(|r| r.content.as_str())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// `true` for `AddPartialTranslation` (interim), `false` for `AddTranslation` (final).
+    pub fn is_partial(&self) -> bool {
+        self.message == "AddPartialTranslation"
+    }
+}
+
 /// EndOfTranscript message signaling session completion.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EndOfTranscriptMessage {

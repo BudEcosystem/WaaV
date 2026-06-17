@@ -512,6 +512,45 @@ class TestP0TranscriptMapping:
         assert results[0].is_final is True
         assert results[0].is_speech_final is True
         assert results[0].confidence == 0.97
+        # No translation on this frame -> empty list (default).
+        assert results[0].translations == []
+
+    @pytest.mark.asyncio
+    async def test_translations_surface_through_deserializer(self):
+        # P5: the uniform translations:[{lang,text}] array on the stt_result frame
+        # must surface onto STTResult.translations through the SDK receive loop.
+        session = WebSocketSession(url="ws://localhost:3009/ws")
+        results = []
+        session.on("transcript", lambda r: results.append(r))
+
+        wire = json.dumps({
+            "type": "stt_result",
+            "transcript": "hello world",
+            "is_final": True,
+            "is_speech_final": True,
+            "confidence": 0.95,
+            "translations": [
+                {"lang": "es-ES", "text": "hola mundo", "is_partial": False},
+                {"lang": "de-DE", "text": "hallo welt"},
+            ],
+        })
+
+        async def one_message():
+            yield wire
+
+        session._ws = one_message()
+        session._connected = True
+        await session._receive_loop()
+
+        assert len(results) == 1
+        translations = results[0].translations
+        assert len(translations) == 2
+        assert translations[0].lang == "es-ES"
+        assert translations[0].text == "hola mundo"
+        assert translations[0].is_partial is False
+        assert translations[1].lang == "de-DE"
+        assert translations[1].text == "hallo welt"
+        assert translations[1].is_partial is False
 
 
 class TestP0RateLimitError:

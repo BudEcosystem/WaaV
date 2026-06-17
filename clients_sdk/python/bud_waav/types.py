@@ -1096,6 +1096,25 @@ class WordInfo(BaseModel):
     """Speaker ID for diarization"""
 
 
+class Translation(BaseModel):
+    """One translated segment in the uniform gateway ``translations`` array (P5).
+
+    The gateway folds Speechmatics ``AddTranslation`` / Gladia ``type:"translation"``
+    / the OpenAI-Groq English fast path into this single ``{lang, text}`` shape so the
+    SDK reads ONE field regardless of provider. Mirrors gateway ``Translation``
+    (``gateway/src/core/stt/standard.rs``).
+    """
+
+    lang: str
+    """Canonical target-language BCP-47 string (e.g. ``"es-ES"``)."""
+
+    text: str
+    """The translated text for this segment."""
+
+    is_partial: bool = False
+    """``True`` if this is a partial (interim) translation, ``False`` if final."""
+
+
 class STTResult(BaseModel):
     """Speech-to-Text result."""
 
@@ -1126,6 +1145,11 @@ class STTResult(BaseModel):
     words: Optional[list[WordInfo]] = None
     """Word-level details"""
 
+    translations: list[Translation] = Field(default_factory=list)
+    """Uniform in-stream translations merged onto this transcript (P5). Empty
+    unless a translation-capable provider (Speechmatics/Gladia/OpenAI EN fast
+    path) returned a `translations:[{lang,text}]` array on this stt_result frame."""
+
 
 class TranscriptEvent(BaseModel):
     """Transcript event from WebSocket session."""
@@ -1150,6 +1174,11 @@ class TranscriptEvent(BaseModel):
 
     words: Optional[list[WordInfo]] = None
     """Word-level details"""
+
+    translations: list[Translation] = Field(default_factory=list)
+    """Uniform in-stream translations merged onto this transcript (P5). Empty
+    unless a translation-capable provider returned a `translations:[{lang,text}]`
+    array on this stt_result frame."""
 
     role: Optional[Literal["user", "assistant"]] = None
     """Speaker role for realtime conversations"""

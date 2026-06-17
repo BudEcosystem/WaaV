@@ -550,6 +550,16 @@ pub struct SpeechmaticsSTTConfig {
     /// P5 translation: emit `AddPartialTranslation` (interim) alongside finals
     /// (`translation_config.enable_partials`). `None` = provider default (finals only).
     pub translation_enable_partials: Option<bool>,
+
+    /// P5 translation OUTPUT mapping: the CANONICAL BCP-47 target strings the
+    /// developer asked for (e.g. `"es-ES"`, `"de-DE"`), in the SAME order as
+    /// [`translation_target_languages`](Self::translation_target_languages)'s
+    /// ISO-639-1 codes. Speechmatics echoes only the ISO-639-1 code on each
+    /// `AddTranslation` frame (`"es"`), which is lossy; the client uses this to
+    /// upgrade that code back to the canonical BCP-47 the caller requested so
+    /// the uniform `translations[].lang` stays canonical. Empty = no upgrade
+    /// (pass the provider code through verbatim).
+    pub translation_target_canonical: Vec<String>,
 }
 
 impl Default for SpeechmaticsSTTConfig {
@@ -582,6 +592,7 @@ impl Default for SpeechmaticsSTTConfig {
             endpoint_override: None,
             translation_target_languages: Vec::new(),
             translation_enable_partials: None,
+            translation_target_canonical: Vec::new(),
         }
     }
 }
@@ -745,6 +756,15 @@ impl SpeechmaticsSTTConfig {
         {
             cfg.translation_target_languages = t
                 .target_iso639_1(Some(
+                    crate::core::stt::standard::SPEECHMATICS_MAX_TRANSLATION_TARGETS,
+                ))
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+            // Index-aligned canonical BCP-47 list, so the OUTPUT path can upgrade
+            // the ISO-639-1 code Speechmatics echoes back to the canonical target.
+            cfg.translation_target_canonical = t
+                .target_canonical(Some(
                     crate::core::stt::standard::SPEECHMATICS_MAX_TRANSLATION_TARGETS,
                 ))
                 .into_iter()

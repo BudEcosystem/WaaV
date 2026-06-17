@@ -360,6 +360,15 @@ export class WebSocketSession {
       isFinal: message.is_final,
       isSpeechFinal: message.is_speech_final,
       confidence: message.confidence,
+      // P5: surface the uniform translations[] (camelCased) onto the event.
+      translations: (message.translations ?? []).map((t) => {
+        const out: { lang: string; text: string; isPartial?: boolean } = {
+          lang: t.lang,
+          text: t.text,
+        };
+        if (t.is_partial !== undefined) out.isPartial = t.is_partial;
+        return out;
+      }),
       raw: message,
     };
     if (message.segment_transcript !== undefined) {

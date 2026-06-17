@@ -16,6 +16,7 @@ from websockets.asyncio.client import ClientConnection
 from ..types import (
     STTConfig, TTSConfig, STTResult, TranscriptEvent, AudioEvent,
     AudioFeatures, DAGConfig, ConversationConfig, intensity_to_number,
+    Translation,
 )
 from ..errors import ConnectionError, ReconnectError, TimeoutError, RateLimitError
 
@@ -811,12 +812,24 @@ class WebSocketSession:
                             self._metrics.record_stt_ttft(ttft)
                             self._config_sent_time = None
 
+                        # P5: uniform translations[] array (Speechmatics/Gladia/
+                        # OpenAI-EN fast path), folded onto the transcript. Absent
+                        # on non-translation sessions (gateway skips it when empty).
+                        translations = [
+                            Translation(
+                                lang=t.get("lang", ""),
+                                text=t.get("text", ""),
+                                is_partial=t.get("is_partial", False),
+                            )
+                            for t in data.get("translations", [])
+                        ]
                         result = STTResult(
                             text=data.get("transcript", ""),
                             is_final=data.get("is_final", False),
                             is_speech_final=data.get("is_speech_final", False),
                             confidence=data.get("confidence"),
                             speaker_id=data.get("speaker_id"),
+                            translations=translations,
                         )
                         # Carry the optional speaker role through the queue (the
                         # gateway's cascade stt_result has no role, but a DAG

@@ -54,6 +54,7 @@ from .types import (
     AudioEvent,
     Voice,
     WordInfo,
+    Translation,
     PercentileStats,
     STTMetrics,
     TTSMetrics,
@@ -285,6 +286,7 @@ __all__ = [
     "AudioEvent",
     "Voice",
     "WordInfo",
+    "Translation",
     # Metrics types
     "PercentileStats",
     "STTMetrics",

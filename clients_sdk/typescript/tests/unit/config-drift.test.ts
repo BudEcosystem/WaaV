@@ -87,6 +87,8 @@ const STT_SDK = new Set([
   'alternatives', 'sentiment', 'speechBeginEvent',
   // turn detection (nested into stt_config.turn_detection):
   'turnDetection',
+  // P5 canonical translation block (STTConfig.translation):
+  'translation',
 ]);
 
 const TTS_SDK = new Set([
@@ -94,6 +96,8 @@ const TTS_SDK = new Set([
   'audioOutChunkMs', 'clientPlaybackRate', 'connectionTimeout', 'requestTimeout',
   'model', 'pronunciations', 'apiKey', 'emotion', 'emotionIntensity',
   'deliveryStyle', 'emotionDescription', 'extras',
+  // P4 abstract voice selection (TTSConfig.voiceDescriptor):
+  'voiceDescriptor',
   // features{} canonical surface (flattened onto TTSConfig):
   'speed', 'pitch', 'volume', 'stability', 'similarityBoost', 'style',
   'useSpeakerBoost', 'instructions', 'ssml', 'language', 'wordTimestamps',

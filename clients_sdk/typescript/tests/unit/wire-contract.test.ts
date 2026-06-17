@@ -67,6 +67,38 @@ describe('STT result wire mapping (transcript, NOT text)', () => {
     const msg = deserializeMessage(wire) as STTResultMessage;
     expect(msg.transcript).toBe('correct-value');
   });
+
+  it('surfaces the uniform translations[] array (P5) from the stt_result frame', () => {
+    // EXACT gateway wire: OutgoingMessage::STTResult with translations.
+    const wire = JSON.stringify({
+      type: 'stt_result',
+      transcript: 'hello world',
+      is_final: true,
+      is_speech_final: true,
+      confidence: 0.95,
+      translations: [
+        { lang: 'es-ES', text: 'hola mundo', is_partial: false },
+        { lang: 'de-DE', text: 'hallo welt' },
+      ],
+    });
+    const msg = deserializeMessage(wire) as STTResultMessage;
+    expect(msg.translations).toBeDefined();
+    expect(msg.translations).toHaveLength(2);
+    expect(msg.translations![0]).toEqual({ lang: 'es-ES', text: 'hola mundo', is_partial: false });
+    expect(msg.translations![1]).toEqual({ lang: 'de-DE', text: 'hallo welt' });
+  });
+
+  it('omits translations on a frame without them (non-translation sessions)', () => {
+    const wire = JSON.stringify({
+      type: 'stt_result',
+      transcript: 'hello world',
+      is_final: true,
+      is_speech_final: true,
+      confidence: 0.95,
+    });
+    const msg = deserializeMessage(wire) as STTResultMessage;
+    expect(msg.translations).toBeUndefined();
+  });
 });
 
 describe('ready envelope wire mapping', () => {
