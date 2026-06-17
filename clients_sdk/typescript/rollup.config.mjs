@@ -62,4 +62,18 @@ export default [
     external,
     plugins: [dts()],
   },
+  // D3: standalone AudioWorklet capture module. It runs in its OWN global scope
+  // (AudioWorkletGlobalScope) and must NOT be bundled into the main entry — it
+  // is loaded at runtime via `audioWorklet.addModule('.../capture.worklet.js')`.
+  // Emitted as an ESM module sibling to the main bundle (recorder.ts derives the
+  // URL from import.meta.url, or accepts an explicit `workletUrl`).
+  {
+    input: 'src/audio/capture.worklet.ts',
+    output: {
+      file: 'dist/capture.worklet.js',
+      format: 'esm',
+      sourcemap: true,
+    },
+    plugins: [resolve(), typescript(tsPluginOptions)],
+  },
 ];

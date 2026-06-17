@@ -76,6 +76,61 @@ class ReconnectError(BudError):
         self.attempts = attempts
 
 
+class FatalConnectionError(BudError):
+    """A connection is judged unrecoverable; the SDK stops its reconnect storm.
+
+    Raised by the client-side quick-failure breaker (D4a) after a run of
+    connections that each died within seconds of opening — the hallmark of a
+    doomed config (bad key, rejected provider, malformed config) that the
+    gateway keeps accepting at the handshake but tearing down immediately.
+    Looping such a config just storms; instead we surface this typed FATAL so
+    the caller fixes the config rather than retrying. This is the CLIENT analog
+    of the gateway's per-provider CircuitBreaker FATAL fast-trip (which is
+    upstream-only and never surfaced on the client wire), not a duplicate.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        consecutive_quick_failures: int,
+        last_error: Optional[Exception] = None,
+    ):
+        super().__init__(
+            message,
+            code="FATAL_CONNECTION",
+            cause=last_error,
+            context={"consecutive_quick_failures": consecutive_quick_failures},
+        )
+        self.consecutive_quick_failures = consecutive_quick_failures
+
+
+class ProtocolVersionError(BudError):
+    """The gateway's wire ``protocol_version`` MAJOR differs from the SDK's.
+
+    Emitted (as a typed ``warning`` event, not raised) when the ``ready``
+    envelope carries a protocol whose major component the bundled SDK does not
+    understand. A major bump means the wire contract changed in a
+    backward-incompatible way, so field drift would otherwise corrupt silently.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        gateway_version: Optional[str] = None,
+        sdk_version: Optional[str] = None,
+    ):
+        super().__init__(
+            message,
+            code="PROTOCOL_VERSION_MISMATCH",
+            context={
+                "gateway_version": gateway_version,
+                "sdk_version": sdk_version,
+            },
+        )
+        self.gateway_version = gateway_version
+        self.sdk_version = sdk_version
+
+
 class APIError(BudError):
     """API request failed."""
 

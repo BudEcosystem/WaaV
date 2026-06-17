@@ -13,9 +13,21 @@ import type { MetricsSummary } from '../types/metrics.js';
 import { getMetricsCollector, MetricsCollector } from '../metrics/collector.js';
 import { WebSocketConnection, type ConnectionState } from './connection.js';
 import { ReconnectStrategy, type ReconnectConfig } from './reconnect.js';
+import { LivenessWatchdog, type LivenessConfig } from './liveness.js';
+import { UplinkAudioShedder, type UplinkConfig } from './uplink.js';
 import { createConfigMessage, createSpeakMessage, createClearMessage, createAudioEndMessage, createSendMessageMessage, type SDKOutgoingMessage } from './messages.js';
 import { MessageQueue, type MessageQueueConfig } from './queue.js';
 import { SessionEventEmitter, type SessionEventMap, type SessionEventHandler, type TranscriptEvent, type AudioEvent, type ReadyEvent, type SessionErrorEvent } from './events.js';
+
+/**
+ * Extract the MAJOR component of a dotted protocol version string (e.g.
+ * "1.0" -> "1", "2.3.1" -> "2"). Used to grade a protocol_version drift: a
+ * different major is a breaking error, a same-major drift is a soft warning.
+ */
+function majorOf(version: string): string {
+  const dot = version.indexOf('.');
+  return dot === -1 ? version : version.slice(0, dot);
+}
 
 /**
  * Session configuration
@@ -61,11 +73,22 @@ export interface SessionConfig {
   /** Feature flags */
   features?: FeatureFlags;
   /**
-   * @deprecated No longer used. Keepalive is handled by native WebSocket
-   * ping/pong frames (the `ws` lib and browsers manage this automatically);
-   * the SDK no longer sends a JSON ping. Kept only for backward compatibility.
+   * Liveness / zombie-socket watchdog tuning (D1). The gateway never pings
+   * clients, so the SDK detects a dead-but-OPEN socket itself: Node sends native
+   * WS pings (pong deadline); the browser watches for stale inbound frames and
+   * probes on network/visibility resume. Pass `false` to disable, or an object
+   * to override the thresholds. Enabled by default.
    */
-  pingInterval?: number;
+  liveness?: LivenessConfig | false;
+  /**
+   * Uplink audio backpressure shedding (D5). When the gateway/socket can't keep
+   * up, outbound audio frames are bounded in a drop-oldest ring and only handed
+   * to the socket while its `bufferedAmount` is below a high-water mark — so a
+   * slow gateway never accumulates uplink latency (mirrors the gateway's own
+   * drop-oldest egress). Pass `false` to send every frame immediately, or an
+   * object to tune the ring size / high-water mark. Enabled by default.
+   */
+  uplink?: UplinkConfig | false;
   /** Whether to auto-send config on connect (default: true) */
   autoConfig?: boolean;
   /**
@@ -111,6 +134,23 @@ export class WebSocketSession {
   private conversationConfig?: ConversationConfig;
   private turnDetectionConfig?: TurnDetectionConfig;
   private featuresConfig?: FeatureFlags;
+  /** D1: per-socket liveness watchdog (recreated after each (re)connect). */
+  private liveness: LivenessWatchdog | null = null;
+  /** D5: uplink audio shedder (bounded drop-oldest ring + bufferedAmount gate). */
+  private uplink: UplinkAudioShedder | null = null;
+  /** D5: timer that keeps draining the uplink ring while frames remain. */
+  private uplinkPumpTimer: ReturnType<typeof setInterval> | null = null;
+  /** D1 verify-after-reconnect: true while we await proof the new socket carries data. */
+  private awaitingReconnectProof = false;
+  /** D1: bound browser network/visibility listeners, for teardown. */
+  private networkListenersBound = false;
+  private readonly onNetworkOnline = (): void => this.handleNetworkResume('online');
+  private readonly onNetworkOffline = (): void => this.handleNetworkOffline();
+  private readonly onVisibility = (): void => {
+    if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+      this.handleNetworkResume('visibilitychange');
+    }
+  };
 
   constructor(config: SessionConfig) {
     this.config = config;
@@ -144,6 +184,18 @@ export class WebSocketSession {
     this.emitter = new SessionEventEmitter();
     this.metrics = getMetricsCollector();
 
+    // D5: uplink audio shedder (drop-oldest ring + bufferedAmount-gated drain).
+    if (config.uplink !== false) {
+      this.uplink = new UplinkAudioShedder(
+        {
+          send: (frame) => this.connection.sendBinary(frame),
+          bufferedAmount: () => this.connection.bufferedAmount(),
+          isConnected: () => this.connection.isConnected(),
+        },
+        typeof config.uplink === 'object' ? config.uplink : {}
+      );
+    }
+
     this.setupConnectionHandlers();
   }
 
@@ -157,6 +209,8 @@ export class WebSocketSession {
       onError: (error) => this.handleError(error),
       onMessage: (message) => this.handleMessage(message),
       onBinaryMessage: (data) => this.handleBinaryMessage(data),
+      // D1: a native WS pong (Node) proves the socket is alive — feed the watchdog.
+      onPong: () => this.liveness?.markPong(),
     });
 
     if (this.reconnectStrategy) {
@@ -181,6 +235,23 @@ export class WebSocketSession {
         onReconnectExhausted: (state) => {
           this.emitter.emit('reconnect', { state, event: 'exhausted' });
         },
+        onReconnectFatal: (state) => {
+          // D4: the quick-failure breaker tripped — stop the storm and surface a
+          // typed FATAL error so the app shows "gateway unreachable / check
+          // key/config" instead of silently retrying forever.
+          this.metrics.increment('ws.reconnectFatal');
+          this.emitter.emit('reconnect', { state, event: 'failed' });
+          this.emitter.emit('error', {
+            code: 'RECONNECT_FATAL',
+            message: `Gateway unreachable: ${state.consecutiveQuickFailures} consecutive connections each failed within the stability window. Reconnection has been abandoned; check the gateway URL, API key, and config.`,
+            recoverable: false,
+            raw: {
+              type: 'error',
+              code: 'RECONNECT_FATAL',
+              message: `quick-failure breaker tripped after ${state.consecutiveQuickFailures} unstable connections`,
+            },
+          });
+        },
       });
     }
   }
@@ -190,6 +261,9 @@ export class WebSocketSession {
    */
   private handleOpen(): void {
     const previousState = this.state;
+    // If this open follows a reconnecting state, we must PROVE the new socket
+    // carries data before declaring it healthy (verify-after-reconnect).
+    const wasReconnect = previousState === 'reconnecting';
     this.state = 'connected';
     this.metrics.setWSState('connected');
     this.reconnectStrategy?.markConnected();
@@ -200,10 +274,20 @@ export class WebSocketSession {
       timestamp: Date.now(),
     });
 
-    // NOTE: Keepalive is handled by NATIVE WebSocket ping/pong frames, which the
-    // `ws` library (Node) and browsers manage automatically. We deliberately do
-    // NOT send a JSON {type:'ping'} — the gateway has no such op and would emit a
-    // parse-error every interval. (Removed in P0; see SDK_STANDARDIZATION_PLAN.)
+    // D1: Keepalive is NOT a JSON ping (the gateway has no such op). Instead the
+    // liveness watchdog uses native WS pings (Node) or stale-inbound detection
+    // (browser). Start a fresh watchdog for this socket and (in the browser)
+    // subscribe network/visibility resume probes.
+    this.bindNetworkListeners();
+    this.startLiveness();
+
+    // Verify-after-reconnect: require inbound data on the NEW socket before
+    // treating the reconnect as healed. On Node, ping immediately so a frozen
+    // peer is caught fast; either the pong or the `ready` ack clears the flag.
+    if (wasReconnect) {
+      this.awaitingReconnectProof = true;
+      this.connection.ping();
+    }
 
     // Send queued messages
     this.flushQueue();
@@ -223,6 +307,15 @@ export class WebSocketSession {
     this.metrics.setWSState('disconnected');
     this.readyReceived = false;
     this.lastReadyEvent = null;
+    // D1: the socket is gone — stop its watchdog so its timers don't fire on a
+    // dead/replaced socket. A fresh watchdog is created on the next open. The
+    // network listeners stay bound across a reconnect cycle (they drive resume
+    // probes); they are only removed on an explicit disconnect().
+    this.stopLiveness();
+    // D5: drop any in-flight uplink frames — the gateway session is gone and a
+    // reconnect starts a fresh one, so stale mid-utterance audio is loss-tolerant.
+    this.stopUplinkPump();
+    this.uplink?.clear();
 
     this.emitter.emit('close', { code, reason });
     this.emitter.emit('connectionState', {
@@ -232,15 +325,25 @@ export class WebSocketSession {
     });
 
     // Attempt reconnection if enabled and not a clean close
-    if (this.reconnectStrategy?.shouldReconnect() && code !== 1000) {
-      this.reconnectStrategy.scheduleReconnect(() => this.connection.connect()).catch((err) => {
-        this.emitter.emit('error', {
-          code: 'RECONNECT_FAILED',
-          message: err instanceof Error ? err.message : 'Reconnection failed',
-          recoverable: false,
-          raw: { type: 'error', code: 'RECONNECT_FAILED', message: String(err) },
+    if (this.reconnectStrategy && code !== 1000) {
+      // D4: record this close for the quick-failure breaker BEFORE deciding to
+      // reconnect — a sub-minStableMs survival counts toward the FATAL trip and
+      // gates even the fast first-hop. Then re-check shouldReconnect (the
+      // breaker may already have tripped on a prior close).
+      this.reconnectStrategy.noteConnectionClosed();
+      if (this.reconnectStrategy.shouldReconnect()) {
+        this.reconnectStrategy.scheduleReconnect(() => this.connection.connect()).catch((err) => {
+          // A fatal-breaker throw is surfaced via onReconnectFatal (below) as a
+          // distinct typed event; this generic path covers abort/exhaust/other.
+          if (this.reconnectStrategy?.getState().fatal) return;
+          this.emitter.emit('error', {
+            code: 'RECONNECT_FAILED',
+            message: err instanceof Error ? err.message : 'Reconnection failed',
+            recoverable: false,
+            raw: { type: 'error', code: 'RECONNECT_FAILED', message: String(err) },
+          });
         });
-      });
+      }
     }
   }
 
@@ -257,10 +360,117 @@ export class WebSocketSession {
   }
 
   /**
+   * D1: record an inbound frame for the liveness watchdog and resolve a pending
+   * verify-after-reconnect (any inbound data on the new socket proves it is live,
+   * not merely OPEN — the Pipecat `_verify_connection` discipline).
+   */
+  private noteInbound(): void {
+    this.liveness?.markInbound();
+    if (this.awaitingReconnectProof) {
+      this.awaitingReconnectProof = false;
+      this.metrics.increment('ws.reconnectVerified');
+    }
+  }
+
+  /**
+   * D1: start a fresh liveness watchdog for the current socket. Called once the
+   * socket is open + (re)configured. Idempotent per socket; a prior watchdog is
+   * stopped first so timers never overlap across reconnects.
+   */
+  private startLiveness(): void {
+    if (this.config.liveness === false) return;
+    this.stopLiveness();
+    const cfg = typeof this.config.liveness === 'object' ? this.config.liveness : {};
+    this.liveness = new LivenessWatchdog(
+      {
+        ping: () => this.connection.ping(),
+        isPingCapable: () => this.connection.isPingCapable(),
+        onZombie: (reason) => this.handleZombie(reason),
+      },
+      cfg
+    );
+    this.liveness.start();
+  }
+
+  /** D1: stop and drop the current liveness watchdog. */
+  private stopLiveness(): void {
+    if (this.liveness) {
+      this.liveness.stop();
+      this.liveness = null;
+    }
+  }
+
+  /**
+   * D1: the watchdog judged the socket dead (missed pong, or stale inbound).
+   * Terminate the zombie socket immediately (a graceful close can hang on a
+   * frozen peer) and fall through to the EXISTING reconnect path via onClose.
+   */
+  private handleZombie(reason: string): void {
+    this.stopLiveness();
+    this.metrics.increment('ws.zombieDetected');
+    this.emitter.emit('error', {
+      code: 'LIVENESS_ZOMBIE',
+      message: `Connection appears dead (${reason}); terminating and reconnecting.`,
+      recoverable: true,
+      raw: { type: 'error', code: 'LIVENESS_ZOMBIE', message: reason },
+    });
+    // terminate() fires onClose -> handleClose -> scheduleReconnect (with code
+    // 4000 != 1000, so reconnect is NOT suppressed).
+    this.connection.terminate();
+  }
+
+  /**
+   * D1 network-change: on `online` / tab-foreground, fire an immediate liveness
+   * probe so a socket that died while the NIC was down / the tab was hidden is
+   * healed promptly instead of after the full watchdog window.
+   */
+  private handleNetworkResume(_source: 'online' | 'visibilitychange'): void {
+    this.liveness?.probeNow();
+  }
+
+  /**
+   * D1 network-change: on `offline`, stop the watchdog from firing into a known
+   * down NIC (avoids a reconnect storm against an unreachable network). The
+   * watchdog resumes/heals on the paired `online`.
+   */
+  private handleNetworkOffline(): void {
+    this.stopLiveness();
+  }
+
+  /** D1: subscribe browser network/visibility events (no-op under Node). */
+  private bindNetworkListeners(): void {
+    if (this.networkListenersBound) return;
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('online', this.onNetworkOnline);
+      window.addEventListener('offline', this.onNetworkOffline);
+      this.networkListenersBound = true;
+    }
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      document.addEventListener('visibilitychange', this.onVisibility);
+    }
+  }
+
+  /** D1: unsubscribe browser network/visibility events. */
+  private unbindNetworkListeners(): void {
+    if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      window.removeEventListener('online', this.onNetworkOnline);
+      window.removeEventListener('offline', this.onNetworkOffline);
+    }
+    if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+      document.removeEventListener('visibilitychange', this.onVisibility);
+    }
+    this.networkListenersBound = false;
+  }
+
+  /**
    * Handle incoming message
    */
   private handleMessage(message: IncomingMessage): void {
     this.metrics.increment('ws.received');
+    // D1: every inbound frame proves the socket carries data (resets the
+    // browser staleness clock; satisfies a Node pong deadline) and confirms a
+    // pending verify-after-reconnect.
+    this.noteInbound();
 
     switch (message.type) {
       case 'ready':
@@ -278,9 +488,9 @@ export class WebSocketSession {
       case 'config_warning':
         this.handleConfigWarning(message as ConfigWarningMessage);
         break;
-      case 'pong':
-        this.handlePong(message as { type: 'pong'; timestamp: number; server_time?: number });
-        break;
+      // NOTE: the gateway never sends a JSON `pong` (verified: no JSON ping op).
+      // Native WS pong control frames are handled out-of-band by the liveness
+      // watchdog via the connection `onPong` hook — there is no JSON pong case.
     }
   }
 
@@ -326,21 +536,36 @@ export class WebSocketSession {
     // Store the event for later retrieval by waitForReady()
     this.lastReadyEvent = event;
 
-    // Assert the wire-protocol version matches. A mismatch means the gateway's
-    // message contract has drifted from what this SDK expects, so surface it
-    // loudly as a typed error event (recoverable) instead of letting fields
-    // silently break (plan W-K1).
+    // Assert the wire-protocol version on `ready`. A drift means the gateway's
+    // message contract has moved from what this SDK expects (plan W-K1). We
+    // grade by SEVERITY: a MAJOR mismatch (e.g. gateway 2.x vs SDK 1.x) is a
+    // breaking, recoverable error event; a minor/patch drift (same major) is a
+    // softer configWarning so a forward-compatible bump isn't alarming.
     if (message.protocol_version !== undefined && message.protocol_version !== PROTOCOL_VERSION) {
-      this.emitter.emit('error', {
-        code: 'PROTOCOL_VERSION_MISMATCH',
-        message: `Gateway protocol_version "${message.protocol_version}" does not match SDK PROTOCOL_VERSION "${PROTOCOL_VERSION}". The wire contract may have changed; upgrade @bud-foundry/sdk.`,
-        recoverable: true,
-        raw: {
-          type: 'error',
+      const gwMajor = majorOf(message.protocol_version);
+      const sdkMajor = majorOf(PROTOCOL_VERSION);
+      if (gwMajor !== sdkMajor) {
+        this.emitter.emit('error', {
           code: 'PROTOCOL_VERSION_MISMATCH',
-          message: `protocol_version mismatch: gateway=${message.protocol_version} sdk=${PROTOCOL_VERSION}`,
-        },
-      });
+          message: `Gateway protocol_version "${message.protocol_version}" has a MAJOR mismatch with SDK PROTOCOL_VERSION "${PROTOCOL_VERSION}". The wire contract may have changed incompatibly; upgrade @bud-foundry/sdk.`,
+          recoverable: true,
+          raw: {
+            type: 'error',
+            code: 'PROTOCOL_VERSION_MISMATCH',
+            message: `protocol_version major mismatch: gateway=${message.protocol_version} sdk=${PROTOCOL_VERSION}`,
+          },
+        });
+      } else {
+        this.emitter.emit('configWarning', {
+          code: 'PROTOCOL_VERSION_MINOR_DRIFT',
+          message: `Gateway protocol_version "${message.protocol_version}" differs from SDK PROTOCOL_VERSION "${PROTOCOL_VERSION}" (same major; likely forward-compatible).`,
+          raw: {
+            type: 'config_warning',
+            code: 'PROTOCOL_VERSION_MINOR_DRIFT',
+            message: `protocol_version minor drift: gateway=${message.protocol_version} sdk=${PROTOCOL_VERSION}`,
+          },
+        });
+      }
     }
 
     this.emitter.emit('ready', event);
@@ -418,22 +643,12 @@ export class WebSocketSession {
   }
 
   /**
-   * Handle pong message
-   */
-  private handlePong(message: { type: 'pong'; timestamp: number; server_time?: number }): void {
-    // The gateway may echo a pong in response to an application-level message;
-    // surface round-trip latency relative to that message's own timestamp.
-    const latency = Date.now() - message.timestamp;
-    const event: { latency: number; serverTime?: number } = { latency };
-    if (message.server_time !== undefined) event.serverTime = message.server_time;
-    this.emitter.emit('pong', event);
-  }
-
-  /**
    * Handle binary message (audio frames)
    */
   private handleBinaryMessage(data: ArrayBuffer): void {
     this.metrics.increment('ws.bytesReceived', data.byteLength);
+    // D1: TTS audio arrives as raw binary frames — they prove liveness too.
+    this.noteInbound();
 
     // Binary data is typically raw audio - emit as audio event
     const event: AudioEvent = {
@@ -537,7 +752,15 @@ export class WebSocketSession {
           this.metrics.increment('ws.rateLimited');
           const delay = this.computeBackoffMs(err.retryAfterMs, attempt, baseDelayMs, maxDelayMs);
           this.emitter.emit('reconnect', {
-            state: { attempt: attempt + 1, delay, lastConnectedAt: null, reconnecting: true, exhausted: false },
+            state: {
+              attempt: attempt + 1,
+              delay,
+              lastConnectedAt: null,
+              reconnecting: true,
+              exhausted: false,
+              consecutiveQuickFailures: 0,
+              fatal: false,
+            },
             event: 'reconnecting',
           });
           attempt++;
@@ -573,6 +796,13 @@ export class WebSocketSession {
    */
   async disconnect(): Promise<void> {
     this.reconnectStrategy?.abort();
+    // D1: tear down the watchdog + network listeners on an explicit disconnect.
+    this.stopLiveness();
+    this.unbindNetworkListeners();
+    this.awaitingReconnectProof = false;
+    // D5: stop + clear the uplink shedder.
+    this.stopUplinkPump();
+    this.uplink?.clear();
     await this.connection.close();
   }
 
@@ -640,10 +870,47 @@ export class WebSocketSession {
     this.metrics.increment('ws.bytesSent', buffer.byteLength);
 
     if (this.connection.isConnected()) {
-      this.connection.sendBinary(buffer);
+      // D5: route uplink audio through the backpressure shedder so a slow socket
+      // sheds the OLDEST frame instead of accumulating latency. When disabled,
+      // send immediately.
+      if (this.uplink) {
+        this.uplink.push(buffer);
+        this.ensureUplinkPump();
+      } else {
+        this.connection.sendBinary(buffer);
+      }
     } else {
-      // Raw binary audio frame — no JSON message wrapper.
+      // Raw binary audio frame — no JSON message wrapper. Offline buffering is
+      // the MessageQueue's drop-oldest ring (flushed on reconnect open).
       this.queue.enqueue(undefined, buffer);
+    }
+  }
+
+  /**
+   * D5: keep a low-frequency pump running while the uplink ring has frames, so a
+   * socket that drains AFTER the last push still gets the remaining audio. The
+   * timer stops itself once the ring empties (no idle wakeups during silence).
+   */
+  private ensureUplinkPump(): void {
+    if (!this.uplink || this.uplinkPumpTimer) return;
+    if (!this.uplink.hasPending()) return;
+    this.uplinkPumpTimer = setInterval(() => {
+      if (!this.uplink) {
+        this.stopUplinkPump();
+        return;
+      }
+      this.uplink.pump();
+      if (!this.uplink.hasPending()) {
+        this.stopUplinkPump();
+      }
+    }, 10);
+  }
+
+  /** D5: stop the uplink drain pump timer. */
+  private stopUplinkPump(): void {
+    if (this.uplinkPumpTimer) {
+      clearInterval(this.uplinkPumpTimer);
+      this.uplinkPumpTimer = null;
     }
   }
 
@@ -768,6 +1035,18 @@ export class WebSocketSession {
    */
   getQueueStats(): { size: number; maxSize: number; droppedCount: number; oldestAge: number | null } {
     return this.queue.getStats();
+  }
+
+  /**
+   * D5: uplink shedder statistics — frames currently queued in the pre-socket
+   * ring and the total shed (oldest-dropped) under backpressure. `{0,0}` when
+   * shedding is disabled.
+   */
+  getUplinkStats(): { pending: number; droppedFrames: number } {
+    return {
+      pending: this.uplink?.size() ?? 0,
+      droppedFrames: this.uplink?.getDroppedFrames() ?? 0,
+    };
   }
 
   /**

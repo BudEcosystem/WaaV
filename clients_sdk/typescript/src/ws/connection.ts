@@ -27,6 +27,20 @@ function hasOn(ws: unknown): ws is WsEventEmitterLike {
 }
 
 /**
+ * Duck-typed `ping()` present on the Node `ws` library's WebSocket (NOT on the
+ * browser `WebSocket`, which cannot send control frames). When present, the SDK
+ * drives a native WS ping/pong liveness watchdog (D1); browsers fall back to a
+ * stale-inbound-data timer in the session.
+ */
+interface WsPingLike {
+  ping(data?: unknown, mask?: boolean, cb?: (err?: Error) => void): void;
+}
+
+function hasPing(ws: unknown): ws is WsPingLike {
+  return typeof (ws as { ping?: unknown })?.ping === 'function';
+}
+
+/**
  * WebSocket connection options
  */
 export interface WebSocketConnectionOptions {
@@ -54,6 +68,11 @@ export interface ConnectionEventHandlers {
   onError?: (error: Error) => void;
   onMessage?: (message: IncomingMessage) => void;
   onBinaryMessage?: (data: ArrayBuffer) => void;
+  /**
+   * Fired when a native WS `pong` control frame arrives (Node `ws` only — the
+   * browser `WebSocket` does not surface pong). Backs the D1 liveness watchdog.
+   */
+  onPong?: () => void;
 }
 
 /**
@@ -175,6 +194,12 @@ export class WebSocketConnection {
               }
             }
           });
+          // Plumb the native `pong` control frame up to the session so the D1
+          // watchdog can confirm the socket is alive. The browser `WebSocket`
+          // has no equivalent event, so this is Node (`ws`) only.
+          this.ws.on('pong', () => {
+            this.handlers.onPong?.();
+          });
         }
 
         this.ws.onopen = () => {
@@ -279,6 +304,16 @@ export class WebSocketConnection {
   }
 
   /**
+   * Bytes queued in the WebSocket's send buffer but not yet handed to the OS
+   * (the `bufferedAmount`). A rising value means the socket can't drain as fast
+   * as we're sending — the signal the D5 uplink shedder uses to apply
+   * backpressure. Returns 0 when not connected.
+   */
+  bufferedAmount(): number {
+    return this.ws?.bufferedAmount ?? 0;
+  }
+
+  /**
    * Send binary data
    * @returns true if sent successfully, false if not connected
    */
@@ -292,6 +327,60 @@ export class WebSocketConnection {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * Whether this connection can send native WS ping frames (Node `ws` only).
+   * Browsers cannot, so the session uses a stale-inbound-data watchdog instead.
+   */
+  isPingCapable(): boolean {
+    return hasPing(this.ws);
+  }
+
+  /**
+   * Send a native WS ping control frame (Node `ws` only). The matching `pong`
+   * is plumbed back via the `onPong` handler, letting the session run a
+   * ping/pong liveness deadline (D1). No-op (returns false) in the browser or
+   * when not connected.
+   * @returns true if a ping was sent.
+   */
+  ping(): boolean {
+    if (this.state !== 'connected' || !this.ws || !hasPing(this.ws)) {
+      return false;
+    }
+    try {
+      this.ws.ping();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Forcibly tear down a (possibly half-open / zombie) socket WITHOUT a clean
+   * close handshake. A graceful `close()` can hang on a frozen peer that never
+   * sends FIN/RST, which is exactly the zombie case the D1 watchdog detects, so
+   * the watchdog calls this to drop the dead socket immediately and let the
+   * reconnect path build a fresh one. Uses Node `ws.terminate()` when available,
+   * otherwise a best-effort `close()`. Fires `onClose` so the session reacts.
+   */
+  terminate(code = 4000, reason = 'liveness watchdog'): void {
+    const ws = this.ws as (WebSocket & { terminate?: () => void }) | null;
+    if (!ws) return;
+    const wasConnected = this.state === 'connected' || this.state === 'connecting';
+    this.cleanup();
+    try {
+      if (typeof ws.terminate === 'function') {
+        ws.terminate();
+      } else {
+        ws.close(code, reason);
+      }
+    } catch {
+      // Ignore — the socket is already dead.
+    }
+    if (wasConnected) {
+      this.handlers.onClose?.(code, reason);
     }
   }
 

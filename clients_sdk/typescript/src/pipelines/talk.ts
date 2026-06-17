@@ -87,17 +87,27 @@ export class BudTalk extends BasePipeline {
       diarize: config.stt?.diarize ?? false,
     };
 
+    const ttsSampleRate = config.tts?.sampleRate ?? 24000;
+    const autoPlay = config.autoPlay ?? true;
     const ttsConfig: TTSConfig = {
       provider: config.tts?.provider ?? 'deepgram',
       voice: config.tts?.voice,
       voiceId: config.tts?.voiceId,
       model: config.tts?.model,
-      sampleRate: config.tts?.sampleRate ?? 24000,
+      sampleRate: ttsSampleRate,
       audioFormat: config.tts?.audioFormat ?? 'linear16',
       speed: config.tts?.speed,
       pitch: config.tts?.pitch,
       volume: config.tts?.volume,
     };
+
+    // D2 gateway leverage (see BudTTS): 20ms egress chunks + downlink resampled
+    // to the player sink rate so the scheduled player does no client resampling.
+    // Defaulted only; an explicit user value wins.
+    if (autoPlay) {
+      if (config.tts?.audioOutChunkMs === undefined) ttsConfig.audioOutChunkMs = 20;
+      if (config.tts?.clientPlaybackRate === undefined) ttsConfig.clientPlaybackRate = ttsSampleRate;
+    }
 
     super({
       ...config,
@@ -111,7 +121,7 @@ export class BudTalk extends BasePipeline {
     this.sttConfig = sttConfig;
     this.ttsConfig = ttsConfig;
     this.livekitConfig = config.livekit;
-    this.autoPlay = config.autoPlay ?? true;
+    this.autoPlay = autoPlay;
     this.autoRecord = config.autoRecord ?? false;
     this.bargeIn = config.bargeIn ?? true;
 
@@ -358,11 +368,17 @@ export class BudTalk extends BasePipeline {
   }
 
   /**
-   * Interrupt current TTS
+   * Interrupt current TTS (barge-in). Sends the gateway `clear` op (via
+   * super.interrupt -> session.clear) AND cuts the audio the user is currently
+   * hearing: with the D2 scheduled player, `clearBuffer()` now `source.stop()`s
+   * every scheduled node (audible cut within ~20ms) — the old `stop()` here only
+   * emptied a JS array and never interrupted already-scheduled playback. We use
+   * `clearBuffer()` (not the player's own `interrupt()`) to avoid double-sending
+   * `clear`, and keep the player ready to play the next turn (not 'stopped').
    */
   interrupt(): void {
     super.interrupt();
-    this.player?.stop();
+    this.player?.clearBuffer();
   }
 
   /**

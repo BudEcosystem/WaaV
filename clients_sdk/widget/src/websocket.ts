@@ -86,16 +86,29 @@ export function buildConfigMessage(config: WidgetConfig): Record<string, unknown
 
   // TTS configuration with emotion support.
   if (config.tts) {
+    // The widget's AudioPlayer creates its AudioContext at this sample rate
+    // (widget.ts: `new AudioPlayer({ sampleRate: tts.sampleRate || 24000 })`),
+    // so it is also the audio SINK rate.
+    const sinkRate = config.tts.sampleRate || 24000;
     const ttsConfig: Record<string, unknown> = {
       provider: config.tts.provider,
       voice_id: config.tts.voiceId || config.tts.voice,
-      sample_rate: config.tts.sampleRate || 24000,
+      sample_rate: sinkRate,
       // `model` is REQUIRED on the wire (gateway TTSWebSocketConfig has no serde
       // default). Omitting it makes the gateway HARD-REJECT the whole config
       // message ("missing field `model`") — which would silently break the bare
       // `data-tts-voice` flagship path. An empty string is the gateway-blessed
       // "use the provider's recommended default model" (gateway config.rs).
       model: config.tts.model ?? '',
+      // D2 gateway-leverage audio knobs (TTSWebSocketConfig, gateway config.rs:540/549):
+      //  - audio_out_chunk_ms=20: the gateway re-frames PCM egress into ~20ms
+      //    chunks, so a barge-in `clear` truncates within ONE server chunk AND the
+      //    chunks arrive pre-sized for the player's scheduled-chunk playout clock.
+      //  - client_playback_rate=<sink rate>: the gateway resamples downlink PCM to
+      //    EXACTLY the AudioContext rate with continuous filter state, so the player
+      //    does ZERO downlink resampling (no client resample stage / boundary clicks).
+      audio_out_chunk_ms: 20,
+      client_playback_rate: sinkRate,
     };
 
     // Abstract voice selection (P4): the gateway resolves a VoiceDescriptor to a
@@ -205,6 +218,19 @@ export type MessageHandler = {
   onClose: () => void;
 };
 
+/**
+ * D1 liveness: max ms with no inbound frame during an ACTIVE session before we
+ * declare the socket a zombie and reconnect. The gateway never pings clients and
+ * has no JSON ping op, so app-level stale-inbound detection is the only browser
+ * liveness signal. Must be FAR under the gateway's ~300s idle-close (handler.rs:265)
+ * yet above normal transcript/audio cadence; ~12s during an active call.
+ */
+const STALE_INBOUND_MS = 12000;
+/** How often the watchdog wakes to check the stale-inbound deadline. */
+const LIVENESS_CHECK_MS = 3000;
+/** On resume (online/foreground), reconnect immediately if no inbound this recently. */
+const RESUME_PROBE_STALE_MS = 2000;
+
 export class WidgetWebSocket {
   private ws: WebSocket | null = null;
   private config: WidgetConfig;
@@ -219,6 +245,26 @@ export class WidgetWebSocket {
     messagesSent: 0,
   };
   private reconnectTimeoutId: ReturnType<typeof setTimeout> | null = null;
+
+  // D1/D4 session liveness state.
+  /**
+   * True from the first connect() until disconnect(). Distinguishes a network
+   * drop (reconnect) from a user-initiated close (do NOT reconnect). Survives
+   * across reconnect attempts, unlike the per-connect `settled` closure flag.
+   */
+  private active = false;
+  /** True once the gateway has sent `ready` at least once on the current attempt. */
+  private ready = false;
+  /** Monotonic timestamp (performance.now) of the most recent inbound frame. */
+  private lastInboundMonotonic = 0;
+  /** D1 stale-inbound watchdog interval. */
+  private livenessIntervalId: ReturnType<typeof setInterval> | null = null;
+  /** Whether the network-change listeners are currently installed. */
+  private networkListenersAttached = false;
+  // Bound network-change handlers (so add/removeEventListener pair correctly).
+  private boundOnline: (() => void) | null = null;
+  private boundOffline: (() => void) | null = null;
+  private boundVisibility: (() => void) | null = null;
 
   constructor(config: WidgetConfig, handlers: MessageHandler) {
     this.config = config;
@@ -240,6 +286,12 @@ export class WidgetWebSocket {
   }
 
   connect(timeout = 10000): Promise<void> {
+    // The session is now meant to be alive: a drop should reconnect (D4) until
+    // the caller explicitly disconnect()s. Set BEFORE opening so a fast close
+    // still routes through the reconnect path.
+    this.active = true;
+    this.ready = false;
+    this.installNetworkListeners();
     return new Promise((resolve, reject) => {
       let settled = false;
       let timeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -261,8 +313,11 @@ export class WidgetWebSocket {
       // Set connection timeout
       timeoutId = setTimeout(() => {
         if (!settled) {
-          // Close WebSocket if still connecting
+          // Close WebSocket if still connecting. Null the handler first so this
+          // deliberate close does NOT trigger the onclose reconnect path (the
+          // surfaced timeout error drives the caller's own recovery instead).
           if (this.ws) {
+            this.ws.onclose = null;
             this.ws.close();
             this.ws = null;
           }
@@ -282,13 +337,25 @@ export class WidgetWebSocket {
 
         this.ws.onopen = () => {
           this.reconnectAttempts = 0;
+          // Treat the open itself as inbound activity so the liveness watchdog
+          // has a fresh baseline before the first frame arrives.
+          this.lastInboundMonotonic = performance.now();
           this.sendConfig();
           // We'll resolve when we get the ready message
         };
 
         this.ws.onmessage = (event) => {
           this._metrics.messagesReceived++;
-          this.handleMessage(event, () => settle());
+          // D1: every inbound frame (binary audio, transcripts, keepalive, JSON)
+          // refreshes the liveness clock — the only browser zombie signal.
+          this.lastInboundMonotonic = performance.now();
+          this.handleMessage(event, () => {
+            // Resolve the connect promise AND arm the stale-inbound watchdog the
+            // first time the gateway says `ready`.
+            this.ready = true;
+            this.startLivenessWatchdog();
+            settle();
+          });
         };
 
         this.ws.onerror = () => {
@@ -296,9 +363,13 @@ export class WidgetWebSocket {
         };
 
         this.ws.onclose = () => {
+          this.stopLivenessWatchdog();
           this.handlers.onClose();
-          if (!settled) {
-            // Only attempt reconnect if we haven't settled yet (connection dropped before ready)
+          // D4: reconnect on ANY drop while the session is active — including a
+          // POST-ready drop (the old code gated on `!settled`, so a drop after
+          // ready left the widget dead). A user-initiated disconnect() clears
+          // `active` first, so it does NOT reconnect.
+          if (this.active) {
             this.attemptReconnect();
           }
         };
@@ -309,6 +380,12 @@ export class WidgetWebSocket {
   }
 
   disconnect(): void {
+    // User-initiated teardown: do NOT reconnect after this close.
+    this.active = false;
+    this.ready = false;
+    this.stopLivenessWatchdog();
+    this.removeNetworkListeners();
+
     // Cancel any pending reconnect attempt
     if (this.reconnectTimeoutId !== null) {
       clearTimeout(this.reconnectTimeoutId);
@@ -316,12 +393,135 @@ export class WidgetWebSocket {
     }
 
     if (this.ws) {
+      // Detach onclose so the deliberate close does not re-enter the reconnect
+      // path (active is already false, but this avoids a spurious onClose call).
+      this.ws.onclose = null;
       this.ws.close();
       this.ws = null;
     }
 
     // Reset metrics on disconnect to prevent unbounded growth
     this.resetMetrics();
+  }
+
+  // ===========================================================================
+  // D1 LIVENESS: browser stale-inbound watchdog + network-change probes
+  // ===========================================================================
+
+  /**
+   * Arm the stale-inbound watchdog. The gateway emits frequent inbound frames
+   * (transcripts/audio/keepalive) during any active session and never pings the
+   * client, so "no inbound for STALE_INBOUND_MS" is the browser zombie signal.
+   * On a stale deadline we close the socket; onclose then reconnects (D4).
+   */
+  private startLivenessWatchdog(): void {
+    if (this.livenessIntervalId !== null) return; // already armed
+    this.lastInboundMonotonic = performance.now();
+    this.livenessIntervalId = setInterval(() => {
+      if (!this.active || !this.ready) return;
+      const idle = performance.now() - this.lastInboundMonotonic;
+      if (idle >= STALE_INBOUND_MS) {
+        // Zombie: socket is OPEN but no data has arrived. Force a reconnect.
+        this.recycleSocket();
+      }
+    }, LIVENESS_CHECK_MS);
+  }
+
+  private stopLivenessWatchdog(): void {
+    if (this.livenessIntervalId !== null) {
+      clearInterval(this.livenessIntervalId);
+      this.livenessIntervalId = null;
+    }
+  }
+
+  /**
+   * Close the current (suspected-zombie) socket so the onclose handler routes
+   * into the reconnect path. Guarded so a missing/closed socket is a no-op.
+   */
+  private recycleSocket(): void {
+    this.ready = false;
+    this.stopLivenessWatchdog();
+    if (this.ws) {
+      // Keep onclose attached: we WANT it to fire so attemptReconnect runs (active).
+      try {
+        this.ws.close();
+      } catch (e) {
+        // ignore
+      }
+    }
+  }
+
+  /**
+   * Subscribe to network/visibility changes so a resumed tab or restored NIC
+   * heals immediately instead of waiting out the watchdog interval. Browser-only
+   * (guarded for non-DOM/test hosts).
+   */
+  private installNetworkListeners(): void {
+    if (this.networkListenersAttached) return;
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return;
+    }
+    this.boundOnline = () => this.onNetworkResume();
+    this.boundOffline = () => {
+      // NIC is down: stop retrying into a known-dead network (avoids a storm).
+      // The next 'online' event will probe + reconnect.
+      if (this.reconnectTimeoutId !== null) {
+        clearTimeout(this.reconnectTimeoutId);
+        this.reconnectTimeoutId = null;
+      }
+    };
+    this.boundVisibility = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        this.onNetworkResume();
+      }
+    };
+    window.addEventListener('online', this.boundOnline);
+    window.addEventListener('offline', this.boundOffline);
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      document.addEventListener('visibilitychange', this.boundVisibility);
+    }
+    this.networkListenersAttached = true;
+  }
+
+  private removeNetworkListeners(): void {
+    if (!this.networkListenersAttached) return;
+    if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      if (this.boundOnline) window.removeEventListener('online', this.boundOnline);
+      if (this.boundOffline) window.removeEventListener('offline', this.boundOffline);
+      if (
+        this.boundVisibility &&
+        typeof document !== 'undefined' &&
+        typeof document.removeEventListener === 'function'
+      ) {
+        document.removeEventListener('visibilitychange', this.boundVisibility);
+      }
+    }
+    this.boundOnline = null;
+    this.boundOffline = null;
+    this.boundVisibility = null;
+    this.networkListenersAttached = false;
+  }
+
+  /**
+   * On tab-resume / NIC-restore during an active session: if the socket is gone,
+   * reconnect now; if it is open but has been quiet, proactively recycle it (a
+   * resumed tab often holds a half-open socket the OS hasn't reset yet).
+   */
+  private onNetworkResume(): void {
+    if (!this.active) return;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      // Socket already gone — reconnect immediately (skip any pending backoff).
+      if (this.reconnectTimeoutId !== null) {
+        clearTimeout(this.reconnectTimeoutId);
+        this.reconnectTimeoutId = null;
+      }
+      this.attemptReconnect();
+      return;
+    }
+    // Socket OPEN: if nothing arrived very recently, assume it is half-open.
+    if (this.ready && performance.now() - this.lastInboundMonotonic > RESUME_PROBE_STALE_MS) {
+      this.recycleSocket();
+    }
   }
 
   private sendConfig(): void {
@@ -452,18 +652,30 @@ export class WidgetWebSocket {
   }
 
   private attemptReconnect(): void {
+    // A reconnect is already scheduled — don't stack a second timer (would leak
+    // the prior id and double-count attempts).
+    if (this.reconnectTimeoutId !== null) {
+      return;
+    }
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       this.handlers.onError(new Error('Max reconnection attempts reached'));
       return;
     }
 
+    // No live socket should remain across the backoff window (D1/D4: a recycled
+    // or dropped socket is already closing); drop the stale ready flag so the
+    // watchdog stays disarmed until the fresh `ready`.
+    this.ready = false;
+
     this.reconnectAttempts++;
+    // Reuse the existing 1.5^attempt backoff with +-20% jitter (D4: same backoff).
     const delay = this.reconnectDelay * Math.pow(1.5, this.reconnectAttempts - 1);
     const jitter = delay * 0.2 * (Math.random() * 2 - 1);
 
     // Store timeout ID so it can be cancelled on disconnect
     this.reconnectTimeoutId = setTimeout(() => {
       this.reconnectTimeoutId = null;
+      // connect() re-sends the full config envelope in onopen (D4: re-send config).
       this.connect().catch((error) => {
         this.handlers.onError(error);
       });

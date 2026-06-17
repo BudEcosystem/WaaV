@@ -20,6 +20,8 @@
 import { BudWidget, defineWidget } from './widget';
 import { mergeConfig, parseConfigFromAttributes } from './config';
 import { buildConfigMessage, buildConversationConfig } from './websocket';
+import { AudioPlayer } from './audio/player';
+import { AudioRecorder } from './audio/recorder';
 import {
   STT_PROVIDERS,
   TTS_PROVIDERS,
@@ -61,6 +63,10 @@ export {
   parseConfigFromAttributes,
   buildConfigMessage,
   buildConversationConfig,
+  // Audio primitives (D2 scheduled player / D3 AudioWorklet recorder). Exported so
+  // advanced embedders can drive playout/capture directly and for unit testing.
+  AudioPlayer,
+  AudioRecorder,
   // Canonical provider value-space (mirrors the gateway dispatch tables).
   STT_PROVIDERS,
   TTS_PROVIDERS,

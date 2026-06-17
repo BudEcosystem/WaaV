@@ -23,6 +23,20 @@ export interface RecorderConfig {
   autoGainControl?: boolean;
   /** Device ID to use (default: system default) */
   deviceId?: string;
+  /**
+   * URL of the standalone capture AudioWorklet module (built to
+   * `dist/capture.worklet.js`). When omitted, the recorder tries to derive it
+   * from the package location (`import.meta.url`); if that fails or the runtime
+   * lacks AudioWorklet, it falls back to the legacy ScriptProcessor path. Pass
+   * an explicit URL when your bundler relocates assets.
+   */
+  workletUrl?: string;
+  /**
+   * Force the legacy ScriptProcessor capture path even when AudioWorklet is
+   * available (default false). The worklet is preferred because it runs off the
+   * main thread; this escape hatch is for debugging only.
+   */
+  forceScriptProcessor?: boolean;
 }
 
 /**
@@ -63,9 +77,12 @@ export class AudioRecorder {
   private mediaStream: MediaStream | null = null;
   private sourceNode: MediaStreamAudioSourceNode | null = null;
   private workletNode: AudioWorkletNode | null = null;
+  private scriptProcessorNode: ScriptProcessorNode | null = null;
   private analyserNode: AnalyserNode | null = null;
   private levelCheckInterval: ReturnType<typeof setInterval> | null = null;
   private nativeSampleRate = 48000;
+  /** Which capture path is live (for diagnostics + correct teardown). */
+  private captureMode: 'worklet' | 'scriptprocessor' | null = null;
 
   constructor(config: RecorderConfig = {}) {
     this.config = {
@@ -76,6 +93,8 @@ export class AudioRecorder {
       noiseSuppression: config.noiseSuppression ?? true,
       autoGainControl: config.autoGainControl ?? true,
       deviceId: config.deviceId ?? '',
+      workletUrl: config.workletUrl ?? '',
+      forceScriptProcessor: config.forceScriptProcessor ?? false,
     };
   }
 
@@ -146,9 +165,9 @@ export class AudioRecorder {
       this.analyserNode.fftSize = 256;
       this.sourceNode.connect(this.analyserNode);
 
-      // Create processor using ScriptProcessorNode (deprecated but widely supported)
-      // TODO: Upgrade to AudioWorklet when better cross-browser support
-      await this.setupScriptProcessor();
+      // D3: prefer the off-main-thread AudioWorklet capture; fall back to the
+      // legacy ScriptProcessor only when the worklet is unavailable.
+      await this.setupCapture();
 
       // Monitor track ended
       const track = this.mediaStream.getAudioTracks()[0];
@@ -166,13 +185,113 @@ export class AudioRecorder {
   }
 
   /**
-   * Setup script processor for audio capture
+   * D3: set up audio capture, preferring the off-main-thread AudioWorklet and
+   * falling back to the legacy ScriptProcessor only if the worklet path is
+   * unavailable (no AudioWorklet, no resolvable module URL, or addModule fails).
    */
-  private async setupScriptProcessor(): Promise<void> {
+  private async setupCapture(): Promise<void> {
+    if (!this.config.forceScriptProcessor && this.canUseWorklet()) {
+      try {
+        await this.setupWorklet();
+        this.captureMode = 'worklet';
+        return;
+      } catch {
+        // Worklet unavailable/failed (e.g. addModule URL not resolvable in this
+        // bundler) — fall through to the legacy path. Reset any partial state.
+        if (this.workletNode) {
+          try { this.workletNode.disconnect(); } catch { /* ignore */ }
+          this.workletNode = null;
+        }
+      }
+    }
+    this.setupScriptProcessor();
+    this.captureMode = 'scriptprocessor';
+  }
+
+  /** Whether this runtime can run an AudioWorklet capture node. */
+  private canUseWorklet(): boolean {
+    return (
+      typeof AudioWorkletNode !== 'undefined' &&
+      !!this.audioContext &&
+      'audioWorklet' in this.audioContext &&
+      typeof this.audioContext.audioWorklet?.addModule === 'function'
+    );
+  }
+
+  /** Resolve the worklet module URL (explicit config, else derive from package). */
+  private resolveWorkletUrl(): string | null {
+    if (this.config.workletUrl) return this.config.workletUrl;
+    // Derive the standalone worklet asset that sits next to the built bundle.
+    // `import.meta.url` points at this module's location; the worklet is emitted
+    // as a sibling `capture.worklet.js`. Guarded because some toolchains rewrite
+    // import.meta — on failure we return null and the caller falls back.
+    try {
+      const base = (import.meta as unknown as { url?: string }).url;
+      if (base) return new URL('./capture.worklet.js', base).href;
+    } catch {
+      // ignore — fall through
+    }
+    return null;
+  }
+
+  /**
+   * Set up the AudioWorklet capture path: load the module, create the node,
+   * configure it (target rate + 20ms frames), and pump Int16 frames up to
+   * onData. The worklet posts TRANSFERABLE buffers; we send them back via a
+   * 'recycle' message so the worklet's process() stays allocation-free.
+   */
+  private async setupWorklet(): Promise<void> {
+    if (!this.audioContext || !this.sourceNode) throw new Error('audio context not ready');
+    const url = this.resolveWorkletUrl();
+    if (!url) throw new Error('worklet URL unresolved');
+
+    await this.audioContext.audioWorklet.addModule(url);
+
+    const node = new AudioWorkletNode(this.audioContext, 'waav-capture', {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      channelCount: 1,
+    });
+    this.workletNode = node;
+
+    node.port.onmessage = (e: MessageEvent) => {
+      const data = e.data as { type?: string; buffer?: ArrayBuffer; samples?: number };
+      if (data?.type === 'frame' && data.buffer && this.state === 'recording') {
+        const samples = data.samples ?? data.buffer.byteLength / 2;
+        // Wrap the transferred buffer as Int16 (zero-copy) for the consumer.
+        const frame = new Int16Array(data.buffer, 0, samples);
+        this.handlers.onData?.(frame);
+        // Return the buffer to the worklet pool to avoid per-frame allocation.
+        try {
+          node.port.postMessage({ type: 'recycle', buffer: data.buffer }, [data.buffer]);
+        } catch {
+          // If the consumer retained the buffer, just let the worklet allocate.
+        }
+      }
+    };
+
+    // Tell the worklet the target rate + frame size (20ms @ target rate).
+    node.port.postMessage({ type: 'config', targetSampleRate: this.config.sampleRate, frameMs: 20 });
+
+    // Connect capture graph. A muted sink keeps the node pulled without audible
+    // output (some browsers require an output connection to run the processor).
+    this.sourceNode.connect(node);
+    const mute = this.audioContext.createGain();
+    mute.gain.value = 0;
+    node.connect(mute);
+    mute.connect(this.audioContext.destination);
+  }
+
+  /**
+   * Legacy fallback: ScriptProcessorNode capture (deprecated, main-thread).
+   * Retained only for runtimes without AudioWorklet. Frames are resampled +
+   * Int16-converted on the main thread (the very contention the worklet avoids).
+   */
+  private setupScriptProcessor(): void {
     if (!this.audioContext || !this.sourceNode) return;
 
-    // Use ScriptProcessorNode (deprecated but reliable)
     const processor = this.audioContext.createScriptProcessor(this.config.bufferSize, 1, 1);
+    this.scriptProcessorNode = processor;
 
     processor.onaudioprocess = (event) => {
       if (this.state !== 'recording') return;
@@ -194,6 +313,11 @@ export class AudioRecorder {
 
     this.sourceNode.connect(processor);
     processor.connect(this.audioContext.destination);
+  }
+
+  /** Which capture path is active ('worklet' | 'scriptprocessor' | null). */
+  getCaptureMode(): 'worklet' | 'scriptprocessor' | null {
+    return this.captureMode;
   }
 
   /**
@@ -287,9 +411,18 @@ export class AudioRecorder {
     this.stop();
 
     if (this.workletNode) {
+      try { this.workletNode.port.onmessage = null; } catch { /* ignore */ }
       this.workletNode.disconnect();
       this.workletNode = null;
     }
+
+    if (this.scriptProcessorNode) {
+      this.scriptProcessorNode.onaudioprocess = null;
+      this.scriptProcessorNode.disconnect();
+      this.scriptProcessorNode = null;
+    }
+
+    this.captureMode = null;
 
     if (this.analyserNode) {
       this.analyserNode.disconnect();
