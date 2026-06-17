@@ -48,6 +48,18 @@ export function parseConfigFromAttributes(element: HTMLElement): WidgetConfig {
       channels: parseInt(element.dataset.sttChannels || '1', 10),
       encoding: element.dataset.sttEncoding || 'linear16',
     };
+    // Canonical in-stream translation (P5): `data-translate-target="hi-IN,es-ES"`
+    // (canonical BCP-47, comma-separated) and/or `data-translate-to-english`. The
+    // gateway emits translations[]{lang,text} on each stt_result.
+    const targets = (element.dataset.translateTarget || '')
+      .split(',').map((s) => s.trim()).filter(Boolean);
+    const toEnglish = element.dataset.translateToEnglish === 'true';
+    if (targets.length || toEnglish) {
+      config.stt.translation = {
+        ...(targets.length ? { targetLanguages: targets } : {}),
+        ...(toEnglish ? { translateToEnglish: true } : {}),
+      };
+    }
   }
 
   // Parse TTS config with emotion support.

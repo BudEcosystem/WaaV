@@ -254,6 +254,24 @@ export interface STTConfig {
   sampleRate?: number;
   channels?: number;
   encoding?: string;
+  /**
+   * Canonical in-stream translation (P5). Ask for translation with the same
+   * canonical BCP-47 tokens as {@link language}; the gateway maps to each
+   * provider's native code and emits `translations:[{lang,text}]` on the
+   * stt_result (Speechmatics/Gladia side-channel, OpenAI/Groq English fast path).
+   * Serialized under `stt_config.translation`.
+   */
+  translation?: TranslationConfig;
+}
+
+/** Canonical translation request block (P5). Mirrors the gateway TranslationConfig. */
+export interface TranslationConfig {
+  /** Canonical BCP-47 target languages, e.g. `["hi-IN", "es-ES"]`. */
+  targetLanguages?: string[];
+  /** Fast path: translate the whole stream to English (OpenAI/Groq). */
+  translateToEnglish?: boolean;
+  /** Emit interim (partial) translations, not just finals. */
+  partials?: boolean;
 }
 
 export interface TTSConfig {

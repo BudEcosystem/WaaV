@@ -75,6 +75,9 @@ export class BudWidget extends HTMLElement {
       'data-voice-age',
       'data-voice-style',
       'data-voice-name-hint',
+      // P5 in-stream translation (canonical BCP-47 targets, comma-separated).
+      'data-translate-target',
+      'data-translate-to-english',
       // Flagship one-tag conversation loop: re-parse when the LLM target changes
       // so a talking bot can be configured declaratively after mount.
       'data-llm-base-url',

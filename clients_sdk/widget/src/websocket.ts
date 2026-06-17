@@ -70,6 +70,17 @@ export function buildConfigMessage(config: WidgetConfig): Record<string, unknown
       sttConfig.turn_detection = turnDetection;
     }
 
+    // Canonical in-stream translation (P5) -> stt_config.translation. Canonical
+    // BCP-47 target tokens; the gateway maps to each provider's native code.
+    const tr = config.stt.translation;
+    if (tr && (tr.targetLanguages?.length || tr.translateToEnglish || tr.partials)) {
+      const trWire: Record<string, unknown> = {};
+      if (tr.targetLanguages?.length) trWire.target_languages = tr.targetLanguages;
+      if (tr.translateToEnglish !== undefined) trWire.translate_to_english = tr.translateToEnglish;
+      if (tr.partials !== undefined) trWire.partials = tr.partials;
+      sttConfig.translation = trWire;
+    }
+
     message.stt_config = sttConfig;
   }
 
