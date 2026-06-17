@@ -139,6 +139,116 @@ class RealtimeProvider(str, Enum):
     HUME_EVI = "hume"
 
 
+# =============================================================================
+# Canonical Language Value Space (P2 unified-language system)
+# =============================================================================
+#
+# WaaV's gateway maps ONE canonical, region-qualified BCP-47 language token to
+# EACH provider's native notation internally (so the same ``language`` string
+# works on every provider — switch models without client edits). A developer
+# passes one of these canonical tokens (or a bare ISO-639-1 shorthand like
+# ``"en"``/``"hi"``, or the reversed/underscore/name spellings the gateway folds:
+# ``"us-en"``, ``"en_US"``, ``"english"``) and the gateway resolves + renders it.
+#
+# This list is the value space, mirrored 1:1 from the gateway's
+# ``CanonicalLanguage::all()`` (``gateway/src/core/lang/types.rs``). It is
+# REFERENCE/discovery only — ``STTConfig.language``/``TtsFeatures.language`` stay
+# free ``str`` on the wire (an unrecognized token is still forwarded verbatim and
+# surfaced as a ``config_warning``, never a hard error). For the authoritative,
+# always-current per-provider native-notation matrix call the gateway's
+# ``GET /capabilities/languages``.
+#
+# Chinese uses ``cmn``/``yue`` (ISO-639-3) — NOT ``zh`` — because the canonical
+# must disambiguate Mandarin from Cantonese (the providers do: Google STT
+# ``cmn-Hans-CN`` vs ``yue-Hant-HK``). ``"auto"`` is the detection token.
+CANONICAL_LANGUAGES: tuple[str, ...] = (
+    "en-US", "en-GB", "en-IN", "en-AU", "en-ZA", "en-NZ",
+    "es-ES", "es-MX", "es-US",
+    "fr-FR", "fr-CA",
+    "pt-BR", "pt-PT",
+    "de-DE", "it-IT", "nl-NL", "ru-RU", "tr-TR", "pl-PL", "sv-SE", "nb-NO",
+    "da-DK", "fi-FI", "uk-UA", "cs-CZ", "el-GR", "ro-RO", "hu-HU",
+    "ja-JP", "ko-KR", "cmn-CN", "cmn-TW", "yue-HK",
+    "hi-IN", "bn-IN", "ta-IN", "te-IN", "gu-IN", "kn-IN", "ml-IN", "mr-IN",
+    "pa-IN", "or-IN",
+    "ar-SA", "vi-VN", "th-TH", "id-ID", "ms-MY", "he-IL",
+)
+"""The canonical region-qualified BCP-47 language tokens WaaV accepts (P2).
+
+Mirror of the gateway ``CanonicalLanguage::all()``. Pass one of these (or a bare
+ISO-639-1 shorthand / common alias) as ``language``; the gateway maps it to each
+provider's native notation. ``"auto"`` requests language detection. Discovery
+only — the wire field stays a free string (additive/backward-compatible).
+"""
+
+
+# Per-provider language-notation summary, mirroring the gateway language support
+# matrix (``gateway/src/core/lang/mod.rs::language_support_matrix``): how the
+# provider spells languages natively + whether it auto-detects. This is the
+# CANONICAL contract, NOT a stale per-provider language whitelist — passing any
+# :data:`CANONICAL_LANGUAGES` token is supported for every provider (unsupported
+# pairings degrade with a ``config_warning``, never a hard error). An
+# uncatalogued provider defaults to ``("bcp47", False)`` (the gateway's safe
+# default). ``notation`` ∈ {bcp47, iso6391, underscore, model-id, composite, none}.
+_LANGUAGE_NOTATION: dict[str, tuple[str, bool]] = {
+    # IDENTITY-BCP47 (native == canonical BCP-47, region preserved)
+    "deepgram": ("bcp47", True),
+    "microsoft-azure": ("bcp47", True),
+    "azure": ("bcp47", True),
+    "aws-transcribe": ("bcp47", True),
+    "aws-polly": ("bcp47", False),
+    "sarvam": ("bcp47", True),
+    "yandex": ("bcp47", True),
+    "google": ("bcp47", True),
+    "gemini": ("bcp47", True),
+    "nova_sonic": ("bcp47", True),
+    "tinkoff": ("bcp47", False),
+    # DOWNGRADE-TO-ISO639-1 (native == ISO-639-1, region dropped)
+    "elevenlabs": ("iso6391", True),
+    "openai": ("iso6391", True),
+    "cartesia": ("iso6391", False),
+    "assemblyai": ("iso6391", True),
+    "speechmatics": ("iso6391", True),
+    "groq": ("iso6391", True),
+    "gladia": ("iso6391", True),
+    "fpt-ai": ("iso6391", True),
+    "reverie": ("iso6391", False),
+    # UNDERSCORE
+    "iflytek": ("underscore", False),
+    # ENUM / NUMERIC / COMPOSITE (language IS a model id / fused token)
+    "baidu": ("model-id", False),
+    "tencent": ("composite", False),
+    # SPECIAL (no language parameter — inferred from text/voice/description)
+    "hume": ("none", True),
+}
+
+
+def language_capabilities(provider: str) -> dict[str, Any]:
+    """Canonical language capability summary for ``provider`` (P2).
+
+    The SDK's documented stand-in for the gateway ``GET /capabilities/languages``
+    endpoint (not shipped this phase): it tells a developer (a) that the FULL
+    canonical value space (:data:`CANONICAL_LANGUAGES`) is accepted for every
+    provider — the gateway maps it — and (b) how the provider spells languages
+    natively (``notation``) + whether it ``auto_detect``s. It intentionally does
+    NOT return a stale per-provider language whitelist (the thing the SDK used to
+    hardcode and let drift): passing any canonical token is supported.
+
+    Returns ``{provider, notation, auto_detect, canonical_languages}``. An
+    uncatalogued provider gets ``notation="bcp47"`` + ``auto_detect=False`` (the
+    gateway's safe default) — it is never blocked.
+    """
+    notation, auto = _LANGUAGE_NOTATION.get(provider, ("bcp47", False))
+    return {
+        "provider": provider,
+        "notation": notation,
+        "auto_detect": auto,
+        # The full canonical value space is accepted for every provider; the
+        # gateway renders it to the provider's native notation server-side.
+        "canonical_languages": list(CANONICAL_LANGUAGES),
+    }
+
+
 # Provider capability hints (best-effort REFERENCE only — NOT authoritative).
 #
 # This is a small curated subset for the most-used providers; it is intentionally

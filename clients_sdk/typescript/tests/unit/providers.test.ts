@@ -10,6 +10,12 @@ import {
   isValidRealtimeProvider,
   getProviderCapabilities,
 } from '../../src/types/providers';
+import {
+  CANONICAL_LANGUAGES,
+  isCanonicalLanguage,
+  languageCapabilities,
+} from '../../src/types/canonical-languages';
+import { serializeMessage, createConfigMessage } from '../../src/ws/messages';
 
 // =============================================================================
 // Provider-enum DRIFT GUARD
@@ -174,5 +180,119 @@ describe('Realtime Provider Types (gateway /realtime fleet)', () => {
     const openai = getProviderCapabilities('openai', 'realtime');
     expect(openai?.streaming).toBe(true);
     expect(openai?.supportsInterruption).toBe(true);
+  });
+});
+
+// =============================================================================
+// Canonical-language DRIFT GUARD (P2 unified-language value space)
+//
+// The SDK CANONICAL_LANGUAGES list must mirror the gateway's
+// CanonicalLanguage::all() 1:1, so the value space a developer sees in the SDK
+// matches what the gateway actually resolves. Source of truth: the as_bcp47()
+// match arms in gateway/src/core/lang/types.rs (the variant => "ll-RR" map).
+// =============================================================================
+
+const LANG_TYPES_RS = resolve(__dirname, '../../../../gateway/src/core/lang/types.rs');
+
+/** Parse the non-`auto` BCP-47 codes from the gateway's `as_bcp47` match arms. */
+function gatewayCanonicalLanguages(): string[] {
+  const src = readFileSync(LANG_TYPES_RS, 'utf8');
+  const start = src.indexOf('pub const fn as_bcp47(&self)');
+  if (start === -1) throw new Error('as_bcp47 not found in gateway types.rs');
+  const body = src.slice(start, src.indexOf('\n    }', start));
+  const codes: string[] = [];
+  const re = /=>\s*"([a-z]{2,3}-[A-Z]{2})"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body)) !== null) codes.push(m[1]);
+  return codes;
+}
+
+describe('canonical languages (P2)', () => {
+  it('has no duplicates and is region-qualified ll-RR', () => {
+    expect(new Set(CANONICAL_LANGUAGES).size).toBe(CANONICAL_LANGUAGES.length);
+    for (const code of CANONICAL_LANGUAGES) {
+      expect(code).toMatch(/^[a-z]{2,3}-[A-Z]{2}$/);
+    }
+  });
+
+  it('uses cmn/yue (not zh-*) for Chinese and includes the headline tokens', () => {
+    for (const code of ['en-US', 'en-GB', 'en-IN', 'cmn-CN', 'cmn-TW', 'yue-HK', 'or-IN', 'nb-NO']) {
+      expect(CANONICAL_LANGUAGES).toContain(code);
+    }
+    expect(CANONICAL_LANGUAGES.some((c) => c.startsWith('zh-'))).toBe(false);
+  });
+
+  it('isCanonicalLanguage narrows membership', () => {
+    expect(isCanonicalLanguage('en-US')).toBe(true);
+    expect(isCanonicalLanguage('klingon')).toBe(false);
+    // a bare shorthand is NOT in the canonical set (it still resolves gateway-side)
+    expect(isCanonicalLanguage('en')).toBe(false);
+  });
+
+  it('mirrors the gateway CanonicalLanguage::all() exactly', () => {
+    const gateway = gatewayCanonicalLanguages();
+    expect([...CANONICAL_LANGUAGES].sort()).toEqual([...gateway].sort());
+  });
+});
+
+// =============================================================================
+// Language capabilities accessor (P2): the SDK exposes the canonical value space
+// + per-provider native-notation summary, replacing stale per-provider whitelists.
+// =============================================================================
+
+describe('languageCapabilities (P2)', () => {
+  it('exposes the FULL canonical set for every provider', () => {
+    const caps = languageCapabilities('deepgram');
+    expect(caps.provider).toBe('deepgram');
+    expect(caps.notation).toBe('bcp47');
+    expect(caps.autoDetect).toBe(true);
+    // The full canonical value space is offered for every provider (the gateway maps it).
+    expect([...caps.canonicalLanguages].sort()).toEqual([...CANONICAL_LANGUAGES].sort());
+  });
+
+  it('reports the headline notation forks', () => {
+    expect(languageCapabilities('elevenlabs').notation).toBe('iso6391'); // downgrade
+    expect(languageCapabilities('iflytek').notation).toBe('underscore');
+    expect(languageCapabilities('baidu').notation).toBe('model-id');
+    expect(languageCapabilities('tencent').notation).toBe('composite');
+    expect(languageCapabilities('hume').notation).toBe('none');
+  });
+
+  it('gives an uncatalogued provider a safe BCP-47 default (never blocked)', () => {
+    const caps = languageCapabilities('some-brand-new-provider');
+    expect(caps.notation).toBe('bcp47');
+    expect(caps.autoDetect).toBe(false);
+    expect([...caps.canonicalLanguages].sort()).toEqual([...CANONICAL_LANGUAGES].sort());
+  });
+});
+
+// =============================================================================
+// Language passthrough (P2 backward-compat): the SDK does NOT map language
+// client-side — the `language` field flows through configToWire UNCHANGED (the
+// gateway maps it). A canonical token, an alias, and an arbitrary raw string all
+// reach the wire verbatim.
+// =============================================================================
+
+describe('language passthrough through configToWire (P2)', () => {
+  const wireLanguage = (language: string): unknown => {
+    const json = serializeMessage(
+      createConfigMessage(
+        { provider: 'deepgram', language },
+        { provider: 'deepgram' },
+      ),
+    );
+    return (JSON.parse(json) as { stt_config: { language: unknown } }).stt_config.language;
+  };
+
+  it('forwards a canonical token verbatim (no client-side downgrade)', () => {
+    expect(wireLanguage('en-US')).toBe('en-US');
+  });
+
+  it('forwards an alias verbatim (the gateway folds `us-en`, not the SDK)', () => {
+    expect(wireLanguage('us-en')).toBe('us-en');
+  });
+
+  it('forwards an arbitrary raw string (forward-compat — never rejected client-side)', () => {
+    expect(wireLanguage('brand-new-locale-x')).toBe('brand-new-locale-x');
   });
 });

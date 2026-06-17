@@ -34,6 +34,18 @@ export {
   intensityToNumber,
 } from './config.js';
 
+// Canonical language value space (P2)
+export {
+  CANONICAL_LANGUAGES,
+  isCanonicalLanguage,
+  languageCapabilities,
+} from './canonical-languages.js';
+export type {
+  CanonicalLanguage,
+  LanguageNotation,
+  LanguageCapabilities,
+} from './canonical-languages.js';
+
 // Message types
 export type {
   ConfigMessage,

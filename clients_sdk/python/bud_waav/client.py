@@ -13,6 +13,7 @@ from .pipelines.transcribe import BudTranscribe
 from .pipelines.realtime import BudRealtime, RealtimeConfig
 from .types import (
     STTConfig, TTSConfig, ConversationConfig, AudioFeatures, TurnDetectionConfig,
+    CANONICAL_LANGUAGES, language_capabilities,
 )
 from .ws.session import ReconnectConfig
 
@@ -280,6 +281,23 @@ class BudClient:
             Health status with version info
         """
         return await self._rest_client.health()
+
+    @staticmethod
+    def capabilities(provider: str) -> dict[str, Any]:
+        """Canonical language capabilities for ``provider`` (P2 standardization).
+
+        Returns ``{provider, notation, auto_detect, canonical_languages}`` — how
+        the provider spells languages natively + whether it auto-detects, plus
+        the FULL canonical value space (:data:`CANONICAL_LANGUAGES`) the gateway
+        accepts for every provider (it maps the canonical token to the native
+        notation server-side). This replaces the SDK's old stale per-provider
+        language whitelists; pass any canonical token and the gateway handles it.
+
+        This is a local lookup (the documented stand-in for the gateway
+        ``GET /capabilities/languages`` endpoint, not shipped this phase), so it
+        is synchronous and needs no connection.
+        """
+        return language_capabilities(provider)
 
     async def list_voices(
         self,

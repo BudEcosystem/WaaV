@@ -373,13 +373,34 @@ impl STTWebSocketConfig {
         STTConfig {
             provider: self.provider.clone(),
             api_key,
-            language: self.language.clone(),
+            // P2: resolve the canonical language token and map it to THIS provider's native
+            // notation at the config→provider boundary, so no STT provider ever sees a raw client
+            // string (e.g. the live-proven `us-en`). Identity for already-native values. Warnings
+            // are surfaced separately as `config_warning` advisories (never a hard 400) — see
+            // [`Self::language_mapping`] and `config_handler::emit_language_config_warnings`.
+            language: self.mapped_stt_language(),
             sample_rate: self.sample_rate,
             channels: self.channels,
             punctuation: self.punctuation,
             encoding: self.encoding.clone(),
             model: self.model.clone(),
         }
+    }
+
+    /// Map the client's raw `language` to this STT provider's native notation (P2). Returns the
+    /// native string the provider should use; an `Auto`/omit result becomes the empty string so the
+    /// provider falls back to its own default (the existing "empty language" convention every STT
+    /// provider already handles). See [`crate::core::lang`].
+    pub(crate) fn mapped_stt_language(&self) -> String {
+        let mapped = self.language_mapping();
+        if mapped.omit { String::new() } else { mapped.native }
+    }
+
+    /// The full language mapping result (native + warnings) for this STT config. Pure/cheap;
+    /// `config_handler` re-runs it to emit `config_warning` advisories without changing the
+    /// `to_stt_config` signature.
+    pub(crate) fn language_mapping(&self) -> crate::core::lang::MappedLanguage {
+        crate::core::lang::map_language(&self.language, &self.provider, &self.model)
     }
 
     /// Convert WebSocket STT config to the standardized [`StandardSTTConfig`] that crosses the
@@ -622,11 +643,42 @@ impl TTSWebSocketConfig {
     /// # Arguments
     /// * `api_key` - The resolved API key (client-provided or server config) for this provider.
     pub fn to_standard_tts(&self, api_key: String) -> crate::core::tts::standard::StandardTTSConfig {
+        let mut features = self.features.clone();
+        // P2: map the client's TTS `features.language` to THIS provider's native notation at the
+        // config→provider boundary (TTS language rides `TtsFeatures.language`, the typed slot every
+        // TTS provider's `from_standard` reads). Identity for already-native values; unmapped/omit
+        // clears the field so the provider keeps its default. Warnings surface as `config_warning`
+        // (see `config_handler::emit_language_config_warnings`).
+        if let Some(mapped) = self.mapped_tts_language() {
+            features.language = if mapped.omit { None } else { Some(mapped.native) };
+        }
         crate::core::tts::standard::StandardTTSConfig {
             base: self.to_tts_config(api_key),
-            features: self.features.clone(),
+            features,
             extras: self.extras.clone(),
         }
+    }
+
+    /// Map the client's `features.language` to this TTS provider's native notation (P2). Returns
+    /// `None` when the client supplied no language (leave the provider default untouched), else the
+    /// mapping result. See [`crate::core::lang`].
+    pub(crate) fn mapped_tts_language(&self) -> Option<crate::core::lang::MappedLanguage> {
+        self.tts_language_mapping()
+    }
+
+    /// The full TTS language mapping (native + warnings), or `None` if no `features.language` was
+    /// supplied. The TTS-provider id is suffixed for the model-aware / composite TTS mappers
+    /// (`google-tts`, `baidu-tts`, `reverie-tts`) so they diverge from their STT siblings.
+    pub(crate) fn tts_language_mapping(&self) -> Option<crate::core::lang::MappedLanguage> {
+        let raw = self.features.language.as_ref()?;
+        if raw.trim().is_empty() {
+            return None;
+        }
+        Some(crate::core::lang::map_language(
+            raw,
+            &tts_provider_alias(&self.provider),
+            &self.model,
+        ))
     }
 
     /// Extract emotion configuration from WebSocket config.
@@ -679,6 +731,24 @@ impl TTSWebSocketConfig {
             || self.emotion_intensity.is_some()
             || self.delivery_style.is_some()
             || self.emotion_description.is_some()
+    }
+}
+
+/// Map a provider name to its TTS-side language-mapper key (P2). A handful of providers expose a
+/// DIFFERENT native language notation for TTS than for STT on the SAME canonical — Google
+/// (`cmn-CN` for TTS vs `cmn-Hans-CN` for STT), Baidu (`zh`/`ct` enum vs numeric dev_pid), Reverie
+/// (`{lang}_{gender}` composite vs ISO short code). Those have a dedicated `*-tts` mapper in
+/// [`crate::core::lang::mappers`]; everything else shares one mapper across STT/TTS, so the name
+/// passes through unchanged.
+fn tts_provider_alias(provider: &str) -> String {
+    match provider.to_lowercase().as_str() {
+        "google" | "google-tts" | "google_tts" => "google-tts".to_string(),
+        "baidu" | "baidu-tts" | "baidu_tts" => "baidu-tts".to_string(),
+        "reverie" | "reverie-ai" | "reverie_ai" | "reverie-tts" | "reverieinc" => {
+            "reverie-tts".to_string()
+        }
+        "openai" => "openai-tts".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -814,5 +884,103 @@ mod config_tests {
         let cfg: STTWebSocketConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.encoding, "mulaw");
         assert_eq!(cfg.model, "scribe_v2_realtime");
+    }
+
+    /// Helper: a minimal STT WS config for a provider + raw language.
+    fn stt_ws(provider: &str, language: &str, model: &str) -> STTWebSocketConfig {
+        STTWebSocketConfig {
+            provider: provider.to_string(),
+            language: language.to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: default_stt_encoding(),
+            model: model.to_string(),
+            api_key: None,
+            features: Default::default(),
+            extras: Default::default(),
+            turn_detection: None,
+        }
+    }
+
+    #[test]
+    fn p2_stt_language_is_mapped_to_provider_native_at_boundary() {
+        // The live-proven `us-en` reversal bug: the provider must receive the NATIVE notation, not
+        // the raw client string. Deepgram is identity-BCP47 → "en-US".
+        let dg = stt_ws("deepgram", "us-en", "");
+        assert_eq!(dg.to_stt_config("k".into()).language, "en-US");
+
+        // ElevenLabs is ISO-639-1 downgrade → "en" (region dropped) for the SAME canonical input.
+        let el = stt_ws("elevenlabs", "en-US", "scribe_v1");
+        assert_eq!(el.to_stt_config("k".into()).language, "en");
+
+        // Speechmatics ISO-639-3 for Chinese.
+        let sm = stt_ws("speechmatics", "zh-CN", "");
+        assert_eq!(sm.to_stt_config("k".into()).language, "cmn");
+
+        // Already-native value resolves as identity (additive guarantee).
+        let id = stt_ws("deepgram", "en-US", "");
+        assert_eq!(id.to_stt_config("k".into()).language, "en-US");
+    }
+
+    #[test]
+    fn p2_stt_auto_becomes_provider_default_or_native_token() {
+        // Deepgram "auto" → the native "multi" code-switch token.
+        let dg = stt_ws("deepgram", "auto", "");
+        assert_eq!(dg.to_stt_config("k".into()).language, "multi");
+
+        // A provider with no auto token + auto request → empty string (provider falls back to its
+        // own default), and a warning is recorded in the mapping.
+        let ct = stt_ws("cartesia", "auto", "");
+        assert_eq!(ct.to_stt_config("k".into()).language, "en"); // cartesia Auto -> "en" + warn
+        assert!(ct.language_mapping().has_warnings());
+    }
+
+    #[test]
+    fn p2_stt_unknown_token_passes_through_with_warning() {
+        // Graceful: an unrecognized token is forwarded VERBATIM (never a hard 400) + warns.
+        let cfg = stt_ws("deepgram", "klingon", "");
+        assert_eq!(cfg.to_stt_config("k".into()).language, "klingon");
+        assert!(cfg.language_mapping().has_warnings());
+    }
+
+    /// Helper: a TTS WS config from provider/model/language (via serde, so it stays robust to the
+    /// full TTSWebSocketConfig field set). A `None` language omits `features.language`.
+    fn tts_ws(provider: &str, model: &str, language: Option<&str>) -> TTSWebSocketConfig {
+        let mut v = serde_json::json!({
+            "provider": provider,
+            "voice_id": "rachel",
+            "model": model,
+        });
+        if let Some(l) = language {
+            v["features"] = serde_json::json!({ "language": l });
+        }
+        serde_json::from_value(v).expect("tts ws config deserializes")
+    }
+
+    #[test]
+    fn p2_tts_features_language_is_mapped() {
+        // TTS language rides features.language. ElevenLabs downgrade: "es-ES" -> "es".
+        let el = tts_ws("elevenlabs", "eleven_turbo_v2_5", Some("es-ES"));
+        assert_eq!(el.to_standard_tts("k".into()).features.language.as_deref(), Some("es"));
+
+        // Reverie TTS composite: the {lang} half is canonical.iso639_1() — "hi-IN" -> "hi".
+        let rv = tts_ws("reverie", "indian", Some("hi-IN"));
+        assert_eq!(rv.to_standard_tts("k".into()).features.language.as_deref(), Some("hi"));
+
+        // Google TTS keeps cmn-CN (no script subtag), diverging from Google STT's cmn-Hans-CN.
+        let gt = tts_ws("google", "", Some("cmn-CN"));
+        assert_eq!(gt.to_standard_tts("k".into()).features.language.as_deref(), Some("cmn-CN"));
+
+        // A name spelling resolves too: "spanish" -> es-ES -> elevenlabs "es".
+        let name = tts_ws("elevenlabs", "eleven_turbo_v2_5", Some("spanish"));
+        assert_eq!(name.to_standard_tts("k".into()).features.language.as_deref(), Some("es"));
+    }
+
+    #[test]
+    fn p2_tts_no_language_leaves_features_untouched() {
+        // A TTS config without features.language must not invent one (backward-compat).
+        let tts = tts_ws("elevenlabs", "eleven_turbo_v2_5", None);
+        assert_eq!(tts.to_standard_tts("k".into()).features.language, None);
     }
 }

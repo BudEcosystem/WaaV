@@ -559,6 +559,70 @@ async fn emit_reasoning_config_warnings(
     }
 }
 
+/// P2 language standardization (SDK_STANDARDIZATION_PLAN.md): emit a non-fatal `config_warning` for
+/// each graceful-degrade case the language mapper produced when rendering the client's canonical
+/// `language`/`features.language` to the chosen STT/TTS provider's native notation — an unsupported
+/// language→provider (fell back to the provider default), an `auto` request a provider can't honor,
+/// or an unrecognized token passed through verbatim. Identity mappings (already-native, or a
+/// recognized alias the provider supports) are silent. Reuses the `record_degraded` + `ConfigWarning`
+/// idiom; NEVER a hard 400.
+async fn emit_language_config_warnings(
+    stt_ws_config: &STTWebSocketConfig,
+    tts_ws_config: &TTSWebSocketConfig,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) {
+    // (raw token, provider id, side label, mapping) for each side that carries a language.
+    let stt_mapping = stt_ws_config.language_mapping();
+    let tts_mapping = tts_ws_config.tts_language_mapping();
+
+    for (raw, provider, side, warnings) in [
+        Some((
+            stt_ws_config.language.as_str(),
+            stt_ws_config.provider.as_str(),
+            "stt",
+            stt_mapping.warnings.clone(),
+        )),
+        tts_mapping.as_ref().map(|m| {
+            (
+                tts_ws_config
+                    .features
+                    .language
+                    .as_deref()
+                    .unwrap_or_default(),
+                tts_ws_config.provider.as_str(),
+                "tts",
+                m.warnings.clone(),
+            )
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if warnings.is_empty() {
+            continue;
+        }
+        let message = warnings.join("; ");
+        warn!(
+            side = side,
+            provider = provider,
+            requested = raw,
+            "language config advisory: {message}"
+        );
+        crate::core::metrics::bridge::record_degraded("language_mapping", side);
+        let _ = message_tx
+            .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
+                code: "language_unsupported_or_degraded".to_string(),
+                message,
+                detail: Some(serde_json::json!({
+                    "side": side,
+                    "provider": provider,
+                    "requested_language": raw,
+                })),
+            }))
+            .await;
+    }
+}
+
 /// the orchestrator. Returns `Ok(true)` when the loop is active.
 async fn initialize_conversation_loop(
     conv_config: &ConversationWebSocketConfig,
@@ -875,6 +939,13 @@ async fn initialize_voice_manager(
     // standardized bases) for cache hashing and other flat consumers below.
     let standard_stt = stt_ws_config.to_standard_stt(stt_api_key);
     let standard_tts = tts_ws_config.to_standard_tts(tts_api_key);
+
+    // P2 language standardization: the client's canonical `language` was just mapped to each
+    // provider's native notation inside `to_standard_stt`/`to_standard_tts` (so no provider sees a
+    // raw client string). Surface any graceful-degrade advisories (unsupported lang→provider, auto
+    // requested where the provider can't detect, an unrecognized token passed through verbatim) as
+    // non-fatal `config_warning`s — NEVER a hard 400. Identity mappings are silent.
+    emit_language_config_warnings(stt_ws_config, tts_ws_config, message_tx).await;
     // The TTS cache key is computed HERE from the FULL standardized config — base + advanced
     // features + extras — before `standard_tts` is moved into the manager, so audio-changing
     // features (voice settings, emotion, ssml, seed, …) are part of the key and cannot collide.

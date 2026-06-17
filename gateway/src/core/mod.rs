@@ -3,6 +3,10 @@ pub mod cache;
 pub mod conversation;
 pub mod emotion;
 pub mod flow;
+/// Unified language system (P2): one canonical region-qualified BCP-47 token per request, mapped to
+/// each provider's native notation. Mirrors the [`emotion`] mapper chassis. Registered right after
+/// `emotion` per the standardization plan.
+pub mod lang;
 pub mod llm;
 pub mod metrics;
 // Canonical SSRF/URL validation shared by the DAG endpoint nodes, the
@@ -78,6 +82,13 @@ pub use emotion::{
     DeliveryStyle, Emotion, EmotionConfig, EmotionIntensity, EmotionMapper, EmotionMethod,
     IntensityLevel, MappedEmotion, ProviderEmotionSupport, get_mapper_for_provider,
     map_emotion_for_provider, provider_supports_emotions, validate_emotion_config,
+};
+
+// Re-export the unified language system (P2): canonical language + provider mapping.
+pub use lang::{
+    CanonicalLanguage, LanguageMapper, MappedLanguage, NotationKind, ProviderLanguageSupport,
+    get_language_mapper, language_support_matrix, map_language, resolve as resolve_language,
+    to_provider_language,
 };
 
 // Re-export audio types for VAD

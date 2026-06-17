@@ -49,6 +49,19 @@ export {
   createTTSConfig,
 } from './types/config.js';
 
+// Canonical language value space (P2 unified-language system): the region-qualified BCP-47 tokens
+// the gateway maps to each provider's native notation, plus the per-provider capability accessor.
+export {
+  CANONICAL_LANGUAGES,
+  isCanonicalLanguage,
+  languageCapabilities,
+} from './types/canonical-languages.js';
+export type {
+  CanonicalLanguage,
+  LanguageNotation,
+  LanguageCapabilities,
+} from './types/canonical-languages.js';
+
 // Conversation / agent-loop config (the flagship LLM + reasoning surface).
 export type {
   ConversationConfig,

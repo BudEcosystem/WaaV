@@ -4,7 +4,7 @@ use axum::{
 };
 use tower_http::trace::TraceLayer;
 
-use crate::handlers::{dag, livekit, recording, sip, speak, voices};
+use crate::handlers::{capabilities, dag, livekit, recording, sip, speak, voices};
 use crate::state::AppState;
 use std::sync::Arc;
 
@@ -32,6 +32,11 @@ pub fn create_api_router() -> Router<Arc<AppState>> {
         )
         // SIP call transfer
         .route("/sip/transfer", post(sip::sip_transfer))
+        // Capability discovery: the unified-language support matrix (P2).
+        .route(
+            "/capabilities/languages",
+            get(capabilities::list_language_capabilities),
+        )
         // DAG routing endpoints
         .route("/dag/templates", get(dag::list_templates))
         .route("/dag/templates/{template_name}", get(dag::get_template))

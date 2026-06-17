@@ -34,6 +34,7 @@ from .types import (
     STTProvider,
     TTSProvider,
     RealtimeProvider,
+    CANONICAL_LANGUAGES,
     STT_PROVIDER_CAPABILITIES,
     TTS_PROVIDER_CAPABILITIES,
     REALTIME_PROVIDER_CAPABILITIES,
@@ -41,6 +42,7 @@ from .types import (
     is_valid_tts_provider,
     is_valid_realtime_provider,
     get_provider_capabilities,
+    language_capabilities,
     # Configuration types
     STTConfig,
     TTSConfig,
@@ -174,6 +176,7 @@ __all__ = [
     "STTProvider",
     "TTSProvider",
     "RealtimeProvider",
+    "CANONICAL_LANGUAGES",
     "STT_PROVIDER_CAPABILITIES",
     "TTS_PROVIDER_CAPABILITIES",
     "REALTIME_PROVIDER_CAPABILITIES",
@@ -181,6 +184,7 @@ __all__ = [
     "is_valid_tts_provider",
     "is_valid_realtime_provider",
     "get_provider_capabilities",
+    "language_capabilities",
     # Configuration types
     "STTConfig",
     "TTSConfig",
