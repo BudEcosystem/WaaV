@@ -28,6 +28,7 @@
  */
 
 import { AudioProcessor } from './processor.js';
+import { JitterBuffer, type JitterBufferConfig } from './jitter-buffer.js';
 
 /**
  * Player configuration
@@ -59,6 +60,16 @@ export interface PlayerConfig {
    * 0.04 = two 20ms chunks).
    */
   lateFrameGraceSec?: number;
+  /**
+   * Adaptive jitter buffer + PLC (D9). When enabled, incoming chunks first pass
+   * through a {@link JitterBuffer} that engages ONLY under measured network
+   * arrival jitter — reordering, concealing late/lost frames, and time-stretching
+   * to drain — before reaching the scheduled playout below. On a clean network
+   * it passes through with ZERO added latency, so it is safe to leave on. `false`
+   * (default) disables it; `true` enables with defaults; an object tunes it. It
+   * does NOT resample (client_playback_rate already aligns the rate).
+   */
+  jitter?: boolean | Omit<JitterBufferConfig, 'sampleRate'>;
 }
 
 /**
@@ -110,6 +121,14 @@ export class PCMPlayer {
   private totalSamplesScheduled = 0;
   /** Samples dropped as late (diagnostics). */
   private droppedLateSamples = 0;
+  /** D9: optional adaptive jitter buffer in front of scheduled playout. */
+  private jitterBuffer: JitterBuffer | null = null;
+  /**
+   * D10: when true, this playback is a must-play prompt (e.g. a legal
+   * disclaimer) and a barge-in {@link interrupt}/{@link clearBuffer} is IGNORED
+   * so it plays to completion. Set via {@link setUninterruptible}.
+   */
+  private uninterruptible = false;
 
   constructor(config: PlayerConfig = {}) {
     this.config = {
@@ -119,7 +138,21 @@ export class PCMPlayer {
       maxBufferDuration: config.maxBufferDuration ?? 2.0,
       gainDb: config.gainDb ?? 0,
       lateFrameGraceSec: config.lateFrameGraceSec ?? 0.04,
+      jitter: config.jitter ?? false,
     };
+
+    // D9: build the jitter buffer when enabled. Its `release` feeds the same
+    // scheduled-playout path used directly on a clean network; the buffer only
+    // interposes ordering/PLC/drain once it MEASURES arrival jitter.
+    if (config.jitter !== undefined && config.jitter !== false) {
+      this.jitterBuffer = new JitterBuffer(
+        {
+          sampleRate: this.config.sampleRate,
+          ...(typeof config.jitter === 'object' ? config.jitter : {}),
+        },
+        { release: (frame) => { void this.schedule(frame); } }
+      );
+    }
   }
 
   /**
@@ -173,6 +206,23 @@ export class PCMPlayer {
   }
 
   /**
+   * D10: mark the current/next playback as a must-play prompt. While true, a
+   * barge-in {@link interrupt}/{@link clearBuffer} is IGNORED so the prompt
+   * (e.g. a legal disclaimer the user must hear) is never cut off. Clear it
+   * (`false`) once the prompt finishes to restore normal barge-in. A plain
+   * {@link stop} still tears down (it is an explicit local teardown, not a
+   * barge-in).
+   */
+  setUninterruptible(value: boolean): void {
+    this.uninterruptible = value;
+  }
+
+  /** D10: whether the current playback is flagged must-play (uninterruptible). */
+  isUninterruptible(): boolean {
+    return this.uninterruptible;
+  }
+
+  /**
    * Get buffered duration in seconds — how far the scheduled playout clock is
    * ahead of the audio context's current time.
    */
@@ -199,24 +249,53 @@ export class PCMPlayer {
   }
 
   /**
-   * Add PCM data to the playout (Int16 format).
-   * @param pcmData Int16 PCM data
+   * D9 jitter-buffer diagnostics: whether it is currently engaged (vs zero-
+   * latency passthrough), the measured arrival jitter (ms), how many frames it
+   * concealed (PLC), and how many samples it dropped to drain. All zero/false
+   * when the jitter buffer is disabled.
    */
-  addPCM(pcmData: ArrayBuffer | Int16Array): void {
-    const int16 = pcmData instanceof Int16Array ? pcmData : new Int16Array(pcmData);
-    const float32 = AudioProcessor.int16ToFloat32(int16);
-    this.addFloat32(float32);
+  getJitterStats(): { enabled: boolean; engaged: boolean; jitterMs: number; concealedFrames: number; droppedSamples: number } {
+    if (!this.jitterBuffer) {
+      return { enabled: false, engaged: false, jitterMs: 0, concealedFrames: 0, droppedSamples: 0 };
+    }
+    return {
+      enabled: true,
+      engaged: this.jitterBuffer.isEngaged(),
+      jitterMs: this.jitterBuffer.getJitterMs(),
+      concealedFrames: this.jitterBuffer.getConcealedFrames(),
+      droppedSamples: this.jitterBuffer.getDroppedSamples(),
+    };
   }
 
   /**
-   * Add Float32 audio to the playout and schedule it immediately on the playout
-   * clock. Each call is treated as one contiguous chunk.
-   * @param audioData Float32 audio data
+   * Add PCM data to the playout (Int16 format).
+   * @param pcmData Int16 PCM data
+   * @param seq Optional source sequence number (D9 jitter-buffer reordering).
    */
-  addFloat32(audioData: Float32Array): void {
+  addPCM(pcmData: ArrayBuffer | Int16Array, seq?: number): void {
+    const int16 = pcmData instanceof Int16Array ? pcmData : new Int16Array(pcmData);
+    const float32 = AudioProcessor.int16ToFloat32(int16);
+    this.addFloat32(float32, seq);
+  }
+
+  /**
+   * Add Float32 audio to the playout. With the D9 jitter buffer enabled the
+   * chunk first passes through it (engages only under measured arrival jitter;
+   * zero-latency passthrough otherwise); without it the chunk is scheduled
+   * immediately on the playout clock. Each call is treated as one contiguous
+   * chunk.
+   * @param audioData Float32 audio data
+   * @param seq Optional source sequence number (D9 jitter-buffer reordering).
+   */
+  addFloat32(audioData: Float32Array, seq?: number): void {
     if (audioData.length === 0) return;
     if (this.state === 'paused' || this.state === 'stopped') {
       // Don't schedule while paused/stopped; drop (loss-tolerant).
+      return;
+    }
+    if (this.jitterBuffer) {
+      // D9: the buffer's release() routes back into schedule() below.
+      this.jitterBuffer.push(audioData, seq);
       return;
     }
     // Fire-and-forget; initialization is awaited inside.
@@ -329,6 +408,7 @@ export class PCMPlayer {
    */
   pause(): void {
     if (this.state !== 'playing' && this.state !== 'idle') return;
+    this.jitterBuffer?.reset();
     this.stopAllScheduled();
     this.state = 'paused';
     this.handlers.onPause?.();
@@ -340,6 +420,7 @@ export class PCMPlayer {
    * gateway to stop generating).
    */
   stop(): void {
+    this.jitterBuffer?.reset();
     this.stopAllScheduled();
     this.state = 'stopped';
     this.nextStartTime = 0;
@@ -356,6 +437,12 @@ export class PCMPlayer {
    * incoming chunk.
    */
   interrupt(): void {
+    // D10: a must-play prompt is not barge-over-able — ignore the cut entirely
+    // (do not stop sources, do not fire onClear) so it plays to completion.
+    if (this.uninterruptible) return;
+    // D9: drop any jitter-buffered audio too, so barge-in cuts EVERYTHING
+    // pending (not just what's already scheduled on the playout clock).
+    this.jitterBuffer?.reset();
     this.stopAllScheduled();
     this.nextStartTime = 0;
     // Return to idle (not 'stopped') so a subsequent bot turn plays normally.
@@ -370,6 +457,10 @@ export class PCMPlayer {
    * want to flush local playout.
    */
   clearBuffer(): void {
+    // D10: respect the must-play flag — a barge-in clear is ignored while an
+    // uninterruptible prompt is playing.
+    if (this.uninterruptible) return;
+    this.jitterBuffer?.reset();
     this.stopAllScheduled();
     this.nextStartTime = 0;
     if (this.state === 'playing') this.state = 'idle';

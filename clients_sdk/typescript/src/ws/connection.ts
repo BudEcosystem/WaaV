@@ -41,12 +41,27 @@ function hasPing(ws: unknown): ws is WsPingLike {
 }
 
 /**
+ * Default WebSocket connect timeout in ms (D6). Sized to comfortably exceed the
+ * gateway's ~30s PROVIDER_READY ceiling for an `audio=true` session
+ * (config_handler.rs:45). See {@link WebSocketConnectionOptions.timeout}.
+ */
+export const DEFAULT_CONNECT_TIMEOUT_MS = 35000;
+
+/**
  * WebSocket connection options
  */
 export interface WebSocketConnectionOptions {
   /** WebSocket URL (e.g., "ws://localhost:3001/ws") */
   url: string;
-  /** Connection timeout in milliseconds (default: 10000) */
+  /**
+   * Connection timeout in milliseconds (default: 35000). D6: the WS handshake
+   * itself is fast (~2ms), but for an `audio=true` session the gateway holds the
+   * connect open until PROVIDER_READY, which can take up to ~30s while it builds
+   * the STT/TTS upstreams (config_handler.rs:45). The old 10s default tripped
+   * that legitimate wait and failed a perfectly-healthy connect, so the default
+   * is 35s. A genuinely-dead gateway now takes 35s to fail the FIRST connect;
+   * post-connect death is covered far faster by the D1 liveness watchdog.
+   */
   timeout?: number;
   /** Custom WebSocket implementation (for Node.js compatibility) */
   WebSocket?: typeof WebSocket;
@@ -89,12 +104,17 @@ export class WebSocketConnection {
   private connectPromise: Promise<void> | null = null;
   private connectResolve: (() => void) | null = null;
   private connectReject: ((error: Error) => void) | null = null;
-  /** Captured HTTP 429 from the `ws` upgrade, if the gateway rate-limited us. */
-  private rateLimit: { retryAfterMs?: number; retryAfter?: string } | null = null;
+  /**
+   * Captured back-off-worthy HTTP status from the `ws` upgrade: 429 (per-IP
+   * throttle) or 503 (global "Server at capacity"). Both are retryable, not
+   * fatal — the handshake failure is surfaced as a typed RateLimitError so the
+   * connect-backoff loop retries instead of giving up. (Browsers can't see this.)
+   */
+  private rateLimit: { statusCode: number; retryAfterMs?: number; retryAfter?: string } | null = null;
 
   constructor(options: WebSocketConnectionOptions) {
     this.url = options.url;
-    this.timeout = options.timeout ?? 10000;
+    this.timeout = options.timeout ?? DEFAULT_CONNECT_TIMEOUT_MS;
     this.WebSocketImpl = options.WebSocket ?? globalThis.WebSocket;
     this.protocols = options.protocols;
 
@@ -182,11 +202,15 @@ export class WebSocketConnection {
         if (hasOn(this.ws)) {
           this.ws.on('unexpected-response', (...args: unknown[]) => {
             const res = args[1] as UpgradeResponseLike | undefined;
-            if (res?.statusCode === 429) {
+            // D7: BOTH the per-IP 429 throttle and the global 503 "Server at
+            // capacity" are retryable back-off signals, not fatal — capture
+            // either (with any Retry-After) so the handshake rejects with a
+            // typed RateLimitError the connect-backoff loop will retry.
+            if (res?.statusCode === 429 || res?.statusCode === 503) {
               const headers = res.headers ?? {};
               const raw = headers['retry-after'] ?? headers['Retry-After'];
               const retryAfter = Array.isArray(raw) ? raw[0] : raw;
-              this.rateLimit = {};
+              this.rateLimit = { statusCode: res.statusCode };
               if (retryAfter !== undefined) {
                 this.rateLimit.retryAfter = retryAfter;
                 const ms = parseRetryAfterMs(retryAfter);
@@ -251,8 +275,13 @@ export class WebSocketConnection {
   private handshakeError(message: string, closeCode?: number, closeReason?: string): ConnectionError | RateLimitError {
     if (this.rateLimit) {
       const rl = this.rateLimit;
-      return new RateLimitError('WebSocket upgrade rate-limited by gateway (HTTP 429)', {
+      const desc =
+        rl.statusCode === 503
+          ? 'WebSocket upgrade rejected — gateway at capacity (HTTP 503)'
+          : 'WebSocket upgrade rate-limited by gateway (HTTP 429)';
+      return new RateLimitError(desc, {
         url: this.url,
+        statusCode: rl.statusCode,
         ...(rl.retryAfterMs !== undefined ? { retryAfterMs: rl.retryAfterMs } : {}),
         ...(rl.retryAfter !== undefined ? { retryAfter: rl.retryAfter } : {}),
       });

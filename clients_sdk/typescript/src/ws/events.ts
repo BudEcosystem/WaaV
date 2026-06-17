@@ -176,6 +176,20 @@ export interface ListeningEvent {
 }
 
 /**
+ * D10 mic-silence event: the microphone has been below the silence threshold
+ * for the configured window (likely muted/dead) — or has recovered. Mirrors
+ * Pipecat base_input's mic-timeout signal.
+ */
+export interface MicSilenceEvent {
+  /** True when the mic went silent, false when audio returned. */
+  silent: boolean;
+  /** How long the mic was silent in ms (only meaningful when `silent` is true). */
+  silentForMs?: number;
+  /** Timestamp */
+  timestamp: number;
+}
+
+/**
  * Session event map for type-safe event handling
  */
 export interface SessionEventMap {
@@ -204,6 +218,8 @@ export interface SessionEventMap {
   speaking: SpeakingEvent;
   /** Listening state changed */
   listening: ListeningEvent;
+  /** D10: mic went silent (likely muted/dead) or recovered. */
+  micSilent: MicSilenceEvent;
   /** Session closed */
   close: { code: number; reason: string };
   /** Ping/pong roundtrip */

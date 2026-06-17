@@ -4,6 +4,7 @@
 
 import { APIError, TimeoutError, RateLimitError } from '../errors/index.js';
 import { getMetricsCollector } from '../metrics/collector.js';
+import { buildKeepAliveInit, type KeepAliveInit, type KeepAliveAgentOptions } from './keepalive-agent.js';
 import { cloneVoice, cloneVoiceAndWait, getClonedVoiceStatus } from './voice.js';
 import type { VoiceCloneRequest, VoiceCloneResponse } from '../types/voice.js';
 import type { Voice, VoiceListResponse, TTSSynthesisResult } from '../types/tts.js';
@@ -88,6 +89,16 @@ export interface RestClientOptions {
   fetch?: typeof fetch;
   /** Custom headers to include in all requests */
   headers?: Record<string, string>;
+  /**
+   * D7 connection pooling. Node's built-in `fetch` (undici) already pools per
+   * origin by default; this installs a scheme-matched `node:http(s).Agent` so
+   * `node-fetch`-style consumers (which do NOT pool on their own) also reuse one
+   * warm TCP/TLS connection, and lets you tune undici's pool when available.
+   * `true` (default) installs it with defaults; pass an object to tune
+   * sockets/idle-TTL, or `false` to disable (e.g. when you supply your own
+   * pre-configured `fetch`). No-op in the browser, where `fetch` already pools.
+   */
+  keepAlive?: boolean | KeepAliveAgentOptions;
 }
 
 /**
@@ -100,6 +111,12 @@ export class RestClient {
   private fetchFn: typeof fetch;
   private customHeaders: Record<string, string>;
   private metrics = getMetricsCollector();
+  /**
+   * D7: per-request init carrying the Node keep-alive agent (undici `dispatcher`
+   * and/or node:http(s) `agent`). Built once and spread into every fetch so
+   * sequential REST calls reuse one pooled TCP/TLS connection. `{}` in browsers.
+   */
+  private keepAliveInit: KeepAliveInit;
 
   constructor(options: RestClientOptions) {
     // Remove trailing slash from base URL
@@ -108,6 +125,13 @@ export class RestClient {
     this.timeout = options.timeout ?? 30000;
     this.fetchFn = options.fetch ?? globalThis.fetch;
     this.customHeaders = options.headers ?? {};
+    // D7: install the keep-alive agent under Node (no-op in the browser). Pass
+    // the (slash-trimmed) baseUrl so the agent matches the gateway scheme — an
+    // https.Agent on an http:// origin would throw ERR_INVALID_PROTOCOL.
+    this.keepAliveInit =
+      options.keepAlive === false
+        ? {}
+        : buildKeepAliveInit(this.baseUrl, typeof options.keepAlive === 'object' ? options.keepAlive : {});
   }
 
   /**
@@ -149,6 +173,9 @@ export class RestClient {
         headers,
         body: options?.body ? JSON.stringify(options.body) : undefined,
         signal: controller.signal,
+        // D7: attach the Node keep-alive agent (undici dispatcher / http(s)
+        // agent). Empty object in the browser, so the spread is a no-op there.
+        ...(this.keepAliveInit as RequestInit),
       });
 
       clearTimeout(timeoutId);
@@ -160,6 +187,15 @@ export class RestClient {
         // Surface the per-IP rate limit as a typed, retryable error carrying
         // the parsed Retry-After delay.
         if (response.status === 429) {
+          throw RateLimitError.fromResponse(response, { url });
+        }
+        // D7: the gateway returns 503 "Server at capacity" when its global
+        // connection cap is hit (connection_limit.rs). Like a 429 this is a
+        // back-off-and-retry signal, NOT a fatal error — surface it as a
+        // RateLimitError (honouring any Retry-After) so callers/retry loops
+        // treat it the same.
+        if (response.status === 503) {
+          this.metrics.increment('rest.serverAtCapacity');
           throw RateLimitError.fromResponse(response, { url });
         }
         throw await APIError.fromResponse(response, { method });

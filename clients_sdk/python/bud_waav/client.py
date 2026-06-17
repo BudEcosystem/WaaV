@@ -546,6 +546,28 @@ class BudClient:
         """
         return await self._rest_client.health()
 
+    async def prepare_connection(self, timeout: float = 5.0) -> bool:
+        """Warm DNS/TLS to the gateway BEFORE first use (D6 prewarm).
+
+        Call this at page-load / SDK init (it is safe to fire-and-forget) so the
+        cold DNS + TCP + TLS handshake is paid up front and the socket lands in
+        the REST keepalive pool. The first real ``connect()`` / REST call then
+        attaches to an already-warm origin, shaving the typical 100-400ms cold
+        handshake off perceived first-connect. Mirrors LiveKit
+        ``Room.prepareConnection``.
+
+        Best-effort: never raises (a dead gateway just returns ``False``); the
+        WebSocket path warms the same origin host as REST, so a prewarmed REST
+        pool benefits the ``/ws`` and ``/realtime`` upgrades too.
+
+        Returns:
+            ``True`` if the gateway origin was reached and warmed, else ``False``.
+        """
+        return await self._rest_client.warmup(timeout=timeout)
+
+    # ``prewarm`` is an alias for parity with the SOTA / TS naming.
+    prewarm = prepare_connection
+
     @staticmethod
     def capabilities(provider: str) -> dict[str, Any]:
         """Canonical language capabilities for ``provider`` (P2 standardization).

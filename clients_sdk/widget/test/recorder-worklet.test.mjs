@@ -168,7 +168,10 @@ test('D3: AudioWorklet path is preferred — addModule + AudioWorkletNode, no Sc
 
 test('D3: worklet frames reach onData + drive RMS VAD (onSpeech on a loud frame)', async () => {
   await withEnv({ withWorklet: true }, async () => {
-    const rec = new AudioRecorder({ sampleRate: 16000 });
+    // vadStartSecs:0 keeps the original "one loud frame starts speech" semantics
+    // for this capture-path test; the D3b hysteresis (sustained start/stop secs)
+    // is exercised separately in recorder-constraints.test.mjs.
+    const rec = new AudioRecorder({ sampleRate: 16000, vadStartSecs: 0 });
     const datas = [];
     let speeches = 0;
     rec.onData((d) => datas.push(d));
@@ -181,7 +184,7 @@ test('D3: worklet frames reach onData + drive RMS VAD (onSpeech on a loud frame)
 
     assert.equal(datas.length, 1, 'the Int16 frame was forwarded to onData');
     assert.equal(datas[0].length, 320, 'frame is a 20ms@16k Int16 frame');
-    assert.equal(speeches, 1, 'a loud frame triggers the speech-start VAD edge');
+    assert.equal(speeches, 1, 'a loud frame triggers the speech-start VAD edge (vadStartSecs=0)');
     rec.stop();
   });
 });

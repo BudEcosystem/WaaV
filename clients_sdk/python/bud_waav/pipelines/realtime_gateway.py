@@ -51,6 +51,7 @@ import websockets
 from websockets.asyncio.client import ClientConnection, connect as ws_connect
 
 from ..types import TranscriptEvent, AudioEvent
+from ..ws.session import DEFAULT_CONNECT_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -393,8 +394,13 @@ class GatewayRealtime:
                 logger.error("Error in realtime handler for %s: %s", event, exc)
 
     # -------------------------------------------------------------- lifecycle
-    async def connect(self, timeout: float = 10.0) -> None:
-        """Open the gateway WebSocket and send the ``config`` message."""
+    async def connect(self, timeout: float = DEFAULT_CONNECT_TIMEOUT) -> None:
+        """Open the gateway WebSocket and send the ``config`` message.
+
+        Defaults to the 35s connect timeout (D6): the gateway connects the
+        realtime/S2S provider upstream from its own credentials before the
+        session is usable, which can take well over the old 10s default.
+        """
         if self._connected:
             return
 

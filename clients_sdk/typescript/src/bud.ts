@@ -18,6 +18,7 @@ import {
   type GatewayRealtimeConfig,
 } from './pipelines/realtime-gateway.js';
 import { WebSocketSession, type SessionConfig } from './ws/session.js';
+import { ConnectGate, type ConnectGateConfig } from './ws/connect-gate.js';
 import type { FeatureFlags, DEFAULT_FEATURE_FLAGS } from './types/features.js';
 import type { MetricsSummary } from './types/metrics.js';
 import { getMetricsCollector, resetMetricsCollector } from './metrics/collector.js';
@@ -72,6 +73,15 @@ export interface BudClientConfig {
   headers?: Record<string, string>;
   /** Default feature flags for all pipelines */
   features?: FeatureFlags;
+  /**
+   * WS connect-concurrency cap (D7). A burst of sessions/pipelines created from
+   * this client share ONE gate that caps concurrent connects + paces their
+   * starts, so they cooperate with the gateway's per-IP 60rps/burst10 bucket
+   * instead of self-DDoSing into a 429/503 storm. `true`/omitted uses defaults;
+   * pass an object to tune (`maxConcurrent`/`minSpacingMs`), or `false` to
+   * disable the cap.
+   */
+  connectGate?: boolean | ConnectGateConfig;
 }
 
 /**
@@ -115,6 +125,12 @@ export class BudClient {
   private baseUrl: string;
   private sloTracker: SLOTracker;
   private activePipelines: Set<BudSTT | BudTTS | BudTalk | BudTranscribe> = new Set();
+  /**
+   * D7: shared WS connect-concurrency gate, passed to every session this client
+   * creates so a burst of connects paces under the gateway's per-IP rate bucket.
+   * Undefined when disabled via `connectGate: false`.
+   */
+  private connectGate?: ConnectGate;
 
   /**
    * STT (Speech-to-Text) pipeline factory
@@ -193,6 +209,14 @@ export class BudClient {
     // Initialize SLO tracker
     this.sloTracker = new SLOTracker();
 
+    // D7: one shared connect gate for all sessions from this client (the gateway
+    // rate limit is per-IP, so the cap is per-client). Disabled with `false`.
+    if (config.connectGate !== false) {
+      this.connectGate = new ConnectGate(
+        typeof config.connectGate === 'object' ? config.connectGate : {}
+      );
+    }
+
     // Setup pipeline factories
     this.stt = this.createSTTFactory();
     this.tts = this.createTTSFactory();
@@ -235,7 +259,8 @@ export class BudClient {
     if (merged.WebSocket === undefined && this.config.WebSocket !== undefined) {
       merged.WebSocket = this.config.WebSocket;
     }
-    return new AgentSession(merged, this.wsUrl, this.config.apiKey);
+    // D7: thread the shared connect gate so a fleet of agents paces its connects.
+    return new AgentSession(merged, this.wsUrl, this.config.apiKey, this.connectGate);
   }
 
   /**
@@ -317,6 +342,89 @@ export class BudClient {
   }
 
   /**
+   * Pre-warm the gateway connection (D6) — call at page-load / app-start, well
+   * BEFORE the first user action, to shave the cold DNS + TLS handshake (and,
+   * under Node with the D7 keep-alive agent, an actual pooled TCP connection)
+   * off the first real connect. Mirrors LiveKit's `Room.prepareConnection()`.
+   *
+   * It fires a cheap `HEAD /` (falling back to `GET /` for servers that reject
+   * HEAD) against the gateway origin so the OS resolves DNS, the TLS session is
+   * negotiated, and — with the keep-alive agent — the warmed connection is left
+   * in the pool for the subsequent REST/WS call to reuse. Optionally prefetches
+   * an auth token via a caller-supplied resolver, off the connect critical path.
+   *
+   * Best-effort and never throws: a warmup failure (gateway briefly down, HEAD
+   * unsupported) is swallowed — the real connect will surface any genuine error.
+   * Returns whether the warmup round-trip succeeded (useful in tests/diagnostics).
+   *
+   * NOTE on fastest perceived start: prefer a server-side `alias` on your
+   * session config — the gateway resolves the WHOLE `{stt, tts, llm, dag}` bundle
+   * in ONE round-trip (echoed back as `resolvedAlias` on `ready`), instead of the
+   * client sending a large multi-provider config. Combine `prepareConnection()`
+   * (warm the transport) with an `alias` (one-RTT resolve) for the lowest
+   * time-to-first-audio.
+   *
+   * @example
+   * ```ts
+   * const bud = new BudClient({ baseUrl: 'https://gw.example.com' });
+   * // At app start, before the user clicks "talk":
+   * void bud.prepareConnection();
+   * // ...later, the first connect reuses the warmed DNS/TLS/pool:
+   * const agent = bud.agent({ alias: 'support-bot' });
+   * await agent.connect();
+   * ```
+   */
+  async prepareConnection(options?: {
+    /** Optional async token resolver; its result is ignored here but the call
+     *  is awaited so any token round-trip happens off the connect critical path. */
+    prefetchToken?: () => Promise<unknown>;
+    /** Per-warmup timeout in ms (default 5000). */
+    timeoutMs?: number;
+  }): Promise<boolean> {
+    const timeoutMs = options?.timeoutMs ?? 5000;
+    const fetchFn = this.config.fetch ?? globalThis.fetch;
+    let warmed = false;
+
+    if (typeof fetchFn === 'function') {
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : undefined;
+      const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+      const reqInit: RequestInit = controller ? { signal: controller.signal } : {};
+      try {
+        // HEAD is the cheapest warmup; some servers 405 it, so fall back to GET.
+        try {
+          await fetchFn(this.baseUrl + '/', { method: 'HEAD', ...reqInit });
+          warmed = true;
+        } catch {
+          await fetchFn(this.baseUrl + '/', { method: 'GET', ...reqInit });
+          warmed = true;
+        }
+      } catch {
+        // Best-effort warmup — swallow (the real connect surfaces real errors).
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+
+    // Optional token prefetch, off the connect critical path. Swallowed too.
+    if (options?.prefetchToken) {
+      try {
+        await options.prefetchToken();
+      } catch {
+        // Ignore — token resolution is the caller's concern at connect time.
+      }
+    }
+
+    return warmed;
+  }
+
+  /**
+   * Alias for {@link prepareConnection} (matches the SDK's `prewarm` vocabulary).
+   */
+  async prewarm(options?: Parameters<BudClient['prepareConnection']>[0]): Promise<boolean> {
+    return this.prepareConnection(options);
+  }
+
+  /**
    * Derive WebSocket URL from REST URL
    */
   private deriveWsUrl(baseUrl: string): string {
@@ -336,6 +444,7 @@ export class BudClient {
           url: this.wsUrl,
           apiKey: this.config.apiKey,
           features: this.config.features,
+          ...(this.connectGate ? { connectGate: this.connectGate } : {}),
           ...config,
         });
         this.activePipelines.add(pipeline);
@@ -360,6 +469,7 @@ export class BudClient {
           apiKey: this.config.apiKey,
           features: this.config.features,
           restBaseUrl: this.baseUrl,
+          ...(this.connectGate ? { connectGate: this.connectGate } : {}),
           ...config,
         });
         this.activePipelines.add(pipeline);
@@ -393,6 +503,7 @@ export class BudClient {
           url: this.wsUrl,
           apiKey: this.config.apiKey,
           features: this.config.features,
+          ...(this.connectGate ? { connectGate: this.connectGate } : {}),
           ...config,
         });
         this.activePipelines.add(pipeline);

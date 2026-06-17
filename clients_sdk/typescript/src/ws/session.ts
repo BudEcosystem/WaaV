@@ -11,10 +11,12 @@ import type { ConfigWarningEvent } from '../types/warnings.js';
 import { PROTOCOL_VERSION } from '../types/messages.js';
 import type { MetricsSummary } from '../types/metrics.js';
 import { getMetricsCollector, MetricsCollector } from '../metrics/collector.js';
-import { WebSocketConnection, type ConnectionState } from './connection.js';
+import { WebSocketConnection, DEFAULT_CONNECT_TIMEOUT_MS, type ConnectionState } from './connection.js';
 import { ReconnectStrategy, type ReconnectConfig } from './reconnect.js';
 import { LivenessWatchdog, type LivenessConfig } from './liveness.js';
 import { UplinkAudioShedder, type UplinkConfig } from './uplink.js';
+import { KeepaliveSilence, type KeepaliveConfig } from './keepalive.js';
+import type { ConnectGate } from './connect-gate.js';
 import { createConfigMessage, createSpeakMessage, createClearMessage, createAudioEndMessage, createSendMessageMessage, type SDKOutgoingMessage } from './messages.js';
 import { MessageQueue, type MessageQueueConfig } from './queue.js';
 import { SessionEventEmitter, type SessionEventMap, type SessionEventHandler, type TranscriptEvent, type AudioEvent, type ReadyEvent, type SessionErrorEvent } from './events.js';
@@ -37,7 +39,11 @@ export interface SessionConfig {
   url: string;
   /** API key for authentication */
   apiKey?: string;
-  /** Connection timeout in milliseconds */
+  /**
+   * Connection timeout in milliseconds (default: 35000). D6: must exceed the
+   * gateway's ~30s PROVIDER_READY for an audio=true session (config_handler.rs:45)
+   * — a smaller value fails an otherwise-healthy connect mid-provider-build.
+   */
   connectionTimeout?: number;
   /** Reconnection configuration */
   reconnect?: ReconnectConfig | false;
@@ -89,6 +95,25 @@ export interface SessionConfig {
    * object to tune the ring size / high-water mark. Enabled by default.
    */
   uplink?: UplinkConfig | false;
+  /**
+   * STT keepalive-silence (D6). On an `audio` session, the gateway's auto-pong
+   * keeps the socket open during a conversational pause but NOT the upstream
+   * provider STT stream warm; this sends a short zero-PCM frame every few idle
+   * seconds so the next word after a lull doesn't pay a stream-warmup penalty.
+   * It is GATED on real audio (never overlaps genuine frames) and only runs when
+   * `audio !== false`. Pass `false` to disable, or an object to tune the idle
+   * gap / frame size. Enabled by default for audio sessions.
+   */
+  keepalive?: KeepaliveConfig | false;
+  /**
+   * Shared WS connect-concurrency gate (D7). When a burst of sessions connects
+   * at once they can self-DDoS the gateway's per-IP 60rps/burst10 bucket into a
+   * multi-minute 429/503 storm; a gate (one instance shared across all sessions
+   * from a client) caps concurrent connects + paces their starts so the burst
+   * cooperates with the bucket. Injected by {@link BudClient}; absent for a
+   * standalone session (no cap).
+   */
+  connectGate?: ConnectGate;
   /** Whether to auto-send config on connect (default: true) */
   autoConfig?: boolean;
   /**
@@ -140,6 +165,8 @@ export class WebSocketSession {
   private uplink: UplinkAudioShedder | null = null;
   /** D5: timer that keeps draining the uplink ring while frames remain. */
   private uplinkPumpTimer: ReturnType<typeof setInterval> | null = null;
+  /** D6: STT keepalive-silence pump (audio sessions only; gated on real audio). */
+  private keepalive: KeepaliveSilence | null = null;
   /** D1 verify-after-reconnect: true while we await proof the new socket carries data. */
   private awaitingReconnectProof = false;
   /** D1: bound browser network/visibility listeners, for teardown. */
@@ -171,8 +198,10 @@ export class WebSocketSession {
     }
 
     this.connection = new WebSocketConnection({
+      // D6: default to the 35s connect timeout so an audio=true session's
+      // server-side PROVIDER_READY (up to ~30s) isn't tripped as a failure.
       url: wsUrl,
-      timeout: config.connectionTimeout ?? 10000,
+      timeout: config.connectionTimeout ?? DEFAULT_CONNECT_TIMEOUT_MS,
       WebSocket: config.WebSocket,
     });
 
@@ -193,6 +222,28 @@ export class WebSocketSession {
           isConnected: () => this.connection.isConnected(),
         },
         typeof config.uplink === 'object' ? config.uplink : {}
+      );
+    }
+
+    // D6: STT keepalive-silence — only for audio sessions (audio !== false), and
+    // only when not explicitly disabled. Sends zero-PCM during a silence gap so
+    // the upstream STT stream stays warm; gated on real audio in sendAudio().
+    if (config.keepalive !== false && config.audio !== false) {
+      const kaCfg: KeepaliveConfig = typeof config.keepalive === 'object' ? config.keepalive : {};
+      // Default the keepalive frame's sample rate to the configured STT rate so
+      // the zero-PCM matches the ingress format the gateway expects.
+      if (kaCfg.sampleRate === undefined && config.stt?.sampleRate !== undefined) {
+        kaCfg.sampleRate = config.stt.sampleRate;
+      }
+      this.keepalive = new KeepaliveSilence(
+        {
+          // Route keepalive frames straight to the socket (bypassing the uplink
+          // shedder): they are tiny, must not be shed, and must not reset the
+          // shedder's fast path. They never overlap real audio (gated below).
+          sendAudio: (frame) => this.connection.sendBinary(frame),
+          isConnected: () => this.connection.isConnected(),
+        },
+        kaCfg
       );
     }
 
@@ -296,6 +347,10 @@ export class WebSocketSession {
     if (this.config.autoConfig !== false) {
       this.sendConfig();
     }
+
+    // D6: (re)start the STT keepalive-silence pump for this socket. Idempotent;
+    // it only emits during a genuine idle gap and only while connected.
+    this.keepalive?.start();
   }
 
   /**
@@ -316,6 +371,8 @@ export class WebSocketSession {
     // reconnect starts a fresh one, so stale mid-utterance audio is loss-tolerant.
     this.stopUplinkPump();
     this.uplink?.clear();
+    // D6: pause the keepalive pump; a fresh `ready`/open restarts it.
+    this.keepalive?.stop();
 
     this.emitter.emit('close', { code, reason });
     this.emitter.emit('connectionState', {
@@ -736,20 +793,46 @@ export class WebSocketSession {
       timestamp: Date.now(),
     });
 
+    // D7: route the connect through the shared concurrency gate when present, so
+    // a burst of sessions paces under the gateway's per-IP rate bucket instead
+    // of stampeding it. The whole rate-limit-retry loop runs inside one slot.
+    try {
+      if (this.config.connectGate) {
+        await this.config.connectGate.run(() => this.connectWithRateLimitRetry());
+      } else {
+        await this.connectWithRateLimitRetry();
+      }
+    } catch (err) {
+      this.state = 'disconnected';
+      this.metrics.setWSState('disconnected');
+      throw err;
+    }
+
+    const duration = Date.now() - startTime;
+    this.metrics.record('ws.connect', duration);
+  }
+
+  /**
+   * The connect attempt with the typed-429/503 back-off retry loop (D7). Only a
+   * RateLimitError (per-IP 429 throttle OR global 503 "Server at capacity") is
+   * retried — both are back-off-not-fatal; every other error propagates
+   * immediately. Honours any Retry-After via {@link computeBackoffMs}.
+   */
+  private async connectWithRateLimitRetry(): Promise<void> {
     const maxRetries = this.config.rateLimitRetry?.maxRetries ?? 5;
     const baseDelayMs = this.config.rateLimitRetry?.baseDelayMs ?? 500;
     const maxDelayMs = this.config.rateLimitRetry?.maxDelayMs ?? 20000;
 
     let attempt = 0;
-    // Retry loop that only triggers on a typed 429 RateLimitError. All other
-    // errors propagate immediately.
     for (;;) {
       try {
         await this.connection.connect();
-        break;
+        return;
       } catch (err) {
         if (err instanceof RateLimitError && attempt < maxRetries) {
-          this.metrics.increment('ws.rateLimited');
+          // statusCode distinguishes 429 (per-IP throttle) from 503 (gateway at
+          // capacity); both back off here, neither is treated as fatal.
+          this.metrics.increment(err.isAtCapacity() ? 'ws.serverAtCapacity' : 'ws.rateLimited');
           const delay = this.computeBackoffMs(err.retryAfterMs, attempt, baseDelayMs, maxDelayMs);
           this.emitter.emit('reconnect', {
             state: {
@@ -767,14 +850,9 @@ export class WebSocketSession {
           await new Promise((resolve) => setTimeout(resolve, delay));
           continue;
         }
-        this.state = 'disconnected';
-        this.metrics.setWSState('disconnected');
         throw err;
       }
     }
-
-    const duration = Date.now() - startTime;
-    this.metrics.record('ws.connect', duration);
   }
 
   /**
@@ -803,6 +881,8 @@ export class WebSocketSession {
     // D5: stop + clear the uplink shedder.
     this.stopUplinkPump();
     this.uplink?.clear();
+    // D6: stop the keepalive pump on explicit disconnect.
+    this.keepalive?.stop();
     await this.connection.close();
   }
 
@@ -868,6 +948,10 @@ export class WebSocketSession {
     }
 
     this.metrics.increment('ws.bytesSent', buffer.byteLength);
+
+    // D6: this is a REAL audio frame — reset the keepalive idle clock so the
+    // keepalive-silence pump never overlaps genuine audio (it only fills gaps).
+    this.keepalive?.noteRealAudio();
 
     if (this.connection.isConnected()) {
       // D5: route uplink audio through the backpressure shedder so a slow socket
@@ -1050,9 +1134,26 @@ export class WebSocketSession {
   }
 
   /**
-   * Wait for ready state
+   * D6: STT keepalive-silence statistics — how many zero-PCM keepalive frames
+   * have been sent (and the per-frame byte size). `{0,0}` when keepalive is
+   * disabled or this is not an audio session.
    */
-  waitForReady(timeout = 10000): Promise<ReadyEvent> {
+  getKeepaliveStats(): { sent: number; frameBytes: number } {
+    return {
+      sent: this.keepalive?.getSentCount() ?? 0,
+      frameBytes: this.keepalive?.frameBytes() ?? 0,
+    };
+  }
+
+  /**
+   * Wait for ready state.
+   *
+   * D6: defaults to the 35s connect timeout, not 10s. The gateway only sends
+   * `ready` AFTER PROVIDER_READY, which for an audio=true session can take up to
+   * ~30s while it builds the STT/TTS upstreams (config_handler.rs:45); a 10s
+   * default would reject on a perfectly-healthy-but-still-warming session.
+   */
+  waitForReady(timeout = DEFAULT_CONNECT_TIMEOUT_MS): Promise<ReadyEvent> {
     // Return stored event if already received (with actual values, not hardcoded)
     if (this.readyReceived && this.lastReadyEvent) {
       return Promise.resolve(this.lastReadyEvent);

@@ -494,5 +494,7 @@ export interface WidgetEventMap {
   'metrics': CustomEvent<WidgetMetrics>;
   /** Non-fatal gateway advisory: a config key was ignored / a feature is a no-op. */
   'configWarning': CustomEvent<ConfigWarning>;
+  /** D10: the mic went silent for ~0.5s (likely OS-muted / dead device). */
+  'micSilence': CustomEvent<{ message: string }>;
   'error': CustomEvent<Error>;
 }

@@ -34,6 +34,27 @@ from .queue import MessageQueue, QueueConfig
 # explicit mismatch instead of silent field drift.
 PROTOCOL_VERSION = "1.0"
 
+# Default connect timeout (D6). For an audio=true session the gateway constructs
+# the STT *and* TTS provider upstreams before it emits `ready`
+# (PROVIDER_READY, config_handler.rs:45) and that can take up to ~30s. The old
+# 10s default therefore TIMED OUT a perfectly healthy slow-cold-start session —
+# a bug. 35s bounds the worst-case PROVIDER_READY with headroom. The WS upgrade
+# handshake itself is ~2ms; this generous bound is only for the post-config
+# provider wait. Trade-off (documented): a genuinely-dead gateway now takes up to
+# 35s to fail the FIRST connect — acceptable, since the D1 liveness watchdog
+# covers post-connect death and a caller may always pass a smaller timeout.
+DEFAULT_CONNECT_TIMEOUT = 35.0
+
+# Default cadence for STT keepalive-silence (D6): when audio=true and no real
+# audio has been sent for this long, emit one short zero-PCM frame to keep the
+# gateway's upstream STT stream warm through a conversational pause. The
+# gateway's auto-pong keeps the SOCKET open but does NOT keep the provider's STT
+# stream from idling out, which is what this covers (Pipecat stt_service.py:45).
+DEFAULT_STT_KEEPALIVE_INTERVAL = 5.0
+# One keepalive frame is ~100ms of 16-bit mono silence at 16kHz = 3200 bytes of
+# zeros. Sized from the session's STT sample_rate at runtime; this is the floor.
+_KEEPALIVE_SILENCE_MS = 100
+
 
 @dataclass
 class ReconnectConfig:
@@ -227,6 +248,7 @@ class WebSocketSession:
         stale_inbound_timeout: float = 12.0,
         control_queue: Optional[MessageQueue] = None,
         max_pending_audio: int = 256,
+        stt_keepalive_interval: float = DEFAULT_STT_KEEPALIVE_INTERVAL,
     ):
         """
         Initialize WebSocket session.
@@ -269,6 +291,15 @@ class WebSocketSession:
                 disconnected (D5). Oldest frames are shed first (mirrors the
                 gateway's DroppableAudio drop-oldest egress discipline) so a slow
                 or absent gateway never grows uplink latency without limit.
+            stt_keepalive_interval: Seconds of no REAL audio after which the
+                session emits one ~100ms zero-PCM frame to keep the gateway's
+                upstream STT stream warm through a conversational pause (D6,
+                Pipecat stt_service.py:45). Only runs while ``audio`` is True and
+                connected; it is GATED on real audio (a frame is sent only if no
+                ``send_audio`` happened within the interval) so it never fights
+                live capture, and a real ``send_audio`` resets the timer. The
+                gateway's auto-pong keeps the SOCKET alive but NOT the provider
+                STT stream, which is exactly what this covers. Set <=0 to disable.
         """
         self.url = url
         self.api_key = api_key
@@ -319,6 +350,14 @@ class WebSocketSession:
         # Set when the watchdog (or a ping miss) forces a reconnect, so the
         # receive loop's own ConnectionClosed handler doesn't double-reconnect.
         self._reconnecting_due_to_stale = False
+
+        # D6 STT keepalive-silence. Monotonic timestamp of the last REAL audio
+        # frame sent (None until the first). The keepalive loop only emits a
+        # zero-PCM frame when this is older than the interval, so it never fights
+        # live capture; a real send_audio() updates it (resetting the timer).
+        self._stt_keepalive_interval = stt_keepalive_interval
+        self._last_real_audio_monotonic: Optional[float] = None
+        self._keepalive_task: Optional[asyncio.Task[None]] = None
 
         # D5 control-op queue (buffer-and-flush like the TS SDK). Drop-oldest,
         # bounded; control ops are small JSON so the default cap is generous.
@@ -453,9 +492,19 @@ class WebSocketSession:
     def _classify_connect_error(e: Exception, url: str) -> Exception:
         """Map a raw websockets connect failure to a typed SDK error.
 
-        The WaaV gateway applies a per-IP token bucket to the WS upgrade, so a
-        429 is common and must be a typed :class:`RateLimitError` carrying
-        ``Retry-After`` (not an opaque ConnectionError) so callers can back off.
+        Two gateway connect-time rejections are TRANSIENT and must back off
+        rather than fail hard (D7), so both map to a typed :class:`RateLimitError`
+        that the connect retry loop honors identically:
+
+        * **429** — the per-IP token bucket / tower_governor rate limit. Carries
+          ``Retry-After``; common under a burst, so it must not be an opaque
+          ConnectionError.
+        * **503** — "Server at capacity" (global connection-limit saturation,
+          connection_limit.rs). Also transient; back off and retry, do NOT treat
+          as fatal. The gateway rarely sets Retry-After here, so the loop falls
+          back to its exponential base.
+
+        Any other failure is a genuine :class:`ConnectionError`.
         """
         status = None
         headers: dict[str, Any] = {}
@@ -466,7 +515,7 @@ class WebSocketSession:
         # websockets<14 used status_code directly on the exception.
         if status is None:
             status = getattr(e, "status_code", None)
-        if status == 429:
+        if status in (429, 503):
             retry_after: Optional[float] = None
             try:
                 ra = headers.get("retry-after") if hasattr(headers, "get") else None
@@ -474,8 +523,9 @@ class WebSocketSession:
                     retry_after = float(ra)
             except (TypeError, ValueError):
                 retry_after = None
+            label = "Rate limited (429)" if status == 429 else "Server at capacity (503)"
             return RateLimitError(
-                message=f"Rate limited (429) connecting to {url}",
+                message=f"{label} connecting to {url}",
                 retry_after=retry_after,
                 url=url,
                 cause=e,
@@ -523,22 +573,31 @@ class WebSocketSession:
 
     async def connect(
         self,
-        timeout: float = 10.0,
+        timeout: float = DEFAULT_CONNECT_TIMEOUT,
         max_rate_limit_retries: int = 3,
     ) -> None:
         """
         Connect to the WebSocket server.
 
         On HTTP 429 (the gateway's per-IP token bucket) the connect is retried
-        with jittered backoff honoring the ``Retry-After`` header, then re-raised
-        as a typed :class:`RateLimitError` if still throttled.
+        with jittered backoff honoring the ``Retry-After`` header. On HTTP 503
+        ("Server at capacity", a transient global-saturation signal) it is
+        likewise retried with backoff — a 503 is NOT fatal. If still throttled
+        after the retries it is re-raised as a typed :class:`RateLimitError`.
 
         Args:
-            timeout: Connection timeout in seconds
-            max_rate_limit_retries: Number of 429 backoff retries before giving up
+            timeout: Connection timeout in seconds. Defaults to
+                :data:`DEFAULT_CONNECT_TIMEOUT` (35s): an audio=true session
+                blocks on server-side PROVIDER_READY (STT+TTS upstream build,
+                up to ~30s) before `ready`, so the old 10s default was a bug that
+                timed out healthy slow-cold-start sessions. The WS upgrade itself
+                is ~2ms; pass a smaller value for a config-only (audio=false)
+                session where no providers are constructed.
+            max_rate_limit_retries: Number of 429/503 backoff retries before
+                giving up.
 
         Raises:
-            RateLimitError: If still rate-limited (429) after all retries
+            RateLimitError: If still rate-limited (429/503) after all retries
             ConnectionError: If connection fails
             TimeoutError: If connection times out
         """
@@ -609,6 +668,11 @@ class WebSocketSession:
                 self._last_inbound_monotonic = time.monotonic()
                 self._reconnecting_due_to_stale = False
                 self._start_watchdog()
+                # D6: (re)start the STT keepalive-silence loop. Seed the real-audio
+                # clock to NOW so a brand-new session that opens then pauses gets
+                # its first keepalive only after a full idle interval, not instantly.
+                self._last_real_audio_monotonic = time.monotonic()
+                self._start_keepalive()
 
                 # D5/D4d: flush buffered CONTROL ops first (the gateway has the
                 # fresh config + is ready), then replay buffered uplink AUDIO. The
@@ -712,6 +776,68 @@ class WebSocketSession:
                         except Exception:
                             pass
                     return
+        except asyncio.CancelledError:
+            return
+
+    def _keepalive_frame(self) -> bytes:
+        """One ~100ms zero-PCM (16-bit mono) silence frame at the STT rate (D6).
+
+        Sized from ``stt_config.sample_rate`` so it matches what the gateway+STT
+        expect (default 16kHz → 3200 bytes). Pure silence, so it advances the
+        upstream STT stream's clock without affecting transcription.
+        """
+        rate = 16000
+        if self.stt_config is not None and getattr(self.stt_config, "sample_rate", None):
+            rate = int(self.stt_config.sample_rate)
+        # samples = rate * ms/1000 ; 2 bytes/sample (linear16) ; all zeros = silence.
+        n_bytes = max(2, int(rate * (_KEEPALIVE_SILENCE_MS / 1000.0)) * 2)
+        return b"\x00" * n_bytes
+
+    def _start_keepalive(self) -> None:
+        """Start (or restart) the STT keepalive-silence loop (D6).
+
+        Only meaningful for an audio=true session; a config-only / audio=false
+        session has no STT stream to keep warm. Disabled when the interval is
+        <=0.
+        """
+        if not self.audio or self._stt_keepalive_interval <= 0:
+            return
+        self._stop_keepalive()
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+
+    def _stop_keepalive(self) -> None:
+        """Cancel the keepalive-silence loop if running."""
+        if self._keepalive_task is not None:
+            self._keepalive_task.cancel()
+            self._keepalive_task = None
+
+    async def _keepalive_loop(self) -> None:
+        """Emit a zero-PCM frame after each idle gap, GATED on real audio (D6).
+
+        Sleeps the interval, then sends one silence frame ONLY if no real
+        ``send_audio`` happened within the interval — so during active capture it
+        sends nothing (the gate keeps deferring), and only a genuine pause warms
+        the stream. The send goes straight to the socket (never the offline
+        buffer): if we are disconnected the loop simply skips, and reconnect
+        restarts a fresh keepalive timer.
+        """
+        interval = self._stt_keepalive_interval
+        try:
+            while self._connected and not self._closed:
+                await asyncio.sleep(interval)
+                if not self._connected or self._closed or self._ws is None:
+                    continue
+                last = self._last_real_audio_monotonic
+                # Gate: skip if a real frame was sent within the interval (the
+                # line is already warm — never fight live capture).
+                if last is not None and (time.monotonic() - last) < interval:
+                    continue
+                try:
+                    await self._ws.send(self._keepalive_frame())
+                    self._emit("stt_keepalive", {"interval": interval})
+                except Exception:
+                    # Socket died mid-send — let the receive loop handle reconnect.
+                    continue
         except asyncio.CancelledError:
             return
 
@@ -1315,6 +1441,9 @@ class WebSocketSession:
         # doomed config that died fast doesn't even get the fast first hop.
         self._note_session_ended()
         self._stop_watchdog()
+        # Stop keepalive too: the old socket is dead, and connect() restarts a
+        # fresh keepalive timer once the new session is ready.
+        self._stop_keepalive()
         if self._closed:
             return
         self._trip_if_doomed(None)
@@ -1379,8 +1508,10 @@ class WebSocketSession:
         self._closed = True
         self._connected = False
 
-        # Stop the liveness watchdog first so it can't race a reconnect during teardown.
+        # Stop the liveness watchdog + keepalive first so neither can race a
+        # reconnect (or send into a half-torn socket) during teardown.
         self._stop_watchdog()
+        self._stop_keepalive()
 
         if self._receive_task:
             self._receive_task.cancel()
@@ -1424,6 +1555,11 @@ class WebSocketSession:
         Args:
             audio: PCM audio data (16-bit signed integer)
         """
+        # D6: mark that REAL audio just flowed so the keepalive-silence loop
+        # defers — a genuine frame (live OR buffered while down) means the user
+        # is producing audio, so the line needs no synthetic silence.
+        self._last_real_audio_monotonic = time.monotonic()
+
         if not self._connected:
             # deque(maxlen=…) drops the oldest automatically on overflow; surface
             # it so callers can SEE backpressure shedding.

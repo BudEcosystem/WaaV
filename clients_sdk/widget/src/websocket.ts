@@ -285,7 +285,19 @@ export class WidgetWebSocket {
     };
   }
 
-  connect(timeout = 10000): Promise<void> {
+  /**
+   * Open the socket and resolve on the gateway `ready`.
+   *
+   * D6: the default timeout is 35s, NOT 10s. The dominant connect cost is the
+   * server-side PROVIDER_READY (gateway config_handler.rs:45) which, for an
+   * audio=true session, can take up to ~30s to bring up the STT+TTS upstreams —
+   * the widget ALWAYS sends `audio:true` (buildConfigMessage). A 10s timeout would
+   * spuriously abort a perfectly healthy slow-provider connect. The WS handshake
+   * itself is ~2ms, so this only loosens the PROVIDER_READY bound; a genuinely
+   * dead gateway is caught faster by the onerror/onclose paths and, post-connect,
+   * by the D1 stale-inbound watchdog.
+   */
+  connect(timeout = 35000): Promise<void> {
     // The session is now meant to be alive: a drop should reconnect (D4) until
     // the caller explicitly disconnect()s. Set BEFORE opening so a fast close
     // still routes through the reconnect path.

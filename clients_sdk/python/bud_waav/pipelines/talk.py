@@ -9,7 +9,12 @@ from ..types import (
     STTConfig, TTSConfig, STTResult, AudioEvent, FeatureFlags, AudioFeatures,
     DAGConfig, ConversationConfig,
 )
-from ..ws.session import WebSocketSession, SessionMetrics, ReconnectConfig
+from ..ws.session import (
+    WebSocketSession,
+    SessionMetrics,
+    ReconnectConfig,
+    DEFAULT_CONNECT_TIMEOUT,
+)
 
 
 @dataclass
@@ -399,8 +404,13 @@ class TalkSession:
             elif handler in self._event_handlers[event]:
                 self._event_handlers[event].remove(handler)
 
-    async def connect(self, timeout: float = 10.0) -> None:
-        """Connect to the gateway."""
+    async def connect(self, timeout: float = DEFAULT_CONNECT_TIMEOUT) -> None:
+        """Connect to the gateway.
+
+        Defaults to the 35s connect timeout (D6) — the agent loop's audio=true
+        session waits on server-side PROVIDER_READY (STT+TTS upstream build, up
+        to ~30s) before `ready`.
+        """
         await self._session.connect(timeout=timeout)
 
     async def disconnect(self) -> None:

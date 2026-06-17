@@ -60,6 +60,19 @@ export class AudioPlayer {
     this.gainNode.connect(this.audioContext.destination);
   }
 
+  /**
+   * D6 prewarm: adopt an AudioContext that was created early (at page-load) so the
+   * first TTS chunk doesn't pay the cold context-create cost on the user gesture.
+   * No-op if a context already exists (initialize() then stays a no-op). The
+   * adopted context is wired with a fresh gain node exactly like initialize().
+   */
+  adoptContext(ctx: AudioContext): void {
+    if (this.audioContext || !ctx) return;
+    this.audioContext = ctx;
+    this.gainNode = this.audioContext.createGain();
+    this.gainNode.connect(this.audioContext.destination);
+  }
+
   async play(audioData: ArrayBuffer): Promise<void> {
     // Use a single Promise to prevent race condition on initialization
     if (!this.audioContext) {

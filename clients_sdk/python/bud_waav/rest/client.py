@@ -2,10 +2,34 @@
 Async REST client for Bud WaaV Gateway
 """
 
+import asyncio
+import random
 from typing import Any, Optional
 import httpx
 
-from ..errors import APIError, ConnectionError, TimeoutError
+from ..errors import APIError, ConnectionError, RateLimitError, TimeoutError
+
+# REST connection-pool tuning (D7). httpx defaults are UNtuned (no explicit
+# limits / no keepalive expiry), so a memoized client still drops idle keepalive
+# connections unpredictably and a batch of sequential calls can re-do TLS. These
+# defaults keep a healthy warm pool so the SDK's typical sequential workload
+# (submit_batch -> poll, or list_voices/clone bursts) REUSES one TCP/TLS
+# connection instead of paying a handshake per call.
+#
+#   * max_keepalive_connections: idle sockets kept warm for reuse (per host).
+#   * max_connections: hard ceiling on concurrent sockets (backpressure, not a
+#     self-DDoS) — cooperates with the gateway's per-IP connection cap.
+#   * keepalive_expiry: how long an idle socket is kept before close; 90s
+#     comfortably spans a poll loop's inter-request gap.
+DEFAULT_MAX_KEEPALIVE_CONNECTIONS = 20
+DEFAULT_MAX_CONNECTIONS = 100
+DEFAULT_KEEPALIVE_EXPIRY = 90.0
+
+# Transient HTTP statuses the gateway returns under load. Both are RETRIABLE,
+# NOT fatal, and are handled identically to the WS connect path:
+#   * 429 — per-IP token bucket / tower_governor rate limit (carries Retry-After).
+#   * 503 — "Server at capacity" (global connection-limit saturation).
+_RETRYABLE_STATUSES = (429, 503)
 
 
 class RestClient:
@@ -16,6 +40,11 @@ class RestClient:
         base_url: str,
         api_key: Optional[str] = None,
         timeout: float = 30.0,
+        *,
+        max_keepalive_connections: int = DEFAULT_MAX_KEEPALIVE_CONNECTIONS,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
+        keepalive_expiry: float = DEFAULT_KEEPALIVE_EXPIRY,
+        max_retries: int = 3,
     ):
         """
         Initialize REST client.
@@ -24,14 +53,31 @@ class RestClient:
             base_url: Base URL of the Bud WaaV gateway
             api_key: Optional API key for authentication
             timeout: Request timeout in seconds
+            max_keepalive_connections: Idle keepalive sockets kept warm for reuse
+                (D7 pooling). See module ``DEFAULT_*`` for the rationale.
+            max_connections: Hard ceiling on concurrent sockets.
+            keepalive_expiry: Seconds an idle socket is kept before close.
+            max_retries: Backoff retries on a transient 429/503 before giving up.
         """
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
+        self._limits = httpx.Limits(
+            max_keepalive_connections=max_keepalive_connections,
+            max_connections=max_connections,
+            keepalive_expiry=keepalive_expiry,
+        )
+        self._max_retries = max(0, max_retries)
         self._client: Optional[httpx.AsyncClient] = None
 
     async def _get_client(self) -> httpx.AsyncClient:
-        """Get or create the HTTP client."""
+        """Get or create the pooled HTTP client (D7).
+
+        The client is MEMOIZED and reused across every call so the tuned
+        keepalive pool actually persists — sequential batch/poll/voices/clone
+        calls share one warm TCP/TLS connection instead of re-handshaking. A new
+        client is built only on first use or after :meth:`close`.
+        """
         if self._client is None or self._client.is_closed:
             headers = {}
             if self.api_key:
@@ -42,6 +88,7 @@ class RestClient:
                 base_url=self.base_url,
                 headers=headers,
                 timeout=httpx.Timeout(self.timeout),
+                limits=self._limits,
             )
         return self._client
 
@@ -51,6 +98,48 @@ class RestClient:
             await self._client.aclose()
             self._client = None
 
+    async def warmup(self, timeout: float = 5.0) -> bool:
+        """Pre-resolve DNS + establish a TLS keepalive socket to the gateway (D6).
+
+        Sends one cheap request to the gateway origin so the TCP+TLS handshake is
+        paid NOW (e.g. at page-load / SDK init) and the resulting socket lands in
+        the keepalive pool — the first real call then attaches to an
+        already-warm connection instead of paying cold DNS+TLS (typically
+        100-400ms). Mirrors LiveKit ``Room.prepareConnection``.
+
+        A HEAD to ``/`` is preferred (no body); if the gateway rejects HEAD we
+        fall back to a GET so the socket still gets warmed. Best-effort: any
+        failure (gateway down, network) is swallowed and returns ``False`` — a
+        prewarm must never raise into the caller's init path.
+
+        Returns:
+            ``True`` if a request round-tripped (socket warmed), else ``False``.
+        """
+        try:
+            client = await self._get_client()
+            try:
+                await client.head("/", timeout=timeout)
+            except httpx.HTTPStatusError:
+                # Reached the server (warmed) but it returned an error status.
+                return True
+            except httpx.HTTPError:
+                # HEAD may be unsupported/blocked — try GET to still warm the pool.
+                await client.get("/", timeout=timeout)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _parse_retry_after(headers: httpx.Headers) -> Optional[float]:
+        """Parse a numeric ``Retry-After`` (seconds) header, if present."""
+        ra = headers.get("retry-after")
+        if ra is None:
+            return None
+        try:
+            return float(ra)
+        except (TypeError, ValueError):
+            return None
+
     async def _request(
         self,
         method: str,
@@ -59,7 +148,14 @@ class RestClient:
         params: Optional[dict[str, Any]] = None,
     ) -> Any:
         """
-        Make an HTTP request.
+        Make an HTTP request, backing off on transient 429/503 (D7).
+
+        A 429 (rate limit) or 503 ("Server at capacity") is TRANSIENT, not fatal:
+        the call is retried with jittered backoff that honors ``Retry-After``
+        when the gateway supplies it (identical to the WS connect path). After
+        ``max_retries`` it is surfaced as a typed :class:`RateLimitError` (NOT an
+        opaque APIError) so the caller can back off deterministically. All other
+        ``>= 400`` responses raise :class:`APIError` immediately.
 
         Args:
             method: HTTP method (GET, POST, DELETE, etc.)
@@ -73,59 +169,84 @@ class RestClient:
         Raises:
             ConnectionError: If connection fails
             TimeoutError: If request times out
-            APIError: If API returns an error response
+            RateLimitError: If still throttled (429/503) after all retries
+            APIError: If API returns any other error response
         """
         client = await self._get_client()
+        url = f"{self.base_url}{endpoint}"
 
-        try:
-            response = await client.request(
-                method=method,
-                url=endpoint,
-                json=json,
-                params=params,
-            )
-        except httpx.ConnectError as e:
-            raise ConnectionError(
-                message=f"Failed to connect to {self.base_url}{endpoint}",
-                url=f"{self.base_url}{endpoint}",
-                cause=e,
-            ) from e
-        except httpx.TimeoutException as e:
-            raise TimeoutError(
-                message=f"Request timed out after {self.timeout}s",
-                timeout_ms=int(self.timeout * 1000),
-                operation=f"{method} {endpoint}",
-            ) from e
-        except httpx.HTTPError as e:
-            raise ConnectionError(
-                message=f"HTTP error: {e}",
-                url=f"{self.base_url}{endpoint}",
-                cause=e,
-            ) from e
-
-        if response.status_code >= 400:
+        attempt = 0
+        while True:
             try:
-                error_body = response.json()
-            except Exception:
-                error_body = response.text
+                response = await client.request(
+                    method=method,
+                    url=endpoint,
+                    json=json,
+                    params=params,
+                )
+            except httpx.ConnectError as e:
+                raise ConnectionError(
+                    message=f"Failed to connect to {url}",
+                    url=url,
+                    cause=e,
+                ) from e
+            except httpx.TimeoutException as e:
+                raise TimeoutError(
+                    message=f"Request timed out after {self.timeout}s",
+                    timeout_ms=int(self.timeout * 1000),
+                    operation=f"{method} {endpoint}",
+                ) from e
+            except httpx.HTTPError as e:
+                raise ConnectionError(
+                    message=f"HTTP error: {e}",
+                    url=url,
+                    cause=e,
+                ) from e
 
-            raise APIError.from_response(
-                status_code=response.status_code,
-                response_body=error_body,
-                url=f"{self.base_url}{endpoint}",
-                method=method,
-            )
+            # Transient saturation (429/503): back off and retry, do NOT treat as
+            # fatal. Honor Retry-After; else exponential base + jitter.
+            if response.status_code in _RETRYABLE_STATUSES:
+                retry_after = self._parse_retry_after(response.headers)
+                if attempt >= self._max_retries:
+                    label = (
+                        "Rate limited (429)"
+                        if response.status_code == 429
+                        else "Server at capacity (503)"
+                    )
+                    raise RateLimitError(
+                        message=f"{label} after {attempt + 1} attempt(s): {method} {endpoint}",
+                        retry_after=retry_after,
+                        url=url,
+                    )
+                base = retry_after if retry_after is not None else min(2 ** attempt, 15)
+                jitter = base * 0.2 * (random.random() * 2 - 1)
+                await asyncio.sleep(max(0.0, base + jitter))
+                attempt += 1
+                continue
 
-        if response.status_code == 204:
-            return None
+            if response.status_code >= 400:
+                try:
+                    error_body = response.json()
+                except Exception:
+                    error_body = response.text
 
-        content_type = response.headers.get("content-type", "")
-        if "application/json" in content_type:
-            return response.json()
-        elif "audio/" in content_type or "application/octet-stream" in content_type:
-            return response.content
-        else:
-            return response.text
+                raise APIError.from_response(
+                    status_code=response.status_code,
+                    response_body=error_body,
+                    url=url,
+                    method=method,
+                )
+
+            if response.status_code == 204:
+                return None
+
+            content_type = response.headers.get("content-type", "")
+            if "application/json" in content_type:
+                return response.json()
+            elif "audio/" in content_type or "application/octet-stream" in content_type:
+                return response.content
+            else:
+                return response.text
 
     async def get(
         self,

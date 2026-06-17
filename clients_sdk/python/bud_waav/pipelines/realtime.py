@@ -16,6 +16,7 @@ import websockets
 from websockets.asyncio.client import ClientConnection, connect as ws_connect
 
 from ..types import TranscriptEvent, AudioEvent
+from ..ws.session import DEFAULT_CONNECT_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -348,7 +349,9 @@ class BudRealtime:
         if self._connect_lock is None:
             self._connect_lock = asyncio.Lock()
 
-    async def connect(self, url: Optional[str] = None, timeout: float = 10.0) -> None:
+    async def connect(
+        self, url: Optional[str] = None, timeout: float = DEFAULT_CONNECT_TIMEOUT
+    ) -> None:
         """
         Connect to the realtime service.
 

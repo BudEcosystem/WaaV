@@ -5,7 +5,12 @@ BudSTT - Speech-to-Text pipeline
 from typing import Any, AsyncIterator, Callable, Optional, Union
 
 from ..types import STTConfig, STTResult, FeatureFlags, AudioFeatures, DAGConfig
-from ..ws.session import WebSocketSession, SessionMetrics, ReconnectConfig
+from ..ws.session import (
+    WebSocketSession,
+    SessionMetrics,
+    ReconnectConfig,
+    DEFAULT_CONNECT_TIMEOUT,
+)
 
 
 class BudSTT:
@@ -206,8 +211,12 @@ class STTSession:
         else:
             self._session.off(event, handler)
 
-    async def connect(self, timeout: float = 10.0) -> None:
-        """Connect to the gateway."""
+    async def connect(self, timeout: float = DEFAULT_CONNECT_TIMEOUT) -> None:
+        """Connect to the gateway.
+
+        Defaults to the 35s connect timeout (D6) — an audio=true STT session
+        waits on server-side PROVIDER_READY (up to ~30s) before `ready`.
+        """
         await self._session.connect(timeout=timeout)
 
     async def disconnect(self) -> None:

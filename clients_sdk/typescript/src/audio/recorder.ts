@@ -37,6 +37,19 @@ export interface RecorderConfig {
    * main thread; this escape hatch is for debugging only.
    */
   forceScriptProcessor?: boolean;
+  /**
+   * D10 mic-silence watchdog: input level (0-1) at/below which the mic is
+   * considered silent (default 0.01). Sustained silence for `micSilenceMs` fires
+   * the `micSilent` event (a likely-muted/dead mic). Mirrors Pipecat base_input's
+   * AUDIO_INPUT_TIMEOUT.
+   */
+  micSilenceThreshold?: number;
+  /**
+   * D10 mic-silence watchdog: how long input must stay at/below
+   * `micSilenceThreshold` before `micSilent` fires, ms (default 500 — Pipecat's
+   * 0.5s). Set 0 to disable the watchdog.
+   */
+  micSilenceMs?: number;
 }
 
 /**
@@ -64,6 +77,14 @@ export interface RecorderEventHandlers {
   onError?: (error: Error) => void;
   /** Called when audio track ends (device disconnected) */
   onDeviceDisconnected?: () => void;
+  /**
+   * D10: called when the mic has been below `micSilenceThreshold` for at least
+   * `micSilenceMs` while recording — a likely muted/dead mic. Fires once per
+   * silence episode (re-arms after audio returns); pair with {@link onMicActive}.
+   */
+  onMicSilent?: (silentForMs: number) => void;
+  /** D10: called when input returns after a `micSilent` episode. */
+  onMicActive?: () => void;
 }
 
 /**
@@ -83,6 +104,10 @@ export class AudioRecorder {
   private nativeSampleRate = 48000;
   /** Which capture path is live (for diagnostics + correct teardown). */
   private captureMode: 'worklet' | 'scriptprocessor' | null = null;
+  /** D10: monotonic time the mic first dropped below the silence threshold (or null). */
+  private silentSince: number | null = null;
+  /** D10: whether a `micSilent` event has already fired for the current episode. */
+  private micSilentFired = false;
 
   constructor(config: RecorderConfig = {}) {
     this.config = {
@@ -95,6 +120,8 @@ export class AudioRecorder {
       deviceId: config.deviceId ?? '',
       workletUrl: config.workletUrl ?? '',
       forceScriptProcessor: config.forceScriptProcessor ?? false,
+      micSilenceThreshold: config.micSilenceThreshold ?? 0.01,
+      micSilenceMs: config.micSilenceMs ?? 500,
     };
   }
 
@@ -321,12 +348,18 @@ export class AudioRecorder {
   }
 
   /**
-   * Start level monitoring
+   * Start level monitoring. Runs whenever an `onLevel` handler is set OR the D10
+   * mic-silence watchdog is enabled (so the watchdog works even without a level
+   * subscriber). On each 100ms tick it reports the level and feeds the watchdog.
    */
   private startLevelMonitoring(): void {
-    if (!this.analyserNode || !this.handlers.onLevel) return;
+    const watchdogEnabled = this.config.micSilenceMs > 0 && (!!this.handlers.onMicSilent || !!this.handlers.onMicActive);
+    if (!this.analyserNode || (!this.handlers.onLevel && !watchdogEnabled)) return;
 
     const dataArray = new Uint8Array(this.analyserNode.frequencyBinCount);
+    // Reset watchdog state for a fresh recording episode.
+    this.silentSince = null;
+    this.micSilentFired = false;
 
     this.levelCheckInterval = setInterval(() => {
       if (this.state !== 'recording' || !this.analyserNode) return;
@@ -341,7 +374,32 @@ export class AudioRecorder {
       const average = sum / dataArray.length / 255;
 
       this.handlers.onLevel?.(average);
+      if (watchdogEnabled) this.updateMicSilenceWatchdog(average);
     }, 100);
+  }
+
+  /**
+   * D10 mic-silence watchdog. Tracks how long the input has stayed at/below the
+   * silence threshold; once that exceeds `micSilenceMs` it fires `micSilent`
+   * once (a likely muted/dead mic), and fires `micActive` when audio returns.
+   */
+  private updateMicSilenceWatchdog(level: number): void {
+    const now = monotonicNow();
+    if (level <= this.config.micSilenceThreshold) {
+      if (this.silentSince === null) this.silentSince = now;
+      const silentFor = now - this.silentSince;
+      if (!this.micSilentFired && silentFor >= this.config.micSilenceMs) {
+        this.micSilentFired = true;
+        this.handlers.onMicSilent?.(silentFor);
+      }
+    } else {
+      // Audio returned: if we had declared silence, signal recovery, then reset.
+      if (this.micSilentFired) {
+        this.handlers.onMicActive?.();
+      }
+      this.silentSince = null;
+      this.micSilentFired = false;
+    }
   }
 
   /**
@@ -460,6 +518,14 @@ export class AudioRecorder {
   getTargetSampleRate(): number {
     return this.config.sampleRate;
   }
+}
+
+/** A monotonic clock that never goes backwards (immune to wall-clock jumps). */
+function monotonicNow(): number {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now();
+  }
+  return Date.now();
 }
 
 /**

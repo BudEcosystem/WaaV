@@ -45,5 +45,26 @@ describe('RateLimitError', () => {
     expect(err.statusCode).toBe(429);
     expect(err.retryAfterMs).toBe(7000);
     expect(err.url).toBe('http://x/ws');
+    expect(err.isAtCapacity()).toBe(false);
+  });
+
+  // D7: a 503 "Server at capacity" is the SAME back-off-not-fatal class as 429.
+  it('builds from a 503 Response as an at-capacity back-off signal', () => {
+    const res = new Response('Server at capacity', {
+      status: 503,
+      headers: { 'Retry-After': '3' },
+    });
+    const err = RateLimitError.fromResponse(res, { url: 'http://x/ws' });
+    expect(err.statusCode).toBe(503);
+    expect(err.isRateLimited()).toBe(true); // retryable, not fatal
+    expect(err.isAtCapacity()).toBe(true);
+    expect(err.retryAfterMs).toBe(3000);
+    expect(err.message).toMatch(/capacity/i);
+  });
+
+  it('an explicit 503 statusCode flags at-capacity', () => {
+    const err = new RateLimitError('cap', { statusCode: 503 });
+    expect(err.statusCode).toBe(503);
+    expect(err.isAtCapacity()).toBe(true);
   });
 });

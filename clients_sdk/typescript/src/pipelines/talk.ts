@@ -247,7 +247,9 @@ export class BudTalk extends BasePipeline {
     this.emitter.emit('audio', event);
 
     if (this.autoPlay && this.player) {
-      this.player.addPCM(event.audio);
+      // Thread the gateway sequence number so the D9 jitter buffer (if enabled)
+      // can reorder out-of-order arrivals.
+      this.player.addPCM(event.audio, event.sequence);
     }
   }
 
@@ -350,6 +352,14 @@ export class BudTalk extends BasePipeline {
           raw: { type: 'error', code: 'RECORDER_ERROR', message: error.message },
         });
       },
+      // D10: surface the mic-silence watchdog as a typed `micSilent` event so the
+      // app can prompt "your mic may be muted" (and clear it on recovery).
+      onMicSilent: (silentForMs) => {
+        this.emitter.emit('micSilent', { silent: true, silentForMs, timestamp: Date.now() });
+      },
+      onMicActive: () => {
+        this.emitter.emit('micSilent', { silent: false, timestamp: Date.now() });
+      },
     });
 
     await this.recorder.start();
@@ -377,8 +387,33 @@ export class BudTalk extends BasePipeline {
    * `clear`, and keep the player ready to play the next turn (not 'stopped').
    */
   interrupt(): void {
+    // D10: if a must-play prompt is in flight, a barge-in is ignored entirely —
+    // do NOT send the gateway `clear` and do NOT cut local playback, so the
+    // prompt (e.g. a legal disclaimer) plays to completion.
+    if (this.player?.isUninterruptible()) return;
     super.interrupt();
     this.player?.clearBuffer();
+  }
+
+  /**
+   * D10: mark the current/next bot speech as a must-play prompt (uninterruptible)
+   * or restore normal barge-in. While true, both a VAD barge-in and an explicit
+   * {@link interrupt} are ignored so the prompt is never cut off. Remember to
+   * clear it (`false`) when the prompt completes.
+   */
+  setUninterruptible(value: boolean): void {
+    this.player?.setUninterruptible(value);
+  }
+
+  /**
+   * D10: speak a must-play prompt that cannot be barged over (e.g. a legal
+   * disclaimer). Sets the uninterruptible flag for the duration of this
+   * utterance; the caller clears it via {@link setUninterruptible}(false) once
+   * the prompt has finished playing (e.g. on the player's drain/`onBufferEmpty`).
+   */
+  async speakUninterruptible(text: string, options?: Parameters<BudTalk['speak']>[1]): Promise<void> {
+    this.setUninterruptible(true);
+    await this.speak(text, options);
   }
 
   /**

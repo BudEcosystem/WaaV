@@ -40,11 +40,13 @@ export function parseRetryAfterMs(value: string | null | undefined): number | un
 
 /**
  * Error thrown when the gateway rate-limits a request or WebSocket upgrade
- * (HTTP 429).
+ * (HTTP 429) OR signals it is at global capacity (HTTP 503 "Server at
+ * capacity"). Both are back-off-and-retry conditions, not fatal failures, so
+ * they share this typed error; `statusCode` tells them apart.
  */
 export class RateLimitError extends BudError {
-  /** HTTP status code (always 429) */
-  readonly statusCode = 429;
+  /** HTTP status that triggered this (429 per-IP throttle, or 503 at-capacity). */
+  readonly statusCode: number;
   /**
    * Suggested delay before retrying, in milliseconds, parsed from the
    * `Retry-After` response header when present.
@@ -61,40 +63,57 @@ export class RateLimitError extends BudError {
       retryAfterMs?: number;
       retryAfter?: string;
       url?: string;
+      /** HTTP status (default 429; pass 503 for the at-capacity case). */
+      statusCode?: number;
       cause?: Error;
       context?: Record<string, unknown>;
     }
   ) {
+    const statusCode = options?.statusCode ?? 429;
     super(message, BudErrorCode.API_RATE_LIMITED, {
       ...(options?.cause !== undefined ? { cause: options.cause } : {}),
       context: {
         ...options?.context,
-        statusCode: 429,
+        statusCode,
         retryAfterMs: options?.retryAfterMs,
         url: options?.url,
       },
     });
     this.name = 'RateLimitError';
+    this.statusCode = statusCode;
     if (options?.retryAfterMs !== undefined) this.retryAfterMs = options.retryAfterMs;
     if (options?.retryAfter !== undefined) this.retryAfter = options.retryAfter;
     if (options?.url !== undefined) this.url = options.url;
   }
 
-  /** Always true — this error type is exactly the 429 case. */
+  /** True for both the 429 throttle and the 503 at-capacity back-off case. */
   isRateLimited(): boolean {
     return true;
   }
 
+  /** Whether this is the gateway's global 503 "Server at capacity" signal. */
+  isAtCapacity(): boolean {
+    return this.statusCode === 503;
+  }
+
   /**
-   * Construct a RateLimitError from a fetch `Response` (status 429),
-   * extracting the `Retry-After` header.
+   * Construct a RateLimitError from a fetch `Response` (status 429 per-IP
+   * throttle, or 503 "Server at capacity"), extracting the `Retry-After` header.
+   * The message + `statusCode` reflect the ACTUAL status so a 503 isn't
+   * mislabelled as a 429.
    */
   static fromResponse(response: Response, options?: { url?: string }): RateLimitError {
     const retryAfter = response.headers.get('retry-after');
     const retryAfterMs = parseRetryAfterMs(retryAfter);
+    const status = response.status;
+    const what =
+      status === 503
+        ? 'Gateway at capacity (HTTP 503)'
+        : 'Request rate-limited by gateway (HTTP 429)';
     return new RateLimitError(
-      `Request rate-limited by gateway (HTTP 429)${retryAfterMs !== undefined ? `; retry after ${retryAfterMs}ms` : ''}`,
+      `${what}${retryAfterMs !== undefined ? `; retry after ${retryAfterMs}ms` : ''}`,
       {
+        statusCode: status === 503 ? 503 : 429,
         ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
         ...(retryAfter !== null ? { retryAfter } : {}),
         ...(options?.url !== undefined ? { url: options.url } : {}),

@@ -14,6 +14,7 @@
 import type { STTConfig, TTSConfig, ConversationConfig } from '../types/config.js';
 import type { TurnDetectionConfig } from '../types/audio-features.js';
 import type { ReconnectConfig } from '../ws/reconnect.js';
+import type { ConnectGate } from '../ws/connect-gate.js';
 import { WebSocketSession } from '../ws/session.js';
 import type {
   SessionEventMap,
@@ -102,7 +103,8 @@ const DEFAULT_AGENT_TTS: Pick<TTSConfig, 'provider' | 'model' | 'voiceId'> = {
 export function buildAgentSessionConfig(
   config: AgentConfig,
   url: string,
-  apiKey?: string
+  apiKey?: string,
+  connectGate?: ConnectGate
 ): {
   url: string;
   apiKey?: string;
@@ -115,6 +117,7 @@ export function buildAgentSessionConfig(
   conversation?: ConversationConfig;
   alias?: string;
   turnDetection?: TurnDetectionConfig;
+  connectGate?: ConnectGate;
 } {
   // An agent needs an LLM from SOMEWHERE: an explicit `llm`, or a server `alias`
   // that resolves one. (stt/tts have sane defaults; the LLM loop does not.)
@@ -157,6 +160,9 @@ export function buildAgentSessionConfig(
   if (config.reconnect !== undefined) out.reconnect = config.reconnect;
   if (config.streamId !== undefined) out.streamId = config.streamId;
   if (turnDetection !== undefined) out.turnDetection = turnDetection;
+  // D7: pass the shared connect gate through (BudClient injects it) so the agent
+  // session's connect paces with the rest of the client's sessions.
+  if (connectGate !== undefined) out.connectGate = connectGate;
   return out;
 }
 
@@ -183,8 +189,8 @@ export function buildAgentSessionConfig(
 export class AgentSession {
   private session: WebSocketSession;
 
-  constructor(config: AgentConfig, url: string, apiKey?: string) {
-    this.session = new WebSocketSession(buildAgentSessionConfig(config, url, apiKey));
+  constructor(config: AgentConfig, url: string, apiKey?: string, connectGate?: ConnectGate) {
+    this.session = new WebSocketSession(buildAgentSessionConfig(config, url, apiKey, connectGate));
   }
 
   /** Connect and wait for the gateway `ready` handshake. */

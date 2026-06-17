@@ -185,3 +185,71 @@ describe('D2 true barge-in', () => {
     expect(player.getScheduledCount()).toBe(0);
   });
 });
+
+describe('D10 uninterruptible (must-play) prompt', () => {
+  it('interrupt()/clearBuffer() are IGNORED while uninterruptible', async () => {
+    const onClear = vi.fn();
+    const player = new PCMPlayer({ sampleRate: 24000 });
+    player.setHandlers({ onClear });
+    await player.initialize();
+    player.addFloat32(chunk());
+    player.addFloat32(chunk());
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(player.getScheduledCount()).toBe(2);
+
+    player.setUninterruptible(true);
+    expect(player.isUninterruptible()).toBe(true);
+
+    // A barge-in must NOT cut a must-play prompt.
+    player.interrupt();
+    player.clearBuffer();
+    expect(lastCtx.stops).toBe(0);
+    expect(player.getScheduledCount()).toBe(2);
+    expect(onClear).not.toHaveBeenCalled();
+
+    // Once cleared, barge-in works again.
+    player.setUninterruptible(false);
+    player.interrupt();
+    expect(lastCtx.stops).toBe(2);
+    expect(onClear).toHaveBeenCalledTimes(1);
+  });
+
+  it('stop() still tears down even while uninterruptible (explicit teardown)', async () => {
+    const player = new PCMPlayer({ sampleRate: 24000 });
+    await player.initialize();
+    player.addFloat32(chunk());
+    await Promise.resolve();
+    await Promise.resolve();
+    player.setUninterruptible(true);
+    player.stop(); // explicit local teardown is not a barge-in
+    expect(lastCtx.stops).toBe(1);
+    expect(player.getScheduledCount()).toBe(0);
+  });
+});
+
+describe('D9 jitter buffer routed through the player', () => {
+  it('disabled by default → chunks schedule immediately (passthrough)', async () => {
+    const player = new PCMPlayer({ sampleRate: 24000 });
+    await player.initialize();
+    player.addFloat32(chunk());
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(player.getJitterStats().enabled).toBe(false);
+    expect(lastCtx.starts.length).toBe(1);
+  });
+
+  it('enabled but on a clean (regular-arrival) stream stays in passthrough', async () => {
+    const player = new PCMPlayer({ sampleRate: 24000, jitter: { engageJitterMs: 8 } });
+    await player.initialize();
+    // Regular arrivals (same microtask) → near-zero jitter → never engages.
+    for (let i = 0; i < 6; i++) player.addFloat32(chunk(), i);
+    await Promise.resolve();
+    await Promise.resolve();
+    const stats = player.getJitterStats();
+    expect(stats.enabled).toBe(true);
+    expect(stats.engaged).toBe(false);
+    // Passthrough → every chunk reached the scheduled playout.
+    expect(lastCtx.starts.length).toBe(6);
+  });
+});

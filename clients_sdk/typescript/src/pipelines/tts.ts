@@ -148,7 +148,9 @@ export class BudTTS extends BasePipeline {
     this.emitter.emit('audio', event);
 
     if (this.autoPlay && this.player) {
-      this.player.addPCM(event.audio);
+      // Thread the gateway sequence number so the D9 jitter buffer (if enabled)
+      // can reorder out-of-order arrivals.
+      this.player.addPCM(event.audio, event.sequence);
     }
   }
 
