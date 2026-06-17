@@ -65,6 +65,14 @@ WaaV eliminates the complexity of integrating with multiple voice AI providers b
 
 ## Latest Updates
 
+**June 2026 — Provider-agnostic standardization + rebuilt client SDKs (6-phase, live-validated).** WaaV now delivers its core promise — **switch providers/models without changing client code** — across every axis, with three drilled-out client SDKs (Python / TypeScript / embeddable widget). One canonical token maps to each provider's native form **server-side**, so the SDKs stay a thin, drift-guarded mirror. Shipped phase-by-phase with extreme-TDD + multi-agent brutal-review workflows + credential-free live validation against the running gateway (gateway lib **~6,490 tests, 0 failing**; SDKs Python **354** / TS **194** / widget **22**).
+
+- **Canonical mappers (gateway-side, one source of truth).** `language` — one `en-US` works on every provider (`core/lang/`, 49 region-qualified BCP-47 locales + an alias resolver, mapping the 8-way Chinese fork / Sarvam `od-IN` / ElevenLabs ISO-639-1 downgrade / Baidu numeric / … per provider). `emotion`/`style` — a 44-variant canonical set where `emotion="excited"` becomes a Cartesia emotion array, an OpenAI `instructions` string, an ElevenLabs `[excited]` inline tag, or an Azure SSML style. `voice` — a `VoiceDescriptor{gender,locale,age,style}` resolved to a real provider `voice_id` over the unified `/voices` catalog. Unsupported → a typed `config_warning`, never a 400.
+- **`bud.agent(...)` — a full voice agent in ~5 lines.** The flagship helper drives the gateway's built-in STT→LLM→TTS loop with reasoning, barge-in, and latency-filler, yielding one unified `transcript | audio | warning` event stream. Beginner-first DX that beats Pipecat's per-service wiring.
+- **Proxy / alias model names.** A server-config alias maps a logical name to a full `{stt,tts,llm,dag}` bundle — `bud.agent(alias="support-bot")`. Re-point what "support-bot" means (swap providers, A/B, cost-tier) by editing server config; the client never changes (proven live: identical payload, provider swapped).
+- **All call types, one SDK surface.** `bud.realtime(provider=…)` speaks the gateway's provider-agnostic `/realtime` protocol for **all 12 S2S providers**; `bud.transcribe_batch(...)` for async/prerecorded; `bud.voices.clone(...)` for instant + professional voice cloning; canonical in-stream **translation** (`translation={target_languages:[…]}`). 
+- **Drift-guarded mirror.** A CI guard reads the gateway OpenAPI spec and fails the build if any config field is unreachable from the SDK — structurally killing the entire "feature exists server-side but the SDK silently drops it" bug class that had left TS transcripts empty and the whole reasoning loop unreachable.
+
 **June 2026 — Realtime / Speech-to-Speech (S2S) fleet + full WaaV integration (live-validated).** WaaV's full-duplex realtime path grew from **2 providers to 12** on a shared, heavily-reviewed S2S scaffold, then was proven integrated with every relevant gateway subsystem — DAG, noise reduction, VAD, smart-turn, turn detection, the cascade audio sink, and circuit-breaker resilience — end-to-end through the **running gateway**. Shipped with extreme-TDD + multi-agent brutal-review (RCA / integration / impact / adversarial-verify workflows) + credential-free live validation; lib suite **6,400+ tests, 0 failing**.
 
 - **Shared S2S scaffold.** A generic `RealtimeSession<P: RealtimeProtocol>` driver implements the reconnect supervisor, conversation replay, barge-in/truncate, and resilience **once**; each provider is a small pure protocol mapper + a thin newtype. A `RealtimeTransport` seam absorbs all transports — WS-JSON, WS-binary, REST-handshake→WS (Ultravox), and AWS Bedrock bidirectional HTTP/2 (Nova Sonic). The existing OpenAI client was migrated onto it under a byte-identical golden-wire oracle (every pre-existing test unchanged).
@@ -581,7 +589,25 @@ await stt.startListening();
 const tts = await bud.tts.connect({ provider: 'elevenlabs' });
 await tts.speak('Hello from WaaV!');
 
-// Bidirectional Voice
+// ── Flagship: a full voice AGENT in ~5 lines (STT → built-in LLM → TTS,
+//    with reasoning + barge-in + latency-filler) ──
+const agent = bud.agent({
+  stt: { provider: 'deepgram', language: 'en-US' },   // one canonical language token
+  tts: { provider: 'elevenlabs', voiceDescriptor: { gender: 'female', locale: 'en-US', style: 'warm' } },
+  llm: { baseUrl: 'http://localhost:11434/v1', model: 'qwen2.5', reasoningEffort: 'minimal', latencyFiller: 'auto' },
+  turn: { eagerEot: true }, interrupt: true,
+});
+agent.on('transcript', (t) => console.log('user:', t.text));
+agent.on('audio', (a) => playback(a.audio));          // bot speech
+await agent.connect();
+
+// Proxy / alias model name — re-point providers server-side, client never changes
+const bot = bud.agent({ alias: 'support-bot' });       // a complete agent from one name
+
+// Provider-agnostic realtime (S2S) — same surface for ALL 12 providers
+const rt = bud.realtime({ provider: 'openai', voice: 'alloy', instructions: 'Be concise.' });
+
+// Bidirectional Voice (low-level STT+TTS, no LLM loop)
 const talk = await bud.talk.connect({
   stt: { provider: 'deepgram' },
   tts: { provider: 'elevenlabs' }
@@ -621,31 +647,52 @@ await ttsHume.speak('Hello from Hume AI with emotion!');
 ### Python SDK
 
 ```bash
-pip install bud-foundry
+pip install bud-waav
 ```
 
 ```python
-from bud_foundry import BudClient
+from bud_waav import BudClient
 
-bud = BudClient(base_url="http://localhost:3001", api_key="your-api-key")
+bud = BudClient(base_url="http://localhost:3009", api_key="your-api-key")
 
-# Speech-to-Text
+# ── Flagship: a full voice AGENT in ~5 lines (STT → built-in LLM → TTS,
+#    with reasoning + barge-in + latency-filler) ──
+async with bud.agent(
+    stt={"provider": "deepgram", "language": "en-US"},   # one canonical language token
+    tts={"provider": "elevenlabs",
+         "voice_descriptor": {"gender": "female", "locale": "en-US", "style": "warm"}},
+    llm={"base_url": "http://localhost:11434/v1", "model": "qwen2.5",
+         "reasoning_effort": "minimal", "latency_filler": "auto"},
+    turn={"eager": True}, interrupt=True,
+) as call:
+    await call.send_audio(pcm)
+    async for ev in call:                # one unified stream
+        if ev.type == "transcript": print("user:", ev.text)
+        elif ev.type == "audio":    play(ev.audio.audio)   # bot speech
+        elif ev.type == "warning":  print("ignored by provider:", ev.warning.code)
+
+# Proxy / alias model name — re-point providers server-side, client never changes
+call = bud.agent(alias="support-bot")          # a complete agent from one name
+
+# Provider-agnostic realtime (S2S) — same surface for ALL 12 providers
+rt = bud.realtime(provider="openai", voice="alloy", instructions="Be concise.")
+
+# Voice cloning + batched/async transcription + standardized translation
+cloned = await bud.voices.clone(provider="elevenlabs", name="My Voice", samples=[wav_bytes])
+job = await bud.transcribe_batch(audio=url, config={"provider": "deepgram"})
+async with bud.transcribe(stt={"provider": "deepgram",
+        "translation": {"target_languages": ["hi-IN"]}}) as s:    # transcribe + translate
+    async for r in s:
+        print(r.text, [t.text for t in r.translations])
+
+# Low-level Speech-to-Text
 async with bud.stt.connect(provider="deepgram") as session:
     async for result in session.transcribe_stream(audio_generator()):
         print(f"Transcript: {result.text}")
 
-# Text-to-Speech
+# Low-level Text-to-Speech (emotion is one canonical token across providers)
 async with bud.tts.connect(provider="elevenlabs") as session:
     await session.speak("Hello from WaaV!")
-
-# Bidirectional Voice
-async with bud.talk.connect(
-    stt={"provider": "deepgram"},
-    tts={"provider": "elevenlabs"}
-) as session:
-    async for event in session:
-        if event.type == "transcript":
-            print(event.text)
 
 # OpenAI STT/TTS
 async with bud.stt.connect(provider="openai", model="whisper-1") as session:
