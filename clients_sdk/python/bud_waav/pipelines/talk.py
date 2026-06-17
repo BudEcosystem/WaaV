@@ -115,6 +115,7 @@ class BudTalk:
         dag_config: Optional[DAGConfig] = None,
         conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
+        alias: Optional[str] = None,
     ) -> "TalkSession":
         """
         Create a Talk session.
@@ -182,6 +183,7 @@ class BudTalk:
             dag_config=dag_config,
             conversation_config=conversation_config,
             stream_id=stream_id,
+            alias=alias,
         )
 
     async def connect(
@@ -195,6 +197,7 @@ class BudTalk:
         dag_config: Optional[DAGConfig] = None,
         conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
+        alias: Optional[str] = None,
     ) -> "TalkSession":
         """
         Create and connect a Talk session.
@@ -222,6 +225,7 @@ class BudTalk:
             dag_config=dag_config,
             conversation_config=conversation_config,
             stream_id=stream_id,
+            alias=alias,
         )
         await session.connect()
         return session
@@ -243,6 +247,7 @@ class TalkSession:
         dag_config: Optional[DAGConfig] = None,
         conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
+        alias: Optional[str] = None,
     ):
         """
         Initialize Talk session.
@@ -275,6 +280,7 @@ class TalkSession:
             dag_config=dag_config,
             conversation_config=conversation_config,
             stream_id=stream_id,
+            alias=alias,
         )
 
         self._event_handlers: dict[str, list[Callable[..., Any]]] = {}

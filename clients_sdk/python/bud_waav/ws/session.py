@@ -191,6 +191,7 @@ class WebSocketSession:
         stream_id: Optional[str] = None,
         reconnect: Optional[ReconnectConfig] = None,
         audio: bool = True,
+        alias: Optional[str] = None,
     ):
         """
         Initialize WebSocket session.
@@ -223,12 +224,18 @@ class WebSocketSession:
         # When False, the gateway skips STT/TTS provider construction and reaches
         # `ready` immediately (config-only session). Default True (a voice session).
         self.audio = audio
+        # Server-defined proxy/alias name (P3). The gateway resolves it to a full
+        # {stt,tts,llm,dag} bundle BEFORE provider construction; an explicit config
+        # field above always wins. The resolved concrete providers come back on the
+        # `ready` ack as `resolved_alias` (see `resolved_alias` property).
+        self.alias = alias
         self.requested_stream_id = stream_id
         self.reconnect_config = reconnect or ReconnectConfig()
 
         self._ws: Optional[ClientConnection] = None
         self._stream_id: Optional[str] = None
         self._protocol_version: Optional[str] = None
+        self._resolved_alias: Optional[dict[str, Any]] = None
         self._connected = False
         self._connecting = False
         self._closed = False
@@ -267,6 +274,18 @@ class WebSocketSession:
     def protocol_version(self) -> Optional[str]:
         """Gateway wire-protocol version from the `ready` envelope (plan W-K1)."""
         return self._protocol_version
+
+    @property
+    def resolved_alias(self) -> Optional[dict[str, Any]]:
+        """The concrete providers the gateway resolved ``alias`` to (P3).
+
+        Populated from the ``ready`` ack when an ``alias`` was sent — e.g.
+        ``{"name": "support-bot", "kind": "agent", "stt": {"provider": "deepgram",
+        ...}, "tts": {"provider": "cartesia", ...}, "llm": {...}}`` (no secrets).
+        ``None`` when no alias was named (or it was unknown). Lets a developer SEE
+        what the alias became, and re-point it server-side with zero client change.
+        """
+        return self._resolved_alias
 
     def on(self, event: str, handler: Callable[..., Any]) -> None:
         """
@@ -492,6 +511,12 @@ class WebSocketSession:
             "type": "config",
             "audio": self.audio,
         }
+
+        # Proxy/alias name (P3): a single top-level field the gateway resolves to a
+        # full {stt,tts,llm,dag} bundle server-side. Composes with everything else —
+        # any explicit stt/tts/conversation config below overrides the alias default.
+        if self.alias:
+            config["alias"] = self.alias
 
         # Include stream_id if requested
         if self.requested_stream_id:
@@ -738,6 +763,10 @@ class WebSocketSession:
 
                     if msg_type == "ready":
                         self._stream_id = data.get("stream_id")
+                        # P3: capture the resolved-alias echo — the concrete
+                        # providers the gateway resolved `alias` to (no secrets), so
+                        # a developer can SEE what e.g. "support-bot" became.
+                        self._resolved_alias = data.get("resolved_alias")
                         # Capture + drift-check the wire protocol version (plan W-K1).
                         # The gateway emits this specifically so SDKs detect a
                         # breaking contract change instead of silent field drift.

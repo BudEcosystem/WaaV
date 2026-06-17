@@ -32,6 +32,14 @@ export function buildConfigMessage(config: WidgetConfig): Record<string, unknown
     audio: true,
   };
 
+  // Proxy/alias name (P3): a single server-defined name the gateway resolves to a
+  // full {stt,tts,llm,dag} bundle. `<bud-widget data-alias="support-bot">` is a
+  // complete agent; ops re-point what "support-bot" means with zero client change.
+  // An explicit stt/tts/conversation below overrides the alias default.
+  if (config.alias) {
+    message.alias = config.alias;
+  }
+
   // STT configuration (turn_detection nests HERE, per gateway config.rs:345).
   if (config.stt) {
     const sttConfig: Record<string, unknown> = {

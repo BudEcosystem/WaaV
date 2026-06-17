@@ -51,10 +51,19 @@ export interface AgentConfig {
   /** TTS configuration (defaults: deepgram / aura-asteria-en). */
   tts?: Partial<TTSConfig>;
   /**
-   * Conversation/LLM-loop configuration. REQUIRED — it must carry `baseUrl` and
-   * `model`; the reasoning / latency-filler / barge-in knobs are optional.
+   * Conversation/LLM-loop configuration. Carries `baseUrl` and `model` plus the
+   * optional reasoning / latency-filler / barge-in knobs. OPTIONAL only when an
+   * `alias` is given (the server-defined alias then supplies the LLM bundle);
+   * required otherwise.
    */
-  llm: ConversationConfig;
+  llm?: ConversationConfig;
+  /**
+   * Proxy/alias name (P3): a single server-defined name that resolves to a full
+   * {stt,tts,llm,dag} bundle. `bud.agent({ alias: 'support-bot' })` is a complete
+   * agent — ops can re-point what "support-bot" means with zero client change.
+   * Any explicit `stt`/`tts`/`llm` here overrides the alias default.
+   */
+  alias?: string;
   /** Turn-detection knobs (see {@link AgentTurnConfig}). */
   turn?: AgentTurnConfig;
   /** Reconnection configuration (or false to disable). */
@@ -103,14 +112,23 @@ export function buildAgentSessionConfig(
   streamId?: string;
   stt: STTConfig;
   tts: TTSConfig;
-  conversation: ConversationConfig;
+  conversation?: ConversationConfig;
+  alias?: string;
   turnDetection?: TurnDetectionConfig;
 } {
+  // An agent needs an LLM from SOMEWHERE: an explicit `llm`, or a server `alias`
+  // that resolves one. (stt/tts have sane defaults; the LLM loop does not.)
+  if (!config.llm && !config.alias) {
+    throw new Error('bud.agent requires `llm` (or an `alias` that supplies it)');
+  }
+
   const stt: STTConfig = { ...DEFAULT_AGENT_STT, ...config.stt };
   const tts: TTSConfig = { ...DEFAULT_AGENT_TTS, ...config.tts };
 
-  // Clone the conversation config so flipping eager_eot doesn't mutate caller state.
-  const conversation: ConversationConfig = { ...config.llm };
+  // Clone the conversation config so flipping eager_eot doesn't mutate caller
+  // state. When only an `alias` is given, the gateway's alias resolves the LLM
+  // bundle server-side, so the client sends no conversation block here.
+  const conversation: ConversationConfig | undefined = config.llm ? { ...config.llm } : undefined;
 
   let turnDetection: TurnDetectionConfig | undefined;
   if (config.turn) {
@@ -121,7 +139,7 @@ export function buildAgentSessionConfig(
     if (config.turn.eagerEot !== undefined) turnDetection.eager = config.turn.eagerEot;
     // Eager EoT requires BOTH the turn-detection eager flag and the conversation
     // eager_eot flag; forward it unless the caller set eager_eot explicitly.
-    if (config.turn.eagerEot && conversation.eagerEot === undefined) {
+    if (config.turn.eagerEot && conversation && conversation.eagerEot === undefined) {
       conversation.eagerEot = true;
     }
   }
@@ -131,8 +149,9 @@ export function buildAgentSessionConfig(
     audio: true as const,
     stt,
     tts,
-    conversation,
   } as ReturnType<typeof buildAgentSessionConfig>;
+  if (conversation !== undefined) out.conversation = conversation;
+  if (config.alias !== undefined) out.alias = config.alias;
   if (apiKey !== undefined) out.apiKey = apiKey;
   if (config.WebSocket !== undefined) out.WebSocket = config.WebSocket;
   if (config.reconnect !== undefined) out.reconnect = config.reconnect;

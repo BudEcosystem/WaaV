@@ -3,7 +3,7 @@
  * Type-safe event definitions for session callbacks
  */
 
-import type { STTResultMessage, ErrorMessage, TTSAudioMessage, ReadyMessage, ConfigWarningMessage } from '../types/messages.js';
+import type { STTResultMessage, ErrorMessage, TTSAudioMessage, ReadyMessage, ResolvedAlias, ConfigWarningMessage } from '../types/messages.js';
 import type { MetricsSummary } from '../types/metrics.js';
 import type { ReconnectState } from './reconnect.js';
 
@@ -88,6 +88,12 @@ export interface ReadyEvent {
   waavParticipantIdentity?: string;
   /** Display name of the AI agent participant */
   waavParticipantName?: string;
+  /**
+   * P3 proxy/alias echo: the concrete providers the gateway resolved an `alias`
+   * to (no secrets), e.g. `{ name: 'support-bot', tts: { provider: 'cartesia' } }`.
+   * Present only when an `alias` was sent and recognized.
+   */
+  resolvedAlias?: ResolvedAlias;
   /** Original message for advanced use */
   raw: ReadyMessage;
 }

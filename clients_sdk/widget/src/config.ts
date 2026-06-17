@@ -25,6 +25,8 @@ export function parseConfigFromAttributes(element: HTMLElement): WidgetConfig {
   const config: WidgetConfig = {
     gatewayUrl: element.dataset.gatewayUrl || 'ws://localhost:3009/ws',
     apiKey: element.dataset.apiKey || element.dataset.authToken,
+    // P3 proxy/alias: a server-defined name resolved to a full agent bundle.
+    alias: element.dataset.alias,
     theme: parseTheme(element.dataset.theme),
     position: parsePosition(element.dataset.position),
     mode: parseMode(element.dataset.mode),
@@ -325,6 +327,9 @@ export function mergeConfig(config: Partial<WidgetConfig>): WidgetConfig {
   return {
     gatewayUrl: config.gatewayUrl || 'ws://localhost:3009/ws',
     apiKey: config.apiKey,
+    // P3 proxy/alias: carry the server-defined alias name through (it was being
+    // dropped by this explicit-field rebuild — a real bug the alias test caught).
+    alias: config.alias,
     theme: config.theme || 'auto',
     position: config.position || 'bottom-right',
     mode: config.mode || 'vad',

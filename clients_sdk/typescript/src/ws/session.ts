@@ -48,6 +48,12 @@ export interface SessionConfig {
   conversation?: ConversationConfig;
   /** ML turn detection (nested into `stt_config.turn_detection`). */
   turnDetection?: TurnDetectionConfig;
+  /**
+   * Proxy/alias name (P3): a server-defined name the gateway resolves to a full
+   * {stt,tts,llm,dag} bundle before provider construction. The resolved concrete
+   * providers come back on `ready` as `resolvedAlias`.
+   */
+  alias?: string;
   /** Stream identifier to request (wire: stream_id). */
   streamId?: string;
   /** Enable audio processing (STT/TTS). Defaults to true (gateway default). */
@@ -313,6 +319,9 @@ export class WebSocketSession {
       event.waavParticipantIdentity = message.waav_participant_identity;
     if (message.waav_participant_name !== undefined)
       event.waavParticipantName = message.waav_participant_name;
+    // P3: surface the resolved-alias echo so a developer SEES what their alias
+    // (e.g. "support-bot") resolved to — and can re-point it server-side.
+    if (message.resolved_alias !== undefined) event.resolvedAlias = message.resolved_alias;
 
     // Store the event for later retrieval by waitForReady()
     this.lastReadyEvent = event;
@@ -460,6 +469,7 @@ export class WebSocketSession {
       this.conversationConfig ||
       this.turnDetectionConfig ||
       this.featuresConfig ||
+      this.config.alias !== undefined ||
       this.config.audio !== undefined ||
       this.config.streamId !== undefined;
     if (hasConfig) {
@@ -472,6 +482,7 @@ export class WebSocketSession {
           dag: this.dagConfig,
           conversation: this.conversationConfig,
           turnDetection: this.turnDetectionConfig,
+          alias: this.config.alias,
           streamId: this.config.streamId,
           audio: this.config.audio,
         }

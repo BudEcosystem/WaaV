@@ -81,6 +81,7 @@ export type {
   SpeakMessage,
   IncomingMessage,
   ReadyMessage,
+  ResolvedAlias,
   STTResultMessage,
   ErrorMessage,
   OutgoingMessage,

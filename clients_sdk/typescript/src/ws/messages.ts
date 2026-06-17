@@ -10,6 +10,7 @@ import type {
   SendMessageMessage,
   ClearMessage,
   ReadyMessage,
+  ResolvedAlias,
   STTResultMessage,
   TTSAudioMessage,
   ErrorMessage,
@@ -123,6 +124,13 @@ export interface SDKConfigMessage {
   /** ML turn detection (nested into `stt_config.turn_detection`). */
   turnDetection?: TurnDetectionConfig;
   /**
+   * Proxy/alias name (P3): a single server-defined name the gateway resolves to a
+   * full {stt,tts,llm,dag} bundle BEFORE provider construction. Composes with the
+   * rest — an explicit `stt`/`tts`/`conversation` here overrides the alias default.
+   * The resolved concrete providers come back on `ready` as `resolved_alias`.
+   */
+  alias?: string;
+  /**
    * Legacy client feature flags. These are folded into the nested
    * `stt_config.features{}` block (NOT emitted as a top-level `features` key,
    * which the gateway does not recognize and silently drops).
@@ -209,6 +217,12 @@ function configToWire(message: SDKConfigMessage): Record<string, unknown> {
 
   if (message.streamId) {
     wire.stream_id = message.streamId;
+  }
+
+  // Proxy/alias name (P3): a single top-level field the gateway resolves to a full
+  // {stt,tts,llm,dag} bundle server-side (an explicit config below overrides it).
+  if (message.alias) {
+    wire.alias = message.alias;
   }
 
   if (message.audio !== undefined) {
@@ -507,6 +521,11 @@ function readyFromWire(wire: Record<string, unknown>): ReadyMessage {
   if (pId !== undefined) msg.waav_participant_identity = pId;
   const pName = asString(wire.waav_participant_name);
   if (pName !== undefined) msg.waav_participant_name = pName;
+  // P3: the resolved-alias echo — the concrete providers the gateway resolved an
+  // `alias` to (no secrets), so a developer can SEE what e.g. "support-bot" became.
+  if (wire.resolved_alias && typeof wire.resolved_alias === 'object') {
+    msg.resolved_alias = wire.resolved_alias as ResolvedAlias;
+  }
   return msg;
 }
 
@@ -621,6 +640,7 @@ export function createConfigMessage(
     dag?: DAGConfig;
     conversation?: ConversationConfig;
     turnDetection?: TurnDetectionConfig;
+    alias?: string;
     streamId?: string;
     audio?: boolean;
   }
@@ -635,6 +655,7 @@ export function createConfigMessage(
   if (extra?.dag !== undefined) msg.dag = extra.dag;
   if (extra?.conversation !== undefined) msg.conversation = extra.conversation;
   if (extra?.turnDetection !== undefined) msg.turnDetection = extra.turnDetection;
+  if (extra?.alias !== undefined) msg.alias = extra.alias;
   if (extra?.streamId !== undefined) msg.streamId = extra.streamId;
   if (extra?.audio !== undefined) msg.audio = extra.audio;
   return msg;

@@ -136,6 +136,13 @@ export interface WidgetConfig {
   gatewayUrl: string;
   /** API key for authentication */
   apiKey?: string;
+  /**
+   * Proxy/alias name (P3, `data-alias`): a server-defined name the gateway
+   * resolves to a full {stt,tts,llm,dag} bundle. `<bud-widget data-alias="...">`
+   * is a complete agent; the bundle can be re-pointed server-side with no client
+   * change. An explicit stt/tts/conversation here overrides the alias default.
+   */
+  alias?: string;
   /** STT configuration */
   stt?: STTConfig;
   /** TTS configuration */

@@ -161,6 +161,7 @@ class BudClient:
         interrupt: bool = True,
         reconnect: Optional[ReconnectConfig] = None,
         stream_id: Optional[str] = None,
+        alias: Optional[str] = None,
     ) -> TalkSession:
         """Create the flagship agent loop (STT -> built-in LLM -> TTS) in ~5 lines.
 
@@ -271,6 +272,7 @@ class BudClient:
             audio_features=audio_features,
             conversation_config=conversation_config,
             stream_id=stream_id,
+            alias=alias,
         )
 
     async def health(self) -> dict[str, Any]:

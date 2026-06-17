@@ -71,6 +71,9 @@ export class BudWidget extends HTMLElement {
       // so a talking bot can be configured declaratively after mount.
       'data-llm-base-url',
       'data-llm-model',
+      // P3 proxy/alias: `<bud-widget data-alias="support-bot">` is a complete
+      // agent resolved + re-pointable server-side.
+      'data-alias',
     ];
   }
 

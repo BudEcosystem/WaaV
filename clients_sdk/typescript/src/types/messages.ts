@@ -174,6 +174,32 @@ export interface ReadyMessage {
   waav_participant_identity?: string;
   /** Display name of the AI agent participant */
   waav_participant_name?: string;
+  /**
+   * P3 proxy/alias echo: the concrete providers the gateway resolved an `alias`
+   * to (no secrets). Present only when an `alias` was sent and recognized. Lets a
+   * developer SEE what e.g. "support-bot" became — and re-point it server-side
+   * with zero client change.
+   */
+  resolved_alias?: ResolvedAlias;
+}
+
+/**
+ * The post-merge concrete bundle a server-defined `alias` resolved to (P3),
+ * echoed on `ready`. No secrets (system prompts / API keys are omitted).
+ */
+export interface ResolvedAlias {
+  /** The alias name that was resolved. */
+  name?: string;
+  /** Resolution kind: stt | tts | realtime | agent | dag. */
+  kind?: string;
+  /** Resolved STT provider/model/language. */
+  stt?: Record<string, unknown>;
+  /** Resolved TTS provider/voice/emotion. */
+  tts?: Record<string, unknown>;
+  /** Resolved LLM/conversation settings. */
+  llm?: Record<string, unknown>;
+  /** Resolved DAG template name, when the alias routes to a DAG. */
+  dag_template?: string;
 }
 
 /**
