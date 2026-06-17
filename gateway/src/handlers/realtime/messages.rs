@@ -172,6 +172,16 @@ pub struct RealtimeSessionConfig {
     /// `far_field` (laptop / room mics). Omitted = off.
     #[serde(default)]
     pub input_audio_noise_reduction: Option<String>,
+
+    /// Optional server-side ALIAS name (P3). Resolves a server-defined
+    /// `{realtime provider+model+voice}` bundle (and/or `llm` instructions) BEFORE the
+    /// provider/credential is selected; explicit fields above OVERRIDE the alias
+    /// default. The client supplies only the NAME — alias DEFINITIONS are
+    /// server-config-only (`aliases:` in `config.yaml`), SSRF-safe like
+    /// `realtime_endpoint_overrides`. An unknown alias is non-fatal (the session
+    /// proceeds with the client config + an `alias_unknown` error advisory).
+    #[serde(default)]
+    pub alias: Option<String>,
 }
 
 /// Turn detection configuration

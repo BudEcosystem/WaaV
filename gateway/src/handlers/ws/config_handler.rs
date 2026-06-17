@@ -88,11 +88,12 @@ fn resolve_stream_id(stream_id: Option<String>) -> String {
 pub async fn handle_config_message(
     stream_id: Option<String>,
     audio: Option<bool>,
-    stt_ws_config: Option<STTWebSocketConfig>,
-    tts_ws_config: Option<TTSWebSocketConfig>,
+    mut stt_ws_config: Option<STTWebSocketConfig>,
+    mut tts_ws_config: Option<TTSWebSocketConfig>,
     livekit_ws_config: Option<LiveKitWebSocketConfig>,
-    dag_ws_config: Option<DAGWebSocketConfig>,
-    conversation_ws_config: Option<ConversationWebSocketConfig>,
+    mut dag_ws_config: Option<DAGWebSocketConfig>,
+    mut conversation_ws_config: Option<ConversationWebSocketConfig>,
+    alias: Option<String>,
     state: &Arc<RwLock<ConnectionState>>,
     message_tx: &mpsc::Sender<MessageRoute>,
     app_state: &Arc<AppState>,
@@ -115,6 +116,47 @@ pub async fn handle_config_message(
             return true;
         }
     }
+
+    // P3: resolve a server-side ALIAS into the session config BEFORE any provider
+    // construction. The alias supplies DEFAULTS; explicit client fields above always
+    // win (handled inside `splice_alias`). Definitions are server-config-only, so the
+    // client `alias` string can never inject a backend url/credential (SSRF-safe). The
+    // resolved CONCRETE config is echoed in the `ready` ack below. This runs at the
+    // SAME config-message layer the `dag_config.template` already resolves at, and
+    // composes with the P2 canonical language/emotion mappers downstream (they map
+    // whatever provider the alias resolved to).
+    let resolved_alias = if let Some(alias_name) = alias.as_deref() {
+        match crate::core::alias::global_aliases().resolve(alias_name) {
+            Some(def) => {
+                let echo = crate::core::alias::splice_alias(
+                    alias_name,
+                    &def,
+                    &mut stt_ws_config,
+                    &mut tts_ws_config,
+                    &mut conversation_ws_config,
+                    &mut dag_ws_config,
+                );
+                info!(alias = %alias_name, resolved = ?echo, "Resolved server-side alias");
+                Some(echo)
+            }
+            None => {
+                // Unknown alias is NON-FATAL (plan rule #3): proceed with the client
+                // config and surface a `config_warning` advisory (reusing the P0/P2
+                // advisory channel) instead of a hard 400.
+                let (code, message) = crate::core::alias::unknown_alias_message(alias_name);
+                let _ = message_tx
+                    .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
+                        code,
+                        message,
+                        detail: Some(serde_json::json!({ "alias": alias_name })),
+                    }))
+                    .await;
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Generate stream_id if not provided by client
     let stream_id = resolve_stream_id(stream_id);
@@ -417,6 +459,7 @@ pub async fn handle_config_message(
             livekit_url: Some(app_state.config.livekit_public_url.clone()),
             waav_participant_identity: waav_identity,
             waav_participant_name: waav_name,
+            resolved_alias: resolved_alias.map(Box::new),
         }))
         .await;
 

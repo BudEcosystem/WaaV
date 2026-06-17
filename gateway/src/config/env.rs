@@ -375,6 +375,9 @@ impl ServerConfig {
             plugins,
             dag_timeouts,
             realtime_endpoint_overrides,
+            // Aliases are config.yaml-only (no env spelling for a whole {stt,tts,llm}
+            // bundle); the env-only path starts with an empty registry.
+            aliases: crate::core::alias::AliasConfig::default(),
         })
     }
 }

@@ -1,3 +1,9 @@
+/// Server-side ALIAS registry (P3): a logical name (e.g. `support-bot`) → a resolved
+/// `{stt, tts, llm}` / `dag_template` bundle, spliced into the session config BEFORE
+/// provider construction so ops can re-point providers with ZERO client redeploy.
+/// Mirrors the [`crate::dag::templates`] named-whole-DAG indirection primitive;
+/// SSRF-safe (definitions are server-config-only).
+pub mod alias;
 pub mod audio;
 pub mod cache;
 pub mod conversation;

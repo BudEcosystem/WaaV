@@ -439,12 +439,43 @@ async fn handle_realtime_incoming(
 
 /// Handle config message - create and connect provider
 async fn handle_config(
-    config: RealtimeSessionConfig,
+    mut config: RealtimeSessionConfig,
     realtime_provider: &mut Option<Box<dyn BaseRealtime>>,
     session_id: &mut Option<String>,
     message_tx: &mpsc::Sender<RealtimeMessageRoute>,
     app_state: &Arc<AppState>,
 ) -> bool {
+    // P3: resolve a server-side ALIAS into the session config BEFORE the provider /
+    // credential is selected. Definitions are server-config-only (SSRF-safe); explicit
+    // client fields win. Unknown alias is non-fatal (proceed + advisory). This mirrors
+    // the `/ws` config-handler resolution point.
+    if let Some(alias_name) = config.alias.clone() {
+        match crate::core::alias::global_aliases().resolve(&alias_name) {
+            Some(def) => {
+                let echo = crate::core::alias::splice_alias_realtime(
+                    &alias_name,
+                    &def,
+                    &mut config.provider,
+                    &mut config.model,
+                    &mut config.voice,
+                    &mut config.instructions,
+                );
+                info!(alias = %alias_name, resolved = ?echo, "Resolved server-side realtime alias");
+            }
+            None => {
+                let (code, message) = crate::core::alias::unknown_alias_message(&alias_name);
+                let _ = message_tx
+                    .send(RealtimeMessageRoute::Outgoing(
+                        RealtimeOutgoingMessage::Error {
+                            code: Some(code),
+                            message,
+                        },
+                    ))
+                    .await;
+            }
+        }
+    }
+
     let provider_name = config.provider.as_deref().unwrap_or(DEFAULT_PROVIDER);
     let model = config.model.as_deref().unwrap_or(DEFAULT_MODEL);
 
@@ -1059,6 +1090,7 @@ mod tests {
             output_audio_format: Some("pcm16".to_string()),
             reasoning_effort: Some(crate::core::llm::ReasoningEffort::Low),
             input_audio_noise_reduction: Some("near_field".to_string()),
+            alias: None,
         };
 
         // Step 1: the client→config converter must carry the full surface through

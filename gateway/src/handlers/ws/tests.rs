@@ -99,6 +99,7 @@ fn test_incoming_message_serialization() {
         livekit: None,
         dag_config: None,
         conversation_config: None,
+        alias: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -306,6 +307,7 @@ fn test_outgoing_message_serialization() {
         livekit_url: None,
         waav_participant_identity: None,
         waav_participant_name: None,
+        resolved_alias: None,
     };
     let json = serde_json::to_string(&ready_msg).unwrap();
     assert!(json.contains("\"type\":\"ready\""));
@@ -318,6 +320,7 @@ fn test_outgoing_message_serialization() {
         livekit_url: Some("ws://localhost:7880".to_string()),
         waav_participant_identity: Some("waav-ai".to_string()),
         waav_participant_name: Some("WaaV AI".to_string()),
+        resolved_alias: None,
     };
     let json_with_livekit = serde_json::to_string(&ready_msg_with_livekit).unwrap();
     assert!(json_with_livekit.contains("\"type\":\"ready\""));
@@ -746,6 +749,7 @@ fn test_incoming_message_config_with_livekit() {
         }),
         dag_config: None,
         conversation_config: None,
+        alias: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -796,6 +800,7 @@ fn test_incoming_message_config_without_livekit() {
         livekit: None,
         dag_config: None,
         conversation_config: None,
+        alias: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1119,6 +1124,7 @@ fn test_config_message_without_livekit_routing() {
         livekit: None, // No LiveKit configuration
         dag_config: None,
         conversation_config: None,
+        alias: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1186,6 +1192,7 @@ fn test_config_message_with_livekit_routing() {
         }),
         dag_config: None,
         conversation_config: None,
+        alias: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1376,6 +1383,7 @@ fn test_config_message_audio_disabled() {
         }),
         dag_config: None,
         conversation_config: None,
+        alias: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1450,6 +1458,7 @@ fn test_config_message_audio_default() {
         livekit: None,
         dag_config: None,
         conversation_config: None,
+        alias: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();

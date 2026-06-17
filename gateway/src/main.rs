@@ -128,6 +128,17 @@ async fn main() -> anyhow::Result<()> {
         ServerConfig::from_env().map_err(|e| anyhow!(e.to_string()))?
     };
 
+    // P3: register the server-side alias registry from config (the `aliases:` section).
+    // Mirrors the DAG template registry initialization; definitions are server-config-
+    // only (SSRF-safe). A client may NAME an alias on its `config` message but never
+    // DEFINE one. Done before serving so the first connection resolves correctly.
+    {
+        let n = waav_gateway::core::alias::initialize_aliases(&config.aliases);
+        if n > 0 {
+            info!("Registered {} server-side config alias(es)", n);
+        }
+    }
+
     // Initialize the plugin registry (including built-in plugins)
     let registry = global_registry();
 

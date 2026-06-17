@@ -89,6 +89,18 @@ pub enum IncomingMessage {
         /// is unchanged.
         #[serde(skip_serializing_if = "Option::is_none")]
         conversation_config: Option<ConversationWebSocketConfig>,
+        /// Optional server-side ALIAS name (P3). Resolves to a server-defined
+        /// `{stt, tts, llm}` / `dag_template` bundle BEFORE provider construction;
+        /// any explicit field above OVERRIDES the alias default. The client supplies
+        /// only the NAME — alias DEFINITIONS are server-config-only (`aliases:` in
+        /// `config.yaml`), so a client can never inject a backend url/credential
+        /// (SSRF-safe, mirroring `realtime_endpoint_overrides`). An unknown alias is
+        /// non-fatal: the session proceeds with the client config and a
+        /// `config_warning` (`alias_unknown`) is sent. The resolved concrete config is
+        /// echoed back on `ready` as `resolved_alias`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(example = "support-bot"))]
+        alias: Option<String>,
     },
     #[serde(rename = "speak")]
     Speak {
@@ -271,6 +283,17 @@ pub enum OutgoingMessage {
         /// Optional display name of the AI agent participant
         #[serde(skip_serializing_if = "Option::is_none")]
         waav_participant_name: Option<String>,
+        /// The CONCRETE config a server-side `alias` resolved to (P3), echoed so a
+        /// developer SEES what e.g. `support-bot` became (which STT/TTS/LLM providers)
+        /// and so SDK capability negotiation runs against the resolved providers.
+        /// Present only when the `config` message named an alias that was found. No
+        /// secrets are included (system prompt / api keys are omitted).
+        ///
+        /// Boxed to keep the hot-path `OutgoingMessage` variants (stt_result / audio /
+        /// message) small — the echo is only ever present on the one-per-session
+        /// `ready` frame.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resolved_alias: Option<Box<crate::core::alias::ResolvedAliasEcho>>,
     },
     #[serde(rename = "stt_result")]
     STTResult {
@@ -620,6 +643,7 @@ mod tests {
             livekit_url: Some("ws://localhost:7880".to_string()),
             waav_participant_identity: Some("waav-ai".to_string()),
             waav_participant_name: Some("WaaV AI".to_string()),
+            resolved_alias: None,
         };
 
         let json = serde_json::to_string(&ready).expect("Should serialize");
@@ -640,6 +664,7 @@ mod tests {
             livekit_url: None,
             waav_participant_identity: None,
             waav_participant_name: None,
+            resolved_alias: None,
         };
 
         let json = serde_json::to_string(&ready).expect("Should serialize");
@@ -659,6 +684,7 @@ mod tests {
             livekit_url: None,
             waav_participant_identity: None,
             waav_participant_name: None,
+            resolved_alias: None,
         };
 
         let json = serde_json::to_string(&ready).expect("Should serialize");
@@ -682,6 +708,7 @@ mod tests {
             livekit_url: None,
             waav_participant_identity: None,
             waav_participant_name: None,
+            resolved_alias: None,
         };
 
         let json = serde_json::to_string(&ready).expect("Should serialize");
@@ -698,6 +725,7 @@ mod tests {
             livekit_url: None,
             waav_participant_identity: None,
             waav_participant_name: None,
+            resolved_alias: None,
         };
 
         let json = serde_json::to_string(&ready).expect("Should serialize");
@@ -903,6 +931,7 @@ mod tests {
             livekit: None,
             dag_config: None,
             conversation_config: None,
+            alias: None,
         };
         assert!(msg.validate_size().is_ok());
     }

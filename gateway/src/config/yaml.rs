@@ -70,6 +70,13 @@ pub struct YamlConfig {
     pub security: Option<SecurityYaml>,
     pub plugins: Option<PluginsYaml>,
     pub dag_timeouts: Option<DAGTimeoutsYaml>,
+    /// Server-side ALIAS registry (P3): logical name → resolved `{stt, tts, llm}` /
+    /// `dag_template` bundle, spliced into a session's config BEFORE provider
+    /// construction so ops can re-point providers with ZERO client redeploy. These are
+    /// the ONLY place aliases can be DEFINED — a client may only NAME one (SSRF-safe,
+    /// like `realtime_endpoint_overrides`). `deny_unknown_fields` on the definition
+    /// makes a typo fail loudly at startup.
+    pub aliases: Option<std::collections::HashMap<String, crate::core::alias::AliasDefinition>>,
 }
 
 /// Server configuration from YAML

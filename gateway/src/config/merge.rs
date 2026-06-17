@@ -687,6 +687,13 @@ pub fn merge_config(
             .unwrap_or(30),
     };
 
+    // P3: server-side alias registry. config.yaml is the ONLY definition source (no env
+    // spelling for a whole {stt,tts,llm} bundle), so this is taken verbatim from the
+    // parsed YAML `aliases:` section (empty when absent). A client can never define one.
+    let aliases = crate::core::alias::AliasConfig {
+        aliases: yaml.aliases.clone().unwrap_or_default(),
+    };
+
     Ok(ServerConfig {
         host,
         port,
@@ -753,6 +760,7 @@ pub fn merge_config(
         plugins,
         dag_timeouts,
         realtime_endpoint_overrides,
+        aliases,
     })
 }
 
