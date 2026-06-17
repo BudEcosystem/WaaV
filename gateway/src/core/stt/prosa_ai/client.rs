@@ -1005,6 +1005,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let stt = ProsaStt::new_standard(&std_on).unwrap();
         assert!(stt.config.model.supports_streaming());

@@ -424,6 +424,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = YandexSTTConfig::from_standard(&std).unwrap();
         assert!(cfg.speaker_identification); // diarization
@@ -450,6 +451,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = YandexSTTConfig::from_standard(&std).unwrap();
         assert!(cfg.raw_results);
@@ -480,6 +482,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg2 = YandexSTTConfig::from_standard(&std_figures).unwrap();
         assert!(!cfg2.raw_results);

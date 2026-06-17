@@ -597,6 +597,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras(extras),
+            translation: None,
         };
         let cfg = TinkoffSttConfig::from_standard(&std).unwrap();
 

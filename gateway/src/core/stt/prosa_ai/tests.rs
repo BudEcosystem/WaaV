@@ -60,6 +60,7 @@ fn test_prosa_new_standard_unlocks_advanced_features() {
             ..Default::default()
         },
         extras: ProviderExtras::default(),
+        translation: None,
     };
     let stt = ProsaStt::new_standard(&std).expect("new_standard must succeed");
     let cfg = stt.get_prosa_config();

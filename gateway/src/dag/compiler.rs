@@ -383,6 +383,57 @@ impl DAGCompiler {
                 // Use try_new() for SSRF protection on the client-supplied base_url.
                 Arc::new(LlmEndpointNode::try_new(&def.id, llm_config)?)
             }
+            NodeType::Translate {
+                target_language,
+                source_language,
+                base_url,
+                model,
+                api_key,
+                backend: _backend,
+                system_prompt,
+                temperature,
+                max_tokens,
+                timeout_ms,
+                headers,
+            } => {
+                // P5: the canonical translate node DESUGARS to the proven LlmEndpoint executor —
+                // no new execution path. We synthesize a translation system prompt from the
+                // canonical languages (unless overridden) and reuse all LLM plumbing (SSRF guard,
+                // ${ENV_VAR} resolution, vendor adapters). `backend` is reserved for a future
+                // provider-side-channel; anything other than the default falls back here (additive).
+                let prompt = system_prompt.clone().unwrap_or_else(|| {
+                    let tgt = target_language.as_bcp47();
+                    match source_language {
+                        Some(src) => format!(
+                            "You are a translation engine. Translate the user's text from {} into {}. \
+                             Output ONLY the translation — no source text, no transliteration, no notes, \
+                             no explanations.",
+                            src.as_bcp47(),
+                            tgt
+                        ),
+                        None => format!(
+                            "You are a translation engine. Translate the user's text into {tgt}. \
+                             Output ONLY the translation — no source text, no transliteration, no notes, \
+                             no explanations."
+                        ),
+                    }
+                });
+                let llm_config = LlmEndpointConfig {
+                    base_url: base_url.clone(),
+                    model: model.clone(),
+                    api_key: api_key.clone(),
+                    system_prompt: Some(prompt),
+                    // Translation wants low variance + enough tokens for reasoning translators
+                    // (the proven Sarvam template returns null content if max_tokens is starved).
+                    temperature: Some(temperature.unwrap_or(0.1)),
+                    max_tokens: Some(max_tokens.unwrap_or(4000)),
+                    streaming: false,
+                    timeout_ms: timeout_ms.unwrap_or(60000),
+                    headers: headers.clone(),
+                    ..Default::default()
+                };
+                Arc::new(LlmEndpointNode::try_new(&def.id, llm_config)?)
+            }
             NodeType::WebhookOutput { url, headers } => {
                 // Use try_new() for SSRF protection (S6): webhook URLs are client-supplied.
                 let mut node = WebhookOutputNode::try_new(&def.id, url)?;
@@ -1018,6 +1069,130 @@ mod tests {
         assert!(
             compiler.compile(dag).is_ok(),
             "public LLM base_url should compile"
+        );
+    }
+
+    /// P5: the canonical `translate` node round-trips from its minimal wire form and DESUGARS to
+    /// the proven LlmEndpoint executor (so STT→translate→TTS compiles with zero new exec path).
+    #[test]
+    fn test_translate_node_roundtrips_and_compiles() {
+        use crate::core::lang::CanonicalLanguage;
+
+        // (1) Minimal wire form round-trips through serde with `type: "translate"`.
+        let wire = r#"{
+            "id": "translate",
+            "type": "translate",
+            "target_language": "hi-IN",
+            "base_url": "https://api.sarvam.ai/v1",
+            "model": "sarvam-30b",
+            "api_key": "${SARVAM_API_KEY}"
+        }"#;
+        let def: NodeDefinition = serde_json::from_str(wire).unwrap();
+        match &def.node_type {
+            NodeType::Translate {
+                target_language,
+                source_language,
+                base_url,
+                model,
+                ..
+            } => {
+                assert_eq!(*target_language, CanonicalLanguage::HiIn);
+                assert!(source_language.is_none());
+                assert_eq!(base_url, "https://api.sarvam.ai/v1");
+                assert_eq!(model, "sarvam-30b");
+            }
+            other => panic!("expected Translate, got {other:?}"),
+        }
+
+        // (2) An STT→translate→TTS DAG compiles (the translate node desugars to LlmEndpoint).
+        let compiler = DAGCompiler::new();
+        let mut dag = DAGDefinition::new("stt-translate-tts", "EN→HI uniform");
+        dag.add_node(NodeDefinition::new("input", NodeType::AudioInput));
+        dag.add_node(
+            NodeDefinition::new(
+                "stt",
+                NodeType::SttProvider {
+                    provider: "deepgram".to_string(),
+                    model: Some("nova-2".to_string()),
+                    language: Some("en-US".to_string()),
+                },
+            ),
+        );
+        dag.add_node(def); // the translate node parsed above
+        dag.add_node(NodeDefinition::new(
+            "tts",
+            NodeType::TtsProvider {
+                provider: "elevenlabs".to_string(),
+                voice_id: Some("21m00Tcm4TlvDq8ikWAM".to_string()),
+                model: Some("eleven_multilingual_v2".to_string()),
+            },
+        ));
+        dag.add_edge(EdgeDefinition::new("input", "stt"));
+        dag.add_edge(EdgeDefinition::new("stt", "translate"));
+        dag.add_edge(EdgeDefinition::new("translate", "tts"));
+        dag.with_entry("input");
+        dag.add_exit("tts");
+
+        assert!(
+            compiler.compile(dag).is_ok(),
+            "STT→translate→TTS should compile (translate desugars to LlmEndpoint)"
+        );
+    }
+
+    /// P5: a translate node with a custom `system_prompt` and a source-language hint round-trips,
+    /// and an SSRF-unsafe base_url is rejected (it reuses the LlmEndpoint SSRF guard).
+    #[test]
+    fn test_translate_node_custom_prompt_and_ssrf_guard() {
+        use crate::core::lang::CanonicalLanguage;
+        let node = NodeType::Translate {
+            target_language: CanonicalLanguage::FrFr,
+            source_language: Some(CanonicalLanguage::EnUs),
+            base_url: "https://api.openai.com/v1".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            api_key: Some("${OPENAI_API_KEY}".to_string()),
+            backend: None,
+            system_prompt: Some("Translate to French, formal register.".to_string()),
+            temperature: Some(0.0),
+            max_tokens: Some(512),
+            timeout_ms: None,
+            headers: HashMap::new(),
+        };
+        // Round-trips with the source hint + custom prompt preserved.
+        let v = serde_json::to_value(&node).unwrap();
+        assert_eq!(v["type"], "translate");
+        assert_eq!(v["source_language"], "en-US");
+        assert_eq!(v["target_language"], "fr-FR");
+        let back: NodeType = serde_json::from_value(v).unwrap();
+        assert!(matches!(back, NodeType::Translate { .. }));
+
+        // SSRF guard: a loopback/private base_url must be rejected at compile (LlmEndpoint path).
+        let compiler = DAGCompiler::new();
+        let mut dag = DAGDefinition::new("ssrf-translate", "SSRF");
+        dag.add_node(NodeDefinition::new("input", NodeType::TextInput));
+        dag.add_node(NodeDefinition::new(
+            "translate",
+            NodeType::Translate {
+                target_language: CanonicalLanguage::FrFr,
+                source_language: None,
+                base_url: "http://169.254.169.254/latest/meta-data".to_string(),
+                model: "x".to_string(),
+                api_key: None,
+                backend: None,
+                system_prompt: None,
+                temperature: None,
+                max_tokens: None,
+                timeout_ms: None,
+                headers: HashMap::new(),
+            },
+        ));
+        dag.add_node(NodeDefinition::new("output", NodeType::Passthrough));
+        dag.add_edge(EdgeDefinition::new("input", "translate"));
+        dag.add_edge(EdgeDefinition::new("translate", "output"));
+        dag.with_entry("input");
+        dag.add_exit("output");
+        assert!(
+            compiler.compile(dag).is_err(),
+            "translate with an SSRF-unsafe base_url must be rejected"
         );
     }
 }

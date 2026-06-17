@@ -535,6 +535,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = AzureSTTConfig::from_standard(&std);
         assert!(!cfg.interim_results); // interim_results
@@ -748,6 +749,7 @@ mod tests {
             },
             features,
             extras: ProviderExtras(extras),
+            translation: None,
         };
         let cfg = AzureSTTConfig::from_standard(&std);
         let body = cfg
@@ -763,6 +765,7 @@ mod tests {
             base: STTConfig { provider: "azure".into(), api_key: "k".into(), ..Default::default() },
             features: SttFeatures::default(),
             extras: ProviderExtras::default(),
+            translation: None,
         });
         assert!(!cfg.has_speech_context());
         assert!(cfg.build_speech_context_body().is_none());

@@ -624,6 +624,7 @@ mod tests {
                     .unwrap()
                     .clone(),
             ),
+            translation: None,
         };
         let stt = GnaniSTT::new_standard(&std).expect("new_standard should succeed");
         let cfg = stt.config.expect("config should be set");

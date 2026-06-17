@@ -622,6 +622,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let stt = SberDevicesSTT::new_standard(&std).unwrap();
         use base64::{Engine, engine::general_purpose::STANDARD};

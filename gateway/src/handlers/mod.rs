@@ -21,6 +21,7 @@ pub mod realtime;
 pub mod recording;
 pub mod sip;
 pub mod speak;
+pub mod transcribe;
 pub mod voices;
 pub mod ws;
 

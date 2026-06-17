@@ -591,6 +591,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = RevAISTTConfig::from_standard(&std).unwrap();
         assert!(cfg.enable_speaker_switch); // diarization
@@ -617,6 +618,7 @@ mod tests {
             },
             features: Default::default(),
             extras: ProviderExtras(extras),
+            translation: None,
         };
         let cfg = RevAISTTConfig::from_standard(&std).unwrap();
         // mapped onto the config struct...

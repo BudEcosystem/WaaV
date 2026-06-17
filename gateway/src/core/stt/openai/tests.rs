@@ -664,6 +664,7 @@ mod client_tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let stt = OpenAISTT::new_standard(&std).unwrap();
         let config = stt.config.as_ref().unwrap();
@@ -676,6 +677,39 @@ mod client_tests {
             ..Default::default()
         });
         assert!(OpenAISTT::new_standard(&bad).is_err());
+    }
+
+    #[test]
+    fn from_standard_translation_flips_to_translations_endpoint() {
+        // P5 (Class B): the canonical translation block selects the English-only
+        // `/v1/audio/translations` endpoint (Whisper translations always output English).
+        use crate::core::stt::standard::{StandardSTTConfig, TranslationConfig};
+        let mut std = StandardSTTConfig::from_base(STTConfig {
+            provider: "openai".into(),
+            api_key: "sk-test-key".into(),
+            ..Default::default()
+        });
+        // Even an arbitrary target list degrades to the English endpoint (warn handled upstream).
+        std.translation = Some(TranslationConfig {
+            translate_to_english: Some(true),
+            ..Default::default()
+        });
+        let cfg = OpenAISTTConfig::from_standard(&std);
+        assert!(cfg.translate_to_english);
+        assert!(
+            cfg.api_url().ends_with("/v1/audio/translations"),
+            "endpoint should flip to translations: {}",
+            cfg.api_url()
+        );
+
+        // Without translation it stays on transcriptions.
+        let plain = OpenAISTTConfig::from_standard(&StandardSTTConfig::from_base(STTConfig {
+            provider: "openai".into(),
+            api_key: "sk-test-key".into(),
+            ..Default::default()
+        }));
+        assert!(!plain.translate_to_english);
+        assert!(plain.api_url().ends_with("/v1/audio/transcriptions"));
     }
 }
 

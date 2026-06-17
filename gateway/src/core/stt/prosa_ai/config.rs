@@ -634,6 +634,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = ProsaSttConfig::from_standard(&std).unwrap();
         assert!(!cfg.include_partial); // interim_results

@@ -335,6 +335,14 @@ pub struct STTWebSocketConfig {
     #[serde(default)]
     pub extras: crate::core::stt::standard::ProviderExtras,
 
+    /// P5 canonical translation block: `{ target_languages: [CanonicalLanguage], translate_to_english?,
+    /// partials? }`. `None` = no translation. Threaded across the dispatch boundary via
+    /// [`Self::to_standard_stt`] so translation-capable providers (Speechmatics/Gladia side-channel,
+    /// OpenAI/Groq English fast path) emit `translations[]{lang,text}`; unsupported providers degrade
+    /// with a `config_warning`, never a 400.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translation: Option<crate::core::stt::standard::TranslationConfig>,
+
     /// ML turn detection for this session (P1.2): runs the audio-based
     /// smart-turn detector on the live frame path so end-of-turn is PREDICTED
     /// instead of waiting out the provider's silence endpointing. Standardized
@@ -418,6 +426,7 @@ impl STTWebSocketConfig {
             base: self.to_stt_config(api_key),
             features: self.features.clone(),
             extras: self.extras.clone(),
+            translation: self.translation.clone(),
         }
     }
 }
@@ -960,6 +969,7 @@ mod config_tests {
             features: Default::default(),
             extras: Default::default(),
             turn_detection: None,
+            translation: None,
         }
     }
 

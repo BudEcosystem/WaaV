@@ -47,6 +47,12 @@ pub struct AppState {
     /// clone (and every session loop selecting on `shutdown.cancelled()`)
     /// observes the same cancellation.
     pub shutdown: CancellationToken,
+
+    /// P5 batched-STT job store: `job_id` → [`BatchJob`](crate::core::stt::batch::BatchJob).
+    /// Holds results for async callback jobs and poll-stored synchronous jobs so
+    /// `GET /transcribe/batch/{job_id}` can return them. In-process (single-node); a multi-node
+    /// deployment would back this with a shared store.
+    pub batch_jobs: Arc<DashMap<String, crate::core::stt::batch::BatchJob>>,
 }
 
 impl AppState {
@@ -306,6 +312,7 @@ impl AppState {
             active_ws_connections: Arc::new(AtomicUsize::new(0)),
             connections_per_ip: Arc::new(DashMap::new()),
             shutdown: CancellationToken::new(),
+            batch_jobs: Arc::new(DashMap::new()),
         })
     }
 

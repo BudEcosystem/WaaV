@@ -811,6 +811,7 @@ mod tests {
                 ..Default::default()
             },
             extras: Default::default(),
+            translation: None,
         };
         let stt = CartesiaSTT::new_standard(&std).unwrap();
         assert_eq!(

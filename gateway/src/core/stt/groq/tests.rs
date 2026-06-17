@@ -968,6 +968,7 @@ mod client_tests {
                 ..Default::default()
             },
             extras: Default::default(),
+            translation: None,
         };
         let stt = GroqSTT::new_standard(&std).expect("new_standard should succeed");
         let cfg = stt.config.as_ref().expect("config should be set");
@@ -1589,6 +1590,7 @@ mod audio_url_wire_tests {
             },
             features: Default::default(),
             extras: ProviderExtras(extras),
+            translation: None,
         }
     }
 

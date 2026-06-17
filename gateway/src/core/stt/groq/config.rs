@@ -516,6 +516,16 @@ impl GroqSTTConfig {
         let f = &std.features;
         let mut cfg = Self::from_base(std.base.clone());
         cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        // P5 translation (Class B — English-only fast path): the canonical translation block
+        // flips Groq to the `/audio/translations` endpoint when ENGLISH output is requested. Groq
+        // (like OpenAI Whisper) cannot target arbitrary languages, so any non-noop translation
+        // request selects the translations endpoint (arbitrary targets are degraded to English and
+        // surfaced as a `config_warning` via `TranslationConfig::warnings_for`).
+        if let Some(t) = &std.translation
+            && !t.is_noop()
+        {
+            cfg.translate_to_english = true;
+        }
         if let Some(true) = f.word_timestamps {
             cfg.response_format = GroqResponseFormat::VerboseJson;
             if !cfg
@@ -692,6 +702,7 @@ mod tests {
                 ..Default::default()
             },
             extras: Default::default(),
+            translation: None,
         };
         let cfg = GroqSTTConfig::from_standard(&std);
         // The one mappable feature reaches its field.

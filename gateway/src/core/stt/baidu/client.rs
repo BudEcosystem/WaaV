@@ -949,6 +949,7 @@ mod tests {
             },
             features: Default::default(),
             extras: ProviderExtras(extras),
+            translation: None,
         };
         let stt = BaiduStt::new_standard(&std).unwrap();
         assert_eq!(stt.config.lm_id, Some(98765));

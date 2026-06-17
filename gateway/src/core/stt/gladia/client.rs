@@ -742,6 +742,7 @@ mod tests {
             },
             features: Default::default(),
             extras: ProviderExtras(extras.as_object().unwrap().clone()),
+            translation: None,
         }
     }
 

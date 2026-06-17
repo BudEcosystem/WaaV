@@ -653,6 +653,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let stt = ReverieSTT::new_standard(&std).expect("new_standard must succeed");
         assert_eq!(stt.reverie_config.api_key, "test-api-key");

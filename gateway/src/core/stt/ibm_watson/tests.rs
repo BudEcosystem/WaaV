@@ -718,6 +718,7 @@ fn new_standard_unlocks_advanced_features_and_instance_id() {
             ..Default::default()
         },
         extras: ProviderExtras(extras),
+        translation: None,
     };
     let stt = IbmWatsonSTT::new_standard(&std).expect("new_standard should succeed");
     let cfg = stt.get_ibm_config().expect("ibm config should be set");

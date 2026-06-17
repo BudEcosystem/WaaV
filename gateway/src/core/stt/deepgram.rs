@@ -1643,6 +1643,7 @@ mod tests {
                 ..Default::default()
             },
             extras: Default::default(),
+            translation: None,
         };
         let cfg = DeepgramSTTConfig::from_standard(&std_cfg);
         // Config fields mapped from the standardized features.
@@ -1715,6 +1716,7 @@ mod tests {
                 ..Default::default()
             },
             extras: Default::default(),
+            translation: None,
         };
         let cfg = DeepgramSTTConfig::from_standard(&std_cfg);
         // Supported features mapped onto the config...
@@ -1819,6 +1821,7 @@ mod tests {
                 ..Default::default()
             },
             extras,
+            translation: None,
         };
         let cfg = DeepgramSTTConfig::from_standard(&std_cfg);
         // Mapped onto the config...

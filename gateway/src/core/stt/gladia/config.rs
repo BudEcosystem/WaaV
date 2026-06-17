@@ -567,6 +567,27 @@ impl GladiaSTTConfig {
             cfg.language_config = GladiaLanguageConfig::auto();
         }
 
+        // P5 translation (Class A — arbitrary targets): the canonical block maps to
+        // `realtime_processing.translation` + `translation_target_languages` (ISO-639-1). Gladia
+        // imposes no documented hard cap, so no truncation. `partials` is reflected onto the live
+        // partial-transcript channel (Gladia translation partials ride the partial-transcript flow).
+        if let Some(t) = &std.translation
+            && !t.is_noop()
+        {
+            let targets: Vec<String> = t
+                .target_iso639_1(None)
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+            if !targets.is_empty() {
+                cfg.realtime_processing.translation = true;
+                cfg.realtime_processing.translation_target_languages = targets;
+                if let Some(p) = t.partials {
+                    cfg.messages_config.receive_partial_transcripts = p;
+                }
+            }
+        }
+
         // --- Newly-wired Gladia features via the open ProviderExtras passthrough ---------------
         // All map onto nested fields of the session-init body (realtime_processing /
         // post_processing / messages_config) and are confirmed Gladia v2 Live params.

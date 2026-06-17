@@ -513,6 +513,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = PhonexiaSTTConfig::from_standard(&std).unwrap();
         assert!(!cfg.enable_timestamps); // word_timestamps
@@ -547,6 +548,7 @@ mod tests {
             },
             features: SttFeatures::default(),
             extras: ProviderExtras(extras),
+            translation: None,
         };
 
         let cfg = PhonexiaSTTConfig::from_standard(&std).unwrap();

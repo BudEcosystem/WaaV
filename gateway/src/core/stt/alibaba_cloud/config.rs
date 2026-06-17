@@ -762,6 +762,7 @@ mod tests {
                 ..Default::default()
             },
             extras,
+            translation: None,
         };
         let cfg = DashScopeSttConfig::from_standard(&std).unwrap();
         // Honored: registered vocabulary id (extras), filler removal, and the endpointing window.

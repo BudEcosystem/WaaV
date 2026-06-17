@@ -114,6 +114,13 @@ use crate::handlers::{
         SttFeatures,
         TtsFeatures,
         ProviderExtras,
+        // P5 canonical translation vocabulary (referenced by STTWebSocketConfig.translation)
+        crate::core::stt::standard::TranslationConfig,
+        crate::core::stt::standard::Translation,
+        // P5 batched / async STT vocabulary (POST /transcribe/batch)
+        crate::core::stt::batch::BatchFeatures,
+        crate::core::stt::batch::BatchJob,
+        crate::core::stt::batch::BatchStatus,
         // Emotion control vocabulary referenced by TTSWebSocketConfig
         Emotion,
         EmotionIntensity,

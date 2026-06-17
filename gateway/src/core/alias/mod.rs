@@ -342,6 +342,7 @@ fn default_alias_stt() -> STTWebSocketConfig {
         api_key: None,
         features: Default::default(),
         extras: Default::default(),
+        translation: None,
         turn_detection: None,
     }
 }

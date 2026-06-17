@@ -539,6 +539,17 @@ pub struct SpeechmaticsSTTConfig {
     /// region endpoint from `ws_url()`. Only the dialed scheme://host is swapped; the `/v2` path is
     /// preserved (a path-less URL fails the WS handshake).
     pub endpoint_override: Option<String>,
+
+    /// P5 translation (Class A): target languages (ISO-639-1) for the `translation_config` PEER
+    /// object (a sibling of `transcription_config`, NOT nested inside it). Empty = no translation.
+    /// Speechmatics accepts at most 5; the canonical mapper truncates + warns. Source language is
+    /// the normal `transcription_config.language`. Stream output arrives as `AddTranslation` /
+    /// `AddPartialTranslation` messages folded into the uniform `translations[]`.
+    pub translation_target_languages: Vec<String>,
+
+    /// P5 translation: emit `AddPartialTranslation` (interim) alongside finals
+    /// (`translation_config.enable_partials`). `None` = provider default (finals only).
+    pub translation_enable_partials: Option<bool>,
 }
 
 impl Default for SpeechmaticsSTTConfig {
@@ -569,6 +580,8 @@ impl Default for SpeechmaticsSTTConfig {
             max_delay_mode: None,
             vocab_sounds_like: std::collections::BTreeMap::new(),
             endpoint_override: None,
+            translation_target_languages: Vec::new(),
+            translation_enable_partials: None,
         }
     }
 }
@@ -724,6 +737,21 @@ impl SpeechmaticsSTTConfig {
         }
         // Standardized endpoint override (mock/proxy host) for credential-free integration tests.
         cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        // P5 translation (Class A — arbitrary targets): the canonical block maps to the
+        // `translation_config` PEER object. `target_iso639_1(Some(5))` caps to Speechmatics' MAX 5
+        // (the truncation is surfaced as a `config_warning` by `TranslationConfig::warnings_for`).
+        if let Some(t) = &std.translation
+            && !t.is_noop()
+        {
+            cfg.translation_target_languages = t
+                .target_iso639_1(Some(
+                    crate::core::stt::standard::SPEECHMATICS_MAX_TRANSLATION_TARGETS,
+                ))
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+            cfg.translation_enable_partials = t.partials;
+        }
         Ok(cfg)
     }
 
@@ -838,12 +866,44 @@ mod tests {
                 ..Default::default()
             },
             extras: Default::default(),
+            translation: None,
         };
         let cfg = SpeechmaticsSTTConfig::from_standard(&std).unwrap();
         assert!(cfg.enable_diarization);
         assert!(cfg.enable_entities);
         assert_eq!(cfg.additional_vocab, vec!["WaaV", "Speechmatics"]);
         assert!(!cfg.enable_partials);
+    }
+
+    #[test]
+    fn from_standard_maps_canonical_translation_to_peer_object() {
+        // P5: the canonical translation block (Class A) → `translation_config` peer fields,
+        // canonical BCP-47 → ISO-639-1, with the Speechmatics MAX-5 cap applied.
+        use crate::core::lang::CanonicalLanguage;
+        use crate::core::stt::standard::{StandardSTTConfig, TranslationConfig};
+        let mut std = StandardSTTConfig::from_base(STTConfig {
+            provider: "speechmatics".into(),
+            api_key: "k".into(),
+            ..Default::default()
+        });
+        std.translation = Some(TranslationConfig {
+            target_languages: vec![
+                CanonicalLanguage::EsEs,
+                CanonicalLanguage::DeDe,
+                CanonicalLanguage::FrFr,
+                CanonicalLanguage::ItIt,
+                CanonicalLanguage::PtPt,
+                CanonicalLanguage::NlNl, // 6th → truncated by the cap
+            ],
+            translate_to_english: None,
+            partials: Some(true),
+        });
+        let cfg = SpeechmaticsSTTConfig::from_standard(&std).unwrap();
+        assert_eq!(
+            cfg.translation_target_languages,
+            vec!["es", "de", "fr", "it", "pt"]
+        );
+        assert_eq!(cfg.translation_enable_partials, Some(true));
     }
 
     #[test]

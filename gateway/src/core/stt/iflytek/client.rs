@@ -973,6 +973,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let stt = IFlytekStt::new_standard(&std).unwrap();
         assert_eq!(stt.config.vad_eos_ms, 1500); // endpointing_ms survived to provider config

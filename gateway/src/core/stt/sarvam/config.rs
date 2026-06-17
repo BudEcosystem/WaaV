@@ -354,6 +354,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = SarvamSTTConfig::from_standard(&std);
         assert!(!cfg.vad_signals); // vad_events -> vad_signals
@@ -389,6 +390,7 @@ mod tests {
             },
             features: Default::default(),
             extras: ProviderExtras(extras),
+            translation: None,
         };
         let cfg = SarvamSTTConfig::from_standard(&std);
         let url = cfg.build_websocket_url();

@@ -217,6 +217,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = FptSttConfig::from_standard(&std).unwrap();
         assert_eq!(cfg.api_key, "test_key");

@@ -808,6 +808,7 @@ mod tests {
                 ..Default::default()
             },
             extras: Default::default(),
+            translation: None,
         };
         let cfg = AwsTranscribeSTTConfig::from_standard(&std);
         assert!(cfg.show_speaker_label);

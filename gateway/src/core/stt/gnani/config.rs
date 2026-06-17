@@ -433,6 +433,7 @@ mod tests {
                     .unwrap()
                     .clone(),
             ),
+            translation: None,
         };
         let cfg = GnaniSTTConfig::from_standard(&std).unwrap();
         assert!(!cfg.interim_results);

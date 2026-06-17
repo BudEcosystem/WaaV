@@ -592,6 +592,7 @@ mod tests {
                 ..Default::default()
             },
             extras: Default::default(),
+            translation: None,
         };
         let stt = BhashiniStt::new_standard(&std).unwrap();
         assert_eq!(stt.config.user_id, "user123");

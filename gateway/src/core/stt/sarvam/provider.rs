@@ -954,6 +954,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let stt = SarvamSTT::new_standard(&std).unwrap();
         let sarvam_config = stt.sarvam_config.as_ref().expect("sarvam_config set");

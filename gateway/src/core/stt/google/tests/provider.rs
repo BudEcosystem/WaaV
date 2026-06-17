@@ -130,6 +130,7 @@ async fn new_standard_unlocks_features_and_project_id() {
             ..Default::default()
         },
         extras: ProviderExtras(extras),
+        translation: None,
     };
     let stt = GoogleSTT::new_standard(&std).expect("new_standard should build a valid client");
     let cfg = stt.config.as_ref().expect("config should be set");

@@ -521,6 +521,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let stt = ViettelStt::new_standard(&std).unwrap();
         let cfg = stt.get_viettel_config();

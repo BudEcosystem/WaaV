@@ -450,6 +450,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let stt = NaverClovaStt::new_standard(&std).unwrap();
         assert_eq!(stt.config.client_id, "test_client_id"); // base api_key survived

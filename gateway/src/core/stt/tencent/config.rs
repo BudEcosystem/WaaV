@@ -887,6 +887,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = TencentSttConfig::from_standard(&std).unwrap();
         assert_eq!(cfg.filter_dirty, TencentFilterDirtyMode::Filter); // profanity_filter

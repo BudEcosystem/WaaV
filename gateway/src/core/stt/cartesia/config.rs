@@ -370,6 +370,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = CartesiaSTTConfig::from_standard(&std);
         assert_eq!(cfg.max_silence_duration_secs, Some(0.5)); // endpointing_ms -> seconds
@@ -391,6 +392,7 @@ mod tests {
             },
             features: SttFeatures::default(),
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = CartesiaSTTConfig::from_standard(&std);
         assert_eq!(cfg.model, "ink-2");
@@ -413,6 +415,7 @@ mod tests {
             },
             features: SttFeatures::default(),
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = CartesiaSTTConfig::from_standard(&std);
         assert_eq!(cfg.encoding, CartesiaAudioEncoding::PcmMulaw);
@@ -452,6 +455,7 @@ mod tests {
             },
             features: SttFeatures::default(),
             extras: ProviderExtras(extras),
+            translation: None,
         };
         let cfg = CartesiaSTTConfig::from_standard(&std);
         assert_eq!(cfg.access_token.as_deref(), Some("ephemeral-xyz"));

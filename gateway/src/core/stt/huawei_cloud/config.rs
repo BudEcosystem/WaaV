@@ -929,6 +929,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = HuaweiCloudSttConfig::from_standard(&std).unwrap();
         assert!(cfg.need_word_info); // word_timestamps

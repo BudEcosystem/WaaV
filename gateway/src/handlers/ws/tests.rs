@@ -21,6 +21,7 @@ fn test_ws_config_serialization() {
         features: Default::default(),
         extras: Default::default(),
             turn_detection: None,
+        translation: None,
     };
 
     let json = serde_json::to_string(&stt_ws_config).unwrap();
@@ -76,6 +77,7 @@ fn test_incoming_message_serialization() {
             features: Default::default(),
             extras: Default::default(),
             turn_detection: None,
+            translation: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -382,6 +384,7 @@ fn test_stt_ws_config_conversion() {
         features: Default::default(),
         extras: Default::default(),
             turn_detection: None,
+        translation: None,
     };
 
     let api_key = "test_api_key".to_string();
@@ -726,6 +729,7 @@ fn test_incoming_message_config_with_livekit() {
             features: Default::default(),
             extras: Default::default(),
             turn_detection: None,
+            translation: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -784,6 +788,7 @@ fn test_incoming_message_config_without_livekit() {
             features: Default::default(),
             extras: Default::default(),
             turn_detection: None,
+            translation: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -1110,6 +1115,7 @@ fn test_config_message_without_livekit_routing() {
             features: Default::default(),
             extras: Default::default(),
             turn_detection: None,
+            translation: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -1173,6 +1179,7 @@ fn test_config_message_with_livekit_routing() {
             features: Default::default(),
             extras: Default::default(),
             turn_detection: None,
+            translation: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -1446,6 +1453,7 @@ fn test_config_message_audio_default() {
             features: Default::default(),
             extras: Default::default(),
             turn_detection: None,
+            translation: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,

@@ -588,6 +588,7 @@ mod tests {
                 .unwrap()
                 .clone(),
             ),
+            translation: None,
         };
         let cfg = GnaniSTTConfig::from_standard(&std).expect("from_standard");
         let md = create_gnani_metadata(&cfg).expect("metadata");

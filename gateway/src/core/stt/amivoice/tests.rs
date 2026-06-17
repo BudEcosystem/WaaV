@@ -729,6 +729,7 @@ fn test_new_standard_unlocks_diarization_and_interim() {
             ..Default::default()
         },
         extras: Default::default(),
+        translation: None,
     };
     let stt = AmiVoiceSTT::new_standard(&std).unwrap();
     let cfg = stt.get_amivoice_config().unwrap();

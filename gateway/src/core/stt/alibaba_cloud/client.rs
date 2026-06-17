@@ -891,6 +891,7 @@ mod tests {
                 ..Default::default()
             },
             extras,
+            translation: None,
         };
         let stt = DashScopeStt::new_standard(&std).unwrap();
         assert_eq!(stt.config.vocabulary_id.as_deref(), Some("vocab-xyz"));
@@ -1031,6 +1032,7 @@ mod tests {
             base,
             features: Default::default(),
             extras,
+            translation: None,
         };
         let stt = DashScopeStt::new_standard(&std).unwrap();
         assert_eq!(stt.config.multi_threshold_mode_enabled, Some(true));
@@ -1057,6 +1059,7 @@ mod tests {
             base: create_test_config(), // qwen3-asr-flash-realtime
             features: Default::default(),
             extras,
+            translation: None,
         };
         let stt = DashScopeStt::new_standard(&std).unwrap();
         assert_eq!(stt.config.turn_detection_threshold, Some(0.8));

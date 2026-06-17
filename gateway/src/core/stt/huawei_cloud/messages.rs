@@ -675,6 +675,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras(extras),
+            translation: None,
         };
 
         let cfg = HuaweiCloudSttConfig::from_standard(&std).expect("from_standard");

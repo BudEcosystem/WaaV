@@ -810,6 +810,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let stt = TencentStt::new_standard(&std).unwrap();
         assert_eq!(stt.config.word_info, TencentWordInfo::Basic); // word_timestamps
@@ -973,6 +974,7 @@ mod tests {
             },
             features: Default::default(),
             extras: ProviderExtras(extras),
+            translation: None,
         };
         let stt = TencentStt::new_standard(&std).unwrap();
         let url = stt.build_ws_url().unwrap();

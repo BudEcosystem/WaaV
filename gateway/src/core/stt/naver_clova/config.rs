@@ -397,6 +397,7 @@ mod tests {
             },
             features: SttFeatures::default(),
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = NaverClovaSttConfig::from_standard(&std).unwrap();
         assert_eq!(cfg.client_id, "client_id"); // base api_key carried through

@@ -266,6 +266,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras(extras),
+            translation: None,
         };
         let cfg = GoogleSTTConfig::from_standard(&std);
         assert!(!cfg.interim_results);

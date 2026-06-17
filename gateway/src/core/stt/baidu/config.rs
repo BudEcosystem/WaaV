@@ -557,6 +557,7 @@ mod tests {
             },
             features: SttFeatures::default(),
             extras: ProviderExtras(extras),
+            translation: None,
         };
         let cfg = BaiduSttConfig::from_standard(&std).unwrap();
         assert_eq!(cfg.lm_id, Some(98765)); // custom vocabulary model id from provider_extras

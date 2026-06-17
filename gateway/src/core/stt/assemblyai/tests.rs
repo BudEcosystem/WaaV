@@ -387,6 +387,7 @@ mod client_tests {
                 ..Default::default()
             },
             extras: Default::default(),
+            translation: None,
         };
         let stt = AssemblyAISTT::new_standard(&std).unwrap();
         assert!(!stt.config.as_ref().unwrap().include_word_timestamps);

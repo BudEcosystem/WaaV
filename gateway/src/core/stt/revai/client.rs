@@ -709,6 +709,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let stt = RevAISTT::new_standard(&std).expect("new_standard must succeed");
         assert!(stt.revai_config.enable_speaker_switch); // diarization

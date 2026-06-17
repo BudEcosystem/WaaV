@@ -809,6 +809,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras(extras),
+            translation: None,
         };
         let cfg = IbmWatsonSTTConfig::from_standard(&std);
         assert!(cfg.speaker_labels);
@@ -852,6 +853,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras(extras),
+            translation: None,
         };
 
         let cfg = IbmWatsonSTTConfig::from_standard(&std);

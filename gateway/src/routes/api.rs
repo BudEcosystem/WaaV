@@ -4,7 +4,7 @@ use axum::{
 };
 use tower_http::trace::TraceLayer;
 
-use crate::handlers::{capabilities, dag, livekit, recording, sip, speak, voices};
+use crate::handlers::{capabilities, dag, livekit, recording, sip, speak, transcribe, voices};
 use crate::state::AppState;
 use std::sync::Arc;
 
@@ -41,5 +41,8 @@ pub fn create_api_router() -> Router<Arc<AppState>> {
         .route("/dag/templates", get(dag::list_templates))
         .route("/dag/templates/{template_name}", get(dag::get_template))
         .route("/dag/validate", post(dag::validate_dag))
+        // P5 batched / async STT: submit a prerecorded job + poll it by id.
+        .route("/transcribe/batch", post(transcribe::submit_batch))
+        .route("/transcribe/batch/{job_id}", get(transcribe::get_batch))
         .layer(TraceLayer::new_for_http())
 }

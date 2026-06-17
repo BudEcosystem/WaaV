@@ -483,6 +483,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let stt = YandexSTT::new_standard(&std).unwrap();
         assert!(stt.yandex_config.speaker_identification); // diarization

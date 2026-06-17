@@ -623,6 +623,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let stt = NectecStt::new_standard(&std).unwrap();
         assert_eq!(stt.config.api_key, "test_key"); // base api_key survived

@@ -841,6 +841,7 @@ mod tests {
                 ..Default::default()
             },
             extras,
+            translation: None,
         };
         let cfg = AmiVoiceSTTConfig::from_standard(&std);
         // Mapped onto the config...

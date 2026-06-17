@@ -428,7 +428,11 @@ impl SpeechmaticsSTT {
             transcription_config = transcription_config.with_max_delay_mode(mode.clone());
         }
 
-        StartRecognitionMessage::with_config(audio_format, transcription_config)
+        // P5 translation: attach the `translation_config` peer object (no-op if no targets).
+        StartRecognitionMessage::with_config(audio_format, transcription_config).with_translation(
+            self.config.translation_target_languages.clone(),
+            self.config.translation_enable_partials,
+        )
     }
 }
 
@@ -785,6 +789,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let stt = SpeechmaticsSTT::new_standard(&std).unwrap();
         assert!(stt.config.enable_diarization);
@@ -863,6 +868,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras(extras),
+            translation: None,
         };
 
         let stt = SpeechmaticsSTT::new_standard(&std).unwrap();
@@ -934,6 +940,44 @@ mod tests {
             json.contains("\"sounds_like\":[\"speech matics\"]"),
             "vocab sounds_like hint missing: {json}"
         );
+    }
+
+    // WIRE-LEVEL P5: the canonical translation block must serialize as the `translation_config`
+    // PEER object (sibling of `transcription_config`) in the StartRecognition bytes.
+    #[test]
+    fn translation_config_reaches_start_recognition_json_as_peer() {
+        use crate::core::lang::CanonicalLanguage;
+        use crate::core::stt::standard::{StandardSTTConfig, TranslationConfig};
+        let mut std = StandardSTTConfig::from_base(STTConfig {
+            provider: "speechmatics".into(),
+            api_key: "test-api-key".into(),
+            language: "en".into(),
+            ..Default::default()
+        });
+        std.translation = Some(TranslationConfig {
+            target_languages: vec![CanonicalLanguage::EsEs, CanonicalLanguage::DeDe],
+            translate_to_english: None,
+            partials: Some(true),
+        });
+        let stt = SpeechmaticsSTT::new_standard(&std).unwrap();
+        let msg = stt.build_start_recognition();
+        let v = serde_json::to_value(&msg).unwrap();
+        // PEER (sibling), not nested under transcription_config.
+        assert!(
+            v.get("translation_config").is_some(),
+            "translation_config peer missing: {v}"
+        );
+        assert!(
+            v["transcription_config"]
+                .get("translation_config")
+                .is_none(),
+            "translation_config must NOT be nested under transcription_config: {v}"
+        );
+        assert_eq!(
+            v["translation_config"]["target_languages"],
+            serde_json::json!(["es", "de"])
+        );
+        assert_eq!(v["translation_config"]["enable_partials"], true);
     }
 
     #[test]

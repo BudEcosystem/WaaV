@@ -637,6 +637,57 @@ pub enum NodeType {
         reasoning_effort: Option<crate::core::llm::ReasoningEffort>,
     },
 
+    /// P5 canonical translate node: text-in → translated-text-out, making STT→translate→TTS
+    /// uniform and first-class. It **desugars to the proven [`LlmEndpoint`] executor** (the same
+    /// path live-validated by `en_to_hindi_multivendor.json` /
+    /// `tests/dag_multivendor_live_e2e.rs`): the compiler auto-generates a translation
+    /// `system_prompt` from `target_language`/`source_language` and reuses ALL the LLM plumbing —
+    /// zero new execution path.
+    ///
+    /// Wire form (minimal): `{ "id":"translate", "type":"translate", "target_language":"hi-IN",
+    /// "base_url":"https://api.sarvam.ai/v1", "model":"sarvam-30b", "api_key":"${SARVAM_API_KEY}" }`.
+    /// A custom `system_prompt` overrides the auto-generated one; everything else mirrors
+    /// [`LlmEndpoint`].
+    Translate {
+        /// Canonical target language (region-qualified BCP-47, e.g. `hi-IN`). Reuses P2's value
+        /// space so a developer names the language the SAME way as everywhere else.
+        target_language: crate::core::lang::CanonicalLanguage,
+        /// Optional source-language hint (default: auto-detect, the model infers it).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_language: Option<crate::core::lang::CanonicalLanguage>,
+        /// LLM backend base URL (OpenAI-compatible), e.g. `https://api.sarvam.ai/v1`,
+        /// `http://localhost:11434/v1`. The translate node defaults to the LLM backend (the proven
+        /// path); a future provider-side-channel backend can be selected via `backend`.
+        base_url: String,
+        /// Model identifier (e.g. `sarvam-30b`, `gpt-4o-mini`, `llama3`).
+        model: String,
+        /// API key (literal or `${ENV_VAR}`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
+        /// Backend selector: `"llm"` (default, reuses the LlmEndpoint plumbing). Reserved for a
+        /// future translation-capable-provider side-channel backend; unknown values fall back to
+        /// the LLM backend (additive/forward-compatible — never a hard error).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backend: Option<String>,
+        /// Override the auto-generated translation system prompt. When omitted, the compiler
+        /// synthesizes "You are a translation engine. Translate … into <target> …".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        system_prompt: Option<String>,
+        /// Sampling temperature (default 0.1 — translation wants low variance).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        temperature: Option<f32>,
+        /// Max tokens (default 4000 — reasoning translators return null content if starved, per the
+        /// proven Sarvam template note).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_tokens: Option<u32>,
+        /// Request timeout in milliseconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        /// Extra headers for the LLM request.
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
+
     /// Webhook notification (fire-and-forget)
     WebhookOutput {
         url: String,

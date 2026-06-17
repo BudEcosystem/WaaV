@@ -561,6 +561,7 @@ mod tests {
                 ..Default::default()
             },
             extras: Default::default(),
+            translation: None,
         };
         let cfg = AssemblyAISTTConfig::from_standard(&std);
         assert!(
@@ -913,6 +914,7 @@ mod tests {
                 ..Default::default()
             },
             extras: Default::default(),
+            translation: None,
         };
         let cfg = AssemblyAISTTConfig::from_standard(&std);
         // Struct mapping happened.
@@ -1082,6 +1084,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras(extras),
+            translation: None,
         };
         let cfg = AssemblyAISTTConfig::from_standard(&std);
         let url = cfg.build_websocket_url();

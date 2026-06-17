@@ -426,6 +426,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = SberSTTConfig::from_standard(&std).unwrap();
         // Base carried through: credentials encoded and language parsed, exactly like from_base.
@@ -464,6 +465,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras(extras),
+            translation: None,
         };
         let cfg = SberSTTConfig::from_standard(&std).unwrap();
         // Config carried the mapping...

@@ -8,6 +8,8 @@ mod base;
 pub mod bhashini;
 /// Standardized capability-rich STT config (W1 keystone, additive).
 pub mod standard;
+/// Batched / async STT (P5): canonical envelope + per-provider prerecorded request builders.
+pub mod batch;
 pub mod cartesia;
 pub mod deepgram;
 pub mod elevenlabs;

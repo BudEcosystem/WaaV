@@ -1210,6 +1210,7 @@ fn test_from_standard_maps_advanced_features_to_wire() {
             ..Default::default()
         },
         extras: ProviderExtras(extras),
+        translation: None,
     };
     let cfg = GoogleSTTConfig::from_standard(&std);
     // Confirm the standardized features survived into the wire request.

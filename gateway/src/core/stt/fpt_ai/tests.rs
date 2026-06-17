@@ -84,6 +84,7 @@ fn new_standard_carries_base_through() {
             ..Default::default()
         },
         extras: ProviderExtras::default(),
+        translation: None,
     };
     let stt = FptStt::new_standard(&std).expect("new_standard should succeed");
     let cfg = stt.get_fpt_config();

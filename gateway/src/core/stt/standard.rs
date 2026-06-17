@@ -12,6 +12,7 @@
 //! factory/registry gains a standardized constructor path.
 
 use super::base::STTConfig;
+use crate::core::lang::CanonicalLanguage;
 use serde::{Deserialize, Serialize};
 
 /// Canonical, provider-agnostic advanced STT features. Every field is `Option`, so `None`
@@ -65,6 +66,145 @@ pub struct SttFeatures {
     /// begin-of-speech marker IBM emits as a `speaker_begin`/`speech_begin` notification.
     #[serde(default)]
     pub speech_begin_event: Option<bool>,
+}
+
+/// Canonical, provider-agnostic in-stream / batch translation request (P5).
+///
+/// Reuses P2's [`CanonicalLanguage`] value space so a developer asks for translation with the
+/// SAME language token (`es-ES`, `de-DE`, …) they use everywhere else, and the gateway maps it to
+/// each provider's native code. `None` (the field is `Option<TranslationConfig>` on
+/// [`StandardSTTConfig`]) means "no translation" — additive, so the existing construction sites
+/// are unaffected, exactly like `features`/`extras` were added.
+///
+/// Two provider classes are folded into ONE canonical shape:
+///   * **Class A** — arbitrary target languages via a side-channel (Speechmatics
+///     `translation_config`, Gladia `realtime_processing.translation`, AssemblyAI batch).
+///   * **Class B** — translate-the-whole-stream-to-ENGLISH fast path (OpenAI/Groq
+///     `/audio/translations`); selected by [`translate_to_english`](Self::translate_to_english).
+///
+/// The gateway emits a uniform `translations: [{ lang, text }]` array merged onto the transcript
+/// event regardless of provider. Unsupported providers **degrade with a `config_warning`, NEVER a
+/// 400** (see [`TranslationConfig::warnings_for`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct TranslationConfig {
+    /// Canonical target languages (region-qualified BCP-47 → provider-native via the per-provider
+    /// lang mappers / `.iso639_1()`). Capped per-provider (Speechmatics MAX 5 → warn + truncate).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_languages: Vec<CanonicalLanguage>,
+    /// Fast path: translate the whole stream to ENGLISH (OpenAI/Groq `/audio/translations`
+    /// endpoint). When `Some(true)`, `target_languages` is ignored for Class-B providers; for
+    /// Class-A providers it is sugar for `target_languages = [en-US]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translate_to_english: Option<bool>,
+    /// Emit partial (interim) translations where supported (Speechmatics `enable_partials`,
+    /// Gladia live). `None` = provider default (finals only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partials: Option<bool>,
+}
+
+/// One translated segment in the uniform gateway output (`translations: [{lang,text}]`).
+///
+/// `lang` is the canonical [`CanonicalLanguage`] BCP-47 string (e.g. `"es-ES"`); the gateway folds
+/// Speechmatics `AddTranslation`/`AddPartialTranslation` (`.language` + `.results[].content`),
+/// Gladia `type:"translation"` (`data.target_language` + `data.translated_utterance.text`), and
+/// the Class-B `{text}` (lang = `"en-US"`) into this single shape so SDKs read ONE field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct Translation {
+    /// Canonical target-language BCP-47 string.
+    pub lang: String,
+    /// The translated text for this segment.
+    pub text: String,
+    /// `true` if this is a partial (interim) translation, `false`/omitted if final.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_partial: bool,
+}
+
+/// Maximum target languages Speechmatics accepts on `translation_config.target_languages`.
+pub const SPEECHMATICS_MAX_TRANSLATION_TARGETS: usize = 5;
+
+impl TranslationConfig {
+    /// True if no translation was requested (no targets and not the EN fast path).
+    pub fn is_noop(&self) -> bool {
+        self.target_languages.is_empty() && self.translate_to_english != Some(true)
+    }
+
+    /// Whether the English fast path is requested.
+    pub fn wants_english(&self) -> bool {
+        self.translate_to_english == Some(true)
+    }
+
+    /// The effective Class-A target list as ISO-639-1 codes (what Speechmatics/Gladia want on the
+    /// wire). When [`translate_to_english`](Self::translate_to_english) is set it is sugar for
+    /// `["en"]`. De-duplicates while preserving order. Caps to `cap` when `Some` (Speechmatics 5),
+    /// the truncation a caller surfaces via [`warnings_for`](Self::warnings_for).
+    pub fn target_iso639_1(&self, cap: Option<usize>) -> Vec<&'static str> {
+        if self.wants_english() {
+            return vec!["en"];
+        }
+        let mut out: Vec<&'static str> = Vec::new();
+        for c in &self.target_languages {
+            let code = c.iso639_1();
+            if !code.is_empty() && !out.contains(&code) {
+                out.push(code);
+            }
+        }
+        if let Some(n) = cap {
+            out.truncate(n);
+        }
+        out
+    }
+
+    /// Degrade warnings (NEVER a 400) for a given provider, so the caller can surface a
+    /// `config_warning` and proceed transcript-only / truncated. `streaming` selects the
+    /// streaming-vs-batch capability matrix (AssemblyAI translation is batch-only).
+    ///
+    /// Returns the warnings; an empty vec means the request is fully honored.
+    pub fn warnings_for(&self, provider: &str, streaming: bool) -> Vec<String> {
+        if self.is_noop() {
+            return Vec::new();
+        }
+        let p = provider.to_lowercase();
+        let mut warns = Vec::new();
+        match p.as_str() {
+            // Class A (arbitrary targets) — both streaming and batch.
+            "speechmatics" => {
+                if !self.wants_english()
+                    && self.target_languages.len() > SPEECHMATICS_MAX_TRANSLATION_TARGETS
+                {
+                    warns.push(format!(
+                        "translation: speechmatics accepts at most {SPEECHMATICS_MAX_TRANSLATION_TARGETS} target languages; truncating to the first {SPEECHMATICS_MAX_TRANSLATION_TARGETS}"
+                    ));
+                }
+            }
+            "gladia" => {}
+            // AssemblyAI: translation is a batch Speech-Understanding model only.
+            "assemblyai" => {
+                if streaming {
+                    warns.push(
+                        "translation not supported by assemblyai in streaming mode; transcript only (use POST /transcribe/batch)".to_string(),
+                    );
+                }
+            }
+            // Class B (English-only fast path).
+            "openai" | "groq" => {
+                if !self.wants_english() && !self.target_languages.is_empty() {
+                    warns.push(format!(
+                        "translation: {p} only supports translate-to-English; target_languages ignored (set translate_to_english=true)"
+                    ));
+                }
+            }
+            // Everything else has no translation capability → transcript only.
+            other => {
+                warns.push(format!(
+                    "translation not supported by {other} in {} mode; transcript only",
+                    if streaming { "streaming" } else { "batch" }
+                ));
+            }
+        }
+        warns
+    }
 }
 
 /// Open, typed passthrough for any provider-specific parameter not modeled above — the escape
@@ -141,6 +281,12 @@ pub struct StandardSTTConfig {
     /// Open provider-specific passthrough.
     #[serde(default)]
     pub extras: ProviderExtras,
+    /// Canonical in-stream / batch translation request (P5). `None` = no translation. The gateway
+    /// maps it per-provider (Speechmatics/Gladia side-channel, OpenAI/Groq English fast path) and
+    /// emits a uniform `translations: [{lang,text}]`; unsupported providers degrade with a
+    /// `config_warning`, never a 400.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translation: Option<TranslationConfig>,
 }
 
 /// The reserved [`ProviderExtras`] key carrying an endpoint override.
@@ -160,6 +306,7 @@ impl StandardSTTConfig {
             base,
             features: SttFeatures::default(),
             extras: ProviderExtras::default(),
+            translation: None,
         }
     }
 
@@ -404,6 +551,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         assert!(create_stt_standard("deepgram", cfg).is_ok());
 
@@ -429,11 +577,152 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let v = serde_json::to_value(&cfg).unwrap();
         // base fields are flattened to the top level alongside `features`.
         assert_eq!(v["provider"], "deepgram");
         assert_eq!(v["model"], "nova-3");
         assert_eq!(v["features"]["diarization"], true);
+    }
+
+    // ---- P5: TranslationConfig --------------------------------------------------------------
+
+    #[test]
+    fn translation_config_deserializes_canonical_targets() {
+        // Region-qualified BCP-47 canonical tokens (the same P2 value space used everywhere)
+        // deserialize and map to provider-native ISO-639-1. This is the exact `translation` block
+        // shape the WS/batch envelope carries.
+        let json = r#"{ "target_languages": ["es-ES", "de-DE"], "partials": true }"#;
+        let t: TranslationConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            t.target_languages,
+            vec![CanonicalLanguage::EsEs, CanonicalLanguage::DeDe]
+        );
+        assert_eq!(t.partials, Some(true));
+        assert_eq!(t.target_iso639_1(None), vec!["es", "de"]);
+        assert!(!t.is_noop());
+
+        // And it deserializes as the `translation` field on a full StandardSTTConfig payload
+        // (the flattened base needs every STTConfig field), surviving the dispatch boundary.
+        let mut v = serde_json::to_value(StandardSTTConfig::from_base(STTConfig {
+            provider: "speechmatics".into(),
+            ..Default::default()
+        }))
+        .unwrap();
+        v["translation"] = serde_json::json!({ "target_languages": ["es-ES"] });
+        let cfg: StandardSTTConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            cfg.translation.unwrap().target_languages,
+            vec![CanonicalLanguage::EsEs]
+        );
+    }
+
+    #[test]
+    fn translation_absent_keeps_field_none_and_omitted() {
+        // Additive: a payload predating P5 round-trips to `translation: None` and omits the key.
+        let v = serde_json::to_value(StandardSTTConfig::from_base(STTConfig {
+            provider: "deepgram".into(),
+            ..Default::default()
+        }))
+        .unwrap();
+        assert!(v.get("translation").is_none(), "omitted when None");
+        let cfg: StandardSTTConfig = serde_json::from_value(v).unwrap();
+        assert!(cfg.translation.is_none());
+    }
+
+    #[test]
+    fn translate_to_english_is_sugar_for_en_and_overrides_targets() {
+        let t = TranslationConfig {
+            target_languages: vec![CanonicalLanguage::EsEs],
+            translate_to_english: Some(true),
+            partials: None,
+        };
+        // English fast path wins regardless of the target list.
+        assert!(t.wants_english());
+        assert_eq!(t.target_iso639_1(None), vec!["en"]);
+    }
+
+    #[test]
+    fn translation_speechmatics_caps_targets_to_five_with_warning() {
+        let t = TranslationConfig {
+            target_languages: vec![
+                CanonicalLanguage::EsEs,
+                CanonicalLanguage::DeDe,
+                CanonicalLanguage::FrFr,
+                CanonicalLanguage::ItIt,
+                CanonicalLanguage::PtPt,
+                CanonicalLanguage::NlNl,
+            ],
+            translate_to_english: None,
+            partials: None,
+        };
+        // 6 targets > Speechmatics MAX 5 → warn + truncate (NEVER a 400).
+        let warns = t.warnings_for("speechmatics", true);
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].contains("at most 5"));
+        assert_eq!(
+            t.target_iso639_1(Some(SPEECHMATICS_MAX_TRANSLATION_TARGETS)).len(),
+            5
+        );
+    }
+
+    #[test]
+    fn translation_assemblyai_streaming_degrades_with_warning() {
+        let t = TranslationConfig {
+            target_languages: vec![CanonicalLanguage::EsEs],
+            ..Default::default()
+        };
+        // AssemblyAI translation is batch-only → streaming warns (no 400), batch is clean.
+        assert!(
+            t.warnings_for("assemblyai", true)[0].contains("streaming mode")
+        );
+        assert!(t.warnings_for("assemblyai", false).is_empty());
+    }
+
+    #[test]
+    fn translation_unsupported_provider_warns_never_errors() {
+        let t = TranslationConfig {
+            target_languages: vec![CanonicalLanguage::EsEs],
+            ..Default::default()
+        };
+        // Deepgram has no streaming translation → transcript-only warning, never a 400.
+        let w = t.warnings_for("deepgram", true);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("not supported by deepgram"));
+    }
+
+    #[test]
+    fn translation_classb_arbitrary_targets_warn_english_only() {
+        let t = TranslationConfig {
+            target_languages: vec![CanonicalLanguage::EsEs],
+            ..Default::default()
+        };
+        // OpenAI/Groq are English-only: an arbitrary target list warns (degraded to EN), no 400.
+        for p in ["openai", "groq"] {
+            let w = t.warnings_for(p, false);
+            assert_eq!(w.len(), 1, "{p}");
+            assert!(w[0].contains("English"), "{p}: {}", w[0]);
+        }
+        // The pure EN fast path is clean for Class-B.
+        let en = TranslationConfig {
+            translate_to_english: Some(true),
+            ..Default::default()
+        };
+        assert!(en.warnings_for("openai", false).is_empty());
+    }
+
+    #[test]
+    fn translation_output_segment_serializes_uniformly() {
+        let seg = Translation {
+            lang: "es-ES".into(),
+            text: "Hola".into(),
+            is_partial: false,
+        };
+        let v = serde_json::to_value(&seg).unwrap();
+        assert_eq!(v["lang"], "es-ES");
+        assert_eq!(v["text"], "Hola");
+        // `is_partial:false` is omitted (skip_serializing_if Not::not) — keeps the wire lean.
+        assert!(v.get("is_partial").is_none());
     }
 }

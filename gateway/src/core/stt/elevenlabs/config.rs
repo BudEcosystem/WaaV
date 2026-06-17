@@ -643,6 +643,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = ElevenLabsSTTConfig::from_standard(&std);
         assert_eq!(cfg.include_language_detection, Some(true));
@@ -670,6 +671,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = ElevenLabsSTTConfig::from_standard(&drop);
         assert_eq!(cfg.no_verbatim, Some(true));
@@ -689,6 +691,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = ElevenLabsSTTConfig::from_standard(&keep);
         assert_eq!(cfg.no_verbatim, Some(false));

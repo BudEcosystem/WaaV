@@ -566,6 +566,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras(extras_map),
+            translation: None,
         };
         let cfg = IFlytekSttConfig::from_standard(&std).unwrap();
 
@@ -633,6 +634,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = IFlytekSttConfig::from_standard(&std).unwrap();
         assert!(!cfg.convert_numbers); // smart_format

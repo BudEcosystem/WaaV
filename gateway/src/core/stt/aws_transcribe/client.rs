@@ -1093,6 +1093,7 @@ mod tests {
                 ..Default::default()
             },
             extras: Default::default(),
+            translation: None,
         };
         let stt = AwsTranscribeSTT::new_standard(&std).unwrap();
         let cfg = stt.config.as_ref().unwrap();
@@ -1213,6 +1214,7 @@ mod tests {
             },
             features,
             extras: ProviderExtras(extras),
+            translation: None,
         };
         let cfg = AwsTranscribeSTTConfig::from_standard(&std);
         AwsTranscribeSTT::apply_request_params(&cfg, StartStreamTranscriptionInput::builder())

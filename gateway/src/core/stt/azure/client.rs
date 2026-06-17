@@ -1160,6 +1160,7 @@ mod tests {
                 ..Default::default()
             },
             extras: Default::default(),
+            translation: None,
         };
         let stt = AzureSTT::new_standard(&std).unwrap();
         assert!(stt.config.as_ref().unwrap().word_level_timing);

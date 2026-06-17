@@ -272,6 +272,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         // `new_standard` builds the provider from exactly this config, so asserting the mapping
         // here proves the features it carries reach the constructed client (the config field is

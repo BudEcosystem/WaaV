@@ -307,6 +307,18 @@ impl TranscriptionConfig {
     }
 }
 
+/// P5 translation config — the `translation_config` PEER object (a sibling of
+/// `transcription_config` on `StartRecognition`, NOT nested inside it). Speechmatics emits
+/// `AddTranslation`/`AddPartialTranslation` messages for these targets.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpeechmaticsTranslationConfig {
+    /// Target languages (ISO-639-1). Speechmatics accepts at most 5.
+    pub target_languages: Vec<String>,
+    /// Emit partial (interim) translations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_partials: Option<bool>,
+}
+
 /// StartRecognition message to initialize a transcription session.
 #[derive(Debug, Clone, Serialize)]
 pub struct StartRecognitionMessage {
@@ -316,6 +328,10 @@ pub struct StartRecognitionMessage {
     pub audio_format: AudioFormat,
     /// Transcription configuration
     pub transcription_config: TranscriptionConfig,
+    /// P5 translation: the `translation_config` PEER object (sibling of `transcription_config`).
+    /// Omitted when no translation was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub translation_config: Option<SpeechmaticsTranslationConfig>,
 }
 
 impl StartRecognitionMessage {
@@ -329,6 +345,7 @@ impl StartRecognitionMessage {
             message: "StartRecognition".to_string(),
             audio_format: AudioFormat::raw(encoding, sample_rate),
             transcription_config: TranscriptionConfig::new(language),
+            translation_config: None,
         }
     }
 
@@ -341,7 +358,23 @@ impl StartRecognitionMessage {
             message: "StartRecognition".to_string(),
             audio_format,
             transcription_config,
+            translation_config: None,
         }
+    }
+
+    /// P5: attach the `translation_config` peer object (no-op when `target_languages` is empty).
+    pub fn with_translation(
+        mut self,
+        target_languages: Vec<String>,
+        enable_partials: Option<bool>,
+    ) -> Self {
+        if !target_languages.is_empty() {
+            self.translation_config = Some(SpeechmaticsTranslationConfig {
+                target_languages,
+                enable_partials,
+            });
+        }
+        self
     }
 }
 

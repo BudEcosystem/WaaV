@@ -688,6 +688,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let cfg = BhashiniSttConfig::from_standard(&std).unwrap();
         assert_eq!(cfg.user_id, "user123");
@@ -719,6 +720,7 @@ mod tests {
             },
             features: Default::default(),
             extras: ProviderExtras(extras),
+            translation: None,
         };
         let cfg = BhashiniSttConfig::from_standard(&std).unwrap();
         assert_eq!(cfg.source_script_code.as_deref(), Some("Latn"));
@@ -757,6 +759,7 @@ mod tests {
             },
             features: Default::default(),
             extras: ProviderExtras(extras),
+            translation: None,
         };
         let cfg = BhashiniSttConfig::from_standard(&std).unwrap();
         assert_eq!(cfg.source_script_code.as_deref(), Some("Deva"));

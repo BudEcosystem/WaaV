@@ -587,6 +587,7 @@ mod tests {
                 ..Default::default()
             },
             extras: ProviderExtras::default(),
+            translation: None,
         };
         let stt = PhonexiaSTT::new_standard(&std).expect("new_standard must succeed");
         assert!(stt.phonexia_config.enable_timestamps); // word_timestamps
