@@ -204,6 +204,7 @@ async fn roundtrip_model(model: &str) {
             ..Default::default()
         },
         extras: ProviderExtras::default(),
+        translation: None,
     };
     let (transcript, error) = transcribe_via_waav(std_cfg, &pcm, SAMPLE_RATE).await;
     println!("[{model}] transcript: {transcript:?}  error: {error:?}");
@@ -254,6 +255,7 @@ async fn test_deepgram_stt_all_features_live() {
             ..Default::default()
         },
         extras: ProviderExtras::default(),
+        translation: None,
     };
     let (transcript, error) = transcribe_via_waav(std_cfg, &pcm, SAMPLE_RATE).await;
     println!("[all-features] transcript: {transcript:?}  error: {error:?}");
@@ -295,6 +297,7 @@ async fn test_deepgram_numerals_live() {
             ..Default::default()
         },
         extras: ProviderExtras::default(),
+        translation: None,
     };
     let (t_off, e_off) = transcribe_via_waav(off_cfg, &pcm, SAMPLE_RATE).await;
     println!("[numerals=off] transcript: {t_off:?}  error: {e_off:?}");
@@ -310,6 +313,7 @@ async fn test_deepgram_numerals_live() {
             ..Default::default()
         },
         extras: ProviderExtras::default(),
+        translation: None,
     };
     let (t_on, e_on) = transcribe_via_waav(on_cfg, &pcm, SAMPLE_RATE).await;
     println!("[numerals=on ] transcript: {t_on:?}  error: {e_on:?}");
@@ -346,6 +350,7 @@ async fn test_deepgram_multichannel_live() {
             ..Default::default()
         },
         extras: ProviderExtras::default(),
+        translation: None,
     };
     let (transcript, error) = transcribe_via_waav(std_cfg, &pcm, SAMPLE_RATE).await;
     println!("[multichannel=on] transcript: {transcript:?}  error: {error:?}");
@@ -381,6 +386,7 @@ async fn test_deepgram_numerals_and_multichannel_combined_live() {
             ..Default::default()
         },
         extras: ProviderExtras::default(),
+        translation: None,
     };
     let (transcript, error) = transcribe_via_waav(std_cfg, &pcm, SAMPLE_RATE).await;
     println!("[numerals+multichannel] transcript: {transcript:?}  error: {error:?}");
@@ -468,6 +474,7 @@ fn gateway_config() -> waav_gateway::ServerConfig {
         realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     }
 }
 

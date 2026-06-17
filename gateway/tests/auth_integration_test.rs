@@ -79,6 +79,7 @@ async fn create_test_state_auth_disabled() -> Arc<AppState> {
             realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     };
 
     AppState::new(config).await
@@ -253,6 +254,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
+            aliases: Default::default(),
         };
 
         let state = AppState::new(config).await;
@@ -565,6 +567,7 @@ mod with_api_secret {
             realtime_endpoint_overrides: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
+            aliases: Default::default(),
         };
 
         AppState::new(config).await

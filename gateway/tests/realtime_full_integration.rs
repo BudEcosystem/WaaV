@@ -398,6 +398,7 @@ fn session_config_to_realtime_config_carries_every_feature_field() {
         output_audio_format: Some("g711_ulaw".to_string()),
         reasoning_effort: Some(ReasoningEffort::Medium),
         input_audio_noise_reduction: Some("far_field".to_string()),
+        alias: None,
     };
 
     // Convert via the handler's REAL converter (the exact fn the live

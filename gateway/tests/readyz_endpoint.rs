@@ -91,6 +91,7 @@ fn config_with_deepgram() -> ServerConfig {
         realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     }
 }
 

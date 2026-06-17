@@ -81,6 +81,7 @@ async fn test_websocket_voice_config() {
             realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     };
 
     // Create application state
@@ -286,6 +287,7 @@ async fn test_websocket_invalid_message() {
             realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     };
 
     // Create application state
@@ -423,6 +425,7 @@ async fn test_websocket_sip_transfer_without_livekit_config() {
             realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     };
 
     // Create application state
@@ -563,6 +566,7 @@ async fn test_websocket_sip_transfer_invalid_phone_number() {
             realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     };
 
     // Create application state
@@ -703,6 +707,7 @@ async fn test_websocket_sip_transfer_empty_phone_number() {
             realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     };
 
     // Create application state

@@ -268,6 +268,7 @@ async fn deepgram_recovers_after_midstream_kill() {
             ..Default::default()
         },
         extras: Default::default(),
+        translation: None,
     }
     .with_endpoint_override(&endpoint);
 
@@ -466,6 +467,7 @@ async fn cartesia_recovers_after_midstream_kill() {
             ..Default::default()
         },
         extras: Default::default(),
+        translation: None,
     }
     .with_endpoint_override(&endpoint);
 
@@ -670,6 +672,7 @@ async fn assemblyai_recovers_after_midstream_kill() {
             ..Default::default()
         },
         extras: Default::default(),
+        translation: None,
     }
     .with_endpoint_override(&endpoint);
 
@@ -893,6 +896,7 @@ async fn assert_replays_unfinalized_tail(provider_name: &str, proto: ReplayProto
         },
         features: SttFeatures::default(),
         extras: Default::default(),
+        translation: None,
     }
     .with_endpoint_override(&endpoint);
 

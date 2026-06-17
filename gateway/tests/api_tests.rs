@@ -79,6 +79,7 @@ async fn test_health_check() {
             realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     };
 
     // Create app state
@@ -177,6 +178,7 @@ async fn test_speak_endpoint_missing_api_key() {
             realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     };
 
     // Create app state
@@ -281,6 +283,7 @@ async fn test_speak_endpoint_empty_text() {
             realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     };
 
     // Create app state
@@ -392,6 +395,7 @@ async fn test_speak_endpoint_with_pronunciations() {
             realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     };
 
     // Create app state
@@ -505,6 +509,7 @@ async fn test_speak_endpoint_invalid_provider() {
             realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     };
 
     // Create app state

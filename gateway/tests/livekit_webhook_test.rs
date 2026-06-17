@@ -81,6 +81,7 @@ fn create_test_config_with_livekit() -> ServerConfig {
             realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     }
 }
 
@@ -150,6 +151,7 @@ fn create_test_config_without_livekit() -> ServerConfig {
             realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     }
 }
 

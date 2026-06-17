@@ -158,6 +158,7 @@ fn create_test_config(port: u16) -> ServerConfig {
             realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     }
 }
 

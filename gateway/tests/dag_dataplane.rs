@@ -285,6 +285,7 @@ fn test_server_config() -> ServerConfig {
         realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     }
 }
 

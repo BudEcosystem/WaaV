@@ -39,6 +39,7 @@ fn std_cfg(provider: &str, features: SttFeatures, extras: ProviderExtras) -> Sta
         },
         features,
         extras,
+        translation: None,
     }
 }
 
