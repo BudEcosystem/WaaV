@@ -68,8 +68,8 @@ pub async fn handle_audio_message(
         return true;
     }
 
-    // Fast path: read lock to check state and get voice manager
-    let voice_manager = {
+    // Fast path: read lock to check state, get the voice manager, and (D8) opus-decode the frame.
+    let (voice_manager, audio_data) = {
         let state_guard = state.read().await;
 
         // Check if audio processing is enabled (atomic read, no lock overhead)
@@ -84,7 +84,7 @@ pub async fn handle_audio_message(
             return true;
         }
 
-        match &state_guard.voice_manager {
+        let voice_manager = match &state_guard.voice_manager {
             Some(vm) => vm.clone(),
             None => {
                 let _ = message_tx
@@ -95,14 +95,27 @@ pub async fn handle_audio_message(
                     .await;
                 return true;
             }
-        }
+        };
+
+        // D8: when the session negotiated opus uplink, each WS binary frame is one opus packet —
+        // decode it to PCM16 (at the negotiated rate) before STT. A bad packet is logged + dropped,
+        // never tearing down the stream. linear16 sessions (the common case) pass straight through.
+        #[cfg(feature = "opus-codec")]
+        let audio_data = match &state_guard.opus_decoder {
+            Some(decoder) => match decoder.lock().await.decode_packet(&audio_data) {
+                Ok(pcm) => Bytes::from(pcm),
+                Err(e) => {
+                    warn!("opus uplink decode failed: {e}; dropping frame");
+                    return true;
+                }
+            },
+            None => audio_data,
+        };
+
+        (voice_manager, audio_data)
     };
 
-    // Direct pass-through without unnecessary allocation
-    // The Bytes type already provides efficient cloning and slicing
-
-    // Send audio to STT provider with zero-copy optimization
-    // Bytes type provides O(1) cloning via reference counting
+    // Send the (decoded) PCM audio to the STT provider. Bytes gives O(1) clones.
     if let Err(e) = voice_manager.receive_audio(audio_data).await {
         error!("Failed to process audio: {}", e);
         let _ = message_tx

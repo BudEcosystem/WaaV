@@ -194,6 +194,32 @@ pub async fn handle_config_message(
     }
     debug!(stream_id = %stream_id, "Stored stream_id in connection state");
 
+    // D8: negotiate the uplink/downlink transport codecs (linear16|opus) BEFORE the audio pipeline is
+    // built, so an opus session can coerce its rate/frame to opus-valid values shared by the decoder,
+    // the C-G5 resampler and the egress chunker. The effective tokens are echoed in `ready`; an
+    // unsupported request degrades to linear16 with a warning (never a hard error).
+    let uplink_codec = crate::core::audio::codec::negotiate(
+        stt_ws_config.as_ref().and_then(|s| s.audio_in_codec.as_deref()),
+        "uplink",
+    );
+    let downlink_codec = crate::core::audio::codec::negotiate(
+        tts_ws_config.as_ref().and_then(|t| t.audio_out_codec.as_deref()),
+        "downlink",
+    );
+    emit_codec_warning("uplink", &uplink_codec, message_tx).await;
+    emit_codec_warning("downlink", &downlink_codec, message_tx).await;
+    #[cfg(feature = "opus-codec")]
+    coerce_opus_rates(
+        &uplink_codec,
+        &downlink_codec,
+        stt_ws_config.as_mut(),
+        tts_ws_config.as_mut(),
+        message_tx,
+    )
+    .await;
+    let audio_in_codec = uplink_codec.echo_value();
+    let audio_out_codec = downlink_codec.echo_value();
+
     // Initialize voice manager if audio is enabled
     let voice_manager = if audio_enabled {
         match initialize_voice_manager(
@@ -208,6 +234,23 @@ pub async fn handle_config_message(
                 // Store in connection state
                 let mut state_guard = state.write().await;
                 state_guard.voice_manager = Some(vm.clone());
+
+                // D8: build the uplink opus decoder for an opus-negotiated session and stash it on
+                // the connection state, so the audio hot path decodes each WS binary frame to PCM16
+                // before STT. The sample rate was already coerced to an opus-valid value above.
+                #[cfg(feature = "opus-codec")]
+                if uplink_codec.effective == crate::core::audio::AudioCodec::Opus {
+                    let rate = stt_ws_config.as_ref().map(|s| s.sample_rate).unwrap_or(16_000);
+                    match crate::core::audio::opus_codec::OpusStreamDecoder::new(rate) {
+                        Ok(decoder) => {
+                            state_guard.opus_decoder = Some(tokio::sync::Mutex::new(decoder));
+                            info!(rate, "D8 opus uplink decoder active");
+                        }
+                        Err(e) => {
+                            warn!("opus decoder init failed: {e}; uplink falls back to linear16")
+                        }
+                    }
+                }
                 // D-G10: optional pipeline liveness heartbeat (env-gated, off
                 // by default) probing audio-provider readiness; aborted when
                 // the connection state drops.
@@ -460,12 +503,8 @@ pub async fn handle_config_message(
         false
     };
 
-    // D8: negotiate the uplink/downlink transport codecs (linear16|opus) and emit any downgrade
-    // warning, so the `ready` echo tells the SDK exactly what to send/decode.
-    let (audio_in_codec, audio_out_codec) =
-        negotiate_audio_codecs(stt_ws_config.as_ref(), tts_ws_config.as_ref(), message_tx).await;
-
     // Send ready message with optional LiveKit room information
+    // (D8 audio_in_codec/audio_out_codec were negotiated early, before the audio pipeline.)
     let _ = message_tx
         .send(MessageRoute::Outgoing(OutgoingMessage::Ready {
             protocol_version: crate::handlers::ws::messages::PROTOCOL_VERSION.to_string(),
@@ -683,41 +722,114 @@ async fn emit_language_config_warnings(
     }
 }
 
-/// D8: negotiate the uplink/downlink transport codecs (`linear16` | `opus`) for the session. Emits a
-/// `config_warning` for any downgrade (opus requested on a build without the `opus-codec` feature, or
-/// an unknown token) and returns the EFFECTIVE codec tokens to echo in `ready` as
-/// `(audio_in, audio_out)` — each `Some` only when the client explicitly set that codec field, so a
-/// default linear16 session adds no new wire fields. NEVER errors: an opus request always degrades
-/// cleanly to linear16.
-async fn negotiate_audio_codecs(
-    stt_ws_config: Option<&STTWebSocketConfig>,
-    tts_ws_config: Option<&TTSWebSocketConfig>,
+/// D8: emit a `config_warning` for a codec downgrade advisory on one direction (opus requested on a
+/// build without `opus-codec`, or an unknown token coerced to linear16). No-op when the negotiation
+/// produced no warning. NEVER errors — an opus request always degrades cleanly.
+async fn emit_codec_warning(
+    side: &'static str,
+    neg: &crate::core::audio::codec::CodecNegotiation,
     message_tx: &mpsc::Sender<MessageRoute>,
-) -> (Option<String>, Option<String>) {
-    use crate::core::audio::codec::negotiate;
+) {
+    if let Some(message) = neg.warning.clone() {
+        warn!(side = side, "audio codec advisory: {message}");
+        crate::core::metrics::bridge::record_degraded("audio_codec", side);
+        let _ = message_tx
+            .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
+                code: "audio_codec_unsupported_or_degraded".to_string(),
+                message,
+                detail: Some(serde_json::json!({
+                    "side": side,
+                    "requested": neg.requested.as_str(),
+                    "effective": neg.effective.as_str(),
+                })),
+            }))
+            .await;
+    }
+}
 
-    let uplink = negotiate(stt_ws_config.and_then(|s| s.audio_in_codec.as_deref()), "uplink");
-    let downlink = negotiate(tts_ws_config.and_then(|t| t.audio_out_codec.as_deref()), "downlink");
+/// D8: opus needs a valid sample rate ({8,12,16,24,48}kHz) and, downlink, a valid frame size
+/// (5/10/20/40/60 ms). When opus is the EFFECTIVE codec for a direction, snap that direction's rate
+/// (and the downlink frame size) to the nearest opus-valid value so the decoder/encoder, the C-G5
+/// resampler and the egress chunker all agree on one rate. Mutates the ws configs in place and emits
+/// a `config_warning` on any change. Only meaningful (and only compiled) under `opus-codec`.
+#[cfg(feature = "opus-codec")]
+async fn coerce_opus_rates(
+    uplink: &crate::core::audio::codec::CodecNegotiation,
+    downlink: &crate::core::audio::codec::CodecNegotiation,
+    stt: Option<&mut STTWebSocketConfig>,
+    tts: Option<&mut TTSWebSocketConfig>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) {
+    use crate::core::audio::AudioCodec;
+    use crate::core::audio::codec::{
+        is_opus_frame_ms, is_opus_rate, nearest_opus_frame_ms, nearest_opus_rate,
+    };
 
-    for (side, neg) in [("uplink", &uplink), ("downlink", &downlink)] {
-        if let Some(message) = neg.warning.clone() {
-            warn!(side = side, "audio codec advisory: {message}");
-            crate::core::metrics::bridge::record_degraded("audio_codec", side);
-            let _ = message_tx
-                .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
-                    code: "audio_codec_unsupported_or_degraded".to_string(),
-                    message,
-                    detail: Some(serde_json::json!({
-                        "side": side,
-                        "requested": neg.requested.as_str(),
-                        "effective": neg.effective.as_str(),
-                    })),
-                }))
-                .await;
-        }
+    if uplink.effective == AudioCodec::Opus
+        && let Some(stt) = stt
+        && !is_opus_rate(stt.sample_rate)
+    {
+        let to = nearest_opus_rate(stt.sample_rate);
+        emit_codec_coercion("uplink", "sample_rate", stt.sample_rate as u64, to as u64, message_tx)
+            .await;
+        stt.sample_rate = to;
     }
 
-    (uplink.echo_value(), downlink.echo_value())
+    if downlink.effective == AudioCodec::Opus
+        && let Some(tts) = tts
+    {
+        // client_playback_rate drives both the resampler target and the opus rate; default 48k.
+        let rate = tts.client_playback_rate.unwrap_or(48_000);
+        let snapped = if is_opus_rate(rate) { rate } else { nearest_opus_rate(rate) };
+        if Some(snapped) != tts.client_playback_rate {
+            if tts.client_playback_rate.is_some() {
+                emit_codec_coercion(
+                    "downlink",
+                    "client_playback_rate",
+                    rate as u64,
+                    snapped as u64,
+                    message_tx,
+                )
+                .await;
+            }
+            tts.client_playback_rate = Some(snapped);
+        }
+        // audio_out_chunk_ms is the opus frame size; default 20ms.
+        let chunk = tts.audio_out_chunk_ms.unwrap_or(20);
+        let snapped_ms = if is_opus_frame_ms(chunk) { chunk } else { nearest_opus_frame_ms(chunk) };
+        if Some(snapped_ms) != tts.audio_out_chunk_ms {
+            if tts.audio_out_chunk_ms.is_some() {
+                emit_codec_coercion(
+                    "downlink",
+                    "audio_out_chunk_ms",
+                    chunk as u64,
+                    snapped_ms as u64,
+                    message_tx,
+                )
+                .await;
+            }
+            tts.audio_out_chunk_ms = Some(snapped_ms);
+        }
+    }
+}
+
+/// D8: advise the client that an opus parameter was snapped to a valid value (non-fatal).
+#[cfg(feature = "opus-codec")]
+async fn emit_codec_coercion(
+    side: &str,
+    field: &str,
+    from: u64,
+    to: u64,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) {
+    warn!(side, field, from, to, "opus param coerced to a valid value");
+    let _ = message_tx
+        .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
+            code: "audio_codec_param_coerced".to_string(),
+            message: format!("opus {side}: {field} {from} is not opus-valid; using {to}"),
+            detail: Some(serde_json::json!({ "side": side, "field": field, "from": from, "to": to })),
+        }))
+        .await;
 }
 
 /// P4 voice-descriptor resolution: when a [`TTSWebSocketConfig`] carries a
@@ -1571,8 +1683,17 @@ pub(crate) fn valid_playback_rate(rate: u32) -> bool {
 
 /// E-G2: per-session WS egress re-framer — bounds the barge-in residual to
 /// one chunk on the RAW-WS path (LiveKit already frames internally).
+///
+/// D8: when `tts_config.audio_out_codec = opus` (and the `opus-codec` feature is built), each
+/// PCM16 chunk the inner chunker emits is encoded to one opus packet here, so ALL WS-path egress
+/// (live frames, resampler tail, utterance-end remainder) is opus-framed through this single
+/// chokepoint. The session's rate/chunk_ms are pre-coerced to opus-valid values so one chunk == one
+/// opus frame. LiveKit egress bypasses the chunker entirely (it carries Opus over WebRTC already).
 pub(crate) struct WsEgressChunker {
     inner: parking_lot::Mutex<crate::core::audio::OutputChunker>,
+    /// D8 downlink opus encoder; `Some` only for an opus-negotiated `opus-codec` build.
+    #[cfg(feature = "opus-codec")]
+    encoder: Option<parking_lot::Mutex<crate::core::audio::opus_codec::OpusStreamEncoder>>,
 }
 
 impl WsEgressChunker {
@@ -1591,23 +1712,86 @@ impl WsEgressChunker {
             .filter(|r| valid_playback_rate(*r))
             .or(tts.sample_rate)
             .unwrap_or(24_000);
+
+        // D8: build the opus encoder when this session negotiated opus egress. The rate/chunk_ms are
+        // already coerced to opus-valid values upstream, so one inner PCM chunk is exactly one opus
+        // frame; the encoder is defensive about any residual.
+        #[cfg(feature = "opus-codec")]
+        let encoder = {
+            let want_opus = crate::core::audio::codec::negotiate(
+                tts.audio_out_codec.as_deref(),
+                "downlink",
+            )
+            .effective
+                == crate::core::audio::AudioCodec::Opus;
+            want_opus
+                .then(|| {
+                    crate::core::audio::opus_codec::OpusStreamEncoder::new(
+                        rate,
+                        chunk_ms,
+                        crate::core::audio::opus_codec::DEFAULT_OPUS_BITRATE,
+                    )
+                    .map_err(|e| warn!("opus egress encoder init failed: {e}; sending linear16"))
+                    .ok()
+                })
+                .flatten()
+                .map(parking_lot::Mutex::new)
+        };
+
         Some(Arc::new(Self {
             inner: parking_lot::Mutex::new(crate::core::audio::OutputChunker::new(
                 chunk_ms, rate,
             )),
+            #[cfg(feature = "opus-codec")]
+            encoder,
         }))
     }
 
+    /// Re-frame `data` to fixed chunks; encode each to an opus packet when opus egress is active.
     fn push(&self, data: &[u8]) -> Vec<bytes::Bytes> {
-        self.inner.lock().push(data)
+        let frames = self.inner.lock().push(data);
+        #[cfg(feature = "opus-codec")]
+        if let Some(enc) = &self.encoder {
+            let mut enc = enc.lock();
+            let mut out = Vec::with_capacity(frames.len());
+            for f in &frames {
+                match enc.push_pcm(f) {
+                    Ok(packets) => out.extend(packets.into_iter().map(bytes::Bytes::from)),
+                    Err(e) => warn!("opus egress encode failed: {e}; frame dropped"),
+                }
+            }
+            return out;
+        }
+        frames
     }
 
+    /// Emit the utterance-end tail: the inner sub-chunk remainder, opus-encoded (zero-padded to a
+    /// full frame) when opus egress is active.
     fn flush(&self) -> Option<bytes::Bytes> {
-        self.inner.lock().flush_remainder()
+        let remainder = self.inner.lock().flush_remainder();
+        #[cfg(feature = "opus-codec")]
+        if let Some(enc) = &self.encoder {
+            let mut enc = enc.lock();
+            if let Some(rem) = &remainder {
+                let _ = enc.push_pcm(rem); // a sub-frame tail buffers; flush() pads + emits it
+            }
+            return match enc.flush() {
+                Ok(packet) => packet.map(bytes::Bytes::from),
+                Err(e) => {
+                    warn!("opus egress flush failed: {e}");
+                    None
+                }
+            };
+        }
+        remainder
     }
 
     pub(crate) fn clear(&self) {
         self.inner.lock().clear();
+        #[cfg(feature = "opus-codec")]
+        if let Some(enc) = &self.encoder {
+            enc.lock().reset_buffer();
+        }
     }
 }
 
@@ -2775,5 +2959,61 @@ mod tests {
         let id2 = Uuid::new_v4().to_string();
 
         assert_ne!(id1, id2, "Generated UUIDs should be unique");
+    }
+
+    // D8: the egress chunker, built from an opus-negotiated TTS config, encodes each PCM16 chunk to
+    // one opus packet (proving from_tts_config wires the encoder + push/flush route through it).
+    #[cfg(feature = "opus-codec")]
+    #[test]
+    fn ws_egress_chunker_opus_encodes_each_chunk() {
+        let tts: TTSWebSocketConfig = serde_json::from_value(serde_json::json!({
+            "provider": "deepgram",
+            "model": "aura-asteria-en",
+            "audio_out_codec": "opus",
+            "client_playback_rate": 48000,
+            "audio_out_chunk_ms": 20,
+        }))
+        .expect("deserialize opus tts config");
+        let chunker = WsEgressChunker::from_tts_config(Some(&tts)).expect("opus egress chunker");
+
+        // Three exact 20ms PCM16 frames @48k (960 samples = 1920 bytes each) of a tone.
+        let spf = 48_000usize * 20 / 1000;
+        let mut pcm = Vec::with_capacity(spf * 3 * 2);
+        for i in 0..(spf * 3) {
+            let s = ((i as f32 * 0.05).sin() * 8000.0) as i16;
+            pcm.extend_from_slice(&s.to_le_bytes());
+        }
+        let frames = chunker.push(&pcm);
+        assert_eq!(frames.len(), 3, "one opus packet per 20ms PCM frame");
+        for f in &frames {
+            assert!(!f.is_empty() && f.len() < spf * 2, "opus packet compresses vs PCM");
+        }
+        // Exact frames consumed → no padded tail on flush.
+        assert!(chunker.flush().is_none());
+    }
+
+    // D8: opus-effective directions snap their rate (and downlink frame) to opus-valid values so the
+    // codec, resampler and chunker share one rate.
+    #[cfg(feature = "opus-codec")]
+    #[tokio::test]
+    async fn coerce_opus_rates_snaps_to_opus_valid() {
+        use crate::core::audio::codec::negotiate;
+        let (tx, _rx) = mpsc::channel(16);
+        let mut stt: STTWebSocketConfig = serde_json::from_value(serde_json::json!({
+            "provider": "deepgram", "language": "en-US", "sample_rate": 44100, "channels": 1,
+            "punctuation": true, "model": "nova-3", "audio_in_codec": "opus",
+        }))
+        .unwrap();
+        let mut tts: TTSWebSocketConfig = serde_json::from_value(serde_json::json!({
+            "provider": "deepgram", "model": "aura-asteria-en", "audio_out_codec": "opus",
+            "client_playback_rate": 44100, "audio_out_chunk_ms": 15,
+        }))
+        .unwrap();
+        let up = negotiate(Some("opus"), "uplink");
+        let down = negotiate(Some("opus"), "downlink");
+        coerce_opus_rates(&up, &down, Some(&mut stt), Some(&mut tts), &tx).await;
+        assert_eq!(stt.sample_rate, 48_000, "44100 → 48000");
+        assert_eq!(tts.client_playback_rate, Some(48_000), "44100 → 48000");
+        assert_eq!(tts.audio_out_chunk_ms, Some(20), "15ms → 20ms opus frame");
     }
 }

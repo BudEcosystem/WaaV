@@ -48,6 +48,14 @@ pub struct ConnectionState {
     /// Auth context for this connection (used for room name normalization)
     pub auth: Auth,
 
+    /// D8 uplink opus decoder (feature `opus-codec`): `Some` only when the session negotiated
+    /// `stt_config.audio_in_codec = opus`. Each client WS binary frame is one opus packet decoded
+    /// to PCM16 (at the negotiated rate) BEFORE STT. `tokio::sync::Mutex` for `&mut` access under
+    /// the connection read-lock on the audio hot path.
+    #[cfg(feature = "opus-codec")]
+    pub opus_decoder:
+        Option<tokio::sync::Mutex<crate::core::audio::opus_codec::OpusStreamDecoder>>,
+
     // DAG routing state (feature-gated)
     /// Compiled DAG for this connection
     #[cfg(feature = "dag-routing")]
@@ -83,6 +91,8 @@ impl ConnectionState {
             livekit_local_identity: None,
             recording_egress_id: None,
             auth: Auth::empty(),
+            #[cfg(feature = "opus-codec")]
+            opus_decoder: None,
             #[cfg(feature = "dag-routing")]
             compiled_dag: None,
             #[cfg(feature = "dag-routing")]
@@ -108,6 +118,8 @@ impl ConnectionState {
             livekit_local_identity: None,
             recording_egress_id: None,
             auth,
+            #[cfg(feature = "opus-codec")]
+            opus_decoder: None,
             #[cfg(feature = "dag-routing")]
             compiled_dag: None,
             #[cfg(feature = "dag-routing")]
