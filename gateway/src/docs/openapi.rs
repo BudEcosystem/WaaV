@@ -120,6 +120,18 @@ use crate::handlers::{
         IntensityLevel,
         DeliveryStyle,
         EmotionConfig,
+        // P4 voice descriptor vocabulary referenced by TTSWebSocketConfig
+        crate::core::voice::VoiceDescriptor,
+        crate::core::voice::Gender,
+        crate::core::voice::Age,
+        // P4 canonical voice-clone vocabulary (POST /voices/clone)
+        crate::handlers::voices::VoiceCloneRequest,
+        crate::handlers::voices::VoiceCloneResponse,
+        crate::handlers::voices::VoiceCloneProvider,
+        crate::handlers::voices::CloneMode,
+        crate::handlers::voices::CloneStatus,
+        crate::handlers::voices::CloneLabels,
+        crate::handlers::voices::CloneConsent,
     )),
     modifiers(&SecurityAddon),
     tags(

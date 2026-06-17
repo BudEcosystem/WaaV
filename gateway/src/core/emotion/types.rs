@@ -102,6 +102,57 @@ pub enum Emotion {
     Content,
     /// Bored, uninterested, disengaged
     Bored,
+
+    // =========================================================================
+    // Widened Affective States (P4 — researched across Azure-DragonHD /
+    // Cartesia-Sonic3 / Hume; each has a direct provider token). The governing
+    // distinction: these are AFFECTIVE STATES (what the speaker FEELS), as
+    // opposed to `DeliveryStyle` which is the delivery MECHANISM.
+    // =========================================================================
+    /// Amazed, awestruck (distinct from Surprised: wonder rather than shock)
+    Amazed,
+    /// Amused, entertained, lightly laughing
+    Amused,
+    /// Affectionate, warm, loving
+    Affectionate,
+    /// Intrigued, drawn-in (deeper than Curious)
+    Intrigued,
+    /// Flirtatious, playful, teasing
+    Flirtatious,
+    /// Frustrated (between Angry and Annoyed — blocked, exasperated)
+    Frustrated,
+    /// Annoyed, irritated (milder than Angry)
+    Annoyed,
+    /// Determined, resolute, driven
+    Determined,
+    /// Reassuring, calming-of-another, soothing
+    Reassuring,
+    /// Sympathetic, commiserating (feeling-with, vs. Empathetic understanding)
+    Sympathetic,
+    /// Nostalgic, fond-remembering
+    Nostalgic,
+    /// Serene, deeply peaceful (calmer than Calm)
+    Serene,
+    /// Terrified (peak fear, sharper than Fearful)
+    Terrified,
+    /// Ecstatic (peak joy/excitement, beyond Excited)
+    Ecstatic,
+    /// Skeptical, doubtful, unconvinced
+    Skeptical,
+    /// Relieved, unburdened
+    Relieved,
+    /// Panicked (acute, overwhelmed fear — beyond Terrified)
+    Panicked,
+    /// Concerned, worried-for (softer, outward-facing worry)
+    Concerned,
+    /// Apologetic, contrite
+    Apologetic,
+    /// Resigned, accepting-of-defeat
+    Resigned,
+    /// Wistful, yearning, bittersweet
+    Wistful,
+    /// Contemplative, reflective, pensive
+    Contemplative,
 }
 
 impl Emotion {
@@ -140,6 +191,29 @@ impl Emotion {
             Emotion::Embarrassed,
             Emotion::Content,
             Emotion::Bored,
+            // P4 widened affective states
+            Emotion::Amazed,
+            Emotion::Amused,
+            Emotion::Affectionate,
+            Emotion::Intrigued,
+            Emotion::Flirtatious,
+            Emotion::Frustrated,
+            Emotion::Annoyed,
+            Emotion::Determined,
+            Emotion::Reassuring,
+            Emotion::Sympathetic,
+            Emotion::Nostalgic,
+            Emotion::Serene,
+            Emotion::Terrified,
+            Emotion::Ecstatic,
+            Emotion::Skeptical,
+            Emotion::Relieved,
+            Emotion::Panicked,
+            Emotion::Concerned,
+            Emotion::Apologetic,
+            Emotion::Resigned,
+            Emotion::Wistful,
+            Emotion::Contemplative,
         ]
     }
 
@@ -242,6 +316,28 @@ impl Emotion {
             Emotion::Embarrassed => "embarrassed",
             Emotion::Content => "content",
             Emotion::Bored => "bored",
+            Emotion::Amazed => "amazed",
+            Emotion::Amused => "amused",
+            Emotion::Affectionate => "affectionate",
+            Emotion::Intrigued => "intrigued",
+            Emotion::Flirtatious => "flirtatious",
+            Emotion::Frustrated => "frustrated",
+            Emotion::Annoyed => "annoyed",
+            Emotion::Determined => "determined",
+            Emotion::Reassuring => "reassuring",
+            Emotion::Sympathetic => "sympathetic",
+            Emotion::Nostalgic => "nostalgic",
+            Emotion::Serene => "serene",
+            Emotion::Terrified => "terrified",
+            Emotion::Ecstatic => "ecstatic",
+            Emotion::Skeptical => "skeptical",
+            Emotion::Relieved => "relieved",
+            Emotion::Panicked => "panicked",
+            Emotion::Concerned => "concerned",
+            Emotion::Apologetic => "apologetic",
+            Emotion::Resigned => "resigned",
+            Emotion::Wistful => "wistful",
+            Emotion::Contemplative => "contemplative",
         }
     }
 
@@ -269,25 +365,48 @@ impl Emotion {
             "neutral" => Some(Emotion::Neutral),
             "happy" | "joyful" | "cheerful" => Some(Emotion::Happy),
             "sad" | "melancholic" | "sorrowful" => Some(Emotion::Sad),
-            "angry" | "frustrated" | "mad" => Some(Emotion::Angry),
+            "angry" | "mad" | "outraged" => Some(Emotion::Angry),
             "fearful" | "scared" | "frightened" | "afraid" => Some(Emotion::Fearful),
             "surprised" | "shocked" | "astonished" => Some(Emotion::Surprised),
             "disgusted" | "repulsed" => Some(Emotion::Disgusted),
             "excited" | "enthusiastic" | "energetic" => Some(Emotion::Excited),
-            "calm" | "peaceful" | "relaxed" | "serene" => Some(Emotion::Calm),
+            "calm" | "peaceful" | "relaxed" => Some(Emotion::Calm),
             "anxious" | "nervous" | "worried" => Some(Emotion::Anxious),
             "confident" | "assured" | "assertive" => Some(Emotion::Confident),
             "confused" | "uncertain" | "puzzled" => Some(Emotion::Confused),
             "empathetic" | "compassionate" | "understanding" => Some(Emotion::Empathetic),
             "sarcastic" | "ironic" | "dry" => Some(Emotion::Sarcastic),
             "hopeful" | "optimistic" => Some(Emotion::Hopeful),
-            "disappointed" | "let_down" => Some(Emotion::Disappointed),
+            "disappointed" | "let_down" | "dejected" => Some(Emotion::Disappointed),
             "curious" | "inquisitive" | "interested" => Some(Emotion::Curious),
             "grateful" | "thankful" | "appreciative" => Some(Emotion::Grateful),
             "proud" | "accomplished" => Some(Emotion::Proud),
-            "embarrassed" | "sheepish" => Some(Emotion::Embarrassed),
+            "embarrassed" | "sheepish" | "shy" => Some(Emotion::Embarrassed),
             "content" | "satisfied" | "at_peace" => Some(Emotion::Content),
             "bored" | "uninterested" | "disengaged" => Some(Emotion::Bored),
+            // P4 widened affective states
+            "amazed" | "awestruck" | "astounded" => Some(Emotion::Amazed),
+            "amused" | "entertained" | "tickled" => Some(Emotion::Amused),
+            "affectionate" | "loving" | "tender" | "warm" => Some(Emotion::Affectionate),
+            "intrigued" => Some(Emotion::Intrigued),
+            "flirtatious" | "flirty" | "playful" | "teasing" => Some(Emotion::Flirtatious),
+            "frustrated" | "exasperated" | "agitated" => Some(Emotion::Frustrated),
+            "annoyed" | "irritated" | "disgruntled" => Some(Emotion::Annoyed),
+            "determined" | "resolute" | "driven" => Some(Emotion::Determined),
+            "reassuring" | "soothing" | "comforting" => Some(Emotion::Reassuring),
+            "sympathetic" | "commiserating" => Some(Emotion::Sympathetic),
+            "nostalgic" => Some(Emotion::Nostalgic),
+            "serene" | "tranquil" => Some(Emotion::Serene),
+            "terrified" | "petrified" => Some(Emotion::Terrified),
+            "ecstatic" | "euphoric" | "elated" | "thrilled" => Some(Emotion::Ecstatic),
+            "skeptical" | "doubtful" | "unconvinced" | "suspicious" => Some(Emotion::Skeptical),
+            "relieved" => Some(Emotion::Relieved),
+            "panicked" | "alarmed" => Some(Emotion::Panicked),
+            "concerned" => Some(Emotion::Concerned),
+            "apologetic" | "contrite" | "remorseful" => Some(Emotion::Apologetic),
+            "resigned" => Some(Emotion::Resigned),
+            "wistful" | "yearning" | "bittersweet" => Some(Emotion::Wistful),
+            "contemplative" | "reflective" | "pensive" => Some(Emotion::Contemplative),
             _ => None,
         }
     }
@@ -321,6 +440,13 @@ impl fmt::Display for Emotion {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryStyle {
+    // =========================================================================
+    // Delivery MECHANISMS — HOW speech is produced, independent of felt emotion.
+    // (The affective overlaps Cheerful/Serious/Soft were removed in P4 and now
+    // live ONLY in `Emotion`; their string forms are still accepted by
+    // `DeliveryStyle::from_str` as cross-enum aliases for backward compatibility,
+    // resolving to `Normal` here while `Emotion::from_str` resolves the feeling.)
+    // =========================================================================
     /// Normal, default delivery
     #[default]
     Normal,
@@ -342,16 +468,45 @@ pub enum DeliveryStyle {
     Casual,
     /// Storytelling, narrative, engaging
     Storytelling,
-    /// Soft, gentle, tender
-    Soft,
     /// Loud, strong volume
     Loud,
-    /// Cheerful, upbeat, bright
-    Cheerful,
-    /// Serious, grave, solemn
-    Serious,
-    /// Formal, proper, polished
+    /// Formal, proper, polished register (delivery register, not an emotion)
     Formal,
+
+    // =========================================================================
+    // Scenario / narration framings (P4 — map 1:1 to Azure express-as scenario
+    // style names and AWS Polly `amazon:domain` names; warn+default elsewhere).
+    // =========================================================================
+    /// Newscast / news-anchor delivery
+    Newscast,
+    /// Casual newscast variant
+    NewscastCasual,
+    /// Formal newscast variant
+    NewscastFormal,
+    /// Customer-service agent delivery
+    CustomerService,
+    /// Voice-assistant delivery
+    Assistant,
+    /// Conversational chat delivery
+    Chat,
+    /// Upbeat advertisement read
+    AdvertisementUpbeat,
+    /// Sports commentary
+    SportsCommentary,
+    /// Excited sports commentary
+    SportsCommentaryExcited,
+    /// Documentary narration
+    DocumentaryNarration,
+    /// Professional narration
+    NarrationProfessional,
+    /// Relaxed narration
+    NarrationRelaxed,
+    /// Poetry reading
+    PoetryReading,
+    /// Lyrical / song-like delivery
+    Lyrical,
+    /// Gentle, soft-spoken delivery mechanism
+    Gentle,
 }
 
 impl DeliveryStyle {
@@ -369,20 +524,37 @@ impl DeliveryStyle {
             DeliveryStyle::Professional => "professional",
             DeliveryStyle::Casual => "casual",
             DeliveryStyle::Storytelling => "storytelling",
-            DeliveryStyle::Soft => "soft",
             DeliveryStyle::Loud => "loud",
-            DeliveryStyle::Cheerful => "cheerful",
-            DeliveryStyle::Serious => "serious",
             DeliveryStyle::Formal => "formal",
+            DeliveryStyle::Newscast => "newscast",
+            DeliveryStyle::NewscastCasual => "newscast_casual",
+            DeliveryStyle::NewscastFormal => "newscast_formal",
+            DeliveryStyle::CustomerService => "customer_service",
+            DeliveryStyle::Assistant => "assistant",
+            DeliveryStyle::Chat => "chat",
+            DeliveryStyle::AdvertisementUpbeat => "advertisement_upbeat",
+            DeliveryStyle::SportsCommentary => "sports_commentary",
+            DeliveryStyle::SportsCommentaryExcited => "sports_commentary_excited",
+            DeliveryStyle::DocumentaryNarration => "documentary_narration",
+            DeliveryStyle::NarrationProfessional => "narration_professional",
+            DeliveryStyle::NarrationRelaxed => "narration_relaxed",
+            DeliveryStyle::PoetryReading => "poetry_reading",
+            DeliveryStyle::Lyrical => "lyrical",
+            DeliveryStyle::Gentle => "gentle",
         }
     }
 
     /// Parses a delivery style from a string (case-insensitive).
+    ///
+    /// The affective words `cheerful`/`serious`/`soft` were promoted to `Emotion`
+    /// in P4; they are still accepted here as cross-enum aliases (resolving to a
+    /// neutral delivery mechanism) so existing `delivery_style: "cheerful"` inputs
+    /// never error — the felt component is captured by `Emotion::from_str`.
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "normal" | "default" => Some(DeliveryStyle::Normal),
-            "whispered" | "whisper" | "quiet" => Some(DeliveryStyle::Whispered),
-            "shouted" | "shout" => Some(DeliveryStyle::Shouted),
+            "whispered" | "whisper" | "whispering" | "quiet" => Some(DeliveryStyle::Whispered),
+            "shouted" | "shout" | "shouting" => Some(DeliveryStyle::Shouted),
             "rushed" | "rush" | "fast" | "urgent" => Some(DeliveryStyle::Rushed),
             "measured" | "slow" | "deliberate" | "careful" => Some(DeliveryStyle::Measured),
             "monotone" | "flat" | "robotic" => Some(DeliveryStyle::Monotone),
@@ -390,13 +562,73 @@ impl DeliveryStyle {
             "professional" | "business" => Some(DeliveryStyle::Professional),
             "casual" | "informal" | "conversational" => Some(DeliveryStyle::Casual),
             "storytelling" | "narrative" | "story" => Some(DeliveryStyle::Storytelling),
-            "soft" | "gentle" | "tender" => Some(DeliveryStyle::Soft),
             "loud" | "strong" => Some(DeliveryStyle::Loud),
-            "cheerful" | "upbeat" | "bright" => Some(DeliveryStyle::Cheerful),
-            "serious" | "grave" | "solemn" => Some(DeliveryStyle::Serious),
             "formal" | "proper" | "polished" => Some(DeliveryStyle::Formal),
+            // Scenario / narration framings.
+            "newscast" | "news" => Some(DeliveryStyle::Newscast),
+            "newscast_casual" | "newscast-casual" => Some(DeliveryStyle::NewscastCasual),
+            "newscast_formal" | "newscast-formal" => Some(DeliveryStyle::NewscastFormal),
+            "customer_service" | "customerservice" | "customer-service" => {
+                Some(DeliveryStyle::CustomerService)
+            }
+            "assistant" => Some(DeliveryStyle::Assistant),
+            "chat" => Some(DeliveryStyle::Chat),
+            "advertisement_upbeat" | "advertisement-upbeat" | "advert_upbeat" => {
+                Some(DeliveryStyle::AdvertisementUpbeat)
+            }
+            "sports_commentary" | "sports-commentary" => Some(DeliveryStyle::SportsCommentary),
+            "sports_commentary_excited" | "sports-commentary-excited" => {
+                Some(DeliveryStyle::SportsCommentaryExcited)
+            }
+            "documentary_narration" | "documentary-narration" | "documentary" => {
+                Some(DeliveryStyle::DocumentaryNarration)
+            }
+            "narration_professional" | "narration-professional" => {
+                Some(DeliveryStyle::NarrationProfessional)
+            }
+            "narration_relaxed" | "narration-relaxed" => Some(DeliveryStyle::NarrationRelaxed),
+            "poetry_reading" | "poetry-reading" | "poetry" => Some(DeliveryStyle::PoetryReading),
+            "lyrical" => Some(DeliveryStyle::Lyrical),
+            "gentle" => Some(DeliveryStyle::Gentle),
+            // Cross-enum aliases for the promoted-to-Emotion words (backward compat).
+            "cheerful" | "upbeat" | "bright" | "serious" | "grave" | "solemn" | "soft"
+            | "tender" => Some(DeliveryStyle::Normal),
             _ => None,
         }
+    }
+
+    /// Returns all delivery styles as a slice (used by capability listings/tests).
+    #[inline]
+    pub const fn all() -> &'static [DeliveryStyle] {
+        &[
+            DeliveryStyle::Normal,
+            DeliveryStyle::Whispered,
+            DeliveryStyle::Shouted,
+            DeliveryStyle::Rushed,
+            DeliveryStyle::Measured,
+            DeliveryStyle::Monotone,
+            DeliveryStyle::Expressive,
+            DeliveryStyle::Professional,
+            DeliveryStyle::Casual,
+            DeliveryStyle::Storytelling,
+            DeliveryStyle::Loud,
+            DeliveryStyle::Formal,
+            DeliveryStyle::Newscast,
+            DeliveryStyle::NewscastCasual,
+            DeliveryStyle::NewscastFormal,
+            DeliveryStyle::CustomerService,
+            DeliveryStyle::Assistant,
+            DeliveryStyle::Chat,
+            DeliveryStyle::AdvertisementUpbeat,
+            DeliveryStyle::SportsCommentary,
+            DeliveryStyle::SportsCommentaryExcited,
+            DeliveryStyle::DocumentaryNarration,
+            DeliveryStyle::NarrationProfessional,
+            DeliveryStyle::NarrationRelaxed,
+            DeliveryStyle::PoetryReading,
+            DeliveryStyle::Lyrical,
+            DeliveryStyle::Gentle,
+        ]
     }
 }
 

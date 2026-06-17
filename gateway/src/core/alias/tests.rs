@@ -126,6 +126,7 @@ fn client_field_overrides_alias_default() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
     });

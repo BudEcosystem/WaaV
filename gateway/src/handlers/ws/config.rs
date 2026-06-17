@@ -500,9 +500,18 @@ pub struct TTSWebSocketConfig {
     /// Provider name (e.g., "deepgram", "hume", "elevenlabs")
     #[cfg_attr(feature = "openapi", schema(example = "deepgram"))]
     pub provider: String,
-    /// Voice ID or name to use for synthesis
+    /// Voice ID or name to use for synthesis.
+    ///
+    /// ESCAPE HATCH: when set, this raw provider id is used VERBATIM and the
+    /// [`Self::voice_descriptor`] resolution is skipped.
     #[cfg_attr(feature = "openapi", schema(example = "aura-asteria-en"))]
     pub voice_id: Option<String>,
+    /// Canonical voice DESCRIPTOR (P4): `{gender, locale/accent, style, age,
+    /// name_hint}` resolved SERVER-SIDE to a provider `voice_id` over the `/voices`
+    /// catalog when no raw `voice_id` is given. No match → provider default +
+    /// `config_warning` (never a 400). The resolved id is echoed back to the client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_descriptor: Option<crate::core::voice::VoiceDescriptor>,
     /// Speaking rate (0.25 to 4.0, 1.0 is normal)
     #[cfg_attr(feature = "openapi", schema(example = 1.0))]
     pub speaking_rate: Option<f32>,
@@ -706,31 +715,82 @@ impl TTSWebSocketConfig {
     /// }
     /// ```
     pub fn to_emotion_config(&self) -> Option<EmotionConfig> {
-        // Only return config if at least one emotion field is set
-        if self.emotion.is_none()
-            && self.emotion_intensity.is_none()
-            && self.delivery_style.is_none()
-            && self.emotion_description.is_none()
+        // DOUBLE-PATH UNIFICATION (P4). Two inputs can carry emotion:
+        //   (a) the structured fields `emotion` / `emotion_intensity` / `delivery_style`
+        //       / `emotion_description` on this config, and
+        //   (b) the flat `features.emotion` String sugar (e.g. "happy", or a free-form
+        //       "warm and reassuring").
+        // Defined precedence: structured > string-as-emotion > string-as-description.
+        // The structured path wins whenever ANY structured field is set; otherwise the
+        // flat String is parsed via `emotion_config_from_string`.
+        if self.emotion.is_some()
+            || self.emotion_intensity.is_some()
+            || self.delivery_style.is_some()
+            || self.emotion_description.is_some()
         {
-            return None;
+            return Some(EmotionConfig {
+                emotion: self.emotion,
+                intensity: self.emotion_intensity,
+                style: self.delivery_style,
+                description: self.emotion_description.clone(),
+                context: None, // Context is not exposed in WebSocket config for simplicity
+            });
         }
 
-        Some(EmotionConfig {
-            emotion: self.emotion,
-            intensity: self.emotion_intensity,
-            style: self.delivery_style,
-            description: self.emotion_description.clone(),
-            context: None, // Context is not exposed in WebSocket config for simplicity
-        })
+        // No structured fields → fold the flat `features.emotion` String sugar in.
+        self.features
+            .emotion
+            .as_deref()
+            .and_then(Self::emotion_config_from_string)
     }
 
-    /// Returns whether any emotion settings are configured.
+    /// Parse the flat `features.emotion` String sugar into a structured
+    /// [`EmotionConfig`] (P4 double-path unification).
+    ///
+    /// Precedence: a recognized canonical [`Emotion`] token wins; else a recognized
+    /// [`DeliveryStyle`] token; else — if the value looks free-form (more than one
+    /// word and not a known token) — it is treated as a Hume/OpenAI-style
+    /// `description`. A single unrecognized word yields `None` (nothing to apply).
+    pub(crate) fn emotion_config_from_string(raw: &str) -> Option<EmotionConfig> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Some(emotion) = Emotion::from_str(trimmed) {
+            return Some(EmotionConfig {
+                emotion: Some(emotion),
+                ..Default::default()
+            });
+        }
+        if let Some(style) = DeliveryStyle::from_str(trimmed) {
+            return Some(EmotionConfig {
+                style: Some(style),
+                ..Default::default()
+            });
+        }
+        // Free-form (multi-word) → description; single unknown word → ignore.
+        if trimmed.split_whitespace().count() > 1 {
+            return Some(EmotionConfig {
+                description: Some(trimmed.to_string()),
+                ..Default::default()
+            });
+        }
+        None
+    }
+
+    /// Returns whether any emotion settings are configured (structured fields OR the
+    /// flat `features.emotion` String sugar).
     #[inline]
     pub fn has_emotion_config(&self) -> bool {
         self.emotion.is_some()
             || self.emotion_intensity.is_some()
             || self.delivery_style.is_some()
             || self.emotion_description.is_some()
+            || self
+                .features
+                .emotion
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
     }
 }
 
@@ -982,5 +1042,88 @@ mod config_tests {
         // A TTS config without features.language must not invent one (backward-compat).
         let tts = tts_ws("elevenlabs", "eleven_turbo_v2_5", None);
         assert_eq!(tts.to_standard_tts("k".into()).features.language, None);
+    }
+
+    // ---- P4 double-path emotion unification --------------------------------
+
+    #[test]
+    fn p4_flat_emotion_string_folds_to_emotion() {
+        // features.emotion: "happy" (no structured fields) → EmotionConfig{emotion: Happy}.
+        let cfg: TTSWebSocketConfig = serde_json::from_value(serde_json::json!({
+            "provider": "cartesia",
+            "model": "sonic-3",
+            "features": { "emotion": "happy" }
+        }))
+        .unwrap();
+        let ec = cfg.to_emotion_config().expect("string sugar folds in");
+        assert_eq!(ec.emotion, Some(Emotion::Happy));
+        assert!(ec.description.is_none());
+    }
+
+    #[test]
+    fn p4_flat_emotion_string_delivery_style() {
+        // A delivery-style word lands on the style slot, not emotion.
+        let cfg: TTSWebSocketConfig = serde_json::from_value(serde_json::json!({
+            "provider": "azure",
+            "model": "neural",
+            "features": { "emotion": "whispering" }
+        }))
+        .unwrap();
+        let ec = cfg.to_emotion_config().unwrap();
+        assert_eq!(ec.style, Some(DeliveryStyle::Whispered));
+        assert!(ec.emotion.is_none());
+    }
+
+    #[test]
+    fn p4_flat_emotion_string_freeform_becomes_description() {
+        // Multi-word free-form → description (Hume/OpenAI path).
+        let cfg: TTSWebSocketConfig = serde_json::from_value(serde_json::json!({
+            "provider": "hume",
+            "model": "octave",
+            "features": { "emotion": "warm and reassuring, like a friend" }
+        }))
+        .unwrap();
+        let ec = cfg.to_emotion_config().unwrap();
+        assert_eq!(
+            ec.description.as_deref(),
+            Some("warm and reassuring, like a friend")
+        );
+        assert!(ec.emotion.is_none());
+    }
+
+    #[test]
+    fn p4_structured_wins_over_flat_string() {
+        // Structured `emotion` present → flat string is ignored (defined precedence).
+        let cfg: TTSWebSocketConfig = serde_json::from_value(serde_json::json!({
+            "provider": "cartesia",
+            "model": "sonic-3",
+            "emotion": "sad",
+            "features": { "emotion": "happy" }
+        }))
+        .unwrap();
+        let ec = cfg.to_emotion_config().unwrap();
+        assert_eq!(ec.emotion, Some(Emotion::Sad));
+    }
+
+    #[test]
+    fn p4_flat_string_reaches_cartesia_native_token() {
+        // End-to-end through the unifier: features.emotion "ecstatic" → base.emotion_config
+        // → Cartesia native token "euphoric".
+        let cfg: TTSWebSocketConfig = serde_json::from_value(serde_json::json!({
+            "provider": "cartesia",
+            "model": "sonic-3",
+            "features": { "emotion": "ecstatic" }
+        }))
+        .unwrap();
+        let base = cfg.to_tts_config("k".into());
+        let ec = base.emotion_config.expect("unified emotion config present");
+        assert_eq!(ec.emotion, Some(Emotion::Ecstatic));
+    }
+
+    #[test]
+    fn p4_single_unknown_word_is_ignored() {
+        // A single unrecognized token yields no emotion config (nothing to apply).
+        assert!(TTSWebSocketConfig::emotion_config_from_string("zzz").is_none());
+        assert!(TTSWebSocketConfig::emotion_config_from_string("   ").is_none());
     }
 }

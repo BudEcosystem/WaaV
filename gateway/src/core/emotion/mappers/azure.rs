@@ -81,9 +81,56 @@ impl AzureEmotionMapper {
             Emotion::Curious => Some("chat"), // Conversational
             Emotion::Grateful => Some("friendly"),
             Emotion::Proud => Some("excited"), // Positive energy
-            Emotion::Embarrassed => Some("shy"),
+            Emotion::Embarrassed => Some("embarrassed"),
             Emotion::Content => Some("calm"),
             Emotion::Bored => Some("disgruntled"), // Closest match
+            // P4 widened affective states → nearest Azure express-as style.
+            Emotion::Amazed => Some("excited"),
+            Emotion::Amused => Some("cheerful"),
+            Emotion::Affectionate => Some("affectionate"),
+            Emotion::Intrigued => Some("chat"),
+            Emotion::Flirtatious => Some("affectionate"),
+            Emotion::Frustrated => Some("disgruntled"),
+            Emotion::Annoyed => Some("disgruntled"),
+            Emotion::Determined => Some("serious"),
+            Emotion::Reassuring => Some("gentle"),
+            Emotion::Sympathetic => Some("empathetic"),
+            Emotion::Nostalgic => Some("sad"),
+            Emotion::Serene => Some("calm"),
+            Emotion::Terrified => Some("terrified"),
+            Emotion::Ecstatic => Some("excited"),
+            Emotion::Skeptical => Some("unfriendly"),
+            Emotion::Relieved => Some("calm"),
+            Emotion::Panicked => Some("terrified"),
+            Emotion::Concerned => Some("fearful"),
+            Emotion::Apologetic => Some("empathetic"),
+            Emotion::Resigned => Some("depressed"),
+            Emotion::Wistful => Some("sad"),
+            Emotion::Contemplative => Some("calm"),
+        }
+    }
+
+    /// Maps a scenario / narration [`DeliveryStyle`] to the Azure express-as style
+    /// name it corresponds to 1:1 (these ARE express-as styles, not speed knobs).
+    /// Returns `None` for non-scenario delivery mechanisms (handled by speed).
+    fn delivery_style_to_express_as(style: &DeliveryStyle) -> Option<&'static str> {
+        match style {
+            DeliveryStyle::Newscast => Some("newscast"),
+            DeliveryStyle::NewscastCasual => Some("newscast-casual"),
+            DeliveryStyle::NewscastFormal => Some("newscast-formal"),
+            DeliveryStyle::CustomerService => Some("customerservice"),
+            DeliveryStyle::Assistant => Some("assistant"),
+            DeliveryStyle::Chat => Some("chat"),
+            DeliveryStyle::AdvertisementUpbeat => Some("advertisement_upbeat"),
+            DeliveryStyle::SportsCommentary => Some("sports_commentary"),
+            DeliveryStyle::SportsCommentaryExcited => Some("sports_commentary_excited"),
+            DeliveryStyle::DocumentaryNarration => Some("documentary-narration"),
+            DeliveryStyle::NarrationProfessional => Some("narration-professional"),
+            DeliveryStyle::NarrationRelaxed => Some("narration-relaxed"),
+            DeliveryStyle::PoetryReading => Some("poetry-reading"),
+            DeliveryStyle::Lyrical => Some("lyrical"),
+            DeliveryStyle::Gentle => Some("gentle"),
+            _ => None,
         }
     }
 
@@ -110,11 +157,13 @@ impl AzureEmotionMapper {
             DeliveryStyle::Professional => Some(0.95),
             DeliveryStyle::Casual => Some(1.1),
             DeliveryStyle::Storytelling => Some(0.9),
-            DeliveryStyle::Soft => Some(0.95),
             DeliveryStyle::Loud => Some(1.05),
-            DeliveryStyle::Cheerful => Some(1.1),
-            DeliveryStyle::Serious => Some(0.9),
             DeliveryStyle::Formal => Some(0.95),
+            // Scenario / narration framings carry an express-as style (see
+            // `delivery_style_to_express_as`); a couple also get a gentle pacing nudge.
+            DeliveryStyle::NarrationRelaxed | DeliveryStyle::Gentle => Some(0.92),
+            DeliveryStyle::SportsCommentaryExcited => Some(1.15),
+            _ => None,
         }
     }
 }
@@ -171,6 +220,15 @@ impl EmotionMapper for AzureEmotionMapper {
         if let Some(style) = &config.style {
             if let Some(speed) = Self::style_to_speed(style) {
                 mapped.speed = Some(speed);
+            }
+
+            // Scenario / narration framings ARE express-as styles. If the emotion
+            // didn't already claim the express-as slot, the scenario style fills it
+            // (e.g. `delivery_style: "newscast"` → express-as style="newscast").
+            if mapped.ssml_style.is_none()
+                && let Some(scenario) = Self::delivery_style_to_express_as(style)
+            {
+                mapped.ssml_style = Some(scenario.to_string());
             }
 
             // Special case for whispered

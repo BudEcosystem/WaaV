@@ -672,10 +672,16 @@ impl CartesiaTTSConfig {
         if let Some(s) = f.speed {
             base.speaking_rate = Some(s);
         }
-        if let Some(emotion) = f
-            .emotion
-            .as_deref()
-            .and_then(crate::core::emotion::Emotion::from_str)
+        // P4 double-path: the unified `to_emotion_config` path (which also folds the
+        // flat `features.emotion` String + delivery_style/description) populates
+        // `base.emotion_config` BEFORE dispatch and takes precedence. Only when it is
+        // absent do we parse the flat String here as a backstop (e.g. the `/speak`
+        // REST path, which does not run the WS unifier).
+        if base.emotion_config.is_none()
+            && let Some(emotion) = f
+                .emotion
+                .as_deref()
+                .and_then(crate::core::emotion::Emotion::from_str)
         {
             base.emotion_config = Some(crate::core::emotion::EmotionConfig::with_emotion(emotion));
         }

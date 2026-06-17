@@ -367,6 +367,7 @@ fn default_alias_tts() -> TTSWebSocketConfig {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
     }

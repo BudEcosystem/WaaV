@@ -212,15 +212,20 @@ impl TTSRequestBuilder for CartesiaRequestBuilder {
             generation_config.insert("volume".to_string(), json!(volume));
         }
 
-        // Pass emotion from emotion_config if present
+        // Pass emotion from emotion_config if present. P4: route through the real
+        // `CartesiaEmotionMapper` so the canonical emotion is mapped to the NEAREST
+        // of Cartesia's ~48 native Sonic-3 tokens (e.g. Bored→"tired",
+        // Ecstatic→"euphoric"), not the raw canonical string.
         if let Some(ref emotion_config) = self.config.emotion_config
-            && let Some(ref emotion) = emotion_config.emotion {
-                // Convert emotion enum to string for Cartesia API
-                generation_config.insert(
-                    "emotion".to_string(),
-                    json!(emotion.to_string().to_lowercase()),
-                );
+            && emotion_config.emotion.is_some()
+        {
+            use crate::core::emotion::EmotionMapper;
+            let mapped = crate::core::emotion::mappers::CartesiaEmotionMapper::new()
+                .map_emotion(emotion_config);
+            if let Some(native) = mapped.native_emotion {
+                generation_config.insert("emotion".to_string(), json!(native));
             }
+        }
 
         // Build the request body
         let mut body = json!({

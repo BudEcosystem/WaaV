@@ -37,6 +37,11 @@ pub mod tts;
 pub mod turn;
 pub mod turn_decision;
 pub mod turn_detect;
+/// Unified VOICE-DESCRIPTOR system (P4): a canonical `{gender, locale/accent, style,
+/// age, name_hint}` resolved server-side to a provider `voice_id` over the `/voices`
+/// catalog. Mirrors the [`emotion`] / [`lang`] mapper chassis; raw `voice_id` is the
+/// escape hatch, no-match → provider default + `config_warning` (never a 400).
+pub mod voice;
 pub mod voice_manager;
 pub mod websocket;
 
@@ -89,6 +94,9 @@ pub use emotion::{
     IntensityLevel, MappedEmotion, ProviderEmotionSupport, get_mapper_for_provider,
     map_emotion_for_provider, provider_supports_emotions, validate_emotion_config,
 };
+
+// Re-export voice-descriptor types (P4) for convenience.
+pub use voice::{Age, Gender, ResolvedVoice, VoiceDescriptor, resolve_voice};
 
 // Re-export the unified language system (P2): canonical language + provider mapping.
 pub use lang::{

@@ -158,6 +158,16 @@ pub async fn handle_config_message(
         None
     };
 
+    // P4: resolve a canonical VoiceDescriptor into a concrete provider `voice_id`
+    // SERVER-SIDE, AFTER the alias merge (so an alias-supplied descriptor resolves
+    // too) and BEFORE provider construction. The raw `voice_id` escape hatch always
+    // wins; on no catalog match the resolver returns the provider default + a
+    // non-fatal `config_warning` (never a 400). The resolved id is set on the config
+    // and thus echoed in the `ready` ack.
+    if let Some(tts) = tts_ws_config.as_mut() {
+        resolve_voice_descriptor(tts, app_state, message_tx).await;
+    }
+
     // Generate stream_id if not provided by client
     let stream_id = resolve_stream_id(stream_id);
     info!("Session stream_id: {}", stream_id);
@@ -666,6 +676,68 @@ async fn emit_language_config_warnings(
     }
 }
 
+/// P4 voice-descriptor resolution: when a [`TTSWebSocketConfig`] carries a
+/// `voice_descriptor` but NO raw `voice_id`, resolve it SERVER-SIDE to a concrete
+/// provider `voice_id` over the (cached) `/voices` catalog and write it back onto
+/// `tts.voice_id`. On no catalog match the resolver returns the provider default and
+/// we surface a non-fatal `config_warning` — never a 400. The raw `voice_id` escape
+/// hatch (already set) short-circuits this entirely.
+async fn resolve_voice_descriptor(
+    tts: &mut TTSWebSocketConfig,
+    app_state: &Arc<AppState>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) {
+    // Escape hatch / nothing to resolve.
+    if tts.voice_id.as_ref().is_some_and(|v| !v.trim().is_empty()) {
+        return;
+    }
+    let Some(descriptor) = tts.voice_descriptor.clone() else {
+        return;
+    };
+    if !descriptor.is_set() {
+        return;
+    }
+
+    let catalog =
+        crate::handlers::voices::fetch_provider_catalog(app_state, &tts.provider).await;
+    let default_id = crate::handlers::voices::provider_default_voice(&tts.provider);
+    let resolved = crate::core::voice::resolve_voice(&descriptor, &catalog, default_id);
+
+    // Apply the resolved id (only if non-empty — some providers have no default).
+    if !resolved.voice_id.trim().is_empty() {
+        tts.voice_id = Some(resolved.voice_id.clone());
+    }
+
+    if let Some(warning) = resolved.warning {
+        crate::core::metrics::bridge::record_degraded("voice_resolution", "tts");
+        warn!(
+            provider = %tts.provider,
+            descriptor = %descriptor.describe(),
+            resolved = %resolved.voice_id,
+            "voice descriptor advisory: {warning}"
+        );
+        let _ = message_tx
+            .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
+                code: "voice_descriptor_unmatched".to_string(),
+                message: warning,
+                detail: Some(serde_json::json!({
+                    "provider": tts.provider,
+                    "descriptor": descriptor.describe(),
+                    "resolved_voice_id": resolved.voice_id,
+                    "used_default": resolved.used_default,
+                })),
+            }))
+            .await;
+    } else {
+        info!(
+            provider = %tts.provider,
+            descriptor = %descriptor.describe(),
+            voice_id = %resolved.voice_id,
+            "Resolved voice descriptor to provider voice_id"
+        );
+    }
+}
+
 /// the orchestrator. Returns `Ok(true)` when the loop is active.
 async fn initialize_conversation_loop(
     conv_config: &ConversationWebSocketConfig,
@@ -973,6 +1045,81 @@ async fn initialize_voice_manager(
                 return None;
             }
         }
+    };
+
+    // P4 VOICE-DESCRIPTOR resolution: when the client supplied a canonical
+    // `voice_descriptor` but NO raw `voice_id`, resolve it SERVER-SIDE to a concrete
+    // provider `voice_id` over the (cached) `/voices` catalog. The raw `voice_id`
+    // escape hatch always wins; on no match → provider default + `config_warning`
+    // (never a 400). The resolved id is folded into a local clone so it rides
+    // `to_standard_tts` → the provider exactly like an explicit `voice_id`.
+    let tts_ws_config_owned;
+    let tts_ws_config: &TTSWebSocketConfig = if tts_ws_config.voice_id.is_none()
+        && tts_ws_config
+            .voice_descriptor
+            .as_ref()
+            .is_some_and(|d| d.is_set())
+    {
+        let descriptor = tts_ws_config.voice_descriptor.clone().unwrap();
+        let provider = tts_ws_config.provider.clone();
+        let catalog = crate::handlers::voices::fetch_provider_catalog(app_state, &provider).await;
+        let default_id = crate::handlers::voices::provider_default_voice(&provider);
+        let resolved = crate::core::voice::resolve_voice(&descriptor, &catalog, default_id);
+
+        if let Some(warning) = resolved.warning.as_ref() {
+            warn!(
+                provider = provider.as_str(),
+                descriptor = descriptor.describe(),
+                "voice descriptor config advisory: {warning}"
+            );
+            crate::core::metrics::bridge::record_degraded("voice_descriptor", "tts");
+            let _ = message_tx
+                .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
+                    code: "voice_descriptor_unmatched".to_string(),
+                    message: warning.clone(),
+                    detail: Some(serde_json::json!({
+                        "side": "tts",
+                        "provider": provider,
+                        "descriptor": descriptor.describe(),
+                        "resolved_voice_id": resolved.voice_id,
+                        "used_default": resolved.used_default,
+                    })),
+                }))
+                .await;
+        } else {
+            info!(
+                provider = provider.as_str(),
+                descriptor = descriptor.describe(),
+                resolved_voice_id = resolved.voice_id.as_str(),
+                "resolved voice descriptor to provider voice_id"
+            );
+            // Echo the resolved id back so the client can see what it got (alias-ack
+            // pattern), even on a clean match.
+            let _ = message_tx
+                .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
+                    code: "voice_descriptor_resolved".to_string(),
+                    message: format!(
+                        "resolved voice descriptor {{{}}} to '{}'",
+                        descriptor.describe(),
+                        resolved.voice_id
+                    ),
+                    detail: Some(serde_json::json!({
+                        "side": "tts",
+                        "provider": provider,
+                        "descriptor": descriptor.describe(),
+                        "resolved_voice_id": resolved.voice_id,
+                        "used_default": false,
+                    })),
+                }))
+                .await;
+        }
+
+        let mut cfg = tts_ws_config.clone();
+        cfg.voice_id = Some(resolved.voice_id);
+        tts_ws_config_owned = cfg;
+        &tts_ws_config_owned
+    } else {
+        tts_ws_config
     };
 
     // Build standardized configs (W1 keystone): they carry the flat base PLUS advanced
@@ -1812,6 +1959,7 @@ async fn initialize_livekit_client(
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
     };

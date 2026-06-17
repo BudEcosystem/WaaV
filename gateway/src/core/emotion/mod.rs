@@ -139,9 +139,9 @@ pub use mapper::{EmotionMapper, EmotionMethod, MappedEmotion, ProviderEmotionSup
 
 // Provider mappers
 pub use mappers::{
-    AzureEmotionMapper, ElevenLabsEmotionMapper, FallbackEmotionMapper, HumeEmotionMapper,
-    get_mapper_for_provider, provider_supports_emotions, providers_with_emotion_support,
-    providers_without_emotion_support,
+    AzureEmotionMapper, CartesiaEmotionMapper, ElevenLabsEmotionMapper, FallbackEmotionMapper,
+    HumeEmotionMapper, OpenAiEmotionMapper, get_mapper_for_provider, get_mapper_for_provider_model,
+    provider_supports_emotions, providers_with_emotion_support, providers_without_emotion_support,
 };
 
 // =============================================================================

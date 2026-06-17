@@ -46,6 +46,7 @@ fn test_ws_config_serialization() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
     };
@@ -93,6 +94,7 @@ fn test_incoming_message_serialization() {
             emotion_intensity: None,
             delivery_style: None,
             emotion_description: None,
+            voice_descriptor: None,
             features: Default::default(),
             extras: Default::default(),
         }),
@@ -412,6 +414,7 @@ fn test_tts_ws_config_conversion_with_all_values() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
     };
@@ -448,6 +451,7 @@ fn test_tts_ws_config_conversion_with_defaults() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
     };
@@ -513,6 +517,7 @@ fn test_livekit_ws_config_conversion() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
     };
@@ -559,6 +564,7 @@ fn test_livekit_config_with_empty_listen_participants() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
     };
@@ -603,6 +609,7 @@ fn test_livekit_config_with_listen_participants() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
     };
@@ -737,6 +744,7 @@ fn test_incoming_message_config_with_livekit() {
             emotion_intensity: None,
             delivery_style: None,
             emotion_description: None,
+            voice_descriptor: None,
             features: Default::default(),
             extras: Default::default(),
         }),
@@ -794,6 +802,7 @@ fn test_incoming_message_config_without_livekit() {
             emotion_intensity: None,
             delivery_style: None,
             emotion_description: None,
+            voice_descriptor: None,
             features: Default::default(),
             extras: Default::default(),
         }),
@@ -1064,6 +1073,7 @@ fn test_tts_ws_config_conversion_mixed_values() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
     };
@@ -1118,6 +1128,7 @@ fn test_config_message_without_livekit_routing() {
             emotion_intensity: None,
             delivery_style: None,
             emotion_description: None,
+            voice_descriptor: None,
             features: Default::default(),
             extras: Default::default(),
         }),
@@ -1180,6 +1191,7 @@ fn test_config_message_with_livekit_routing() {
             emotion_intensity: None,
             delivery_style: None,
             emotion_description: None,
+            voice_descriptor: None,
             features: Default::default(),
             extras: Default::default(),
         }),
@@ -1452,6 +1464,7 @@ fn test_config_message_audio_default() {
             emotion_intensity: None,
             delivery_style: None,
             emotion_description: None,
+            voice_descriptor: None,
             features: Default::default(),
             extras: Default::default(),
         }),
@@ -1553,6 +1566,7 @@ fn tts_cfg(provider_rate: Option<u32>, client_rate: Option<u32>) -> TTSWebSocket
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        voice_descriptor: None,
         features: Default::default(),
         extras: Default::default(),
     }

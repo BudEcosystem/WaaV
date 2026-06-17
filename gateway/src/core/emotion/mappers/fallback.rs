@@ -26,6 +26,11 @@ use crate::core::emotion::types::{Emotion, EmotionConfig};
 pub struct FallbackEmotionMapper {
     /// The provider identifier for warning messages
     provider_id: &'static str,
+    /// PARTIAL-support delivery domains the provider DOES honor (AWS Polly NEURAL:
+    /// `Newscast` + `Casual`→conversational). When a requested [`DeliveryStyle`]
+    /// matches one of these, the mapper emits the provider's domain name as
+    /// [`MappedEmotion::ssml_style`] instead of warning. Empty = pure fallback.
+    partial_domains: &'static [crate::core::emotion::types::DeliveryStyle],
 }
 
 impl FallbackEmotionMapper {
@@ -36,7 +41,10 @@ impl FallbackEmotionMapper {
     /// * `provider_id` - The provider name for warning messages
     #[inline]
     pub const fn new(provider_id: &'static str) -> Self {
-        Self { provider_id }
+        Self {
+            provider_id,
+            partial_domains: &[],
+        }
     }
 
     /// Creates a fallback mapper for Deepgram.
@@ -46,6 +54,9 @@ impl FallbackEmotionMapper {
     }
 
     /// Creates a fallback mapper for Cartesia.
+    ///
+    /// NOTE: as of P4 Cartesia has a REAL [`super::CartesiaEmotionMapper`]; this
+    /// factory is retained only for the fallback unit tests.
     #[inline]
     pub const fn cartesia() -> Self {
         Self::new("cartesia")
@@ -63,19 +74,32 @@ impl FallbackEmotionMapper {
         Self::new("ibm-watson")
     }
 
-    /// Creates a fallback mapper for AWS Polly.
+    /// Creates a PARTIAL mapper for AWS Polly NEURAL: zero affective emotion, but
+    /// the two delivery domains `Newscast` (`<amazon:domain name="newscast"/>`) and
+    /// `Casual`→conversational (`<amazon:domain name="conversational"/>`) ARE honored
+    /// (emitted as [`MappedEmotion::ssml_style`]). Affective emotion still warns.
     #[inline]
     pub const fn aws_polly() -> Self {
-        Self::new("aws-polly")
+        use crate::core::emotion::types::DeliveryStyle;
+        Self {
+            provider_id: "aws-polly",
+            partial_domains: &[DeliveryStyle::Newscast, DeliveryStyle::Casual],
+        }
     }
 
-    /// Creates a fallback mapper for OpenAI (basic models).
-    ///
-    /// Note: gpt-4o-mini-tts supports instructions for emotion,
-    /// but the basic tts-1 and tts-1-hd models don't.
+    /// Creates a fallback mapper for the LEGACY OpenAI `tts-1` / `tts-1-hd` models,
+    /// which do NOT accept the `instructions` field (the modern `gpt-4o-mini-tts` /
+    /// `gpt-realtime` use the real [`super::OpenAiEmotionMapper`]).
+    #[inline]
+    pub const fn openai_legacy() -> Self {
+        Self::new("openai")
+    }
+
+    /// Deprecated alias for [`Self::openai_legacy`]; retained for the fallback unit
+    /// tests. (Modern OpenAI TTS now has a real instruction mapper.)
     #[inline]
     pub const fn openai() -> Self {
-        Self::new("openai")
+        Self::openai_legacy()
     }
 
     /// Creates a fallback mapper for LMNT.
@@ -95,6 +119,26 @@ impl Default for FallbackEmotionMapper {
     }
 }
 
+impl FallbackEmotionMapper {
+    /// Maps a partially-supported [`DeliveryStyle`] to the provider's SSML domain
+    /// name (currently AWS Polly only). `None` if this provider/style isn't a
+    /// honored domain.
+    fn partial_domain_name(
+        &self,
+        style: &crate::core::emotion::types::DeliveryStyle,
+    ) -> Option<&'static str> {
+        use crate::core::emotion::types::DeliveryStyle;
+        if !self.partial_domains.contains(style) {
+            return None;
+        }
+        match style {
+            DeliveryStyle::Newscast => Some("newscast"),
+            DeliveryStyle::Casual => Some("conversational"),
+            _ => None,
+        }
+    }
+}
+
 impl EmotionMapper for FallbackEmotionMapper {
     fn get_support(&self) -> ProviderEmotionSupport {
         ProviderEmotionSupport {
@@ -102,9 +146,14 @@ impl EmotionMapper for FallbackEmotionMapper {
             supports_emotions: false,
             supported_emotions: &[],
             supports_intensity: false,
-            supports_style: false,
+            // AWS Polly honors a small set of delivery domains (newscast/conversational).
+            supports_style: !self.partial_domains.is_empty(),
             supports_free_description: false,
-            method: EmotionMethod::None,
+            method: if self.partial_domains.is_empty() {
+                EmotionMethod::None
+            } else {
+                EmotionMethod::Ssml
+            },
         }
     }
 
@@ -134,14 +183,19 @@ impl EmotionMapper for FallbackEmotionMapper {
                 ));
             }
 
-        // Generate warning for delivery style
+        // Delivery style: honor a partially-supported domain (AWS Polly), else warn.
         if let Some(style) = &config.style
-            && *style != crate::core::emotion::types::DeliveryStyle::Normal {
+            && *style != crate::core::emotion::types::DeliveryStyle::Normal
+        {
+            if let Some(domain) = self.partial_domain_name(style) {
+                mapped.ssml_style = Some(domain.to_string());
+            } else {
                 mapped.add_warning(format!(
                     "Delivery style '{}' is not supported by provider '{}'; using normal delivery",
                     style, self.provider_id
                 ));
             }
+        }
 
         // Generate warning for intensity if significantly non-default
         if let Some(intensity) = &config.intensity {
