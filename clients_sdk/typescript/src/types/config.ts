@@ -182,6 +182,42 @@ export interface VoiceDescriptor {
 }
 
 /**
+ * Canonical, provider-agnostic in-stream/batch translation request (P5).
+ *
+ * Reuses P2's canonical language tokens ({@link CanonicalLanguage}). Lives as
+ * `STTConfig.translation` (nested under `stt_config.translation` on the wire) and
+ * on the batch envelope; the gateway emits a uniform `translations:[{lang,text}]`
+ * array merged onto the transcript event regardless of provider, degrading with a
+ * `config_warning` (never a 400) where a provider lacks streaming translation.
+ *
+ * Provider classes:
+ *  - Class A (arbitrary targets, side-channel): Speechmatics
+ *    (`translation_config.target_languages`, MAX 5), Gladia
+ *    (`realtime_processing.translation`), AssemblyAI (batch only).
+ *  - Class B (English-only fast path): OpenAI/Groq `/audio/translations` — set
+ *    `translateToEnglish: true`.
+ */
+export interface TranslationConfig {
+  /**
+   * Canonical target languages (region-qualified BCP-47, e.g. `["es-ES","de-DE"]`).
+   * Mapped to each provider's native codes server-side; capped per-provider
+   * (Speechmatics MAX 5 → warn + truncate).
+   */
+  targetLanguages?: string[];
+  /**
+   * Fast path: translate the whole stream to ENGLISH (OpenAI/Groq
+   * `/audio/translations`). For Class-A providers this is sugar for
+   * `targetLanguages: ["en-US"]`.
+   */
+  translateToEnglish?: boolean;
+  /**
+   * Emit partial (interim) translations where supported (Speechmatics
+   * `enable_partials` / Gladia live). Omit for provider default (finals only).
+   */
+  partials?: boolean;
+}
+
+/**
  * STT (Speech-to-Text) Configuration
  * Maps to the gateway STTWebSocketConfig in src/handlers/ws/config.rs
  */
@@ -261,6 +297,14 @@ export interface STTConfig {
   extras?: Record<string, unknown>;
   /** Per-session API key override (literal or '${ENV}'). */
   apiKey?: string;
+
+  /**
+   * Canonical in-stream/batch translation (P5). When set, the gateway emits a
+   * uniform `translations:[{lang,text}]` array merged onto the transcript;
+   * unsupported providers degrade with a `config_warning` (never a 400). Nests
+   * under `stt_config.translation` on the wire (see `sttConfigToWire`).
+   */
+  translation?: TranslationConfig;
 }
 
 /**

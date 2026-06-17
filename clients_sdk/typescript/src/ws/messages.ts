@@ -348,6 +348,19 @@ function sttConfigToWire(
   }
   if (Object.keys(extras).length > 0) wire.extras = extras;
 
+  // Canonical in-stream translation (P5) → stt_config.translation. The gateway
+  // folds Speechmatics/Gladia side-channels + the OpenAI/Groq English fast-path
+  // into a uniform translations:[{lang,text}] array; unsupported providers
+  // degrade with a config_warning (never a 400).
+  if (config.translation) {
+    const t = config.translation;
+    const tWire: Record<string, unknown> = {};
+    if (t.targetLanguages && t.targetLanguages.length > 0) tWire.target_languages = t.targetLanguages;
+    if (t.translateToEnglish !== undefined) tWire.translate_to_english = t.translateToEnglish;
+    if (t.partials !== undefined) tWire.partials = t.partials;
+    if (Object.keys(tWire).length > 0) wire.translation = tWire;
+  }
+
   return wire;
 }
 

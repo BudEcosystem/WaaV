@@ -350,6 +350,90 @@ class RestClient:
         return result
 
     # =========================================================================
+    # Batched / Async STT (P5)
+    # =========================================================================
+
+    async def submit_batch(
+        self,
+        *,
+        url: Optional[str] = None,
+        audio_base64: Optional[str] = None,
+        content_type: Optional[str] = None,
+        stt_config: Optional[dict[str, Any]] = None,
+        batch: Optional[dict[str, Any]] = None,
+        translation: Optional[dict[str, Any]] = None,
+        callback_url: Optional[str] = None,
+        callback_method: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Submit a batched/async transcription job (``POST /transcribe/batch``).
+
+        The canonical batch envelope WRAPS the streaming ``StandardSTTConfig``
+        VERBATIM (so the full typed ``SttFeatures`` — diarization/redaction/etc. —
+        are reused) plus the batch-only knobs that the streaming path intentionally
+        drops but ARE batch-capable (``alternatives`` / ``detect_language`` /
+        ``summarize`` / ``topics`` / ``intents`` / ``paragraphs`` / ``utterances``).
+
+        Supply audio as EITHER ``url`` OR ``audio_base64`` (+ optional
+        ``content_type``). When ``callback_url`` is set the gateway returns
+        ``{job_id, status:"queued"}`` immediately and POSTs the result to the
+        webhook; otherwise poll :meth:`get_batch` / use :meth:`transcribe_batch`.
+
+        Args:
+            url: Audio URL (Deepgram ``{"url"}`` / AssemblyAI ``audio_url``).
+            audio_base64: Inline base64 audio bytes (mutually exclusive with ``url``).
+            content_type: MIME type for inline bytes (e.g. ``audio/wav``).
+            stt_config: ``StandardSTTConfig`` fields (provider/language/model +
+                ``features{}`` + ``extras{}``), flattened onto the envelope.
+            batch: ``BatchFeatures`` dict (``paragraphs``/``utterances``/
+                ``summarize``/``topics``/``intents``/``detect_language``/
+                ``alternatives``).
+            translation: Canonical :class:`~bud_waav.types.TranslationConfig` dict
+                (batch enables AssemblyAI/Speechmatics/Gladia targets).
+            callback_url: Webhook for async delivery.
+            callback_method: ``POST`` (default) or ``PUT``.
+
+        Returns:
+            ``{job_id, status, ...}`` (and ``result`` when run synchronously).
+
+        Raises:
+            ValueError: If neither/both of ``url`` and ``audio_base64`` are given.
+        """
+        if (url is None) == (audio_base64 is None):
+            raise ValueError("Provide exactly one of `url` or `audio_base64`")
+
+        payload: dict[str, Any] = {}
+        if url is not None:
+            payload["url"] = url
+        else:
+            payload["audio_base64"] = audio_base64
+            if content_type is not None:
+                payload["content_type"] = content_type
+
+        # StandardSTTConfig is flattened onto the envelope (gateway #[serde(flatten)]).
+        if stt_config:
+            payload.update(stt_config)
+        if batch:
+            payload["batch"] = batch
+        if translation:
+            payload["translation"] = translation
+        if callback_url is not None:
+            payload["callback_url"] = callback_url
+        if callback_method is not None:
+            payload["callback_method"] = callback_method
+
+        result: dict[str, Any] = await self.post("/transcribe/batch", json=payload)
+        return result
+
+    async def get_batch(self, job_id: str) -> dict[str, Any]:
+        """Poll a batch job (``GET /transcribe/batch/{job_id}``).
+
+        Returns the canonical ``BatchJob``: ``{job_id, status, result?, error?}``
+        with ``status`` ∈ ``queued|processing|completed|error``.
+        """
+        result: dict[str, Any] = await self.get(f"/transcribe/batch/{job_id}")
+        return result
+
+    # =========================================================================
     # Voice Cloning Methods
     # =========================================================================
 

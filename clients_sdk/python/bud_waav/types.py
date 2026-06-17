@@ -859,6 +859,51 @@ class ConversationConfig(BaseModel):
     """Hard ceiling on the reasoning tier's output tokens."""
 
 
+class TranslationConfig(BaseModel):
+    """Canonical, provider-agnostic in-stream/batch translation request (P5).
+
+    Reuses P2's canonical language tokens (:data:`CANONICAL_LANGUAGES`). Lives as
+    ``STTConfig.translation`` (and on the batch envelope); the gateway emits a
+    uniform ``translations:[{lang, text}]`` array merged onto the transcript
+    event regardless of provider, degrading with a ``config_warning`` (never a
+    400) where a provider lacks streaming translation.
+
+    Provider classes (the gateway folds them all into one output shape):
+
+    * Class A (arbitrary targets, side-channel): Speechmatics
+      (``translation_config.target_languages``, MAX 5), Gladia
+      (``realtime_processing.translation``), AssemblyAI (batch only).
+    * Class B (English-only fast path): OpenAI/Groq ``/audio/translations`` —
+      set ``translate_to_english=True``.
+    """
+
+    target_languages: Optional[list[str]] = None
+    """Canonical target languages (region-qualified BCP-47, e.g. ``["es-ES",
+    "de-DE"]``). Mapped to each provider's native codes server-side; capped
+    per-provider (Speechmatics MAX 5 → warn + truncate)."""
+
+    translate_to_english: Optional[bool] = None
+    """Fast path: translate the whole stream to ENGLISH (OpenAI/Groq
+    ``/audio/translations``). For Class-A providers this is sugar for
+    ``target_languages=["en-US"]``."""
+
+    partials: Optional[bool] = None
+    """Emit partial (interim) translations where supported (Speechmatics
+    ``enable_partials`` / Gladia live). ``None`` = provider default (finals
+    only)."""
+
+    def to_wire(self) -> dict[str, Any]:
+        """Serialize to the gateway ``stt_config.translation`` shape (omit unset)."""
+        wire: dict[str, Any] = {}
+        if self.target_languages:
+            wire["target_languages"] = list(self.target_languages)
+        if self.translate_to_english is not None:
+            wire["translate_to_english"] = self.translate_to_english
+        if self.partials is not None:
+            wire["partials"] = self.partials
+        return wire
+
+
 class STTConfig(BaseModel):
     """STT (Speech-to-Text) configuration."""
 
@@ -900,6 +945,11 @@ class STTConfig(BaseModel):
 
     custom_vocabulary: Optional[list[str]] = None
     """Custom vocabulary words"""
+
+    translation: Optional[TranslationConfig] = None
+    """Canonical in-stream/batch translation (P5). When set, the gateway emits a
+    uniform ``translations:[{lang, text}]`` array merged onto the transcript;
+    unsupported providers degrade with a ``config_warning`` (never a 400)."""
 
 
 class TTSConfig(BaseModel):

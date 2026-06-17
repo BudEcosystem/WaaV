@@ -35,6 +35,7 @@
 export type {
   STTConfig,
   TTSConfig,
+  TranslationConfig,
   Pronunciation,
   LiveKitConfig,
   SessionConfig,

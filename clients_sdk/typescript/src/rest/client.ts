@@ -9,6 +9,70 @@ import type { VoiceCloneRequest, VoiceCloneResponse } from '../types/voice.js';
 import type { Voice, VoiceListResponse, TTSSynthesisResult } from '../types/tts.js';
 import type { LiveKitTokenRequest, LiveKitTokenResponse, RoomInfo, RoomListResponse } from '../types/livekit.js';
 import type { SIPHook, SIPHookListResponse, SIPHookCreateRequest, SIPHookCreateResponse } from '../types/sip.js';
+import type { STTConfig, TranslationConfig } from '../types/config.js';
+
+/**
+ * Batch-only STT knobs that the streaming path drops but ARE batch-capable on
+ * Deepgram prerecorded / AssemblyAI async / OpenAI (P5). Mirrors the gateway
+ * `BatchFeatures` (gateway/src/core/stt/batch.rs).
+ */
+export interface BatchFeatures {
+  /** Paragraph formatting (Deepgram `paragraphs` / AAI). */
+  paragraphs?: boolean;
+  /** Utterance segmentation (Deepgram / AAI `utterances`). */
+  utterances?: boolean;
+  /** Summary (Deepgram `summarize=v2` / AAI `summarization`). */
+  summarize?: boolean;
+  /** Topic detection (Deepgram `topics` / AAI `iab_categories`). */
+  topics?: boolean;
+  /** Intent detection (Deepgram `intents`; no AAI equiv → warn). */
+  intents?: boolean;
+  /** Language detection (Deepgram / AAI / OpenAI verbose_json). STREAMING GAP. */
+  detectLanguage?: boolean;
+  /** N-best alternatives (Deepgram prerecorded). STREAMING GAP. */
+  alternatives?: number;
+}
+
+/** Canonical batch job status (AssemblyAI-aligned superset). */
+export type BatchStatus = 'queued' | 'processing' | 'completed' | 'error';
+
+/** Canonical, provider-agnostic batch job (gateway `BatchJob`). */
+export interface BatchJob {
+  /** Gateway job id (maps to provider request_id / transcript id). */
+  job_id: string;
+  /** `queued | processing | completed | error`. */
+  status: BatchStatus;
+  /** Canonical transcript + features once `completed`. */
+  result?: unknown;
+  /** Error message when `status === 'error'`. */
+  error?: string;
+}
+
+/** Options for {@link RestClient.transcribeBatch}. */
+export interface BatchTranscribeOptions {
+  /** Audio URL (Deepgram `{url}` / AssemblyAI `audio_url`). */
+  url?: string;
+  /** Inline base64 audio bytes (mutually exclusive with `url`). */
+  audioBase64?: string;
+  /** MIME type for inline bytes (e.g. `audio/wav`). */
+  contentType?: string;
+  /** `StandardSTTConfig` reused VERBATIM (provider/language/model + features + extras). */
+  config?: STTConfig;
+  /** Batch-only knobs (the streaming-drop set). */
+  batch?: BatchFeatures;
+  /** Canonical translation block (batch enables AssemblyAI/Speechmatics/Gladia). */
+  translation?: TranslationConfig;
+  /** Async webhook for result delivery. */
+  callbackUrl?: string;
+  /** Callback verb: `POST` (default) or `PUT`. */
+  callbackMethod?: string;
+  /** Poll until terminal when no `callbackUrl` (default true). */
+  poll?: boolean;
+  /** Seconds between polls (default 2). */
+  pollIntervalSeconds?: number;
+  /** Max seconds to poll before throwing (default 300). */
+  timeoutSeconds?: number;
+}
 
 /**
  * REST client options
@@ -335,4 +399,166 @@ export class RestClient {
     const buffer = await this.request<ArrayBuffer>('GET', `/recording/${encodeURIComponent(streamId)}`);
     return new Blob([buffer], { type: 'audio/wav' });
   }
+
+  // ===========================================================================
+  // Batched / Async STT (P5)
+  // ===========================================================================
+
+  /**
+   * Submit a batched/async transcription job (`POST /transcribe/batch`) and, by
+   * default, poll `GET /transcribe/batch/{job_id}` until terminal.
+   *
+   * The canonical batch envelope WRAPS the streaming {@link STTConfig} VERBATIM
+   * (so the full typed `SttFeatures` — diarization/redaction/etc. — are reused)
+   * plus the batch-only knobs the streaming path drops but ARE batch-capable
+   * (`alternatives`/`detectLanguage`/`summarize`/`topics`/`intents`/`paragraphs`/
+   * `utterances`). Supply audio as EITHER `url` OR `audioBase64` (+ optional
+   * `contentType`). When `callbackUrl` is set the gateway returns
+   * `{job_id, status:"queued"}` immediately and POSTs the result to the webhook.
+   *
+   * @returns The terminal {@link BatchJob} when polled, else the submit ack.
+   */
+  async transcribeBatch(options: BatchTranscribeOptions): Promise<BatchJob> {
+    if ((options.url === undefined) === (options.audioBase64 === undefined)) {
+      throw new Error('Provide exactly one of `url` or `audioBase64`');
+    }
+
+    const submit = await this.submitBatch(options);
+
+    // Webhook mode or caller opted out → return the submit ack.
+    if (options.callbackUrl !== undefined || options.poll === false) {
+      return submit;
+    }
+    // Some providers run synchronously and return a terminal job immediately.
+    if (submit.status === 'completed' || submit.status === 'error' || submit.result !== undefined) {
+      return submit;
+    }
+    if (!submit.job_id) return submit;
+
+    const intervalMs = (options.pollIntervalSeconds ?? 2) * 1000;
+    const deadline = Date.now() + (options.timeoutSeconds ?? 300) * 1000;
+    for (;;) {
+      const job = await this.getBatchJob(submit.job_id);
+      if (job.status === 'completed' || job.status === 'error') return job;
+      if (Date.now() >= deadline) {
+        const timeoutSec = options.timeoutSeconds ?? 300;
+        throw new TimeoutError(
+          `Batch job ${submit.job_id} did not finish within ${timeoutSec}s ` +
+            `(last status: ${job.status})`,
+          timeoutSec * 1000,
+          { operation: 'transcribeBatch' },
+        );
+      }
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+  }
+
+  /** Submit a batch job without polling (`POST /transcribe/batch`). */
+  async submitBatch(options: BatchTranscribeOptions): Promise<BatchJob> {
+    const body: Record<string, unknown> = {};
+    if (options.url !== undefined) {
+      body.url = options.url;
+    } else if (options.audioBase64 !== undefined) {
+      body.audio_base64 = options.audioBase64;
+      if (options.contentType !== undefined) body.content_type = options.contentType;
+    }
+
+    // StandardSTTConfig is flattened onto the envelope (gateway #[serde(flatten)]).
+    if (options.config) {
+      Object.assign(body, sttConfigToBatchWire(options.config));
+    }
+    if (options.batch) body.batch = batchFeaturesToWire(options.batch);
+    if (options.translation) {
+      const t = options.translation;
+      const tWire: Record<string, unknown> = {};
+      if (t.targetLanguages && t.targetLanguages.length > 0) tWire.target_languages = t.targetLanguages;
+      if (t.translateToEnglish !== undefined) tWire.translate_to_english = t.translateToEnglish;
+      if (t.partials !== undefined) tWire.partials = t.partials;
+      if (Object.keys(tWire).length > 0) body.translation = tWire;
+    }
+    if (options.callbackUrl !== undefined) body.callback_url = options.callbackUrl;
+    if (options.callbackMethod !== undefined) body.callback_method = options.callbackMethod;
+
+    return this.request<BatchJob>('POST', '/transcribe/batch', { body });
+  }
+
+  /** Poll a batch job (`GET /transcribe/batch/{job_id}`). */
+  async getBatchJob(jobId: string): Promise<BatchJob> {
+    return this.request<BatchJob>('GET', `/transcribe/batch/${encodeURIComponent(jobId)}`);
+  }
+}
+
+/**
+ * Flatten an {@link STTConfig} to the `StandardSTTConfig` wire fields the batch
+ * envelope expects (provider/language/model/sample_rate/channels/encoding +
+ * nested `features` + open `extras` + `translation` + `api_key`). Streaming-only
+ * concerns (turn_detection) are intentionally excluded.
+ */
+function sttConfigToBatchWire(config: STTConfig): Record<string, unknown> {
+  const wire: Record<string, unknown> = { provider: config.provider };
+  const set = (k: string, v: unknown) => {
+    if (v !== undefined && v !== null) wire[k] = v;
+  };
+  set('language', config.language);
+  set('sample_rate', config.sampleRate);
+  set('channels', config.channels);
+  set('punctuation', config.punctuation ?? config.punctuate);
+  set('encoding', config.encoding);
+  set('model', config.model);
+  set('api_key', config.apiKey);
+
+  // Nested canonical SttFeatures the batch wire reuses verbatim.
+  const features: Record<string, unknown> = {};
+  const setF = (k: string, v: unknown) => {
+    if (v !== undefined && v !== null) features[k] = v;
+  };
+  setF('interim_results', config.interimResults);
+  setF('diarization', config.diarize);
+  setF('smart_format', config.smartFormat);
+  setF('profanity_filter', config.profanityFilter);
+  setF('word_timestamps', config.wordTimestamps);
+  setF('filler_words', config.fillerWords);
+  setF('vad_events', config.vadEvents);
+  setF('redaction', config.redaction);
+  setF('language_detection', config.languageDetection);
+  setF('entity_detection', config.entityDetection);
+  setF('numerals', config.numerals);
+  setF('multichannel', config.multichannel);
+  setF('alternatives', config.alternatives);
+  setF('sentiment', config.sentiment);
+  if (config.keyterms) setF('keyterms', config.keyterms);
+  else if (config.keywords) setF('keyterms', config.keywords);
+  if (Object.keys(features).length > 0) wire.features = features;
+
+  // Open passthrough.
+  const extras: Record<string, unknown> = { ...(config.extras ?? {}) };
+  if (config.customVocabulary !== undefined && extras.custom_vocabulary === undefined) {
+    extras.custom_vocabulary = config.customVocabulary;
+  }
+  if (Object.keys(extras).length > 0) wire.extras = extras;
+
+  // Translation block (P5).
+  if (config.translation) {
+    const t = config.translation;
+    const tWire: Record<string, unknown> = {};
+    if (t.targetLanguages && t.targetLanguages.length > 0) tWire.target_languages = t.targetLanguages;
+    if (t.translateToEnglish !== undefined) tWire.translate_to_english = t.translateToEnglish;
+    if (t.partials !== undefined) tWire.partials = t.partials;
+    if (Object.keys(tWire).length > 0) wire.translation = tWire;
+  }
+
+  return wire;
+}
+
+/** Map {@link BatchFeatures} (camelCase) to the gateway snake_case wire. */
+function batchFeaturesToWire(batch: BatchFeatures): Record<string, unknown> {
+  const wire: Record<string, unknown> = {};
+  if (batch.paragraphs !== undefined) wire.paragraphs = batch.paragraphs;
+  if (batch.utterances !== undefined) wire.utterances = batch.utterances;
+  if (batch.summarize !== undefined) wire.summarize = batch.summarize;
+  if (batch.topics !== undefined) wire.topics = batch.topics;
+  if (batch.intents !== undefined) wire.intents = batch.intents;
+  if (batch.detectLanguage !== undefined) wire.detect_language = batch.detectLanguage;
+  if (batch.alternatives !== undefined) wire.alternatives = batch.alternatives;
+  return wire;
 }

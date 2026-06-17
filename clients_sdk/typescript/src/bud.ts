@@ -2,12 +2,21 @@
  * BudClient - Main entry point for @bud-foundry/sdk
  */
 
-import { RestClient, type RestClientOptions } from './rest/client.js';
+import {
+  RestClient,
+  type RestClientOptions,
+  type BatchJob,
+  type BatchTranscribeOptions,
+} from './rest/client.js';
 import { BudSTT, type BudSTTConfig } from './pipelines/stt.js';
 import { BudTTS, type BudTTSConfig } from './pipelines/tts.js';
 import { BudTalk, type BudTalkConfig } from './pipelines/talk.js';
 import { BudTranscribe, type BudTranscribeConfig } from './pipelines/transcribe.js';
 import { AgentSession, type AgentConfig } from './pipelines/agent.js';
+import {
+  GatewayRealtime,
+  type GatewayRealtimeConfig,
+} from './pipelines/realtime-gateway.js';
 import { WebSocketSession, type SessionConfig } from './ws/session.js';
 import type { FeatureFlags, DEFAULT_FEATURE_FLAGS } from './types/features.js';
 import type { MetricsSummary } from './types/metrics.js';
@@ -227,6 +236,84 @@ export class BudClient {
       merged.WebSocket = this.config.WebSocket;
     }
     return new AgentSession(merged, this.wsUrl, this.config.apiKey);
+  }
+
+  /**
+   * The GATEWAY-NATIVE realtime entry point (recommended).
+   *
+   * Returns an UNCONNECTED {@link GatewayRealtime} that speaks the gateway's
+   * provider-agnostic `/realtime` WebSocket protocol, so the SAME surface works
+   * for ALL 12 realtime/S2S providers — `provider` is just a field: `openai`,
+   * `hume`, `azure`, `grok`, `inworld`, `deepgram`, `elevenlabs`, `gemini`,
+   * `ultravox`, `nova_sonic`, `speechmatics`, `yandex`.
+   *
+   * Unlike {@link BudRealtime} (the provider-NATIVE OpenAI/Hume escape hatch that
+   * can bypass the gateway), this client never speaks a vendor wire: the gateway
+   * connects the provider server-side from its own credentials. Consume events
+   * via callbacks (`session.on(...)`) AND/OR the unified async stream
+   * (`for await (const ev of session.events())`).
+   *
+   * @example
+   * ```ts
+   * const session = bud.realtime({ provider: 'openai', voice: 'alloy', instructions: 'You are helpful.' });
+   * session.on('transcript', (t) => console.log(t.text));
+   * session.on('audio', (a) => playback(a.audio));   // bot speech
+   * await session.connect();
+   * session.sendAudio(pcm);
+   * ```
+   */
+  realtime(config: GatewayRealtimeConfig): GatewayRealtime {
+    // Derive the /realtime WS URL from the gateway base (sibling of /ws).
+    const realtimeUrl = this.wsUrl.replace(/\/ws$/, '/realtime');
+    return new GatewayRealtime({
+      url: realtimeUrl,
+      config,
+      apiKey: this.config.apiKey,
+      WebSocket: this.config.WebSocket,
+    });
+  }
+
+  /**
+   * Submit a batched/async transcription job and (by default) poll until done
+   * (`POST /transcribe/batch` → `GET /transcribe/batch/{job_id}`).
+   *
+   * The batch envelope REUSES the streaming {@link STTConfig} VERBATIM plus
+   * batch-only knobs (`batch=`) that the streaming path drops but ARE
+   * batch-capable on Deepgram prerecorded / AssemblyAI async / OpenAI
+   * (alternatives, detectLanguage, summarize, topics, intents, paragraphs,
+   * utterances).
+   *
+   * Audio source — pass `audio` as a URL string, a `File`/`Blob`, or an
+   * `ArrayBuffer`/`Uint8Array` (base64-encoded for you); or set `url`/
+   * `audioBase64` directly via {@link BatchTranscribeOptions}. With `callbackUrl`
+   * set, the gateway returns `{job_id, status:"queued"}` and POSTs the result to
+   * the webhook.
+   *
+   * @example
+   * ```ts
+   * const job = await bud.transcribeBatch({
+   *   audio: 'https://example.com/call.wav',
+   *   config: { provider: 'deepgram', language: 'en-US' },
+   *   batch: { summarize: true, detectLanguage: true, alternatives: 3 },
+   *   translation: { targetLanguages: ['es-ES'] },
+   * });
+   * if (job.status === 'completed') console.log(job.result);
+   * ```
+   */
+  async transcribeBatch(
+    options: BatchTranscribeOptions & { audio?: string | File | Blob | ArrayBuffer | Uint8Array },
+  ): Promise<BatchJob> {
+    const { audio, ...rest } = options;
+    const opts: BatchTranscribeOptions = { ...rest };
+
+    if (audio !== undefined && opts.url === undefined && opts.audioBase64 === undefined) {
+      if (typeof audio === 'string') {
+        opts.url = audio;
+      } else {
+        opts.audioBase64 = await arrayBufferToBase64Async(audio);
+      }
+    }
+    return this.restClient.transcribeBatch(opts);
   }
 
   /**
@@ -508,6 +595,41 @@ export class BudClient {
     await this.disconnectAll();
     this.sloTracker.reset();
   }
+}
+
+/**
+ * Encode audio (File/Blob/ArrayBuffer/Uint8Array) to base64. Works in the
+ * browser (btoa) and Node (Buffer); used by {@link BudClient.transcribeBatch}
+ * for inline-bytes submission.
+ */
+async function arrayBufferToBase64Async(
+  audio: File | Blob | ArrayBuffer | Uint8Array,
+): Promise<string> {
+  let bytes: Uint8Array;
+  if (audio instanceof Uint8Array) {
+    bytes = audio;
+  } else if (audio instanceof ArrayBuffer) {
+    bytes = new Uint8Array(audio);
+  } else {
+    // File | Blob
+    bytes = new Uint8Array(await audio.arrayBuffer());
+  }
+
+  // Node path: Buffer is fastest and avoids btoa's binary-string limits.
+  const maybeBuffer = (globalThis as { Buffer?: { from(b: Uint8Array): { toString(enc: string): string } } })
+    .Buffer;
+  if (maybeBuffer) {
+    return maybeBuffer.from(bytes).toString('base64');
+  }
+
+  // Browser path: chunked binary string → btoa (8KB chunks avoid stack limits).
+  const chunkSize = 8192;
+  const chunks: string[] = [];
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+    chunks.push(String.fromCharCode(...chunk));
+  }
+  return btoa(chunks.join(''));
 }
 
 /**

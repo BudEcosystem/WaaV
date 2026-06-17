@@ -82,6 +82,13 @@ SDK_CONFIG_REACH: dict[str, set[str]] = {
         "features",  # nested SttFeatures (see SttFeatures below)
         "extras",  # open passthrough (custom_vocabulary, …)
         "turn_detection",  # AudioFeatures.turn_detection (nested here)
+        # NOTE (P5): the SDK ALSO sends `stt_config.translation` (the canonical
+        # TranslationConfig — see STTConfig.translation + ws/session.py). It is
+        # intentionally NOT listed here yet: the drift guard is bidirectional and
+        # the committed gateway openapi.yaml STTWebSocketConfig has not been
+        # regenerated with `translation` (the gateway `/ws` `to_standard_stt`
+        # wiring lands in the same P5 gateway commit). Add `"translation"` here in
+        # lockstep with that openapi regen so the coverage direction stays green.
     },
     # ---- TurnDetectionWsConfig (config.rs:351) --------------------------------
     "TurnDetectionWsConfig": {

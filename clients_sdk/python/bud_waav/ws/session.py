@@ -561,6 +561,16 @@ class WebSocketSession:
                     "custom_vocabulary": list(self.stt_config.custom_vocabulary)
                 }
 
+            # Canonical in-stream translation (P5) → stt_config.translation. The
+            # gateway folds Speechmatics/Gladia side-channels + the OpenAI/Groq
+            # English fast-path into a uniform translations:[{lang,text}] array;
+            # unsupported providers degrade with a config_warning (never a 400).
+            translation = getattr(self.stt_config, "translation", None)
+            if translation is not None:
+                tw = translation.to_wire()
+                if tw:
+                    stt_dict["translation"] = tw
+
             # ML turn detection → stt_config.turn_detection (config.rs:345). This is
             # the REAL wire home for turn_detection (it was a dead no-op before).
             td = self.audio_features.turn_detection if self.audio_features else None

@@ -18,6 +18,19 @@ from .realtime import (
     EmotionEvent,
     StateChangeEvent,
 )
+from .realtime_gateway import (
+    GatewayRealtime,
+    GatewayRealtimeConfig,
+    GatewayTurnDetection,
+    RealtimeTool,
+    RealtimeEvent,
+    SpeechEvent,
+    ErrorEvent,
+    SessionCreatedEvent,
+    ResponseEvent,
+    REALTIME_PROVIDERS,
+    get_supported_realtime_providers,
+)
 
 __all__ = [
     "BudSTT",
@@ -30,7 +43,7 @@ __all__ = [
     "ConfigWarning",
     "BudTranscribe",
     "TranscribeSession",
-    # Realtime pipeline
+    # Realtime pipeline (provider-native escape hatch)
     "BudRealtime",
     "RealtimeSession",
     "RealtimeConfig",
@@ -41,4 +54,16 @@ __all__ = [
     "RealtimeAudioEvent",
     "EmotionEvent",
     "StateChangeEvent",
+    # Gateway-native realtime (provider-agnostic /realtime — all 12 providers)
+    "GatewayRealtime",
+    "GatewayRealtimeConfig",
+    "GatewayTurnDetection",
+    "RealtimeTool",
+    "RealtimeEvent",
+    "SpeechEvent",
+    "ErrorEvent",
+    "SessionCreatedEvent",
+    "ResponseEvent",
+    "REALTIME_PROVIDERS",
+    "get_supported_realtime_providers",
 ]

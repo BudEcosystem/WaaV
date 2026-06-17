@@ -46,6 +46,7 @@ from .types import (
     # Configuration types
     STTConfig,
     TTSConfig,
+    TranslationConfig,
     LiveKitConfig,
     FeatureFlags,
     STTResult,
@@ -167,6 +168,18 @@ from .pipelines import (
     RealtimeAudioEvent,
     EmotionEvent,
     StateChangeEvent,
+    # Gateway-native realtime (provider-agnostic /realtime — all 12 providers)
+    GatewayRealtime,
+    GatewayRealtimeConfig,
+    GatewayTurnDetection,
+    RealtimeTool,
+    RealtimeEvent,
+    SpeechEvent,
+    ErrorEvent,
+    SessionCreatedEvent,
+    ResponseEvent,
+    REALTIME_PROVIDERS,
+    get_supported_realtime_providers,
 )
 from .rest import RestClient
 from .voices import VoicesAPI, CloneResult
@@ -194,6 +207,7 @@ __all__ = [
     # Configuration types
     "STTConfig",
     "TTSConfig",
+    "TranslationConfig",
     "LiveKitConfig",
     "FeatureFlags",
     # Emotion types (Unified Emotion System)
@@ -322,6 +336,18 @@ __all__ = [
     "RealtimeAudioEvent",
     "EmotionEvent",
     "StateChangeEvent",
+    # Gateway-native realtime (provider-agnostic /realtime — all 12 providers)
+    "GatewayRealtime",
+    "GatewayRealtimeConfig",
+    "GatewayTurnDetection",
+    "RealtimeTool",
+    "RealtimeEvent",
+    "SpeechEvent",
+    "ErrorEvent",
+    "SessionCreatedEvent",
+    "ResponseEvent",
+    "REALTIME_PROVIDERS",
+    "get_supported_realtime_providers",
     # Utility classes
     "RestClient",
     "WebSocketSession",

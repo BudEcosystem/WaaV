@@ -2,7 +2,11 @@
 BudClient - Main entry point for Bud WaaV SDK
 """
 
+import asyncio
+import base64
+import time
 import weakref
+from pathlib import Path
 from typing import Any, Optional, Union
 
 from .rest.client import RestClient
@@ -12,9 +16,15 @@ from .pipelines.tts import BudTTS
 from .pipelines.talk import BudTalk, TalkSession
 from .pipelines.transcribe import BudTranscribe
 from .pipelines.realtime import BudRealtime, RealtimeConfig
+from .pipelines.realtime_gateway import (
+    GatewayRealtime,
+    GatewayRealtimeConfig,
+    GatewayTurnDetection,
+    RealtimeTool,
+)
 from .types import (
     STTConfig, TTSConfig, ConversationConfig, AudioFeatures, TurnDetectionConfig,
-    CANONICAL_LANGUAGES, language_capabilities,
+    TranslationConfig, CANONICAL_LANGUAGES, language_capabilities,
 )
 from .ws.session import ReconnectConfig
 
@@ -169,6 +179,240 @@ class BudClient:
             if self.api_key:
                 config.api_key = self.api_key
         return BudRealtime(config)
+
+    def realtime(
+        self,
+        provider: str = "openai",
+        *,
+        voice: Optional[str] = None,
+        instructions: Optional[str] = None,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_response_tokens: Optional[int] = None,
+        turn_detection: Optional[Union[GatewayTurnDetection, dict[str, Any]]] = None,
+        tools: Optional[list[Union[RealtimeTool, dict[str, Any]]]] = None,
+        modalities: Optional[list[str]] = None,
+        transcribe_input: Optional[bool] = None,
+        transcription_model: Optional[str] = None,
+        input_audio_format: Optional[str] = None,
+        output_audio_format: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        input_audio_noise_reduction: Optional[str] = None,
+        alias: Optional[str] = None,
+    ) -> GatewayRealtime:
+        """The GATEWAY-NATIVE realtime entry point (recommended).
+
+        Returns an UNCONNECTED :class:`GatewayRealtime` that speaks the gateway's
+        provider-agnostic ``/realtime`` WebSocket protocol, so the SAME surface
+        works for ALL 12 realtime/S2S providers — ``provider`` is just a field:
+        ``openai``, ``hume``, ``azure``, ``grok``, ``inworld``, ``deepgram``,
+        ``elevenlabs``, ``gemini``, ``ultravox``, ``nova_sonic``,
+        ``speechmatics``, ``yandex``.
+
+        Unlike :meth:`create_realtime` (the provider-NATIVE escape hatch that only
+        knows OpenAI/Hume and can bypass the gateway), this client never speaks a
+        vendor wire: the gateway connects the provider server-side from its own
+        credentials. Consume events via callbacks (``session.on(...)``) AND/OR the
+        unified async stream (``async for ev in session``).
+
+        Args:
+            provider: Realtime provider (default ``"openai"``). One of the 12 above.
+            voice: Output TTS voice (provider-specific).
+            instructions: System instructions for the assistant.
+            model: Model id (provider-specific; gateway defaults apply if unset).
+            temperature: Response temperature.
+            max_response_tokens: Max output tokens (-1 = unlimited).
+            turn_detection: A :class:`GatewayTurnDetection` or a dict
+                (``{"mode":"server_vad","threshold":0.5,...}`` /
+                ``{"mode":"semantic","eagerness":"high"}`` / ``{"mode":"manual"}``).
+            tools: Function tools (``RealtimeTool`` or
+                ``{"name","description","parameters"}`` dicts).
+            modalities: Output modalities (e.g. ``["text","audio"]``).
+            transcribe_input: Enable input-audio transcription.
+            transcription_model: Input transcription model.
+            input_audio_format / output_audio_format: Audio format overrides.
+            reasoning_effort: ``minimal|low|medium|high`` for reasoning-capable
+                realtime models.
+            input_audio_noise_reduction: ``near_field`` | ``far_field``.
+            alias: Server-side alias bundle name (P3).
+
+        Returns:
+            An unconnected :class:`GatewayRealtime`. ``await session.connect()``
+            (or use it as an async context manager), then send audio/text and
+            iterate events.
+
+        Example:
+            >>> session = bud.realtime(provider="openai", voice="alloy",
+            ...                        instructions="You are helpful.")
+            >>> async with session:
+            ...     await session.send_audio(pcm)
+            ...     async for ev in session:
+            ...         if ev.type == "transcript": print(ev.transcript.text)
+            ...         elif ev.type == "audio":    play(ev.audio.audio)
+        """
+        td: Optional[GatewayTurnDetection] = None
+        if isinstance(turn_detection, GatewayTurnDetection):
+            td = turn_detection
+        elif isinstance(turn_detection, dict):
+            td = GatewayTurnDetection(**turn_detection)
+
+        tool_list: list[RealtimeTool] = []
+        for t in tools or []:
+            tool_list.append(t if isinstance(t, RealtimeTool) else RealtimeTool(**t))
+
+        config = GatewayRealtimeConfig(
+            provider=provider,
+            voice=voice,
+            instructions=instructions,
+            model=model,
+            temperature=temperature,
+            max_response_tokens=max_response_tokens,
+            turn_detection=td,
+            tools=tool_list,
+            modalities=modalities,
+            transcribe_input=transcribe_input,
+            transcription_model=transcription_model,
+            input_audio_format=input_audio_format,
+            output_audio_format=output_audio_format,
+            reasoning_effort=reasoning_effort,
+            input_audio_noise_reduction=input_audio_noise_reduction,
+            alias=alias,
+        )
+        return GatewayRealtime(url=self._realtime_url, config=config, api_key=self.api_key)
+
+    async def transcribe_batch(
+        self,
+        audio: Optional[Union[str, bytes, Path]] = None,
+        *,
+        url: Optional[str] = None,
+        content_type: Optional[str] = None,
+        config: Optional[Union[STTConfig, dict[str, Any]]] = None,
+        provider: Optional[str] = None,
+        language: Optional[str] = None,
+        model: Optional[str] = None,
+        batch: Optional[dict[str, Any]] = None,
+        translation: Optional[Union[TranslationConfig, dict[str, Any]]] = None,
+        callback_url: Optional[str] = None,
+        callback_method: Optional[str] = None,
+        poll: bool = True,
+        poll_interval: float = 2.0,
+        timeout: float = 300.0,
+    ) -> dict[str, Any]:
+        """Submit a batched/async transcription job and (by default) poll until done.
+
+        Hits ``POST /transcribe/batch`` then polls ``GET /transcribe/batch/{job_id}``
+        until the job reaches ``completed``/``error`` (or ``timeout``). The batch
+        envelope REUSES the streaming :class:`~bud_waav.types.STTConfig` VERBATIM
+        plus batch-only knobs (``batch=``) that the streaming path drops but ARE
+        batch-capable on Deepgram prerecorded / AssemblyAI async / OpenAI
+        (alternatives, detect_language, summarize, topics, intents, paragraphs,
+        utterances).
+
+        Audio source — supply ONE of:
+          * ``audio`` as a URL string, a filesystem path (``str``/``Path``), or raw
+            ``bytes`` (base64-encoded for you), or
+          * ``url=`` explicitly.
+
+        Async mode: pass ``callback_url`` (and optionally ``poll=False``) — the
+        gateway returns ``{job_id, status:"queued"}`` immediately and POSTs the
+        result to your webhook.
+
+        Args:
+            audio: URL str / file path / raw bytes. A non-existent string that
+                looks like ``http(s)://`` is treated as a URL.
+            url: Explicit audio URL (overrides ``audio`` URL detection).
+            content_type: MIME type for inline bytes (e.g. ``audio/wav``).
+            config: Full :class:`STTConfig` (or dict) reused verbatim. If omitted,
+                a minimal config is built from ``provider``/``language``/``model``.
+            provider: STT provider when ``config`` is not given (default deepgram).
+            language: Language when ``config`` is not given (default en-US).
+            model: Model when ``config`` is not given.
+            batch: ``BatchFeatures`` dict (see :meth:`RestClient.submit_batch`).
+            translation: Canonical translation block (typed or dict).
+            callback_url / callback_method: Async webhook delivery.
+            poll: Poll until terminal when no ``callback_url`` (default True).
+            poll_interval: Seconds between polls.
+            timeout: Max seconds to poll before raising ``TimeoutError``.
+
+        Returns:
+            The terminal ``BatchJob`` dict (``{job_id, status, result?, error?}``)
+            when polled, else the submit response (``{job_id, status}``).
+        """
+        # Resolve audio source.
+        submit_url: Optional[str] = url
+        audio_b64: Optional[str] = None
+        if submit_url is None and audio is not None:
+            if isinstance(audio, (bytes, bytearray)):
+                audio_b64 = base64.b64encode(bytes(audio)).decode("utf-8")
+            elif isinstance(audio, Path):
+                audio_b64 = base64.b64encode(audio.read_bytes()).decode("utf-8")
+            elif isinstance(audio, str):
+                if audio.startswith("http://") or audio.startswith("https://"):
+                    submit_url = audio
+                else:
+                    audio_b64 = base64.b64encode(
+                        Path(audio).read_bytes()
+                    ).decode("utf-8")
+
+        # Resolve STT config → flattened StandardSTTConfig dict.
+        stt_cfg: STTConfig
+        if isinstance(config, STTConfig):
+            stt_cfg = config
+        elif isinstance(config, dict):
+            stt_cfg = STTConfig(**config)
+        else:
+            stt_cfg = STTConfig(
+                provider=provider or "deepgram",
+                language=language or "en-US",
+                model=model,
+            )
+        stt_dict = stt_cfg.model_dump(exclude_none=True, exclude={"translation"})
+
+        # Translation block (typed or dict) → wire.
+        translation_wire: Optional[dict[str, Any]] = None
+        if isinstance(translation, TranslationConfig):
+            translation_wire = translation.to_wire()
+        elif isinstance(translation, dict):
+            translation_wire = TranslationConfig(**translation).to_wire()
+        elif stt_cfg.translation is not None:
+            translation_wire = stt_cfg.translation.to_wire()
+
+        submit = await self._rest_client.submit_batch(
+            url=submit_url,
+            audio_base64=audio_b64,
+            content_type=content_type,
+            stt_config=stt_dict,
+            batch=batch,
+            translation=translation_wire or None,
+            callback_url=callback_url,
+            callback_method=callback_method,
+        )
+
+        # Webhook mode or caller opted out of polling → return submit ack.
+        if callback_url is not None or not poll:
+            return submit
+
+        # Some providers run synchronously and return a terminal job immediately.
+        status = str(submit.get("status", "")).lower()
+        if status in ("completed", "error") or submit.get("result") is not None:
+            return submit
+
+        job_id = submit.get("job_id")
+        if not job_id:
+            return submit
+
+        deadline = time.monotonic() + timeout
+        while True:
+            job = await self._rest_client.get_batch(job_id)
+            status = str(job.get("status", "")).lower()
+            if status in ("completed", "error"):
+                return job
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Batch job {job_id} did not finish within {timeout}s "
+                    f"(last status: {status or 'unknown'})"
+                )
+            await asyncio.sleep(poll_interval)
 
     def agent(
         self,
