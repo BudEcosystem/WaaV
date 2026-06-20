@@ -9,6 +9,7 @@
 //! is "just another `(protocol, transport)` pair" in a later phase.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use std::str::FromStr;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -129,6 +130,12 @@ async fn connect_ws(
 /// [`ConnectSpec::WebSocket`], applying the protocol's auth/headers via
 /// `into_client_request()` (the standard WS upgrade headers are generated for us
 /// — the lesson from the Sarvam/DashScope header bugs).
+///
+/// It ALSO serves the in-box [`ConnectSpec::Unix`] (GW-13 UDS half): a co-located
+/// WaaV Infer sidecar reached over a unix domain socket. The default
+/// `RealtimeProtocol::transport_factory()` is this factory, so a provider whose
+/// `connect_spec` returns `Unix` (the in-box Infer S2S sidecar) gets UDS for free
+/// — no separate factory, the driver re-dials it on reconnect like any other.
 pub struct WsTransportFactory;
 
 #[async_trait]
@@ -136,6 +143,7 @@ impl RealtimeTransportFactory for WsTransportFactory {
     async fn connect(&self, spec: ConnectSpec) -> RealtimeResult<Box<dyn RealtimeTransport>> {
         match spec {
             ConnectSpec::WebSocket { url, headers } => connect_ws(url, headers).await,
+            ConnectSpec::Unix { path } => connect_uds(path).await,
             ConnectSpec::RestThenWebSocket { .. } => Err(RealtimeError::ConnectionFailed(
                 "WsTransportFactory does not support RestThenWebSocket; \
                  use RestHandshakeWsTransportFactory"
@@ -148,6 +156,159 @@ impl RealtimeTransportFactory for WsTransportFactory {
             )),
         }
     }
+}
+
+// =============================================================================
+// Unix-domain-socket transport (GW-13 UDS half — in-box WaaV Infer S2S sidecar)
+// =============================================================================
+//
+// A co-located Infer sidecar (the single-box topology, INFER_GATEWAY_INTEGRATION
+// §6.2/§7) is reached over a UNIX DOMAIN SOCKET, removing the loopback-TCP hop.
+// A raw UDS stream has no WebSocket Text/Binary opcodes, so we frame each
+// `OutFrame` with a tiny self-delimiting header that preserves the SAME Text +
+// Binary vocabulary the WS transport carries — so the protocol's wire mapping is
+// untouched and raw-binary audio stays byte-exact (the accuracy-at-the-seam
+// invariant). The framing mirrors the in-tree length-prefixed UDS precedent
+// (`dag/nodes/endpoint.rs`), extended with a 1-byte KIND tag:
+//
+//   ┌──────────┬──────────────────┬───────────────┐
+//   │ kind: u8 │ len: u32 (BE)    │ payload: len B │
+//   └──────────┴──────────────────┴───────────────┘
+//     0 = Text (UTF-8 JSON control)   1 = Binary (raw audio, byte-exact)
+
+/// The 1-byte frame-kind tag for a Text (UTF-8 control) UDS frame.
+const UDS_KIND_TEXT: u8 = 0;
+/// The 1-byte frame-kind tag for a Binary (raw audio) UDS frame.
+const UDS_KIND_BINARY: u8 = 1;
+/// The fixed UDS frame header size: 1 kind byte + 4 length bytes.
+const UDS_HEADER_LEN: usize = 5;
+/// Reject an absurd inbound length (a corrupt/hostile peer) before allocating —
+/// mirrors the 100 MB sanity bound the in-tree UDS endpoint applies.
+const UDS_MAX_FRAME_LEN: usize = 100 * 1024 * 1024;
+
+/// PURE encoder (unit-testable, no socket): append the kind+length-prefixed wire
+/// bytes for one [`OutFrame`] to `out`. Text frames carry the UTF-8 bytes; Binary
+/// frames carry the raw audio bytes byte-exact.
+fn encode_uds_frame(frame: &OutFrame, out: &mut Vec<u8>) {
+    let (kind, body): (u8, &[u8]) = match frame {
+        OutFrame::Text(s) => (UDS_KIND_TEXT, s.as_bytes()),
+        OutFrame::Binary(b) => (UDS_KIND_BINARY, b.as_ref()),
+    };
+    out.push(kind);
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(body);
+}
+
+/// PURE decoder (unit-testable, no socket): try to decode ONE [`OutFrame`] from
+/// the front of `buf`. Returns `Some((frame, consumed))` when a whole frame is
+/// present (`consumed` = bytes to drain), or `None` when more bytes are needed.
+/// An over-long length is surfaced as a typed `Err` (a corrupt/hostile peer),
+/// never a panic or a huge allocation.
+#[allow(clippy::type_complexity)]
+fn decode_uds_frame(buf: &[u8]) -> Option<RealtimeResult<(OutFrame, usize)>> {
+    if buf.len() < UDS_HEADER_LEN {
+        return None; // not even a full header yet — wait for more.
+    }
+    let kind = buf[0];
+    let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    if len > UDS_MAX_FRAME_LEN {
+        return Some(Err(RealtimeError::ProviderError(format!(
+            "UDS frame length {len} exceeds the {UDS_MAX_FRAME_LEN}-byte bound"
+        ))));
+    }
+    let end = UDS_HEADER_LEN + len;
+    if buf.len() < end {
+        return None; // header present, body incomplete — wait for more.
+    }
+    let body = &buf[UDS_HEADER_LEN..end];
+    let frame = match kind {
+        UDS_KIND_TEXT => match std::str::from_utf8(body) {
+            Ok(s) => OutFrame::Text(s.to_string()),
+            Err(e) => {
+                return Some(Err(RealtimeError::ProviderError(format!(
+                    "UDS text frame is not valid UTF-8: {e}"
+                ))));
+            }
+        },
+        UDS_KIND_BINARY => OutFrame::Binary(Bytes::copy_from_slice(body)),
+        other => {
+            return Some(Err(RealtimeError::ProviderError(format!(
+                "unknown UDS frame kind {other} (expected 0=text or 1=binary)"
+            ))));
+        }
+    };
+    Some(Ok((frame, end)))
+}
+
+/// A length-framed unix-domain-socket transport for the in-box Infer S2S sidecar.
+/// Carries the same Text+Binary `OutFrame` vocabulary as the WS transport over a
+/// raw `UnixStream`, framed by [`encode_uds_frame`]/[`decode_uds_frame`].
+pub struct UdsTransport {
+    stream: tokio::net::UnixStream,
+    /// Carry-over inbound bytes that did not yet form a whole frame (the stream is
+    /// byte-oriented: one read can split or coalesce frames).
+    rx_buf: Vec<u8>,
+}
+
+#[async_trait]
+impl RealtimeTransport for UdsTransport {
+    async fn send(&mut self, frame: OutFrame) -> RealtimeResult<()> {
+        use tokio::io::AsyncWriteExt;
+        let mut out = Vec::with_capacity(UDS_HEADER_LEN);
+        encode_uds_frame(&frame, &mut out);
+        self.stream
+            .write_all(&out)
+            .await
+            .map_err(|e| RealtimeError::ConnectionFailed(format!("UDS write failed: {e}")))
+    }
+
+    async fn recv(&mut self) -> Option<RealtimeResult<OutFrame>> {
+        use tokio::io::AsyncReadExt;
+        loop {
+            // First, try to satisfy a frame entirely from the carry-over buffer
+            // (no await on the host path — no in-loop host sync beyond the socket).
+            match decode_uds_frame(&self.rx_buf) {
+                Some(Ok((frame, consumed))) => {
+                    self.rx_buf.drain(..consumed);
+                    return Some(Ok(frame));
+                }
+                Some(Err(e)) => return Some(Err(e)),
+                None => {} // need more bytes from the socket.
+            }
+            // Read more bytes (an awaited socket read — bounded by the peer/close,
+            // and by the driver's reconnect supervisor + the test timeout).
+            let mut chunk = [0u8; 16 * 1024];
+            match self.stream.read(&mut chunk).await {
+                Ok(0) => return None, // clean EOF ⇒ no reconnect (the WS `Close` analogue).
+                Ok(n) => self.rx_buf.extend_from_slice(&chunk[..n]),
+                Err(e) => {
+                    return Some(Err(RealtimeError::ConnectionFailed(format!(
+                        "UDS read failed: {e}"
+                    ))));
+                }
+            }
+        }
+    }
+
+    async fn close(&mut self) {
+        use tokio::io::AsyncWriteExt;
+        // Best-effort half-close so the peer sees EOF (the UDS analogue of a WS
+        // Close frame). Errors are ignored — the socket may already be gone.
+        let _ = self.stream.shutdown().await;
+    }
+}
+
+/// Open a unix-domain-socket transport to `path` (the in-box Infer S2S sidecar).
+/// A missing/unreachable socket is a typed `ConnectionFailed` (the driver's
+/// reconnect supervisor + breaker handle it exactly like a WS dial failure).
+async fn connect_uds(path: String) -> RealtimeResult<Box<dyn RealtimeTransport>> {
+    let stream = tokio::net::UnixStream::connect(&path).await.map_err(|e| {
+        RealtimeError::ConnectionFailed(format!("UDS connect to {path:?} failed: {e}"))
+    })?;
+    Ok(Box::new(UdsTransport {
+        stream,
+        rx_buf: Vec::new(),
+    }))
 }
 
 // =============================================================================
@@ -234,6 +395,11 @@ impl RealtimeTransportFactory for RestHandshakeWsTransportFactory {
                 // Not needed by Ultravox, but harmless: a plain WS still works.
                 connect_ws(url, headers).await
             }
+            ConnectSpec::Unix { .. } => Err(RealtimeError::ConnectionFailed(
+                "RestHandshakeWsTransportFactory does not support Unix; \
+                 use the default WsTransportFactory for UDS"
+                    .to_string(),
+            )),
             ConnectSpec::BedrockBidi { .. } => Err(RealtimeError::ConnectionFailed(
                 "RestHandshakeWsTransportFactory does not support BedrockBidi; \
                  use BedrockBidiTransportFactory"
@@ -611,6 +777,151 @@ mod tests {
         let spec = ConnectSpec::WebSocket {
             url: "wss://example/ws".to_string(),
             headers: vec![],
+        };
+        assert!(matches!(
+            BedrockBidiTransportFactory.connect(spec).await,
+            Err(RealtimeError::ConnectionFailed(_))
+        ));
+    }
+
+    // =========================================================================
+    // GW-13 (UDS half) — ConnectSpec::Unix domain-socket transport
+    // =========================================================================
+
+    /// The UDS frame codec is the byte-exact round-trip that carries BOTH a JSON
+    /// control frame (Text) AND a raw audio frame (Binary) over the
+    /// kind+length-prefixed stream. (Pure, no socket — the wire contract in
+    /// isolation; the accuracy invariant: Binary audio survives byte-for-byte.)
+    #[test]
+    fn uds_frame_codec_round_trips_text_and_binary() {
+        // Text control frame.
+        let txt = OutFrame::Text(r#"{"type":"session.config","task":"s2s"}"#.to_string());
+        let mut buf = Vec::new();
+        encode_uds_frame(&txt, &mut buf);
+        let (decoded, consumed) = decode_uds_frame(&buf)
+            .expect("a full frame is present")
+            .expect("and decodes Ok");
+        assert_eq!(consumed, buf.len());
+        match decoded {
+            OutFrame::Text(s) => assert_eq!(s, r#"{"type":"session.config","task":"s2s"}"#),
+            OutFrame::Binary(_) => panic!("a Text frame must decode back to Text"),
+        }
+
+        // Raw binary audio frame — byte-exact (the accuracy-at-the-seam invariant).
+        let audio = bytes::Bytes::from(vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0x40]);
+        let bin = OutFrame::Binary(audio.clone());
+        let mut buf2 = Vec::new();
+        encode_uds_frame(&bin, &mut buf2);
+        let (decoded2, _) = decode_uds_frame(&buf2)
+            .expect("a full binary frame is present")
+            .expect("and decodes Ok");
+        match decoded2 {
+            OutFrame::Binary(b) => assert_eq!(b, audio, "audio rides UDS byte-exact, no base64"),
+            OutFrame::Text(_) => panic!("a Binary frame must decode back to Binary"),
+        }
+
+        // A partial buffer (fewer than the prefix or fewer than `len` body bytes)
+        // ⇒ None (wait for more), NOT a panic or a torn frame.
+        assert!(decode_uds_frame(&buf[..2]).is_none(), "partial prefix ⇒ wait");
+        assert!(
+            decode_uds_frame(&buf[..buf.len() - 1]).is_none(),
+            "partial body ⇒ wait"
+        );
+    }
+
+    /// **RED→GREEN `connect_spec_unix_uds_connects`** (GW-13 UDS half, §6.2/§13):
+    /// the DEFAULT [`WsTransportFactory`] connects a [`ConnectSpec::Unix`] against a
+    /// live unix domain socket and returns a [`RealtimeTransport`] that carries the
+    /// S2S frame vocabulary BOTH ways — a JSON control frame OUT and a raw binary
+    /// audio frame IN — over the in-box UDS. Bounded by a timeout so a hang FAILS.
+    #[tokio::test]
+    async fn connect_spec_unix_uds_connects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            // A unique socket path under the test tmp dir (cleaned by the OS tmp).
+            let dir = std::env::temp_dir();
+            let path = dir.join(format!("waav_uds_connect_{}.sock", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let listener = tokio::net::UnixListener::bind(&path).expect("bind UDS");
+
+            // A tiny in-box "Infer S2S" server: accept ONE connection, read the
+            // first OUTBOUND frame (the session.config control text), then push ONE
+            // INBOUND binary audio frame back — exercising both directions.
+            let server_path = path.clone();
+            let server = tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.expect("accept");
+                // Read the kind byte + length prefix + body of the first frame.
+                let mut kind = [0u8; 1];
+                sock.read_exact(&mut kind).await.expect("read kind");
+                let mut len_buf = [0u8; 4];
+                sock.read_exact(&mut len_buf).await.expect("read len");
+                let n = u32::from_be_bytes(len_buf) as usize;
+                let mut body = vec![0u8; n];
+                sock.read_exact(&mut body).await.expect("read body");
+                let got_text = String::from_utf8(body).expect("control frame is utf-8");
+                // Push back ONE binary audio frame: kind=1, len, body.
+                let audio = [0x10u8, 0x20, 0x30, 0x40];
+                sock.write_all(&[1u8]).await.expect("write kind");
+                sock.write_all(&(audio.len() as u32).to_be_bytes())
+                    .await
+                    .expect("write len");
+                sock.write_all(&audio).await.expect("write body");
+                sock.flush().await.expect("flush");
+                // keep the socket alive briefly so the client read completes.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let _ = std::fs::remove_file(&server_path);
+                got_text
+            });
+
+            // The DEFAULT factory connects the Unix spec (no separate factory needed
+            // — the in-box S2S provider uses the default `transport_factory()`).
+            let spec = ConnectSpec::Unix {
+                path: path.to_string_lossy().to_string(),
+            };
+            let mut transport = WsTransportFactory
+                .connect(spec)
+                .await
+                .expect("UDS connect must succeed against a live socket");
+
+            // OUT: send the session.config control frame.
+            transport
+                .send(OutFrame::Text(
+                    r#"{"type":"session.config","task":"s2s"}"#.to_string(),
+                ))
+                .await
+                .expect("send control frame OUT over UDS");
+
+            // IN: the server's binary audio frame arrives byte-exact.
+            let inbound = transport
+                .recv()
+                .await
+                .expect("a frame IN")
+                .expect("inbound frame is Ok");
+            match inbound {
+                OutFrame::Binary(b) => {
+                    assert_eq!(b.as_ref(), &[0x10, 0x20, 0x30, 0x40], "audio IN byte-exact")
+                }
+                OutFrame::Text(_) => panic!("expected a binary audio frame IN"),
+            }
+
+            transport.close().await;
+            let server_got = server.await.expect("server task joined");
+            assert!(
+                server_got.contains("\"task\":\"s2s\""),
+                "the server received the session.config control frame OUT over UDS"
+            );
+        })
+        .await
+        .expect("the UDS connect test must complete within the bound (no deadlock)");
+    }
+
+    /// Symmetric rejection: the Bedrock factory does not speak UDS (callers use the
+    /// default WS factory for `Unix`) — a typed error, reachable without AWS.
+    #[tokio::test]
+    async fn bedrock_factory_rejects_unix_spec() {
+        let spec = ConnectSpec::Unix {
+            path: "/tmp/x.sock".to_string(),
         };
         assert!(matches!(
             BedrockBidiTransportFactory.connect(spec).await,

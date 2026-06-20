@@ -138,6 +138,26 @@ pub enum ConnectSpec {
         /// (`AWS_REGION` / shared config) by the `aws-config` default chain.
         region: Option<String>,
     },
+    /// THE IN-BOX UDS PATTERN (GW-13 UDS half, `INFER_GATEWAY_INTEGRATION.md`
+    /// §6.2/§13): a co-located WaaV Infer **sidecar** reached over a **unix domain
+    /// socket** instead of loopback TCP/WS. The single-box topology (§7): the
+    /// gateway and the Infer engine share a host, so a UDS removes the loopback-TCP
+    /// hop entirely (RTT ≈ 2.3 µs). The transport factory ([`WsTransportFactory`])
+    /// opens the socket and frames each [`OutFrame`] with a 1-byte kind tag
+    /// (Text/Binary) + a `u32` big-endian length prefix — the same Text+Binary
+    /// frame vocabulary the WS transport carries, so the protocol's wire mapping is
+    /// UNCHANGED (raw-binary audio stays byte-exact, JSON control stays Text).
+    /// Re-dialing on reconnect reconnects the socket.
+    ///
+    /// SSRF-safe: `path` is sourced ONLY from the trusted server config (a
+    /// `unix://…` `realtime_endpoint_override`), never from a client request.
+    ///
+    /// [`WsTransportFactory`]: super::transport::WsTransportFactory
+    Unix {
+        /// The filesystem path of the sidecar's listening unix domain socket
+        /// (e.g. `/run/waav-infer/s2s.sock`).
+        path: String,
+    },
 }
 
 /// Apply a SERVER-CONFIG-ONLY realtime endpoint override (SSRF-safe) to a

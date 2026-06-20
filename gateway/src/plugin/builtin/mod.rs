@@ -40,17 +40,17 @@ use crate::core::realtime::{
 use crate::core::stt::{
     AmiVoiceSTT, AssemblyAISTT, AwsTranscribeSTT, AzureSTT, BaiduStt, BaseSTT, BhashiniStt,
     CartesiaSTT, DashScopeStt, DeepgramSTT, ElevenLabsSTT, FptStt, GladiaSTT, GnaniSTT, GoogleSTT,
-    GroqSTT, HuaweiCloudStt, IFlytekStt, IbmWatsonSTT, NaverClovaStt, NectecStt, OpenAISTT,
+    GroqSTT, HuaweiCloudStt, IFlytekStt, IbmWatsonSTT, InferSTT, NaverClovaStt, NectecStt, OpenAISTT,
     PhonexiaSTT, ProsaStt, RevAISTT, ReverieSTT, STTConfig, STTError, SarvamSTT, SberDevicesSTT,
     SpeechmaticsSTT, TencentStt, TinkoffStt, ViettelStt, YandexSTT,
 };
 use crate::core::tts::{
     AcapelaTts, AwsPollyTTS, AzureTTS, BaiduTts, BaseTTS, BhashiniTts, CartesiaTTS, CereprocTts,
     DashScopeTts, DeepgramTTS, ElevenLabsTTS, FptTts, GnaniTTS, GoogleTTS, HuaweiCloudTts, HumeTTS,
-    IFlytekTts, IbmWatsonTTS, LmntTts, MurfTts, NaverClovaTts, NectecTts, OpenAITTS, PlayHtTts,
-    ProsaTts, ResembleTts, ReverieTts, SberDevicesTts, SmallestTts, SpeechifyTts, SpeechmaticsTts,
-    TTSConfig, TencentTts, TinkoffTts, UnrealSpeechTts, ViettelTts, WellSaidTts, YandexTts,
-    ZaloTts,
+    IFlytekTts, IbmWatsonTTS, InferTTS, LmntTts, MurfTts, NaverClovaTts, NectecTts, OpenAITTS,
+    PlayHtTts, ProsaTts, ResembleTts, ReverieTts, SberDevicesTts, SmallestTts, SpeechifyTts,
+    SpeechmaticsTts, TTSConfig, TencentTts, TinkoffTts, UnrealSpeechTts, ViettelTts, WellSaidTts,
+    YandexTts, ZaloTts,
 };
 use crate::plugin::metadata::ProviderMetadata;
 use crate::plugin::registry::PluginConstructor;
@@ -628,6 +628,18 @@ fn nectec_stt_metadata() -> ProviderMetadata {
         .with_models(["partii5", "partii4"])
 }
 
+fn infer_stt_metadata() -> ProviderMetadata {
+    ProviderMetadata::stt("waav-infer", "WaaV Infer (self-hosted)")
+        .with_description(
+            "WaaV's self-hosted inference tier behind the gateway's BaseSTT seam (GW-1..GW-3): \
+             local cascade STT over native WS v1; GW-3 breaker treats Infer's typed reject-reasons \
+             (admission_rejected/model_not_ready/draining) as failover-eligible non-failures",
+        )
+        .with_aliases(["infer", "waav_infer", "waavinfer", "self-hosted"])
+        .with_features(["streaming", "self-hosted", "low-latency", "cross-tier-failover"])
+        .with_models(["parakeet-tdt", "whisper", "moonshine", "sensevoice"])
+}
+
 // ============================================================================
 // TTS Provider Metadata Functions
 // ============================================================================
@@ -636,6 +648,17 @@ fn deepgram_tts_metadata() -> ProviderMetadata {
     ProviderMetadata::tts("deepgram", "Deepgram Aura")
         .with_description("Real-time TTS with Aura voice models")
         .with_features(["streaming", "websocket"])
+}
+
+fn infer_tts_metadata() -> ProviderMetadata {
+    ProviderMetadata::tts("waav-infer", "WaaV Infer (self-hosted)")
+        .with_description(
+            "WaaV's self-hosted inference tier behind the gateway's BaseTTS seam (GW-1..GW-3): \
+             local cascade TTS over native WS v1, GW-3 cross-tier failover on the typed reject-reasons",
+        )
+        .with_aliases(["infer", "waav_infer", "waavinfer", "self-hosted"])
+        .with_features(["streaming", "self-hosted", "low-latency", "cross-tier-failover"])
+        .with_models(["kokoro", "orpheus", "supertonic", "cosyvoice"])
 }
 
 fn elevenlabs_tts_metadata() -> ProviderMetadata {
@@ -1383,6 +1406,10 @@ fn create_deepgram_stt(config: STTConfig) -> Result<Box<dyn BaseSTT>, STTError> 
     Ok(Box::new(DeepgramSTT::new(config)?))
 }
 
+fn create_infer_stt(config: STTConfig) -> Result<Box<dyn BaseSTT>, STTError> {
+    Ok(Box::new(InferSTT::new(config)?))
+}
+
 fn create_google_stt(config: STTConfig) -> Result<Box<dyn BaseSTT>, STTError> {
     Ok(Box::new(GoogleSTT::new(config)?))
 }
@@ -1513,6 +1540,10 @@ fn create_nectec_stt(config: STTConfig) -> Result<Box<dyn BaseSTT>, STTError> {
 
 fn create_deepgram_tts(config: TTSConfig) -> crate::core::tts::TTSResult<Box<dyn BaseTTS>> {
     Ok(Box::new(DeepgramTTS::new(config)?))
+}
+
+fn create_infer_tts(config: TTSConfig) -> crate::core::tts::TTSResult<Box<dyn BaseTTS>> {
+    Ok(Box::new(InferTTS::new(config)?))
 }
 
 fn create_elevenlabs_tts(config: TTSConfig) -> crate::core::tts::TTSResult<Box<dyn BaseTTS>> {
@@ -1731,6 +1762,14 @@ inventory::submit! {
     PluginConstructor::stt("deepgram", deepgram_stt_metadata, create_deepgram_stt)
 }
 
+// WaaV Infer — the self-hosted inference tier behind BaseSTT (GW-1..GW-3). Registered like any
+// other provider via the inventory→DashMap path (NOT in the PHF map: it resolves through the
+// registry's lowercase DashMap fallback), so it needs zero handler/route/PHF changes.
+inventory::submit! {
+    PluginConstructor::stt("waav-infer", infer_stt_metadata, create_infer_stt)
+        .with_aliases(&["infer", "waav_infer", "waavinfer", "self-hosted"])
+}
+
 inventory::submit! {
     PluginConstructor::stt("google", google_stt_metadata, create_google_stt)
 }
@@ -1886,6 +1925,12 @@ inventory::submit! {
 
 inventory::submit! {
     PluginConstructor::tts("deepgram", deepgram_tts_metadata, create_deepgram_tts)
+}
+
+// WaaV Infer — self-hosted inference tier behind BaseTTS (GW-1..GW-3).
+inventory::submit! {
+    PluginConstructor::tts("waav-infer", infer_tts_metadata, create_infer_tts)
+        .with_aliases(&["infer", "waav_infer", "waavinfer", "self-hosted"])
 }
 
 inventory::submit! {
@@ -2127,6 +2172,71 @@ inventory::submit! {
 #[cfg(test)]
 mod tests {
     use crate::plugin::registry::global_registry;
+
+    /// GW1-T3 RED→GREEN: the WaaV-Infer provider registers as a gateway plugin behind BOTH the
+    /// `BaseSTT` and `BaseTTS` seams, with its aliases, and its factory produces a live provider —
+    /// all through the existing `inventory`→registry path with zero handler/route changes
+    /// (INFER_GATEWAY_INTEGRATION §5,§13 GW-1/GW-3).
+    #[test]
+    fn gateway_registers_infer_plugin() {
+        let registry = global_registry();
+
+        // Registered under its canonical id on both seams.
+        assert!(
+            registry.has_stt_provider("waav-infer"),
+            "waav-infer must register as a BaseSTT plugin"
+        );
+        assert!(
+            registry.has_tts_provider("waav-infer"),
+            "waav-infer must register as a BaseTTS plugin"
+        );
+
+        // Aliases resolve (case-insensitive) on both seams via the DashMap fallback — the provider
+        // is intentionally NOT in the PHF map.
+        for alias in ["infer", "waav_infer", "waavinfer", "self-hosted", "WAAV-INFER", "Infer"] {
+            assert!(
+                registry.has_stt_provider(alias),
+                "STT alias `{alias}` must resolve to waav-infer"
+            );
+            assert!(
+                registry.has_tts_provider(alias),
+                "TTS alias `{alias}` must resolve to waav-infer"
+            );
+        }
+
+        // Metadata is discoverable and self-describing.
+        let stt_meta = registry
+            .get_stt_metadata("waav-infer")
+            .expect("waav-infer STT metadata present");
+        assert_eq!(stt_meta.name, "waav-infer");
+        assert!(stt_meta.features.contains("self-hosted"));
+        let tts_meta = registry
+            .get_tts_metadata("waav-infer")
+            .expect("waav-infer TTS metadata present");
+        assert_eq!(tts_meta.name, "waav-infer");
+
+        // The factory actually constructs a live provider (not just a registered name) on both
+        // seams — a lazy registration that never builds would pass has_* but fail here.
+        let stt_cfg = crate::core::stt::STTConfig {
+            provider: "waav-infer".to_string(),
+            model: "parakeet-tdt".to_string(),
+            ..Default::default()
+        };
+        let stt = registry
+            .create_stt("waav-infer", stt_cfg)
+            .expect("waav-infer STT factory must construct");
+        assert_eq!(stt.get_provider_info(), "waav-infer (self-hosted cascade STT)");
+
+        let tts_cfg = crate::core::tts::TTSConfig {
+            provider: "waav-infer".to_string(),
+            model: "kokoro".to_string(),
+            ..Default::default()
+        };
+        let tts = registry
+            .create_tts("infer", tts_cfg) // via alias too
+            .expect("waav-infer TTS factory must construct");
+        assert_eq!(tts.get_provider_info()["provider"], "waav-infer");
+    }
 
     #[test]
     fn test_builtin_stt_providers_registered() {

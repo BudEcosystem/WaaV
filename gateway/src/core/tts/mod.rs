@@ -22,6 +22,8 @@ pub mod huawei_cloud;
 pub mod hume;
 pub mod ibm_watson;
 pub mod iflytek;
+/// WaaV-Infer self-hosted cascade TTS adapter (`provider = "waav-infer"`).
+pub mod infer;
 pub mod lmnt;
 pub mod murf;
 pub mod naver_clova;
@@ -68,6 +70,7 @@ pub use cereproc::{
 pub use deepgram::{DEEPGRAM_TTS_URL, DeepgramTTS};
 pub use deepgram_aura::{DEEPGRAM_TTS_WS_URL, DeepgramAuraTTS};
 pub use elevenlabs::{ELEVENLABS_TTS_URL, ElevenLabsTTS};
+pub use infer::{INFER_TTS_ALIASES, INFER_TTS_PROVIDER_ID, InferTTS};
 pub use google::{GOOGLE_TTS_URL, GoogleTTS};
 pub use hume::{HUME_TTS_STREAM_URL, HumeTTS, HumeTTSConfig};
 pub use ibm_watson::{

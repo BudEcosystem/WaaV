@@ -21,6 +21,8 @@ pub mod groq;
 pub mod huawei_cloud;
 pub mod ibm_watson;
 pub mod iflytek;
+/// WaaV-Infer self-hosted cascade STT adapter (`provider = "waav-infer"`).
+pub mod infer;
 pub mod naver_clova;
 pub mod nectec;
 pub mod openai;
@@ -58,6 +60,9 @@ pub use alibaba_cloud::{
 
 // Re-export Deepgram implementation
 pub use deepgram::{DeepgramSTT, DeepgramSTTConfig};
+
+// Re-export WaaV-Infer self-hosted implementation
+pub use infer::{INFER_STT_ALIASES, INFER_STT_PROVIDER_ID, InferSTT};
 
 // Re-export ElevenLabs implementation
 pub use elevenlabs::{

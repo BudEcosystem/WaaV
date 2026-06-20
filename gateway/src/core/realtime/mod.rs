@@ -54,6 +54,7 @@ pub mod elevenlabs;
 pub mod gemini;
 pub mod grok;
 pub mod hume;
+pub mod infer;
 pub mod inworld;
 pub mod nova_sonic;
 pub mod openai;
@@ -80,6 +81,7 @@ pub use hume::{
     EVIVersion, HUME_EVI_DEFAULT_SAMPLE_RATE, HUME_EVI_WEBSOCKET_URL, HumeEVI, HumeEVIConfig,
     ProsodyScores,
 };
+pub use infer::{InferProtocol, InferRealtime, InferWire};
 pub use inworld::{InworldProtocol, InworldRealtime};
 pub use nova_sonic::{NovaSonicProtocol, NovaSonicRealtime};
 pub use openai::{
