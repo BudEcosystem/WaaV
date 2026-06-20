@@ -36,10 +36,22 @@ full throughput scaling; new batched paths proven BIT-IDENTICAL to per-slot/sing
    decode loop, then `decode_audio()` ONCE post-loop and slices the buffer — so "first audio
    chunk" == full-synthesis latency (3804 ms) and inter-chunk jitter percentiles are ~0 ms
    buffer-slice artifacts. → Real incremental decode + true TTFA measurement.
-8. **"55×@64" thesis does not reproduce on the real path** (best 1.80×@B8 equal-context / 1.14×
-   end-to-end ragged). The validation doc is honest (pass=false) but `INFER_ENGINE.md` /
-   `INFER_PERF.md` still assert 55×@64 as the headline lever. → Correct the design docs to the
-   measured reality (and let fixes #1–#4 raise the real ragged/concurrent number).
+8. **"55×@64" thesis does not reproduce on the real path — RESOLVED (re-scoped to the measured
+   curve, 2026-06-21).** Re-measured live on GB10 (CUDA EP, equal-context, bit-identical to
+   per-slot) up to the doc's claimed B=64 ceiling: the real chatterbox codec-LM batched speedup
+   **RISES to a peak then REGRESSES** — 1.12×(B2)/0.99×(B4)/1.39×(B8)/**1.81×(B16 peak)**/1.46×(B32)/
+   **0.95×(B64, slower than per-slot)**. Root cause: the exported `language_model.onnx` re-streams
+   the full split-KV host↔device every stride (`O(B·max_past·n_layers·2)`), which the synthetic
+   GEMV microbenchmark that produced 55×@64 omitted. **The headline is now RE-SCOPED to the
+   empirically-measured curve (peak ~1.8× @ B≈16, NOT 55×@64) across INFER_ENGINE.md (§1.1 pts 2/3,
+   §4.3), INFER_PERF.md (§0/§3/engine-win #2), INFER_PERF_BENCH.md, INFER_ENGINE_V2.md, and
+   INFER_GUIDELINES.md**, pinned by the live re-measurement gate
+   `live_headline_batched_scaling_matches_doc_curve` + the single-source-of-truth constants
+   `CHATTERBOX_HEADLINE_PEAK_BATCH_SPEEDUP`/`CHATTERBOX_HEADLINE_PEAK_BATCH` (which fail any future
+   doc-drift). Accuracy stayed byte-identical (bit-identity proven at width: a 16-row ragged cohort
+   batched == per-slot token-for-token). 55×@64 is recoverable only by a device-resident-KV
+   re-export (no host re-stream) — the open #1 follow-up; the docs no longer assert it as a shipped
+   serving figure. See INFER_PERF_VALIDATION.md §3a/§7.
 
 ## #9 Load resilience — graceful degradation under overload (REQUIRED, added 2026-06-21 per user)
 

@@ -88,7 +88,7 @@ Streams/40GB @ctx3000: GQA 2kv = **1085** vs MHA 14kv = 155 (7× concurrency).
 ## ============ EMPIRICAL HEADLINE (3 batches, GB10, all accuracy-preserving) ============
 1. EXACT attention backend (cuDNN/flash SDPA, NOT math, NOT FlashInfer): 40-135× — biggest single per-op lever, just a backend pin.
 2. KV-on-device (IoBinding, the #1 engine fix): 13%→2× (grows with batch×ctx); StaticGraph seam currently round-trips KV every step.
-3. Batching amortization (lockstep): 55×@64 (memory-bound; the headline throughput lever the no-quant constraint LEAVES INTACT).
+3. Batching amortization (lockstep): idealized 55×@64 (synthetic GEMV decode step); REAL exported-graph ~1.8× PEAK @ B≈16, REGRESSING by B=64 (host-KV re-stream caps it, bit-identical to per-slot — live chatterbox gate `live_headline_batched_scaling_matches_doc_curve`, INFER_PERF_VALIDATION.md §3a). Still the headline lever the no-quant constraint LEAVES INTACT, but size slots at the per-graph knee (B≈16), not B=64; 55×@64 needs a device-resident-KV re-export.
 4. GQA-native KV layout: 5.5-6.9× attention + 7× concurrency, free.
 5. Prefix-KV reuse (R1 radix, ~86% hit): skips 9-117ms prefill, bit-identical → ~7× TTFA on reuse.
 6. CUDA-graph + torch.compile(epilogue_fusion=False): 1.18-1.24×@B1, HURT @B32 → EDGE/low-batch tier only.
