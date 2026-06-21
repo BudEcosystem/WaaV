@@ -95,6 +95,45 @@ the #9 bounded queue/shed), and the 16-arm registry. ANY component that is orpha
 duplicated / not on the live path is a limitation to wire in (bit-faithfully). Codify this rule in
 `INFER_GUIDELINES.md` so it binds future work. "Built" ≠ "shipped": only live-path-integrated counts.
 
+## FOUND + FIXED — ORT first-touch re-entrant-`Once` deadlock (#1 production blocker, 2026-06-21, commit `bbcf663`)
+
+**Symptom.** `engine::tests::gb10_serves_16_concurrent_codec_ar_streams_rtf_under_1` hung FOREVER at
+0% CPU (reproduced 4×, killed only by its timeout), RSS flat ~9 MB — i.e. it hung at *first-touch ORT
+init*, before any model load. NOT an OOM, NOT the serving-loop concurrency. A live server that lazily
+first-touches ORT on its first burst of concurrent requests would hang identically — so this was a real
+production blocker, not just a test flake.
+
+**Root cause (gdb-proven, live backtrace of the hung process + a deterministic standalone repro).**
+`ort` rc.12 self-deadlocks on **any** dylib-load failure. `setup_api()` enters the
+`G_ORT_API`/`G_ORT_LIB` `OnceLock` (held, mid-init), `load_dylib_from_path` fails, and **constructing
+the failure `ort::Error`** (`Error::new` → `new_internal` → `ortsys![CreateStatus]`) calls **`ort::api()`
+again**, which **re-enters the same in-flight `Once` on the same thread** → `futex_wait` forever. Stack:
+`futex_wait → Once::call_once_force → ort::api() (lib.rs:176) → Error::new_internal::{closure}
+(lib.rs:291) → load_dylib_from_path::{closure} (lib.rs:107) → try_init_inner::{closure} (once_lock.rs:147)`.
+A standalone repro confirmed it deadlocks via **both** entry points: the lazy `Session::builder()` path
+(re-enters `G_ORT_API`) AND `ort::init_from(bad)` (re-enters `G_ORT_LIB`) — so `init_from` is NOT a safe
+fix. Our old `init_ort()` used `init().commit()`, which only **stores env options** (no dylib load), so
+the first *real* touch (`Session::builder`) was the racy/error-prone first load that could trip this.
+
+**Fix (bit-faithful — NO numerics / EP / precision / TF32 / `gpu_mem_limit` / cuDNN change).**
+- `waav-infer-backend-ort`: new `ensure_ort_initialized()` — **pre-flight the dylib ourselves** with
+  `libloading` (the same crate `ort` uses; a plain `dlopen` that touches no `ort` global) **before** `ort`
+  can, converting `ort`'s deadlock-on-failure into a typed `BackendError::Load`; then commit
+  `ort::init()` and **force a successful `ort::api()` ONCE, single-threaded**, so `G_ORT_LIB`/`G_ORT_API`
+  fill cleanly and no later concurrent first-touch can race the load or hit the error-path re-entry.
+  Cached in a process-wide `OnceLock` (idempotent). `OrtModel::load_with` now `?`-propagates it.
+- `waav-infer-server`: `Engine::load()` calls `ensure_ort_initialized()?` **as its first step** — the
+  production startup fix (eager ORT init before any model load or concurrent serving burst; covers the
+  live `serve` path and CLI subcommands via the shared load seam). A bad `ORT_DYLIB_PATH` is now a clean
+  boot error, never a hang.
+- Regression test `deadlock_regression::preflight_dylib_rejects_bad_path_without_deadlock`
+  (watchdog-timer bounded): a bad `ORT_DYLIB_PATH` returns `Err`, never hangs.
+
+**Verified on GB10.** `gb10_serves_16_concurrent_codec_ar_streams_rtf_under_1` COMPLETES + PASSES:
+16 concurrent codec-AR streams, `audio=75.440s wall=51.473s RTF=0.6823 ep=cuda`. backend-ort lib suite
+24/24 green (incl. live CUDA tiny-graph + `run_bound_*` bit-identity). `cargo clippy --workspace
+--all-targets -D warnings` clean.
+
 ## Recovery
 Resume `wf_ed99336f-e4a` via `resumeFromRunId` after the session limit resets (20:20 Asia/Kolkata):
 the RCA agents are cached, so resume re-runs only the fix + revalidate phases.
