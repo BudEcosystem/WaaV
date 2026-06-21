@@ -53,26 +53,46 @@ full throughput scaling; new batched paths proven BIT-IDENTICAL to per-slot/sing
    re-export (no host re-stream) — the open #1 follow-up; the docs no longer assert it as a shipped
    serving figure. See INFER_PERF_VALIDATION.md §3a/§7.
 
-## #9 Load resilience — graceful degradation under overload (REQUIRED, added 2026-06-21 per user)
+## #9 Load resilience — graceful degradation under overload — **DONE (2026-06-21, commits `086c17d` + `691b057`)**
 
-A worker must NEVER crash or buffer unboundedly under load. Even if requests spike past what a
-worker can serve, or latency explodes, the system MUST queue / shed / backpressure — degrade
-gracefully with a clear signal. The 2026-06-20 OOM crashes were the unbounded-buffering failure
-mode (the ORT arena cap, commit 950d491, only turns a crash into a clean error — it is the safety
-net, NOT the design). Required, bit-faithfully (no correctness loss):
-- **Bounded admission queue, not unbounded.** `codec_ar_batcher.rs:57` (egress) + `:80`
-  (submission `tx`) are both `UnboundedSender` — the literal flood-to-OOM trap. Make them bounded.
-- **Concurrency cap + bounded queue + load-shed.** N active slots (`MAX_SLOTS`); excess requests
-  queue up to a BOUNDED depth; when full, reject fast with an explicit server-busy / 429 /
-  retry-after (or backpressure the caller) — never admit unboundedly.
-- **Deadline-aware admission.** Under latency explosion, drop/reject requests that can't meet their
-  deadline (wire the deadline-graded scheduler + `DutyLedger`/`Ceilings` into ADMISSION, not just
-  scheduling).
-- **VRAM-accounted admission.** Admit a new stream only with memory headroom (`VramAccountant`);
-  never admit past the budget.
-- **Acceptance gate:** a deliberate request-spike + latency-explosion stress test — the worker
-  queues/sheds/backpressures, peak memory stays bounded, NO OOM, NO crash, accepted streams stay
-  bit-identical, shed streams get a clear typed signal.
+A worker must NEVER crash / OOM / hang / buffer unboundedly under load. Even if requests spike past
+what a worker can serve, or latency explodes, the system MUST queue (bounded) / shed (typed) /
+backpressure — degrade gracefully with a clear signal. The 2026-06-20 OOM crashes were the
+unbounded-buffering failure mode (the ORT arena cap, commit 950d491, only turns a crash into a clean
+error — it is the safety net, NOT the design). **All five legs implemented bit-faithfully (accepted
+streams unchanged — admission/shed/backpressure are control-plane only):**
+
+- **Bounded admission queue, not unbounded — DONE.** The submission channel + per-stream egress in
+  `codec_ar_batcher.rs` were both `UnboundedSender` (the flood-to-OOM trap). Now: the submission
+  channel is a BOUNDED `tokio::mpsc` (depth 256; `submit` `try_send`s, a full channel sheds a typed
+  429); the per-stream egress is a BOUNDED `tokio::mpsc` (depth 64, `bounded_send`).
+- **In-loop pending queue bounded — DONE (the documented "ONE instance, flat-bounded" limit is GONE).**
+  `serve_codec_ar_multiplexed_bounded` hard-caps the runtime loop's `pending` VecDeque at `max_pending`;
+  overflow is load-shed via `shed_admission` (one typed retriable `AdmissionRejected` terminal). The
+  old comment that called this a "production limitation" is removed — it is now an explicit, honest cap.
+- **Concurrency cap + load-shed — DONE.** `CodecArAdmission` (new `codec_ar_admission.rs`) bounds
+  simultaneously-admitted streams; overflow sheds a typed `AdmissionRejected` (429 + retry-after)
+  surfaced through `InferError`/`TerminalFrame::Error` — the WS/REST caller sees a clean "busy, retry".
+- **Deadline-aware admission — DONE.** `CodecArAdmission` projects the queue wait (depth × per-stream
+  serve time from the rated `Ceilings`) vs the request deadline and sheds what can't be served in time;
+  AND the engine's measured `DutyLedger` is wired INTO `try_admit` (`Engine::admit_bandwidth`) — a
+  saturated shared bus (measured duty ≥ rated headroom) refuses a new admission with a typed 429.
+- **VRAM-accounted admission — DONE.** `CodecArAdmission` reserves a per-stream KV footprint against a
+  `VramAccountant` box budget (RAII `AdmissionTicket` releases on stream end); never admits past the
+  budget → no unified-memory OOM.
+- **Acceptance gate — DONE (RED stress test, runs in the default pass, no GPU/leak).**
+  `gate9_request_spike_and_latency_explosion_queues_sheds_bounded_memory_accepted_bit_identical`:
+  a 400-request SPIKE (≫ MAX_ADMIT=8) + a per-step latency explosion through the LIVE
+  `CodecArBatcher::submit` path ⇒ **5 admitted (all token-for-token BIT-IDENTICAL to their
+  single-stream reference), 395 shed (typed `AdmissionRejected` asserted)**, peak in-flight ≤ cap
+  (8), peak reserved-VRAM ≤ budget, **peak RSS growth ~1 MB (≤ 256 MB bound)**, NO crash / hang / OOM,
+  RAII back to zero (no leak). Plus a runtime-level bounded-pending shed gate
+  (`multiplexed_bounded_pending_sheds_overflow_with_typed_terminal`) and a DutyLedger-admission gate
+  (`admit_bandwidth_refuses_a_saturated_bus_with_a_typed_signal`). Bit-identity of the multiplexed
+  path is unchanged (`multiplexed_ragged_concurrent_is_bit_identical_to_per_slot_and_shares_one_tick`
+  still green). Files: `serve.rs` (`serve_codec_ar_multiplexed_bounded`/`shed_admission`),
+  `codec_ar_admission.rs` (new gate), `codec_ar_batcher.rs` (bounded channels + `bounded_send` +
+  gate wiring), `lib.rs`/`ws.rs` (typed-shed surfacing), `engine.rs` (`admit_bandwidth`).
 
 ## #10 Integration completeness — NO SHELF-WARE (STANDING RULE, added 2026-06-21 per user)
 
@@ -94,6 +114,32 @@ delta-streaming egress, barge-in, the admission machinery (`DutyLedger`/`Ceiling
 the #9 bounded queue/shed), and the 16-arm registry. ANY component that is orphaned / test-only /
 duplicated / not on the live path is a limitation to wire in (bit-faithfully). Codify this rule in
 `INFER_GUIDELINES.md` so it binds future work. "Built" ≠ "shipped": only live-path-integrated counts.
+
+### #10 audit result — 2026-06-21 (commits `086c17d` + `691b057`)
+
+The no-shelf-ware rule is codified in `INFER_GUIDELINES.md §0.3` (already present) + §5 (load-resilience
+rule added). Component-by-component audit (live-path call site → live test):
+
+| Component | LIVE-PATH (call site) | LIVE-TEST | Status |
+|---|---|---|---|
+| `codec_ar_batcher` | `ws.rs:317` + `lib.rs:759` (REST) `submit` | `live_concurrent_…` + `live_gb10_batcher_…` (heavy suite) + `gate9_…` stress (default pass) | ✅ LIVE |
+| `stt_coalescer` | `engine.rs` (transcribe → `submit`), field `:275` | `coalescer_fans_concurrent_into_batched_forwards` + perf_bench whisper concurrent (heavy) | ✅ LIVE |
+| `tts_coalescer` | `engine.rs` (one-shot synthesize), field `:260` | `tts_coalescer_fans_concurrent…` + perf_bench kokoro (heavy) | ✅ LIVE |
+| S2S `DuplexStepModel` | provider orchestration (NOT the gateway server — there is NO `/v1/realtime` route on this server; S2S is the M5/provider surface by design) | `s2s_duplex_ragged_concurrent_batched_bit_identical_and_scales` — a **REAL GPU model** (`CodecArDuplexModel`), NOT a `FakeStage` (heavy suite) | ✅ LIVE-TESTED (real model); **provider-scoped, not gateway-server-routed — documented architectural boundary, NOT shelf-ware** (RCA #6 resolved: the FakeStage-only gap is closed by the real-model gate) |
+| `FrameWatchdog`/`LeakWatchdog` | `ProdSpine` (`lib.rs:188`), `spawn_watchdog` (`lib.rs:321`), registered per slot by `serve_codec_ar_multiplexed` | `spawned_watchdog_thread_sheds_a_silently_hung_session` + `multiplexed_spine_fires_and_reconciles_clean` | ✅ LIVE |
+| `VramAccountant` | control plane (`control.rs` `admit_slot`/box ledger) + boot graph-pool reserve (`engine.rs:487`) + **GATE #9** `CodecArAdmission` per-stream footprint | `vram_accountant_*` + `gate9_…` (per-stream reserve/release under spike) | ✅ LIVE |
+| NaN-reject sampler / H1 egress reject | `egress.rs:204` H1 gate on every delta `push` (the live codec-AR egress path) | egress finiteness-reject tests | ✅ LIVE |
+| delta-streaming egress (`StreamEgress`/`EgressEvent`) | the codec-AR mux loop emits `Delta` deltas → `StreamItem` on the live WS/REST path | `engine_stream_ships_deltas_then_explicit_final_terminal` | ✅ LIVE |
+| barge-in | `ws.rs` `ClientFrame::BargeIn` → `cancel.cancel()` | `live_barge_in_cancels_only_its_own_stream` (heavy) + `multiplexed_barge_in_cancels_only_its_own_slot` | ✅ LIVE |
+| `DutyLedger`/`Ceilings`/deadline admission | **NOW WIRED INTO ADMISSION** (was "MEASURED but NOT ADMITTED"): `try_admit` → `Engine::admit_bandwidth` (`lib.rs`) consults the measured `DutyLedger`; `CodecArAdmission` uses `Ceilings` for the deadline projection | `admit_bandwidth_refuses_a_saturated_bus_with_a_typed_signal` + `engine_calibrates_bandwidth_profile_…` + `deadline_gate_sheds_…` | ✅ LIVE (gap closed) |
+| 16-arm registry | `model.rs:403` config-arch dispatch (15 STT/TTS/AR arms on the live load path; duplex is `as_stepped()` from chatterbox, not a separate dispatch arm) | `registered_archs_are_all_dispatchable` | ✅ LIVE |
+
+**Verdict.** Every component is on the live path AND live-tested. The two prior asymmetries are resolved:
+(a) **DutyLedger was measured-but-not-admitted** → now wired into `try_admit` via `admit_bandwidth` (a
+deadline-graded bus-saturation shed). (b) **DuplexStepModel was FakeStage-only (RCA #6)** → a real GPU
+`CodecArDuplexModel` gate now proves it (heavy suite); it is **provider-scoped by architecture** (the
+gateway-facing infer server exposes STT/TTS/codec-AR; full-duplex S2S is the M5 provider surface — there
+is no `/v1/realtime` route on this server, which is the intended boundary, not an orphan). No shelf-ware.
 
 ## FOUND + FIXED — ORT first-touch re-entrant-`Once` deadlock (#1 production blocker, 2026-06-21, commit `bbcf663`)
 
