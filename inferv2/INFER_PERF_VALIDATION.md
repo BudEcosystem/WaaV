@@ -158,6 +158,23 @@ RTF<1 at ≥ 4 concurrent **holds for all three real models.** The two headline 
 
 **No production code changed** (`git diff` = 241 insertions, 0 deletions: the new test only). All sibling bit-exact gates re-run green alongside it: `live_ragged_batched_forward_bit_identical_and_scales` (base, 1.69×), `batched_forward_codes_identical_to_per_slot`, `codec_ar_run_ar_compounding_identical`, `flow_solve_bit_identical_to_run_loop`, `path_a_run_bound_bit_identical_per_arm`, `ar_compounding_emitted_codes_identical`, `pcm16_round_trip_is_bit_faithful`. The turbo arm now batches ragged/concurrent cohorts at full throughput with bit-identical accuracy — **no fallback, no re-export needed**.
 
+### 4.5 Deterministic ragged-batch == per-slot bit-identity gate — the proof-obligation now runs on EVERY `cargo test` (closed)
+
+**Reported limitation (stale RCA):** *"No ragged-batch == per-slot bit-identity RED test exists anywhere — the only batched-forward gate (`batched_forward_codes_identical_to_per_slot`) uses EQUAL-length prefill, so the ragged path's accuracy is asserted by prose, not a test."*
+
+**Root cause (verified against the live tree):** the ragged bit-identity obligation *was* enforced, but **only by the CUDA-gated live tests** (`live_ragged_batched_forward_bit_identical_and_scales`, `live_turbo_ragged_batched_forward_bit_identical_and_scales`), which SKIP cleanly without `ORT_DYLIB_PATH` + the model. The one **always-runs (deterministic)** batched gate, `batched_forward_codes_identical_to_per_slot`, deliberately uses EQUAL-length prefill (`vec![3+k, 9, 13]`, all length 3 ⇒ pad=0), so on a dev box / CI without GB10 the ragged LEFT-align / right-pad / un-pad path's accuracy was asserted by prose, not a test.
+
+**Fix (extreme-TDD, test-only — no production code changed):** a new deterministic gate `ragged_batched_forward_codes_identical_to_per_slot` (`waav-infer-core` `tts/chatterbox`) drives a **genuinely RAGGED** cohort — DISTINCT prefill lengths (2,3,4,5 ids) AND STAGGERED admission (slot k at tick k·3) ⇒ each slot at a DISTINCT `attn_len`, **pad>0 on every batched run** — through `step_slots_batched`, and asserts the emitted codec codes are **BIT-IDENTICAL token-for-token** to the per-slot `step` loop on the SAME staggered schedule. It bites because the `FakeLm` double is **ragged-faithful**: each row's next id is `((last_token + real_attn) % 100) + 10` where `real_attn` is the SUM of THAT ROW's `attention_mask` (its un-padded context length), so any ragged-feed corruption (LEFT-pad instead of LEFT-align, wrong per-row mask length, cross-row KV bleed) diverges a row's whole compounding trajectory. The gate also asserts the **KV un-pad invariant** (each active slot's stored KV `seq == attn_len - 1` after every ragged stride) via two `#[cfg(test)]` accessors (`slot_kv_len_for_test` / `slot_attn_len_for_test`), so a wrong un-pad offset (reading the right-padded `max_past` window back) is a deterministic RED too.
+
+**RED-capability proof (both failure classes):**
+| Injected bug | Result |
+|---|---|
+| Mask drops ragged context (`real = max_past+1` for every row, not `past_seq+1`) | **FIRES** — slots 1/2/3 (the padded rows) diverge token-for-token; the assert REDs naming the slot |
+| Un-pad reads the padded window (`slot_past1 = new_past`, no un-pad) | **FIRES** — `slot 1: stored KV seq (9) must equal attn_len-1 (7)` — the KV-length invariant catches it |
+| Correct implementation | **PASS** — all 4 ragged slots bit-identical, distinct trajectory lengths confirmed |
+
+**Why this is the right closure:** the deterministic gate makes the ragged accuracy obligation enforceable on **every** `cargo test` run (no GB10, no model download), while the live REAL-weights twins (§3a / §4.4) keep proving the SAME identity on real CUDA numerics AND that it scales (base 1.69× @ N=8, turbo 1.12–1.33× @ N=8). The ragged path's correctness is now asserted by a test at both layers — never by prose.
+
 ---
 
 ## 5. Honest gaps + recommended follow-ups
