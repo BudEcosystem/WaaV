@@ -74,6 +74,27 @@ net, NOT the design). Required, bit-faithfully (no correctness loss):
   queues/sheds/backpressures, peak memory stays bounded, NO OOM, NO crash, accepted streams stay
   bit-identical, shed streams get a clear typed signal.
 
+## #10 Integration completeness — NO SHELF-WARE (STANDING RULE, added 2026-06-21 per user)
+
+Every component developed for WaaV Infer (now and earlier) MUST be **optimally integrated into the
+live main codebase and serving path** — reachable from the real WS / REST / realtime entry points
+and **exercised by a live (non-Fake) integration test** — not test-only, dead, behind a disabled
+flag, duplicated, or shadowed by an older path. A component is NOT "done" until it is wired into the
+live path AND a live test proves it actually runs there. This is the generalization of the two worst
+limitations we found: **#1** (the lockstep batcher was fully built but **never wired to live
+traffic**) and **#6** (native-S2S existed but was exercised **only by a `FakeStage` double**).
+
+**Acceptance gate — integration-completeness audit (part of revalidation, every round):** enumerate
+EVERY component and trace it from the live server entry points (`ws.rs`, the REST handler, the
+realtime/S2S handler, `engine.rs`) — each MUST be invoked on the real path, with a live test
+covering it. Audit at least: `codec_ar_batcher` (live codec-AR), `stt_coalescer` (live transcribe),
+`tts_coalescer` (live one-shot TTS), the S2S `DuplexStepModel` (live realtime, not FakeStage), the
+production spine (`FrameWatchdog`/`LeakWatchdog`/`VramAccountant`), the NaN-reject sampler,
+delta-streaming egress, barge-in, the admission machinery (`DutyLedger`/`Ceilings`/deadline-graded +
+the #9 bounded queue/shed), and the 16-arm registry. ANY component that is orphaned / test-only /
+duplicated / not on the live path is a limitation to wire in (bit-faithfully). Codify this rule in
+`INFER_GUIDELINES.md` so it binds future work. "Built" ≠ "shipped": only live-path-integrated counts.
+
 ## Recovery
 Resume `wf_ed99336f-e4a` via `resumeFromRunId` after the session limit resets (20:20 Asia/Kolkata):
 the RCA agents are cached, so resume re-runs only the fix + revalidate phases.
