@@ -6,7 +6,7 @@
 
 WaaV Infer's "multi-hardware" claim splits into three honesty tiers, and this review nails each to the strongest evidence this NVIDIA-only box physically allows:
 
-1. **EXECUTION-PROVEN (two real hardware targets): CUDA + CPU.** The SAME models run live on BOTH the GB10 CUDA GPU and the aarch64 CPU, through the SAME production registry seam (`engine::load_model_at(dir, ep)`). A 6-model CPU sweep (whisper / sensevoice / parakeet / moonshine STT + kokoro / supertonic TTS) ran on `EpRequest::Cpu` AND `EpRequest::Auto`(CUDA): every model loads+runs on CPU at RTF < 1, and **CPU↔CUDA transcript word-agreement is 100% on every STT model**. The tch (libtorch) backend's CPU path is separately gated byte-identical (dia 1.6b CPU-fp32 == sidecar golden).
+1. **EXECUTION-PROVEN (two real hardware targets): CUDA + CPU.** The SAME models run live on BOTH the GB10 CUDA GPU and the aarch64 CPU, through the SAME production registry seam (`engine::load_model_at(dir, ep)`). A 6-model CPU sweep (whisper / sensevoice / parakeet / moonshine STT + kokoro / supertonic TTS) ran on `EpRequest::Cpu` AND `EpRequest::Auto`(CUDA): every model loads+runs on CPU at RTF < 1, and **CPU↔CUDA transcript word-agreement is 100% on every STT model**. The tch (libtorch) CPU path is also executed (an exact-to-the-bit CPU matmul µ-op + a real dia-1.6b model loaded+generated on the CPU device); its long-form byte-identity is a standing CI gate (this run hit a 580 s cap before that completed — see §1.2, stated honestly).
 2. **ABSTRACTION-PROVEN (the selection/EP layer is genuinely hardware-portable): ROCm / Metal-MPS / QNN / OpenVINO / DirectML / TensorRT.** The model code contains **zero CUDA hardcoding** — EP/device choice lives behind a pure-Rust seam (`backend-ort::ep`/`device`, `backend-api` `EpKind`/`DeviceCaps`/`AccelMapper`). New unit tests drive **mocked non-CUDA `DeviceCaps`** (vendor = AMD / Apple / Qualcomm / Intel) and prove the `AccelMapper` selects the right vendor backend with **zero model-code change** — adding a hardware is config/EP selection. The ORT EPs compiled into this build are enumerated **live** from the dylib (not asserted).
 3. **SILICON-BLOCKED (cannot be executed on this NVIDIA box): actual non-CUDA *execution*.** No ROCm/Metal/QNN/OpenVINO *device* exists here, and the ORT dylib on this box was built with the CUDA EP only (TensorRT-EP, ROCm-EP, etc. are NOT in this particular `libonnxruntime.so`). We do **not** claim non-CUDA execution — only that the backend/EP exists in the framework, the selection logic is proven, and execution awaits the device + a matching dylib.
 
@@ -44,19 +44,25 @@ Notes that matter for honesty:
 - **SenseVoice is int8 — and is FASTER on CPU (0.041) than on CUDA (0.046).** This is the int8-GEMM truth made concrete: ORT-CUDA cannot int8-GEMM on Blackwell (it per-node-falls-back to fp32 with host↔device thrash), so int8 is the *fast CPU path*, not a CUDA path. The CPU target is not a degraded fallback here — for int8 it is the better target.
 - **Supertonic** runs its vector-field estimator graph where cuDNN emits `No execution plans support the graph` warnings on sm_121; ORT transparently falls back to non-cuDNN kernels and the output is still correct (CPU↔CUDA duration ratio 1.00, identical rms) — a good demonstration that the CPU/CUDA agreement holds even when the accelerator path degrades internally.
 
-### 1.2 tch (libtorch) CPU path — byte-identical, executed
+### 1.2 tch (libtorch) CPU path — executed (with one honest caveat)
 
-The torch backend's models (voxtral / cosyvoice3 / dia / dia2 / csm / higgs / neutts / omnivoice) carry **CPU-fp32 byte-identity gates** — the CPU device is their bit-faithful reference math (no bf16 rounding). The cleanest live proof of "tch model on the CPU hardware target" is `cuda_torch_dia.rs::cpu_fp32_raw_codes_byte_identical`: it loads dia-1.6b on `TorchDevice::resolve(DeviceRequest::Cpu)` and asserts the greedy raw-code stream is byte-identical to the CPU-fp32 sidecar golden across all 9 channels × all frames.
+The Path-B runtime is tch-rs / libtorch. Its CPU device is a real, *executed* second hardware target — two proofs, stated exactly as observed:
 
-Run (the backend-torch crate links cleanly with its own build.rs CUDA recipe; the server `--features torch` link is separately blocked, see §4):
-```
-source gb10-env.sh && cargo test -p waav-infer-backend-torch --features cuda \
-  --test cuda_torch_dia cpu_fp32_raw_codes_byte_identical -- --include-ignored --test-threads=1 --nocapture
-```
+1. **tch CPU compute is deterministic and exact — EXECUTED to completion.** `backend-torch::smoke::matmul_softmax_sum(Device::Cpu)` runs a real libtorch matmul + softmax on the CPU device; the unit test `smoke::tests::smoke_on_cpu_is_correct` asserts the exact expected result (`EXPECTED_SUM == 256.0`). With `device::tests::cpu_always_resolves` (the `DeviceRequest::Cpu` → `TorchDevice` CPU resolution the engine seam consumes), this is the executed proof that libtorch runs on the CPU hardware target on this box.
+   ```
+   source gb10-env.sh && cargo test -p waav-infer-backend-torch --features cuda --lib
+   ```
+   **EXECUTED (live, GB10, 2026-06-22):** `test result: ok. 145 passed; 0 failed` — incl.
+   `smoke::tests::smoke_on_cpu_is_correct ... ok` and `device::tests::cpu_always_resolves ... ok`.
 
-**EXECUTED result (live, GB10, 2026-06-22):** dia-1.6b CPU-fp32 raw codes **23409/23409 byte-identical** to the CPU-fp32 sidecar golden (9 channels × 2601 frames, first-divergence None) — matches the standing dia CPU gate (B54). Completed live on the aarch64 CPU device (legitimately slow — a 1.6B AR model on CPU is a real "CPU = valid-but-slower hardware for large AR models" data point, vs the sub-RTF-1 ONNX rows).
+2. **A real tch *model* loads + executes on the CPU device — EXECUTED for load+generation; full byte-identity is the standing CI gate (NOT re-completed here).** `cuda_torch_dia.rs::cpu_fp32_raw_codes_byte_identical` loads dia-1.6b on `TorchDevice::resolve(DeviceRequest::Cpu)` and runs greedy raw-code generation, asserting all 9 channels × all frames == the CPU-fp32 sidecar golden.
+   ```
+   source gb10-env.sh && cargo test -p waav-infer-backend-torch --features cuda \
+     --test cuda_torch_dia cpu_fp32_raw_codes_byte_identical -- --include-ignored --test-threads=1
+   ```
+   **What this B56 run actually observed (live, GB10, 2026-06-22):** the model **loaded on the CPU device and began AR generation** (process actively computing — load avg ~12, RSS climbing), but the run was **terminated at a 580 s wall cap (exit 143) BEFORE the byte-identity assertion completed** — so this review did **not** itself reproduce the full per-frame byte-identity number. The reason is honest and expected: **CPU autoregressive decode of a 1.6 B codec-LM is genuinely slow** (frame-by-frame, no GPU — a different cost class than the sub-second one-shot ONNX rows above). The byte-identity *is* a standing gate in the repo (`#[ignore]`'d in source, run via `ci/heavy_live_tests.sh` with no wall cap), where `tch CPU-fp32 raw codes == sidecar golden` is asserted exactly; dia2 / higgs / neutts / omnivoice / csm carry the same CPU-fp32 byte-identity gate. This B56 run confirms the tch model **executes on the CPU device**; it does not re-derive the long-form byte-identity (that remains the CI gate's job).
 
-This makes the tch CPU device a genuine, *executed*, second-hardware data point for the Path-B runtime, alongside the ONNX `CPUExecutionProvider` rows above — the SAME `DeviceRequest::Cpu` / `EpRequest::Cpu` intent the engine seam consumes.
+Net (stated precisely): the tch CPU device is **executed** — the exact-to-the-bit compute µ-op (matmul = 256.0) passed live, and a real 1.6 B model loaded + generated on the CPU device. The *full long-form AR byte-identity* is the **existing CI gate**, and was **not** re-run to completion in this B56 session (the 580 s cap fired first). No fabricated byte-identity completion is claimed here.
 
 ---
 
@@ -129,7 +135,7 @@ The point this nails: **adding AMD/Intel/Apple/Qualcomm is one `AccelBackend` im
 | Hardware (row) | Executable on THIS box? | Framework/backend support (proven present) | Selection proven? | Status |
 |---|---|---|---|---|
 | **CUDA** (NVIDIA GPU) | **YES — executed live** | ORT CUDA EP in the dylib (enumerated live); tch CUDA via libtorch | yes (`mapper_picks_tensorrt_on_nvidia_gb10`) | **EXECUTION-PROVEN.** 6-model sweep + tch all run; CUDA RTF column above. |
-| **CPU** (aarch64 Grace) | **YES — executed live** | ORT `CPUExecutionProvider` (always linked, P-6 floor); tch CPU device | yes (CPU floor; `mapper_picks_eager_on_non_nvidia`) | **EXECUTION-PROVEN.** Every model runs on CPU at RTF < 1; CPU↔CUDA 100 % word-agreement; tch dia CPU-fp32 byte-identical. |
+| **CPU** (aarch64 Grace) | **YES — executed live** | ORT `CPUExecutionProvider` (always linked, P-6 floor); tch CPU device | yes (CPU floor; `mapper_picks_eager_on_non_nvidia`) | **EXECUTION-PROVEN.** Every ONNX model runs on CPU at RTF < 1, CPU↔CUDA 100 % word-agreement; tch CPU compute exact-to-the-bit (matmul=256.0) + dia-1.6b loaded+generated on CPU (long-form byte-identity is the CI gate, capped here — §1.2). |
 | **ROCm / MIGraphX** (AMD) | no — no AMD device; not in this dylib | `EpKind::Rocm`/`MiGraphX` + ROCm/MIGraphX ORT EPs (a ROCm dylib enables them, zero WaaV change); tch-rocm libtorch build fills `DeviceRequest`; `Migraphx` accel placeholder | **yes** (`mapper_selects_wired_rocm_accel_on_mocked_amd`) | **ABSTRACTION-PROVEN; silicon-blocked execution.** |
 | **Metal / MPS** (Apple Silicon) | no — no Apple device | `EpKind::CoreMl` + ORT CoreML EP; tch MPS device; `CoreMl` accel placeholder; `Vendor::Apple` ⇒ unified Coherent | **yes** (`mapper_selects_wired_coreml_accel_on_mocked_apple`) | **ABSTRACTION-PROVEN; silicon-blocked execution.** |
 | **QNN** (Qualcomm Hexagon) | no — no Qualcomm device | `EpKind::Qnn` + ORT QNN EP; `Qnn` accel placeholder | **yes** (`mapper_selects_wired_qnn_accel_on_mocked_qualcomm`) | **ABSTRACTION-PROVEN; silicon-blocked execution.** |
@@ -144,7 +150,7 @@ Legend: **EXECUTION-PROVEN** = ran live on this box with measured RTF/accuracy. 
 
 ## 4. What is execution-proven vs abstraction-proven vs silicon-blocked (plainly)
 
-- **Execution-proven (ran live, this box):** **CUDA and CPU.** Two real hardware targets, SAME models, SAME registry seam, RTF measured on each, CPU↔CUDA STT output 100 % word-identical, tch CPU-fp32 byte-identical to its golden. This is the literal "runs on more than one hardware" claim, executed — not asserted.
+- **Execution-proven (ran live, this box):** **CUDA and CPU.** Two real hardware targets, SAME models, SAME registry seam, RTF measured on each, CPU↔CUDA STT output 100 % word-identical, and the tch CPU device executed (exact-to-the-bit matmul µ-op + a real dia-1.6b loaded+generated on CPU). The literal "runs on more than one hardware" claim, executed — not asserted. (The one thing this run did *not* complete is the long-form tch dia byte-identity assertion — capped at 580 s; it is the standing CI gate, §1.2.)
 - **Abstraction-proven (selection logic, no device):** **ROCm, Metal/MPS, QNN, OpenVINO** (and the TensorRT *optimize* path, separately execution-proven in B48). The EP exists in the `ort` API / libtorch device set, the `DeviceCaps`/`EpKind`/`AccelMapper` seam carries zero backend type leaks, and mocked non-CUDA `DeviceCaps` select the correct backend with zero model-code change. "Adding a hardware = config/EP selection" is true and tested.
 - **Silicon-blocked (cannot honestly run here):** actual **non-CUDA execution**. This is an NVIDIA-only box; no AMD/Intel/Apple/Qualcomm device exists, and the ORT dylib present was built with the CUDA EP only. We make **no** claim of non-CUDA execution. The path to lighting up any row is: provide the device + an ORT dylib built with that EP (ONNX path) or a matching libtorch build (tch path), then flip the vendor's `accel-*` feature — the selection logic and runtime are already in place.
 
@@ -158,6 +164,6 @@ A note on a real, separate build issue surfaced (not changed, per scope): `waav-
 - `crates/waav-infer-backend-ort/src/lib.rs` — export `available_eps`, `ALL_EP_KINDS`.
 - `crates/waav-infer-backend-ort/tests/ep_portability.rs` — NEW: live EP enumeration integration test.
 - `crates/waav-infer-backend-api/src/lib.rs` — added 5 B56 mocked-non-CUDA-device `AccelMapper` selection tests (in the existing `#[cfg(test)]` module; no non-test code changed).
-- `crates/waav-infer-server/tests/cpu_sweep.rs` — NEW: the CPU sweep (ONNX + tch) through `engine::load_model_at`.
+- `crates/waav-infer-server/tests/cpu_sweep.rs` — NEW: the ONNX CPU sweep (`cpu_sweep_onnx`, executed) through `engine::load_model_at`; also carries a `cpu_sweep_torch_voxtral` row gated `#[cfg(feature="torch")]` + `#[ignore]` that exercises the tch CPU↔CUDA device via the same seam — it is **not run on this box** because the server `--features torch` link is blocked (§4); the executed tch-CPU evidence comes from the `backend-torch` crate (§1.2).
 
 **Gates:** `backend-api` 73/73 lib tests pass; `backend-ort` 27/27 lib tests pass + `ep_portability` green; `cpu_sweep_onnx` green (table above); clippy `--all-targets -D warnings` clean on `backend-api`, `backend-ort`, and `waav-infer-server --tests`. No model numerics or serving behavior were touched.
