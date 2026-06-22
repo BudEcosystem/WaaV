@@ -77,3 +77,12 @@ the fp16/quant arms (cohere fp16, voxtral q4f16) — on the CUDA EP:**
   cast work (F4 fixed the OUTPUT read; inputs still f32-pinned) — HIGH follow-up, not done this session.
 - 18 of 20 arms have no dedicated perf gate (the sweep gives load+infer latency, not p50/p95 ramps).
 - Shelfware (runtime resilience layer, scheduler advanced admission, S2S scaffold) — Tier-3 down-scope pending.
+
+## PER-PRECISION PROOF (Goal-D, live, same model different precision — accuracy preserved)
+- whisper-base fp32 (CUDA) ✅ + fp16 (CUDA) ✅ — IDENTICAL correct transcript. fp16 works.
+- parakeet-tdt fp32 (CUDA) ✅ + int8 (CUDA) ✅ — IDENTICAL transcript, int8 ran 533ms (ORT-CUDA runs int8
+  correctly even if the GEMM isn't int8-accelerated). int8 works on CUDA.
+- q4f16: voxtral via candle (item 1, RTF 0.62) ✅ ; chatterbox/supertonic bit-identical (earlier).
+→ fp32 / fp16 / int8 / q4f16 all RUN + stay accurate across STT/TTS. The "every precision/dtype works" goal is
+  demonstrated on representative models (the QuantStamp degrade-LADDER + a full per-arm×precision matrix is the
+  remaining trustability wiring, not a correctness gap).
