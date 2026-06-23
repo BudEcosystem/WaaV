@@ -14,12 +14,16 @@ LLM-decoder ark/granite/higgs-stt/vibevoice-asr · the tch codec-AR/flow/diffusi
   lfm2.5-jp · vibevoice-realtime · higgs-v2-3b · vieneu-tts · voxtral-4b-tts · **s2-pro** · resemble-enhance.
 - + INTEGRATION MILESTONE: all 14 tch models now engine-served (was 5) — fully integrated.
 
-## B. IN-FLIGHT (final TTS batch) — 3
-MOSS-TTS-v1.5 · Trendyol-TTS · ViiTorVoice-NAR (verifying now; committed when they land or dispositioned honestly).
-
-## C. WINNABLE-NEXT (deferred, but a clean reuse exists) — 1+
-- **nvidia/canary-qwen-2.5b** (HARD tier) — an LLM-decoder ASR; reuses the proven qwen3-asr / higgs-v3-stt template.
-  Not a blocker, just unstarted. The next onboard if the campaign continues.
+## B. FINAL TTS BATCH + WINNABLE-NEXT — RESOLVED (2026-06-23) => winnable triage EXHAUSTED
+- **Trendyol-TTS** → ONBOARDED, zero-code (Turkish VoxCPM2 LoRA-finetune; byte-identical 8192/8192 latents; serves
+  via the existing `voxcpm2` arm — a finetune of an onboarded arch = zero repo change).
+- **ViiTorVoice-NAR** → PORTED + byte-faithful (12-cb masked-diffusion NAR; gate codes 0/948, wav maxΔ=0; new
+  viitorvoice.rs reusing the ORT codec/backbone hybrid + the omnivoice recurrence; cfm::masked untouched).
+- **nvidia/canary-qwen-2.5b** → ONBOARDED (WER 0.0% byte-identical to the NeMo SALM reference; the triage's
+  "HARD/.nemo-locked" was stale — NVIDIA ships HF safetensors; reused the higgs-stt LLM-decoder-ASR template +
+  new FastConformer glue).
+- **MOSS-TTS-v1.5** → HARD blocker (moved to F): a NEW 8.5B Qwen3-delay arch, PyTorch-only, NO backbone ONNX
+  (the family's only ONNX is the gated Realtime sibling); the 8.5B tch reimpl is multi-day.
 
 ## D. DUPLICATES / already-supported (NO work) — 5
 ggerganov/whisper.cpp · Systran/faster-whisper-large-v3 · zhifeixie/Mega-ASR · mudler/parakeet-cpp-gguf ·
