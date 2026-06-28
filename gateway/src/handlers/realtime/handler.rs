@@ -64,19 +64,28 @@ pub async fn realtime_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<Auth>,
+    request_id: Option<Extension<crate::middleware::request_id::RequestId>>,
 ) -> Response {
     info!(
         auth_id = ?auth.id,
         "Realtime WebSocket connection upgrade requested"
     );
 
+    // GW-17: mint (or propagate) the connection's W3C `traceparent` ONCE here — reusing the inbound
+    // request's correlation id when it is a valid trace id (set by the request-id middleware from an
+    // inbound `traceparent`), else minting a fresh one. The Infer-S2S adapter forwards it on the handshake
+    // so one distributed trace spans the gateway turn AND the intra-Infer stages. Other providers ignore it.
+    let inbound = request_id.as_ref().map(|ext| ext.0.as_str());
+    let trace_parent = crate::middleware::request_id::mint_traceparent(inbound);
+
     ws.max_frame_size(MAX_WS_FRAME_SIZE)
         .max_message_size(MAX_WS_MESSAGE_SIZE)
-        .on_upgrade(move |socket| handle_realtime_socket(socket, state, auth))
+        .on_upgrade(move |socket| handle_realtime_socket(socket, state, auth, trace_parent))
 }
 
-/// Handle the realtime WebSocket connection
-async fn handle_realtime_socket(socket: WebSocket, app_state: Arc<AppState>, auth: Auth) {
+/// Handle the realtime WebSocket connection. `trace_parent` is the connection's W3C `traceparent`
+/// (GW-17), forwarded onto the WaaV Infer handshake when the selected provider is the Infer-S2S tier.
+async fn handle_realtime_socket(socket: WebSocket, app_state: Arc<AppState>, auth: Auth, trace_parent: String) {
     info!(auth_id = ?auth.id, "Realtime WebSocket connection established");
 
     let (mut sender, mut receiver) = socket.split();
@@ -147,6 +156,7 @@ async fn handle_realtime_socket(socket: WebSocket, app_state: Arc<AppState>, aut
                             &mut session_id,
                             &message_tx,
                             &app_state,
+                            &trace_parent,
                         ).await;
 
                         if !continue_processing {
@@ -214,6 +224,7 @@ async fn process_realtime_message(
     session_id: &mut Option<String>,
     message_tx: &mpsc::Sender<RealtimeMessageRoute>,
     app_state: &Arc<AppState>,
+    trace_parent: &str,
 ) -> bool {
     match msg {
         Message::Text(text) => {
@@ -255,6 +266,7 @@ async fn process_realtime_message(
                 session_id,
                 message_tx,
                 app_state,
+                trace_parent,
             )
             .await
         }
@@ -307,10 +319,11 @@ async fn handle_realtime_incoming(
     session_id: &mut Option<String>,
     message_tx: &mpsc::Sender<RealtimeMessageRoute>,
     app_state: &Arc<AppState>,
+    trace_parent: &str,
 ) -> bool {
     match msg {
         RealtimeIncomingMessage::Config(config) => {
-            handle_config(config, realtime_provider, session_id, message_tx, app_state).await
+            handle_config(config, realtime_provider, session_id, message_tx, app_state, trace_parent).await
         }
         RealtimeIncomingMessage::Text { text } => {
             if let Some(provider) = realtime_provider
@@ -444,6 +457,7 @@ async fn handle_config(
     session_id: &mut Option<String>,
     message_tx: &mpsc::Sender<RealtimeMessageRoute>,
     app_state: &Arc<AppState>,
+    trace_parent: &str,
 ) -> bool {
     // P3: resolve a server-side ALIAS into the session config BEFORE the provider /
     // credential is selected. Definitions are server-config-only (SSRF-safe); explicit
@@ -591,6 +605,14 @@ async fn handle_config(
         .and_then(|canon| app_state.config.realtime_endpoint_overrides.get(canon))
     {
         realtime_config.realtime_endpoint_override = Some(override_url.clone());
+    }
+
+    // GW-17: forward the connection's propagated W3C `traceparent` so the WaaV Infer-S2S adapter injects it
+    // on the handshake (`session.config` `trace` + a `traceparent` connect header) and the engine parents
+    // its per-turn / per-stage spans under it — one distributed trace spans the gateway turn AND the
+    // intra-Infer STT/LLM/TTS stages. Only well-formed (validated at mint); other providers ignore it.
+    if crate::middleware::request_id::is_w3c_traceparent(trace_parent) {
+        realtime_config.trace = Some(trace_parent.to_string());
     }
 
     // Create provider

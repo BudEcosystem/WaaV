@@ -32,6 +32,7 @@ use crate::core::realtime::base::{
 use crate::core::realtime::scaffold::{
     ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol, S2sEvent, apply_endpoint_override,
 };
+use crate::middleware::request_id::is_w3c_traceparent;
 
 /// The default loopback native-WS endpoint for a co-located Infer S2S tier (§6.2 D5: loopback-ws
 /// first; same-box TCP-HOL is negligible). A SERVER-CONFIG `realtime_endpoint_override` points it at a
@@ -84,6 +85,15 @@ impl InferProtocol {
         // is intrinsic (§6.4 / §10 D2: the LLM is inside the model), so there is no system-prompt key.
         if let Some(voice) = cfg.voice.as_deref().filter(|v| !v.is_empty()).or(self.voice.as_deref()) {
             sc["conditioning"] = json!({ "voice": voice });
+        }
+        // GW-17 (INFER_GATEWAY_INTEGRATION §13): forward the propagated W3C `traceparent` on the handshake
+        // so the engine parses it into `SessionConfig::trace` and parents its per-turn / per-stage spans
+        // under the gateway trace — one distributed trace spans the gateway turn AND the intra-Infer
+        // STT/LLM/TTS stages. The Infer `trace` field is a typed traceparent, so we inject ONLY a
+        // well-formed value (a malformed one would fail the engine's `session.config` deserialization);
+        // absent/invalid ⇒ the key is omitted (an untraced handshake is byte-unchanged).
+        if let Some(tp) = cfg.trace.as_deref().filter(|t| is_w3c_traceparent(t)) {
+            sc["trace"] = json!(tp);
         }
         sc
     }
@@ -148,7 +158,16 @@ impl RealtimeProtocol for InferProtocol {
         );
         // A co-located loopback tier needs no auth header; if the override carries an authenticated
         // remote, the gateway's per-deployment header config attaches it (not modeled in the open seam).
-        Ok(ConnectSpec::WebSocket { url, headers: vec![] })
+        // GW-17: also forward the propagated W3C `traceparent` as a connect header (the standard
+        // out-of-band carrier) so a trace-aware proxy / collector on the hop sees it too — the engine's
+        // primary read is the `session.config` `trace` field above, but the header keeps the hop W3C-clean.
+        let headers = cfg
+            .trace
+            .as_deref()
+            .filter(|t| is_w3c_traceparent(t))
+            .map(|tp| vec![("traceparent".to_string(), tp.to_string())])
+            .unwrap_or_default();
+        Ok(ConnectSpec::WebSocket { url, headers })
     }
 
     fn build_session_config(
@@ -400,6 +419,55 @@ mod tests {
         // the model owns turns ⇒ create_response/commit_turn send NOTHING (don't fight intrinsic turns).
         assert!(p.create_response(None).is_empty(), "the model owns response creation (§6.4)");
         assert!(p.commit_turn().is_empty(), "the model owns the turn boundary (§6.4)");
+    }
+
+    /// **`infer_protocol_injects_propagated_traceparent`** (GW-17, the gateway INJECTING half): when the
+    /// connection carries a propagated W3C `traceparent`, the Infer-S2S adapter forwards it on BOTH the
+    /// `session.config` `trace` field (the engine's primary read → `SessionConfig::trace`) AND a
+    /// `traceparent` connect header — so one distributed trace (`trace_id` X) spans the gateway turn and the
+    /// intra-Infer stages. An untraced or malformed config injects NEITHER (an untraced handshake is
+    /// byte-unchanged; a malformed value can never fail the engine's typed `trace` deserialization).
+    #[test]
+    fn infer_protocol_injects_propagated_traceparent() {
+        const TP: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+        let traced = RealtimeConfig { trace: Some(TP.to_string()), ..cfg() };
+        let p = InferProtocol::from_config(&traced).unwrap();
+
+        // (a) session.config carries the traceparent on the `trace` field, with the gateway's trace id X.
+        let sc = control(&p.build_session_config(&traced, None)[0]).clone();
+        assert_eq!(sc["trace"], serde_json::json!(TP), "session.config.trace is the propagated traceparent");
+        assert!(
+            sc["trace"].as_str().unwrap().contains(TRACE_ID),
+            "the gateway's trace id rides the handshake (one trace spans both halves)"
+        );
+
+        // (b) connect_spec carries the standard `traceparent` connect header too (W3C-clean hop).
+        match p.connect_spec(&traced).unwrap() {
+            ConnectSpec::WebSocket { headers, .. } => assert!(
+                headers.iter().any(|(k, v)| k == "traceparent" && v == TP),
+                "the traceparent rides a connect header, got {headers:?}"
+            ),
+            other => panic!("expected a WebSocket spec, got {other:?}"),
+        }
+
+        // (c) an untraced config injects NOTHING (byte-unchanged untraced handshake).
+        let untraced = InferProtocol::from_config(&cfg()).unwrap();
+        assert!(control(&untraced.build_session_config(&cfg(), None)[0]).get("trace").is_none());
+        match untraced.connect_spec(&cfg()).unwrap() {
+            ConnectSpec::WebSocket { headers, .. } => assert!(headers.is_empty(), "no trace ⇒ no header"),
+            other => panic!("expected a WebSocket spec, got {other:?}"),
+        }
+
+        // (d) a MALFORMED traceparent is injected NOWHERE (it would fail the engine's typed deserialize).
+        let bad = RealtimeConfig { trace: Some("not-a-traceparent".into()), ..cfg() };
+        let pbad = InferProtocol::from_config(&bad).unwrap();
+        assert!(control(&pbad.build_session_config(&bad, None)[0]).get("trace").is_none());
+        match pbad.connect_spec(&bad).unwrap() {
+            ConnectSpec::WebSocket { headers, .. } => assert!(headers.is_empty(), "malformed ⇒ no header"),
+            other => panic!("expected a WebSocket spec, got {other:?}"),
+        }
     }
 
     /// **`infer_protocol_from_config_requires_model`**: a native-S2S session must name the interaction

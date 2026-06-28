@@ -285,6 +285,16 @@ pub struct RealtimeConfig {
     /// Reconnection configuration for automatic reconnection on connection loss.
     #[serde(default)]
     pub reconnection: Option<ReconnectionConfig>,
+
+    /// **GW-17 (INFER_GATEWAY_INTEGRATION §13): the propagated W3C `traceparent` the gateway forwards to a
+    /// co-located WaaV Infer tier** so one distributed trace spans the gateway turn AND the intra-Infer
+    /// STT/LLM/TTS stages. A canonical `00-<trace32>-<span16>-01` string (reusing the inbound request's
+    /// trace id when present, else freshly minted — see the realtime handler). The Infer-S2S adapter injects
+    /// it onto the `session.config` `trace` field + a `traceparent` connect header; the engine parses it into
+    /// `SessionConfig::trace` and parents its per-turn / per-stage spans under it. `None` ⇒ untraced (the
+    /// engine opens a fresh root span). Server-set only; other providers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<String>,
 }
 
 /// Configuration for input audio transcription.
