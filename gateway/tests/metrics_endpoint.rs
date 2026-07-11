@@ -164,6 +164,9 @@ async fn metrics_exposes_provider_ttfb() {
 
     // SAFETY (edition 2024): set/remove_var are unsafe. This is the only place in this test
     // touching OPENAI_BASE_URL; it is removed after the synthesis call below.
+    // The endpoint-override SSRF validation rejects loopback by default; the sanctioned
+    // WAAV_ALLOW_LOOPBACK_ENDPOINTS escape covers this in-process mock (core::net).
+    unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
     unsafe { std::env::set_var("OPENAI_BASE_URL", format!("http://{addr}")) };
 
     // 2. Build the gateway router with the public /metrics route + the /speak API route.

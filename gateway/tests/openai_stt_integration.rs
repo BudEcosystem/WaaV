@@ -62,6 +62,13 @@ where
     }
 }
 
+/// Binary-wide lock serializing every test span that SETS or DEPENDS ON `OPENAI_BASE_URL`
+/// (env vars are process-global; see the SAFETY note at the set_var site). Poison-tolerant.
+fn openai_base_url_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Test that OpenAI is included in supported providers
 #[test]
 fn test_openai_in_supported_providers() {
@@ -74,6 +81,9 @@ fn test_openai_in_supported_providers() {
 /// Test provider creation via string name
 #[test]
 fn test_create_openai_provider_by_name() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = STTConfig {
         provider: "openai".to_string(),
         api_key: "test-api-key".to_string(),
@@ -97,6 +107,9 @@ fn test_create_openai_provider_by_name() {
 /// Test provider creation via enum
 #[test]
 fn test_create_openai_provider_by_enum() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = STTConfig {
         provider: "openai".to_string(),
         api_key: "test-api-key".to_string(),
@@ -115,6 +128,9 @@ fn test_create_openai_provider_by_enum() {
 /// Test case-insensitive provider name parsing
 #[test]
 fn test_openai_provider_name_case_insensitive() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = STTConfig {
         provider: "openai".to_string(),
         api_key: "test-api-key".to_string(),
@@ -130,6 +146,9 @@ fn test_openai_provider_name_case_insensitive() {
 /// Test API key validation
 #[test]
 fn test_openai_requires_api_key() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = STTConfig {
         provider: "openai".to_string(),
         api_key: String::new(), // Empty API key
@@ -204,6 +223,9 @@ fn test_openai_model_parsing() {
 /// Test callback registration using Arc callbacks
 #[tokio::test]
 async fn test_openai_callback_registration() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = STTConfig {
         provider: "openai".to_string(),
         api_key: "test-api-key".to_string(),
@@ -227,6 +249,9 @@ async fn test_openai_callback_registration() {
 /// Test default model selection
 #[test]
 fn test_openai_default_model() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = STTConfig {
         provider: "openai".to_string(),
         api_key: "test-api-key".to_string(),
@@ -241,6 +266,9 @@ fn test_openai_default_model() {
 /// Test provider info
 #[test]
 fn test_openai_provider_info() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = STTConfig {
         provider: "openai".to_string(),
         api_key: "test-api-key".to_string(),
@@ -257,6 +285,9 @@ fn test_openai_provider_info() {
 /// Test OpenAI STT specific methods using with_config
 #[test]
 fn test_openai_stt_specific_creation() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     use waav_gateway::core::stt::openai::{OpenAISTTConfig, ResponseFormat};
 
     let config = OpenAISTTConfig {
@@ -499,8 +530,17 @@ async fn test_openai_stt_local_server_roundtrip() {
     });
 
     // --- Point the real WaaV OpenAI provider at our local server ---
-    // SAFETY (edition 2024): set/remove_var are unsafe. Only this test touches OPENAI_BASE_URL in
-    // the default suite (the other live tests are #[ignore]d), and it is removed below.
+    // SAFETY (edition 2024): set/remove_var are unsafe BECAUSE the process environment is a
+    // shared mutable global — glibc getenv/setenv race across threads (real UB, not just a
+    // logical race), and sibling tests in THIS binary construct providers whose api_url() READS
+    // OPENAI_BASE_URL. Hold a binary-wide lock for the whole set→drive→remove span so no
+    // parallel test observes (or races) the mutation (the PR#2 review finding; same discipline
+    // as the lib suite's net::ssrf_env_lock).
+    let _env_guard = openai_base_url_env_lock();
+    // The endpoint-override SSRF validation (creation-time) rejects loopback URLs by default;
+    // WAAV_ALLOW_LOOPBACK_ENDPOINTS=1 is the sanctioned escape for exactly this in-process
+    // mock-server case (see core::net) — set/removed inside the same lock span.
+    unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
     unsafe { std::env::set_var("OPENAI_BASE_URL", format!("http://{addr}")) };
 
     let mut config = OpenAISTTConfig::from_base(STTConfig {
@@ -546,6 +586,7 @@ async fn test_openai_stt_local_server_roundtrip() {
     stt.disconnect().await.expect("disconnect");
     // Restore global env before asserting so a failure can't leak into other tests.
     unsafe { std::env::remove_var("OPENAI_BASE_URL") };
+    unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
 
     let result = received
         .expect("timed out waiting for transcription result")

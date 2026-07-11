@@ -13,6 +13,8 @@ use tracing::{debug, error, info};
 
 use super::config::YandexSTTConfig;
 use super::messages::{YandexSTTApiError, YandexSTTStatusCode, YandexSyncResponse};
+use crate::core::stt::http_resilience::HttpBreaker;
+
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
@@ -85,6 +87,10 @@ pub struct YandexSTT {
     processing_task: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Flag to stop processing
     stop_flag: Arc<AtomicBool>,
+    /// Shared per-provider circuit breaker for the REST transport (uniform with the WS fleet):
+    /// consulted before each upstream call, fed by the unified HTTP status classification.
+    /// Inert until `set_resilience` injects the process-global handles (W-D2).
+    resilience: HttpBreaker,
 }
 
 impl YandexSTT {
@@ -110,6 +116,7 @@ impl YandexSTT {
             audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_SYNC_AUDIO_SIZE))),
             processing_task: Arc::new(RwLock::new(None)),
             stop_flag: Arc::new(AtomicBool::new(false)),
+            resilience: HttpBreaker::new("yandex"),
         })
     }
 
@@ -138,7 +145,15 @@ impl YandexSTT {
             audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_SYNC_AUDIO_SIZE))),
             processing_task: Arc::new(RwLock::new(None)),
             stop_flag: Arc::new(AtomicBool::new(false)),
+            resilience: HttpBreaker::new("yandex"),
         })
+    }
+
+    /// The shared circuit breaker this client feeds, if the process-global resilience handles
+    /// have been injected (W-D2). Two `YandexSTT` built from the same
+    /// [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.breaker()
     }
 
     /// Recognize audio using synchronous API
@@ -150,14 +165,22 @@ impl YandexSTT {
             audio_data.len()
         );
 
+        // Consult the shared per-provider breaker before paying the upstream round-trip: an
+        // open breaker fails fast with a typed classified refusal (uniform with the WS fleet).
+        self.resilience.check()?;
+
         // Send request
         let response =
             yandex_stt_recognize_request(&self.client, &self.yandex_config, audio_data.to_vec())
                 .send()
                 .await
-                .map_err(|e| STTError::NetworkError(format!("Failed to send request: {}", e)))?;
+                .map_err(|e| {
+                    self.resilience.record_send_error();
+                    STTError::NetworkError(format!("Failed to send request: {}", e))
+                })?;
 
         let status = response.status();
+        self.resilience.record_status(status);
         let status_code = YandexSTTStatusCode::from_http_status(status.as_u16());
 
         if status_code.is_success() {
@@ -200,6 +223,7 @@ impl YandexSTT {
         let stop_flag = Arc::clone(&self.stop_flag);
         let client = self.client.clone();
         let yandex_config = self.yandex_config.clone();
+        let resilience = self.resilience.clone();
 
         let task = tokio::spawn(async move {
             let mut last_process_time = std::time::Instant::now();
@@ -239,6 +263,17 @@ impl YandexSTT {
                 debug!("Processing {} bytes of accumulated audio", audio_data.len());
                 last_process_time = std::time::Instant::now();
 
+                // Consult the shared per-provider breaker before each pseudo-streaming
+                // round-trip: while it is open the classified refusal reaches the session's
+                // error callback without paying a doomed upstream round-trip.
+                if let Err(e) = resilience.check() {
+                    debug!("Yandex STT breaker refusal: {}", e);
+                    if let Some(callback) = error_callback.read().await.as_ref() {
+                        callback(e).await;
+                    }
+                    continue;
+                }
+
                 // Send request
                 let result = yandex_stt_recognize_request(&client, &yandex_config, audio_data)
                     .send()
@@ -247,6 +282,7 @@ impl YandexSTT {
                 match result {
                     Ok(response) => {
                         let status = response.status();
+                        resilience.record_status(status);
                         if status.is_success() {
                             if let Ok(text) = response.text().await
                                 && let Ok(sync_response) =
@@ -280,6 +316,7 @@ impl YandexSTT {
                         }
                     }
                     Err(e) => {
+                        resilience.record_send_error();
                         error!("Yandex STT request failed: {}", e);
                         if let Some(callback) = error_callback.read().await.as_ref() {
                             callback(STTError::NetworkError(e.to_string())).await;
@@ -419,6 +456,13 @@ impl BaseSTT for YandexSTT {
 
     fn get_provider_info(&self) -> &'static str {
         "Yandex SpeechKit v1"
+    }
+
+    /// W-D2: attach the shared per-provider circuit breaker so every Yandex session trips
+    /// (and observes) the SAME breaker, uniform with the WS fleet. The REST transport consults
+    /// it before each upstream call and feeds it the unified HTTP status classification.
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        self.resilience.set_handles(resilience);
     }
 }
 

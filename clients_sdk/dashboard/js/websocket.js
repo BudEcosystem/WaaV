@@ -16,14 +16,18 @@ export class WebSocketManager {
   connect() {
     return new Promise((resolve, reject) => {
       try {
+        // FIRST-MESSAGE AUTH (not ?token= in the URL): tokens in URLs are logged by
+        // proxies/access logs. The gateway admits a tokenless /ws and expects
+        // {"type":"auth","token":...} as the first message (works for both API-secret
+        // and JWT gateway auth modes).
         const wsUrl = new URL(this.url);
-        if (this.apiKey) {
-          wsUrl.searchParams.set('token', this.apiKey);
-        }
 
         this.ws = new WebSocket(wsUrl.toString());
 
         this.ws.onopen = () => {
+          if (this.apiKey) {
+            this.ws.send(JSON.stringify({ type: 'auth', token: this.apiKey }));
+          }
           if (this.onOpen) this.onOpen();
           resolve();
         };

@@ -1726,3 +1726,140 @@ mod audio_url_wire_tests {
         mock.assert_async().await;
     }
 }
+
+// =============================================================================
+// Resilience-trio wiring (shared per-provider circuit breaker on the REST path)
+// =============================================================================
+
+mod resilience_tests {
+    use super::*;
+    use crate::core::resilience::{CircuitState, ResilienceRegistry};
+    use bytes::Bytes;
+    use std::sync::Arc;
+
+    /// Build a `GroqSTT` against a local mock endpoint with the shared registry breaker
+    /// injected (the same `set_resilience` call the VoiceManager makes in production).
+    /// Construction happens under the loopback escape hatch, mirroring the transcribe-by-URL
+    /// mock-harness test above.
+    fn breaker_wired_stt(endpoint: String, reg: &ResilienceRegistry) -> GroqSTT {
+        let cfg = GroqSTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            custom_endpoint: Some(endpoint),
+            ..Default::default()
+        };
+        let mut stt = {
+            let _guard = crate::core::net::test_env_lock()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+            unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
+            let stt = GroqSTT::with_config(cfg).expect("construct Groq STT");
+            // SAFETY: restore the process env before releasing the test env lock.
+            unsafe {
+                if let Some(previous) = previous {
+                    std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+                } else {
+                    std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+                }
+            }
+            stt
+        };
+        stt.set_resilience(reg.handles_for("groq"));
+        stt
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn breaker_records_failure_on_upstream_4xx() {
+        // Uniformity gate: a failed upstream round-trip must be recorded on the SAME shared
+        // per-provider breaker the registry hands the WS fleet. A 400 is non-retryable for
+        // Groq, so exactly ONE attempt (and one recorded failure) happens.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/openai/v1/audio/transcriptions")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":{"message":"bad request","type":"invalid_request_error"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let reg = ResilienceRegistry::new(4);
+        let mut stt = breaker_wired_stt(
+            format!("{}/openai/v1/audio/transcriptions", server.url()),
+            &reg,
+        );
+        // The injected breaker IS the registry's shared per-provider breaker.
+        assert!(
+            Arc::ptr_eq(
+                stt.resilience_breaker().expect("breaker injected"),
+                &reg.breaker_for("groq")
+            ),
+            "provider must feed the registry's shared breaker"
+        );
+
+        stt.connect().await.expect("connect");
+        stt.send_audio(Bytes::from(vec![0u8; 3200]))
+            .await
+            .expect("send_audio buffers");
+        let err = stt.flush().await.expect_err("400 must surface an error");
+        assert!(matches!(err, STTError::ConfigurationError(_)), "{err:?}");
+
+        let snap = stt.resilience_breaker().unwrap().snapshot();
+        assert_eq!(snap.failures, 1, "the 400 must be recorded as ONE failure");
+        assert_eq!(snap.successes, 0);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_breaker_fails_fast_with_typed_refusal_without_contacting_upstream() {
+        // Failover gate: with the shared breaker OPEN (e.g. tripped by other sessions), the
+        // REST path must refuse with a typed classified error BEFORE paying the upstream
+        // round-trip — the mock asserts ZERO hits. The refusal is also non-retryable, so
+        // Groq's internal retry loop stops on the first attempt.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/openai/v1/audio/transcriptions")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let reg = ResilienceRegistry::new(4);
+        let mut stt = breaker_wired_stt(
+            format!("{}/openai/v1/audio/transcriptions", server.url()),
+            &reg,
+        );
+
+        // Another "session" of the same provider trips the shared breaker.
+        let shared = reg.breaker_for("groq");
+        for _ in 0..10 {
+            shared.record_failure();
+        }
+        assert_eq!(shared.state(), CircuitState::Open);
+
+        stt.connect().await.expect("connect");
+        stt.send_audio(Bytes::from(vec![0u8; 3200]))
+            .await
+            .expect("send_audio buffers");
+        let err = stt
+            .flush()
+            .await
+            .expect_err("open breaker must refuse the flush");
+        match err {
+            STTError::ConnectionFailed(msg) => {
+                assert!(msg.contains("circuit breaker"), "{msg}");
+                assert!(msg.contains("groq"), "{msg}");
+            }
+            other => panic!("expected typed ConnectionFailed refusal, got {other:?}"),
+        }
+        assert!(
+            !GroqSTT::is_retryable_error(&STTError::ConnectionFailed("x".into())),
+            "the refusal must not feed Groq's retry loop"
+        );
+        mock.assert_async().await; // zero upstream hits
+    }
+}

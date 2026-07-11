@@ -35,6 +35,7 @@ use tracing::{debug, error, info, warn};
 use super::super::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
+use super::super::http_resilience::HttpBreaker;
 use super::config::{FlushStrategy, GroqResponseFormat, GroqSTTConfig};
 use super::messages::{
     GroqErrorResponse, TranscriptionResponse, TranscriptionResult, VerboseTranscriptionResponse,
@@ -295,6 +296,11 @@ pub struct GroqSTT {
 
     /// Whether the last audio chunk was detected as silent.
     last_was_silent: bool,
+
+    /// Shared per-provider circuit breaker for the REST transport (uniform with the WS fleet):
+    /// consulted before each upstream attempt, fed by the unified HTTP status classification.
+    /// Inert until `set_resilience` injects the process-global handles (W-D2).
+    resilience: HttpBreaker,
 }
 
 impl GroqSTT {
@@ -348,7 +354,15 @@ impl GroqSTT {
             first_audio_time: None,
             silence_start_time: None,
             last_was_silent: false,
+            resilience: HttpBreaker::new("groq"),
         })
+    }
+
+    /// The shared circuit breaker this client feeds, if the process-global resilience handles
+    /// have been injected (W-D2). Two `GroqSTT` built from the same
+    /// [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.breaker()
     }
 
     /// Publicly accessible flush method.
@@ -670,6 +684,12 @@ impl GroqSTT {
             form = form.text(name, value);
         }
 
+        // Consult the shared per-provider breaker before paying the upstream round-trip: an
+        // open breaker fails fast with a typed classified refusal (uniform with the WS fleet).
+        // Consulted per attempt, so a breaker that opens mid-retry stops the loop immediately
+        // (`is_retryable_error` does not retry `ConnectionFailed`).
+        self.resilience.check()?;
+
         // Send request to Groq API
         let response = http_client
             .post(config.api_url())
@@ -677,7 +697,10 @@ impl GroqSTT {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| STTError::NetworkError(format!("Request failed: {e}")))?;
+            .map_err(|e| {
+                self.resilience.record_send_error();
+                STTError::NetworkError(format!("Request failed: {e}"))
+            })?;
 
         // Extract rate limit headers before consuming response
         let rate_limit_info = RateLimitInfo::from_headers(response.headers());
@@ -701,6 +724,7 @@ impl GroqSTT {
 
         // Check response status
         let status = response.status();
+        self.resilience.record_status(status);
         let response_text = response
             .text()
             .await
@@ -961,6 +985,7 @@ impl Default for GroqSTT {
             first_audio_time: None,
             silence_start_time: None,
             last_was_silent: false,
+            resilience: HttpBreaker::new("groq"),
         }
     }
 }
@@ -1156,6 +1181,13 @@ impl BaseSTT for GroqSTT {
     /// Get provider information string.
     fn get_provider_info(&self) -> &'static str {
         "Groq Whisper STT"
+    }
+
+    /// W-D2: attach the shared per-provider circuit breaker so every Groq STT session trips
+    /// (and observes) the SAME breaker, uniform with the WS fleet. The REST transport consults
+    /// it before each upstream attempt and feeds it the unified HTTP status classification.
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        self.resilience.set_handles(resilience);
     }
 }
 

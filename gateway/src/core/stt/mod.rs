@@ -16,6 +16,8 @@ pub mod gladia;
 pub mod gnani;
 pub mod google;
 pub mod groq;
+/// Shared circuit-breaker wiring for request/response (HTTP) STT providers.
+pub(crate) mod http_resilience;
 pub mod huawei_cloud;
 pub mod ibm_watson;
 pub mod iflytek;

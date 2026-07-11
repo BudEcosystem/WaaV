@@ -62,6 +62,13 @@ where
     }
 }
 
+/// Binary-wide lock serializing every test span that SETS or DEPENDS ON `OPENAI_BASE_URL`
+/// (env vars are process-global). Poison-tolerant.
+fn openai_base_url_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Test that OpenAI is included in supported providers
 #[test]
 fn test_openai_in_tts_provider_urls() {
@@ -73,6 +80,9 @@ fn test_openai_in_tts_provider_urls() {
 /// Test provider creation via string name
 #[tokio::test]
 async fn test_create_openai_tts_provider_by_name() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = TTSConfig {
         provider: "openai".to_string(),
         api_key: "test-api-key".to_string(),
@@ -93,6 +103,9 @@ async fn test_create_openai_tts_provider_by_name() {
 /// Test case-insensitive provider name parsing
 #[tokio::test]
 async fn test_openai_tts_provider_name_case_insensitive() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = TTSConfig {
         provider: "openai".to_string(),
         api_key: "test-api-key".to_string(),
@@ -108,6 +121,9 @@ async fn test_openai_tts_provider_name_case_insensitive() {
 /// Test model configuration
 #[tokio::test]
 async fn test_openai_tts_model_configuration() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     // Test tts-1 model
     let config = TTSConfig {
         api_key: "test-api-key".to_string(),
@@ -139,6 +155,9 @@ async fn test_openai_tts_model_configuration() {
 /// Test voice configuration
 #[tokio::test]
 async fn test_openai_tts_voice_configuration() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let voices = [
         ("alloy", OpenAIVoice::Alloy),
         ("ash", OpenAIVoice::Ash),
@@ -172,6 +191,9 @@ async fn test_openai_tts_voice_configuration() {
 /// Test speed/speaking rate clamping
 #[tokio::test]
 async fn test_openai_tts_speed_clamping() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     // Test speed below minimum (should clamp to 0.25)
     let config = TTSConfig {
         api_key: "test-api-key".to_string(),
@@ -235,6 +257,9 @@ fn test_openai_tts_provider_info() {
 /// Test callback registration (without connection)
 #[tokio::test]
 async fn test_openai_tts_callback_registration() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = TTSConfig {
         api_key: "test-api-key".to_string(),
         ..Default::default()
@@ -474,8 +499,15 @@ async fn test_openai_tts_local_server_roundtrip() {
         axum::serve(listener, app).await.expect("serve");
     });
 
-    // SAFETY (edition 2024): set/remove_var are unsafe. Only this test touches OPENAI_BASE_URL in
-    // the default suite (the other live tests are #[ignore]d); it is removed below.
+    // SAFETY (edition 2024): set/remove_var are unsafe BECAUSE the process environment is a
+    // shared mutable global (glibc getenv/setenv race across threads) and sibling tests in this
+    // binary construct providers that READ OPENAI_BASE_URL. Hold a binary-wide lock for the whole
+    // set→drive→remove span (the PR#2 review finding).
+    let _env_guard = openai_base_url_env_lock();
+    // The endpoint-override SSRF validation (creation-time) rejects loopback URLs by default;
+    // WAAV_ALLOW_LOOPBACK_ENDPOINTS=1 is the sanctioned escape for exactly this in-process
+    // mock-server case (see core::net) — set/removed inside the same lock span.
+    unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
     unsafe { std::env::set_var("OPENAI_BASE_URL", format!("http://{addr}")) };
 
     let config = TTSConfig {
@@ -539,6 +571,7 @@ async fn test_openai_tts_local_server_roundtrip() {
 
     tts.disconnect().await.expect("disconnect");
     unsafe { std::env::remove_var("OPENAI_BASE_URL") };
+    unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
 
     assert!(
         total > 0,

@@ -48,7 +48,7 @@
 //! ```
 
 use livekit_api::services::sip::{
-    CreateSIPDispatchRuleOptions, ListSIPDispatchRuleFilter, ListSIPInboundTrunkFilter, SIPClient,
+    ListSIPDispatchRuleFilter, ListSIPInboundTrunkFilter, SIPClient,
 };
 use livekit_protocol as proto;
 
@@ -219,15 +219,10 @@ impl LiveKitSipHandler {
             .any(|rule| rule.name == dispatch_config.dispatch_name);
 
         if !rule_exists {
-            // Note: The livekit-api crate doesn't currently support setting room_config
-            // through CreateSIPDispatchRuleOptions. The max_participants setting
-            // needs to be set through the LiveKit server's admin API or dashboard
-            // after creating the dispatch rule.
-            //
-            // TODO: Extend the livekit-api crate to support room_config in dispatch rules,
-            // or use a lower-level twirp client request to set it during creation.
-
-            // Create dispatch rule with individual dispatch (room prefix)
+            // Create dispatch rule with individual dispatch (room prefix). Routed through the raw
+            // twirp client because livekit-api's wrapper drops `room_config` — the configured
+            // `max_participants` is now applied AT CREATION (previously it was silently ignored
+            // with a "set it in the dashboard" note).
             let dispatch_rule = proto::sip_dispatch_rule::Rule::DispatchRuleIndividual(
                 proto::SipDispatchRuleIndividual {
                     room_prefix: dispatch_config.room_prefix.clone(),
@@ -235,22 +230,19 @@ impl LiveKitSipHandler {
                 },
             );
 
-            let dispatch_options = CreateSIPDispatchRuleOptions {
-                name: dispatch_config.dispatch_name.clone(),
-                ..Default::default()
-            };
-
-            self.sip_client
-                .create_sip_dispatch_rule(dispatch_rule, dispatch_options)
+            self.sip_api_client
+                .create_sip_dispatch_rule_with_room_config(
+                    dispatch_config.dispatch_name.clone(),
+                    dispatch_rule,
+                    Vec::new(),
+                    dispatch_config.max_participants,
+                )
                 .await
                 .map_err(|e| {
                     LiveKitError::ConnectionFailed(format!(
                         "Failed to create SIP dispatch rule: {e}"
                     ))
                 })?;
-
-            // Note: max_participants must be configured separately through
-            // the LiveKit dashboard or API
         }
 
         Ok(())

@@ -30,6 +30,13 @@ fn ensure_crypto() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+fn init_tracing_for_debug() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+    });
+}
+
 fn allow_loopback_endpoint_mocks() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -354,6 +361,10 @@ async fn spawn_reverie_mock(transcript_value: &'static str) -> MockEndpoint {
 #[tokio::test]
 async fn reverie_full_integration_via_mock_endpoint() {
     ensure_crypto();
+    init_tracing_for_debug();
+    // reverie/iflytek SSRF-validate endpoint_override at connect — allow the in-process
+    // loopback mock (the sanctioned escape; same as the sibling test above).
+    allow_loopback_endpoint_mocks();
     let port = spawn_reverie_mock("hello world").await;
     let endpoint = format!("ws://127.0.0.1:{port}");
 
@@ -387,14 +398,11 @@ async fn reverie_full_integration_via_mock_endpoint() {
     .unwrap();
 
     stt.connect().await.expect("connect to mock endpoint");
-    send_mock_audio_chunks(
-        stt.as_mut(),
-        "Reverie",
-        640,
-        5,
-        Some(Duration::from_millis(20)),
-    )
-    .await;
+    // ONE chunk: the mock replies a FINAL after the first binary frame, and in non-continuous
+    // mode (the default; `from_standard` maps no continuous flag) Reverie treats a final as
+    // end-of-session BY DESIGN (ReconnectOutcome::Completed) — further sends would race the
+    // intentional close and flake with "Not connected".
+    send_mock_audio_chunks(stt.as_mut(), "Reverie", 640, 1, None).await;
     tokio::time::sleep(Duration::from_millis(400)).await;
     stt.disconnect().await.expect("disconnect Reverie STT");
 
@@ -547,6 +555,9 @@ async fn spawn_iflytek_mock(transcript_value: &'static str) -> MockEndpoint {
 #[tokio::test]
 async fn iflytek_full_integration_via_mock_endpoint() {
     ensure_crypto();
+    // reverie/iflytek SSRF-validate endpoint_override at connect — allow the in-process
+    // loopback mock (the sanctioned escape; same as the sibling test above).
+    allow_loopback_endpoint_mocks();
     let port = spawn_iflytek_mock("hello world").await;
     let endpoint = format!("ws://127.0.0.1:{port}");
     // iFlytek packs 3 creds into api_key as `app_id|api_key|api_secret`.
@@ -562,7 +573,27 @@ async fn iflytek_full_integration_via_mock_endpoint() {
     })
     .with_endpoint_override(&endpoint);
     let mut stt = create_stt_standard("iflytek", std).expect("build iflytek via keystone");
-    let got = drive_and_capture(stt.as_mut()).await;
+    // Inline drive with ONE chunk (not the shared 6-chunk `drive_and_capture`): the mock replies
+    // a FINAL after the first frame and iFlytek's transport treats a final as end-of-session BY
+    // DESIGN — further sends race the intentional close ("channel closed").
+    let best = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let b2 = best.clone();
+    stt.on_result(Arc::new(move |r: STTResult| {
+        let b = b2.clone();
+        Box::pin(async move {
+            let t = r.transcript.trim().to_string();
+            if !t.is_empty() {
+                *b.lock().await = t;
+            }
+        })
+    }))
+    .await
+    .unwrap();
+    stt.connect().await.expect("connect to mock endpoint");
+    send_mock_audio_chunks(stt.as_mut(), "iFlytek", 1280, 1, None).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    stt.disconnect().await.expect("disconnect iFlytek STT");
+    let got = best.lock().await.clone();
     println!("iFlytek mock e2e surfaced transcript: {got:?}");
     assert_eq!(got, "hello world", "iFlytek full integration broken");
 }

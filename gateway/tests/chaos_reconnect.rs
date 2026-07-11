@@ -38,6 +38,16 @@ use waav_gateway::core::websocket::reconnectable_stream::{
     SupervisorExit, WsTransport,
 };
 
+/// Every test in this binary drives a REAL provider against an in-process loopback mock server via
+/// `endpoint_override`. The creation-time SSRF validation rejects loopback by default;
+/// `WAAV_ALLOW_LOOPBACK_ENDPOINTS=1` is the sanctioned escape for exactly this case (core::net).
+/// Set once for the whole binary — nothing here ever unsets it, so there is no cross-test race.
+fn allow_loopback_mocks() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") });
+}
+
+
 struct MockServer {
     label: &'static str,
     handle: JoinHandle<()>,
@@ -177,6 +187,7 @@ impl WsTransport for DroppingTransport {
 
 #[tokio::test]
 async fn generic_reconnects_after_midstream_drop_no_finals_lost() {
+    allow_loopback_mocks();
     const SPLIT: usize = 5;
     const TOTAL: usize = 10;
 
@@ -358,6 +369,7 @@ async fn spawn_dropping_deepgram_mock(
 
 #[tokio::test]
 async fn deepgram_recovers_after_midstream_kill() {
+    allow_loopback_mocks();
     const SPLIT: usize = 5;
     const TOTAL: usize = 10;
 
@@ -576,6 +588,7 @@ async fn spawn_dropping_cartesia_mock(
 /// is timely, and NO finals are lost across the drop.
 #[tokio::test]
 async fn cartesia_recovers_after_midstream_kill() {
+    allow_loopback_mocks();
     const SPLIT: usize = 5;
     const TOTAL: usize = 10;
 
@@ -796,6 +809,7 @@ async fn spawn_dropping_assemblyai_mock(
 /// writable again after its Begin, recovery is timely, and NO final turns are lost.
 #[tokio::test]
 async fn assemblyai_recovers_after_midstream_kill() {
+    allow_loopback_mocks();
     const SPLIT: usize = 5;
     const TOTAL: usize = 10;
 
@@ -1159,10 +1173,12 @@ async fn assert_replays_unfinalized_tail(provider_name: &str, proto: ReplayProto
 
 #[tokio::test]
 async fn deepgram_replays_unfinalized_audio_after_kill() {
+    allow_loopback_mocks();
     assert_replays_unfinalized_tail("deepgram", ReplayProto::Deepgram).await;
 }
 
 #[tokio::test]
 async fn assemblyai_replays_unfinalized_audio_after_kill() {
+    allow_loopback_mocks();
     assert_replays_unfinalized_tail("assemblyai", ReplayProto::AssemblyAi).await;
 }

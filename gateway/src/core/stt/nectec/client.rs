@@ -23,6 +23,8 @@ use super::config::{
     API_KEY_HEADER, LIB_HEADER, LIB_VALUE, MAX_AUDIO_SIZE_BYTES, NectecSttConfig, NectecSttModel,
     Partii4Response, Partii5Response,
 };
+use crate::core::stt::http_resilience::HttpBreaker;
+
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTConnectionState, STTError, STTErrorCallback, STTResult,
     STTResultCallback,
@@ -64,6 +66,10 @@ pub struct NectecStt {
     result_callback: Arc<RwLock<Option<STTResultCallback>>>,
     /// Error callback.
     error_callback: Arc<RwLock<Option<STTErrorCallback>>>,
+    /// Shared per-provider circuit breaker for the REST transport (uniform with the WS fleet):
+    /// consulted before each upstream call (Partii4/Partii5), fed by the unified HTTP status
+    /// classification. Inert until `set_resilience` injects the process-global handles (W-D2).
+    resilience: HttpBreaker,
 }
 
 fn nectec_stt_http_client(timeout_secs: u64) -> Result<Client, reqwest::Error> {
@@ -110,6 +116,7 @@ impl NectecStt {
             audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_AUDIO_BUFFER_SIZE))),
             result_callback: Arc::new(RwLock::new(None)),
             error_callback: Arc::new(RwLock::new(None)),
+            resilience: HttpBreaker::new("nectec"),
         })
     }
 
@@ -130,6 +137,10 @@ impl NectecStt {
             )
         })?;
 
+        // Consult the shared per-provider breaker before paying the upstream round-trip: an
+        // open breaker fails fast with a typed classified refusal (uniform with the WS fleet).
+        self.resilience.check()?;
+
         let response = http_client
             .post(crate::core::tts::standard::override_rest_endpoint(
                 self.config.endpoint(),
@@ -140,9 +151,13 @@ impl NectecStt {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| STTError::NetworkError(format!("Failed to send STT request: {e}")))?;
+            .map_err(|e| {
+                self.resilience.record_send_error();
+                STTError::NetworkError(format!("Failed to send STT request: {e}"))
+            })?;
 
         let status = response.status();
+        self.resilience.record_status(status);
 
         if !status.is_success() {
             let body = response
@@ -220,6 +235,10 @@ impl NectecStt {
             )
         })?;
 
+        // Consult the shared per-provider breaker before paying the upstream round-trip: an
+        // open breaker fails fast with a typed classified refusal (uniform with the WS fleet).
+        self.resilience.check()?;
+
         let response = http_client
             .post(crate::core::tts::standard::override_rest_endpoint(
                 self.config.endpoint(),
@@ -231,9 +250,13 @@ impl NectecStt {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| STTError::NetworkError(format!("Failed to send STT request: {e}")))?;
+            .map_err(|e| {
+                self.resilience.record_send_error();
+                STTError::NetworkError(format!("Failed to send STT request: {e}"))
+            })?;
 
         let status = response.status();
+        self.resilience.record_status(status);
 
         if !status.is_success() {
             let body = response
@@ -369,6 +392,13 @@ impl NectecStt {
     pub async fn buffer_size(&self) -> usize {
         self.audio_buffer.read().await.len()
     }
+
+    /// The shared circuit breaker this client feeds, if the process-global resilience handles
+    /// have been injected (W-D2). Two `NectecStt` built from the same
+    /// [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.breaker()
+    }
 }
 
 impl Default for NectecStt {
@@ -382,6 +412,7 @@ impl Default for NectecStt {
             audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_AUDIO_BUFFER_SIZE))),
             result_callback: Arc::new(RwLock::new(None)),
             error_callback: Arc::new(RwLock::new(None)),
+            resilience: HttpBreaker::new("nectec"),
         }
     }
 }
@@ -410,6 +441,7 @@ impl BaseSTT for NectecStt {
             audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_AUDIO_BUFFER_SIZE))),
             result_callback: Arc::new(RwLock::new(None)),
             error_callback: Arc::new(RwLock::new(None)),
+            resilience: HttpBreaker::new("nectec"),
         })
     }
 
@@ -537,6 +569,13 @@ impl BaseSTT for NectecStt {
 
     fn get_provider_info(&self) -> &'static str {
         "NECTEC AI for Thai (Partii) - Thai language speech recognition"
+    }
+
+    /// W-D2: attach the shared per-provider circuit breaker so every NECTEC session trips
+    /// (and observes) the SAME breaker, uniform with the WS fleet. The REST transport consults
+    /// it before each upstream call and feeds it the unified HTTP status classification.
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        self.resilience.set_handles(resilience);
     }
 }
 

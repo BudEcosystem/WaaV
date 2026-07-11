@@ -33,6 +33,7 @@ use tracing::{debug, error, info, warn};
 use super::super::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
+use super::super::http_resilience::HttpBreaker;
 use super::config::{BHASHINI_CONFIG_URL, BhashiniSttConfig};
 use super::messages::{
     BhashiniErrorResponse, PipelineComputeRequest, PipelineComputeResponse, PipelineConfigRequest,
@@ -134,6 +135,11 @@ pub struct BhashiniStt {
 
     /// Error callback.
     error_callback: Arc<Mutex<Option<STTErrorCallback>>>,
+
+    /// Shared per-provider circuit breaker for the REST transport (uniform with the WS fleet):
+    /// consulted before each upstream call (config + compute), fed by the unified HTTP status
+    /// classification. Inert until `set_resilience` injects the process-global handles (W-D2).
+    resilience: HttpBreaker,
 }
 
 fn bhashini_stt_http_client() -> Result<Client, reqwest::Error> {
@@ -172,7 +178,15 @@ impl BhashiniStt {
             connected: AtomicBool::new(false),
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
+            resilience: HttpBreaker::new("bhashini"),
         })
+    }
+
+    /// The shared circuit breaker this client feeds, if the process-global resilience handles
+    /// have been injected (W-D2). Two `BhashiniStt` built from the same
+    /// [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.breaker()
     }
 
     /// Public constructor for external use.
@@ -210,6 +224,10 @@ impl BhashiniStt {
             self.config.post_processors.clone(),
         );
 
+        // Consult the shared per-provider breaker before paying the upstream round-trip: an
+        // open breaker fails fast with a typed classified refusal (uniform with the WS fleet).
+        self.resilience.check()?;
+
         let response = self
             .client
             .post(crate::core::tts::standard::override_rest_endpoint(
@@ -223,10 +241,12 @@ impl BhashiniStt {
             .send()
             .await
             .map_err(|e| {
+                self.resilience.record_send_error();
                 STTError::NetworkError(format!("Pipeline config request failed: {}", e))
             })?;
 
         let status = response.status();
+        self.resilience.record_status(status);
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             if let Ok(error) = serde_json::from_str::<BhashiniErrorResponse>(&body) {
@@ -399,6 +419,11 @@ impl BhashiniStt {
                         "Failed to create SSRF-protected callback client: {e}"
                     ))
                 })?;
+        // Consult the shared per-provider breaker before each compute attempt: once the breaker
+        // opens, the retry loop in `send_audio_to_compute` keeps its bounded backoff but no
+        // attempt pays a doomed upstream round-trip — each one fails fast with the typed refusal.
+        self.resilience.check()?;
+
         let response = callback_client
             .post(&pipeline_config.callback_url)
             .header(
@@ -409,9 +434,13 @@ impl BhashiniStt {
             .json(request)
             .send()
             .await
-            .map_err(|e| STTError::NetworkError(format!("Compute request failed: {}", e)))?;
+            .map_err(|e| {
+                self.resilience.record_send_error();
+                STTError::NetworkError(format!("Compute request failed: {}", e))
+            })?;
 
         let status = response.status();
+        self.resilience.record_status(status);
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             if let Ok(error) = serde_json::from_str::<BhashiniErrorResponse>(&body) {
@@ -560,6 +589,13 @@ impl BaseSTT for BhashiniStt {
 
     fn get_provider_info(&self) -> &'static str {
         PROVIDER_INFO
+    }
+
+    /// W-D2: attach the shared per-provider circuit breaker so every Bhashini session trips
+    /// (and observes) the SAME breaker, uniform with the WS fleet. The REST transport consults
+    /// it before each upstream call and feeds it the unified HTTP status classification.
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        self.resilience.set_handles(resilience);
     }
 }
 

@@ -16,6 +16,8 @@ use super::config::{MAX_SYNC_AUDIO_SIZE, SberSTTConfig, TOKEN_REFRESH_THRESHOLD_
 use super::messages::{
     OAuthTokenRequest, OAuthTokenResponse, SberApiError, SberRecognitionResponse, SberStatusCode,
 };
+use crate::core::stt::http_resilience::HttpBreaker;
+
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
@@ -82,8 +84,12 @@ impl TokenManager {
         }
     }
 
-    /// Get a valid access token, refreshing if necessary
-    async fn get_token(&mut self) -> Result<String, STTError> {
+    /// Get a valid access token, refreshing if necessary. `resilience` records the outcome of
+    /// an actual refresh round-trip against the shared provider breaker (a cached token performs
+    /// no upstream call and records nothing). Callers consult the breaker ONCE at the start of
+    /// their flow; the token path only records, so a single half-open probe spans the whole
+    /// token+recognize flow.
+    async fn get_token(&mut self, resilience: &HttpBreaker) -> Result<String, STTError> {
         // Check if current token is valid
         if let Some(ref token) = self.token {
             if !token.is_expired(TOKEN_REFRESH_THRESHOLD_SECS) {
@@ -93,11 +99,11 @@ impl TokenManager {
         }
 
         // Fetch new token
-        self.refresh_token().await
+        self.refresh_token(resilience).await
     }
 
     /// Refresh the OAuth token
-    async fn refresh_token(&mut self) -> Result<String, STTError> {
+    async fn refresh_token(&mut self, resilience: &HttpBreaker) -> Result<String, STTError> {
         debug!("Requesting new OAuth token from SberDevices");
 
         // Generate unique request ID
@@ -114,9 +120,13 @@ impl TokenManager {
             .form(&OAuthTokenRequest::new(&self.scope))
             .send()
             .await
-            .map_err(|e| STTError::NetworkError(format!("Token request failed: {}", e)))?;
+            .map_err(|e| {
+                resilience.record_send_error();
+                STTError::NetworkError(format!("Token request failed: {}", e))
+            })?;
 
         let status = response.status();
+        resilience.record_status(status);
         let status_code = SberStatusCode::from_http_status(status.as_u16());
 
         if status_code.is_success() {
@@ -179,6 +189,11 @@ pub struct SberDevicesSTT {
     processing_task: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Flag to stop processing
     stop_flag: Arc<AtomicBool>,
+    /// Shared per-provider circuit breaker for the REST transport (uniform with the WS fleet):
+    /// consulted once per token+recognize flow, fed by the unified HTTP status classification
+    /// (OAuth and recognize round-trips both record). Inert until `set_resilience` injects the
+    /// process-global handles (W-D2).
+    resilience: HttpBreaker,
 }
 
 impl SberDevicesSTT {
@@ -231,13 +246,30 @@ impl SberDevicesSTT {
             audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_SYNC_AUDIO_SIZE))),
             processing_task: Arc::new(RwLock::new(None)),
             stop_flag: Arc::new(AtomicBool::new(false)),
+            resilience: HttpBreaker::new("sberdevices"),
         })
+    }
+
+    /// The shared circuit breaker this client feeds, if the process-global resilience handles
+    /// have been injected (W-D2). Two `SberDevicesSTT` built from the same
+    /// [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.breaker()
     }
 
     /// Recognize audio using synchronous API
     async fn recognize_sync(&self, audio_data: &[u8]) -> Result<String, STTError> {
+        // Consult the shared per-provider breaker ONCE for the whole token+recognize flow: an
+        // open breaker fails fast with a typed classified refusal before either round-trip.
+        self.resilience.check()?;
+
         // Get access token
-        let access_token = self.token_manager.write().await.get_token().await?;
+        let access_token = self
+            .token_manager
+            .write()
+            .await
+            .get_token(&self.resilience)
+            .await?;
 
         debug!(
             "SberDevices STT request: lang={}, format={}, audio_len={}",
@@ -255,9 +287,13 @@ impl SberDevicesSTT {
         )?
         .send()
         .await
-        .map_err(|e| STTError::NetworkError(format!("Failed to send request: {}", e)))?;
+        .map_err(|e| {
+            self.resilience.record_send_error();
+            STTError::NetworkError(format!("Failed to send request: {}", e))
+        })?;
 
         let status = response.status();
+        self.resilience.record_status(status);
         let status_code = SberStatusCode::from_http_status(status.as_u16());
 
         if status_code.is_success() {
@@ -309,6 +345,7 @@ impl SberDevicesSTT {
         let token_manager = Arc::clone(&self.token_manager);
         let client = self.client.clone();
         let sber_config = self.sber_config.clone();
+        let resilience = self.resilience.clone();
 
         let task = tokio::spawn(async move {
             let mut last_process_time = std::time::Instant::now();
@@ -347,8 +384,19 @@ impl SberDevicesSTT {
                 debug!("Processing {} bytes of accumulated audio", audio_data.len());
                 last_process_time = std::time::Instant::now();
 
+                // Consult the shared per-provider breaker ONCE per token+recognize iteration:
+                // while it is open the classified refusal reaches the session's error callback
+                // without paying a doomed upstream round-trip.
+                if let Err(e) = resilience.check() {
+                    debug!("SberDevices STT breaker refusal: {}", e);
+                    if let Some(callback) = error_callback.read().await.as_ref() {
+                        callback(e).await;
+                    }
+                    continue;
+                }
+
                 // Get access token
-                let access_token = match token_manager.write().await.get_token().await {
+                let access_token = match token_manager.write().await.get_token(&resilience).await {
                     Ok(token) => token,
                     Err(e) => {
                         error!("Failed to get access token: {}", e);
@@ -380,6 +428,7 @@ impl SberDevicesSTT {
                 match result {
                     Ok(response) => {
                         let status = response.status();
+                        resilience.record_status(status);
                         if status.is_success() {
                             if let Ok(text) = response.text().await
                                 && let Ok(recognition_response) =
@@ -419,6 +468,7 @@ impl SberDevicesSTT {
                         }
                     }
                     Err(e) => {
+                        resilience.record_send_error();
                         error!("SberDevices STT request failed: {}", e);
                         if let Some(callback) = error_callback.read().await.as_ref() {
                             callback(STTError::NetworkError(e.to_string())).await;
@@ -459,8 +509,14 @@ impl BaseSTT for SberDevicesSTT {
     async fn connect(&mut self) -> Result<(), STTError> {
         debug!("Connecting to SberDevices SaluteSpeech STT API");
 
-        // Pre-fetch OAuth token to validate credentials
-        self.token_manager.write().await.get_token().await?;
+        // Consult the shared per-provider breaker before the credential-validating round-trip
+        // (uniform with the WS fleet's connect path), then pre-fetch the OAuth token.
+        self.resilience.check()?;
+        self.token_manager
+            .write()
+            .await
+            .get_token(&self.resilience)
+            .await?;
 
         // Reset state
         self.stop_flag.store(false, Ordering::Relaxed);
@@ -585,6 +641,13 @@ impl BaseSTT for SberDevicesSTT {
 
     fn get_provider_info(&self) -> &'static str {
         "SberDevices SaluteSpeech v1"
+    }
+
+    /// W-D2: attach the shared per-provider circuit breaker so every SberDevices session trips
+    /// (and observes) the SAME breaker, uniform with the WS fleet. The REST transport consults
+    /// it once per token+recognize flow and feeds it the unified HTTP status classification.
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        self.resilience.set_handles(resilience);
     }
 }
 

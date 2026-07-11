@@ -46,8 +46,18 @@ fn openai_key() -> Option<String> {
 /// through WaaV's OpenAI adapter — this is the regression for the
 /// `max_tokens`→`max_completion_tokens` shape (reasoning models 400 on
 /// `max_tokens`; live-caught). Validates the fast tier + the two-tier shape too.
+
+/// Serializes the live-ollama tests: two reasoning-LLM generations racing each other (and the
+/// build load on this box) starve the shared local ollama past the adapter timeout — a pure
+/// resource-contention flake, not a product bug. One at a time is deterministic. Poison-tolerant.
+fn ollama_serial_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[tokio::test]
 async fn openai_reasoning_model_live_round_trip() {
+    let _serial = ollama_serial_lock();
     let Some(key) = openai_key() else { return };
     let cancel = CancellationToken::new();
 
@@ -226,6 +236,7 @@ async fn openai_live_round_trip() {
 /// NOT `#[ignore]` — self-skips when ollama is down so CI is unaffected.
 #[tokio::test]
 async fn d1_reasoning_effort_live_ollama() {
+    let _serial = ollama_serial_lock();
     let Some(base) = ollama_base() else { return };
 
     // (1) fast model + Off → no param → must succeed (the bug this guards against
@@ -259,6 +270,9 @@ async fn d1_reasoning_effort_live_ollama() {
     let reason = LlmClientConfig {
         base_url: base,
         model: "deepseek-r1:1.5b".into(),
+        // A local reasoning model generates a full CoT before answering — on a busy GB10
+        // that can exceed the default request timeout; 180s keeps the LIVE gate deterministic.
+        timeout_ms: 180_000,
         api_key: Some("ollama".into()),
         max_tokens: Some(1200),
         streaming: false,
@@ -287,6 +301,7 @@ async fn d1_reasoning_effort_live_ollama() {
 /// escalated turn continues the same conversation rather than starting fresh.
 #[tokio::test]
 async fn s2_two_tier_shares_history_live_ollama() {
+    let _serial = ollama_serial_lock();
     let Some(base) = ollama_base() else { return };
     let fast = LlmClient::new(LlmClientConfig {
         base_url: base,
@@ -298,6 +313,10 @@ async fn s2_two_tier_shares_history_live_ollama() {
         // content. The reasoning tier needs token headroom (real-world tuning note).
         max_tokens: Some(512),
         streaming: false,
+        // The reasoning tier inherits this config via with_tier_overrides: a local CoT
+        // generation on a busy GB10 can exceed the 60s default — 180s keeps the LIVE
+        // gate deterministic under load.
+        timeout_ms: 180_000,
         ..Default::default()
     });
     // Reasoning tier shares the fast tier's per-session history.

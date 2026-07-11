@@ -31,6 +31,7 @@ use super::super::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback, SpeakerInfo,
     WordTiming,
 };
+use super::super::http_resilience::HttpBreaker;
 use super::config::{FlushStrategy, OpenAISTTConfig, ResponseFormat};
 use super::messages::{
     DiarizedTranscriptionResponse, OpenAIErrorResponse, TranscriptionResponse, TranscriptionResult,
@@ -166,6 +167,11 @@ pub struct OpenAISTT {
 
     /// Whether the last audio chunk was detected as silent
     last_was_silent: bool,
+
+    /// Shared per-provider circuit breaker for the REST transport (uniform with the WS fleet):
+    /// consulted before each upstream call, fed by the unified HTTP status classification.
+    /// Inert until `set_resilience` injects the process-global handles (W-D2).
+    resilience: HttpBreaker,
 }
 
 impl OpenAISTT {
@@ -218,7 +224,15 @@ impl OpenAISTT {
             first_audio_time: None,
             silence_start_time: None,
             last_was_silent: false,
+            resilience: HttpBreaker::new("openai"),
         })
+    }
+
+    /// The shared circuit breaker this client feeds, if the process-global resilience handles
+    /// have been injected (W-D2). Two `OpenAISTT` built from the same
+    /// [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.breaker()
     }
 
     /// Publicly accessible flush method.
@@ -413,6 +427,10 @@ impl OpenAISTT {
             )
         })?;
 
+        // Consult the shared per-provider breaker before paying the upstream round-trip: an
+        // open breaker fails fast with a typed classified refusal (uniform with the WS fleet).
+        self.resilience.check()?;
+
         // Send request to OpenAI API
         let response = http_client
             .post(api_url)
@@ -420,10 +438,14 @@ impl OpenAISTT {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| STTError::NetworkError(format!("Request failed: {e}")))?;
+            .map_err(|e| {
+                self.resilience.record_send_error();
+                STTError::NetworkError(format!("Request failed: {e}"))
+            })?;
 
         // Check response status
         let status = response.status();
+        self.resilience.record_status(status);
 
         if !status.is_success() {
             let response_text = response.text().await.unwrap_or_default();
@@ -750,6 +772,7 @@ impl Default for OpenAISTT {
             first_audio_time: None,
             silence_start_time: None,
             last_was_silent: false,
+            resilience: HttpBreaker::new("openai"),
         }
     }
 }
@@ -924,6 +947,13 @@ impl BaseSTT for OpenAISTT {
     /// Get provider information string.
     fn get_provider_info(&self) -> &'static str {
         "OpenAI Whisper STT"
+    }
+
+    /// W-D2: attach the shared per-provider circuit breaker so every OpenAI STT session trips
+    /// (and observes) the SAME breaker, uniform with the WS fleet. The REST transport consults
+    /// it before each upstream call and feeds it the unified HTTP status classification.
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        self.resilience.set_handles(resilience);
     }
 }
 
@@ -1282,5 +1312,200 @@ mod tests {
         // Even above threshold, OnDisconnect strategy should not flush
         stt.audio_buffer = vec![0u8; 5000];
         assert!(!stt.should_flush(None));
+    }
+
+    // =========================================================================
+    // Resilience-trio wiring (shared per-provider circuit breaker on the REST path)
+    // =========================================================================
+
+    /// Build an `OpenAISTT` against a local mock endpoint with the shared registry breaker
+    /// injected (the same `set_resilience` call the VoiceManager makes in production).
+    fn breaker_wired_stt(
+        endpoint: String,
+        reg: &crate::core::resilience::ResilienceRegistry,
+    ) -> OpenAISTT {
+        let config = OpenAISTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            endpoint_override: Some(endpoint),
+            ..Default::default()
+        };
+        let mut stt = OpenAISTT::with_config(config).expect("construct OpenAI STT");
+        stt.set_resilience(reg.handles_for("openai"));
+        stt
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    // The env-lock guard must span the mock round-trips: `try_api_url` re-reads
+    // WAAV_ALLOW_LOOPBACK_ENDPOINTS at flush time (same accepted pattern as the
+    // redirect-policy tests above, which also hold the guard across awaits).
+    #[allow(clippy::await_holding_lock)]
+    async fn breaker_records_failure_on_upstream_5xx() {
+        // Uniformity gate: a failed upstream round-trip must be recorded on the SAME shared
+        // per-provider breaker the registry hands the WS fleet.
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .with_status(500)
+            .with_body("upstream exploded")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let reg = crate::core::resilience::ResilienceRegistry::new(4);
+        let mut stt = breaker_wired_stt(server.url(), &reg);
+        // The injected breaker IS the registry's shared per-provider breaker.
+        assert!(
+            Arc::ptr_eq(
+                stt.resilience_breaker().expect("breaker injected"),
+                &reg.breaker_for("openai")
+            ),
+            "provider must feed the registry's shared breaker"
+        );
+
+        stt.connect().await.expect("connect");
+        stt.send_audio(Bytes::from(vec![0u8; 3200]))
+            .await
+            .expect("send_audio buffers");
+        let err = stt.flush().await.expect_err("5xx must surface an error");
+        assert!(matches!(err, STTError::ProviderError(_)), "{err:?}");
+
+        let snap = stt.resilience_breaker().unwrap().snapshot();
+        assert_eq!(snap.failures, 1, "the 5xx must be recorded as ONE failure");
+        assert_eq!(snap.successes, 0);
+        mock.assert_async().await;
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    // The env-lock guard must span the mock round-trips: `try_api_url` re-reads
+    // WAAV_ALLOW_LOOPBACK_ENDPOINTS at flush time (same accepted pattern as the
+    // redirect-policy tests above, which also hold the guard across awaits).
+    #[allow(clippy::await_holding_lock)]
+    async fn open_breaker_fails_fast_with_typed_refusal_without_contacting_upstream() {
+        // Failover gate: with the shared breaker OPEN (e.g. tripped by other sessions), the
+        // REST path must refuse with a typed classified error BEFORE paying the upstream
+        // round-trip — the mock asserts ZERO hits.
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let reg = crate::core::resilience::ResilienceRegistry::new(4);
+        let mut stt = breaker_wired_stt(server.url(), &reg);
+
+        // Another "session" of the same provider trips the shared breaker.
+        let shared = reg.breaker_for("openai");
+        for _ in 0..10 {
+            shared.record_failure();
+        }
+        assert_eq!(shared.state(), crate::core::resilience::CircuitState::Open);
+
+        stt.connect().await.expect("connect");
+        stt.send_audio(Bytes::from(vec![0u8; 3200]))
+            .await
+            .expect("send_audio buffers");
+        let err = stt
+            .flush()
+            .await
+            .expect_err("open breaker must refuse the flush");
+        match err {
+            STTError::ConnectionFailed(msg) => {
+                assert!(msg.contains("circuit breaker"), "{msg}");
+                assert!(msg.contains("openai"), "{msg}");
+            }
+            other => panic!("expected typed ConnectionFailed refusal, got {other:?}"),
+        }
+        mock.assert_async().await; // zero upstream hits
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    // The env-lock guard must span the mock round-trips: `try_api_url` re-reads
+    // WAAV_ALLOW_LOOPBACK_ENDPOINTS at flush time (same accepted pattern as the
+    // redirect-policy tests above, which also hold the guard across awaits).
+    #[allow(clippy::await_holding_lock)]
+    async fn three_upstream_401s_arm_the_credentials_fatal_state() {
+        // Classification gate: auth rejections flow through the provider path into the D-G2
+        // credentials-fatal detector, exactly like three sub-stable server-side WS closes.
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .with_status(401)
+            .with_body(r#"{"error":{"message":"bad key","type":"invalid_request_error"}}"#)
+            .expect(3)
+            .create_async()
+            .await;
+
+        let reg = crate::core::resilience::ResilienceRegistry::new(4);
+        let mut stt = breaker_wired_stt(server.url(), &reg);
+        stt.connect().await.expect("connect");
+
+        for _ in 0..3 {
+            // The buffer is intentionally NOT cleared on failure, so each flush retries the
+            // same audio against the 401 endpoint.
+            stt.send_audio(Bytes::from(vec![0u8; 1600]))
+                .await
+                .expect("send_audio buffers");
+            let _ = stt.flush().await.expect_err("401 must surface an error");
+            stt.audio_buffer.clear();
+        }
+
+        assert!(
+            stt.resilience_breaker().unwrap().is_permanently_failed(),
+            "3 consecutive 401s must arm the (recoverable) credentials-FATAL state"
+        );
+        mock.assert_async().await;
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 }
