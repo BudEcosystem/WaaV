@@ -37,9 +37,8 @@ impl LanguageMapper for TencentLanguageMapper {
         };
         match stem {
             Some(s) => MappedLanguage::native(s),
-            None if lang == CanonicalLanguage::Auto => MappedLanguage::native("zh").warn(
-                "Tencent ASR requires an explicit language; defaulting to zh (16k_zh)",
-            ),
+            None if lang == CanonicalLanguage::Auto => MappedLanguage::native("zh")
+                .warn("Tencent ASR requires an explicit language; defaulting to zh (16k_zh)"),
             None => MappedLanguage::native("zh").warn(format!(
                 "Tencent ASR does not support {}; defaulting to zh (16k_zh)",
                 lang.as_bcp47()

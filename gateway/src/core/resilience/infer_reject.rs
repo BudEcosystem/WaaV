@@ -182,9 +182,15 @@ mod tests {
             InferRejectReason::parse(" model_not_ready "),
             InferRejectReason::ModelNotReady
         );
-        assert_eq!(InferRejectReason::parse("draining"), InferRejectReason::Draining);
+        assert_eq!(
+            InferRejectReason::parse("draining"),
+            InferRejectReason::Draining
+        );
         // Unknown / transport codes fail safe to HardFailure.
-        assert_eq!(InferRejectReason::parse("internal"), InferRejectReason::HardFailure);
+        assert_eq!(
+            InferRejectReason::parse("internal"),
+            InferRejectReason::HardFailure
+        );
         assert_eq!(InferRejectReason::parse(""), InferRejectReason::HardFailure);
     }
 
@@ -228,7 +234,11 @@ mod tests {
                 cb.allow_request(),
                 "the breaker must keep admitting `{code}` so the tier is re-tried the instant it recovers"
             );
-            assert_eq!(cb.error_rate(), 0.0, "`{code}` must not move the failure window");
+            assert_eq!(
+                cb.error_rate(),
+                0.0,
+                "`{code}` must not move the failure window"
+            );
         }
     }
 
@@ -298,10 +308,7 @@ mod tests {
             let cb = Arc::clone(&cb);
             handles.push(std::thread::spawn(move || {
                 for _ in 0..100 {
-                    record_infer_outcome(
-                        &cb,
-                        BreakerVerdict::for_error_code("admission_rejected"),
-                    );
+                    record_infer_outcome(&cb, BreakerVerdict::for_error_code("admission_rejected"));
                 }
             }));
         }

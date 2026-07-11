@@ -15,9 +15,15 @@
 // Allow dead code in test infrastructure - these utilities may be used by future tests
 #![allow(dead_code)]
 
+use futures_util::FutureExt;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::task::JoinHandle;
 
 /// Simple random number generator (no external crate dependency)
 fn random_f64() -> f64 {
@@ -33,11 +39,146 @@ fn random_f64() -> f64 {
 }
 
 fn random_u32() -> u32 {
-    
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .subsec_nanos()
+}
+
+/// Owned handle for background mock servers used by integration/load tests.
+///
+/// Dropping a raw [`JoinHandle`] detaches the task, letting a mock server keep
+/// running after the test body exits. This guard makes that backstop explicit:
+/// it aborts unfinished servers on drop, and it turns a top-level mock-server
+/// panic into a test failure when the guard is dropped normally.
+pub struct MockServerHandle {
+    label: &'static str,
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+    children: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl MockServerHandle {
+    fn new(
+        label: &'static str,
+        handle: JoinHandle<()>,
+        panicked: Arc<AtomicBool>,
+        children: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    ) -> Self {
+        Self {
+            label,
+            handle,
+            panicked,
+            children,
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    pub fn abort(&self) {
+        self.handle.abort();
+    }
+}
+
+impl Drop for MockServerHandle {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        match self.children.lock() {
+            Ok(mut children) => {
+                for child in children.drain(..) {
+                    if !child.is_finished() {
+                        child.abort();
+                    }
+                }
+            }
+            Err(_) => {
+                self.panicked.store(true, AtomicOrdering::SeqCst);
+            }
+        }
+
+        if self.panicked.load(AtomicOrdering::SeqCst) {
+            let msg = format!("mock server task '{}' panicked", self.label);
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct MockTaskScope {
+    panicked: Arc<AtomicBool>,
+    children: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl MockTaskScope {
+    pub fn detached() -> Self {
+        Self {
+            panicked: Arc::new(AtomicBool::new(false)),
+            children: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn spawn<F>(&self, label: &'static str, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let handle = spawn_mock_task(label, Arc::clone(&self.panicked), future);
+        self.children
+            .lock()
+            .expect("mock child task list poisoned")
+            .push(handle);
+    }
+}
+
+pub fn spawn_mock_server<F>(label: &'static str, future: F) -> MockServerHandle
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let panicked = Arc::new(AtomicBool::new(false));
+    let children = Arc::new(Mutex::new(Vec::new()));
+    let handle = spawn_mock_task(label, Arc::clone(&panicked), future);
+    MockServerHandle::new(label, handle, panicked, children)
+}
+
+pub fn spawn_mock_server_with_scope<F, Fut>(label: &'static str, make_future: F) -> MockServerHandle
+where
+    F: FnOnce(MockTaskScope) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let panicked = Arc::new(AtomicBool::new(false));
+    let children = Arc::new(Mutex::new(Vec::new()));
+    let scope = MockTaskScope {
+        panicked: Arc::clone(&panicked),
+        children: Arc::clone(&children),
+    };
+    let handle = spawn_mock_task(label, Arc::clone(&panicked), make_future(scope));
+    MockServerHandle::new(label, handle, panicked, children)
+}
+
+pub fn spawn_observed_mock_task<F>(label: &'static str, future: F) -> JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    spawn_mock_task(label, Arc::new(AtomicBool::new(false)), future)
+}
+
+fn spawn_mock_task<F>(label: &'static str, panicked: Arc<AtomicBool>, future: F) -> JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked.store(true, AtomicOrdering::SeqCst);
+            eprintln!("mock server task '{label}' panicked");
+        }
+    })
 }
 
 /// Realistic provider latency profiles (in milliseconds)
@@ -283,6 +424,29 @@ impl MockStats {
             self.rate_limited_requests.load(Ordering::Relaxed),
             avg_latency
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mock_server_handle_reports_child_task_panic() {
+        let handle = spawn_mock_server_with_scope("parent_mock", |scope| async move {
+            scope.spawn("child_mock", async {
+                panic!("injected mock child panic");
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let dropped = std::panic::catch_unwind(AssertUnwindSafe(|| drop(handle)));
+
+        assert!(
+            dropped.is_err(),
+            "dropping the parent mock handle must report child task panics"
+        );
     }
 }
 

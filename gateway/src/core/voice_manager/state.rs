@@ -92,7 +92,8 @@ impl InterruptionState {
         self.non_interruptible_until_ms.store(0, Ordering::Release);
         self.is_completed.store(true, Ordering::Release);
         // Audio was cleared / utterance concluded: the bot is silent NOW.
-        self.playout_end_ms.store(now_monotonic_ms(), Ordering::Release);
+        self.playout_end_ms
+            .store(now_monotonic_ms(), Ordering::Release);
     }
 
     /// Advance the estimated playout deadline by one egress chunk's duration.
@@ -104,11 +105,11 @@ impl InterruptionState {
         // when racing reset() from a concurrent barge-in clear (review
         // wf_5772cd64 #3a).
         let now = now_monotonic_ms();
-        let _ = self.playout_end_ms.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |prev| Some(prev.max(now) + chunk_duration_ms),
-        );
+        let _ = self
+            .playout_end_ms
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
+                Some(prev.max(now) + chunk_duration_ms)
+            });
     }
 
     /// Whether the bot is (estimated to be) audibly speaking right now.

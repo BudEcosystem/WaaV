@@ -38,8 +38,13 @@ use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{client::IntoClientRequest, http::Request, protocol::Message},
+    tungstenite::{
+        client::IntoClientRequest,
+        http::{HeaderValue, Request},
+        protocol::Message,
+    },
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::config::{DashScopeSttConfig, TurnDetectionMode};
@@ -47,6 +52,7 @@ use super::messages::{
     ParaformerFinishTask, ParaformerResponse, ParaformerRunTask, QwenAudioBufferAppend,
     QwenServerMessage, QwenSessionFinish, QwenSessionUpdate,
 };
+use crate::core::resilience::connect::with_timeout;
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
@@ -62,9 +68,6 @@ use crate::core::websocket::reconnectable_stream::{
 
 /// Provider information string.
 const PROVIDER_INFO: &str = "Alibaba Cloud DashScope STT (阿里云)";
-
-/// WebSocket connection timeout.
-const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// WebSocket message timeout (idle detection).
 const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -98,11 +101,27 @@ fn build_dashscope_ws_request(
             .parse()
             .map_err(|e| format!("Invalid Authorization header: {e}"))?,
     );
-    headers.insert("User-Agent", "WaaV-Gateway/1.0".parse().unwrap());
+    headers.insert("User-Agent", HeaderValue::from_static("WaaV-Gateway/1.0"));
     if is_qwen_model {
-        headers.insert("OpenAI-Beta", "realtime=v1".parse().unwrap());
+        headers.insert("OpenAI-Beta", HeaderValue::from_static("realtime=v1"));
     }
     Ok(request)
+}
+
+fn dashscope_websocket_url(config: &DashScopeSttConfig) -> String {
+    let mut url = config.get_websocket_url();
+    // Honor an `endpoint_override` for the in-repo mock/proxy: swap the dialed scheme://host
+    // while keeping the `/api-ws/v1/{realtime,inference}` path (+ Qwen `?model=` query).
+    if let Some(o) = config
+        .endpoint_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+        && let Some(idx) = url.find("/api-ws/")
+    {
+        url = format!("{}{}", o.trim_end_matches('/'), &url[idx..]);
+    }
+    url
 }
 
 // =============================================================================
@@ -146,8 +165,8 @@ struct DashScopeTransport {
     ws_stream: SplitStream<DashScopeWs>,
     /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
     audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
-    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
-    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    /// Shared shutdown token (an intentional close must not reconnect).
+    shutdown_token: CancellationToken,
     result_tx: mpsc::Sender<STTResult>,
     error_tx: mpsc::Sender<STTError>,
     /// Fires once after the featured session is (re)established, unblocking `connect`.
@@ -163,6 +182,36 @@ struct DashScopeTransport {
     task_id: Option<String>,
 }
 
+impl DashScopeTransport {
+    async fn shutdown_gracefully(
+        ws_sink: &mut SplitSink<DashScopeWs, Message>,
+        is_qwen: bool,
+        task_id: Option<&str>,
+    ) -> ReconnectOutcome {
+        let finish_msg = if is_qwen {
+            Some(Message::Text(
+                QwenSessionFinish::new()
+                    .to_json()
+                    .unwrap_or_default()
+                    .into(),
+            ))
+        } else {
+            task_id.map(|tid| {
+                Message::Text(
+                    ParaformerFinishTask::new(tid)
+                        .to_json()
+                        .unwrap_or_default()
+                        .into(),
+                )
+            })
+        };
+        if let Some(msg) = finish_msg {
+            let _ = ws_sink.send(msg).await;
+        }
+        ReconnectOutcome::Completed
+    }
+}
+
 #[async_trait::async_trait]
 impl WsTransport for DashScopeTransport {
     async fn restore_session(&mut self) -> Result<(), RestoreError> {
@@ -172,7 +221,9 @@ impl WsTransport for DashScopeTransport {
             .send(Message::Text(self.session_open_json.clone().into()))
             .await
             .map_err(|e| {
-                RestoreError::new(format!("failed to send DashScope session-open message: {e}"))
+                RestoreError::new(format!(
+                    "failed to send DashScope session-open message: {e}"
+                ))
             })?;
 
         // The featured session is established: signal the waiting connect() exactly once.
@@ -183,8 +234,14 @@ impl WsTransport for DashScopeTransport {
     }
 
     async fn run(&mut self) -> ReconnectOutcome {
+        let shutdown_token = self.shutdown_token.clone();
+        if shutdown_token.is_cancelled() {
+            debug!("Received shutdown signal for DashScope STT");
+            let task_id = self.task_id.clone();
+            return Self::shutdown_gracefully(&mut self.ws_sink, self.is_qwen, task_id.as_deref())
+                .await;
+        }
         let mut audio_rx = self.audio_rx.lock().await;
-        let mut shutdown_rx = self.shutdown_rx.lock().await;
         loop {
             tokio::select! {
                 // Handle outgoing audio data
@@ -258,24 +315,10 @@ impl WsTransport for DashScopeTransport {
                 }
 
                 // Handle shutdown signal (intentional close — must NOT reconnect)
-                _ = &mut *shutdown_rx => {
+                _ = shutdown_token.cancelled() => {
                     debug!("Received shutdown signal for DashScope STT");
-                    // Send the graceful finish message before closing.
-                    let finish_msg = if self.is_qwen {
-                        Some(Message::Text(
-                            QwenSessionFinish::new().to_json().unwrap_or_default().into(),
-                        ))
-                    } else {
-                        self.task_id.as_ref().map(|tid| {
-                            Message::Text(
-                                ParaformerFinishTask::new(tid).to_json().unwrap_or_default().into(),
-                            )
-                        })
-                    };
-                    if let Some(msg) = finish_msg {
-                        let _ = self.ws_sink.send(msg).await;
-                    }
-                    return ReconnectOutcome::Completed;
+                    let task_id = self.task_id.clone();
+                    return Self::shutdown_gracefully(&mut self.ws_sink, self.is_qwen, task_id.as_deref()).await;
                 }
             }
         }
@@ -317,8 +360,8 @@ pub struct DashScopeStt {
     connected: Arc<AtomicBool>,
 
     /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
-    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
-    /// server-side close can never trigger a spurious reconnect.
+    /// `connect()`, set in `disconnect()` before cancelling the shutdown token, so a client close
+    /// racing a server-side close can never trigger a spurious reconnect.
     intentional_disconnect: Arc<AtomicBool>,
 
     /// State change notification.
@@ -327,8 +370,8 @@ pub struct DashScopeStt {
     /// WebSocket sender for audio data.
     ws_sender: Option<mpsc::Sender<Bytes>>,
 
-    /// Shutdown signal sender.
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Shutdown token shared with supervised transports.
+    shutdown_token: Option<CancellationToken>,
 
     /// Connection task handle.
     connection_handle: Option<tokio::task::JoinHandle<()>>,
@@ -368,7 +411,7 @@ impl DashScopeStt {
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             connection_handle: None,
             result_forward_handle: None,
             error_forward_handle: None,
@@ -401,7 +444,7 @@ impl DashScopeStt {
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             connection_handle: None,
             result_forward_handle: None,
             error_forward_handle: None,
@@ -421,7 +464,7 @@ impl DashScopeStt {
     /// `Protocol(InvalidHeader)` — which the reconnect supervisor swallows and surfaces only as a
     /// "connection timeout". (This provider was 100% unable to connect before this fix.)
     fn build_request(&self) -> Result<Request<()>, STTError> {
-        let url = self.config.get_websocket_url();
+        let url = dashscope_websocket_url(&self.config);
         build_dashscope_ws_request(
             &url,
             &self.config.api_key,
@@ -567,11 +610,11 @@ impl BaseSTT for DashScopeStt {
         let (audio_tx, audio_rx) = mpsc::channel::<Bytes>(AUDIO_CHANNEL_BUFFER);
         let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(RESULT_CHANNEL_BUFFER);
         let (error_tx, mut error_rx) = mpsc::channel::<STTError>(ERROR_CHANNEL_BUFFER);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_token = CancellationToken::new();
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         self.ws_sender = Some(audio_tx);
-        self.shutdown_tx = Some(shutdown_tx);
+        self.shutdown_token = Some(shutdown_token.clone());
 
         // Build the featured session-open message once (re-sent verbatim on every restore by the
         // supervised transport). Qwen realtime models open with `session.update`; Paraformer
@@ -588,20 +631,12 @@ impl BaseSTT for DashScopeStt {
         if let Some(tid) = &paraformer_task_id {
             *self.task_id.lock().await = Some(tid.clone());
         }
-        let mut url = self.config.get_websocket_url();
-        // Honor an `endpoint_override` for the in-repo mock/proxy: swap the dialed scheme://host
-        // while keeping the `/api-ws/v1/{realtime,inference}` path (+ Qwen `?model=` query).
-        if let Some(o) = self.config.endpoint_override.as_deref().filter(|o| !o.is_empty())
-            && let Some(idx) = url.find("/api-ws/")
-        {
-            url = format!("{}{}", o.trim_end_matches('/'), &url[idx..]);
-        }
+        let url = dashscope_websocket_url(&self.config);
 
         // Shared state the supervised transport re-uses across reconnect attempts: a single-
-        // consumer audio receiver + shutdown oneshot (locked per `run`) and the one-shot connected
-        // signal that fires after the featured session is restored.
+        // consumer audio receiver, shutdown token, and the one-shot connected signal that fires
+        // after the featured session is restored.
         let audio_rx = Arc::new(Mutex::new(audio_rx));
-        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
         let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
 
         // Clone the connect-closure inputs (request must be rebuilt each attempt since
@@ -645,7 +680,7 @@ impl BaseSTT for DashScopeStt {
                     let session_open_json = session_open_json.clone();
                     let paraformer_task_id = paraformer_task_id.clone();
                     let audio_rx = Arc::clone(&audio_rx);
-                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let shutdown_token = shutdown_token.clone();
                     let connected_tx = Arc::clone(&connected_tx);
                     let result_tx = result_tx.clone();
                     let error_tx = error_tx.clone();
@@ -653,12 +688,16 @@ impl BaseSTT for DashScopeStt {
                         // Build a fresh request per attempt via the shared helper so the 5 mandatory
                         // WS upgrade headers are present (a bare builder → InvalidHeader → the
                         // reconnect loop retries forever → connect timeout).
-                        let request =
-                            build_dashscope_ws_request(&url, &api_key, is_qwen_model)
-                                .map_err(StreamError::new)?;
+                        let request = build_dashscope_ws_request(&url, &api_key, is_qwen_model)
+                            .map_err(StreamError::new)?;
 
+                        // Deadline-bounded dial via the shared resilience helper. DashScope keeps
+                        // its historical 10s bound (tighter than the canonical 15s
+                        // `core::resilience::connect::WS_CONNECT_TIMEOUT`).
                         let (ws_stream, _) =
-                            match timeout(WS_CONNECT_TIMEOUT, connect_async(request)).await {
+                            match with_timeout(Duration::from_secs(10), connect_async(request))
+                                .await
+                            {
                                 Ok(Ok(s)) => s,
                                 Ok(Err(e)) => {
                                     return Err(StreamError::new(format!(
@@ -676,7 +715,7 @@ impl BaseSTT for DashScopeStt {
                             ws_sink,
                             ws_stream,
                             audio_rx,
-                            shutdown_rx,
+                            shutdown_token,
                             result_tx,
                             error_tx,
                             connected_tx,
@@ -719,7 +758,7 @@ impl BaseSTT for DashScopeStt {
         self.error_forward_handle = Some(error_forward_handle);
 
         // Wait for the featured session to be established (first restore) with a timeout.
-        match timeout(WS_CONNECT_TIMEOUT, connected_rx).await {
+        match timeout(Duration::from_secs(10), connected_rx).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => {
                 self.connected.store(false, Ordering::SeqCst);
@@ -738,32 +777,43 @@ impl BaseSTT for DashScopeStt {
         // Record the intent BEFORE the connected-guard so the supervisor sees it even if the
         // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
         self.intentional_disconnect.store(true, Ordering::SeqCst);
-        if !self.connected.load(Ordering::SeqCst) {
-            return Ok(());
-        }
 
-        info!("Disconnecting from DashScope STT...");
+        if self.connected.load(Ordering::SeqCst) {
+            info!("Disconnecting from DashScope STT...");
+        }
 
         // Drop audio sender to signal end
         self.ws_sender.take();
 
-        // Send shutdown signal
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
 
         // Wait for connection task to complete
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "alibaba-cloud-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         // Abort forwarding tasks
         if let Some(handle) = self.result_forward_handle.take() {
-            handle.abort();
+            crate::core::observability::abort_and_await_task(
+                "alibaba-cloud-stt-result-forwarder",
+                handle,
+            )
+            .await;
         }
 
         if let Some(handle) = self.error_forward_handle.take() {
-            handle.abort();
+            crate::core::observability::abort_and_await_task(
+                "alibaba-cloud-stt-error-forwarder",
+                handle,
+            )
+            .await;
         }
 
         // Clear task ID
@@ -879,7 +929,7 @@ mod tests {
     // body. (`word_timestamps`/free-text `keyterms` are honest capability gaps — see config.rs.)
     #[test]
     fn test_new_standard_wires_vocabulary_id_and_silence_to_run_task() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let mut extras = ProviderExtras::default();
         extras
             .0
@@ -900,8 +950,14 @@ mod tests {
         // Both must actually reach the Paraformer run-task body (not silently dropped).
         let (json, _) = stt.create_paraformer_run_task();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["payload"]["parameters"]["vocabulary_id"], "vocab-xyz", "vocab not on wire: {json}");
-        assert_eq!(v["payload"]["parameters"]["max_sentence_silence"], 1500, "silence not on wire: {json}");
+        assert_eq!(
+            v["payload"]["parameters"]["vocabulary_id"], "vocab-xyz",
+            "vocab not on wire: {json}"
+        );
+        assert_eq!(
+            v["payload"]["parameters"]["max_sentence_silence"], 1500,
+            "silence not on wire: {json}"
+        );
 
         // Missing key is rejected through the standardized path too.
         let bad = StandardSTTConfig::from_base(STTConfig {
@@ -909,6 +965,50 @@ mod tests {
             ..create_test_config()
         });
         assert!(DashScopeStt::new_standard(&bad).is_err());
+    }
+
+    #[test]
+    fn test_new_standard_rejects_ssrf_endpoint_override() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mk = |endpoint: &str| {
+            StandardSTTConfig {
+                base: STTConfig {
+                    provider: "alibaba_cloud".into(),
+                    api_key: "test_api_key".into(),
+                    language: "zh".into(),
+                    sample_rate: 16000,
+                    encoding: "pcm".into(),
+                    model: "qwen3-asr-flash-realtime".into(),
+                    ..Default::default()
+                },
+                features: SttFeatures::default(),
+                extras: ProviderExtras::default(),
+                translation: None,
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(DashScopeStt::new_standard(&mk("wss://dashscope-proxy.example.com")).is_ok());
+        assert!(DashScopeStt::new_standard(&mk("ws://127.0.0.1:9000")).is_err());
+        assert!(DashScopeStt::new_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(DashScopeStt::new_standard(&mk("https://dashscope-proxy.example.com")).is_err());
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]
@@ -1065,7 +1165,9 @@ mod tests {
         assert_eq!(stt.config.turn_detection_threshold, Some(0.8));
         let json = stt.create_qwen_session_update();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let thr = v["session"]["turn_detection"]["threshold"].as_f64().unwrap();
+        let thr = v["session"]["turn_detection"]["threshold"]
+            .as_f64()
+            .unwrap();
         assert!(
             (thr - 0.8).abs() < 1e-6,
             "threshold not on the session.update wire body: {json}"
@@ -1093,6 +1195,21 @@ mod tests {
     }
 
     #[test]
+    fn test_dashscope_websocket_url_trims_endpoint_override() {
+        let config = create_test_config();
+        let mut stt = DashScopeStt::new(config).unwrap();
+        stt.config.endpoint_override = Some(" wss://dashscope-proxy.example.com/ ".to_string());
+
+        let url = dashscope_websocket_url(&stt.config);
+
+        assert!(
+            url.starts_with("wss://dashscope-proxy.example.com/api-ws/v1/realtime"),
+            "endpoint_override slash should be normalized: {url}"
+        );
+        assert!(url.contains("model=qwen3-asr-flash-realtime"));
+    }
+
+    #[test]
     fn test_build_request_qwen() {
         let config = create_test_config();
         let stt = DashScopeStt::new(config).unwrap();
@@ -1115,6 +1232,14 @@ mod tests {
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.starts_with("Bearer ")),
             "missing Bearer Authorization header"
+        );
+        assert_eq!(
+            h.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some("WaaV-Gateway/1.0")
+        );
+        assert_eq!(
+            h.get("openai-beta").and_then(|v| v.to_str().ok()),
+            Some("realtime=v1")
         );
     }
 

@@ -26,6 +26,8 @@ use super::messages::{
 };
 use crate::core::realtime::base::ReconnectionConfig;
 
+const HUME_WEBSOCKET_URL_SCHEMES: &[&str] = &["ws", "wss"];
+
 // =============================================================================
 // Error Types
 // =============================================================================
@@ -55,6 +57,9 @@ pub enum EVIConfigError {
     /// Invalid channel count.
     #[error("Channels must be greater than 0")]
     InvalidChannels,
+    /// WebSocket URL is invalid or blocked by SSRF protection.
+    #[error("Hume EVI websocket_url rejected: {0}")]
+    InvalidWebsocketUrl(String),
 }
 
 // =============================================================================
@@ -95,7 +100,9 @@ impl EVIVersion {
         match version {
             "1" | "2" => Err(EVIConfigError::DeprecatedVersion {
                 version: version.to_string(),
-                message: "Hume EVI v1/v2 were sunset on August 30, 2025. Please migrate to v3 or v4-mini".to_string(),
+                message:
+                    "Hume EVI v1/v2 were sunset on August 30, 2025. Please migrate to v3 or v4-mini"
+                        .to_string(),
                 migration_guide: "https://dev.hume.ai/docs/evi-version".to_string(),
             }),
             "3" => Ok(EVIVersion::V3),
@@ -133,7 +140,9 @@ impl EVIVersion {
             );
             return Err(EVIConfigError::DeprecatedVersion {
                 version: self.as_str().to_string(),
-                message: "Hume EVI v1/v2 were sunset on August 30, 2025. Please migrate to v3 or v4-mini".to_string(),
+                message:
+                    "Hume EVI v1/v2 were sunset on August 30, 2025. Please migrate to v3 or v4-mini"
+                        .to_string(),
                 migration_guide: "https://dev.hume.ai/docs/evi-version".to_string(),
             });
         }
@@ -395,6 +404,9 @@ impl HumeEVIConfig {
             return Err(EVIConfigError::InvalidChannels);
         }
 
+        crate::core::net::validate_url_for_ssrf(&self.websocket_url, HUME_WEBSOCKET_URL_SCHEMES)
+            .map_err(EVIConfigError::InvalidWebsocketUrl)?;
+
         Ok(())
     }
 }
@@ -466,21 +478,30 @@ mod tests {
     fn test_evi_version_from_str_unknown() {
         let result = EVIVersion::from_version_str("5");
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EVIConfigError::UnknownVersion(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            EVIConfigError::UnknownVersion(_)
+        ));
     }
 
     #[test]
     fn test_evi_version_validate_v1_fails() {
         let result = EVIVersion::V1.validate();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EVIConfigError::DeprecatedVersion { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            EVIConfigError::DeprecatedVersion { .. }
+        ));
     }
 
     #[test]
     fn test_evi_version_validate_v2_fails() {
         let result = EVIVersion::V2.validate();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EVIConfigError::DeprecatedVersion { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            EVIConfigError::DeprecatedVersion { .. }
+        ));
     }
 
     #[test]
@@ -580,7 +601,10 @@ mod tests {
         let config = HumeEVIConfig::new("test-key").with_version(EVIVersion::V1);
         let result = config.validate();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EVIConfigError::DeprecatedVersion { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            EVIConfigError::DeprecatedVersion { .. }
+        ));
     }
 
     #[test]
@@ -588,7 +612,10 @@ mod tests {
         let config = HumeEVIConfig::new("test-key").with_version(EVIVersion::V2);
         let result = config.validate();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EVIConfigError::DeprecatedVersion { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            EVIConfigError::DeprecatedVersion { .. }
+        ));
     }
 
     #[test]
@@ -609,7 +636,10 @@ mod tests {
         };
         let result = config.validate();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EVIConfigError::InvalidSampleRate));
+        assert!(matches!(
+            result.unwrap_err(),
+            EVIConfigError::InvalidSampleRate
+        ));
     }
 
     #[test]
@@ -621,7 +651,41 @@ mod tests {
         };
         let result = config.validate();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EVIConfigError::InvalidChannels));
+        assert!(matches!(
+            result.unwrap_err(),
+            EVIConfigError::InvalidChannels
+        ));
+    }
+
+    #[test]
+    fn test_validate_websocket_url_ssrf_checked() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let public = HumeEVIConfig {
+            api_key: "test".to_string(),
+            websocket_url: "wss://hume-proxy.invalid/v0/evi/chat".to_string(),
+            ..Default::default()
+        };
+        assert!(public.validate().is_ok());
+
+        let loopback = HumeEVIConfig {
+            api_key: "test".to_string(),
+            websocket_url: "ws://127.0.0.1:9000/evi".to_string(),
+            ..Default::default()
+        };
+        let err = loopback
+            .validate()
+            .expect_err("loopback websocket_url must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        let non_ws = HumeEVIConfig {
+            api_key: "test".to_string(),
+            websocket_url: "https://api.hume.ai/v0/evi/chat".to_string(),
+            ..Default::default()
+        };
+        let err = non_ws
+            .validate()
+            .expect_err("non-WS websocket_url must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
     }
 
     #[test]
@@ -691,7 +755,10 @@ mod tests {
         // But validation should fail
         let result = config.validate();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EVIConfigError::DeprecatedVersion { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            EVIConfigError::DeprecatedVersion { .. }
+        ));
     }
 
     #[test]
@@ -716,15 +783,37 @@ mod tests {
         let err = result.unwrap_err();
         let err_string = err.to_string();
 
-        assert!(err_string.contains("hume.ai"), "Error should include migration URL");
-        assert!(err_string.contains("2025"), "Error should include sunset year");
+        assert!(
+            err_string.contains("hume.ai"),
+            "Error should include migration URL"
+        );
+        assert!(
+            err_string.contains("2025"),
+            "Error should include sunset year"
+        );
     }
 
     #[test]
     fn test_error_display() {
-        assert!(EVIConfigError::MissingApiKey.to_string().contains("API key"));
-        assert!(EVIConfigError::InvalidSampleRate.to_string().contains("Sample rate"));
-        assert!(EVIConfigError::InvalidChannels.to_string().contains("Channels"));
-        assert!(EVIConfigError::UnknownVersion("5".into()).to_string().contains("5"));
+        assert!(
+            EVIConfigError::MissingApiKey
+                .to_string()
+                .contains("API key")
+        );
+        assert!(
+            EVIConfigError::InvalidSampleRate
+                .to_string()
+                .contains("Sample rate")
+        );
+        assert!(
+            EVIConfigError::InvalidChannels
+                .to_string()
+                .contains("Channels")
+        );
+        assert!(
+            EVIConfigError::UnknownVersion("5".into())
+                .to_string()
+                .contains("5")
+        );
     }
 }

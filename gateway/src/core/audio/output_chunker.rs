@@ -19,6 +19,10 @@ use bytes::{Bytes, BytesMut};
 /// clears aggressively on barge-in.
 pub const DEFAULT_AUDIO_OUT_CHUNK_MS: u32 = 20;
 
+const MIN_PCM16_CHUNK_BYTES: usize = 2;
+/// Maximum supported WS egress chunk: 1 second of 192 kHz mono PCM16.
+const MAX_PCM16_CHUNK_BYTES: usize = 192_000 * 2;
+
 /// Streaming re-framer. One per WS session egress.
 #[derive(Debug)]
 pub struct OutputChunker {
@@ -30,10 +34,9 @@ impl OutputChunker {
     /// `chunk_ms` at `sample_rate` (PCM16 mono). Chunk size is forced even
     /// (never split a sample) and at least 2 bytes.
     pub fn new(chunk_ms: u32, sample_rate: u32) -> Self {
-        let bytes = (sample_rate as usize * 2 * chunk_ms as usize) / 1000;
         Self {
             buf: BytesMut::new(),
-            chunk_bytes: (bytes & !1).max(2),
+            chunk_bytes: pcm16_mono_chunk_bytes(chunk_ms, sample_rate),
         }
     }
 
@@ -66,6 +69,17 @@ impl OutputChunker {
     pub fn clear(&mut self) {
         self.buf.clear();
     }
+}
+
+fn pcm16_mono_chunk_bytes(chunk_ms: u32, sample_rate: u32) -> usize {
+    let bytes = u128::from(sample_rate)
+        .saturating_mul(2)
+        .saturating_mul(u128::from(chunk_ms))
+        / 1000;
+    let bytes = usize::try_from(bytes)
+        .unwrap_or(MAX_PCM16_CHUNK_BYTES)
+        .clamp(MIN_PCM16_CHUNK_BYTES, MAX_PCM16_CHUNK_BYTES);
+    bytes & !1
 }
 
 #[cfg(test)]
@@ -120,5 +134,12 @@ mod tests {
         assert_eq!(c.chunk_bytes() % 2, 0, "never split a PCM16 sample");
         let c = OutputChunker::new(0, 16_000);
         assert!(c.chunk_bytes() >= 2, "floor at one sample");
+    }
+
+    #[test]
+    fn chunk_size_caps_pathological_inputs_without_overflow() {
+        let c = OutputChunker::new(u32::MAX, u32::MAX);
+        assert_eq!(c.chunk_bytes(), MAX_PCM16_CHUNK_BYTES);
+        assert_eq!(c.chunk_bytes() % 2, 0);
     }
 }

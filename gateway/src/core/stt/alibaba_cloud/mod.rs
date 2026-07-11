@@ -222,8 +222,17 @@ mod tests {
 
     #[test]
     fn test_paraformer_run_task() {
-        let msg =
-            ParaformerRunTask::new("paraformer-realtime-v2", "pcm", 16000, "zh", true, true, None, None, 800);
+        let msg = ParaformerRunTask::new(
+            "paraformer-realtime-v2",
+            "pcm",
+            16000,
+            "zh",
+            true,
+            true,
+            None,
+            None,
+            800,
+        );
         let json = msg.to_json().unwrap();
 
         assert!(json.contains("run-task"));

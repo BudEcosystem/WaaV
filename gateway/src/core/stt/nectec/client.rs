@@ -27,6 +27,7 @@ use crate::core::stt::base::{
     BaseSTT, STTConfig, STTConnectionState, STTError, STTErrorCallback, STTResult,
     STTResultCallback,
 };
+use crate::core::stt::wav as stt_wav;
 use bytes::Bytes;
 use reqwest::Client;
 use reqwest::multipart::{Form, Part};
@@ -52,7 +53,7 @@ pub struct NectecStt {
     /// Base STT configuration.
     base_config: Option<STTConfig>,
     /// HTTP client for REST API calls.
-    http_client: Client,
+    http_client: Option<Client>,
     /// Whether the client is ready to receive audio.
     is_ready: AtomicBool,
     /// Current connection state.
@@ -63,6 +64,25 @@ pub struct NectecStt {
     result_callback: Arc<RwLock<Option<STTResultCallback>>>,
     /// Error callback.
     error_callback: Arc<RwLock<Option<STTErrorCallback>>>,
+}
+
+fn nectec_stt_http_client(timeout_secs: u64) -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+}
+
+fn default_nectec_stt_http_client() -> Option<Client> {
+    match nectec_stt_http_client(super::config::DEFAULT_REQUEST_TIMEOUT) {
+        Ok(client) => Some(client),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to create default NECTEC STT HTTP client; default instance is inert until rebuilt with a valid config"
+            );
+            None
+        }
+    }
 }
 
 impl NectecStt {
@@ -77,17 +97,14 @@ impl NectecStt {
         let nectec_config = NectecSttConfig::from_standard(std)?;
 
         let timeout_secs = nectec_config.request_timeout_secs;
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| {
-                STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
-            })?;
+        let http_client = nectec_stt_http_client(timeout_secs).map_err(|e| {
+            STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         Ok(Self {
             config: nectec_config,
             base_config: Some(std.base.clone()),
-            http_client,
+            http_client: Some(http_client),
             is_ready: AtomicBool::new(false),
             connection_state: Arc::new(RwLock::new(STTConnectionState::Disconnected)),
             audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_AUDIO_BUFFER_SIZE))),
@@ -107,8 +124,13 @@ impl NectecStt {
 
         let form = Form::new().part("file", part);
 
-        let response = self
-            .http_client
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            STTError::ConfigurationError(
+                "NECTEC STT default HTTP client is unavailable; construct with NectecStt::new or new_standard".to_string(),
+            )
+        })?;
+
+        let response = http_client
             .post(crate::core::tts::standard::override_rest_endpoint(
                 self.config.endpoint(),
                 self.config.endpoint_override.as_deref(),
@@ -192,8 +214,13 @@ impl NectecStt {
                 self.config.output_format.as_param().to_string(),
             );
 
-        let response = self
-            .http_client
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            STTError::ConfigurationError(
+                "NECTEC STT default HTTP client is unavailable; construct with NectecStt::new or new_standard".to_string(),
+            )
+        })?;
+
+        let response = http_client
             .post(crate::core::tts::standard::override_rest_endpoint(
                 self.config.endpoint(),
                 self.config.endpoint_override.as_deref(),
@@ -288,7 +315,7 @@ impl NectecStt {
         );
 
         // Build WAV header for raw PCM data
-        let wav_data = self.wrap_in_wav(&audio_data);
+        let wav_data = self.wrap_in_wav(&audio_data)?;
 
         // Route to appropriate model
         match self.config.model {
@@ -298,38 +325,9 @@ impl NectecStt {
     }
 
     /// Wrap raw PCM data in a WAV container.
-    fn wrap_in_wav(&self, pcm_data: &[u8]) -> Vec<u8> {
-        let sample_rate = self.config.sample_rate;
-        let channels = self.config.channels;
-        let bits_per_sample: u16 = 16;
-        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
-        let block_align = channels * bits_per_sample / 8;
-        let data_size = pcm_data.len() as u32;
-        let file_size = 36 + data_size;
-
-        let mut wav = Vec::with_capacity(44 + pcm_data.len());
-
-        // RIFF header
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&file_size.to_le_bytes());
-        wav.extend_from_slice(b"WAVE");
-
-        // fmt chunk
-        wav.extend_from_slice(b"fmt ");
-        wav.extend_from_slice(&16u32.to_le_bytes()); // chunk size
-        wav.extend_from_slice(&1u16.to_le_bytes()); // audio format (PCM)
-        wav.extend_from_slice(&channels.to_le_bytes());
-        wav.extend_from_slice(&sample_rate.to_le_bytes());
-        wav.extend_from_slice(&byte_rate.to_le_bytes());
-        wav.extend_from_slice(&block_align.to_le_bytes());
-        wav.extend_from_slice(&bits_per_sample.to_le_bytes());
-
-        // data chunk
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&data_size.to_le_bytes());
-        wav.extend_from_slice(pcm_data);
-
-        wav
+    fn wrap_in_wav(&self, pcm_data: &[u8]) -> Result<Vec<u8>, STTError> {
+        stt_wav::encode_pcm16_wav(pcm_data, self.config.sample_rate, self.config.channels)
+            .map_err(|e| STTError::AudioProcessingError(format!("Invalid WAV parameters: {e}")))
     }
 
     /// Flush the audio buffer and get transcription.
@@ -378,7 +376,7 @@ impl Default for NectecStt {
         Self {
             config: NectecSttConfig::default(),
             base_config: None,
-            http_client: Client::new(),
+            http_client: default_nectec_stt_http_client(),
             is_ready: AtomicBool::new(false),
             connection_state: Arc::new(RwLock::new(STTConnectionState::Disconnected)),
             audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_AUDIO_BUFFER_SIZE))),
@@ -394,12 +392,9 @@ impl BaseSTT for NectecStt {
         let nectec_config = NectecSttConfig::from_base(&config)?;
 
         let timeout_secs = nectec_config.request_timeout_secs;
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| {
-                STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
-            })?;
+        let http_client = nectec_stt_http_client(timeout_secs).map_err(|e| {
+            STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         info!(
             "NECTEC STT: Initialized with model={}, sample_rate={}, channels={}",
@@ -409,7 +404,7 @@ impl BaseSTT for NectecStt {
         Ok(Self {
             config: nectec_config,
             base_config: Some(config),
-            http_client,
+            http_client: Some(http_client),
             is_ready: AtomicBool::new(false),
             connection_state: Arc::new(RwLock::new(STTConnectionState::Disconnected)),
             audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_AUDIO_BUFFER_SIZE))),
@@ -585,6 +580,77 @@ mod tests {
         assert_eq!(stt.config.model, NectecSttModel::Partii5);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn nectec_stt_redirect_policy_rejects_private_hop() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let stt = NectecStt::new(STTConfig {
+            api_key: "test_key".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            ..Default::default()
+        })
+        .expect("construct NECTEC STT");
+        let err = stt
+            .http_client
+            .as_ref()
+            .expect("strict constructor builds an HTTP client")
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(err) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&err.to_string());
+            source = err.source();
+        }
+        assert!(error_chain.contains("SSRF protection"), "{error_chain}");
+    }
+
+    #[tokio::test]
+    async fn default_without_http_client_returns_typed_error_without_panic() {
+        let mut stt = NectecStt::default();
+        stt.http_client = None;
+
+        let err = stt
+            .process_audio(vec![0; MIN_AUDIO_BUFFER_SIZE])
+            .await
+            .expect_err("inert default client must fail with a typed error");
+
+        match err {
+            STTError::ConfigurationError(msg) => {
+                assert!(msg.contains("default HTTP client"), "{msg}");
+            }
+            other => panic!("expected ConfigurationError, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_new_with_partii4() {
         let config = STTConfig {
@@ -606,7 +672,7 @@ mod tests {
     // proving the standardized path is wired.
     #[test]
     fn test_nectec_new_standard_carries_base() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "nectec".into(),
@@ -649,7 +715,7 @@ mod tests {
         let stt = NectecStt::new(config).unwrap();
 
         let pcm_data = vec![0u8; 1000];
-        let wav_data = stt.wrap_in_wav(&pcm_data);
+        let wav_data = stt.wrap_in_wav(&pcm_data).expect("valid WAV header");
 
         // Check WAV header
         assert_eq!(&wav_data[0..4], b"RIFF");

@@ -376,7 +376,9 @@ async fn test_graceful_shutdown_simulation() {
 
     // Task should complete within timeout
     let result = timeout(Duration::from_secs(1), task).await;
-    assert!(result.is_ok());
+    result
+        .expect("shutdown task should complete within 1s")
+        .expect("shutdown task should not panic");
 }
 
 /// Test that the server correctly handles WebSocket route setup

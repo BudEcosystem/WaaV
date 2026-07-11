@@ -10,7 +10,6 @@
 
 mod mock_providers;
 
-
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -276,9 +275,10 @@ impl BreakingPointSaver {
     async fn write_summary(&self, summary: &BreakingPointSummary) {
         let path = self.output_dir.join("summary.json");
         if let Ok(json) = serde_json::to_string_pretty(summary)
-            && let Ok(mut file) = File::create(&path) {
-                let _ = file.write_all(json.as_bytes());
-            }
+            && let Ok(mut file) = File::create(&path)
+        {
+            let _ = file.write_all(json.as_bytes());
+        }
 
         // Also write human-readable report
         let report_path = self.output_dir.join("report.txt");
@@ -397,7 +397,7 @@ async fn run_iteration(
     // Spawn workers
     let mut handles = Vec::with_capacity(vus as usize);
 
-    for _ in 0..vus {
+    for worker_id in 0..vus {
         let client = client.clone();
         let stats = stats.clone();
         let semaphore = semaphore.clone();
@@ -416,7 +416,7 @@ async fn run_iteration(
             }
         });
 
-        handles.push(handle);
+        handles.push((worker_id, handle));
     }
 
     // Run for duration
@@ -424,8 +424,10 @@ async fn run_iteration(
     running.store(false, Ordering::Relaxed);
 
     // Wait for workers
-    for handle in handles {
-        let _ = handle.await;
+    for (worker_id, handle) in handles {
+        handle.await.unwrap_or_else(|err| {
+            panic!("breaking point worker {worker_id}/{vus} failed to join: {err}")
+        });
     }
 
     stats.to_result(vus).await

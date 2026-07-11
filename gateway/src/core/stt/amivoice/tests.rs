@@ -720,7 +720,7 @@ fn test_client_set_engine() {
 // interim results) survives through `new_standard` into the provider config.
 #[test]
 fn test_new_standard_unlocks_diarization_and_interim() {
-    use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+    use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
     let std = StandardSTTConfig {
         base: make_test_config(),
         features: SttFeatures {

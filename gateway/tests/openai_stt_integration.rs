@@ -9,11 +9,58 @@
 //! Note: Tests requiring actual API calls are marked with #[ignore]
 //! and require OPENAI_API_KEY environment variable.
 
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use futures::FutureExt;
+use tokio::task::JoinHandle;
 use waav_gateway::core::stt::{
     BaseSTT, OpenAIResponseFormat, OpenAISTT, OpenAISTTModel, STTConfig, STTError, STTProvider,
     create_stt_provider, create_stt_provider_from_enum, get_supported_stt_providers,
 };
+
+struct TestServer {
+    label: &'static str,
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        if self.panicked.load(Ordering::SeqCst) {
+            let msg = format!("OpenAI STT test server '{}' panicked", self.label);
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+}
+
+fn spawn_test_server<F>(label: &'static str, future: F) -> TestServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let panicked = Arc::new(AtomicBool::new(false));
+    let panicked_in_task = Arc::clone(&panicked);
+    let handle = tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked_in_task.store(true, Ordering::SeqCst);
+            eprintln!("OpenAI STT test server '{label}' panicked");
+        }
+    });
+    TestServer {
+        label,
+        handle,
+        panicked,
+    }
+}
 
 /// Test that OpenAI is included in supported providers
 #[test]
@@ -447,7 +494,7 @@ async fn test_openai_stt_local_server_roundtrip() {
         .route("/v1/audio/transcriptions", post(transcribe))
         .with_state(state.clone());
     // Socket is already bound, so the client can connect immediately; serve() just accepts.
-    tokio::spawn(async move {
+    let _server = spawn_test_server("local_transcriptions", async move {
         axum::serve(listener, app).await.expect("serve");
     });
 
@@ -489,7 +536,9 @@ async fn test_openai_stt_local_server_roundtrip() {
         let sample = (((i as f32) * 0.05).sin() * 8000.0) as i16;
         audio.extend_from_slice(&sample.to_le_bytes());
     }
-    stt.send_audio(Bytes::from(audio)).await.expect("send_audio");
+    stt.send_audio(Bytes::from(audio))
+        .await
+        .expect("send_audio");
     stt.flush().await.expect("flush");
 
     let received = tokio::time::timeout(tokio::time::Duration::from_secs(10), rx.recv()).await;

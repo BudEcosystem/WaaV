@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
@@ -59,8 +60,8 @@ struct GnaniTransport {
     /// `run`). Each attempt forwards from it into a fresh per-stream channel, so queued audio
     /// survives a reconnect instead of being lost with the old gRPC stream.
     audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
-    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
-    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    /// Shared shutdown signal (cloneable across reconnect attempts; intentional close must not reconnect).
+    shutdown_token: CancellationToken,
     /// Decoded transcript chunks are forwarded here to the dedupe/callback task.
     result_tx: mpsc::Sender<Result<TranscriptChunk, STTError>>,
     /// Fires once on the first successful stream open, unblocking `start_streaming_session`.
@@ -83,7 +84,12 @@ impl WsTransport for GnaniTransport {
         use futures::StreamExt;
 
         let mut audio_rx = self.audio_rx.lock().await;
-        let mut shutdown_rx = self.shutdown_rx.lock().await;
+        let shutdown_token = self.shutdown_token.clone();
+
+        if shutdown_token.is_cancelled() {
+            info!("Shutdown signal already received for Gnani STT");
+            return ReconnectOutcome::Completed;
+        }
 
         // Per-attempt inner channel handed to the fresh gRPC stream. We forward the durable audio
         // receiver into it inside the select! below, so a reconnect re-uses the same durable
@@ -108,7 +114,7 @@ impl WsTransport for GnaniTransport {
                 biased;
 
                 // Intentional shutdown — must NOT reconnect.
-                _ = &mut *shutdown_rx => {
+                _ = shutdown_token.cancelled() => {
                     info!("Shutdown signal received for Gnani STT");
                     return ReconnectOutcome::Completed;
                 }
@@ -194,7 +200,7 @@ pub struct GnaniSTT {
     is_connected: Arc<AtomicBool>,
 
     /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
-    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// `connect()`, set in `disconnect()` before cancelling the shutdown token, so a client close racing a
     /// server-side close can never trigger a spurious reconnect.
     intentional_disconnect: Arc<AtomicBool>,
 
@@ -208,7 +214,7 @@ pub struct GnaniSTT {
     audio_sender: Option<mpsc::Sender<Bytes>>,
 
     /// Shutdown signal for the supervised streaming task (intentional close → no reconnect).
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    shutdown_token: Option<CancellationToken>,
 
     /// Supervised streaming connection task handle (owns the ReconnectableStream supervisor).
     connection_handle: Option<tokio::task::JoinHandle<()>>,
@@ -237,7 +243,7 @@ impl Default for GnaniSTT {
             result_callback: Arc::new(RwLock::new(None)),
             error_callback: Arc::new(RwLock::new(None)),
             audio_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             connection_handle: None,
             result_task: None,
             last_transcript: Arc::new(RwLock::new(String::new())),
@@ -297,17 +303,15 @@ impl GnaniSTT {
 
         // Outbound audio channel + shutdown + decoded-result channel + connected signal.
         let (audio_tx, audio_rx) = mpsc::channel::<Bytes>(100);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let (result_tx, mut result_rx) =
-            mpsc::channel::<Result<TranscriptChunk, STTError>>(100);
+        let shutdown_token = CancellationToken::new();
+        let (result_tx, mut result_rx) = mpsc::channel::<Result<TranscriptChunk, STTError>>(100);
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         self.audio_sender = Some(audio_tx);
-        self.shutdown_tx = Some(shutdown_tx);
+        self.shutdown_token = Some(shutdown_token.clone());
 
         // Shared state the supervised transport re-uses across reconnect attempts.
         let audio_rx = Arc::new(Mutex::new(audio_rx));
-        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
         let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
 
         // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor with
@@ -326,9 +330,7 @@ impl GnaniSTT {
                 r.breaker,
                 (*r.governor).clone(),
             ),
-            None => {
-                ReconnectableStream::new(ReconnectableStreamConfig::new("gnani", reconnection))
-            }
+            None => ReconnectableStream::new(ReconnectableStreamConfig::new("gnani", reconnection)),
         }
         .with_disconnect_flag(disconnect_flag);
 
@@ -338,7 +340,7 @@ impl GnaniSTT {
                     let channel = channel.clone();
                     let config = config.clone();
                     let audio_rx = Arc::clone(&audio_rx);
-                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let shutdown_token = shutdown_token.clone();
                     let connected_tx = Arc::clone(&connected_tx);
                     let result_tx = result_tx.clone();
                     async move {
@@ -349,7 +351,7 @@ impl GnaniSTT {
                         Ok(GnaniTransport {
                             grpc_client,
                             audio_rx,
-                            shutdown_rx,
+                            shutdown_token,
                             result_tx,
                             connected_tx,
                         })
@@ -477,13 +479,13 @@ impl BaseSTT for GnaniSTT {
     async fn disconnect(&mut self) -> Result<(), STTError> {
         info!("Disconnecting from Gnani STT");
 
-        // Record the intent BEFORE firing shutdown_tx so the supervisor sees it even if the
+        // Record the intent BEFORE cancelling the shutdown token so the supervisor sees it even if the
         // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
         self.intentional_disconnect.store(true, Ordering::SeqCst);
 
         // Ask the supervisor to stop (intentional close — must NOT reconnect).
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
 
         // Drop audio sender to signal end of stream
@@ -491,13 +493,23 @@ impl BaseSTT for GnaniSTT {
 
         // Wait for the supervised connection task to wind down, with a timeout.
         if let Some(handle) = self.connection_handle.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "gnani-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         // Wait for result task to complete
         if let Some(task) = self.result_task.take() {
             // Give it a moment to finish processing
-            tokio::time::timeout(Duration::from_secs(2), task).await.ok();
+            crate::core::observability::await_task_shutdown(
+                "gnani-stt-result-task",
+                task,
+                Duration::from_secs(2),
+            )
+            .await;
         }
 
         self.grpc_channel = None;
@@ -570,9 +582,7 @@ impl GnaniSTT {
     /// The shared circuit breaker this session feeds into the generic supervisor, if the
     /// process-global resilience handles have been injected (W-D1/W-D2). Two `GnaniSTT` built from
     /// the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
-    pub fn resilience_breaker(
-        &self,
-    ) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
         self.resilience.as_ref().map(|r| &r.breaker)
     }
 }
@@ -606,7 +616,7 @@ mod tests {
     // (previously dropped by the flat factory).
     #[test]
     fn new_standard_propagates_interim_results_and_creds() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "gnani".into(),

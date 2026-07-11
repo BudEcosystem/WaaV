@@ -160,10 +160,9 @@ impl<'a> ClientGuard<'a> {
         Fut: std::future::Future<Output = Result<Response, reqwest::Error>>,
     {
         let mut attempt = 0;
-        let max_attempts = self.manager.config.max_retries + 1;
-        let mut last_error = None;
+        let max_retries = self.manager.config.max_retries;
 
-        while attempt < max_attempts {
+        loop {
             match request_fn().await {
                 Ok(response) => {
                     // Track retry success if this wasn't the first attempt
@@ -176,26 +175,22 @@ impl<'a> ClientGuard<'a> {
                     return Ok(response);
                 }
                 Err(e) => {
-                    last_error = Some(e);
+                    if attempt >= max_retries {
+                        return Err(e);
+                    }
                     attempt += 1;
 
-                    // If we haven't exhausted retries, wait and try again
-                    if attempt < max_attempts {
-                        self.manager
-                            .metrics
-                            .total_retries
-                            .fetch_add(1, Ordering::Relaxed);
+                    self.manager
+                        .metrics
+                        .total_retries
+                        .fetch_add(1, Ordering::Relaxed);
 
-                        // Calculate exponential backoff delay
-                        let delay = self.calculate_retry_delay(attempt);
-                        tokio::time::sleep(delay).await;
-                    }
+                    // Calculate exponential backoff delay
+                    let delay = self.calculate_retry_delay(attempt);
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
-
-        // All retries exhausted, return the last error
-        Err(last_error.unwrap())
     }
 
     /// Calculate retry delay using exponential backoff with jitter
@@ -393,6 +388,9 @@ impl ReqManager {
         if config.max_concurrent_requests > 1000 {
             return Err("max_concurrent_requests must not exceed 1000".into());
         }
+        if config.max_retries == u32::MAX {
+            return Err("max_retries must be less than u32::MAX".into());
+        }
 
         let client = Arc::new(Self::create_optimized_client(&config)?);
 
@@ -407,7 +405,7 @@ impl ReqManager {
 
     /// Create an optimized HTTP/2 client with advanced connection pooling
     fn create_optimized_client(config: &ReqManagerConfig) -> Result<Client, reqwest::Error> {
-        Client::builder()
+        crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
             .http2_initial_stream_window_size(config.http2_stream_window_size)
             .http2_initial_connection_window_size(config.http2_connection_window_size)
             .http2_keep_alive_interval(Some(config.http2_keep_alive_interval))
@@ -802,6 +800,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_req_manager_rejects_retry_count_overflow_sentinel() {
+        let config = ReqManagerConfig {
+            max_retries: u32::MAX,
+            ..Default::default()
+        };
+        let err = match ReqManager::with_config(config).await {
+            Ok(_) => panic!("max_retries=u32::MAX would overflow the retry attempt count"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("max_retries"),
+            "error should name invalid retry config: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_acquire_and_release() {
         let manager = ReqManager::new(2).await.unwrap();
 
@@ -911,6 +925,60 @@ mod tests {
         let guard2 = manager.acquire().await.unwrap();
         let response2 = guard2.get(&url).await.unwrap();
         assert_eq!(response2.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_req_manager_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!(
+                        "Skipping test_req_manager_redirect_policy_rejects_private_hop: {err}"
+                    );
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let manager = ReqManager::new(1).await.unwrap();
+        let guard = manager.acquire().await.unwrap();
+        let err = guard
+            .client()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
     }
 
     #[tokio::test]

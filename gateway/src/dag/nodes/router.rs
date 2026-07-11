@@ -340,21 +340,22 @@ impl JoinNode {
                 let mut best_score = f64::MIN;
                 for item in arr.iter() {
                     if let Some(map) = item.clone().try_cast::<rhai::Map>()
-                        && let Some(val) = map.get(field) {
-                            let score: f64 = if val.is::<f64>() {
-                                val.clone().cast::<f64>()
-                            } else if val.is::<i64>() {
-                                val.clone().cast::<i64>() as f64
-                            } else if val.is::<i32>() {
-                                val.clone().cast::<i32>() as f64
-                            } else {
-                                continue;
-                            };
-                            if score > best_score {
-                                best_score = score;
-                                best = Some(item.clone());
-                            }
+                        && let Some(val) = map.get(field)
+                    {
+                        let score: f64 = if val.is::<f64>() {
+                            val.clone().cast::<f64>()
+                        } else if val.is::<i64>() {
+                            val.clone().cast::<i64>() as f64
+                        } else if val.is::<i32>() {
+                            val.clone().cast::<i32>() as f64
+                        } else {
+                            continue;
+                        };
+                        if score > best_score {
+                            best_score = score;
+                            best = Some(item.clone());
                         }
+                    }
                 }
                 best.unwrap_or(Dynamic::UNIT)
             });
@@ -476,12 +477,12 @@ impl JoinNode {
                 scope.push_constant("api_key_id", api_key_id);
             }
 
-            let ast = engine
-                .compile(&script_owned)
-                .map_err(|e| DAGError::ExpressionCompilationError {
+            let ast = engine.compile(&script_owned).map_err(|e| {
+                DAGError::ExpressionCompilationError {
                     expression: script_owned.clone(),
                     error: e.to_string(),
-                })?;
+                }
+            })?;
 
             engine
                 .eval_ast_with_scope::<Dynamic>(&mut scope, &ast)
@@ -695,9 +696,10 @@ impl RouterNode {
             }
 
             if let Some(ref condition) = route.condition
-                && evaluator.evaluate(condition, data, ctx)? {
-                    return Ok(Some(&route.target));
-                }
+                && evaluator.evaluate(condition, data, ctx)?
+            {
+                return Ok(Some(&route.target));
+            }
             // Routes without conditions and not default are skipped
             // (they should have conditions to be useful)
         }
@@ -901,6 +903,9 @@ mod tests {
 
         let output = node.execute(input, &mut ctx).await.unwrap();
         let json = output.to_json();
-        assert_eq!(json["text"], "high", "selector should pick highest confidence");
+        assert_eq!(
+            json["text"], "high",
+            "selector should pick highest confidence"
+        );
     }
 }

@@ -198,7 +198,10 @@ impl FunctionRegistry {
 
     /// Any registered tool that survives interruption?
     pub fn has_async_tools(&self) -> bool {
-        self.items.read().values().any(|i| !i.cancel_on_interruption)
+        self.items
+            .read()
+            .values()
+            .any(|i| !i.cancel_on_interruption)
     }
 
     /// Where async finals/progress land. The orchestration layer wires this
@@ -216,8 +219,7 @@ impl FunctionRegistry {
     /// (Pipecat parity — present exactly while it could do something).
     pub fn request_tools(&self) -> Vec<ToolDefinition> {
         let items = self.items.read();
-        let mut tools: Vec<ToolDefinition> =
-            items.values().map(|i| i.definition.clone()).collect();
+        let mut tools: Vec<ToolDefinition> = items.values().map(|i| i.definition.clone()).collect();
         // Deterministic order for request reproducibility.
         tools.sort_by(|a, b| a.function.name.cmp(&b.function.name));
         if items.values().any(|i| !i.cancel_on_interruption) {
@@ -297,7 +299,11 @@ pub struct ToolLoopOptions {
 
 impl Default for ToolLoopOptions {
     fn default() -> Self {
-        Self { parallel: true, max_rounds: 8, turn_id: 0 }
+        Self {
+            parallel: true,
+            max_rounds: 8,
+            turn_id: 0,
+        }
     }
 }
 
@@ -353,8 +359,15 @@ pub async fn run_tool_loop(
             "executing tool-call batch"
         );
 
-        let results =
-            execute_batch(registry, session_id, &batch, cancel, opts.parallel, opts.turn_id).await;
+        let results = execute_batch(
+            registry,
+            session_id,
+            &batch,
+            cancel,
+            opts.parallel,
+            opts.turn_id,
+        )
+        .await;
 
         // Pairing invariant: exactly one result per tool_call_id, batch
         // order — appended under ONE history-lock acquisition so a
@@ -414,7 +427,11 @@ async fn execute_one(
     if name == CANCEL_ASYNC_TOOL_NAME {
         let target = serde_json::from_str::<Value>(&call.function.arguments)
             .ok()
-            .and_then(|v| v.get("tool_call_id").and_then(|s| s.as_str()).map(String::from));
+            .and_then(|v| {
+                v.get("tool_call_id")
+                    .and_then(|s| s.as_str())
+                    .map(String::from)
+            });
         return match target {
             Some(id) => json!({ "cancelled": registry.cancel_async(&id), "tool_call_id": id }),
             None => json!({ "error": "cancel_async_tool_call requires a tool_call_id argument" }),
@@ -457,11 +474,7 @@ async fn execute_one(
         let timeout = item.timeout;
         let run_llm = item.run_llm;
         let reg = Arc::clone(registry);
-        let (sid, cid, fname) = (
-            session_id.to_string(),
-            call.id.clone(),
-            name.to_string(),
-        );
+        let (sid, cid, fname) = (session_id.to_string(), call.id.clone(), name.to_string());
         let task = tokio::spawn(async move {
             let outcome = match tokio::time::timeout(timeout, handler(params)).await {
                 Ok(Ok(v)) => v,
@@ -474,7 +487,10 @@ async fn execute_one(
         });
         registry.in_flight_async.write().insert(
             call.id.clone(),
-            InFlightAsync { name: name.to_string(), abort: task.abort_handle() },
+            InFlightAsync {
+                name: name.to_string(),
+                abort: task.abort_handle(),
+            },
         );
         return json!({
             "status": "started",
@@ -557,7 +573,9 @@ mod tests {
             st.requests.lock().push(req);
             let remaining = st
                 .tool_rounds
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v.saturating_sub(1)))
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                    Some(v.saturating_sub(1))
+                })
                 .unwrap();
             let message = if remaining > 0 {
                 json!({
@@ -581,7 +599,9 @@ mod tests {
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
             }))
         }
-        let app = Router::new().route("/chat/completions", post(chat)).with_state(state.clone());
+        let app = Router::new()
+            .route("/chat/completions", post(chat))
+            .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -605,8 +625,11 @@ mod tests {
     fn cancel_async_tool_registered_only_while_async_present() {
         let reg = FunctionRegistry::new();
         reg.register(def("sync_tool"), handler_returning(json!({"ok": true})));
-        let names: Vec<String> =
-            reg.request_tools().iter().map(|t| t.function.name.clone()).collect();
+        let names: Vec<String> = reg
+            .request_tools()
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect();
         assert!(
             !names.contains(&CANCEL_ASYNC_TOOL_NAME.to_string()),
             "no async tools → no cancel builtin"
@@ -615,13 +638,19 @@ mod tests {
         reg.register_item(
             RegistryItem::new(def("async_tool"), handler_returning(json!(1))).asynchronous(),
         );
-        let names: Vec<String> =
-            reg.request_tools().iter().map(|t| t.function.name.clone()).collect();
+        let names: Vec<String> = reg
+            .request_tools()
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect();
         assert!(names.contains(&CANCEL_ASYNC_TOOL_NAME.to_string()));
 
         reg.unregister("async_tool");
-        let names: Vec<String> =
-            reg.request_tools().iter().map(|t| t.function.name.clone()).collect();
+        let names: Vec<String> = reg
+            .request_tools()
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect();
         assert!(
             !names.contains(&CANCEL_ASYNC_TOOL_NAME.to_string()),
             "last async tool unregistered → builtin pruned"
@@ -638,24 +667,43 @@ mod tests {
         // and the loop must still re-infer to a final answer.
         let llm = client(&url, Arc::clone(&reg));
         let token = CancellationToken::new();
-        let first = llm.complete("s1", "what's the weather?", None, &token, None).await.unwrap();
+        let first = llm
+            .complete("s1", "what's the weather?", None, &token, None)
+            .await
+            .unwrap();
         assert_eq!(first.tool_calls.len(), 2);
 
-        let final_resp =
-            run_tool_loop(&llm, &reg, "s1", first, None, &token, ToolLoopOptions::default())
-                .await
-                .unwrap();
+        let final_resp = run_tool_loop(
+            &llm,
+            &reg,
+            "s1",
+            first,
+            None,
+            &token,
+            ToolLoopOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(final_resp.content, "It is sunny and 12:00.");
-        assert_eq!(mock.requests.lock().len(), 2, "initial + exactly ONE re-inference");
+        assert_eq!(
+            mock.requests.lock().len(),
+            2,
+            "initial + exactly ONE re-inference"
+        );
 
         // Pairing invariant: one tool message per call id, error-shaped.
         let history = llm.history_snapshot("s1").await;
-        let tool_msgs: Vec<_> =
-            history.iter().filter(|m| matches!(m.role, MessageRole::Tool)).collect();
+        let tool_msgs: Vec<_> = history
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Tool))
+            .collect();
         assert_eq!(tool_msgs.len(), 2);
         for m in &tool_msgs {
             assert!(
-                m.content.as_deref().unwrap_or_default().contains("No handler registered"),
+                m.content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("No handler registered"),
                 "missing handler must produce a terminal error result"
             );
         }
@@ -668,16 +716,29 @@ mod tests {
         // Total inferences: initial + 2 = 3 (never one per result = 5).
         let (url, mock) = start_mock(2).await;
         let reg = Arc::new(FunctionRegistry::new());
-        reg.register(def("get_weather"), handler_returning(json!({"weather": "sunny"})));
+        reg.register(
+            def("get_weather"),
+            handler_returning(json!({"weather": "sunny"})),
+        );
         reg.register(def("get_time"), handler_returning(json!({"time": "12:00"})));
         let llm = client(&url, Arc::clone(&reg));
         let token = CancellationToken::new();
 
-        let first = llm.complete("s1", "weather and time?", None, &token, None).await.unwrap();
-        let final_resp =
-            run_tool_loop(&llm, &reg, "s1", first, None, &token, ToolLoopOptions::default())
-                .await
-                .unwrap();
+        let first = llm
+            .complete("s1", "weather and time?", None, &token, None)
+            .await
+            .unwrap();
+        let final_resp = run_tool_loop(
+            &llm,
+            &reg,
+            "s1",
+            first,
+            None,
+            &token,
+            ToolLoopOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(final_resp.content, "It is sunny and 12:00.");
         assert_eq!(
             mock.requests.lock().len(),
@@ -776,13 +837,24 @@ mod tests {
         reg.register(def("typed"), handler_returning(json!(1)));
         let token = CancellationToken::new();
 
-        let out =
-            execute_batch(&reg, "s", &[call("c1", "hang", "{}")], &token, true, 0).await;
+        let out = execute_batch(&reg, "s", &[call("c1", "hang", "{}")], &token, true, 0).await;
         assert!(out[0]["error"].as_str().unwrap().contains("timed out"));
 
-        let out =
-            execute_batch(&reg, "s", &[call("c2", "typed", "{not json")], &token, true, 0).await;
-        assert!(out[0]["error"].as_str().unwrap().contains("Invalid JSON arguments"));
+        let out = execute_batch(
+            &reg,
+            "s",
+            &[call("c2", "typed", "{not json")],
+            &token,
+            true,
+            0,
+        )
+        .await;
+        assert!(
+            out[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("Invalid JSON arguments")
+        );
     }
 
     #[tokio::test]
@@ -805,8 +877,16 @@ mod tests {
         });
         let started = std::time::Instant::now();
         let out = execute_batch(&reg, "s", &[call("c1", "slow", "{}")], &token, true, 0).await;
-        assert!(out[0]["error"].as_str().unwrap().contains("cancelled by interruption"));
-        assert!(started.elapsed() < Duration::from_secs(5), "cancel must be prompt");
+        assert!(
+            out[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("cancelled by interruption")
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancel must be prompt"
+        );
     }
 
     #[tokio::test]
@@ -836,7 +916,10 @@ mod tests {
         let started = std::time::Instant::now();
         // turn_id 7 must round-trip to the sink for turn-id gating (S3).
         let out = execute_batch(&reg, "s", &[call("c9", "lookup", "{}")], &token, true, 7).await;
-        assert!(started.elapsed() < Duration::from_millis(35), "started ack must not wait");
+        assert!(
+            started.elapsed() < Duration::from_millis(35),
+            "started ack must not wait"
+        );
         assert_eq!(out[0]["status"], "started");
 
         // Interruption does NOT cancel it; the final arrives via the sink.
@@ -880,7 +963,11 @@ mod tests {
         let out = execute_batch(
             &reg,
             "s",
-            &[call("c2", CANCEL_ASYNC_TOOL_NAME, r#"{"tool_call_id":"c1"}"#)],
+            &[call(
+                "c2",
+                CANCEL_ASYNC_TOOL_NAME,
+                r#"{"tool_call_id":"c1"}"#,
+            )],
             &token,
             true,
             0,
@@ -888,7 +975,11 @@ mod tests {
         .await;
         assert_eq!(out[0]["cancelled"], true);
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(finals.load(Ordering::SeqCst), 0, "aborted task delivers no final");
+        assert_eq!(
+            finals.load(Ordering::SeqCst),
+            0,
+            "aborted task delivers no final"
+        );
         // Cancelling again: nothing in flight.
         assert!(!reg.cancel_async("c1"));
     }
@@ -904,13 +995,23 @@ mod tests {
         let llm = client(&url, Arc::clone(&reg));
         let token = CancellationToken::new();
         let first = llm.complete("s1", "go", None, &token, None).await.unwrap();
-        let opts = ToolLoopOptions { parallel: true, max_rounds: 3, turn_id: 0 };
-        let resp = run_tool_loop(&llm, &reg, "s1", first, None, &token, opts).await.unwrap();
+        let opts = ToolLoopOptions {
+            parallel: true,
+            max_rounds: 3,
+            turn_id: 0,
+        };
+        let resp = run_tool_loop(&llm, &reg, "s1", first, None, &token, opts)
+            .await
+            .unwrap();
         assert!(
             resp.tool_calls.is_empty(),
             "capped loop must not hand back live tool calls (they were terminally answered)"
         );
-        assert_eq!(mock.requests.lock().len(), 1 + 3, "initial + max_rounds inferences");
+        assert_eq!(
+            mock.requests.lock().len(),
+            1 + 3,
+            "initial + max_rounds inferences"
+        );
 
         // CRITICAL pairing pin (review wf_6783a4b3): the bail must leave NO
         // unpaired assistant{tool_calls} — every call id in history has a
@@ -937,7 +1038,11 @@ mod tests {
             .rev()
             .take_while(|m| matches!(m.role, MessageRole::Tool))
             .collect();
-        assert_eq!(last_results.len(), 2, "the final batch got terminal results");
+        assert_eq!(
+            last_results.len(),
+            2,
+            "the final batch got terminal results"
+        );
         assert!(
             last_results[0]
                 .content
@@ -961,7 +1066,10 @@ mod tests {
         call.tool_calls = Some(vec![crate::core::llm::ToolCall {
             id: "c1".into(),
             call_type: "function".into(),
-            function: crate::core::llm::FunctionCall { name: "f".into(), arguments: "{}".into() },
+            function: crate::core::llm::FunctionCall {
+                name: "f".into(),
+                arguments: "{}".into(),
+            },
         }]);
         h.add(call);
         h.add(ChatMessage::tool("c1", "result"));
@@ -975,11 +1083,11 @@ mod tests {
                 .iter()
                 .enumerate()
                 .any(|(i, m)| m.role == MessageRole::Tool
-                    && !msgs[..i].iter().any(|p| p
-                        .tool_calls
-                        .as_ref()
-                        .is_some_and(|cs| cs.iter().any(|c| Some(c.id.as_str())
-                            == m.tool_call_id.as_deref())))),
+                    && !msgs[..i]
+                        .iter()
+                        .any(|p| p.tool_calls.as_ref().is_some_and(|cs| cs
+                            .iter()
+                            .any(|c| Some(c.id.as_str()) == m.tool_call_id.as_deref())))),
             "orphan tool message survived the trim: {msgs:?}"
         );
         assert_eq!(msgs[0].role, MessageRole::System, "system always survives");

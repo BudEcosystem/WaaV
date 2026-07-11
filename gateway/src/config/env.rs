@@ -1,5 +1,7 @@
 use std::env;
+use std::fmt::Display;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use super::parse_auth_api_secrets_json;
 use super::sip::{SipConfig, SipHookConfig};
@@ -9,6 +11,57 @@ use super::validation::{
     validate_tls_config,
 };
 use super::{AuthApiSecret, DAGTimeoutsConfig, PluginConfig, ServerConfig, TlsConfig};
+
+fn parse_env_value<T>(name: &str) -> Result<Option<T>, Box<dyn std::error::Error>>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<T>()
+            .map(Some)
+            .map_err(|e| format!("Invalid {name} environment variable: {e}").into()),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(format!("{name} environment variable must be valid UTF-8").into())
+        }
+    }
+}
+
+fn parse_env_bool(name: &str) -> Result<Option<bool>, Box<dyn std::error::Error>> {
+    match env::var(name) {
+        Ok(value) => parse_bool(&value).map(Some).ok_or_else(|| {
+            format!("Invalid {name} environment variable: expected true/false/1/0/yes/no").into()
+        }),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(format!("{name} environment variable must be valid UTF-8").into())
+        }
+    }
+}
+
+fn parse_env_path(name: &str) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    match env::var(name) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => Ok(Some(PathBuf::from(value))),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(format!("{name} environment variable must be valid UTF-8").into())
+        }
+    }
+}
+
+fn parse_env_non_empty_string(name: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match env::var(name) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(format!("{name} environment variable must be valid UTF-8").into())
+        }
+    }
+}
 
 impl ServerConfig {
     /// Load configuration from environment variables
@@ -48,18 +101,13 @@ impl ServerConfig {
             .map_err(|e| format!("Invalid port number: {e}"))?;
 
         // TLS configuration
-        let tls_enabled = env::var("TLS_ENABLED")
-            .ok()
-            .and_then(|s| parse_bool(&s))
-            .unwrap_or(false);
+        let tls_enabled = parse_env_bool("TLS_ENABLED")?.unwrap_or(false);
 
         let tls = if tls_enabled {
-            let cert_path = env::var("TLS_CERT_PATH")
-                .map(PathBuf::from)
-                .map_err(|_| "TLS_CERT_PATH is required when TLS_ENABLED=true")?;
-            let key_path = env::var("TLS_KEY_PATH")
-                .map(PathBuf::from)
-                .map_err(|_| "TLS_KEY_PATH is required when TLS_ENABLED=true")?;
+            let cert_path = parse_env_path("TLS_CERT_PATH")?
+                .ok_or("TLS_CERT_PATH is required when TLS_ENABLED=true")?;
+            let key_path = parse_env_path("TLS_KEY_PATH")?
+                .ok_or("TLS_KEY_PATH is required when TLS_ENABLED=true")?;
 
             Some(TlsConfig {
                 cert_path,
@@ -162,7 +210,7 @@ impl ServerConfig {
         // Gnani.ai credentials (used for Indic STT/TTS)
         let gnani_token = cred_env!("GNANI_TOKEN");
         let gnani_access_key = cred_env!("GNANI_ACCESS_KEY");
-        let gnani_certificate_path = env::var("GNANI_CERTIFICATE_PATH").ok().map(PathBuf::from);
+        let gnani_certificate_path = parse_env_path("GNANI_CERTIFICATE_PATH")?;
 
         // LiveKit recording S3 configuration
         let recording_s3_bucket = env::var("RECORDING_S3_BUCKET").ok();
@@ -173,28 +221,20 @@ impl ServerConfig {
         let recording_s3_prefix = env::var("RECORDING_S3_PREFIX").ok();
 
         // Cache configuration
-        let cache_path = env::var("CACHE_PATH").ok().map(PathBuf::from);
-        let cache_ttl_seconds = env::var("CACHE_TTL_SECONDS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .or(Some(30 * 24 * 60 * 60)); // 1 month (30 days) default
+        let cache_path = parse_env_path("CACHE_PATH")?;
+        let cache_ttl_seconds =
+            parse_env_value::<u64>("CACHE_TTL_SECONDS")?.or(Some(30 * 24 * 60 * 60)); // 1 month (30 days) default
 
         // Authentication configuration
-        let auth_service_url = env::var("AUTH_SERVICE_URL").ok();
-        let auth_signing_key_path = env::var("AUTH_SIGNING_KEY_PATH").ok().map(PathBuf::from);
+        let auth_service_url = parse_env_non_empty_string("AUTH_SERVICE_URL")?;
+        let auth_signing_key_path = parse_env_path("AUTH_SIGNING_KEY_PATH")?;
         let auth_api_secrets_json = env::var("AUTH_API_SECRETS_JSON").ok();
         let auth_api_secret = env::var("AUTH_API_SECRET").ok();
         let auth_api_secret_id = env::var("AUTH_API_SECRET_ID")
             .ok()
             .unwrap_or_else(|| "default".to_string());
-        let auth_timeout_seconds = env::var("AUTH_TIMEOUT_SECONDS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(5);
-        let auth_required = env::var("AUTH_REQUIRED")
-            .ok()
-            .and_then(|v| parse_bool(&v))
-            .unwrap_or(false);
+        let auth_timeout_seconds = parse_env_value::<u64>("AUTH_TIMEOUT_SECONDS")?.unwrap_or(5);
+        let auth_required = parse_env_bool("AUTH_REQUIRED")?.unwrap_or(false);
 
         let auth_api_secrets = if let Some(json) = auth_api_secrets_json {
             parse_auth_api_secrets_json(&json)?
@@ -227,21 +267,12 @@ impl ServerConfig {
 
         // Security configuration
         let cors_allowed_origins = env::var("CORS_ALLOWED_ORIGINS").ok();
-        let rate_limit_requests_per_second = env::var("RATE_LIMIT_REQUESTS_PER_SECOND")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(60);
-        let rate_limit_burst_size = env::var("RATE_LIMIT_BURST_SIZE")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(10);
-        let max_websocket_connections = env::var("MAX_WEBSOCKET_CONNECTIONS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok());
-        let max_connections_per_ip = env::var("MAX_CONNECTIONS_PER_IP")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(100);
+        let rate_limit_requests_per_second =
+            parse_env_value::<u32>("RATE_LIMIT_REQUESTS_PER_SECOND")?.unwrap_or(60);
+        let rate_limit_burst_size = parse_env_value::<u32>("RATE_LIMIT_BURST_SIZE")?.unwrap_or(10);
+        let max_websocket_connections = parse_env_value::<usize>("MAX_WEBSOCKET_CONNECTIONS")?;
+        let max_connections_per_ip =
+            parse_env_value::<u32>("MAX_CONNECTIONS_PER_IP")?.unwrap_or(100);
 
         // Validate security configuration
         validate_security_config(
@@ -251,28 +282,18 @@ impl ServerConfig {
         )?;
 
         // Timeout configuration
-        let ws_processing_timeout_secs = env::var("WS_PROCESSING_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(10);
-        let realtime_processing_timeout_secs = env::var("REALTIME_PROCESSING_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(30);
+        let ws_processing_timeout_secs =
+            parse_env_value::<u64>("WS_PROCESSING_TIMEOUT_SECS")?.unwrap_or(10);
+        let realtime_processing_timeout_secs =
+            parse_env_value::<u64>("REALTIME_PROCESSING_TIMEOUT_SECS")?.unwrap_or(30);
 
         // SIP configuration limits
-        let sip_max_participants = env::var("SIP_MAX_PARTICIPANTS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(3);
+        let sip_max_participants = parse_env_value::<u32>("SIP_MAX_PARTICIPANTS")?.unwrap_or(3);
 
         // Plugin configuration (backward compatible: enabled by default)
-        let plugins_enabled = env::var("PLUGINS_ENABLED")
-            .ok()
-            .and_then(|v| parse_bool(&v))
-            .unwrap_or(true); // Enabled by default
+        let plugins_enabled = parse_env_bool("PLUGINS_ENABLED")?.unwrap_or(true); // Enabled by default
 
-        let plugins_dir = env::var("PLUGINS_DIR").ok().map(PathBuf::from);
+        let plugins_dir = parse_env_path("PLUGINS_DIR")?;
 
         let plugins = PluginConfig {
             enabled: plugins_enabled,
@@ -282,29 +303,13 @@ impl ServerConfig {
 
         // DAG timeout configuration
         let dag_timeouts = DAGTimeoutsConfig {
-            node_execution_secs: env::var("DAG_NODE_EXECUTION_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
+            node_execution_secs: parse_env_value::<u64>("DAG_NODE_EXECUTION_SECS")?.unwrap_or(30),
+            provider_operation_secs: parse_env_value::<u64>("DAG_PROVIDER_OPERATION_SECS")?
                 .unwrap_or(30),
-            provider_operation_secs: env::var("DAG_PROVIDER_OPERATION_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(30),
-            stt_endpoint_secs: env::var("DAG_STT_ENDPOINT_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(60),
-            tts_endpoint_secs: env::var("DAG_TTS_ENDPOINT_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(60),
-            llm_endpoint_secs: env::var("DAG_LLM_ENDPOINT_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(120),
-            websocket_operation_secs: env::var("DAG_WEBSOCKET_OPERATION_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
+            stt_endpoint_secs: parse_env_value::<u64>("DAG_STT_ENDPOINT_SECS")?.unwrap_or(60),
+            tts_endpoint_secs: parse_env_value::<u64>("DAG_TTS_ENDPOINT_SECS")?.unwrap_or(60),
+            llm_endpoint_secs: parse_env_value::<u64>("DAG_LLM_ENDPOINT_SECS")?.unwrap_or(120),
+            websocket_operation_secs: parse_env_value::<u64>("DAG_WEBSOCKET_OPERATION_SECS")?
                 .unwrap_or(30),
         };
 
@@ -523,7 +528,25 @@ mod tests {
             env::remove_var("AUTH_API_SECRETS_JSON");
             env::remove_var("AUTH_API_SECRET");
             env::remove_var("AUTH_API_SECRET_ID");
+            env::remove_var("CACHE_PATH");
+            env::remove_var("GNANI_CERTIFICATE_PATH");
+            env::remove_var("PLUGINS_DIR");
             env::remove_var("AUTH_TIMEOUT_SECONDS");
+            env::remove_var("CACHE_TTL_SECONDS");
+            env::remove_var("RATE_LIMIT_REQUESTS_PER_SECOND");
+            env::remove_var("RATE_LIMIT_BURST_SIZE");
+            env::remove_var("MAX_WEBSOCKET_CONNECTIONS");
+            env::remove_var("MAX_CONNECTIONS_PER_IP");
+            env::remove_var("WS_PROCESSING_TIMEOUT_SECS");
+            env::remove_var("REALTIME_PROCESSING_TIMEOUT_SECS");
+            env::remove_var("SIP_MAX_PARTICIPANTS");
+            env::remove_var("PLUGINS_ENABLED");
+            env::remove_var("DAG_NODE_EXECUTION_SECS");
+            env::remove_var("DAG_PROVIDER_OPERATION_SECS");
+            env::remove_var("DAG_STT_ENDPOINT_SECS");
+            env::remove_var("DAG_TTS_ENDPOINT_SECS");
+            env::remove_var("DAG_LLM_ENDPOINT_SECS");
+            env::remove_var("DAG_WEBSOCKET_OPERATION_SECS");
             env::remove_var("HOST");
             env::remove_var("PORT");
             env::remove_var("TLS_ENABLED");
@@ -573,6 +596,52 @@ mod tests {
         cleanup_env_vars();
     }
 
+    #[test]
+    #[serial]
+    fn test_from_env_empty_optional_path_values_resolve_to_none() {
+        cleanup_env_vars();
+        unsafe {
+            env::set_var("CACHE_PATH", "");
+            env::set_var("GNANI_CERTIFICATE_PATH", "   ");
+            env::set_var("AUTH_SIGNING_KEY_PATH", "");
+            env::set_var("PLUGINS_DIR", "   ");
+        }
+
+        let config = ServerConfig::from_env().expect("from_env");
+        assert_eq!(config.cache_path, None, "empty CACHE_PATH must be unset");
+        assert_eq!(
+            config.gnani_certificate_path, None,
+            "whitespace GNANI_CERTIFICATE_PATH must be unset"
+        );
+        assert_eq!(
+            config.auth_signing_key_path, None,
+            "empty AUTH_SIGNING_KEY_PATH must be unset"
+        );
+        assert_eq!(
+            config.plugins.plugin_dir, None,
+            "whitespace PLUGINS_DIR must be unset"
+        );
+
+        cleanup_env_vars();
+    }
+
+    #[test]
+    #[serial]
+    fn test_from_env_empty_auth_service_url_resolves_to_none() {
+        cleanup_env_vars();
+        unsafe {
+            env::set_var("AUTH_SERVICE_URL", "   ");
+        }
+
+        let config = ServerConfig::from_env().expect("from_env");
+        assert_eq!(
+            config.auth_service_url, None,
+            "whitespace AUTH_SERVICE_URL must be unset"
+        );
+
+        cleanup_env_vars();
+    }
+
     /// `read_realtime_endpoint_overrides` maps each `<PROVIDER>_REALTIME_URL` env
     /// var to its CANONICAL provider key, stores only non-empty values, and is
     /// empty when nothing is set.
@@ -597,8 +666,14 @@ mod tests {
             env::set_var("DEEPGRAM_REALTIME_URL", "   ");
         }
         let map = read_realtime_endpoint_overrides();
-        assert_eq!(map.get("openai").map(String::as_str), Some("ws://127.0.0.1:9001/x"));
-        assert_eq!(map.get("gemini").map(String::as_str), Some("wss://proxy.example/gem"));
+        assert_eq!(
+            map.get("openai").map(String::as_str),
+            Some("ws://127.0.0.1:9001/x")
+        );
+        assert_eq!(
+            map.get("gemini").map(String::as_str),
+            Some("wss://proxy.example/gem")
+        );
         assert!(map.get("deepgram").is_none(), "blank value ⇒ no override");
         assert!(map.get("hume").is_none(), "unset ⇒ no override");
         assert_eq!(map.len(), 2);
@@ -684,6 +759,43 @@ mod tests {
         }
         let config = ServerConfig::from_env().expect("Should load config");
         assert!(!config.auth_required);
+
+        cleanup_env_vars();
+    }
+
+    #[test]
+    #[serial]
+    fn test_from_env_invalid_bool_env_fails() {
+        cleanup_env_vars();
+
+        unsafe {
+            env::set_var("AUTH_REQUIRED", "maybe");
+        }
+
+        let result = ServerConfig::from_env();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("AUTH_REQUIRED"));
+
+        cleanup_env_vars();
+    }
+
+    #[test]
+    #[serial]
+    fn test_from_env_invalid_numeric_env_fails() {
+        cleanup_env_vars();
+
+        unsafe {
+            env::set_var("RATE_LIMIT_REQUESTS_PER_SECOND", "many");
+        }
+
+        let result = ServerConfig::from_env();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("RATE_LIMIT_REQUESTS_PER_SECOND")
+        );
 
         cleanup_env_vars();
     }

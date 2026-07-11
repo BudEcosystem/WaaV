@@ -2,10 +2,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use google_api_proto::google::cloud::speech::v2::{
-    ExplicitDecodingConfig, PhraseSet, RecognitionConfig, RecognitionFeatures, SpeakerDiarizationConfig,
-    SpeechAdaptation, StreamingRecognitionConfig, StreamingRecognitionFeatures,
-    StreamingRecognizeRequest, StreamingRecognizeResponse, TranscriptNormalization,
-    explicit_decoding_config::AudioEncoding, phrase_set::Phrase,
+    ExplicitDecodingConfig, PhraseSet, RecognitionConfig, RecognitionFeatures,
+    SpeakerDiarizationConfig, SpeechAdaptation, StreamingRecognitionConfig,
+    StreamingRecognitionFeatures, StreamingRecognizeRequest, StreamingRecognizeResponse,
+    TranscriptNormalization, explicit_decoding_config::AudioEncoding, phrase_set::Phrase,
     recognition_features::MultiChannelMode, speech_adaptation::AdaptationPhraseSet,
     speech_adaptation::adaptation_phrase_set::Value as PhraseSetValue,
     streaming_recognition_features::VoiceActivityTimeout,
@@ -32,17 +32,60 @@ pub(super) const KEEPALIVE_INTERVAL_SECS: u64 = 1;
 /// This is short enough to not interfere with speech detection but keeps the stream alive.
 pub(super) const KEEPALIVE_SILENCE_DURATION_MS: u64 = 20;
 
+const BYTES_PER_LINEAR16_SAMPLE: u64 = 2;
+
 /// Generate silent audio bytes for keep-alive.
 /// The size is calculated based on sample rate, channels, and bytes per sample.
 #[inline]
-pub(super) fn generate_silence_audio(sample_rate: u32, channels: u32, duration_ms: u64) -> Bytes {
-    // For LINEAR16, each sample is 2 bytes
-    let bytes_per_sample = 2u32;
-    let num_samples = (sample_rate as u64 * duration_ms / 1000) as usize;
-    let total_bytes = num_samples * channels as usize * bytes_per_sample as usize;
+pub(super) fn generate_silence_audio(
+    sample_rate: u32,
+    channels: u32,
+    duration_ms: u64,
+) -> Result<Bytes, STTError> {
+    let total_bytes = silence_audio_len(sample_rate, channels, duration_ms)?;
 
     // Pre-allocate and fill with zeros (silence for LINEAR16)
-    Bytes::from(vec![0u8; total_bytes])
+    Ok(Bytes::from(vec![0u8; total_bytes]))
+}
+
+pub(super) fn validate_keepalive_audio_geometry(
+    sample_rate: u32,
+    channels: u32,
+) -> Result<(), STTError> {
+    silence_audio_len(sample_rate, channels, KEEPALIVE_SILENCE_DURATION_MS)?;
+    Ok(())
+}
+
+fn silence_audio_len(sample_rate: u32, channels: u32, duration_ms: u64) -> Result<usize, STTError> {
+    if sample_rate == 0 {
+        return Err(STTError::ConfigurationError(
+            "Google STT keepalive sample_rate cannot be zero".to_string(),
+        ));
+    }
+    if channels == 0 {
+        return Err(STTError::ConfigurationError(
+            "Google STT keepalive channels cannot be zero".to_string(),
+        ));
+    }
+
+    let sample_count = u64::from(sample_rate)
+        .checked_mul(duration_ms)
+        .ok_or_else(|| {
+            STTError::ConfigurationError("Google STT keepalive sample count overflowed".to_string())
+        })?
+        / 1000;
+    let total_bytes = sample_count
+        .checked_mul(u64::from(channels))
+        .and_then(|v| v.checked_mul(BYTES_PER_LINEAR16_SAMPLE))
+        .ok_or_else(|| {
+            STTError::ConfigurationError("Google STT keepalive byte size overflowed".to_string())
+        })?;
+
+    usize::try_from(total_bytes).map_err(|_| {
+        STTError::ConfigurationError(
+            "Google STT keepalive byte size exceeds platform limits".to_string(),
+        )
+    })
 }
 
 /// Tracks the last activity time for keep-alive logic.
@@ -76,7 +119,7 @@ impl KeepaliveTracker {
 
     /// Generate keep-alive silence audio.
     #[inline]
-    pub fn generate_keepalive(&self) -> Bytes {
+    pub fn generate_keepalive(&self) -> Result<Bytes, STTError> {
         generate_silence_audio(
             self.sample_rate,
             self.channels,

@@ -156,7 +156,10 @@ mod tests {
         assert!(!m.has_warnings());
 
         // en-US -> elevenlabs "en" (downgrade).
-        assert_eq!(map_language("en-US", "elevenlabs", "eleven_turbo_v2_5").native, "en");
+        assert_eq!(
+            map_language("en-US", "elevenlabs", "eleven_turbo_v2_5").native,
+            "en"
+        );
     }
 
     #[test]
@@ -175,7 +178,10 @@ mod tests {
         assert_eq!(by("deepgram").example_cmn_cn.as_deref(), Some("zh-CN"));
         assert_eq!(by("azure").example_cmn_cn.as_deref(), Some("zh-CN"));
         assert_eq!(by("aws-polly").example_cmn_cn.as_deref(), Some("cmn-CN"));
-        assert_eq!(by("google-stt").example_cmn_cn.as_deref(), Some("cmn-Hans-CN"));
+        assert_eq!(
+            by("google-stt").example_cmn_cn.as_deref(),
+            Some("cmn-Hans-CN")
+        );
         assert_eq!(by("google-tts").example_cmn_cn.as_deref(), Some("cmn-CN"));
         assert_eq!(by("iflytek").example_cmn_cn.as_deref(), Some("zh_cn"));
         assert_eq!(by("baidu").example_cmn_cn.as_deref(), Some("1537"));

@@ -5,6 +5,15 @@
 use crate::core::stt::base::{STTConfig, STTError};
 use serde::{Deserialize, Serialize};
 
+fn validate_huawei_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -646,6 +655,11 @@ impl HuaweiCloudSttConfig {
             )));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_huawei_stt_endpoint("endpoint_override", endpoint)
+                .map_err(STTError::ConfigurationError)?;
+        }
+
         Ok(())
     }
 
@@ -762,8 +776,7 @@ impl HuaweiCloudSttConfig {
         // Parse region from model string suffix (e.g., "chinese_16k_general@cn-north-4")
         let (model_str, region) = if config.model.contains('@') {
             let model_parts: Vec<&str> = config.model.splitn(2, '@').collect();
-            let region =
-                HuaweiCloudRegion::from_str(model_parts[1]).unwrap_or_default();
+            let region = HuaweiCloudRegion::from_str(model_parts[1]).unwrap_or_default();
             (model_parts[0], region)
         } else {
             (config.model.as_str(), HuaweiCloudRegion::default())
@@ -828,6 +841,7 @@ impl HuaweiCloudSttConfig {
             cfg.max_seconds = Some(max_s as u32);
         }
         cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        cfg.validate()?;
         Ok(cfg)
     }
 }
@@ -915,7 +929,7 @@ mod tests {
     // factory.
     #[test]
     fn from_standard_maps_features() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "huawei_cloud".into(),
@@ -1061,6 +1075,42 @@ mod tests {
     fn test_config_validation_valid() {
         let config = HuaweiCloudSttConfig::new("user", "pass", "domain", "project_id");
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = HuaweiCloudSttConfig::new("user", "pass", "domain", "project_id");
+        config.endpoint_override = Some("https://gateway.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:8080".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        config.endpoint_override = Some("wss://gateway.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        let std = crate::core::stt::standard::StandardSTTConfig::from_base(STTConfig {
+            provider: "huawei_cloud".to_string(),
+            api_key: "user|pass|domain|project_id".to_string(),
+            model: "chinese_16k_general".to_string(),
+            encoding: "pcm16k16bit".to_string(),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(HuaweiCloudSttConfig::from_standard(&std).is_err());
     }
 
     #[test]

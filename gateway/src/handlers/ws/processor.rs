@@ -16,9 +16,23 @@ use super::{
     audio_handler::{handle_audio_end, handle_clear_message, handle_speak_message},
     command_handler::{handle_send_message, handle_sip_transfer},
     config_handler::handle_config_message,
-    messages::{IncomingMessage, MessageRoute, OutgoingMessage},
+    messages::{IncomingMessage, MessageClass, MessageRoute, OutgoingMessage, send_with_policy},
     state::ConnectionState,
 };
+
+async fn send_critical(message_tx: &mpsc::Sender<MessageRoute>, route: MessageRoute) {
+    send_with_policy(message_tx, route, MessageClass::Critical).await;
+}
+
+async fn send_error(message_tx: &mpsc::Sender<MessageRoute>, message: impl Into<String>) {
+    send_critical(
+        message_tx,
+        MessageRoute::Outgoing(OutgoingMessage::Error {
+            message: message.into(),
+        }),
+    )
+    .await;
+}
 
 /// Process incoming WebSocket message based on its type
 ///
@@ -52,13 +66,13 @@ pub async fn handle_incoming_message(
             // Only allow Auth messages when auth is pending
             if !matches!(msg, IncomingMessage::Auth { .. }) {
                 warn!("Received non-auth message while auth is pending, rejecting");
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                        message: "Authentication required. Send auth message first.".to_string(),
-                    }))
-                    .await;
+                send_error(
+                    message_tx,
+                    "Authentication required. Send auth message first.",
+                )
+                .await;
                 // Close connection for security
-                let _ = message_tx.send(MessageRoute::Close).await;
+                send_critical(message_tx, MessageRoute::Close).await;
                 return false;
             }
         }
@@ -162,15 +176,56 @@ async fn handle_auth_message(
     message_tx: &mpsc::Sender<MessageRoute>,
     app_state: &Arc<AppState>,
 ) -> bool {
-    // Validate token against configured API secrets
+    // JWT-only deployments (G3): browser WS clients cannot set an Authorization header, and
+    // the middleware admits a tokenless /ws as Auth::pending expecting FIRST-MESSAGE auth — but
+    // this handler previously hard-rejected unless API-SECRET auth was configured, so on a
+    // JWT-only gateway the advertised first-message path always closed the socket (the only
+    // working JWT path was the ?token= query param, which leaks tokens into access logs).
+    // Route a first-message token through the SAME external auth service the HTTP middleware
+    // uses (empty body/headers; the /ws upgrade context).
     if !app_state.config.has_api_secret_auth() {
-        warn!("First-message auth attempted but API secret auth not configured");
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: "API secret authentication not configured".to_string(),
-            }))
-            .await;
-        let _ = message_tx.send(MessageRoute::Close).await;
+        if app_state.config.has_jwt_auth() {
+            let Some(auth_client) = app_state.auth_client.as_ref() else {
+                warn!("First-message JWT auth attempted but auth client not initialized");
+                send_error(message_tx, "Authentication service unavailable").await;
+                send_critical(message_tx, MessageRoute::Close).await;
+                return false;
+            };
+            match auth_client
+                .validate_token(
+                    &token,
+                    &serde_json::Value::Object(serde_json::Map::new()),
+                    std::collections::HashMap::new(),
+                    "/ws",
+                    "GET",
+                )
+                .await
+            {
+                Ok(auth) => {
+                    let auth_id = auth.id.clone();
+                    info!(auth_id = ?auth_id, "First-message JWT authentication successful");
+                    {
+                        let mut conn_state = state.write().await;
+                        conn_state.auth = auth;
+                    }
+                    send_critical(
+                        message_tx,
+                        MessageRoute::Outgoing(OutgoingMessage::Authenticated { id: auth_id }),
+                    )
+                    .await;
+                    return true;
+                }
+                Err(e) => {
+                    warn!(error = %e, "First-message JWT authentication failed");
+                    send_error(message_tx, "Invalid authentication token").await;
+                    send_critical(message_tx, MessageRoute::Close).await;
+                    return false;
+                }
+            }
+        }
+        warn!("First-message auth attempted but no auth mode is configured");
+        send_error(message_tx, "Authentication not configured").await;
+        send_critical(message_tx, MessageRoute::Close).await;
         return false;
     }
 
@@ -186,22 +241,20 @@ async fn handle_auth_message(
         }
 
         // Send authenticated response
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Authenticated {
+        send_critical(
+            message_tx,
+            MessageRoute::Outgoing(OutgoingMessage::Authenticated {
                 id: Some(secret_id_owned),
-            }))
-            .await;
+            }),
+        )
+        .await;
 
         true
     } else {
         warn!("First-message authentication failed: invalid token");
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: "Invalid authentication token".to_string(),
-            }))
-            .await;
+        send_error(message_tx, "Invalid authentication token").await;
         // Close connection on auth failure
-        let _ = message_tx.send(MessageRoute::Close).await;
+        send_critical(message_tx, MessageRoute::Close).await;
         false
     }
 }
@@ -236,11 +289,11 @@ async fn handle_custom_message(
             message_type = %message_type,
             "No handlers registered for custom message type"
         );
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: format!("Unknown custom message type: {}", message_type),
-            }))
-            .await;
+        send_error(
+            message_tx,
+            format!("Unknown custom message type: {}", message_type),
+        )
+        .await;
         return true;
     }
 
@@ -261,31 +314,33 @@ async fn handle_custom_message(
                 // Convert response to outgoing message
                 match response {
                     WSResponse::Json(json) => {
-                        let _ = message_tx
-                            .send(MessageRoute::Outgoing(OutgoingMessage::PluginResponse {
+                        send_critical(
+                            message_tx,
+                            MessageRoute::Outgoing(OutgoingMessage::PluginResponse {
                                 message_type: message_type.clone(),
                                 payload: json,
-                            }))
-                            .await;
+                            }),
+                        )
+                        .await;
                     }
                     WSResponse::Binary(data) => {
-                        let _ = message_tx.send(MessageRoute::Binary(data)).await;
+                        send_critical(message_tx, MessageRoute::Binary(data)).await;
                     }
                     WSResponse::Multiple(responses) => {
                         for resp in responses {
                             match resp {
                                 WSResponse::Json(json) => {
-                                    let _ = message_tx
-                                        .send(MessageRoute::Outgoing(
-                                            OutgoingMessage::PluginResponse {
-                                                message_type: message_type.clone(),
-                                                payload: json,
-                                            },
-                                        ))
-                                        .await;
+                                    send_critical(
+                                        message_tx,
+                                        MessageRoute::Outgoing(OutgoingMessage::PluginResponse {
+                                            message_type: message_type.clone(),
+                                            payload: json,
+                                        }),
+                                    )
+                                    .await;
                                 }
                                 WSResponse::Binary(data) => {
-                                    let _ = message_tx.send(MessageRoute::Binary(data)).await;
+                                    send_critical(message_tx, MessageRoute::Binary(data)).await;
                                 }
                                 WSResponse::Multiple(_) => {
                                     // Don't recurse into nested multiples
@@ -308,11 +363,7 @@ async fn handle_custom_message(
                     error = %e,
                     "Plugin handler failed"
                 );
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                        message: format!("Plugin handler error: {}", e),
-                    }))
-                    .await;
+                send_error(message_tx, format!("Plugin handler error: {}", e)).await;
             }
         }
     }

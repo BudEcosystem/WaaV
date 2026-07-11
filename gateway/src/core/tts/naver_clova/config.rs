@@ -21,6 +21,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::tts::base::{TTSConfig, TTSError};
 
+pub(crate) const CUSTOM_ENDPOINT_EXTRA_KEY: &str = "custom_endpoint";
+const HTTP_ENDPOINT_SCHEMES: &[&str] = &["http", "https"];
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -456,7 +459,9 @@ impl NaverClovaTtsConfig {
     /// [`TtsFeatures::pitch`]: crate::core::tts::standard::TtsFeatures::pitch
     /// [`TtsFeatures::volume`]: crate::core::tts::standard::TtsFeatures::volume
     /// [`from_base`]: Self::from_base
-    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Result<Self, TTSError> {
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
         let f = &std.features;
         let mut cfg = Self::from_base(std.base.clone())?;
 
@@ -481,11 +486,18 @@ impl NaverClovaTtsConfig {
         }
 
         // Provider-specific passthrough.
-        if let Some(endpoint) = std.extras.0.get("custom_endpoint").and_then(|v| v.as_str()) {
+        if let Some(endpoint) = std
+            .extras
+            .0
+            .get(CUSTOM_ENDPOINT_EXTRA_KEY)
+            .and_then(|v| v.as_str())
+        {
             cfg.custom_endpoint = Some(endpoint.to_string());
         }
 
         cfg.endpoint_override = std.endpoint_override().map(String::from);
+
+        cfg.validate()?;
 
         Ok(cfg)
     }
@@ -527,6 +539,17 @@ impl NaverClovaTtsConfig {
             return Err(TTSError::InvalidConfiguration(
                 "Emotion must be between 0 and 2".to_string(),
             ));
+        }
+
+        if let Some(endpoint) = &self.custom_endpoint {
+            validate_custom_endpoint(endpoint)?;
+        }
+
+        if let Some(endpoint) = &self.endpoint_override {
+            let endpoint = endpoint.trim();
+            if !endpoint.is_empty() {
+                validate_http_endpoint("endpoint_override", endpoint)?;
+            }
         }
 
         Ok(())
@@ -592,6 +615,22 @@ impl NaverClovaTtsConfig {
     }
 }
 
+fn validate_custom_endpoint(endpoint: &str) -> Result<(), TTSError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(TTSError::InvalidConfiguration(
+            "custom_endpoint must not be empty".to_string(),
+        ));
+    }
+    validate_http_endpoint("custom_endpoint", endpoint)
+}
+
+fn validate_http_endpoint(source: &str, endpoint: &str) -> Result<(), TTSError> {
+    crate::core::net::validate_url_for_ssrf(endpoint, HTTP_ENDPOINT_SCHEMES).map_err(|msg| {
+        TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}"))
+    })
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -607,7 +646,7 @@ mod tests {
         use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
         let mut extras = serde_json::Map::new();
         extras.insert(
-            "custom_endpoint".into(),
+            CUSTOM_ENDPOINT_EXTRA_KEY.into(),
             serde_json::json!("https://enterprise.example.com/tts"),
         );
         let std = StandardTTSConfig {
@@ -617,7 +656,7 @@ mod tests {
                 ..Default::default()
             },
             features: TtsFeatures {
-                speed: Some(4.0),  // max multiplier -> +5
+                speed: Some(4.0), // max multiplier -> +5
                 pitch: Some(3.0),
                 volume: Some(-2.0),
                 ssml: Some(true), // capability gap: CLOVA has no SSML, must be ignored
@@ -633,6 +672,70 @@ mod tests {
             cfg.custom_endpoint,
             Some("https://enterprise.example.com/tts".to_string())
         ); // extras passthrough
+    }
+
+    #[test]
+    fn custom_endpoint_extra_is_ssrf_checked() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig};
+
+        fn mk(endpoint: &str) -> StandardTTSConfig {
+            let mut extras = serde_json::Map::new();
+            extras.insert(
+                CUSTOM_ENDPOINT_EXTRA_KEY.into(),
+                serde_json::json!(endpoint),
+            );
+            StandardTTSConfig {
+                base: TTSConfig {
+                    provider: "naver-clova".into(),
+                    api_key: "client_id|client_secret".into(),
+                    ..Default::default()
+                },
+                features: Default::default(),
+                extras: ProviderExtras(extras),
+            }
+        }
+
+        assert!(
+            NaverClovaTtsConfig::from_standard(&mk("https://enterprise.example.com/tts")).is_ok()
+        );
+
+        let err = NaverClovaTtsConfig::from_standard(&mk("http://127.0.0.1:9000/tts"))
+            .expect_err("loopback custom_endpoint must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        let err = NaverClovaTtsConfig::from_standard(&mk("file:///tmp/socket"))
+            .expect_err("non-HTTP custom_endpoint must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+    }
+
+    #[test]
+    fn endpoint_override_is_ssrf_checked() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig};
+
+        let mk = |endpoint: &str| {
+            StandardTTSConfig {
+                base: TTSConfig {
+                    provider: "naver-clova".into(),
+                    api_key: "client_id|client_secret".into(),
+                    ..Default::default()
+                },
+                features: Default::default(),
+                extras: ProviderExtras::default(),
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(NaverClovaTtsConfig::from_standard(&mk("https://enterprise.example.com")).is_ok());
+
+        let err = NaverClovaTtsConfig::from_standard(&mk("http://127.0.0.1:9000"))
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        let err = NaverClovaTtsConfig::from_standard(&mk("file:///tmp/socket"))
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
     }
 
     #[test]

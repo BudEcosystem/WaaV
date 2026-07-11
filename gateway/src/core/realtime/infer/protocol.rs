@@ -26,11 +26,12 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 
 use crate::core::realtime::base::{
-    RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult, ReplayConversationItem,
-    SpeechEvent, TranscriptRole,
+    RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult,
+    ReplayConversationItem, SpeechEvent, TranscriptRole,
 };
 use crate::core::realtime::scaffold::{
-    ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol, S2sEvent, apply_endpoint_override,
+    ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol, S2sEvent,
+    apply_endpoint_override,
 };
 use crate::middleware::request_id::is_w3c_traceparent;
 
@@ -83,7 +84,12 @@ impl InferProtocol {
         // (the engine rejects unknown/explicit-null keys on the handshake, §6.1 note on the scaffold).
         // NB: a `system`/instructions prompt is deliberately NEVER sent — an interaction model's persona
         // is intrinsic (§6.4 / §10 D2: the LLM is inside the model), so there is no system-prompt key.
-        if let Some(voice) = cfg.voice.as_deref().filter(|v| !v.is_empty()).or(self.voice.as_deref()) {
+        if let Some(voice) = cfg
+            .voice
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .or(self.voice.as_deref())
+        {
             sc["conditioning"] = json!({ "voice": voice });
         }
         // GW-17 (INFER_GATEWAY_INTEGRATION §13): forward the propagated W3C `traceparent` on the handshake
@@ -204,7 +210,10 @@ impl RealtimeProtocol for InferProtocol {
         match msg_type {
             // Handshake ack → the driver flips `is_ready`.
             "ready" => vec![S2sEvent::SessionReady {
-                session_id: value.get("session_id").and_then(Value::as_str).map(str::to_string),
+                session_id: value
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             }],
             // The interaction model transcribes BOTH the user it heard and the assistant it spoke;
             // `role` disambiguates (the gateway routes to `on_transcript` with the matching role). A
@@ -216,31 +225,58 @@ impl RealtimeProtocol for InferProtocol {
                     Some("user") => TranscriptRole::User,
                     _ => TranscriptRole::Assistant,
                 };
-                let text = value.get("text").and_then(Value::as_str).unwrap_or("").to_string();
-                let is_final = value.get("is_final").and_then(Value::as_bool).unwrap_or(true);
-                vec![S2sEvent::Transcript { role, text, is_final, item_id: None }]
+                let text = value
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let is_final = value
+                    .get("is_final")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                vec![S2sEvent::Transcript {
+                    role,
+                    text,
+                    is_final,
+                    item_id: None,
+                }]
             }
             // A VAD edge the model surfaces (the user started/stopped) — drives `on_speech_event`. For a
             // continuous-duplex model this is informational; the model owns the turn either way.
             "speech_started" => vec![S2sEvent::Speech(SpeechEvent::Started {
-                audio_start_ms: value.get("audio_start_ms").and_then(Value::as_u64).unwrap_or(0),
+                audio_start_ms: value
+                    .get("audio_start_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
                 item_id: None,
             })],
             "speech_stopped" => vec![S2sEvent::Speech(SpeechEvent::Stopped {
-                audio_end_ms: value.get("audio_end_ms").and_then(Value::as_u64).unwrap_or(0),
+                audio_end_ms: value
+                    .get("audio_end_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
                 item_id: None,
             })],
             // The model finished THIS response's audio (generation done — NOT a playout/clear signal,
             // per the truncate invariant). Drives `on_response_done`.
             "response_done" => vec![S2sEvent::ResponseDone {
-                response_id: value.get("response_id").and_then(Value::as_str).unwrap_or("").to_string(),
+                response_id: value
+                    .get("response_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
             }],
             // `chunk_meta` (audio timing) is informational on the bare-binary gateway path — ignore.
             "chunk_meta" => vec![S2sEvent::Ignore],
             // A typed engine error → `on_error` (GW-3 breaker classification).
             "error" => {
-                let msg = value.get("message").and_then(Value::as_str).unwrap_or("Infer S2S error");
-                vec![S2sEvent::Error(RealtimeError::ProviderError(msg.to_string()))]
+                let msg = value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Infer S2S error");
+                vec![S2sEvent::Error(RealtimeError::ProviderError(
+                    msg.to_string(),
+                ))]
             }
             // Keepalive / lifecycle / unknown ⇒ nothing actionable.
             _ => vec![S2sEvent::Ignore],
@@ -255,7 +291,9 @@ impl RealtimeProtocol for InferProtocol {
 
     fn send_text(&self, text: &str) -> Vec<Self::Wire> {
         // A native-S2S model is audio-first; a text user turn is a `speak`-style inject (best-effort).
-        vec![InferWire::Control(json!({ "type": "user_text", "text": text }))]
+        vec![InferWire::Control(
+            json!({ "type": "user_text", "text": text }),
+        )]
     }
 
     fn create_response(&self, _overrides: Option<&RealtimeResponseOverride>) -> Vec<Self::Wire> {
@@ -293,9 +331,11 @@ impl RealtimeProtocol for InferProtocol {
 
     fn serialize(&self, msg: &Self::Wire) -> RealtimeResult<OutFrame> {
         match msg {
-            InferWire::Control(v) => Ok(OutFrame::Text(
-                serde_json::to_string(v).map_err(|e| RealtimeError::SerializationError(e.to_string()))?,
-            )),
+            InferWire::Control(v) => {
+                Ok(OutFrame::Text(serde_json::to_string(v).map_err(|e| {
+                    RealtimeError::SerializationError(e.to_string())
+                })?))
+            }
             // The raw-binary audio path: byte-exact, no JSON / no base64.
             InferWire::Binary(b) => Ok(OutFrame::Binary(b.clone())),
         }
@@ -348,9 +388,18 @@ mod tests {
 
         // ── CAPS: the §6.1/§6.4 keystone — the model owns turns; truncate degrades to clear ──
         let caps = p.caps();
-        assert!(caps.emits_user_turn_frames, "S2S model owns turn-taking ⇒ cascade Smart-Turn bypassed (§6.1)");
-        assert!(!caps.supports_truncate, "a continuous-duplex model has no server-side truncate (§6.4)");
-        assert!(!caps.supports_input_buffer, "full-duplex streams raw audio ⇒ no gateway input buffer");
+        assert!(
+            caps.emits_user_turn_frames,
+            "S2S model owns turn-taking ⇒ cascade Smart-Turn bypassed (§6.1)"
+        );
+        assert!(
+            !caps.supports_truncate,
+            "a continuous-duplex model has no server-side truncate (§6.4)"
+        );
+        assert!(
+            !caps.supports_input_buffer,
+            "full-duplex streams raw audio ⇒ no gateway input buffer"
+        );
         assert_eq!(caps.output_sample_rate, INFER_S2S_SAMPLE_RATE);
 
         // ── OUTBOUND connect → session.config{task:s2s} (the §6.1 handshake) ──
@@ -361,10 +410,16 @@ mod tests {
         assert_eq!(sc["task"], "s2s", "the S2S regime (duplex), not stt/tts");
         assert_eq!(sc["model"], "moshi");
         assert_eq!(sc["audio"]["sample_rate"], INFER_S2S_SAMPLE_RATE);
-        assert_eq!(sc["conditioning"]["voice"], "af_sky", "the assistant voice survives the hop (§5.4)");
+        assert_eq!(
+            sc["conditioning"]["voice"], "af_sky",
+            "the assistant voice survives the hop (§5.4)"
+        );
         // it serializes to a Text frame on the wire.
         match p.serialize(&frames[0]).unwrap() {
-            OutFrame::Text(t) => assert!(t.contains("\"task\":\"s2s\""), "session.config serializes to JSON text"),
+            OutFrame::Text(t) => assert!(
+                t.contains("\"task\":\"s2s\""),
+                "session.config serializes to JSON text"
+            ),
             OutFrame::Binary(_) => panic!("session.config must be a Text frame"),
         }
 
@@ -372,14 +427,20 @@ mod tests {
         let user_pcm = [0xde_u8, 0xad, 0xbe, 0xef];
         let wire = p.encode_user_audio(&user_pcm);
         match p.serialize(&wire).unwrap() {
-            OutFrame::Binary(b) => assert_eq!(b.as_ref(), &user_pcm, "user audio rides the wire byte-exact, no base64"),
+            OutFrame::Binary(b) => assert_eq!(
+                b.as_ref(),
+                &user_pcm,
+                "user audio rides the wire byte-exact, no base64"
+            ),
             OutFrame::Text(_) => panic!("user audio must be a raw binary frame, not JSON"),
         }
 
         // ── INBOUND assistant audio: a raw binary frame → an assistant Audio event (the IN half) ──
         let asst_pcm = [0x00_u8, 0x40, 0x01, 0x80];
         match p.map_server_event(Inbound::Binary(&asst_pcm)).as_slice() {
-            [S2sEvent::Audio { data, .. }] => assert_eq!(data.as_ref(), &asst_pcm, "assistant audio in is byte-exact"),
+            [S2sEvent::Audio { data, .. }] => {
+                assert_eq!(data.as_ref(), &asst_pcm, "assistant audio in is byte-exact")
+            }
             other => panic!("expected one assistant Audio event, got {other:?}"),
         }
 
@@ -388,7 +449,14 @@ mod tests {
             r#"{"type":"transcript","role":"user","text":"what time is it","is_final":true}"#,
         ));
         match user_evt.as_slice() {
-            [S2sEvent::Transcript { role, text, is_final, .. }] => {
+            [
+                S2sEvent::Transcript {
+                    role,
+                    text,
+                    is_final,
+                    ..
+                },
+            ] => {
                 assert_eq!(*role, TranscriptRole::User);
                 assert_eq!(text, "what time is it");
                 assert!(*is_final);
@@ -400,15 +468,24 @@ mod tests {
         ));
         match asst_evt.as_slice() {
             [S2sEvent::Transcript { role, text, .. }] => {
-                assert_eq!(*role, TranscriptRole::Assistant, "the assistant transcript is role-tagged distinctly");
+                assert_eq!(
+                    *role,
+                    TranscriptRole::Assistant,
+                    "the assistant transcript is role-tagged distinctly"
+                );
                 assert_eq!(text, "it is noon");
             }
             other => panic!("expected an assistant transcript, got {other:?}"),
         }
 
         // ── INBOUND handshake ack → SessionReady (flips is_ready) ──
-        match p.map_server_event(Inbound::Text(r#"{"type":"ready","session_id":"s_42"}"#)).as_slice() {
-            [S2sEvent::SessionReady { session_id }] => assert_eq!(session_id.as_deref(), Some("s_42")),
+        match p
+            .map_server_event(Inbound::Text(r#"{"type":"ready","session_id":"s_42"}"#))
+            .as_slice()
+        {
+            [S2sEvent::SessionReady { session_id }] => {
+                assert_eq!(session_id.as_deref(), Some("s_42"))
+            }
             other => panic!("expected SessionReady, got {other:?}"),
         }
 
@@ -417,8 +494,14 @@ mod tests {
         assert_eq!(cancel.len(), 1);
         assert_eq!(control(&cancel[0])["type"], "clear");
         // the model owns turns ⇒ create_response/commit_turn send NOTHING (don't fight intrinsic turns).
-        assert!(p.create_response(None).is_empty(), "the model owns response creation (§6.4)");
-        assert!(p.commit_turn().is_empty(), "the model owns the turn boundary (§6.4)");
+        assert!(
+            p.create_response(None).is_empty(),
+            "the model owns response creation (§6.4)"
+        );
+        assert!(
+            p.commit_turn().is_empty(),
+            "the model owns the turn boundary (§6.4)"
+        );
     }
 
     /// **`infer_protocol_injects_propagated_traceparent`** (GW-17, the gateway INJECTING half): when the
@@ -432,12 +515,19 @@ mod tests {
         const TP: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
         const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
 
-        let traced = RealtimeConfig { trace: Some(TP.to_string()), ..cfg() };
+        let traced = RealtimeConfig {
+            trace: Some(TP.to_string()),
+            ..cfg()
+        };
         let p = InferProtocol::from_config(&traced).unwrap();
 
         // (a) session.config carries the traceparent on the `trace` field, with the gateway's trace id X.
         let sc = control(&p.build_session_config(&traced, None)[0]).clone();
-        assert_eq!(sc["trace"], serde_json::json!(TP), "session.config.trace is the propagated traceparent");
+        assert_eq!(
+            sc["trace"],
+            serde_json::json!(TP),
+            "session.config.trace is the propagated traceparent"
+        );
         assert!(
             sc["trace"].as_str().unwrap().contains(TRACE_ID),
             "the gateway's trace id rides the handshake (one trace spans both halves)"
@@ -454,18 +544,33 @@ mod tests {
 
         // (c) an untraced config injects NOTHING (byte-unchanged untraced handshake).
         let untraced = InferProtocol::from_config(&cfg()).unwrap();
-        assert!(control(&untraced.build_session_config(&cfg(), None)[0]).get("trace").is_none());
+        assert!(
+            control(&untraced.build_session_config(&cfg(), None)[0])
+                .get("trace")
+                .is_none()
+        );
         match untraced.connect_spec(&cfg()).unwrap() {
-            ConnectSpec::WebSocket { headers, .. } => assert!(headers.is_empty(), "no trace ⇒ no header"),
+            ConnectSpec::WebSocket { headers, .. } => {
+                assert!(headers.is_empty(), "no trace ⇒ no header")
+            }
             other => panic!("expected a WebSocket spec, got {other:?}"),
         }
 
         // (d) a MALFORMED traceparent is injected NOWHERE (it would fail the engine's typed deserialize).
-        let bad = RealtimeConfig { trace: Some("not-a-traceparent".into()), ..cfg() };
+        let bad = RealtimeConfig {
+            trace: Some("not-a-traceparent".into()),
+            ..cfg()
+        };
         let pbad = InferProtocol::from_config(&bad).unwrap();
-        assert!(control(&pbad.build_session_config(&bad, None)[0]).get("trace").is_none());
+        assert!(
+            control(&pbad.build_session_config(&bad, None)[0])
+                .get("trace")
+                .is_none()
+        );
         match pbad.connect_spec(&bad).unwrap() {
-            ConnectSpec::WebSocket { headers, .. } => assert!(headers.is_empty(), "malformed ⇒ no header"),
+            ConnectSpec::WebSocket { headers, .. } => {
+                assert!(headers.is_empty(), "malformed ⇒ no header")
+            }
             other => panic!("expected a WebSocket spec, got {other:?}"),
         }
     }
@@ -474,7 +579,10 @@ mod tests {
     /// model to host — an empty model id is a typed `InvalidConfiguration`, not a panic.
     #[test]
     fn infer_protocol_from_config_requires_model() {
-        let bad = RealtimeConfig { model: String::new(), ..cfg() };
+        let bad = RealtimeConfig {
+            model: String::new(),
+            ..cfg()
+        };
         assert!(matches!(
             InferProtocol::from_config(&bad),
             Err(RealtimeError::InvalidConfiguration(_))
@@ -503,7 +611,9 @@ mod tests {
         let mut bad = cfg();
         bad.realtime_endpoint_override = Some("http://evil".into());
         match p.connect_spec(&bad).unwrap() {
-            ConnectSpec::WebSocket { url, .. } => assert_eq!(url, INFER_S2S_URL, "non-ws override ignored"),
+            ConnectSpec::WebSocket { url, .. } => {
+                assert_eq!(url, INFER_S2S_URL, "non-ws override ignored")
+            }
             other => panic!("expected a WebSocket spec, got {other:?}"),
         }
     }
@@ -528,7 +638,9 @@ mod tests {
         let mut blank = cfg();
         blank.realtime_endpoint_override = Some("unix://".into());
         match p.connect_spec(&blank).unwrap() {
-            ConnectSpec::WebSocket { url, .. } => assert_eq!(url, INFER_S2S_URL, "blank unix:// ignored"),
+            ConnectSpec::WebSocket { url, .. } => {
+                assert_eq!(url, INFER_S2S_URL, "blank unix:// ignored")
+            }
             other => panic!("expected a WebSocket spec, got {other:?}"),
         }
 
@@ -539,7 +651,11 @@ mod tests {
             "trims whitespace, strips the scheme"
         );
         assert_eq!(unix_socket_override(Some("ws://x")), None, "ws is not unix");
-        assert_eq!(unix_socket_override(Some("unix://")), None, "blank path rejected");
+        assert_eq!(
+            unix_socket_override(Some("unix://")),
+            None,
+            "blank path rejected"
+        );
         assert_eq!(unix_socket_override(None), None);
         assert_eq!(unix_socket_override(Some("   ")), None);
     }

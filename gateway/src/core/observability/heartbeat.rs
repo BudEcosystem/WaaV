@@ -26,8 +26,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 /// A liveness probe: resolves `true` when the pipeline is responsive.
-pub type LivenessProbe =
-    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+pub type LivenessProbe = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 
 /// Per-session heartbeat configuration.
 #[derive(Clone, Copy, Debug)]
@@ -40,7 +39,10 @@ pub struct HeartbeatConfig {
 
 impl Default for HeartbeatConfig {
     fn default() -> Self {
-        Self { period: Duration::ZERO, timeout: Duration::from_secs(5) }
+        Self {
+            period: Duration::ZERO,
+            timeout: Duration::from_secs(5),
+        }
     }
 }
 
@@ -90,7 +92,9 @@ impl HeartbeatMonitor {
                 }
             }
         });
-        Self { handle: Some(handle) }
+        Self {
+            handle: Some(handle),
+        }
     }
 
     /// Whether a heartbeat task is running (test/observability).
@@ -149,7 +153,10 @@ mod tests {
         let mon = HeartbeatMonitor::spawn(cfg, "s".into(), probe);
         assert!(mon.is_running());
         tokio::time::sleep(Duration::from_millis(90)).await;
-        assert!(probed.load(Ordering::SeqCst) >= 2, "the probe runs each period");
+        assert!(
+            probed.load(Ordering::SeqCst) >= 2,
+            "the probe runs each period"
+        );
         drop(mon);
     }
 
@@ -169,6 +176,9 @@ mod tests {
         };
         let mon = HeartbeatMonitor::spawn(cfg, "s".into(), probe);
         tokio::time::sleep(Duration::from_millis(90)).await;
-        assert!(mon.is_running(), "a wedged stage warns but never kills the monitor");
+        assert!(
+            mon.is_running(),
+            "a wedged stage warns but never kills the monitor"
+        );
     }
 }

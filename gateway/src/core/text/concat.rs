@@ -24,10 +24,16 @@ pub struct TextPart {
 
 impl TextPart {
     pub fn with_spaces(text: impl Into<String>) -> Self {
-        Self { text: text.into(), includes_spaces: true }
+        Self {
+            text: text.into(),
+            includes_spaces: true,
+        }
     }
     pub fn without_spaces(text: impl Into<String>) -> Self {
-        Self { text: text.into(), includes_spaces: false }
+        Self {
+            text: text.into(),
+            includes_spaces: false,
+        }
     }
 }
 

@@ -113,7 +113,12 @@ pub fn negotiate(raw: Option<&str>, direction: &str) -> CodecNegotiation {
             )),
         )
     };
-    CodecNegotiation { requested, effective, warning, echo: true }
+    CodecNegotiation {
+        requested,
+        effective,
+        warning,
+        echo: true,
+    }
 }
 
 /// The five sample rates libopus accepts (Hz). Used to validate/coerce the opus egress rate.
@@ -233,6 +238,9 @@ mod tests {
     #[test]
     fn supported_matches_feature_flag() {
         assert!(AudioCodec::Linear16.is_supported());
-        assert_eq!(AudioCodec::Opus.is_supported(), cfg!(feature = "opus-codec"));
+        assert_eq!(
+            AudioCodec::Opus.is_supported(),
+            cfg!(feature = "opus-codec")
+        );
     }
 }

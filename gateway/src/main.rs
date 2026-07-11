@@ -4,14 +4,14 @@ use std::path::PathBuf;
 #[cfg(feature = "openapi")]
 use std::fs;
 
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use axum::{Router, middleware};
 use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
 use clap::{Parser, Subcommand};
 use http::{
-    HeaderName, Method,
+    HeaderName, HeaderValue, Method,
     header::{AUTHORIZATION, CONTENT_TYPE},
 };
 use tokio::net::TcpListener;
@@ -32,6 +32,34 @@ use waav_gateway::{
 
 #[cfg(feature = "plugins-dynamic")]
 use waav_gateway::plugin::DynamicPluginLoader;
+
+fn parse_cors_allowed_origins(origins: &str) -> anyhow::Result<Vec<HeaderValue>> {
+    let mut parsed = Vec::new();
+
+    for (index, origin) in origins.split(',').enumerate() {
+        let origin = origin.trim();
+        if origin.is_empty() {
+            anyhow::bail!(
+                "Invalid CORS allowed origin at position {}: empty origin",
+                index + 1
+            );
+        }
+
+        let value = HeaderValue::from_str(origin).map_err(|e| {
+            anyhow!(
+                "Invalid CORS allowed origin at position {} ({origin:?}): {e}",
+                index + 1
+            )
+        })?;
+        parsed.push(value);
+    }
+
+    if parsed.is_empty() {
+        anyhow::bail!("CORS allowed origins must contain at least one origin or '*'");
+    }
+
+    Ok(parsed)
+}
 
 /// WaaV Gateway - Real-time voice processing server
 #[derive(Parser, Debug)]
@@ -102,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
                         .map_err(|e| anyhow!("Failed to generate OpenAPI YAML: {}", e))?,
                     "json" => waav_gateway::docs::openapi::spec_json()
                         .map_err(|e| anyhow!("Failed to generate OpenAPI JSON: {}", e))?,
-                    _ => unreachable!(),
+                    other => anyhow::bail!("Invalid format '{}'. Must be 'yaml' or 'json'", other),
                 };
 
                 // Write to file or stdout
@@ -174,7 +202,9 @@ async fn main() -> anyhow::Result<()> {
     println!("Starting server on {address}");
 
     // Create application state
-    let app_state = AppState::new(config).await;
+    let app_state = AppState::try_new(config)
+        .await
+        .map_err(|e| anyhow!("invalid app state config: {e}"))?;
 
     // Create protected API routes with authentication middleware
     let protected_routes = routes::api::create_api_router().layer(middleware::from_fn_with_state(
@@ -275,7 +305,7 @@ async fn main() -> anyhow::Result<()> {
             .burst_size(rate_limit_burst)
             .key_extractor(PeerIpKeyExtractor)
             .finish()
-            .expect("Failed to build rate limiter config");
+            .ok_or_else(|| anyhow!("Failed to build rate limiter config"))?;
         Some(GovernorLayer::new(governor_config))
     };
 
@@ -299,10 +329,7 @@ async fn main() -> anyhow::Result<()> {
                 .allow_credentials(false)
         } else {
             // Parse comma-separated origins
-            let origins: Vec<_> = origins
-                .split(',')
-                .filter_map(|s| s.trim().parse().ok())
-                .collect();
+            let origins = parse_cors_allowed_origins(origins)?;
             CorsLayer::new()
                 .allow_origin(origins)
                 .allow_methods([
@@ -378,7 +405,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Start server with or without TLS
     if is_tls_enabled {
-        let tls = tls_config.expect("TLS config must be present when TLS is enabled");
+        let Some(tls) = tls_config else {
+            anyhow::bail!("TLS is enabled but TLS config is missing");
+        };
 
         // Load TLS configuration from certificate and key files
         let rustls_config = RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
@@ -442,17 +471,23 @@ async fn main() -> anyhow::Result<()> {
 /// Returns when a shutdown signal is received.
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C handler");
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            error!(error = %e, "Failed to install Ctrl+C handler");
+            std::future::pending::<()>().await;
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("Failed to install SIGTERM handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]
@@ -468,4 +503,37 @@ async fn shutdown_signal() {
     }
 
     warn!("Shutdown signal received. Draining connections...");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cors_allowed_origins_accepts_trimmed_origins() {
+        let origins = parse_cors_allowed_origins(" https://app.example , https://admin.example ")
+            .expect("valid CORS origins parse");
+
+        assert_eq!(origins.len(), 2);
+        assert_eq!(origins[0].to_str().unwrap(), "https://app.example");
+        assert_eq!(origins[1].to_str().unwrap(), "https://admin.example");
+    }
+
+    #[test]
+    fn parse_cors_allowed_origins_rejects_empty_entries() {
+        let err = parse_cors_allowed_origins("https://app.example,,https://admin.example")
+            .expect_err("empty CORS entries must fail startup");
+
+        assert!(err.to_string().contains("empty origin"), "{err}");
+    }
+
+    #[test]
+    fn parse_cors_allowed_origins_rejects_malformed_header_values() {
+        let err = parse_cors_allowed_origins("https://app.example,bad\norigin")
+            .expect_err("malformed CORS origins must fail startup");
+
+        let message = err.to_string();
+        assert!(message.contains("position 2"), "{message}");
+        assert!(message.contains("bad\\norigin"), "{message}");
+    }
 }

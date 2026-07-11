@@ -9,6 +9,15 @@ use crate::core::tts::{TTSConfig, TTSError, TTSResult};
 
 use super::{DEFAULT_SAMPLE_RATE, MAX_TEXT_LENGTH_STREAM};
 
+fn validate_resemble_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Model Selection
 // =============================================================================
@@ -468,6 +477,7 @@ impl ResembleTtsConfig {
             cfg.apply_custom_pronunciations = apply;
         }
         cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -477,16 +487,14 @@ impl ResembleTtsConfig {
     /// The voice_id field is used as voice_uuid.
     pub fn from_base(config: &TTSConfig) -> TTSResult<Self> {
         // Get API key from config or environment
-        let api_key = if !config.api_key.is_empty() {
-            config.api_key.clone()
-        } else {
-            std::env::var("RESEMBLE_API_KEY").map_err(|_| {
+        let api_key = crate::core::credentials::explicit_api_key(&config.api_key)
+            .or_else(|| crate::core::credentials::env_api_key("RESEMBLE_API_KEY"))
+            .ok_or_else(|| {
                 TTSError::InvalidConfiguration(
                     "RESEMBLE_API_KEY environment variable not set and no api_key provided"
                         .to_string(),
                 )
-            })?
-        };
+            })?;
 
         // Get voice UUID from voice_id
         let voice_uuid = config
@@ -558,6 +566,11 @@ impl ResembleTtsConfig {
             )));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_resemble_tts_endpoint("endpoint_override", endpoint)
+                .map_err(TTSError::InvalidConfiguration)?;
+        }
+
         Ok(())
     }
 
@@ -603,8 +616,8 @@ mod tests {
     // Resemble-only `project_uuid` / `use_hd` via the open extras passthrough.
     #[test]
     fn from_standard_maps_sample_rate_and_extras() {
-        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
         use crate::core::stt::standard::ProviderExtras;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
 
         let mut extras = serde_json::Map::new();
         extras.insert("project_uuid".into(), serde_json::json!("proj-123"));
@@ -628,6 +641,42 @@ mod tests {
         assert_eq!(cfg.sample_rate, 44100); // mapped feature
         assert_eq!(cfg.project_uuid, Some("proj-123".to_string())); // extras passthrough
         assert!(cfg.use_hd); // extras passthrough
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = ResembleTtsConfig::new("test-key", "voice-uuid");
+
+        config.endpoint_override = Some("https://resemble-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://resemble-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "resemble".to_string(),
+            api_key: "test-key".to_string(),
+            voice_id: Some("voice-uuid".to_string()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(ResembleTtsConfig::from_standard(&std).is_err());
     }
 
     #[test]

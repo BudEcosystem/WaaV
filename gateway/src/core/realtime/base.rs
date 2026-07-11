@@ -910,11 +910,7 @@ mod tests {
             async fn update_session(&mut self, _c: RealtimeConfig) -> RealtimeResult<()> {
                 Ok(())
             }
-            async fn submit_function_result(
-                &mut self,
-                _id: &str,
-                _r: &str,
-            ) -> RealtimeResult<()> {
+            async fn submit_function_result(&mut self, _id: &str, _r: &str) -> RealtimeResult<()> {
                 Ok(())
             }
             fn get_provider_info(&self) -> serde_json::Value {
@@ -924,9 +920,7 @@ mod tests {
                 self.calls.lock().unwrap().push("preroll");
                 Ok(())
             }
-            async fn truncate_current_response(
-                &mut self,
-            ) -> RealtimeResult<Option<(String, u64)>> {
+            async fn truncate_current_response(&mut self) -> RealtimeResult<Option<(String, u64)>> {
                 self.calls.lock().unwrap().push("truncate");
                 Ok(Some(("item_1".into(), 420)))
             }
@@ -934,7 +928,11 @@ mod tests {
 
         // MANUAL mode: the full sequence, exact order.
         let rec = Recorder::default();
-        let mut rt = MockRt { calls: Arc::clone(&rec.0), fail_clear: false, server_vad: false };
+        let mut rt = MockRt {
+            calls: Arc::clone(&rec.0),
+            fail_clear: false,
+            server_vad: false,
+        };
         let truncated = run_barge_in_sequence(&mut rt).await.unwrap();
         assert_eq!(truncated, Some(("item_1".to_string(), 420)));
         assert_eq!(
@@ -945,15 +943,26 @@ mod tests {
 
         // Best-effort: a failed clear must not skip the rest.
         let rec = Recorder::default();
-        let mut rt = MockRt { calls: Arc::clone(&rec.0), fail_clear: true, server_vad: false };
+        let mut rt = MockRt {
+            calls: Arc::clone(&rec.0),
+            fail_clear: true,
+            server_vad: false,
+        };
         let _ = run_barge_in_sequence(&mut rt).await;
-        assert_eq!(*rec.0.lock().unwrap(), vec!["clear", "preroll", "cancel", "truncate"]);
+        assert_eq!(
+            *rec.0.lock().unwrap(),
+            vec!["clear", "preroll", "cancel", "truncate"]
+        );
 
         // review wf_d43814c3 #11: SERVER-VAD mode SKIPS the input-buffer
         // clear+preroll (which would re-trigger the server VAD and destroy
         // user speech); only cancel + truncate run.
         let rec = Recorder::default();
-        let mut rt = MockRt { calls: Arc::clone(&rec.0), fail_clear: false, server_vad: true };
+        let mut rt = MockRt {
+            calls: Arc::clone(&rec.0),
+            fail_clear: false,
+            server_vad: true,
+        };
         let _ = run_barge_in_sequence(&mut rt).await;
         assert_eq!(
             *rec.0.lock().unwrap(),

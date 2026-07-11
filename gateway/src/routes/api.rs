@@ -1,9 +1,12 @@
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{delete, get, post},
 };
 use tower_http::trace::TraceLayer;
 
+use crate::core::stt::batch::BATCH_JSON_BODY_LIMIT_BYTES;
+use crate::handlers::voices::VOICE_CLONE_JSON_BODY_LIMIT_BYTES;
 use crate::handlers::{capabilities, dag, livekit, recording, sip, speak, transcribe, voices};
 use crate::state::AppState;
 use std::sync::Arc;
@@ -15,7 +18,11 @@ pub fn create_api_router() -> Router<Arc<AppState>> {
     Router::new()
         // Protected routes (auth required when AUTH_REQUIRED=true)
         .route("/voices", get(voices::list_voices))
-        .route("/voices/clone", post(voices::clone_voice))
+        .route(
+            "/voices/clone",
+            post(voices::clone_voice)
+                .layer(DefaultBodyLimit::max(VOICE_CLONE_JSON_BODY_LIMIT_BYTES)),
+        )
         .route("/speak", post(speak::speak_handler))
         .route("/livekit/token", post(livekit::generate_token))
         .route("/livekit/rooms", get(livekit::list_rooms))
@@ -42,7 +49,11 @@ pub fn create_api_router() -> Router<Arc<AppState>> {
         .route("/dag/templates/{template_name}", get(dag::get_template))
         .route("/dag/validate", post(dag::validate_dag))
         // P5 batched / async STT: submit a prerecorded job + poll it by id.
-        .route("/transcribe/batch", post(transcribe::submit_batch))
+        .route(
+            "/transcribe/batch",
+            post(transcribe::submit_batch)
+                .layer(DefaultBodyLimit::max(BATCH_JSON_BODY_LIMIT_BYTES)),
+        )
         .route("/transcribe/batch/{job_id}", get(transcribe::get_batch))
         .layer(TraceLayer::new_for_http())
 }

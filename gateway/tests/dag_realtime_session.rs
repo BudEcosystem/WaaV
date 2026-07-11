@@ -35,14 +35,17 @@
 
 #![cfg(feature = "dag-routing")]
 
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use waav_gateway::{
@@ -62,6 +65,47 @@ use waav_gateway::{
     routes,
     state::AppState,
 };
+
+struct TestServer {
+    label: &'static str,
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        if self.panicked.load(Ordering::SeqCst) {
+            let msg = format!("dag_realtime_session server '{}' panicked", self.label);
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+}
+
+fn spawn_test_server<F>(label: &'static str, future: F) -> TestServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let panicked = Arc::new(AtomicBool::new(false));
+    let panicked_in_task = Arc::clone(&panicked);
+    let handle = tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked_in_task.store(true, Ordering::SeqCst);
+            eprintln!("dag_realtime_session server '{label}' panicked");
+        }
+    });
+    TestServer {
+        label,
+        handle,
+        panicked,
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Process-global counters on the mock realtime provider. Statics (not instance
@@ -93,7 +137,11 @@ struct MockStt {
 #[async_trait::async_trait]
 impl BaseSTT for MockStt {
     fn new(_config: STTConfig) -> Result<Self, STTError> {
-        Ok(Self { ready: false, callback: None, turn: AtomicUsize::new(0) })
+        Ok(Self {
+            ready: false,
+            callback: None,
+            turn: AtomicUsize::new(0),
+        })
     }
     async fn connect(&mut self) -> Result<(), STTError> {
         self.ready = true;
@@ -279,9 +327,7 @@ fn register_mock_stt() {
     let registry = global_registry();
     registry.register_stt(
         "mock-stt",
-        Arc::new(|config: STTConfig| {
-            MockStt::new(config).map(|s| Box::new(s) as Box<dyn BaseSTT>)
-        }),
+        Arc::new(|config: STTConfig| MockStt::new(config).map(|s| Box::new(s) as Box<dyn BaseSTT>)),
         ProviderMetadata::stt("mock-stt", "Mock STT"),
     );
 }
@@ -329,9 +375,7 @@ fn register_mock_tts() {
     let registry = global_registry();
     registry.register_tts(
         "mock-tts",
-        Arc::new(|config: TTSConfig| {
-            MockTts::new(config).map(|t| Box::new(t) as Box<dyn BaseTTS>)
-        }),
+        Arc::new(|config: TTSConfig| MockTts::new(config).map(|t| Box::new(t) as Box<dyn BaseTTS>)),
         ProviderMetadata::tts("mock-tts", "Mock TTS"),
     );
 }
@@ -405,9 +449,8 @@ fn test_server_config() -> ServerConfig {
     }
 }
 
-/// Boot the full gateway, return (ws_url, addr). The server task is spawned and
-/// detached (process teardown reclaims it).
-async fn boot_gateway() -> String {
+/// Boot the full gateway and retain its server task for the test scope.
+async fn boot_gateway() -> (String, TestServer) {
     let config = test_server_config();
     let app_state = AppState::new(config).await;
 
@@ -421,11 +464,11 @@ async fn boot_gateway() -> String {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let server = spawn_test_server("gateway", async move {
         axum::serve(listener, app).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
-    format!("ws://127.0.0.1:{}/ws", addr.port())
+    (format!("ws://127.0.0.1:{}/ws", addr.port()), server)
 }
 
 fn realtime_dag_config() -> Value {
@@ -487,7 +530,7 @@ async fn persistent_realtime_dag_reuses_session_streams_audio_and_disconnects_on
     register_mock_tts();
     register_mock_realtime();
 
-    let url = boot_gateway().await;
+    let (url, _server) = boot_gateway().await;
     let (ws_stream, _) = connect_async(url).await.expect("connect");
     let (mut write, mut read) = ws_stream.split();
 
@@ -515,7 +558,10 @@ async fn persistent_realtime_dag_reuses_session_streams_audio_and_disconnects_on
             _ => break,
         }
     }
-    assert!(ready, "gateway never sent `ready` for the realtime DAG session");
+    assert!(
+        ready,
+        "gateway never sent `ready` for the realtime DAG session"
+    );
 
     // Drive THREE turns: one audio frame each → one finalized STT turn each →
     // one persistent-session response each. Collect the audio-marker egress per turn.
@@ -523,7 +569,10 @@ async fn persistent_realtime_dag_reuses_session_streams_audio_and_disconnects_on
     let mut audio_marker_egresses = 0usize;
     for t in 0..TURNS {
         let audio_frame = vec![0u8; 3200]; // 100ms 16k/16-bit mono silence
-        write.send(Message::Binary(audio_frame.into())).await.unwrap();
+        write
+            .send(Message::Binary(audio_frame.into()))
+            .await
+            .unwrap();
 
         // Wait until THIS turn's audio marker rides back over the WS.
         let mut got = false;
@@ -531,7 +580,10 @@ async fn persistent_realtime_dag_reuses_session_streams_audio_and_disconnects_on
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_secs(5), read.next()).await {
                 Ok(Some(Ok(Message::Binary(bytes)))) => {
-                    if bytes.windows(RT_AUDIO_MARKER.len()).any(|w| w == RT_AUDIO_MARKER) {
+                    if bytes
+                        .windows(RT_AUDIO_MARKER.len())
+                        .any(|w| w == RT_AUDIO_MARKER)
+                    {
                         got = true;
                         audio_marker_egresses += 1;
                         break;
@@ -543,7 +595,10 @@ async fn persistent_realtime_dag_reuses_session_streams_audio_and_disconnects_on
                 Err(_) => break,
             }
         }
-        assert!(got, "turn {t}: expected the realtime audio marker to ride back through the DAG audio_output sink");
+        assert!(
+            got,
+            "turn {t}: expected the realtime audio marker to ride back through the DAG audio_output sink"
+        );
     }
 
     // (b) audio rode back, once per turn.

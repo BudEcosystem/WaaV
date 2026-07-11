@@ -32,7 +32,9 @@ use crate::core::realtime::base::{
     RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult, ReplayConversationItem,
 };
 use crate::core::realtime::openai::ClientEvent;
-use crate::core::realtime::scaffold::{ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol, S2sEvent};
+use crate::core::realtime::scaffold::{
+    ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol, S2sEvent,
+};
 
 /// Yandex Cloud AI Studio Realtime WebSocket base URL. The OpenAI SDK opens
 /// `<websocket_base_url>/realtime?model=<MODEL>`; with `websocket_base_url` =
@@ -381,11 +383,17 @@ mod tests {
         // Auth rides the standard `Authorization` header — NOT a separate Azure-style
         // `api-key` HEADER key.
         assert!(
-            !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("api-key")),
+            !headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("api-key")),
             "Yandex uses the Authorization header, not the Azure api-key header"
         );
         // The `realtime` WS subprotocol matches OpenAI.
-        assert!(headers.iter().any(|(k, v)| k == "Sec-WebSocket-Protocol" && v == "realtime"));
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "Sec-WebSocket-Protocol" && v == "realtime")
+        );
     }
 
     /// SERVER-CONFIG `realtime_endpoint_override` WINS over the Yandex host
@@ -397,15 +405,18 @@ mod tests {
             realtime_endpoint_override: Some("ws://127.0.0.1:9005/yandex".into()),
             ..base_cfg()
         };
-        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap() else {
+        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap()
+        else {
             panic!("expected WebSocket")
         };
         assert_eq!(url, "ws://127.0.0.1:9005/yandex");
         // base_cfg's static key ("iam-token", not `t1.`) ⇒ Api-Key; the auth header
         // rides along unchanged when the override wins.
-        assert!(headers
-            .iter()
-            .any(|(k, v)| k == "Authorization" && v == "Api-Key iam-token"));
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "Authorization" && v == "Api-Key iam-token")
+        );
     }
 
     /// Delegation smoke test: session.update + audio append produce the SAME GA

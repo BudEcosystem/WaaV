@@ -6,6 +6,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 import base64
 
+from bud_waav.errors import APIError
 from bud_waav.rest.client import RestClient
 
 
@@ -92,38 +93,34 @@ class TestVoiceCloning:
 
     @pytest.mark.asyncio
     async def test_delete_cloned_voice(self, client):
-        """Should delete a cloned voice."""
+        """Fail-fast: the gateway serves no DELETE /voices/{id} route — a typed
+        501 APIError is raised immediately instead of a confusing network 404."""
         client.delete = AsyncMock(return_value=None)
 
-        await client.delete_cloned_voice(
-            voice_id="voice_123",
-            provider="elevenlabs",
-        )
+        with pytest.raises(APIError) as excinfo:
+            await client.delete_cloned_voice(
+                voice_id="voice_123",
+                provider="elevenlabs",
+            )
 
-        client.delete.assert_called_once()
-        call_args = client.delete.call_args
-        assert call_args[0][0] == "/voices/voice_123"
-        assert call_args[1]["params"]["provider"] == "elevenlabs"
+        assert excinfo.value.status_code == 501
+        assert "not supported" in str(excinfo.value)
+        client.delete.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_get_cloned_voice(self, client):
-        """Should get a cloned voice by ID."""
-        client.get = AsyncMock(
-            return_value={
-                "voice_id": "voice_123",
-                "name": "My Voice",
-                "provider": "elevenlabs",
-                "is_cloned": True,
-            }
-        )
+        """Fail-fast: the gateway serves no GET /voices/{id} route — a typed
+        501 APIError is raised immediately."""
+        client.get = AsyncMock(return_value={})
 
-        result = await client.get_cloned_voice(
-            voice_id="voice_123",
-            provider="elevenlabs",
-        )
+        with pytest.raises(APIError) as excinfo:
+            await client.get_cloned_voice(
+                voice_id="voice_123",
+                provider="elevenlabs",
+            )
 
-        assert result["voice_id"] == "voice_123"
-        client.get.assert_called_once()
+        assert excinfo.value.status_code == 501
+        client.get.assert_not_called()
 
 
 class TestRecordings:
@@ -136,22 +133,15 @@ class TestRecordings:
 
     @pytest.mark.asyncio
     async def test_get_recording(self, client):
-        """Should get recording info by stream ID."""
-        client.get = AsyncMock(
-            return_value={
-                "stream_id": "stream_123",
-                "status": "ready",
-                "duration_ms": 5000,
-                "format": "wav",
-                "size_bytes": 100000,
-            }
-        )
+        """get_recording is a deprecated alias of download_recording — it must hit
+        the SERVED route GET /recording/{id} (singular; the old plural path 404'd)."""
+        audio_data = b"\x00\x01" * 500
+        client.get = AsyncMock(return_value=audio_data)
 
         result = await client.get_recording(stream_id="stream_123")
 
-        assert result["stream_id"] == "stream_123"
-        assert result["status"] == "ready"
-        client.get.assert_called_once_with("/recordings/stream_123")
+        assert result == audio_data
+        client.get.assert_called_once_with("/recording/stream_123")
 
     @pytest.mark.asyncio
     async def test_download_recording(self, client):
@@ -166,69 +156,25 @@ class TestRecordings:
 
     @pytest.mark.asyncio
     async def test_list_recordings(self, client):
-        """Should list recordings with filters."""
-        client.get = AsyncMock(
-            return_value={
-                "recordings": [
-                    {"stream_id": "s1", "status": "ready"},
-                    {"stream_id": "s2", "status": "ready"},
-                ],
-                "total": 2,
-                "limit": 50,
-                "offset": 0,
-                "has_more": False,
-            }
-        )
+        """Fail-fast: the gateway serves no GET /recordings route — typed 501."""
+        client.get = AsyncMock(return_value={})
 
-        result = await client.list_recordings(
-            limit=50,
-            offset=0,
-            status="ready",
-        )
+        with pytest.raises(APIError) as excinfo:
+            await client.list_recordings(limit=10)
 
-        assert len(result["recordings"]) == 2
-        assert result["has_more"] is False
-
-        client.get.assert_called_once()
-        call_args = client.get.call_args
-        assert call_args[0][0] == "/recordings"
-        params = call_args[1]["params"]
-        assert params["limit"] == 50
-        assert params["offset"] == 0
-        assert params["status"] == "ready"
-
-    @pytest.mark.asyncio
-    async def test_list_recordings_with_date_filter(self, client):
-        """Should list recordings filtered by date."""
-        client.get = AsyncMock(
-            return_value={
-                "recordings": [],
-                "total": 0,
-                "limit": 50,
-                "offset": 0,
-                "has_more": False,
-            }
-        )
-
-        await client.list_recordings(
-            from_date="2024-01-01T00:00:00Z",
-            to_date="2024-01-31T23:59:59Z",
-        )
-
-        client.get.assert_called_once()
-        call_args = client.get.call_args
-        params = call_args[1]["params"]
-        assert params["from_date"] == "2024-01-01T00:00:00Z"
-        assert params["to_date"] == "2024-01-31T23:59:59Z"
+        assert excinfo.value.status_code == 501
+        client.get.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_delete_recording(self, client):
-        """Should delete a recording."""
+        """Fail-fast: the gateway serves no DELETE /recordings/{id} route — typed 501."""
         client.delete = AsyncMock(return_value=None)
 
-        await client.delete_recording(stream_id="stream_123")
+        with pytest.raises(APIError) as excinfo:
+            await client.delete_recording(stream_id="stream_123")
 
-        client.delete.assert_called_once_with("/recordings/stream_123")
+        assert excinfo.value.status_code == 501
+        client.delete.assert_not_called()
 
 
 class TestDAGMethods:

@@ -187,7 +187,8 @@ impl DAGCompiler {
             .map(|id| {
                 node_index
                     .get(id)
-                    .ok_or_else(|| DAGError::ExitNodeNotFound(id.clone())).copied()
+                    .ok_or_else(|| DAGError::ExitNodeNotFound(id.clone()))
+                    .copied()
             })
             .collect::<DAGResult<Vec<_>>>()?;
 
@@ -376,9 +377,9 @@ impl DAGCompiler {
                     && let Ok(parsed_tools) = serde_json::from_value::<
                         Vec<super::nodes::ToolDefinition>,
                     >(tools_json.clone())
-                    {
-                        llm_config.tools = Some(parsed_tools);
-                    }
+                {
+                    llm_config.tools = Some(parsed_tools);
+                }
 
                 // Use try_new() for SSRF protection on the client-supplied base_url.
                 Arc::new(LlmEndpointNode::try_new(&def.id, llm_config)?)
@@ -456,24 +457,24 @@ impl DAGCompiler {
                     // looping (array iteration), so allow it for the syntax check.
                     let mut check_engine = create_rhai_engine();
                     check_engine.set_allow_looping(true);
-                    check_engine.compile(s).map_err(|e| {
-                        DAGError::ExpressionCompilationError {
+                    check_engine
+                        .compile(s)
+                        .map_err(|e| DAGError::ExpressionCompilationError {
                             expression: s.clone(),
                             error: format!("Join '{}' selector: {}", def.id, e),
-                        }
-                    })?;
+                        })?;
                     node = node.with_selector(s);
                 }
                 if let Some(m) = merge_script {
                     // Validate the merge script compiles at compile time.
                     let mut check_engine = create_rhai_engine();
                     check_engine.set_allow_looping(true);
-                    check_engine.compile(m).map_err(|e| {
-                        DAGError::ExpressionCompilationError {
+                    check_engine
+                        .compile(m)
+                        .map_err(|e| DAGError::ExpressionCompilationError {
                             expression: m.clone(),
                             error: format!("Join '{}' merge_script: {}", def.id, e),
-                        }
-                    })?;
+                        })?;
                     node = node.with_merge_script(m);
                 }
                 Arc::new(node)
@@ -845,6 +846,7 @@ mod tests {
     /// must be rejected at compile time.
     #[test]
     fn test_llm_base_url_ssrf_rejected_at_compile() {
+        let _env = crate::core::net::ssrf_env_lock();
         let compiler = DAGCompiler::new();
         let mut dag = DAGDefinition::new("ssrf-llm", "SSRF LLM");
         dag.add_node(NodeDefinition::new("input", NodeType::TextInput));
@@ -888,6 +890,7 @@ mod tests {
     /// at compile time.
     #[test]
     fn test_grpc_address_ssrf_rejected_at_compile() {
+        let _env = crate::core::net::ssrf_env_lock();
         let compiler = DAGCompiler::new();
         let mut dag = DAGDefinition::new("ssrf-grpc", "SSRF gRPC");
         dag.add_node(NodeDefinition::new("input", NodeType::TextInput));
@@ -935,11 +938,11 @@ mod tests {
         dag.add_exit("output");
 
         let result = compiler.compile(dag);
-        assert!(result.is_err(), "split referencing unknown branch must fail");
-        assert!(matches!(
-            result.unwrap_err(),
-            DAGError::InvalidStructure(_)
-        ));
+        assert!(
+            result.is_err(),
+            "split referencing unknown branch must fail"
+        );
+        assert!(matches!(result.unwrap_err(), DAGError::InvalidStructure(_)));
     }
 
     /// A Router route targeting a non-existent node must fail compile.
@@ -962,11 +965,11 @@ mod tests {
         dag.add_exit("output");
 
         let result = compiler.compile(dag);
-        assert!(result.is_err(), "router referencing unknown target must fail");
-        assert!(matches!(
-            result.unwrap_err(),
-            DAGError::InvalidStructure(_)
-        ));
+        assert!(
+            result.is_err(),
+            "router referencing unknown target must fail"
+        );
+        assert!(matches!(result.unwrap_err(), DAGError::InvalidStructure(_)));
     }
 
     /// A node unreachable from the entry must fail compile.
@@ -984,10 +987,7 @@ mod tests {
 
         let result = compiler.compile(dag);
         assert!(result.is_err(), "unreachable node must fail compile");
-        assert!(matches!(
-            result.unwrap_err(),
-            DAGError::InvalidStructure(_)
-        ));
+        assert!(matches!(result.unwrap_err(), DAGError::InvalidStructure(_)));
     }
 
     /// A Join node whose merge_script has a syntax error must fail compile
@@ -1108,16 +1108,14 @@ mod tests {
         let compiler = DAGCompiler::new();
         let mut dag = DAGDefinition::new("stt-translate-tts", "EN→HI uniform");
         dag.add_node(NodeDefinition::new("input", NodeType::AudioInput));
-        dag.add_node(
-            NodeDefinition::new(
-                "stt",
-                NodeType::SttProvider {
-                    provider: "deepgram".to_string(),
-                    model: Some("nova-2".to_string()),
-                    language: Some("en-US".to_string()),
-                },
-            ),
-        );
+        dag.add_node(NodeDefinition::new(
+            "stt",
+            NodeType::SttProvider {
+                provider: "deepgram".to_string(),
+                model: Some("nova-2".to_string()),
+                language: Some("en-US".to_string()),
+            },
+        ));
         dag.add_node(def); // the translate node parsed above
         dag.add_node(NodeDefinition::new(
             "tts",
@@ -1143,6 +1141,7 @@ mod tests {
     /// and an SSRF-unsafe base_url is rejected (it reuses the LlmEndpoint SSRF guard).
     #[test]
     fn test_translate_node_custom_prompt_and_ssrf_guard() {
+        let _env = crate::core::net::ssrf_env_lock();
         use crate::core::lang::CanonicalLanguage;
         let node = NodeType::Translate {
             target_language: CanonicalLanguage::FrFr,

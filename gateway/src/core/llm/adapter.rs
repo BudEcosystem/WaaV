@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::{
     ChatCompletionChunk, ChatCompletionResponse, ChatMessage, FunctionCall, LlmClientConfig,
@@ -127,14 +127,22 @@ impl ReasoningEffort {
 
     /// Raise `self` to at least `floor`.
     pub fn clamp_to_floor(self, floor: Self) -> Self {
-        if self.rank() >= floor.rank() { self } else { floor }
+        if self.rank() >= floor.rank() {
+            self
+        } else {
+            floor
+        }
     }
 
     /// Single source of truth: returns `(applied, floor)` where `applied` is the
     /// floor-clamped value to actually send (`None` when nothing was requested →
     /// vendor default, no param emitted) and `floor` is always the model's floor
     /// (for the session-ack echo).
-    pub fn resolve(model: &str, kind: AdapterKind, requested: Option<Self>) -> (Option<Self>, Self) {
+    pub fn resolve(
+        model: &str,
+        kind: AdapterKind,
+        requested: Option<Self>,
+    ) -> (Option<Self>, Self) {
         let floor = Self::floor_for_model(model, kind);
         (requested.map(|r| r.clamp_to_floor(floor)), floor)
     }
@@ -194,7 +202,10 @@ pub(crate) fn is_openai_reasoning_model(model: &str) -> bool {
     // gpt-5 .. gpt-9 families — future-proofs gpt-5.x → gpt-6/7/8/9. `gpt-4o`
     // resolves to digit `4` here and is correctly excluded.
     if let Some(rest) = m.strip_prefix("gpt-")
-        && rest.as_bytes().first().is_some_and(|b| (b'5'..=b'9').contains(b))
+        && rest
+            .as_bytes()
+            .first()
+            .is_some_and(|b| (b'5'..=b'9').contains(b))
     {
         return true;
     }
@@ -240,7 +251,10 @@ pub struct RenderedRequest {
 #[derive(Debug, Clone)]
 pub enum LlmStreamEvent {
     /// Completion/message identifiers (first occurrence wins at the client).
-    Meta { id: Option<String>, model: Option<String> },
+    Meta {
+        id: Option<String>,
+        model: Option<String>,
+    },
     /// A text content delta (feeds the token callback / sentence aggregator).
     TextDelta(String),
     /// A tool-call fragment. `index` correlates fragments of the same call;
@@ -385,7 +399,9 @@ fn strip_additional_properties(v: &Value) -> Value {
                 .map(|(k, val)| (k.clone(), strip_additional_properties(val)))
                 .collect(),
         ),
-        Value::Array(items) => Value::Array(items.iter().map(strip_additional_properties).collect()),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(strip_additional_properties).collect())
+        }
         other => other.clone(),
     }
 }
@@ -396,6 +412,31 @@ fn parse_args_object(arguments: &str) -> Value {
         // argument string is preserved rather than dropped.
         json!({ "_raw": arguments })
     })
+}
+
+fn request_body_object_mut<'a>(
+    body: &'a mut Value,
+    adapter: AdapterKind,
+) -> Option<&'a mut serde_json::Map<String, Value>> {
+    let obj = body.as_object_mut();
+    if obj.is_none() {
+        tracing::error!(
+            adapter = adapter.as_str(),
+            "LLM adapter constructed a non-object request body; optional fields were not applied"
+        );
+    }
+    obj
+}
+
+fn openai_headers(cfg: &LlmClientConfig, api_key: Option<&str>) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
+    if let Some(key) = api_key {
+        headers.push(("Authorization".into(), format!("Bearer {key}")));
+    }
+    if let Some(org) = &cfg.organization {
+        headers.push(("OpenAI-Organization".into(), org.clone()));
+    }
+    headers
 }
 
 // =============================================================================
@@ -429,7 +470,13 @@ impl LlmAdapter for OpenAiAdapter {
             "messages": messages,
             "stream": stream,
         });
-        let obj = body.as_object_mut().expect("object literal");
+        let Some(obj) = request_body_object_mut(&mut body, self.kind()) else {
+            return RenderedRequest {
+                url: format!("{}/chat/completions", cfg.base_url.trim_end_matches('/')),
+                headers: openai_headers(cfg, api_key),
+                body,
+            };
+        };
         // OpenAI REASONING models (o-series, gpt-5) use a DISTINCT request shape:
         // they REQUIRE `max_completion_tokens` (a `max_tokens` is a hard 400 —
         // live-verified) and reject sampling params (temperature/top_p — only the
@@ -469,13 +516,19 @@ impl LlmAdapter for OpenAiAdapter {
             }
         }
         if let Some(tools) = &cfg.tools {
-            obj.insert("tools".into(), serde_json::to_value(tools).unwrap_or(Value::Null));
+            obj.insert(
+                "tools".into(),
+                serde_json::to_value(tools).unwrap_or(Value::Null),
+            );
         }
         if let Some(tc) = &cfg.tool_choice {
             obj.insert("tool_choice".into(), tc.clone());
         }
         if let Some(rf) = &cfg.response_format {
-            obj.insert("response_format".into(), serde_json::to_value(rf).unwrap_or(Value::Null));
+            obj.insert(
+                "response_format".into(),
+                serde_json::to_value(rf).unwrap_or(Value::Null),
+            );
         }
         if let Some(stop) = &cfg.stop {
             obj.insert("stop".into(), json!(stop));
@@ -510,13 +563,7 @@ impl LlmAdapter for OpenAiAdapter {
             obj.insert(k.clone(), v.clone());
         }
 
-        let mut headers = Vec::new();
-        if let Some(key) = api_key {
-            headers.push(("Authorization".into(), format!("Bearer {key}")));
-        }
-        if let Some(org) = &cfg.organization {
-            headers.push(("OpenAI-Organization".into(), org.clone()));
-        }
+        let headers = openai_headers(cfg, api_key);
 
         RenderedRequest {
             url: format!("{}/chat/completions", cfg.base_url.trim_end_matches('/')),
@@ -709,7 +756,9 @@ impl LlmAdapter for AnthropicAdapter {
     ) -> RenderedRequest {
         let (system, rest) = split_system(messages);
         // A lone system message was returned in `rest`: render it as user.
-        let converted = if system.is_none() && rest.len() == 1 && rest[0].role == MessageRole::System
+        let converted = if system.is_none()
+            && rest.len() == 1
+            && rest[0].role == MessageRole::System
         {
             vec![json!({
                 "role": "user",
@@ -727,7 +776,24 @@ impl LlmAdapter for AnthropicAdapter {
             "max_tokens": cfg.max_tokens.unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS),
             "stream": stream,
         });
-        let obj = body.as_object_mut().expect("object literal");
+
+        // Base URL handling: canonical "https://api.anthropic.com" →
+        // "/v1/messages"; a base already ending in "/v1" → "/messages".
+        let base = cfg.base_url.trim_end_matches('/');
+        let url = if base.ends_with("/v1") {
+            format!("{base}/messages")
+        } else {
+            format!("{base}/v1/messages")
+        };
+
+        let mut headers = vec![("anthropic-version".into(), ANTHROPIC_VERSION.into())];
+        if let Some(key) = api_key {
+            headers.push(("x-api-key".into(), key.to_string()));
+        }
+
+        let Some(obj) = request_body_object_mut(&mut body, self.kind()) else {
+            return RenderedRequest { url, headers, body };
+        };
         if let Some(sys) = system {
             obj.insert("system".into(), json!(sys));
         }
@@ -784,20 +850,6 @@ impl LlmAdapter for AnthropicAdapter {
             obj.insert(k.clone(), v.clone());
         }
 
-        // Base URL handling: canonical "https://api.anthropic.com" →
-        // "/v1/messages"; a base already ending in "/v1" → "/messages".
-        let base = cfg.base_url.trim_end_matches('/');
-        let url = if base.ends_with("/v1") {
-            format!("{base}/messages")
-        } else {
-            format!("{base}/v1/messages")
-        };
-
-        let mut headers = vec![("anthropic-version".into(), ANTHROPIC_VERSION.into())];
-        if let Some(key) = api_key {
-            headers.push(("x-api-key".into(), key.to_string()));
-        }
-
         RenderedRequest { url, headers, body }
     }
 
@@ -841,7 +893,10 @@ impl LlmAdapter for AnthropicAdapter {
                     vec![LlmStreamEvent::ToolCallDelta {
                         index,
                         id: block.get("id").and_then(Value::as_str).map(str::to_string),
-                        name: block.get("name").and_then(Value::as_str).map(str::to_string),
+                        name: block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
                         args_delta: None,
                     }]
                 } else {
@@ -893,7 +948,10 @@ impl LlmAdapter for AnthropicAdapter {
             // A mid-stream error (overloaded_error, api_error…) must surface
             // as an error, not a silent truncation of the reply.
             "error" => {
-                let detail = v.get("error").map(|e| e.to_string()).unwrap_or_else(|| data.to_string());
+                let detail = v
+                    .get("error")
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| data.to_string());
                 vec![LlmStreamEvent::Error(detail)]
             }
             // "ping", "content_block_stop" are intentionally inert.
@@ -902,11 +960,24 @@ impl LlmAdapter for AnthropicAdapter {
     }
 
     fn parse_response(&self, body: Value) -> Result<ParsedCompletion, String> {
-        let id = body.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
-        let model = body.get("model").and_then(Value::as_str).unwrap_or_default().to_string();
+        let id = body
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         let mut text = String::new();
         let mut tool_calls = Vec::new();
-        for block in body.get("content").and_then(Value::as_array).into_iter().flatten() {
+        for block in body
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             match block.get("type").and_then(Value::as_str) {
                 Some("text") => {
                     if let Some(t) = block.get("text").and_then(Value::as_str) {
@@ -914,7 +985,11 @@ impl LlmAdapter for AnthropicAdapter {
                     }
                 }
                 Some("tool_use") => tool_calls.push(ToolCall {
-                    id: block.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    id: block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
                     call_type: "function".into(),
                     function: FunctionCall {
                         name: block
@@ -946,7 +1021,11 @@ impl LlmAdapter for AnthropicAdapter {
             role: MessageRole::Assistant,
             content: if text.is_empty() { None } else { Some(text) },
             name: None,
-            tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls.clone()) },
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls.clone())
+            },
             tool_call_id: None,
             function_call: None,
         };
@@ -1068,9 +1147,35 @@ impl LlmAdapter for GeminiAdapter {
         let mut body = json!({
             "contents": Self::convert_contents(&rest),
         });
-        let obj = body.as_object_mut().expect("object literal");
+
+        // Canonical base "https://generativelanguage.googleapis.com" →
+        // "/v1beta/models/{model}:method"; a base ending in "/v1beta" keeps it.
+        let base = cfg.base_url.trim_end_matches('/');
+        let prefix = if base.ends_with("/v1beta") || base.ends_with("/v1") {
+            base.to_string()
+        } else {
+            format!("{base}/v1beta")
+        };
+        let method = if stream {
+            "streamGenerateContent?alt=sse"
+        } else {
+            "generateContent"
+        };
+        let url = format!("{prefix}/models/{}:{method}", cfg.model);
+
+        let mut headers = Vec::new();
+        if let Some(key) = api_key {
+            headers.push(("x-goog-api-key".into(), key.to_string()));
+        }
+
+        let Some(obj) = request_body_object_mut(&mut body, self.kind()) else {
+            return RenderedRequest { url, headers, body };
+        };
         if let Some(sys) = system {
-            obj.insert("systemInstruction".into(), json!({ "parts": [{ "text": sys }] }));
+            obj.insert(
+                "systemInstruction".into(),
+                json!({ "parts": [{ "text": sys }] }),
+            );
         }
 
         let mut generation_config = serde_json::Map::new();
@@ -1128,26 +1233,13 @@ impl LlmAdapter for GeminiAdapter {
                     })
                 })
                 .collect();
-            obj.insert("tools".into(), json!([{ "functionDeclarations": declarations }]));
+            obj.insert(
+                "tools".into(),
+                json!([{ "functionDeclarations": declarations }]),
+            );
         }
         for (k, v) in &cfg.extra {
             obj.insert(k.clone(), v.clone());
-        }
-
-        // Canonical base "https://generativelanguage.googleapis.com" →
-        // "/v1beta/models/{model}:method"; a base ending in "/v1beta" keeps it.
-        let base = cfg.base_url.trim_end_matches('/');
-        let prefix = if base.ends_with("/v1beta") || base.ends_with("/v1") {
-            base.to_string()
-        } else {
-            format!("{base}/v1beta")
-        };
-        let method = if stream { "streamGenerateContent?alt=sse" } else { "generateContent" };
-        let url = format!("{prefix}/models/{}:{method}", cfg.model);
-
-        let mut headers = Vec::new();
-        if let Some(key) = api_key {
-            headers.push(("x-goog-api-key".into(), key.to_string()));
         }
 
         RenderedRequest { url, headers, body }
@@ -1163,7 +1255,10 @@ impl LlmAdapter for GeminiAdapter {
         };
         let mut events = Vec::new();
         if let Some(model) = v.get("modelVersion").and_then(Value::as_str) {
-            events.push(LlmStreamEvent::Meta { id: None, model: Some(model.to_string()) });
+            events.push(LlmStreamEvent::Meta {
+                id: None,
+                model: Some(model.to_string()),
+            });
         }
         if let Some(candidate) = v.pointer("/candidates/0") {
             for part in candidate
@@ -1196,9 +1291,14 @@ impl LlmAdapter for GeminiAdapter {
             }
         }
         if let Some(meta) = v.get("usageMetadata") {
-            let prompt = meta.get("promptTokenCount").and_then(Value::as_u64).unwrap_or(0) as u32;
-            let completion =
-                meta.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0) as u32;
+            let prompt = meta
+                .get("promptTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            let completion = meta
+                .get("candidatesTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
             let total = meta
                 .get("totalTokenCount")
                 .and_then(Value::as_u64)
@@ -1215,7 +1315,9 @@ impl LlmAdapter for GeminiAdapter {
     }
 
     fn parse_response(&self, body: Value) -> Result<ParsedCompletion, String> {
-        let candidate = body.pointer("/candidates/0").ok_or("no candidates in response")?;
+        let candidate = body
+            .pointer("/candidates/0")
+            .ok_or("no candidates in response")?;
         let mut text = String::new();
         let mut tool_calls = Vec::new();
         for (i, part) in candidate
@@ -1242,15 +1344,23 @@ impl LlmAdapter for GeminiAdapter {
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_string(),
-                        arguments: call.get("args").map(|a| a.to_string()).unwrap_or_else(|| "{}".into()),
+                        arguments: call
+                            .get("args")
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|| "{}".into()),
                     },
                 });
             }
         }
         let usage = body.get("usageMetadata").map(|meta| {
-            let prompt = meta.get("promptTokenCount").and_then(Value::as_u64).unwrap_or(0) as u32;
-            let completion =
-                meta.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0) as u32;
+            let prompt = meta
+                .get("promptTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            let completion = meta
+                .get("candidatesTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
             Usage {
                 prompt_tokens: prompt,
                 completion_tokens: completion,
@@ -1266,7 +1376,11 @@ impl LlmAdapter for GeminiAdapter {
             role: MessageRole::Assistant,
             content: if text.is_empty() { None } else { Some(text) },
             name: None,
-            tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls.clone()) },
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls.clone())
+            },
             tool_call_id: None,
             function_call: None,
         };
@@ -1364,10 +1478,11 @@ mod tests {
         assert_eq!(r.body["messages"][0]["role"], "system");
         assert_eq!(r.body["max_completion_tokens"], 4096);
         assert!(r.body.get("max_tokens").is_none());
-        assert!(r
-            .headers
-            .iter()
-            .any(|(k, v)| k == "Authorization" && v == "Bearer sk-test"));
+        assert!(
+            r.headers
+                .iter()
+                .any(|(k, v)| k == "Authorization" && v == "Bearer sk-test")
+        );
     }
 
     #[test]
@@ -1405,18 +1520,45 @@ mod tests {
         use AdapterKind::{Anthropic, Gemini, OpenAi};
         // Ordinary models floor at Off; adaptive-only models floor at Low — but
         // ONLY on the Anthropic wire (A10b).
-        assert_eq!(ReasoningEffort::floor_for_model("gpt-4o-mini", OpenAi), ReasoningEffort::Off);
-        assert_eq!(ReasoningEffort::floor_for_model("llama3.2:1b", OpenAi), ReasoningEffort::Off);
-        assert_eq!(ReasoningEffort::floor_for_model("claude-opus-4-8", Anthropic), ReasoningEffort::Low);
-        assert_eq!(ReasoningEffort::floor_for_model("fable-5", Anthropic), ReasoningEffort::Low);
+        assert_eq!(
+            ReasoningEffort::floor_for_model("gpt-4o-mini", OpenAi),
+            ReasoningEffort::Off
+        );
+        assert_eq!(
+            ReasoningEffort::floor_for_model("llama3.2:1b", OpenAi),
+            ReasoningEffort::Off
+        );
+        assert_eq!(
+            ReasoningEffort::floor_for_model("claude-opus-4-8", Anthropic),
+            ReasoningEffort::Low
+        );
+        assert_eq!(
+            ReasoningEffort::floor_for_model("fable-5", Anthropic),
+            ReasoningEffort::Low
+        );
         // A10b: the SAME adaptive-only model fronted by an OpenAI/Gemini proxy
         // floors at Off (forcing Low would emit a param the proxy may reject).
-        assert_eq!(ReasoningEffort::floor_for_model("claude-opus-4-8", OpenAi), ReasoningEffort::Off);
-        assert_eq!(ReasoningEffort::floor_for_model("claude-opus-4-8", Gemini), ReasoningEffort::Off);
+        assert_eq!(
+            ReasoningEffort::floor_for_model("claude-opus-4-8", OpenAi),
+            ReasoningEffort::Off
+        );
+        assert_eq!(
+            ReasoningEffort::floor_for_model("claude-opus-4-8", Gemini),
+            ReasoningEffort::Off
+        );
         // clamp raises to the floor but never lowers a higher request.
-        assert_eq!(ReasoningEffort::Off.clamp_to_floor(ReasoningEffort::Low), ReasoningEffort::Low);
-        assert_eq!(ReasoningEffort::High.clamp_to_floor(ReasoningEffort::Low), ReasoningEffort::High);
-        assert_eq!(ReasoningEffort::Off.clamp_to_floor(ReasoningEffort::Off), ReasoningEffort::Off);
+        assert_eq!(
+            ReasoningEffort::Off.clamp_to_floor(ReasoningEffort::Low),
+            ReasoningEffort::Low
+        );
+        assert_eq!(
+            ReasoningEffort::High.clamp_to_floor(ReasoningEffort::Low),
+            ReasoningEffort::High
+        );
+        assert_eq!(
+            ReasoningEffort::Off.clamp_to_floor(ReasoningEffort::Off),
+            ReasoningEffort::Off
+        );
         // resolve = (applied, floor); None stays None (vendor default).
         assert_eq!(
             ReasoningEffort::resolve("gpt-4o-mini", OpenAi, Some(ReasoningEffort::Off)),
@@ -1454,7 +1596,10 @@ mod tests {
         // live-verified against ollama "does not support thinking").
         c.reasoning_effort = Some(ReasoningEffort::Off);
         let r = OpenAiAdapter.render_request(&convo(), &c, false, None);
-        assert!(r.body.get("reasoning_effort").is_none(), "Off emits no param");
+        assert!(
+            r.body.get("reasoning_effort").is_none(),
+            "Off emits no param"
+        );
 
         c.reasoning_effort = None;
         let r = OpenAiAdapter.render_request(&convo(), &c, false, None);
@@ -1465,17 +1610,36 @@ mod tests {
     fn is_openai_reasoning_model_classifies_correctly() {
         // Reasoning → max_completion_tokens shape (incl. future-proofed ids).
         for m in [
-            "o1", "o1-mini", "o3", "o3-pro", "o4-mini", "o4-mini-2025-04-16", "o5-future",
-            "gpt-5", "gpt-5-mini", "gpt-5.1", "gpt-5.1-codex", "gpt-6", "gpt-9-future",
-            "codex-mini-latest", "computer-use-preview",
+            "o1",
+            "o1-mini",
+            "o3",
+            "o3-pro",
+            "o4-mini",
+            "o4-mini-2025-04-16",
+            "o5-future",
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5.1",
+            "gpt-5.1-codex",
+            "gpt-6",
+            "gpt-9-future",
+            "codex-mini-latest",
+            "computer-use-preview",
         ] {
             assert!(is_openai_reasoning_model(m), "{m} should be reasoning");
         }
         // NON-reasoning → keep classic max_tokens + sampling (no false positives).
         for m in [
-            "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "chatgpt-4o-latest",
-            "gpt-5-chat-latest", "gpt-5.1-chat-latest", // chat tunes accept temperature
-            "omni-model", "gpt-oss-20b", "deepseek-chat", "llama-3.1-8b",
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4-turbo",
+            "chatgpt-4o-latest",
+            "gpt-5-chat-latest",
+            "gpt-5.1-chat-latest", // chat tunes accept temperature
+            "omni-model",
+            "gpt-oss-20b",
+            "deepseek-chat",
+            "llama-3.1-8b",
         ] {
             assert!(!is_openai_reasoning_model(m), "{m} should NOT be reasoning");
         }
@@ -1493,11 +1657,23 @@ mod tests {
             c.top_p = Some(0.9);
             c.reasoning_effort = Some(ReasoningEffort::Low);
             let r = OpenAiAdapter.render_request(&convo(), &c, false, None);
-            assert_eq!(r.body["max_completion_tokens"], 2000, "{model}: max_completion_tokens");
-            assert!(r.body.get("max_tokens").is_none(), "{model}: no max_tokens (400-safe)");
-            assert!(r.body.get("temperature").is_none(), "{model}: temperature suppressed");
+            assert_eq!(
+                r.body["max_completion_tokens"], 2000,
+                "{model}: max_completion_tokens"
+            );
+            assert!(
+                r.body.get("max_tokens").is_none(),
+                "{model}: no max_tokens (400-safe)"
+            );
+            assert!(
+                r.body.get("temperature").is_none(),
+                "{model}: temperature suppressed"
+            );
             assert!(r.body.get("top_p").is_none(), "{model}: top_p suppressed");
-            assert_eq!(r.body["reasoning_effort"], "low", "{model}: effort still mapped");
+            assert_eq!(
+                r.body["reasoning_effort"], "low",
+                "{model}: effort still mapped"
+            );
         }
         // A chat model keeps the classic shape (max_tokens + sampling).
         let mut c = cfg(None);
@@ -1540,10 +1716,19 @@ mod tests {
         c.seed = Some(7);
         c.user = Some("u2".to_string());
         let r = OpenAiAdapter.render_request(&convo(), &c, false, None);
-        assert!(r.body.get("presence_penalty").is_none(), "presence_penalty suppressed");
-        assert!(r.body.get("frequency_penalty").is_none(), "frequency_penalty suppressed");
+        assert!(
+            r.body.get("presence_penalty").is_none(),
+            "presence_penalty suppressed"
+        );
+        assert!(
+            r.body.get("frequency_penalty").is_none(),
+            "frequency_penalty suppressed"
+        );
         assert!(r.body.get("logprobs").is_none(), "logprobs suppressed");
-        assert_eq!(r.body["parallel_tool_calls"], false, "parallel_tool_calls kept");
+        assert_eq!(
+            r.body["parallel_tool_calls"], false,
+            "parallel_tool_calls kept"
+        );
         assert_eq!(r.body["seed"], 7, "seed kept");
         assert_eq!(r.body["user"], "u2", "user kept");
     }
@@ -1566,8 +1751,14 @@ mod tests {
         let r = AnthropicAdapter.render_request(&convo(), &c, false, None);
         assert_eq!(r.body["thinking"]["type"], "enabled");
         let budget = r.body["thinking"]["budget_tokens"].as_u64().unwrap();
-        assert!((1024..4000).contains(&(budget as u32)), "budget {budget} in [1024,4000)");
-        assert!(r.body.get("reasoning_effort").is_none(), "exactly one param");
+        assert!(
+            (1024..4000).contains(&(budget as u32)),
+            "budget {budget} in [1024,4000)"
+        );
+        assert!(
+            r.body.get("reasoning_effort").is_none(),
+            "exactly one param"
+        );
 
         // Adaptive-only model (Opus 4.8) rejects the enabled form → emit nothing.
         c.model = "claude-opus-4-8".to_string();
@@ -1655,11 +1846,16 @@ mod tests {
             assert_ne!(msg["role"], "system");
         }
         assert!(r.url.ends_with("/v1/messages"));
-        assert!(r.headers.iter().any(|(k, v)| k == "x-api-key" && v == "sk-ant"));
-        assert!(r
-            .headers
-            .iter()
-            .any(|(k, v)| k == "anthropic-version" && v == ANTHROPIC_VERSION));
+        assert!(
+            r.headers
+                .iter()
+                .any(|(k, v)| k == "x-api-key" && v == "sk-ant")
+        );
+        assert!(
+            r.headers
+                .iter()
+                .any(|(k, v)| k == "anthropic-version" && v == ANTHROPIC_VERSION)
+        );
     }
 
     #[test]
@@ -1742,8 +1938,10 @@ mod tests {
             r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#,
             r#"data: {"type":"message_stop"}"#,
         ];
-        let events: Vec<LlmStreamEvent> =
-            lines.iter().flat_map(|l| a.parse_stream_line(l, &mut st)).collect();
+        let events: Vec<LlmStreamEvent> = lines
+            .iter()
+            .flat_map(|l| a.parse_stream_line(l, &mut st))
+            .collect();
         assert!(matches!(&events[0], LlmStreamEvent::Meta { id: Some(id), .. } if id == "msg_1"));
         assert!(matches!(&events[1], LlmStreamEvent::TextDelta(t) if t == "Hello"));
         assert!(matches!(&events[2], LlmStreamEvent::Finish(Some(r)) if r == "end_turn"));
@@ -1781,7 +1979,11 @@ mod tests {
         let contents = r.body["contents"].as_array().unwrap();
         assert_eq!(contents[1]["role"], "model");
         assert!(r.url.contains(":generateContent"));
-        assert!(r.headers.iter().any(|(k, v)| k == "x-goog-api-key" && v == "g-key"));
+        assert!(
+            r.headers
+                .iter()
+                .any(|(k, v)| k == "x-goog-api-key" && v == "g-key")
+        );
     }
 
     #[test]
@@ -1801,7 +2003,10 @@ mod tests {
         assert_eq!(last["role"], "user");
         // Name resolved from the call_1 → get_weather map, NOT the id.
         assert_eq!(last["parts"][0]["functionResponse"]["name"], "get_weather");
-        assert_eq!(last["parts"][0]["functionResponse"]["response"]["temp_c"], 21);
+        assert_eq!(
+            last["parts"][0]["functionResponse"]["response"]["temp_c"],
+            21
+        );
     }
 
     #[test]
@@ -1809,8 +2014,16 @@ mod tests {
         let mut messages = tool_convo();
         messages.last_mut().unwrap().content = Some("sunny".into());
         let r = GeminiAdapter.render_request(&messages, &cfg(None), false, None);
-        let last = r.body["contents"].as_array().unwrap().last().unwrap().clone();
-        assert_eq!(last["parts"][0]["functionResponse"]["response"]["value"], "sunny");
+        let last = r.body["contents"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            last["parts"][0]["functionResponse"]["response"]["value"],
+            "sunny"
+        );
     }
 
     #[test]
@@ -1818,7 +2031,10 @@ mod tests {
         let messages = vec![ChatMessage::tool("orphan_id", r#"{"x":1}"#)];
         let r = GeminiAdapter.render_request(&messages, &cfg(None), false, None);
         let first = &r.body["contents"][0];
-        assert_eq!(first["parts"][0]["functionResponse"]["name"], "tool_call_result");
+        assert_eq!(
+            first["parts"][0]["functionResponse"]["name"],
+            "tool_call_result"
+        );
     }
 
     #[test]
@@ -1836,7 +2052,11 @@ mod tests {
         let r = GeminiAdapter.render_request(&convo(), &c, false, None);
         let schema = &r.body["tools"][0]["functionDeclarations"][0]["parameters"];
         assert!(schema.get("additionalProperties").is_none());
-        assert!(schema["properties"]["x"].get("additionalProperties").is_none());
+        assert!(
+            schema["properties"]["x"]
+                .get("additionalProperties")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1920,9 +2140,15 @@ mod tests {
         let line = r#"data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"a"},"finish_reason":null}]}"#;
         let first = o.parse_stream_line(line, &mut st);
         let second = o.parse_stream_line(line, &mut st);
-        assert!(first.iter().any(|e| matches!(e, LlmStreamEvent::Meta { .. })));
         assert!(
-            !second.iter().any(|e| matches!(e, LlmStreamEvent::Meta { .. })),
+            first
+                .iter()
+                .any(|e| matches!(e, LlmStreamEvent::Meta { .. }))
+        );
+        assert!(
+            !second
+                .iter()
+                .any(|e| matches!(e, LlmStreamEvent::Meta { .. })),
             "Meta must not re-allocate on every chunk (hot path)"
         );
     }
@@ -1941,7 +2167,8 @@ mod tests {
     fn gemini_empty_assistant_renders_placeholder_part() {
         let mut empty = ChatMessage::assistant("");
         empty.content = None;
-        let r = GeminiAdapter.render_request(&[ChatMessage::user("q"), empty], &cfg(None), false, None);
+        let r =
+            GeminiAdapter.render_request(&[ChatMessage::user("q"), empty], &cfg(None), false, None);
         let contents = r.body["contents"].as_array().unwrap();
         assert_eq!(contents[1]["parts"][0]["text"], "(empty)");
     }
@@ -1963,7 +2190,11 @@ mod tests {
     fn render_request_does_not_mutate_stored_context() {
         let messages = tool_convo();
         let snapshot = serde_json::to_string(&messages).unwrap();
-        for kind in [AdapterKind::OpenAi, AdapterKind::Anthropic, AdapterKind::Gemini] {
+        for kind in [
+            AdapterKind::OpenAi,
+            AdapterKind::Anthropic,
+            AdapterKind::Gemini,
+        ] {
             let _ = adapter_for(kind).render_request(&messages, &cfg(None), true, Some("k"));
         }
         assert_eq!(serde_json::to_string(&messages).unwrap(), snapshot);

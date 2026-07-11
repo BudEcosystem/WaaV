@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use crate::core::voice_manager::VoiceManager;
 
 use super::{
-    messages::{MessageRoute, OutgoingMessage},
+    messages::{MessageClass, MessageRoute, OutgoingMessage, send_with_policy},
     state::ConnectionState,
 };
 
@@ -24,6 +24,17 @@ use super::{
 /// Typical audio frame at 16kHz/16-bit mono for 1 second = 32KB
 /// Even 10 minutes of uncompressed audio = ~19MB, so 5MB is generous for buffered streaming
 pub const MAX_AUDIO_FRAME_SIZE: usize = 5 * 1024 * 1024;
+
+async fn send_error(message_tx: &mpsc::Sender<MessageRoute>, message: impl Into<String>) {
+    send_with_policy(
+        message_tx,
+        MessageRoute::Outgoing(OutgoingMessage::Error {
+            message: message.into(),
+        }),
+        MessageClass::Critical,
+    )
+    .await;
+}
 
 /// Handle incoming audio data with zero-copy optimizations
 ///
@@ -57,14 +68,14 @@ pub async fn handle_audio_message(
             "Audio frame too large: {} bytes (max: {} bytes)",
             audio_len, MAX_AUDIO_FRAME_SIZE
         );
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: format!(
-                    "Audio frame too large: {} bytes (max: {} bytes)",
-                    audio_len, MAX_AUDIO_FRAME_SIZE
-                ),
-            }))
-            .await;
+        send_error(
+            message_tx,
+            format!(
+                "Audio frame too large: {} bytes (max: {} bytes)",
+                audio_len, MAX_AUDIO_FRAME_SIZE
+            ),
+        )
+        .await;
         return true;
     }
 
@@ -74,25 +85,22 @@ pub async fn handle_audio_message(
 
         // Check if audio processing is enabled (atomic read, no lock overhead)
         if !state_guard.is_audio_enabled() {
-            let _ = message_tx
-                .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                    message:
-                        "Audio processing is disabled. Send config message with audio=true first."
-                            .to_string(),
-                }))
-                .await;
+            send_error(
+                message_tx,
+                "Audio processing is disabled. Send config message with audio=true first.",
+            )
+            .await;
             return true;
         }
 
         let voice_manager = match &state_guard.voice_manager {
             Some(vm) => vm.clone(),
             None => {
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                        message: "Voice manager not configured. Send config message with audio=true first."
-                            .to_string(),
-                    }))
-                    .await;
+                send_error(
+                    message_tx,
+                    "Voice manager not configured. Send config message with audio=true first.",
+                )
+                .await;
                 return true;
             }
         };
@@ -118,11 +126,7 @@ pub async fn handle_audio_message(
     // Send the (decoded) PCM audio to the STT provider. Bytes gives O(1) clones.
     if let Err(e) = voice_manager.receive_audio(audio_data).await {
         error!("Failed to process audio: {}", e);
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: format!("Failed to process audio: {e}"),
-            }))
-            .await;
+        send_error(message_tx, format!("Failed to process audio: {e}")).await;
     }
 
     true
@@ -178,11 +182,7 @@ pub async fn handle_speak_message(
         .await
     {
         error!("Failed to synthesize speech: {}", e);
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: format!("Failed to synthesize speech: {e}"),
-            }))
-            .await;
+        send_error(message_tx, format!("Failed to synthesize speech: {e}")).await;
     } else {
         debug!(
             "Speech synthesis started for: {} chars (flush: {}, allow_interruption: {})",
@@ -221,12 +221,11 @@ pub async fn handle_clear_message(
             match &state_guard.voice_manager {
                 Some(vm) => Some(vm.clone()),
                 None => {
-                    let _ = message_tx
-                        .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                            message: "Voice manager not configured. Send config message with audio=true first."
-                                .to_string(),
-                        }))
-                        .await;
+                    send_error(
+                        message_tx,
+                        "Voice manager not configured. Send config message with audio=true first.",
+                    )
+                    .await;
                     return true;
                 }
             }
@@ -257,11 +256,7 @@ pub async fn handle_clear_message(
     if let Some(vm) = voice_manager {
         if let Err(e) = vm.clear_tts().await {
             error!("Failed to clear TTS provider: {}", e);
-            let _ = message_tx
-                .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                    message: format!("Failed to clear TTS provider: {e}"),
-                }))
-                .await;
+            send_error(message_tx, format!("Failed to clear TTS provider: {e}")).await;
         } else {
             debug!("Successfully cleared TTS and audio buffers");
         }
@@ -315,11 +310,7 @@ pub async fn handle_audio_end(
     // Finalize the STT stream
     if let Err(e) = voice_manager.finalize_stt().await {
         error!("Failed to finalize STT stream: {}", e);
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: format!("Failed to finalize STT stream: {e}"),
-            }))
-            .await;
+        send_error(message_tx, format!("Failed to finalize STT stream: {e}")).await;
     } else {
         debug!("STT stream finalized successfully");
     }
@@ -346,25 +337,22 @@ async fn get_voice_manager_if_audio_enabled(
 
     // Check if audio processing is enabled (atomic read, no lock overhead)
     if !state_guard.is_audio_enabled() {
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: "Audio processing is disabled. Send config message with audio=true first."
-                    .to_string(),
-            }))
-            .await;
+        send_error(
+            message_tx,
+            "Audio processing is disabled. Send config message with audio=true first.",
+        )
+        .await;
         return None;
     }
 
     match &state_guard.voice_manager {
         Some(vm) => Some(vm.clone()),
         None => {
-            let _ = message_tx
-                .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                    message:
-                        "Voice manager not configured. Send config message with audio=true first."
-                            .to_string(),
-                }))
-                .await;
+            send_error(
+                message_tx,
+                "Voice manager not configured. Send config message with audio=true first.",
+            )
+            .await;
             None
         }
     }

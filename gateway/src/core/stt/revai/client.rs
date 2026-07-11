@@ -13,8 +13,10 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, client::IntoClientRequest},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
+use crate::core::resilience::connect::{WS_CONNECT_TIMEOUT, with_timeout};
 use crate::core::stt::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback, STTStats,
 };
@@ -60,8 +62,8 @@ struct RevAITransport {
     ws_stream: WebSocketReadStream,
     /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
     audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
-    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
-    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    /// Shared shutdown token (fires once; an intentional close must not reconnect).
+    shutdown_token: CancellationToken,
     /// Result callback storage (invoked directly, preserving the original architecture).
     result_callback: Arc<RwLock<Option<STTResultCallback>>>,
     /// Error callback storage.
@@ -72,6 +74,15 @@ struct RevAITransport {
     stats: Arc<RwLock<STTStats>>,
     /// Fires once on the first successful connect, unblocking `connect`.
     connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+impl RevAITransport {
+    async fn send_eos_and_close(ws_sink: &mut WebSocketSink) {
+        let _ = ws_sink
+            .send(Message::Text(EOS_MESSAGE.to_string().into()))
+            .await;
+        let _ = ws_sink.close().await;
+    }
 }
 
 #[async_trait::async_trait]
@@ -87,8 +98,14 @@ impl WsTransport for RevAITransport {
 
     async fn run(&mut self) -> ReconnectOutcome {
         let mut audio_rx = self.audio_rx.lock().await;
-        let mut shutdown_rx = self.shutdown_rx.lock().await;
+        let shutdown_token = self.shutdown_token.clone();
         loop {
+            if shutdown_token.is_cancelled() {
+                info!("Rev AI: Received shutdown signal");
+                Self::send_eos_and_close(&mut self.ws_sink).await;
+                return ReconnectOutcome::Completed;
+            }
+
             tokio::select! {
                 // Handle outgoing audio data (raw binary frames).
                 Some(audio_data) = audio_rx.recv() => {
@@ -177,14 +194,9 @@ impl WsTransport for RevAITransport {
                 }
 
                 // Handle shutdown signal (intentional close — must NOT reconnect).
-                _ = &mut *shutdown_rx => {
+                _ = shutdown_token.cancelled() => {
                     info!("Rev AI: Received shutdown signal");
-                    // Send EOS message for graceful close, then close the socket.
-                    let _ = self
-                        .ws_sink
-                        .send(Message::Text(EOS_MESSAGE.to_string().into()))
-                        .await;
-                    let _ = self.ws_sink.close().await;
+                    Self::send_eos_and_close(&mut self.ws_sink).await;
                     return ReconnectOutcome::Completed;
                 }
             }
@@ -207,8 +219,8 @@ pub struct RevAISTT {
     /// Audio sender (bounded channel for backpressure); the supervised transport drains it.
     ws_sender: Option<mpsc::Sender<Bytes>>,
 
-    /// Shutdown signal sender.
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Shutdown signal token.
+    shutdown_token: Option<CancellationToken>,
 
     /// Connection task handle (the supervisor's outer reconnect loop).
     connection_handle: Option<tokio::task::JoinHandle<()>>,
@@ -217,7 +229,7 @@ pub struct RevAISTT {
     connected: AtomicBool,
 
     /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
-    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// `connect()`, set in `disconnect()` before cancelling `shutdown_token`, so a client close racing a
     /// server-side close can never trigger a spurious reconnect.
     intentional_disconnect: Arc<AtomicBool>,
 
@@ -252,7 +264,7 @@ impl RevAISTT {
             config: base_config,
             revai_config: config,
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             connection_handle: None,
             connected: AtomicBool::new(false),
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
@@ -276,7 +288,9 @@ impl RevAISTT {
                 "API key is required".to_string(),
             ));
         }
-        Self::from_revai_config(crate::core::stt::revai::config::RevAISTTConfig::from_standard(std)?)
+        Self::from_revai_config(
+            crate::core::stt::revai::config::RevAISTTConfig::from_standard(std)?,
+        )
     }
 
     /// Get the session ID
@@ -408,7 +422,7 @@ impl BaseSTT for RevAISTT {
             config,
             revai_config,
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             connection_handle: None,
             connected: AtomicBool::new(false),
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
@@ -437,17 +451,16 @@ impl BaseSTT for RevAISTT {
 
         // Create channels for communication (bounded for backpressure on audio).
         let (ws_tx, ws_rx) = mpsc::channel::<Bytes>(32);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_token = CancellationToken::new();
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         self.ws_sender = Some(ws_tx);
-        self.shutdown_tx = Some(shutdown_tx);
+        self.shutdown_token = Some(shutdown_token.clone());
 
         // Shared state the supervised transport re-uses across reconnect attempts: a single-
-        // consumer audio receiver + shutdown oneshot (locked per `run`) and the one-shot connected
+        // consumer audio receiver + shutdown token and the one-shot connected
         // signal that fires on the first successful connect.
         let audio_rx = Arc::new(Mutex::new(ws_rx));
-        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
         let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
 
         let result_callback = Arc::clone(&self.result_callback);
@@ -467,9 +480,7 @@ impl BaseSTT for RevAISTT {
                 r.breaker,
                 (*r.governor).clone(),
             ),
-            None => {
-                ReconnectableStream::new(ReconnectableStreamConfig::new("revai", reconnection))
-            }
+            None => ReconnectableStream::new(ReconnectableStreamConfig::new("revai", reconnection)),
         }
         .with_disconnect_flag(disconnect_flag);
 
@@ -481,7 +492,7 @@ impl BaseSTT for RevAISTT {
                 .run(|| {
                     let ws_url = ws_url.clone();
                     let audio_rx = Arc::clone(&audio_rx);
-                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let shutdown_token = shutdown_token.clone();
                     let connected_tx = Arc::clone(&connected_tx);
                     let result_callback = Arc::clone(&result_callback);
                     let error_callback = Arc::clone(&error_callback);
@@ -492,16 +503,24 @@ impl BaseSTT for RevAISTT {
                             StreamError::new(format!("Failed to create request: {e}"))
                         })?;
                         let (ws_stream, response) =
-                            connect_async(request).await.map_err(|e| {
-                                StreamError::new(format!("WebSocket connection failed: {e}"))
-                            })?;
+                            with_timeout(WS_CONNECT_TIMEOUT, connect_async(request))
+                                .await
+                                .map_err(|_| {
+                                    StreamError::new(format!(
+                                        "connect to Rev AI timed out after {}s",
+                                        WS_CONNECT_TIMEOUT.as_secs()
+                                    ))
+                                })?
+                                .map_err(|e| {
+                                    StreamError::new(format!("WebSocket connection failed: {e}"))
+                                })?;
                         debug!(status = ?response.status(), "Rev AI: WebSocket connection established");
                         let (ws_sink, ws_stream) = ws_stream.split();
                         Ok(RevAITransport {
                             ws_sink,
                             ws_stream,
                             audio_rx,
-                            shutdown_rx,
+                            shutdown_token,
                             result_callback,
                             error_callback,
                             session_id,
@@ -536,20 +555,25 @@ impl BaseSTT for RevAISTT {
         // Record the intent BEFORE the connected-guard so the supervisor sees it even if the
         // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
         self.intentional_disconnect.store(true, Ordering::SeqCst);
-        if !self.connected.load(Ordering::Acquire) {
+        if !self.connected.load(Ordering::Acquire) && self.connection_handle.is_none() {
             return Ok(());
         }
 
         info!("Rev AI: Disconnecting");
 
         // Signal the supervised transport to send EOS + close intentionally (no reconnect).
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
 
         // Wait for the connection task to finish with a timeout (EOS + final results drain).
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "revai-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         self.connected.store(false, Ordering::Release);
@@ -629,9 +653,10 @@ impl BaseSTT for RevAISTT {
 
 impl Drop for RevAISTT {
     fn drop(&mut self) {
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
         // Send shutdown signal if still connected so the supervisor task stops cleanly.
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
         if let Some(handle) = self.connection_handle.take() {
             handle.abort();
@@ -696,7 +721,7 @@ mod tests {
     // provider-struct `new_standard` method to the provider-specific config.
     #[test]
     fn test_revai_new_standard_unlocks_advanced_features() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "revai".into(),
@@ -726,6 +751,50 @@ mod tests {
             ..Default::default()
         });
         assert!(RevAISTT::new_standard(&bad).is_err());
+    }
+
+    #[test]
+    fn test_new_standard_rejects_ssrf_endpoint_override() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mk = |endpoint: &str| {
+            StandardSTTConfig {
+                base: STTConfig {
+                    provider: "revai".into(),
+                    api_key: "test-key".into(),
+                    language: "en".into(),
+                    sample_rate: 16000,
+                    encoding: "S16LE".into(),
+                    model: "machine".into(),
+                    ..Default::default()
+                },
+                features: SttFeatures::default(),
+                extras: ProviderExtras::default(),
+                translation: None,
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(RevAISTT::new_standard(&mk("wss://revai-proxy.example.com")).is_ok());
+        assert!(RevAISTT::new_standard(&mk("ws://127.0.0.1:9000")).is_err());
+        assert!(RevAISTT::new_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(RevAISTT::new_standard(&mk("https://revai-proxy.example.com")).is_err());
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]

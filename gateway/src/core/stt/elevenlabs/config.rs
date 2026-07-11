@@ -9,6 +9,16 @@
 use super::super::base::STTConfig;
 use url::form_urlencoded;
 
+fn validate_elevenlabs_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, &["ws", "wss"])
+        .map_err(|e| format!("{source} rejected (SSRF protection): {e}"))
+}
+
 // =============================================================================
 // Audio Format
 // =============================================================================
@@ -394,6 +404,10 @@ impl ElevenLabsSTTConfig {
             );
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_elevenlabs_stt_endpoint("endpoint_override", endpoint)?;
+        }
+
         Ok(())
     }
 
@@ -451,16 +465,17 @@ impl ElevenLabsSTTConfig {
 
         // Add advanced feature parameters
         if let Some(ref terms) = self.keyterms
-            && !terms.is_empty() {
-                // URL-encode each keyterm and join with comma
-                // Use form_urlencoded to properly escape special characters
-                let encoded_terms: Vec<String> = terms
-                    .iter()
-                    .map(|t| form_urlencoded::byte_serialize(t.as_bytes()).collect::<String>())
-                    .collect();
-                url.push_str("&keyterms=");
-                url.push_str(&encoded_terms.join(","));
-            }
+            && !terms.is_empty()
+        {
+            // URL-encode each keyterm and join with comma
+            // Use form_urlencoded to properly escape special characters
+            let encoded_terms: Vec<String> = terms
+                .iter()
+                .map(|t| form_urlencoded::byte_serialize(t.as_bytes()).collect::<String>())
+                .collect();
+            url.push_str("&keyterms=");
+            url.push_str(&encoded_terms.join(","));
+        }
 
         if self.enable_entity_detection == Some(true) {
             url.push_str("&entity_detection=true");
@@ -605,7 +620,7 @@ mod tests {
     // (diarization + key terms) — previously unreachable via the flat factory.
     #[test]
     fn from_standard_maps_features() {
-        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "elevenlabs".into(),
@@ -631,7 +646,7 @@ mod tests {
     // reach the connect URL query string.
     #[test]
     fn language_detection_reaches_ws_url() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "elevenlabs".into(),
@@ -658,7 +673,7 @@ mod tests {
     // connect URL. Keeping filler words => no_verbatim=false.
     #[test]
     fn filler_words_map_to_no_verbatim_inverted_on_ws_url() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
 
         // filler_words = false (drop them) => no_verbatim = true
         let drop = StandardSTTConfig {
@@ -714,5 +729,55 @@ mod tests {
         let url = cfg.build_websocket_url();
         assert!(!url.contains("include_language_detection"), "url: {url}");
         assert!(!url.contains("no_verbatim"), "url: {url}");
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = ElevenLabsSTTConfig {
+            base: STTConfig {
+                api_key: "test-key".to_string(),
+                ..Default::default()
+            },
+            endpoint_override: Some("wss://elevenlabs-proxy.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://elevenlabs-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-WebSocket endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("https://elevenlabs-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("HTTP endpoint_override must be rejected for ElevenLabs WebSocket dial");
+        assert!(err.contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 }

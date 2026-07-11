@@ -34,7 +34,7 @@ use mock_providers::websocket_mock::{
     TTS_MOCK_CHUNK_INTERVAL_MS, WebSocketMockState, spawn_tts_websocket_mock_ephemeral,
     tts_mock_chunk_count,
 };
-use mock_providers::{ChaosConfig, LatencyProfile};
+use mock_providers::{ChaosConfig, LatencyProfile, MockServerHandle};
 use waav_gateway::core::tts::standard::{StandardTTSConfig, TtsFeatures, create_tts_standard};
 use waav_gateway::core::tts::{AudioCallback, AudioData, BaseTTS, TTSConfig, TTSError};
 
@@ -79,7 +79,12 @@ impl Collector {
         self.chunks.lock().unwrap().first().map(|(t, _, _)| *t)
     }
     fn chunk_indices(&self) -> Vec<u8> {
-        self.chunks.lock().unwrap().iter().map(|(_, i, _)| *i).collect()
+        self.chunks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, i, _)| *i)
+            .collect()
     }
     fn completes(&self) -> usize {
         self.completes.load(Ordering::Acquire)
@@ -158,17 +163,20 @@ fn aura_standard_config(port: u16) -> StandardTTSConfig {
 /// Boot mock + connected Aura provider + registered collector.
 async fn connected_aura(
     state: Arc<WebSocketMockState>,
-) -> (Box<dyn BaseTTS>, Arc<Collector>, tokio::task::JoinHandle<()>) {
+) -> (Box<dyn BaseTTS>, Arc<Collector>, MockServerHandle) {
     let (port, mock_handle) = spawn_tts_websocket_mock_ephemeral(state)
         .await
         .expect("mock must bind an ephemeral port");
     let mut tts = create_tts_standard("deepgram", aura_standard_config(port))
         .expect("standard dispatch must construct the Aura WS provider");
     assert_eq!(
-        tts.get_provider_info()["api_type"], "WebSocket",
+        tts.get_provider_info()["api_type"],
+        "WebSocket",
         "streaming=Some(true) must select the WS variant"
     );
-    tts.connect().await.expect("connect to the mock must succeed");
+    tts.connect()
+        .await
+        .expect("connect to the mock must succeed");
     assert!(tts.is_ready());
     let collector = Arc::new(Collector::default());
     tts.on_audio(collector.clone() as Arc<dyn AudioCallback>)
@@ -207,7 +215,11 @@ async fn full_synthesis_flow_ordered_chunks_completion_and_ttfb() {
     let expected: Vec<u8> = (0..expected_chunks as u8).collect();
     assert_eq!(indices, expected, "chunks must arrive in order");
     assert_eq!(collector.completes(), 1, "exactly one on_complete");
-    assert!(collector.errors().is_empty(), "no errors: {:?}", collector.errors());
+    assert!(
+        collector.errors().is_empty(),
+        "no errors: {:?}",
+        collector.errors()
+    );
 
     // TTFB against the mock: wall clock from speak() to first on_audio…
     let ttfb = collector
@@ -251,7 +263,9 @@ async fn clear_mid_stream_cancels_and_stops_audio() {
     // 400 chars → 40 chunks × 20ms ≈ 800ms of streaming: plenty of mid-stream window.
     let long_text = "All work and no play makes the gateway a dull boy. ".repeat(8);
     assert!(tts_mock_chunk_count(long_text.len()) >= 40);
-    tts.speak(&long_text, true).await.expect("speak long utterance");
+    tts.speak(&long_text, true)
+        .await
+        .expect("speak long utterance");
 
     // Wait until we are demonstrably mid-stream…
     assert!(
@@ -278,7 +292,11 @@ async fn clear_mid_stream_cancels_and_stops_audio() {
         "no on_audio may arrive after clear()/Cleared"
     );
     // The cancelled utterance must not complete.
-    assert_eq!(collector.completes(), 0, "cancelled utterance must not on_complete");
+    assert_eq!(
+        collector.completes(),
+        0,
+        "cancelled utterance must not on_complete"
+    );
     // The Clear frame actually reached the provider.
     assert_eq!(state.tts_clear_frames.load(Ordering::Relaxed), 1);
 
@@ -298,7 +316,9 @@ async fn flush_false_accumulates_then_single_speak_on_flush() {
     let (mut tts, collector, _mock) = connected_aura(state.clone()).await;
 
     tts.speak("Hello ", false).await.expect("buffered speak 1");
-    tts.speak("beautiful ", false).await.expect("buffered speak 2");
+    tts.speak("beautiful ", false)
+        .await
+        .expect("buffered speak 2");
     // Nothing on the wire while accumulating.
     assert_eq!(state.tts_speak_frames.load(Ordering::Relaxed), 0);
     assert_eq!(state.tts_flush_frames.load(Ordering::Relaxed), 0);
@@ -380,13 +400,11 @@ async fn ssrf_loopback_override_rejected_without_env_flag() {
     let _env = env_guard();
     deny_loopback();
 
-    // No mock needed: the SSRF gate must reject BEFORE any socket dial.
-    let mut tts = create_tts_standard("deepgram", aura_standard_config(9))
-        .expect("construction itself succeeds; the gate is at connect");
-    let err = tts
-        .connect()
-        .await
-        .expect_err("loopback endpoint_override must be rejected without the env flag");
+    // No mock needed: the standardized SSRF gate must reject BEFORE any socket dial.
+    let err = match create_tts_standard("deepgram", aura_standard_config(9)) {
+        Ok(_) => panic!("loopback endpoint_override must be rejected without the env flag"),
+        Err(err) => err,
+    };
     assert!(
         matches!(err, TTSError::InvalidConfiguration(_)),
         "expected InvalidConfiguration, got: {err:?}"
@@ -395,9 +413,4 @@ async fn ssrf_loopback_override_rejected_without_env_flag() {
         err.to_string().contains("SSRF"),
         "error must name the SSRF protection: {err}"
     );
-    assert!(!tts.is_ready());
-
-    // Speak must not silently succeed either (lazy connect re-runs the gate).
-    let speak_err = tts.speak("hi", true).await.expect_err("speak must fail too");
-    assert!(matches!(speak_err, TTSError::InvalidConfiguration(_)));
 }

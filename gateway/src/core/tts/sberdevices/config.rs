@@ -7,6 +7,15 @@ use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+fn validate_sber_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -426,7 +435,9 @@ impl SberTtsConfig {
     /// capability gap rather than fabricated. Other unsupported features (speed, pitch, volume,
     /// stability, similarity_boost, style, use_speaker_boost, emotion, instructions, word_timestamps,
     /// streaming, seed) are likewise skipped.
-    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Result<Self, String> {
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, String> {
         let f = &std.features;
         let mut cfg = Self::from_base(std.base.clone())?;
 
@@ -446,15 +457,26 @@ impl SberTtsConfig {
         }
 
         // Provider-specific passthrough.
-        if let Some(secs) = std.extras.0.get("connection_timeout_secs").and_then(|v| v.as_u64()) {
+        if let Some(secs) = std
+            .extras
+            .0
+            .get("connection_timeout_secs")
+            .and_then(|v| v.as_u64())
+        {
             cfg.connection_timeout_secs = secs;
         }
-        if let Some(secs) = std.extras.0.get("request_timeout_secs").and_then(|v| v.as_u64()) {
+        if let Some(secs) = std
+            .extras
+            .0
+            .get("request_timeout_secs")
+            .and_then(|v| v.as_u64())
+        {
             cfg.request_timeout_secs = secs;
         }
 
         cfg.endpoint_override = std.endpoint_override().map(String::from);
 
+        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -483,6 +505,10 @@ impl SberTtsConfig {
                 "Invalid sample rate: {}. Must be 8000 or 24000 Hz",
                 self.sample_rate
             ));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_sber_tts_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -561,6 +587,33 @@ mod tests {
         assert_eq!(cfg.synthesis_content_type(), "application/ssml");
         assert_eq!(cfg.connection_timeout_secs, 15); // extras passthrough
         assert_eq!(cfg.request_timeout_secs, 45); // extras passthrough
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+
+        let mk = |endpoint: &str| {
+            StandardTTSConfig {
+                base: TTSConfig {
+                    provider: "sberdevices".into(),
+                    api_key: "test_client:test_secret".into(),
+                    voice_id: Some("Nec".into()),
+                    audio_format: Some("wav".into()),
+                    sample_rate: Some(24000),
+                    ..Default::default()
+                },
+                features: TtsFeatures::default(),
+                extras: ProviderExtras::default(),
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(SberTtsConfig::from_standard(&mk("https://sber-proxy.example.com")).is_ok());
+        assert!(SberTtsConfig::from_standard(&mk("http://127.0.0.1:9000")).is_err());
+        assert!(SberTtsConfig::from_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(SberTtsConfig::from_standard(&mk("wss://sber-proxy.example.com")).is_err());
     }
 
     #[test]

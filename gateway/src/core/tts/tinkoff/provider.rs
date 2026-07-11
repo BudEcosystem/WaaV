@@ -42,11 +42,12 @@ impl TinkoffTts {
     /// maps `speed`→`speaking_rate`, `pitch`→`pitch`, `volume`→`volume_gain_db`, `sample_rate`, and
     /// the `connection_timeout_secs`/`request_timeout_secs` extras), then constructs the provider so
     /// the mapped prosody is honored end-to-end through the dispatch path.
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let tinkoff_config =
             TinkoffTtsConfig::from_standard(std).map_err(TTSError::InvalidConfiguration)?;
+        tinkoff_config
+            .validate()
+            .map_err(TTSError::InvalidConfiguration)?;
 
         Ok(Self {
             config: Some(tinkoff_config),
@@ -363,7 +364,7 @@ mod tests {
         let std = StandardTTSConfig {
             base: TTSConfig {
                 provider: "tinkoff".into(),
-                api_key: "test-api-key".into(),
+                api_key: "test-api-key|test-secret-key".into(),
                 voice_id: Some("alyona".into()),
                 ..Default::default()
             },
@@ -383,6 +384,26 @@ mod tests {
         assert_eq!(cfg.pitch, 5.0);
         assert_eq!(cfg.volume_gain_db, -6.0);
         assert_eq!(cfg.sample_rate, 48000);
+    }
+
+    #[test]
+    fn from_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "tinkoff".into(),
+            api_key: "test-api-key|test-secret-key".into(),
+            voice_id: Some("alyona".into()),
+            ..Default::default()
+        })
+        .with_endpoint_override("http://127.0.0.1:9000");
+
+        match TinkoffTts::from_standard(&std) {
+            Ok(_) => panic!("unsafe endpoint override should be rejected"),
+            Err(err) => assert!(
+                err.to_string().contains("SSRF protection"),
+                "unexpected error: {err}"
+            ),
+        }
     }
 
     #[test]
@@ -461,7 +482,10 @@ mod tests {
         let input = extract_input_submessage(&encoded);
 
         // The input oneof must lead with the SSML tag (0x12), not the text tag (0x0a).
-        assert_eq!(input[0], 0x12, "ssml input must use SynthesisInput field 2 (ssml)");
+        assert_eq!(
+            input[0], 0x12,
+            "ssml input must use SynthesisInput field 2 (ssml)"
+        );
         // And the SSML markup bytes must be present in the wire body.
         assert!(
             encoded
@@ -482,7 +506,10 @@ mod tests {
         let encoded = request.encode();
         let input = extract_input_submessage(&encoded);
 
-        assert_eq!(input[0], 0x0a, "plain text must use SynthesisInput field 1 (text)");
+        assert_eq!(
+            input[0], 0x0a,
+            "plain text must use SynthesisInput field 1 (text)"
+        );
     }
 
     #[tokio::test]

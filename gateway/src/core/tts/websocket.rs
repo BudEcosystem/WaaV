@@ -294,7 +294,8 @@ impl WebSocketTtsClient {
                     "{} streaming TTS connect failed: {e}",
                     self.protocol.provider_name()
                 );
-                self.shared.set_state(ConnectionState::Error(reason.clone()));
+                self.shared
+                    .set_state(ConnectionState::Error(reason.clone()));
                 return Err(TTSError::ConnectionFailed(reason));
             }
             Err(_) => {
@@ -303,7 +304,8 @@ impl WebSocketTtsClient {
                     self.protocol.provider_name(),
                     timeout.as_secs()
                 );
-                self.shared.set_state(ConnectionState::Error(reason.clone()));
+                self.shared
+                    .set_state(ConnectionState::Error(reason.clone()));
                 return Err(TTSError::ConnectionFailed(reason));
             }
         };
@@ -438,17 +440,12 @@ impl WebSocketTtsClient {
         if let Some(callback) = callback {
             let sample_rate = protocol.sample_rate();
             let format = protocol.audio_format();
-            // Mirror the HTTP dispatcher's duration math for raw PCM-family audio.
-            let duration_ms = if crate::core::tts::sniff::is_pcm_family(&format) {
-                let bytes_per_sample = if matches!(format.as_str(), "linear16" | "pcm" | "pcm16") {
-                    2
-                } else {
-                    1
-                };
-                let samples = (data.len() / bytes_per_sample) as u32;
-                Some((samples * 1000) / sample_rate.max(1))
-            } else {
-                None
+            let duration_ms = match streaming_tts_duration_ms(data.len(), &format, sample_rate) {
+                Ok(duration_ms) => duration_ms,
+                Err(e) => {
+                    callback.on_error(e).await;
+                    return;
+                }
             };
             callback
                 .on_audio(AudioData {
@@ -682,19 +679,23 @@ impl WebSocketTtsClient {
     /// Await task exit within a grace period, then abort.
     async fn teardown_tasks(&mut self) {
         self.outbound_tx = None; // closing the channel ends the send task
-        if let Some(mut task) = self.send_task.take() {
-            if tokio::time::timeout(SHUTDOWN_GRACE, &mut task).await.is_err() {
-                warn!("streaming TTS send task did not exit in time; aborting");
-                task.abort();
-            }
+        if let Some(task) = self.send_task.take() {
+            crate::core::observability::await_task_shutdown(
+                "streaming-tts-send-task",
+                task,
+                SHUTDOWN_GRACE,
+            )
+            .await;
         }
-        if let Some(mut task) = self.recv_task.take() {
+        if let Some(task) = self.recv_task.take() {
             // The recv task exits when the socket closes (the send task's WS close
             // frame triggers that for orderly shutdown). Abort as a backstop.
-            if tokio::time::timeout(SHUTDOWN_GRACE, &mut task).await.is_err() {
-                warn!("streaming TTS recv task did not exit in time; aborting");
-                task.abort();
-            }
+            crate::core::observability::await_task_shutdown(
+                "streaming-tts-recv-task",
+                task,
+                SHUTDOWN_GRACE,
+            )
+            .await;
         }
     }
 
@@ -735,6 +736,30 @@ impl WebSocketTtsClient {
     pub fn buffered_chars(&self) -> usize {
         self.shared.buffer.lock().len()
     }
+}
+
+fn streaming_tts_duration_ms(
+    data_len: usize,
+    format: &str,
+    sample_rate: u32,
+) -> TTSResult<Option<u32>> {
+    if sample_rate == 0 {
+        return Err(TTSError::ProviderError(
+            "streaming TTS provider emitted audio with zero sample_rate".to_string(),
+        ));
+    }
+    if !crate::core::tts::sniff::is_pcm_family(format) {
+        return Ok(None);
+    }
+
+    let bytes_per_sample = if crate::core::tts::sniff::is_linear_pcm16(format) {
+        2usize
+    } else {
+        1usize
+    };
+    let samples = (data_len / bytes_per_sample) as u64;
+    let duration_ms = samples.saturating_mul(1000) / u64::from(sample_rate);
+    Ok(Some(duration_ms.min(u64::from(u32::MAX)) as u32))
 }
 
 impl Drop for WebSocketTtsClient {
@@ -813,6 +838,70 @@ mod tests {
         )
     }
 
+    struct MetadataProtocol {
+        sample_rate: u32,
+        format: &'static str,
+    }
+
+    impl WsTtsProtocol for MetadataProtocol {
+        fn provider_name(&self) -> &'static str {
+            "metadata"
+        }
+        fn speak_frame(&self, text: &str) -> String {
+            serde_json::json!({"type": "Speak", "text": text}).to_string()
+        }
+        fn flush_frame(&self) -> Option<String> {
+            Some(r#"{"type":"Flush"}"#.to_string())
+        }
+        fn clear_frame(&self) -> Option<String> {
+            None
+        }
+        fn close_frame(&self) -> Option<String> {
+            None
+        }
+        fn classify_text_frame(&self, _raw: &str) -> WsTtsEvent {
+            WsTtsEvent::Ignored
+        }
+        fn sample_rate(&self) -> u32 {
+            self.sample_rate
+        }
+        fn audio_format(&self) -> String {
+            self.format.to_string()
+        }
+    }
+
+    #[derive(Default)]
+    struct CaptureCallback {
+        audio: parking_lot::Mutex<Vec<AudioData>>,
+        errors: parking_lot::Mutex<Vec<TTSError>>,
+    }
+
+    impl AudioCallback for CaptureCallback {
+        fn on_audio(
+            &self,
+            audio_data: AudioData,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                self.audio.lock().push(audio_data);
+            })
+        }
+
+        fn on_error(
+            &self,
+            error: TTSError,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                self.errors.lock().push(error);
+            })
+        }
+
+        fn on_complete(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async {})
+        }
+    }
+
     #[tokio::test]
     async fn speak_requires_connection() {
         let c = client();
@@ -838,6 +927,81 @@ mod tests {
         assert_eq!(c.buffered_chars(), 0);
     }
 
+    #[test]
+    fn streaming_tts_duration_rejects_zero_rate_and_uses_checked_pcm_math() {
+        assert_eq!(
+            streaming_tts_duration_ms(48_000, "linear16", 24_000).expect("valid pcm16 duration"),
+            Some(1000)
+        );
+        assert_eq!(
+            streaming_tts_duration_ms(8_000, "mulaw", 8_000).expect("valid g711 duration"),
+            Some(1000)
+        );
+        assert_eq!(
+            streaming_tts_duration_ms(4_000, "mp3", 24_000).expect("compressed duration omitted"),
+            None
+        );
+        assert!(
+            matches!(
+                streaming_tts_duration_ms(1, "linear16", 0),
+                Err(TTSError::ProviderError(message)) if message.contains("zero sample_rate")
+            ),
+            "zero sample-rate metadata must fail before duration math"
+        );
+        assert_eq!(
+            streaming_tts_duration_ms(usize::MAX, "mulaw", 1).expect("saturating duration"),
+            Some(u32::MAX),
+            "oversized chunks saturate instead of wrapping the duration counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_frame_rejects_zero_sample_rate_without_delivering_audio() {
+        let shared = Arc::new(WsShared::new());
+        let capture = Arc::new(CaptureCallback::default());
+        let callback: Arc<dyn AudioCallback> = capture.clone();
+        *shared.callback.lock() = Some(callback);
+        let protocol: Arc<dyn WsTtsProtocol> = Arc::new(MetadataProtocol {
+            sample_rate: 0,
+            format: "linear16",
+        });
+
+        WebSocketTtsClient::handle_binary_frame(&shared, &protocol, vec![0u8; 480]).await;
+
+        assert!(
+            capture.audio.lock().is_empty(),
+            "invalid zero-rate audio must not reach on_audio"
+        );
+        let errors = capture.errors.lock();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            matches!(&errors[0], TTSError::ProviderError(message) if message.contains("zero sample_rate")),
+            "error should name the invalid metadata: {:?}",
+            errors[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_frame_delivers_positive_rate_audio_with_duration() {
+        let shared = Arc::new(WsShared::new());
+        let capture = Arc::new(CaptureCallback::default());
+        let callback: Arc<dyn AudioCallback> = capture.clone();
+        *shared.callback.lock() = Some(callback);
+        let protocol: Arc<dyn WsTtsProtocol> = Arc::new(MetadataProtocol {
+            sample_rate: 24_000,
+            format: "linear16",
+        });
+
+        WebSocketTtsClient::handle_binary_frame(&shared, &protocol, vec![0u8; 48_000]).await;
+
+        assert!(capture.errors.lock().is_empty());
+        let audio = capture.audio.lock();
+        assert_eq!(audio.len(), 1);
+        assert_eq!(audio[0].sample_rate, 24_000);
+        assert_eq!(audio[0].format, "linear16");
+        assert_eq!(audio[0].duration_ms, Some(1000));
+    }
+
     #[tokio::test]
     async fn pending_map_orders_and_cancels() {
         let mut map = PendingMap::default();
@@ -854,7 +1018,11 @@ mod tests {
         }
         assert_eq!(map.order.front().map(String::as_str), Some("a"));
         map.cancel_all();
-        assert!(map.by_context.values().all(|p| p.cancel_token.is_cancelled()));
+        assert!(
+            map.by_context
+                .values()
+                .all(|p| p.cancel_token.is_cancelled())
+        );
         map.purge();
         assert!(map.order.is_empty() && map.by_context.is_empty());
     }

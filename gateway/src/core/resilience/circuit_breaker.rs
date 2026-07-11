@@ -31,7 +31,7 @@
 //! be shared across the reconnect supervisor, the metrics exporter (W-C1), and the
 //! readiness probe.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Observable state of a [`CircuitBreaker`].
@@ -497,7 +497,11 @@ mod tests {
         for _ in 0..3 {
             cb.record_failure();
         }
-        assert_eq!(cb.state(), CircuitState::Closed, "must not trip below min volume");
+        assert_eq!(
+            cb.state(),
+            CircuitState::Closed,
+            "must not trip below min volume"
+        );
         assert!(cb.allow_request());
     }
 
@@ -518,15 +522,24 @@ mod tests {
         cb.record_connection_closed(Duration::from_millis(300), false);
         assert!(cb.is_permanently_failed(), "3rd quick failure = fatal");
         // Within the fatal cooldown: denied.
-        assert!(!cb.allow_request(), "fatal state denies within the cooldown");
+        assert!(
+            !cb.allow_request(),
+            "fatal state denies within the cooldown"
+        );
         // After the fatal cooldown: exactly ONE recovery probe is admitted,
         // then re-armed (review wc71hewlx #1: recoverable, not restart-only).
         std::thread::sleep(Duration::from_millis(25));
-        assert!(cb.allow_request(), "fatal state admits a probe after the cooldown");
+        assert!(
+            cb.allow_request(),
+            "fatal state admits a probe after the cooldown"
+        );
         assert!(!cb.allow_request(), "only ONE probe per fatal cooldown");
         // A STABLE recovery connection clears the fatal state entirely.
         cb.record_connection_closed(Duration::from_secs(60), false);
-        assert!(!cb.is_permanently_failed(), "a stable connection heals the fatal state");
+        assert!(
+            !cb.is_permanently_failed(),
+            "a stable connection heals the fatal state"
+        );
         assert!(cb.allow_request());
     }
 
@@ -539,7 +552,10 @@ mod tests {
         for _ in 0..10 {
             cb.record_connection_closed(Duration::from_millis(200), true);
         }
-        assert!(!cb.is_permanently_failed(), "clean short closes never trip the fatal state");
+        assert!(
+            !cb.is_permanently_failed(),
+            "clean short closes never trip the fatal state"
+        );
     }
 
     #[test]
@@ -631,7 +647,11 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::HalfOpen);
 
         cb.record_success();
-        assert_eq!(cb.state(), CircuitState::Closed, "successful probe closes breaker");
+        assert_eq!(
+            cb.state(),
+            CircuitState::Closed,
+            "successful probe closes breaker"
+        );
         assert!(cb.allow_request());
         // Window was reset on close.
         assert_eq!(cb.error_rate(), 0.0);
@@ -649,8 +669,16 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::HalfOpen);
 
         cb.record_failure();
-        assert_eq!(cb.state(), CircuitState::Open, "failed probe re-opens breaker");
-        assert_eq!(cb.total_trips(), trips_after_first + 1, "re-open counts as a trip");
+        assert_eq!(
+            cb.state(),
+            CircuitState::Open,
+            "failed probe re-opens breaker"
+        );
+        assert_eq!(
+            cb.total_trips(),
+            trips_after_first + 1,
+            "re-open counts as a trip"
+        );
         // And immediately denies again.
         assert!(!cb.allow_request());
     }
@@ -692,7 +720,11 @@ mod tests {
         for _ in 0..40 {
             cb.record_success();
         }
-        assert!(cb.error_rate() < 0.5, "rate should decay: {}", cb.error_rate());
+        assert!(
+            cb.error_rate() < 0.5,
+            "rate should decay: {}",
+            cb.error_rate()
+        );
         assert_eq!(cb.state(), CircuitState::Closed);
     }
 
@@ -767,12 +799,18 @@ mod tests {
         std::thread::sleep(Duration::from_millis(45));
         assert!(cb.allow_request(), "probe allowed after cooldown");
         let v = gauge_value(&bridge::render(), provider).expect("half-open sample");
-        assert_eq!(v, 1.0, "half-open breaker must report state-code 1, got {v}");
+        assert_eq!(
+            v, 1.0,
+            "half-open breaker must report state-code 1, got {v}"
+        );
 
         cb.record_success();
         assert_eq!(cb.state(), CircuitState::Closed);
         let v = gauge_value(&bridge::render(), provider).expect("closed sample");
-        assert_eq!(v, 0.0, "recovered breaker must report state-code 0 (closed), got {v}");
+        assert_eq!(
+            v, 0.0,
+            "recovered breaker must report state-code 0 (closed), got {v}"
+        );
     }
 
     /// Parse the `waav_circuit_breaker_state{provider="<provider>"}` sample value out of a

@@ -15,7 +15,10 @@ use axum::{
     response::Response,
 };
 use futures::{SinkExt, StreamExt};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::sync::mpsc;
 use tokio::{select, time::Duration};
 use tracing::{debug, error, info, warn};
@@ -29,10 +32,23 @@ use crate::state::AppState;
 
 use super::messages::{
     RealtimeIncomingMessage, RealtimeMessageRoute, RealtimeOutgoingMessage, RealtimeSessionConfig,
+    send_realtime_with_policy,
 };
 
 /// Optimized channel buffer size for audio workloads
 const CHANNEL_BUFFER_SIZE: usize = 1024;
+
+/// How long realtime teardown waits for the sender task to drain queued critical
+/// messages and emit a close frame before aborting it.
+const SENDER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Maximum idle time before closing an inactive realtime connection.
+const REALTIME_IDLE_BASE_SECS: u64 = 300;
+
+/// ±10% jitter around [`REALTIME_IDLE_BASE_SECS`] to avoid same-second timeout bursts.
+const REALTIME_IDLE_JITTER_RANGE_SECS: u64 = 30;
+
+static REALTIME_IDLE_JITTER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Maximum WebSocket frame size (10 MB)
 const MAX_WS_FRAME_SIZE: usize = 10 * 1024 * 1024;
@@ -85,39 +101,73 @@ pub async fn realtime_handler(
 
 /// Handle the realtime WebSocket connection. `trace_parent` is the connection's W3C `traceparent`
 /// (GW-17), forwarded onto the WaaV Infer handshake when the selected provider is the Infer-S2S tier.
-async fn handle_realtime_socket(socket: WebSocket, app_state: Arc<AppState>, auth: Auth, trace_parent: String) {
+async fn handle_realtime_socket(
+    socket: WebSocket,
+    app_state: Arc<AppState>,
+    auth: Auth,
+    trace_parent: String,
+) {
     info!(auth_id = ?auth.id, "Realtime WebSocket connection established");
 
     let (mut sender, mut receiver) = socket.split();
     let (message_tx, mut message_rx) = mpsc::channel::<RealtimeMessageRoute>(CHANNEL_BUFFER_SIZE);
 
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
     // Sender task for outgoing messages
-    let sender_task = tokio::spawn(async move {
-        while let Some(route) = message_rx.recv().await {
-            let should_close = matches!(route, RealtimeMessageRoute::Close);
+    let mut sender_task = tokio::spawn(async move {
+        loop {
+            select! {
+                route_opt = message_rx.recv() => {
+                    let Some(route) = route_opt else {
+                        break;
+                    };
+                    let should_close = matches!(route, RealtimeMessageRoute::Close);
 
-            let result = match route {
-                RealtimeMessageRoute::Outgoing(message) => match serde_json::to_string(&message) {
-                    Ok(json_str) => sender.send(Message::Text(json_str.into())).await,
-                    Err(e) => {
-                        error!("Failed to serialize outgoing message: {}", e);
-                        continue;
+                    let result = match route {
+                        RealtimeMessageRoute::Outgoing(message) => match serde_json::to_string(&message) {
+                            Ok(json_str) => sender.send(Message::Text(json_str.into())).await,
+                            Err(e) => {
+                                error!("Failed to serialize outgoing message: {}", e);
+                                continue;
+                            }
+                        },
+                        RealtimeMessageRoute::Audio(data) => sender.send(Message::Binary(data)).await,
+                        RealtimeMessageRoute::Close => {
+                            info!("Closing realtime WebSocket connection");
+                            sender.send(Message::Close(None)).await
+                        }
+                    };
+
+                    if let Err(e) = result {
+                        error!("Failed to send WebSocket message: {}", e);
+                        break;
                     }
-                },
-                RealtimeMessageRoute::Audio(data) => sender.send(Message::Binary(data)).await,
-                RealtimeMessageRoute::Close => {
-                    info!("Closing realtime WebSocket connection");
-                    sender.send(Message::Close(None)).await
+
+                    if should_close {
+                        break;
+                    }
                 }
-            };
-
-            if let Err(e) = result {
-                error!("Failed to send WebSocket message: {}", e);
-                break;
-            }
-
-            if should_close {
-                break;
+                _ = &mut shutdown_rx => {
+                    while let Ok(route) = message_rx.try_recv() {
+                        let result = match route {
+                            RealtimeMessageRoute::Outgoing(message) => match serde_json::to_string(&message) {
+                                Ok(json_str) => sender.send(Message::Text(json_str.into())).await,
+                                Err(e) => {
+                                    error!("Failed to serialize outgoing message during shutdown: {}", e);
+                                    continue;
+                                }
+                            },
+                            RealtimeMessageRoute::Audio(data) => sender.send(Message::Binary(data)).await,
+                            RealtimeMessageRoute::Close => sender.send(Message::Close(None)).await,
+                        };
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = sender.send(Message::Close(None)).await;
+                    break;
+                }
             }
         }
     });
@@ -129,15 +179,8 @@ async fn handle_realtime_socket(socket: WebSocket, app_state: Arc<AppState>, aut
     // How often we check if the connection is stale (configurable via REALTIME_PROCESSING_TIMEOUT_SECS)
     let processing_timeout = Duration::from_secs(app_state.config.realtime_processing_timeout_secs);
 
-    // Maximum idle time before closing the connection (5 minutes with ±10% jitter)
-    // Jitter prevents thundering herd when many connections timeout simultaneously
-    let base_idle_secs: u64 = 300;
-    let jitter_range: u64 = 30; // ±10% = 30 seconds
-    let jitter_offset = (std::time::Instant::now().elapsed().as_nanos() as u64 % (jitter_range * 2))
-        as i64
-        - jitter_range as i64;
-    let idle_secs = (base_idle_secs as i64 + jitter_offset).max(1) as u64;
-    let idle_timeout = Duration::from_secs(idle_secs);
+    let idle_timeout =
+        realtime_idle_timeout(REALTIME_IDLE_BASE_SECS, REALTIME_IDLE_JITTER_RANGE_SECS);
 
     // Track last activity time for idle connection detection
     let mut last_activity = std::time::Instant::now();
@@ -165,14 +208,14 @@ async fn handle_realtime_socket(socket: WebSocket, app_state: Arc<AppState>, aut
                     }
                     Some(Err(e)) => {
                         warn!("Realtime WebSocket error: {}", e);
-                        let _ = message_tx
-                            .send(RealtimeMessageRoute::Outgoing(
-                                RealtimeOutgoingMessage::Error {
-                                    code: Some("websocket_error".to_string()),
-                                    message: format!("WebSocket error: {e}"),
-                                },
-                            ))
-                            .await;
+                        send_realtime_with_policy(
+                            &message_tx,
+                            RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                                code: Some("websocket_error".to_string()),
+                                message: format!("WebSocket error: {e}"),
+                            }),
+                        )
+                        .await;
                         break;
                     }
                     None => {
@@ -188,14 +231,14 @@ async fn handle_realtime_socket(socket: WebSocket, app_state: Arc<AppState>, aut
                         "Realtime WebSocket connection idle for {}s, closing stale connection",
                         last_activity.elapsed().as_secs()
                     );
-                    let _ = message_tx
-                        .send(RealtimeMessageRoute::Outgoing(
-                            RealtimeOutgoingMessage::Error {
-                                code: Some("idle_timeout".to_string()),
-                                message: "Connection closed due to inactivity".to_string(),
-                            },
-                        ))
-                        .await;
+                    send_realtime_with_policy(
+                        &message_tx,
+                        RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                            code: Some("idle_timeout".to_string()),
+                            message: "Connection closed due to inactivity".to_string(),
+                        }),
+                    )
+                    .await;
                     break;
                 }
                 debug!("Realtime WebSocket connection idle check - still active");
@@ -203,8 +246,9 @@ async fn handle_realtime_socket(socket: WebSocket, app_state: Arc<AppState>, aut
         }
     }
 
-    // Cleanup
-    sender_task.abort();
+    // Cleanup: give the sender task a bounded chance to drain already-queued
+    // critical messages (for example idle-timeout errors) before aborting it.
+    shutdown_realtime_sender_task(shutdown_tx, &mut sender_task).await;
 
     // Disconnect realtime provider if connected
     if let Some(mut provider) = realtime_provider
@@ -214,6 +258,62 @@ async fn handle_realtime_socket(socket: WebSocket, app_state: Arc<AppState>, aut
     }
 
     info!("Realtime WebSocket connection terminated");
+}
+
+async fn shutdown_realtime_sender_task(
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    sender_task: &mut tokio::task::JoinHandle<()>,
+) -> bool {
+    let _ = shutdown_tx.send(());
+    match tokio::time::timeout(SENDER_SHUTDOWN_TIMEOUT, &mut *sender_task).await {
+        Ok(Ok(())) => {
+            debug!("Realtime sender task completed gracefully");
+            true
+        }
+        Ok(Err(e)) => {
+            if e.is_panic() {
+                error!("Realtime sender task panicked during shutdown: {}", e);
+            } else {
+                debug!("Realtime sender task cancelled during shutdown: {}", e);
+            }
+            true
+        }
+        Err(_) => {
+            warn!("Realtime sender task did not complete within timeout; aborting");
+            sender_task.abort();
+            crate::core::metrics::bridge::record_session_dangling_task();
+            let _ = sender_task.await;
+            false
+        }
+    }
+}
+
+fn realtime_idle_timeout(base_idle_secs: u64, jitter_range_secs: u64) -> Duration {
+    let seq = REALTIME_IDLE_JITTER_SEQ.fetch_add(1, Ordering::Relaxed);
+    realtime_idle_timeout_for_seq(base_idle_secs, jitter_range_secs, seq)
+}
+
+fn realtime_idle_timeout_for_seq(
+    base_idle_secs: u64,
+    jitter_range_secs: u64,
+    seq: u64,
+) -> Duration {
+    let offset = realtime_idle_jitter_offset_for_seq(seq, jitter_range_secs);
+    let idle_secs = if offset.is_negative() {
+        base_idle_secs.saturating_sub(offset.unsigned_abs())
+    } else {
+        base_idle_secs.saturating_add(offset as u64)
+    };
+    Duration::from_secs(idle_secs.max(1))
+}
+
+fn realtime_idle_jitter_offset_for_seq(seq: u64, jitter_range_secs: u64) -> i64 {
+    if jitter_range_secs == 0 {
+        return 0;
+    }
+
+    let width = jitter_range_secs.saturating_mul(2).saturating_add(1);
+    (seq % width) as i64 - jitter_range_secs as i64
 }
 
 /// Process incoming WebSocket message
@@ -234,14 +334,14 @@ async fn process_realtime_message(
                 Ok(msg) => msg,
                 Err(e) => {
                     error!("Failed to parse realtime message: {}", e);
-                    let _ = message_tx
-                        .send(RealtimeMessageRoute::Outgoing(
-                            RealtimeOutgoingMessage::Error {
-                                code: Some("parse_error".to_string()),
-                                message: format!("Invalid message format: {e}"),
-                            },
-                        ))
-                        .await;
+                    send_realtime_with_policy(
+                        message_tx,
+                        RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                            code: Some("parse_error".to_string()),
+                            message: format!("Invalid message format: {e}"),
+                        }),
+                    )
+                    .await;
                     return true;
                 }
             };
@@ -249,14 +349,14 @@ async fn process_realtime_message(
             // Validate message size
             if let Err(e) = incoming_msg.validate_size() {
                 warn!("Message validation failed: {}", e);
-                let _ = message_tx
-                    .send(RealtimeMessageRoute::Outgoing(
-                        RealtimeOutgoingMessage::Error {
-                            code: Some("validation_error".to_string()),
-                            message: e.to_string(),
-                        },
-                    ))
-                    .await;
+                send_realtime_with_policy(
+                    message_tx,
+                    RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                        code: Some("validation_error".to_string()),
+                        message: e.to_string(),
+                    }),
+                )
+                .await;
                 return true;
             }
 
@@ -279,14 +379,14 @@ async fn process_realtime_message(
                     // data is already Bytes, use it directly without allocation
                     if let Err(e) = provider.send_audio(data).await {
                         warn!("Failed to send audio to provider: {:?}", e);
-                        let _ = message_tx
-                            .send(RealtimeMessageRoute::Outgoing(
-                                RealtimeOutgoingMessage::Error {
-                                    code: Some("audio_error".to_string()),
-                                    message: format!("Failed to send audio: {e}"),
-                                },
-                            ))
-                            .await;
+                        send_realtime_with_policy(
+                            message_tx,
+                            RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                                code: Some("audio_error".to_string()),
+                                message: format!("Failed to send audio: {e}"),
+                            }),
+                        )
+                        .await;
                     }
                 } else {
                     debug!("Provider not ready, dropping audio");
@@ -323,21 +423,29 @@ async fn handle_realtime_incoming(
 ) -> bool {
     match msg {
         RealtimeIncomingMessage::Config(config) => {
-            handle_config(config, realtime_provider, session_id, message_tx, app_state, trace_parent).await
+            handle_config(
+                config,
+                realtime_provider,
+                session_id,
+                message_tx,
+                app_state,
+                trace_parent,
+            )
+            .await
         }
         RealtimeIncomingMessage::Text { text } => {
             if let Some(provider) = realtime_provider
                 && provider.is_ready()
                 && let Err(e) = provider.send_text(&text).await
             {
-                let _ = message_tx
-                    .send(RealtimeMessageRoute::Outgoing(
-                        RealtimeOutgoingMessage::Error {
-                            code: Some("text_error".to_string()),
-                            message: format!("Failed to send text: {e}"),
-                        },
-                    ))
-                    .await;
+                send_realtime_with_policy(
+                    message_tx,
+                    RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                        code: Some("text_error".to_string()),
+                        message: format!("Failed to send text: {e}"),
+                    }),
+                )
+                .await;
             }
             true
         }
@@ -347,28 +455,27 @@ async fn handle_realtime_incoming(
                 // message → the session-default `create_response`.
                 let result = match response {
                     Some(ov) => {
-                        let overrides =
-                            crate::core::realtime::RealtimeResponseOverride {
-                                modalities: ov.modalities,
-                                instructions: ov.instructions,
-                                voice: ov.voice,
-                                max_output_tokens: ov.max_output_tokens,
-                                out_of_band: ov.out_of_band.unwrap_or(false),
-                                metadata: ov.metadata,
-                            };
+                        let overrides = crate::core::realtime::RealtimeResponseOverride {
+                            modalities: ov.modalities,
+                            instructions: ov.instructions,
+                            voice: ov.voice,
+                            max_output_tokens: ov.max_output_tokens,
+                            out_of_band: ov.out_of_band.unwrap_or(false),
+                            metadata: ov.metadata,
+                        };
                         provider.create_response_with(overrides).await
                     }
                     None => provider.create_response().await,
                 };
                 if let Err(e) = result {
-                    let _ = message_tx
-                        .send(RealtimeMessageRoute::Outgoing(
-                            RealtimeOutgoingMessage::Error {
-                                code: Some("response_error".to_string()),
-                                message: format!("Failed to create response: {e}"),
-                            },
-                        ))
-                        .await;
+                    send_realtime_with_policy(
+                        message_tx,
+                        RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                            code: Some("response_error".to_string()),
+                            message: format!("Failed to create response: {e}"),
+                        }),
+                    )
+                    .await;
                 }
             }
             true
@@ -386,14 +493,14 @@ async fn handle_realtime_incoming(
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        let _ = message_tx
-                            .send(RealtimeMessageRoute::Outgoing(
-                                RealtimeOutgoingMessage::Error {
-                                    code: Some("cancel_error".to_string()),
-                                    message: format!("Failed to cancel response: {e}"),
-                                },
-                            ))
-                            .await;
+                        send_realtime_with_policy(
+                            message_tx,
+                            RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                                code: Some("cancel_error".to_string()),
+                                message: format!("Failed to cancel response: {e}"),
+                            }),
+                        )
+                        .await;
                     }
                 }
             }
@@ -403,14 +510,14 @@ async fn handle_realtime_incoming(
             if let Some(provider) = realtime_provider
                 && let Err(e) = provider.commit_audio_buffer().await
             {
-                let _ = message_tx
-                    .send(RealtimeMessageRoute::Outgoing(
-                        RealtimeOutgoingMessage::Error {
-                            code: Some("commit_error".to_string()),
-                            message: format!("Failed to commit audio: {e}"),
-                        },
-                    ))
-                    .await;
+                send_realtime_with_policy(
+                    message_tx,
+                    RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                        code: Some("commit_error".to_string()),
+                        message: format!("Failed to commit audio: {e}"),
+                    }),
+                )
+                .await;
             }
             true
         }
@@ -418,14 +525,14 @@ async fn handle_realtime_incoming(
             if let Some(provider) = realtime_provider
                 && let Err(e) = provider.clear_audio_buffer().await
             {
-                let _ = message_tx
-                    .send(RealtimeMessageRoute::Outgoing(
-                        RealtimeOutgoingMessage::Error {
-                            code: Some("clear_error".to_string()),
-                            message: format!("Failed to clear audio: {e}"),
-                        },
-                    ))
-                    .await;
+                send_realtime_with_policy(
+                    message_tx,
+                    RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                        code: Some("clear_error".to_string()),
+                        message: format!("Failed to clear audio: {e}"),
+                    }),
+                )
+                .await;
             }
             true
         }
@@ -433,14 +540,14 @@ async fn handle_realtime_incoming(
             if let Some(provider) = realtime_provider
                 && let Err(e) = provider.submit_function_result(&call_id, &result).await
             {
-                let _ = message_tx
-                    .send(RealtimeMessageRoute::Outgoing(
-                        RealtimeOutgoingMessage::Error {
-                            code: Some("function_error".to_string()),
-                            message: format!("Failed to submit function result: {e}"),
-                        },
-                    ))
-                    .await;
+                send_realtime_with_policy(
+                    message_tx,
+                    RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                        code: Some("function_error".to_string()),
+                        message: format!("Failed to submit function result: {e}"),
+                    }),
+                )
+                .await;
             }
             true
         }
@@ -478,14 +585,14 @@ async fn handle_config(
             }
             None => {
                 let (code, message) = crate::core::alias::unknown_alias_message(&alias_name);
-                let _ = message_tx
-                    .send(RealtimeMessageRoute::Outgoing(
-                        RealtimeOutgoingMessage::Error {
-                            code: Some(code),
-                            message,
-                        },
-                    ))
-                    .await;
+                send_realtime_with_policy(
+                    message_tx,
+                    RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                        code: Some(code),
+                        message,
+                    }),
+                )
+                .await;
             }
         }
     }
@@ -499,17 +606,17 @@ async fn handle_config(
         .iter()
         .any(|p| p.eq_ignore_ascii_case(provider_name))
     {
-        let _ = message_tx
-            .send(RealtimeMessageRoute::Outgoing(
-                RealtimeOutgoingMessage::Error {
-                    code: Some("invalid_provider".to_string()),
-                    message: format!(
-                        "Unsupported provider: {}. Supported: {:?}",
-                        provider_name, supported
-                    ),
-                },
-            ))
-            .await;
+        send_realtime_with_policy(
+            message_tx,
+            RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                code: Some("invalid_provider".to_string()),
+                message: format!(
+                    "Unsupported provider: {}. Supported: {:?}",
+                    provider_name, supported
+                ),
+            }),
+        )
+        .await;
         return true;
     }
 
@@ -518,9 +625,7 @@ async fn handle_config(
         "openai" => app_state.config.openai_api_key.clone(),
         "hume" => app_state.config.hume_api_key.clone(),
         // OpenAI-protocol clones (own credentials, GA wire reused by delegation).
-        "azure" | "azure-openai" | "azure_openai" => {
-            app_state.config.azure_openai_api_key.clone()
-        }
+        "azure" | "azure-openai" | "azure_openai" => app_state.config.azure_openai_api_key.clone(),
         "grok" | "xai" => app_state.config.grok_api_key.clone(),
         "inworld" => app_state.config.inworld_api_key.clone(),
         // Deepgram Voice Agent (S2S) reuses the EXISTING deepgram credential
@@ -560,14 +665,14 @@ async fn handle_config(
     };
 
     let Some(api_key) = api_key else {
-        let _ = message_tx
-            .send(RealtimeMessageRoute::Outgoing(
-                RealtimeOutgoingMessage::Error {
-                    code: Some("missing_api_key".to_string()),
-                    message: format!("API key not configured for provider: {}", provider_name),
-                },
-            ))
-            .await;
+        send_realtime_with_policy(
+            message_tx,
+            RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                code: Some("missing_api_key".to_string()),
+                message: format!("API key not configured for provider: {}", provider_name),
+            }),
+        )
+        .await;
         return true;
     };
 
@@ -619,14 +724,14 @@ async fn handle_config(
     let mut provider = match create_realtime_provider(provider_name, realtime_config) {
         Ok(p) => p,
         Err(e) => {
-            let _ = message_tx
-                .send(RealtimeMessageRoute::Outgoing(
-                    RealtimeOutgoingMessage::Error {
-                        code: Some("provider_error".to_string()),
-                        message: format!("Failed to create provider: {e}"),
-                    },
-                ))
-                .await;
+            send_realtime_with_policy(
+                message_tx,
+                RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                    code: Some("provider_error".to_string()),
+                    message: format!("Failed to create provider: {e}"),
+                }),
+            )
+            .await;
             return true;
         }
     };
@@ -647,15 +752,15 @@ async fn handle_config(
                     TranscriptRole::User => "user",
                     TranscriptRole::Assistant => "assistant",
                 };
-                let _ = tx
-                    .send(RealtimeMessageRoute::Outgoing(
-                        RealtimeOutgoingMessage::Transcript {
-                            text: result.text,
-                            role: role.to_string(),
-                            is_final: result.is_final,
-                        },
-                    ))
-                    .await;
+                send_realtime_with_policy(
+                    &tx,
+                    RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Transcript {
+                        text: result.text,
+                        role: role.to_string(),
+                        is_final: result.is_final,
+                    }),
+                )
+                .await;
             })
         }))
         .ok();
@@ -665,7 +770,7 @@ async fn handle_config(
         .on_audio(Arc::new(move |audio: RealtimeAudioData| {
             let tx = tx_clone.clone();
             Box::pin(async move {
-                let _ = tx.send(RealtimeMessageRoute::Audio(audio.data)).await;
+                send_realtime_with_policy(&tx, RealtimeMessageRoute::Audio(audio.data)).await;
             })
         }))
         .ok();
@@ -675,14 +780,14 @@ async fn handle_config(
         .on_error(Arc::new(move |error: RealtimeError| {
             let tx = tx_clone.clone();
             Box::pin(async move {
-                let _ = tx
-                    .send(RealtimeMessageRoute::Outgoing(
-                        RealtimeOutgoingMessage::Error {
-                            code: Some("provider_error".to_string()),
-                            message: error.to_string(),
-                        },
-                    ))
-                    .await;
+                send_realtime_with_policy(
+                    &tx,
+                    RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                        code: Some("provider_error".to_string()),
+                        message: error.to_string(),
+                    }),
+                )
+                .await;
             })
         }))
         .ok();
@@ -693,15 +798,15 @@ async fn handle_config(
             move |call: crate::core::realtime::FunctionCallRequest| {
                 let tx = tx_clone.clone();
                 Box::pin(async move {
-                    let _ = tx
-                        .send(RealtimeMessageRoute::Outgoing(
-                            RealtimeOutgoingMessage::FunctionCall {
-                                call_id: call.call_id,
-                                name: call.name,
-                                arguments: call.arguments,
-                            },
-                        ))
-                        .await;
+                    send_realtime_with_policy(
+                        &tx,
+                        RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::FunctionCall {
+                            call_id: call.call_id,
+                            name: call.name,
+                            arguments: call.arguments,
+                        }),
+                    )
+                    .await;
                 })
             },
         ))
@@ -721,14 +826,14 @@ async fn handle_config(
                             ("stopped", audio_end_ms)
                         }
                     };
-                    let _ = tx
-                        .send(RealtimeMessageRoute::Outgoing(
-                            RealtimeOutgoingMessage::SpeechEvent {
-                                event: event_type.to_string(),
-                                audio_ms,
-                            },
-                        ))
-                        .await;
+                    send_realtime_with_policy(
+                        &tx,
+                        RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::SpeechEvent {
+                            event: event_type.to_string(),
+                            audio_ms,
+                        }),
+                    )
+                    .await;
                 })
             },
         ))
@@ -739,11 +844,13 @@ async fn handle_config(
         .on_response_done(Arc::new(move |response_id: String| {
             let tx = tx_clone.clone();
             Box::pin(async move {
-                let _ = tx
-                    .send(RealtimeMessageRoute::Outgoing(
-                        RealtimeOutgoingMessage::ResponseDone { response_id },
-                    ))
-                    .await;
+                send_realtime_with_policy(
+                    &tx,
+                    RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::ResponseDone {
+                        response_id,
+                    }),
+                )
+                .await;
             })
         }))
         .ok();
@@ -765,19 +872,19 @@ async fn handle_config(
                 if event.success {
                     return;
                 }
-                let _ = tx
-                    .send(RealtimeMessageRoute::Outgoing(
-                        RealtimeOutgoingMessage::Error {
-                            code: Some("connection_lost".to_string()),
-                            message: event.error.unwrap_or_else(|| {
-                                "Realtime provider connection lost and could not be re-established"
-                                    .to_string()
-                            }),
-                        },
-                    ))
-                    .await;
+                send_realtime_with_policy(
+                    &tx,
+                    RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                        code: Some("connection_lost".to_string()),
+                        message: event.error.unwrap_or_else(|| {
+                            "Realtime provider connection lost and could not be re-established"
+                                .to_string()
+                        }),
+                    }),
+                )
+                .await;
                 // Terminally dead — tell the sender task to close the client WS.
-                let _ = tx.send(RealtimeMessageRoute::Close).await;
+                send_realtime_with_policy(&tx, RealtimeMessageRoute::Close).await;
             })
         }))
         .ok();
@@ -785,14 +892,14 @@ async fn handle_config(
     // Connect to provider
     info!("Connecting to {} realtime provider", provider_name);
     if let Err(e) = provider.connect().await {
-        let _ = message_tx
-            .send(RealtimeMessageRoute::Outgoing(
-                RealtimeOutgoingMessage::Error {
-                    code: Some("connection_error".to_string()),
-                    message: format!("Failed to connect: {e}"),
-                },
-            ))
-            .await;
+        send_realtime_with_policy(
+            message_tx,
+            RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                code: Some("connection_error".to_string()),
+                message: format!("Failed to connect: {e}"),
+            }),
+        )
+        .await;
         return true;
     }
 
@@ -804,15 +911,15 @@ async fn handle_config(
     *realtime_provider = Some(provider);
 
     // Send session created message
-    let _ = message_tx
-        .send(RealtimeMessageRoute::Outgoing(
-            RealtimeOutgoingMessage::SessionCreated {
-                session_id: new_session_id,
-                provider: provider_name.to_string(),
-                model: model.to_string(),
-            },
-        ))
-        .await;
+    send_realtime_with_policy(
+        message_tx,
+        RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::SessionCreated {
+            session_id: new_session_id,
+            provider: provider_name.to_string(),
+            model: model.to_string(),
+        }),
+    )
+    .await;
 
     info!("Realtime session created with provider: {}", provider_name);
     true
@@ -825,14 +932,14 @@ async fn handle_session_update(
     message_tx: &mpsc::Sender<RealtimeMessageRoute>,
 ) -> bool {
     let Some(provider) = realtime_provider else {
-        let _ = message_tx
-            .send(RealtimeMessageRoute::Outgoing(
-                RealtimeOutgoingMessage::Error {
-                    code: Some("no_session".to_string()),
-                    message: "No active session to update".to_string(),
-                },
-            ))
-            .await;
+        send_realtime_with_policy(
+            message_tx,
+            RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                code: Some("no_session".to_string()),
+                message: "No active session to update".to_string(),
+            }),
+        )
+        .await;
         return true;
     };
 
@@ -851,20 +958,20 @@ async fn handle_session_update(
     };
 
     if let Err(e) = provider.update_session(update_config).await {
-        let _ = message_tx
-            .send(RealtimeMessageRoute::Outgoing(
-                RealtimeOutgoingMessage::Error {
-                    code: Some("update_error".to_string()),
-                    message: format!("Failed to update session: {e}"),
-                },
-            ))
-            .await;
+        send_realtime_with_policy(
+            message_tx,
+            RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                code: Some("update_error".to_string()),
+                message: format!("Failed to update session: {e}"),
+            }),
+        )
+        .await;
     } else {
-        let _ = message_tx
-            .send(RealtimeMessageRoute::Outgoing(
-                RealtimeOutgoingMessage::SessionUpdated,
-            ))
-            .await;
+        send_realtime_with_policy(
+            message_tx,
+            RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::SessionUpdated),
+        )
+        .await;
     }
 
     true
@@ -928,7 +1035,9 @@ pub fn build_realtime_config(api_key: String, config: &RealtimeSessionConfig) ->
                 interrupt_response: Some(true),
             }
         }
-        crate::handlers::realtime::messages::TurnDetectionConfig::Manual => TurnDetectionConfig::None,
+        crate::handlers::realtime::messages::TurnDetectionConfig::Manual => {
+            TurnDetectionConfig::None
+        }
     });
 
     let tools = config.tools.as_ref().map(|tools| {
@@ -1071,6 +1180,109 @@ mod tests {
         assert_eq!(DEFAULT_MODEL, "gpt-realtime");
     }
 
+    #[test]
+    fn realtime_idle_jitter_spreads_connection_deadlines() {
+        let offsets: Vec<i64> = (0..=REALTIME_IDLE_JITTER_RANGE_SECS * 2)
+            .map(|seq| realtime_idle_jitter_offset_for_seq(seq, REALTIME_IDLE_JITTER_RANGE_SECS))
+            .collect();
+
+        assert_eq!(
+            offsets.first().copied(),
+            Some(-(REALTIME_IDLE_JITTER_RANGE_SECS as i64))
+        );
+        assert!(offsets.contains(&0));
+        assert_eq!(
+            offsets.last().copied(),
+            Some(REALTIME_IDLE_JITTER_RANGE_SECS as i64)
+        );
+        assert!(
+            offsets.windows(2).any(|pair| pair[0] != pair[1]),
+            "jitter must not collapse to one fixed offset"
+        );
+        assert_eq!(
+            realtime_idle_timeout_for_seq(
+                REALTIME_IDLE_BASE_SECS,
+                REALTIME_IDLE_JITTER_RANGE_SECS,
+                0,
+            ),
+            Duration::from_secs(270)
+        );
+        assert_eq!(
+            realtime_idle_timeout_for_seq(
+                REALTIME_IDLE_BASE_SECS,
+                REALTIME_IDLE_JITTER_RANGE_SECS,
+                REALTIME_IDLE_JITTER_RANGE_SECS,
+            ),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            realtime_idle_timeout_for_seq(
+                REALTIME_IDLE_BASE_SECS,
+                REALTIME_IDLE_JITTER_RANGE_SECS,
+                REALTIME_IDLE_JITTER_RANGE_SECS * 2,
+            ),
+            Duration::from_secs(330)
+        );
+    }
+
+    #[test]
+    fn realtime_idle_timeout_clamps_when_jitter_exceeds_base() {
+        assert_eq!(
+            realtime_idle_timeout_for_seq(10, 30, 0),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            realtime_idle_timeout_for_seq(0, 0, 0),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn p5_realtime_sender_shutdown_completes_gracefully() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let observed_shutdown = Arc::new(AtomicBool::new(false));
+        let observed = observed_shutdown.clone();
+        let mut sender_task = tokio::spawn(async move {
+            let _ = shutdown_rx.await;
+            observed.store(true, Ordering::SeqCst);
+        });
+
+        assert!(shutdown_realtime_sender_task(shutdown_tx, &mut sender_task).await);
+        assert!(
+            observed_shutdown.load(Ordering::SeqCst),
+            "sender task must observe the shutdown signal"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn p5_realtime_sender_shutdown_aborts_stuck_task() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let observed_shutdown = Arc::new(AtomicBool::new(false));
+        let observed = observed_shutdown.clone();
+        let mut sender_task = tokio::spawn(async move {
+            let _ = shutdown_rx.await;
+            observed.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        });
+
+        assert!(
+            !shutdown_realtime_sender_task(shutdown_tx, &mut sender_task).await,
+            "stuck sender task must time out and be aborted"
+        );
+        assert!(
+            observed_shutdown.load(Ordering::SeqCst),
+            "sender task should still receive shutdown before timing out"
+        );
+        assert!(
+            sender_task.is_finished(),
+            "aborted task handle must be joined"
+        );
+    }
+
     /// Full-surface round-trip: a `RealtimeSessionConfig` carrying EVERY feature
     /// (turn detection, tools, transcription, noise reduction, reasoning effort,
     /// modalities, audio formats, temperature, max tokens) must convert through
@@ -1088,11 +1300,13 @@ mod tests {
             instructions: Some("Be concise and helpful.".to_string()),
             temperature: Some(0.7),
             max_response_tokens: Some(2048),
-            turn_detection: Some(crate::handlers::realtime::messages::TurnDetectionConfig::ServerVad {
-                threshold: Some(0.55),
-                silence_duration_ms: Some(700),
-                prefix_padding_ms: Some(120),
-            }),
+            turn_detection: Some(
+                crate::handlers::realtime::messages::TurnDetectionConfig::ServerVad {
+                    threshold: Some(0.55),
+                    silence_duration_ms: Some(700),
+                    prefix_padding_ms: Some(120),
+                },
+            ),
             tools: Some(vec![crate::handlers::realtime::messages::ToolConfig {
                 tool_type: "function".to_string(),
                 function: crate::handlers::realtime::messages::FunctionConfig {
@@ -1117,8 +1331,7 @@ mod tests {
 
         // Step 1: the client→config converter must carry the full surface through
         // and (SSRF) never set the server-only endpoint fields.
-        let mut realtime_config =
-            build_realtime_config("test-key".to_string(), &session_config);
+        let mut realtime_config = build_realtime_config("test-key".to_string(), &session_config);
         assert!(realtime_config.turn_detection.is_some());
         assert!(realtime_config.tools.is_some());
         assert!(realtime_config.input_audio_transcription.is_some());
@@ -1126,7 +1339,10 @@ mod tests {
             realtime_config.input_audio_noise_reduction.as_deref(),
             Some("near_field")
         );
-        assert_eq!(realtime_config.reasoning_effort, Some(crate::core::llm::ReasoningEffort::Low));
+        assert_eq!(
+            realtime_config.reasoning_effort,
+            Some(crate::core::llm::ReasoningEffort::Low)
+        );
         assert!(realtime_config.realtime_endpoint_override.is_none());
 
         // Step 2: that config must construct EVERY provider (offline, no connect).

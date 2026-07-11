@@ -8,6 +8,8 @@
 //! `RequestId` extension for handlers (so they can forward it to outbound provider requests),
 //! echoes it on the response, and runs the handler inside a tracing span carrying `request_id`.
 
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -19,9 +21,45 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+use futures::FutureExt;
+use tokio::task::JoinHandle;
 use tower::util::ServiceExt;
 
 use waav_gateway::middleware::{RequestId, request_id_middleware};
+
+struct TestServer {
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        if self.panicked.load(Ordering::SeqCst) {
+            if std::thread::panicking() {
+                eprintln!("request-id mock provider server panicked");
+            } else {
+                panic!("request-id mock provider server panicked");
+            }
+        }
+    }
+}
+
+fn spawn_test_server<F>(future: F) -> TestServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let panicked = Arc::new(AtomicBool::new(false));
+    let panicked_in_task = Arc::clone(&panicked);
+    let handle = tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked_in_task.store(true, Ordering::SeqCst);
+        }
+    });
+    TestServer { handle, panicked }
+}
 
 /// A handler standing in for a real provider-calling handler: it reads the propagated
 /// `RequestId` and forwards it on an *outbound* request to a local mock, mirroring how WaaV
@@ -67,7 +105,7 @@ async fn request_id_propagates() {
             }),
         )
         .with_state(());
-    tokio::spawn(async move {
+    let _server = spawn_test_server(async move {
         axum::serve(listener, mock).await.unwrap();
     });
 
@@ -113,10 +151,7 @@ async fn request_id_propagates() {
     );
 
     // --- Case 2: absent inbound id is minted and echoed ----------------------------------
-    let req = Request::builder()
-        .uri("/call")
-        .body(Body::empty())
-        .unwrap();
+    let req = Request::builder().uri("/call").body(Body::empty()).unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let minted = resp

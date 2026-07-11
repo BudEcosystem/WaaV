@@ -21,6 +21,17 @@
 use super::auth::IFlytekAuth;
 use crate::core::stt::base::{STTConfig, STTError};
 
+fn validate_iflytek_stt_endpoint(source: &str, endpoint: &str) -> Result<(), STTError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, &["ws", "wss"]).map_err(|e| {
+        STTError::ConfigurationError(format!("{source} rejected (SSRF protection): {e}"))
+    })
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -402,12 +413,10 @@ impl IFlytekSttConfig {
             .map_err(|e| STTError::AuthenticationFailed(e.to_string()))?;
 
         // Parse language
-        let language =
-            IFlytekLanguage::from_code(&config.language).unwrap_or_default();
+        let language = IFlytekLanguage::from_code(&config.language).unwrap_or_default();
 
         // Parse encoding
-        let encoding = IFlytekAudioEncoding::from_str(&config.encoding)
-            .unwrap_or_default();
+        let encoding = IFlytekAudioEncoding::from_str(&config.encoding).unwrap_or_default();
 
         // Determine ASR mode from model field
         let mode = if config.model.to_lowercase().contains("realtime")
@@ -508,6 +517,10 @@ impl IFlytekSttConfig {
             ));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_iflytek_stt_endpoint("endpoint_override", endpoint)?;
+        }
+
         Ok(())
     }
 
@@ -547,11 +560,14 @@ mod tests {
     #[test]
     fn advanced_features_reach_first_frame_business_json() {
         use super::super::messages::SttRequest;
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
 
         let mut extras_map = serde_json::Map::new();
         extras_map.insert("word_alternatives".into(), serde_json::json!(3));
-        extras_map.insert("domain_personalization".into(), serde_json::json!("medical"));
+        extras_map.insert(
+            "domain_personalization".into(),
+            serde_json::json!("medical"),
+        );
         extras_map.insert("result_character_set".into(), serde_json::json!("zh-cn"));
 
         let std = StandardSTTConfig {
@@ -606,13 +622,25 @@ mod tests {
     fn first_frame_without_extras_omits_advanced_business_keys() {
         use super::super::messages::SttRequest;
         let request = SttRequest::first_frame(
-            "app", "zh_cn", "iat", Some("mandarin"), 2000, true, true, true,
-            "audio/L16;rate=16000", "raw", &[0u8; 8],
+            "app",
+            "zh_cn",
+            "iat",
+            Some("mandarin"),
+            2000,
+            true,
+            true,
+            true,
+            "audio/L16;rate=16000",
+            "raw",
+            &[0u8; 8],
         );
         let v: serde_json::Value = serde_json::from_str(&request.to_json().unwrap()).unwrap();
         let business = &v["business"];
         for k in ["vinfo", "nbest", "wbest", "pd", "rlang"] {
-            assert!(business.get(k).is_none(), "{k} should be omitted when unset");
+            assert!(
+                business.get(k).is_none(),
+                "{k} should be omitted when unset"
+            );
         }
     }
 
@@ -621,7 +649,7 @@ mod tests {
     // (diarization, redaction, keyterms, …) are capability gaps left at defaults.
     #[test]
     fn from_standard_maps_features() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "iflytek".into(),
@@ -811,6 +839,51 @@ mod tests {
         let base = create_test_base_config();
         let config = IFlytekSttConfig::from_base(base).unwrap();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = IFlytekSttConfig::default();
+        config.auth = IFlytekAuth::new("app".to_string(), "key".to_string(), "secret".to_string());
+        config.endpoint_override = Some("wss://iflytek-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://iflytek-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-WebSocket endpoint_override must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("https://iflytek-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("HTTP endpoint_override must be rejected for iFlytek WebSocket dial");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]

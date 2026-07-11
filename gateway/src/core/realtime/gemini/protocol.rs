@@ -96,7 +96,11 @@ impl GeminiProtocol {
     /// explicit-null/unknown keys, and a missing `speechConfig` ⇒ the model's
     /// default voice).
     fn speech_config(cfg: &RealtimeConfig) -> Option<Value> {
-        let voice = cfg.voice.as_deref().map(str::trim).filter(|v| !v.is_empty())?;
+        let voice = cfg
+            .voice
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())?;
         Some(json!({
             "voiceConfig": { "prebuiltVoiceConfig": { "voiceName": voice } }
         }))
@@ -138,7 +142,10 @@ impl GeminiProtocol {
             .get("turnComplete")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let interrupted = sc.get("interrupted").and_then(Value::as_bool).unwrap_or(false);
+        let interrupted = sc
+            .get("interrupted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         // ONE S2sEvent PER part of modelTurn.parts[].
         if let Some(parts) = sc
@@ -567,9 +574,15 @@ mod tests {
             "URL must be the BidiGenerateContent endpoint: {url}"
         );
         assert!(url.contains("BidiGenerateContent"), "URL: {url}");
-        assert!(url.ends_with("?key=gkey"), "key must be the ?key= query: {url}");
+        assert!(
+            url.ends_with("?key=gkey"),
+            "key must be the ?key= query: {url}"
+        );
         // NO auth header at all (Gemini auths by query param).
-        assert!(headers.is_empty(), "Gemini sends NO headers, got: {headers:?}");
+        assert!(
+            headers.is_empty(),
+            "Gemini sends NO headers, got: {headers:?}"
+        );
     }
 
     /// SERVER-CONFIG `realtime_endpoint_override` WINS over the Live host; because
@@ -617,8 +630,7 @@ mod tests {
         assert_eq!(setup["model"], "models/gemini-2.0-flash-live-001");
         assert_eq!(setup["generationConfig"]["responseModalities"][0], "AUDIO");
         assert_eq!(
-            setup["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]
-                ["voiceName"],
+            setup["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"],
             "Puck"
         );
         assert_eq!(setup["systemInstruction"]["parts"][0]["text"], "Be terse.");
@@ -682,7 +694,11 @@ mod tests {
         let chunk = &wire["realtimeInput"]["mediaChunks"][0];
         assert_eq!(chunk["mimeType"], "audio/pcm;rate=16000");
         let b64 = chunk["data"].as_str().expect("data is base64 string");
-        assert_eq!(BASE64_STANDARD.decode(b64).unwrap(), pcm, "base64 round-trips");
+        assert_eq!(
+            BASE64_STANDARD.decode(b64).unwrap(),
+            pcm,
+            "base64 round-trips"
+        );
         match p.serialize(&wire).unwrap() {
             OutFrame::Text(s) => assert!(s.contains("realtimeInput")),
             OutFrame::Binary(_) => panic!("Gemini audio must be a JSON text frame"),
@@ -733,7 +749,8 @@ mod tests {
     #[test]
     fn server_content_interrupted_pushes_interrupt() {
         let p = proto(&base_cfg());
-        let raw = r#"{"serverContent":{"modelTurn":{"parts":[{"text":"partial"}]},"interrupted":true}}"#;
+        let raw =
+            r#"{"serverContent":{"modelTurn":{"parts":[{"text":"partial"}]},"interrupted":true}}"#;
         let events = p.map_server_event(Inbound::Text(raw));
         assert!(
             events
@@ -745,9 +762,16 @@ mod tests {
         // ResponseDone.
         assert!(events.iter().any(|e| matches!(
             e,
-            S2sEvent::Transcript { is_final: false, .. }
+            S2sEvent::Transcript {
+                is_final: false,
+                ..
+            }
         )));
-        assert!(!events.iter().any(|e| matches!(e, S2sEvent::ResponseDone { .. })));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, S2sEvent::ResponseDone { .. }))
+        );
     }
 
     /// Multiple audio parts in one serverContent ⇒ one Audio per part.
@@ -793,7 +817,10 @@ mod tests {
     #[test]
     fn setup_complete_maps_to_session_ready() {
         let p = proto(&base_cfg());
-        match p.map_server_event(Inbound::Text(r#"{"setupComplete":{}}"#)).as_slice() {
+        match p
+            .map_server_event(Inbound::Text(r#"{"setupComplete":{}}"#))
+            .as_slice()
+        {
             [S2sEvent::SessionReady { session_id }] => assert!(session_id.is_none()),
             other => panic!("expected SessionReady, got {other:?}"),
         }
@@ -823,7 +850,11 @@ mod tests {
         let p = proto(&base_cfg());
         let raw = r#"{"toolCall":{"functionCalls":[{"id":"call_1","name":"get_weather","args":{"city":"NYC"}},{"id":"call_2","name":"get_time","args":{}}]}}"#;
         let events = p.map_server_event(Inbound::Text(raw));
-        assert_eq!(events.len(), 2, "two functionCalls ⇒ two FunctionCall events");
+        assert_eq!(
+            events.len(),
+            2,
+            "two functionCalls ⇒ two FunctionCall events"
+        );
         match &events[0] {
             S2sEvent::FunctionCall(req) => {
                 assert_eq!(req.call_id, "call_1");
@@ -850,7 +881,10 @@ mod tests {
             "not json",
         ] {
             assert!(
-                matches!(p.map_server_event(Inbound::Text(raw)).as_slice(), [S2sEvent::Ignore]),
+                matches!(
+                    p.map_server_event(Inbound::Text(raw)).as_slice(),
+                    [S2sEvent::Ignore]
+                ),
                 "expected Ignore for {raw}"
             );
         }
@@ -877,7 +911,10 @@ mod tests {
             other => panic!("expected one clientContent, got {other:?}"),
         }
         // Object result ⇒ passed through as the structured response.
-        match p.format_tool_result("call_1", r#"{"temp":"72F"}"#).as_slice() {
+        match p
+            .format_tool_result("call_1", r#"{"temp":"72F"}"#)
+            .as_slice()
+        {
             [v] => {
                 let fr = &v["toolResponse"]["functionResponses"][0];
                 assert_eq!(fr["id"], "call_1");

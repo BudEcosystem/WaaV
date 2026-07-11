@@ -15,6 +15,17 @@ use super::{
     MIN_VARIATION,
 };
 
+fn validate_murf_tts_endpoint(source: &str, endpoint: &str) -> TTSResult<()> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}")),
+    )
+}
+
 // =============================================================================
 // Model Selection
 // =============================================================================
@@ -437,15 +448,13 @@ impl MurfTtsConfig {
     /// after construction.
     pub fn from_base(config: &TTSConfig) -> TTSResult<Self> {
         // Validate API key - check config first, then environment
-        let api_key = if !config.api_key.is_empty() {
-            config.api_key.clone()
-        } else {
-            std::env::var("MURF_API_KEY").map_err(|_| {
+        let api_key = crate::core::credentials::explicit_api_key(&config.api_key)
+            .or_else(|| crate::core::credentials::env_api_key("MURF_API_KEY"))
+            .ok_or_else(|| {
                 TTSError::InvalidConfiguration(
                     "MURF_API_KEY environment variable not set and no api_key provided".to_string(),
                 )
-            })?
-        };
+            })?;
 
         // Parse model from config.model field (e.g., "FALCON", "GEN2")
         let model = if !config.model.is_empty() {
@@ -517,9 +526,7 @@ impl MurfTtsConfig {
     /// word_timestamps, streaming, seed) are skipped.
     ///
     /// [`TtsFeatures`]: crate::core::tts::standard::TtsFeatures
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let f = &std.features;
         let mut cfg = Self::from_base(&std.base)?;
         if let Some(speed) = f.speed {
@@ -549,12 +556,7 @@ impl MurfTtsConfig {
         // `variation` (0..=5 dynamic-delivery level) is a Gen2-only, non-standard Murf knob with no
         // canonical TtsFeatures field, so it rides the open `extras` passthrough. `with_variation`
         // clamps to MAX_VARIATION; `MurfStreamRequest::from_config` emits it on the wire for Gen2.
-        if let Some(variation) = std
-            .extras
-            .0
-            .get("variation")
-            .and_then(|v| v.as_u64())
-        {
+        if let Some(variation) = std.extras.0.get("variation").and_then(|v| v.as_u64()) {
             cfg = cfg.with_variation(variation as u8);
         }
         // Credential-free mock harness (W-T0): redirect the synth POST at a localhost mock, keeping
@@ -587,30 +589,33 @@ impl MurfTtsConfig {
 
         // Validate rate if provided
         if let Some(rate) = self.rate
-            && (!(MIN_RATE..=MAX_RATE).contains(&rate)) {
-                return Err(TTSError::InvalidConfiguration(format!(
-                    "Rate must be between {} and {}, got {}",
-                    MIN_RATE, MAX_RATE, rate
-                )));
-            }
+            && (!(MIN_RATE..=MAX_RATE).contains(&rate))
+        {
+            return Err(TTSError::InvalidConfiguration(format!(
+                "Rate must be between {} and {}, got {}",
+                MIN_RATE, MAX_RATE, rate
+            )));
+        }
 
         // Validate pitch if provided
         if let Some(pitch) = self.pitch
-            && (!(MIN_PITCH..=MAX_PITCH).contains(&pitch)) {
-                return Err(TTSError::InvalidConfiguration(format!(
-                    "Pitch must be between {} and {}, got {}",
-                    MIN_PITCH, MAX_PITCH, pitch
-                )));
-            }
+            && (!(MIN_PITCH..=MAX_PITCH).contains(&pitch))
+        {
+            return Err(TTSError::InvalidConfiguration(format!(
+                "Pitch must be between {} and {}, got {}",
+                MIN_PITCH, MAX_PITCH, pitch
+            )));
+        }
 
         // Validate variation if provided
         if let Some(variation) = self.variation
-            && variation > MAX_VARIATION {
-                return Err(TTSError::InvalidConfiguration(format!(
-                    "Variation must be between {} and {}, got {}",
-                    MIN_VARIATION, MAX_VARIATION, variation
-                )));
-            }
+            && variation > MAX_VARIATION
+        {
+            return Err(TTSError::InvalidConfiguration(format!(
+                "Variation must be between {} and {}, got {}",
+                MIN_VARIATION, MAX_VARIATION, variation
+            )));
+        }
 
         // Validate sample rate for telephony formats
         if self.format.requires_telephony_settings() && self.sample_rate != 8000 {
@@ -626,6 +631,10 @@ impl MurfTtsConfig {
                 "Unsupported sample rate: {}. Use 8000, 24000, 44100, or 48000",
                 self.sample_rate
             )));
+        }
+
+        if let Some(endpoint) = self.custom_endpoint.as_deref() {
+            validate_murf_tts_endpoint("custom_endpoint", endpoint)?;
         }
 
         Ok(())
@@ -895,6 +904,45 @@ mod tests {
         assert_eq!(cfg.api_key, "test-key");
         assert_eq!(cfg.voice_id, "en-US-natalie");
         assert_eq!(cfg.model, MurfModel::Gen2);
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = MurfTtsConfig::new("test-api-key");
+
+        config.custom_endpoint = Some("https://murf-proxy.example.com/v1/speech/stream".into());
+        assert!(config.validate().is_ok());
+
+        config.custom_endpoint = Some("http://127.0.0.1:9000/v1/speech/stream".into());
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("SSRF protection"),
+            "unexpected error: {err}"
+        );
+
+        config.custom_endpoint = Some("file:///tmp/socket/v1/speech/stream".into());
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("URL scheme"),
+            "unexpected error: {err}"
+        );
+
+        config.custom_endpoint = Some("ws://murf-proxy.example.com/v1/speech/stream".into());
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("URL scheme"),
+            "unexpected error: {err}"
+        );
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "murf".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("en-US-natalie".into()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(MurfTtsConfig::from_standard(&std).is_err());
     }
 
     #[test]

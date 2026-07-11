@@ -11,6 +11,17 @@ use super::{
     MIN_CHANNELS, MIN_SAMPLE_RATE, REVAI_STREAM_URL,
 };
 
+fn validate_revai_stt_endpoint(source: &str, endpoint: &str) -> Result<(), STTError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, &["ws", "wss"]).map_err(|e| {
+        STTError::ConfigurationError(format!("{source} rejected (SSRF protection): {e}"))
+    })
+}
+
 // =============================================================================
 // Sample Format
 // =============================================================================
@@ -383,6 +394,10 @@ impl RevAISTTConfig {
             ));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_revai_stt_endpoint("endpoint_override", endpoint)?;
+        }
+
         Ok(())
     }
 
@@ -407,7 +422,12 @@ impl RevAISTTConfig {
         // ws:// server) for credential-free integration; otherwise the production Rev AI endpoint.
         // The override carries only `scheme://host[:port]`, so the Rev AI stream path is re-appended
         // (a path-less URL would fail the WS handshake), mirroring the Cartesia override handling.
-        let base = match self.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
+        let base = match self
+            .endpoint_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+        {
             Some(o) => format!("{}/speechtotext/v1/stream", o.trim_end_matches('/')),
             None => REVAI_STREAM_URL.to_string(),
         };
@@ -538,7 +558,10 @@ impl RevAISTTConfig {
         if let Some(p) = e.get("priority").and_then(|v| v.as_str()) {
             cfg.priority = Some(p.to_string());
         }
-        if let Some(w) = e.get("max_connection_wait_seconds").and_then(|v| v.as_u64()) {
+        if let Some(w) = e
+            .get("max_connection_wait_seconds")
+            .and_then(|v| v.as_u64())
+        {
             cfg.max_connection_wait_seconds = Some(w as u32);
         }
         // Standardized endpoint override (mock/proxy host) for credential-free integration tests.
@@ -578,7 +601,7 @@ mod tests {
     // profanity filter) onto its own config fields.
     #[test]
     fn from_standard_maps_features() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "revai".into(),
@@ -795,6 +818,52 @@ mod tests {
     }
 
     #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = RevAISTTConfig {
+            endpoint_override: Some("wss://revai-proxy.example.com".to_string()),
+            ..RevAISTTConfig::new("test-key")
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://revai-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-WebSocket endpoint_override must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("https://revai-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("HTTP endpoint_override must be rejected for Rev AI WebSocket dial");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
+    }
+
+    #[test]
     fn test_build_content_type() {
         let config = RevAISTTConfig::new("test-key")
             .with_sample_rate(16000)
@@ -843,6 +912,21 @@ mod tests {
 
         let url = config.build_websocket_url();
         assert!(url.contains("custom_vocabulary_id=vocab-123"));
+    }
+
+    #[test]
+    fn test_build_websocket_url_trims_endpoint_override() {
+        let config = RevAISTTConfig {
+            endpoint_override: Some(" wss://revai-proxy.example.com/ ".to_string()),
+            ..RevAISTTConfig::new("test-key")
+        };
+
+        let url = config.build_websocket_url();
+        assert!(url.starts_with("wss://revai-proxy.example.com/speechtotext/v1/stream?"));
+        assert!(
+            !url.contains("example.com//speechtotext"),
+            "endpoint_override slash should be normalized: {url}"
+        );
     }
 
     #[test]

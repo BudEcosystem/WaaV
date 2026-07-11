@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 // Env-overridable; normalise http(s) -> ws(s) and ensure the /ws path.
-const RAW_URL = (process.env.WAAV_GATEWAY_URL ?? 'ws://127.0.0.1:3009')
+const RAW_URL = (process.env.WAAV_GATEWAY_URL ?? 'ws://127.0.0.1:3001')
   .replace(/^http:\/\//, 'ws://')
   .replace(/^https:\/\//, 'wss://');
 const WS_URL = RAW_URL.endsWith('/ws') ? RAW_URL : `${RAW_URL.replace(/\/$/, '')}/ws`;

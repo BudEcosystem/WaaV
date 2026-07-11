@@ -368,7 +368,8 @@ impl ReconnectableStream {
             // healthy providers offline gateway-wide).
             let intentional = matches!(outcome, ReconnectOutcome::Completed)
                 || self.intentional_disconnect.load(Ordering::Acquire);
-            self.breaker.record_connection_closed(stable_for, intentional);
+            self.breaker
+                .record_connection_closed(stable_for, intentional);
             match outcome {
                 ReconnectOutcome::Completed => {
                     return SupervisorExit::Completed;
@@ -413,7 +414,8 @@ impl ReconnectableStream {
         C: FnMut() -> CFut,
         CFut: Future<Output = Result<T, StreamError>>,
     {
-        self.run_with_sleep(connect, |d| tokio::time::sleep(d)).await
+        self.run_with_sleep(connect, |d| tokio::time::sleep(d))
+            .await
     }
 }
 
@@ -476,7 +478,11 @@ mod tests {
             .await;
 
         assert_eq!(exit, SupervisorExit::Completed);
-        assert_eq!(restore_calls.load(Ordering::Acquire), 1, "restore runs once on connect");
+        assert_eq!(
+            restore_calls.load(Ordering::Acquire),
+            1,
+            "restore runs once on connect"
+        );
         assert_eq!(stream.total_reconnections(), 1);
     }
 
@@ -552,8 +558,16 @@ mod tests {
             )
             .await;
 
-        assert_eq!(exit, SupervisorExit::Completed, "intentional close must not reconnect");
-        assert_eq!(restore_calls.load(Ordering::Acquire), 1, "connected exactly once");
+        assert_eq!(
+            exit,
+            SupervisorExit::Completed,
+            "intentional close must not reconnect"
+        );
+        assert_eq!(
+            restore_calls.load(Ordering::Acquire),
+            1,
+            "connected exactly once"
+        );
     }
 
     #[tokio::test]
@@ -577,7 +591,9 @@ mod tests {
                         Ok(MockTransport {
                             restore_calls: Arc::new(AtomicUsize::new(0)),
                             // Stream "ended" — eligible for reconnect — but the flag is not set yet.
-                            outcome: ReconnectOutcome::Reconnectable(StreamError::new("server close")),
+                            outcome: ReconnectOutcome::Reconnectable(StreamError::new(
+                                "server close",
+                            )),
                             restore_result: Ok(()),
                         })
                     }
@@ -596,7 +612,11 @@ mod tests {
             )
             .await;
 
-        assert_eq!(exit, SupervisorExit::Completed, "shared flag must stop the next dial");
+        assert_eq!(
+            exit,
+            SupervisorExit::Completed,
+            "shared flag must stop the next dial"
+        );
         assert_eq!(
             attempt.load(Ordering::Acquire),
             1,
@@ -629,7 +649,11 @@ mod tests {
             .await;
 
         assert_eq!(exit, SupervisorExit::Fatal);
-        assert_eq!(attempt.load(Ordering::Acquire), 1, "fatal -> connected once, no retry");
+        assert_eq!(
+            attempt.load(Ordering::Acquire),
+            1,
+            "fatal -> connected once, no retry"
+        );
     }
 
     #[tokio::test]
@@ -703,7 +727,11 @@ mod tests {
             .await;
 
         assert_eq!(exit, SupervisorExit::Completed);
-        assert_eq!(attempt.load(Ordering::Acquire), 3, "two restore failures then success");
+        assert_eq!(
+            attempt.load(Ordering::Acquire),
+            3,
+            "two restore failures then success"
+        );
     }
 
     #[tokio::test]
@@ -722,11 +750,8 @@ mod tests {
             let peak = Arc::clone(&peak);
             handles.push(tokio::spawn(async move {
                 let cfg = ReconnectableStreamConfig::new("mock", no_jitter_aggressive());
-                let stream = ReconnectableStream::with_breaker_and_governor(
-                    cfg,
-                    breaker,
-                    governor.clone(),
-                );
+                let stream =
+                    ReconnectableStream::with_breaker_and_governor(cfg, breaker, governor.clone());
                 let observed = Arc::new(Mutex::new(()));
                 let _ = observed;
                 stream
@@ -738,10 +763,7 @@ mod tests {
                                 // While we (conceptually) hold a slot, record the peak.
                                 let inflight = governor.in_flight() as usize;
                                 peak.fetch_max(inflight, Ordering::AcqRel);
-                                assert!(
-                                    inflight <= CAP,
-                                    "in-flight {inflight} exceeded cap {CAP}"
-                                );
+                                assert!(inflight <= CAP, "in-flight {inflight} exceeded cap {CAP}");
                                 tokio::time::sleep(Duration::from_millis(1)).await;
                                 Ok(MockTransport {
                                     restore_calls: Arc::new(AtomicUsize::new(0)),

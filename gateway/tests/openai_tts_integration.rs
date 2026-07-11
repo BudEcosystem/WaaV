@@ -9,11 +9,58 @@
 //! Note: Tests requiring actual API calls are marked with #[ignore]
 //! and require OPENAI_API_KEY environment variable.
 
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use futures::FutureExt;
+use tokio::task::JoinHandle;
 use waav_gateway::core::tts::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, OPENAI_TTS_URL, OpenAITTS, OpenAITTSModel,
     OpenAIVoice, TTSConfig, TTSError, create_tts_provider, get_tts_provider_urls,
 };
+
+struct TestServer {
+    label: &'static str,
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        if self.panicked.load(Ordering::SeqCst) {
+            let msg = format!("OpenAI TTS test server '{}' panicked", self.label);
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+}
+
+fn spawn_test_server<F>(label: &'static str, future: F) -> TestServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let panicked = Arc::new(AtomicBool::new(false));
+    let panicked_in_task = Arc::clone(&panicked);
+    let handle = tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked_in_task.store(true, Ordering::SeqCst);
+            eprintln!("OpenAI TTS test server '{label}' panicked");
+        }
+    });
+    TestServer {
+        label,
+        handle,
+        panicked,
+    }
+}
 
 /// Test that OpenAI is included in supported providers
 #[test]
@@ -407,9 +454,11 @@ async fn test_openai_tts_local_server_roundtrip() {
         }
         // The OpenAI speech contract is a JSON body containing the input text + voice/model.
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body)
-            && v.get("input").is_some() && v.get("voice").is_some() {
-                st.saw_json_body.store(true, Ordering::SeqCst);
-            }
+            && v.get("input").is_some()
+            && v.get("voice").is_some()
+        {
+            st.saw_json_body.store(true, Ordering::SeqCst);
+        }
         fake_pcm()
     }
 
@@ -421,7 +470,7 @@ async fn test_openai_tts_local_server_roundtrip() {
     let app = Router::new()
         .route("/v1/audio/speech", post(speak_handler))
         .with_state(state.clone());
-    tokio::spawn(async move {
+    let _server = spawn_test_server("local_speech", async move {
         axum::serve(listener, app).await.expect("serve");
     });
 

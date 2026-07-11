@@ -171,7 +171,10 @@ fn score_voice(d: &VoiceDescriptor, v: &Voice) -> i32 {
         }
     } else if let Some(accent) = d.accent.as_ref().filter(|s| !s.trim().is_empty()) {
         // Free accent string when no locale: match against the catalog accent.
-        if v.accent.to_lowercase().contains(&accent.trim().to_lowercase()) {
+        if v.accent
+            .to_lowercase()
+            .contains(&accent.trim().to_lowercase())
+        {
             score += W_ACCENT_STRING;
         }
     }
@@ -298,7 +301,13 @@ mod tests {
     /// A Deepgram-shaped stub catalog (Aura naming, region accent, gender tag).
     fn deepgram_catalog() -> Vec<Voice> {
         vec![
-            v("aura-asteria-en", "Asteria", "American", "Female", "English"),
+            v(
+                "aura-asteria-en",
+                "Asteria",
+                "American",
+                "Female",
+                "English",
+            ),
             v("aura-luna-en", "Luna", "American", "Female", "English"),
             v("aura-orion-en", "Orion", "American", "Male", "English"),
             v("aura-zeus-en", "Zeus", "American", "Male", "English"),
@@ -322,14 +331,26 @@ mod tests {
                 "Male",
                 "English",
             ),
-            v("AZnzlk1XvdvUeBnXmlld", "Domi", "american", "Female", "English"),
+            v(
+                "AZnzlk1XvdvUeBnXmlld",
+                "Domi",
+                "american",
+                "Female",
+                "English",
+            ),
         ]
     }
 
     /// Azure-shaped stub (short_name ids carrying the locale, locale-derived accent).
     fn azure_catalog() -> Vec<Voice> {
         vec![
-            v("en-US-JennyNeural", "Jenny", "American", "Female", "English"),
+            v(
+                "en-US-JennyNeural",
+                "Jenny",
+                "American",
+                "Female",
+                "English",
+            ),
             v("en-US-GuyNeural", "Guy", "American", "Male", "English"),
             v("en-GB-SoniaNeural", "Sonia", "British", "Female", "English"),
         ]

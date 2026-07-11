@@ -26,6 +26,15 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
+fn validate_nectec_http_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -266,6 +275,7 @@ impl NectecSttConfig {
     ) -> Result<Self, STTError> {
         let mut cfg = Self::from_base(&std.base)?;
         cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        cfg.validate().map_err(STTError::ConfigurationError)?;
         Ok(cfg)
     }
 
@@ -289,6 +299,10 @@ impl NectecSttConfig {
                 "NECTEC requires mono audio (1 channel), got {} channels",
                 self.channels
             ));
+        }
+
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_nectec_http_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -406,7 +420,7 @@ mod tests {
     // gaps and are intentionally dropped).
     #[test]
     fn from_standard_passthrough_carries_base() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "nectec".into(),
@@ -531,6 +545,32 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = NectecSttConfig {
+            api_key: "test_key".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://nectec-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
     }
 
     #[test]

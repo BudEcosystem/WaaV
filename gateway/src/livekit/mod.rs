@@ -15,41 +15,17 @@
 //! - **Callback System**: Flexible audio processing callbacks for integration
 //! - **High-Level Management**: Simplified interface for common use cases
 //!
-//! ## Usage Example
+//! ## Usage
 //!
-//! ```rust,no_run
-//! use waav_gateway::livekit::{LiveKitConfig, LiveKitManager};
+//! The live audio path drives [`LiveKitClient`] directly (see
+//! `handlers/ws/config_handler.rs` for the production wiring); room/token
+//! lifecycle goes through [`LiveKitRoomHandler`]. (A former `LiveKitManager`
+//! convenience wrapper was removed: it was dead code with an unbounded audio
+//! channel — a backpressure trap for any future caller.)
 //!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Configure LiveKit connection
-//!     let config = LiveKitConfig {
-//!         url: "wss://your-livekit-server.com".to_string(),
-//!         token: "your-jwt-token".to_string(),
-//!         room_name: "your-room".to_string(),
-//!         sample_rate: 24000,
-//!         channels: 1,
-//!         enable_noise_filter: cfg!(feature = "noise-filter"),
-//!         listen_participants: vec![],
-//!     };
-//!
-//!     // Create and initialize manager
-//!     let mut manager = LiveKitManager::new();
-//!     manager.initialize(config).await?;
-//!
-//!     // Set up audio processing callback
-//!     manager.set_audio_callback(|audio_data: Vec<u8>| {
-//!         println!("Received {} bytes of audio", audio_data.len());
-//!         // Forward to STT service, save to file, etc.
-//!     }).await?;
-//!
-//!     // Keep connection alive
-//!     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-//!
-//!     // Disconnect gracefully
-//!     manager.disconnect().await?;
-//!     Ok(())
-//! }
+//! ```rust,ignore
+//! let handler = LiveKitRoomHandler::new(url, api_key, api_secret, None)?;
+//! handler.create_room("my-room").await?;
 //! ```
 //!
 //! ## Audio Processing
@@ -67,7 +43,6 @@
 //! - Supporting the WebSocket API abstraction layer
 
 mod client;
-mod manager;
 pub mod operations;
 pub mod room_handler;
 pub mod sip_handler;
@@ -75,7 +50,6 @@ mod types;
 
 // Re-export public types and traits
 pub use client::{AudioCallback, DataCallback, DataMessage, LiveKitClient};
-pub use manager::LiveKitManager;
 pub use operations::{LiveKitOperation, OperationQueue};
 pub use room_handler::LiveKitRoomHandler;
 pub use sip_handler::{DispatchConfig, LiveKitSipHandler, TrunkConfig};
@@ -86,20 +60,6 @@ pub use types::{
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn test_livekit_manager_creation() {
-        let manager = LiveKitManager::new();
-
-        // Should start disconnected
-        assert!(!manager.is_connected().await);
-
-        // Should have no participants initially
-        assert!(manager.get_participants().await.is_empty());
-
-        // Should have no room info initially
-        assert!(manager.get_room_info().await.is_none());
-    }
 
     #[tokio::test]
     async fn test_livekit_config() {

@@ -35,7 +35,9 @@ impl MinWordsStart {
     /// `min_words` < 2 is pointless (1 ≡ the legacy any-speech behavior) —
     /// clamped up to 2 to keep the config honest.
     pub fn new(min_words: usize) -> Self {
-        Self { min_words: min_words.max(2) }
+        Self {
+            min_words: min_words.max(2),
+        }
     }
 }
 
@@ -43,7 +45,11 @@ impl UserTurnStartStrategy for MinWordsStart {
     fn on_signal(&mut self, sig: &ControllerSignal, ctx: &TurnCtx) -> StartVerdict {
         let (text, is_speech_final) = match sig {
             ControllerSignal::SttInterim { text, .. } => (text, false),
-            ControllerSignal::SttFinal { text, is_speech_final, .. } => (text, *is_speech_final),
+            ControllerSignal::SttFinal {
+                text,
+                is_speech_final,
+                ..
+            } => (text, *is_speech_final),
             _ => return StartVerdict::Ignore,
         };
         if text.trim().is_empty() {
@@ -66,10 +72,17 @@ mod tests {
     use super::*;
 
     fn ctx(bot_speaking: bool) -> TurnCtx {
-        TurnCtx { bot_speaking, turn_active: false, stt_ttfs_p99_ms: None }
+        TurnCtx {
+            bot_speaking,
+            turn_active: false,
+            stt_ttfs_p99_ms: None,
+        }
     }
     fn interim(text: &str) -> ControllerSignal {
-        ControllerSignal::SttInterim { text: text.into(), confidence: 0.9 }
+        ControllerSignal::SttInterim {
+            text: text.into(),
+            confidence: 0.9,
+        }
     }
     fn speech_final(text: &str) -> ControllerSignal {
         ControllerSignal::SttFinal {
@@ -99,7 +112,10 @@ mod tests {
     fn single_word_ignored_while_bot_speaks() {
         // The core false-barge-in regression: "uh-huh" over the bot.
         let mut s = MinWordsStart::new(3);
-        assert_eq!(s.on_signal(&interim("uh-huh"), &ctx(true)), StartVerdict::Ignore);
+        assert_eq!(
+            s.on_signal(&interim("uh-huh"), &ctx(true)),
+            StartVerdict::Ignore
+        );
     }
 
     #[test]
@@ -114,8 +130,14 @@ mod tests {
     #[test]
     fn cumulative_interims_cross_the_gate() {
         let mut s = MinWordsStart::new(3);
-        assert_eq!(s.on_signal(&interim("turn"), &ctx(true)), StartVerdict::Ignore);
-        assert_eq!(s.on_signal(&interim("turn that"), &ctx(true)), StartVerdict::Ignore);
+        assert_eq!(
+            s.on_signal(&interim("turn"), &ctx(true)),
+            StartVerdict::Ignore
+        );
+        assert_eq!(
+            s.on_signal(&interim("turn that"), &ctx(true)),
+            StartVerdict::Ignore
+        );
         assert_eq!(
             s.on_signal(&interim("turn that off"), &ctx(true)),
             StartVerdict::Start { interrupt: true }
@@ -127,8 +149,14 @@ mod tests {
         // Sub-threshold plain finals (fragments) must be Ignored, not Reset —
         // discarding them piecewise would eat a long utterance.
         let mut s = MinWordsStart::new(3);
-        assert_eq!(s.on_signal(&plain_final("hello"), &ctx(true)), StartVerdict::Ignore);
-        assert_eq!(s.on_signal(&plain_final("there"), &ctx(true)), StartVerdict::Ignore);
+        assert_eq!(
+            s.on_signal(&plain_final("hello"), &ctx(true)),
+            StartVerdict::Ignore
+        );
+        assert_eq!(
+            s.on_signal(&plain_final("there"), &ctx(true)),
+            StartVerdict::Ignore
+        );
     }
 
     #[test]
@@ -155,6 +183,9 @@ mod tests {
         let mut s = MinWordsStart::new(0);
         // With min_words clamped to 2, a single word while the bot speaks is
         // still gated.
-        assert_eq!(s.on_signal(&interim("hey"), &ctx(true)), StartVerdict::Ignore);
+        assert_eq!(
+            s.on_signal(&interim("hey"), &ctx(true)),
+            StartVerdict::Ignore
+        );
     }
 }

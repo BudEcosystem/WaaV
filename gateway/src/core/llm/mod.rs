@@ -130,7 +130,6 @@ pub enum MessageRole {
     Function,
 }
 
-
 /// OpenAI-compatible message format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -596,9 +595,7 @@ impl ConversationHistory {
                 // call was just (or previously) evicted — strict providers
                 // 400 on orphan tool messages. Any tool message now at the
                 // front is by definition an orphan: drop it with its call.
-                while idx < self.messages.len()
-                    && self.messages[idx].role == MessageRole::Tool
-                {
+                while idx < self.messages.len() && self.messages[idx].role == MessageRole::Tool {
                     self.messages.remove(idx);
                 }
             } else {
@@ -678,7 +675,8 @@ pub type TokenCallback = Arc<dyn Fn(&str) + Send + Sync>;
 #[derive(Clone)]
 pub struct LlmClient {
     config: LlmClientConfig,
-    client: reqwest::Client,
+    client: Option<reqwest::Client>,
+    http_client_init_error: Option<String>,
     /// The vendor wire-format adapter (B-G1). Stateless `'static` unit —
     /// selected once at construction from `config.provider_kind` (or the
     /// canonical-host inference).
@@ -707,16 +705,27 @@ impl LlmClient {
     /// that accept client-supplied URLs must validate separately (the DAG
     /// compiler and the conversation orchestrator both do).
     pub fn new(config: LlmClientConfig) -> Self {
-        let client = reqwest::Client::builder()
+        let (client, http_client_init_error) =
+            match crate::core::net::ssrf_protected_client_builder(
+                crate::core::net::HTTP_URL_SCHEMES,
+            )
             .timeout(Duration::from_millis(config.timeout_ms))
             .pool_max_idle_per_host(10)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            {
+                Ok(client) => (Some(client), None),
+                Err(e) => {
+                    let error = format!("failed to build SSRF-protected LLM HTTP client: {e}");
+                    tracing::error!(%error);
+                    (None, Some(error))
+                }
+            };
 
         let adapter = adapter::select_adapter(&config);
         Self {
             config,
             client,
+            http_client_init_error,
             adapter,
             histories: Arc::new(RwLock::new(HashMap::new())),
             functions: None,
@@ -746,6 +755,7 @@ impl LlmClient {
             adapter: adapter::adapter_for(kind),
             config,
             client: self.client.clone(),
+            http_client_init_error: self.http_client_init_error.clone(),
             histories: Arc::clone(&self.histories),
             functions: self.functions.clone(),
         }
@@ -799,6 +809,7 @@ impl LlmClient {
             adapter: adapter::adapter_for(kind),
             config,
             client: self.client.clone(),
+            http_client_init_error: self.http_client_init_error.clone(),
             histories: Arc::clone(&self.histories),
             functions: self.functions.clone(),
         }
@@ -855,7 +866,15 @@ impl LlmClient {
         messages: &[ChatMessage],
         stream: bool,
         api_key: Option<&str>,
-    ) -> reqwest::RequestBuilder {
+    ) -> LlmResult<reqwest::RequestBuilder> {
+        let Some(client) = &self.client else {
+            return Err(self.endpoint_err(
+                self.http_client_init_error
+                    .clone()
+                    .unwrap_or_else(|| "LLM HTTP client was not initialized".to_string()),
+            ));
+        };
+
         // B-G4: advertise registry tools in every request. Config-declared
         // tools come first; registry definitions are appended (and the
         // builtin cancel tool rides along while async tools exist).
@@ -872,8 +891,7 @@ impl LlmClient {
             _ => &self.config,
         };
         let rendered = self.adapter.render_request(messages, cfg, stream, api_key);
-        let mut req = self
-            .client
+        let mut req = client
             .post(&rendered.url)
             .header("Content-Type", "application/json");
         if stream {
@@ -885,7 +903,7 @@ impl LlmClient {
         for (k, v) in &self.config.headers {
             req = req.header(k, v);
         }
-        req.json(&rendered.body)
+        Ok(req.json(&rendered.body))
     }
 
     /// Build the message list to send. `staged = false` (classic): the user
@@ -931,9 +949,10 @@ impl LlmClient {
         }
 
         if history.messages().is_empty()
-            && let Some(system_prompt) = &self.config.system_prompt {
-                history.add(ChatMessage::system(system_prompt));
-            }
+            && let Some(system_prompt) = &self.config.system_prompt
+        {
+            history.add(ChatMessage::system(system_prompt));
+        }
         history.add(ChatMessage::user(input));
         history.messages().to_vec()
     }
@@ -986,7 +1005,8 @@ impl LlmClient {
             self.complete_streaming(session_id, Some(input), api_key, cancel, on_token, false)
                 .await
         } else {
-            self.complete_sync(session_id, Some(input), api_key, cancel, false).await
+            self.complete_sync(session_id, Some(input), api_key, cancel, false)
+                .await
         }
     }
 
@@ -1001,7 +1021,7 @@ impl LlmClient {
     ) -> LlmResult<LlmResponse> {
         let resolved = self.resolve_api_key(api_key);
         let api_key = resolved.as_deref();
-        let http_request = self.build_http_request(messages, false, api_key);
+        let http_request = self.build_http_request(messages, false, api_key)?;
         let response = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(LlmError::Cancelled),
@@ -1016,7 +1036,10 @@ impl LlmClient {
             .json()
             .await
             .map_err(|e| self.endpoint_err(format!("Failed to parse response: {}", e)))?;
-        let parsed = self.adapter.parse_response(body).map_err(|e| self.endpoint_err(e))?;
+        let parsed = self
+            .adapter
+            .parse_response(body)
+            .map_err(|e| self.endpoint_err(e))?;
         Ok(LlmResponse {
             id: parsed.id,
             model: parsed.model,
@@ -1049,7 +1072,8 @@ impl LlmClient {
             self.complete_streaming(session_id, None, api_key, cancel, on_token, false)
                 .await
         } else {
-            self.complete_sync(session_id, None, api_key, cancel, false).await
+            self.complete_sync(session_id, None, api_key, cancel, false)
+                .await
         }
     }
 
@@ -1070,7 +1094,8 @@ impl LlmClient {
             self.complete_streaming(session_id, Some(input), api_key, cancel, on_token, true)
                 .await
         } else {
-            self.complete_sync(session_id, Some(input), api_key, cancel, true).await
+            self.complete_sync(session_id, Some(input), api_key, cancel, true)
+                .await
         }
     }
 
@@ -1084,7 +1109,7 @@ impl LlmClient {
         staged: bool,
     ) -> LlmResult<LlmResponse> {
         let messages = self.prepare_messages(session_id, input, staged).await;
-        let http_request = self.build_http_request(&messages, false, api_key);
+        let http_request = self.build_http_request(&messages, false, api_key)?;
 
         let response = tokio::select! {
             biased;
@@ -1108,7 +1133,8 @@ impl LlmClient {
             .map_err(|e| self.endpoint_err(e))?;
 
         if !staged {
-            self.record_assistant(session_id, parsed.message.clone()).await;
+            self.record_assistant(session_id, parsed.message.clone())
+                .await;
         }
 
         Ok(LlmResponse {
@@ -1137,7 +1163,7 @@ impl LlmClient {
         staged: bool,
     ) -> LlmResult<LlmResponse> {
         let messages = self.prepare_messages(session_id, input, staged).await;
-        let http_request = self.build_http_request(&messages, true, api_key);
+        let http_request = self.build_http_request(&messages, true, api_key)?;
 
         let response = tokio::select! {
             biased;
@@ -1243,7 +1269,12 @@ impl LlmClient {
                                 )));
                             }
                         }
-                        LlmStreamEvent::ToolCallDelta { index, id, name, args_delta } => {
+                        LlmStreamEvent::ToolCallDelta {
+                            index,
+                            id,
+                            name,
+                            args_delta,
+                        } => {
                             let entry = tool_call_builders
                                 .entry(index)
                                 .or_insert_with(|| (String::new(), String::new(), String::new()));
@@ -1277,8 +1308,9 @@ impl LlmClient {
                             // A vendor-signalled mid-stream failure: surface
                             // it instead of returning the truncated text as
                             // success.
-                            return Err(self
-                                .endpoint_err(format!("mid-stream provider error: {detail}")));
+                            return Err(
+                                self.endpoint_err(format!("mid-stream provider error: {detail}"))
+                            );
                         }
                     }
                 }
@@ -1363,11 +1395,7 @@ impl LlmClient {
     /// Add a BATCH of tool results under one lock acquisition: a concurrent
     /// turn's user message must never interleave between a batch's results
     /// (pairing violation → strict providers 400 forever).
-    pub async fn add_tool_results_batch(
-        &self,
-        session_id: &str,
-        results: Vec<(String, String)>,
-    ) {
+    pub async fn add_tool_results_batch(&self, session_id: &str, results: Vec<(String, String)>) {
         let mut histories = self.histories.write().await;
         if let Some(history) = histories.get_mut(session_id) {
             for (id, result) in results {
@@ -1536,16 +1564,16 @@ mod tests {
         assert_eq!(client.adapter_kind(), AdapterKind::OpenAi);
 
         // Seed history through the OpenAI-shaped client.
-        client
-            .commit_turn("s1", "hello", "hi there")
-            .await;
+        client.commit_turn("s1", "hello", "hi there").await;
 
         let claude = client.with_adapter(AdapterKind::Anthropic);
         assert_eq!(claude.adapter_kind(), AdapterKind::Anthropic);
 
         // Same underlying history map: the switched client sees the turn.
         let histories = claude.histories.read().await;
-        let h = histories.get("s1").expect("shared history must survive the switch");
+        let h = histories
+            .get("s1")
+            .expect("shared history must survive the switch");
         assert_eq!(h.messages().len(), 2);
         drop(histories);
 
@@ -1597,6 +1625,80 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn llm_client_http_init_failure_surfaces_without_request() {
+        let config = LlmClientConfig::default();
+        let client = LlmClient {
+            adapter: adapter::select_adapter(&config),
+            config,
+            client: None,
+            http_client_init_error: Some("test init failure".to_string()),
+            histories: std::sync::Arc::new(RwLock::new(HashMap::new())),
+            functions: None,
+        };
+
+        let err = client
+            .complete_detached(
+                &[ChatMessage::user("hello")],
+                None,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("missing HTTP client must surface as endpoint error");
+
+        match err {
+            LlmError::Endpoint { error, .. } => {
+                assert!(error.contains("test init failure"), "{error}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn llm_client_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let client = LlmClient::new(LlmClientConfig {
+            base_url: format!("http://{addr}/v1"),
+            model: "gpt-test".to_string(),
+            ..Default::default()
+        });
+        let err = client
+            .complete_detached(
+                &[ChatMessage::user("hello")],
+                None,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("private redirect target must be rejected");
+        match err {
+            LlmError::Endpoint { error, .. } => assert!(
+                error.contains("error following redirect"),
+                "unexpected LLM endpoint error: {error}"
+            ),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
     #[test]
     fn test_conversation_history() {
         let mut history = ConversationHistory::new(5);
@@ -1637,8 +1739,14 @@ mod tests {
             "cross-vendor reasoning tier must re-infer Anthropic, not inherit OpenAI"
         );
         // No base_url override → still inherit the fast tier's explicit vendor.
-        let same_host =
-            fast.with_tier_overrides("o3".into(), None, None, None, Some(ReasoningEffort::Low), None);
+        let same_host = fast.with_tier_overrides(
+            "o3".into(),
+            None,
+            None,
+            None,
+            Some(ReasoningEffort::Low),
+            None,
+        );
         assert_eq!(
             same_host.adapter_kind(),
             AdapterKind::OpenAi,
@@ -1653,7 +1761,11 @@ mod tests {
             Some(ReasoningEffort::Low),
             None,
         );
-        assert_eq!(explicit.adapter_kind(), AdapterKind::Anthropic, "explicit kind wins");
+        assert_eq!(
+            explicit.adapter_kind(),
+            AdapterKind::Anthropic,
+            "explicit kind wins"
+        );
     }
 
     #[test]
@@ -1665,7 +1777,10 @@ mod tests {
         asst.tool_calls = Some(vec![ToolCall {
             id: "c1".into(),
             call_type: "function".into(),
-            function: FunctionCall { name: "book".into(), arguments: "{}".into() },
+            function: FunctionCall {
+                name: "book".into(),
+                arguments: "{}".into(),
+            },
         }]);
         h.add(asst);
 
@@ -1679,7 +1794,11 @@ mod tests {
             last.tool_calls.as_ref().is_some_and(|t| !t.is_empty()),
             "the open tool_use must stay at the tail so its result still pairs"
         );
-        assert_eq!(msgs[msgs.len() - 2].role, MessageRole::System, "note inserted before it");
+        assert_eq!(
+            msgs[msgs.len() - 2].role,
+            MessageRole::System,
+            "note inserted before it"
+        );
 
         // Close the pairing with a tool result; now the tail is NOT an open
         // tool_use, so add_pairing_safe appends normally.
@@ -1688,7 +1807,11 @@ mod tests {
         tool.tool_call_id = Some("c1".into());
         h.add(tool);
         h.add_pairing_safe(ChatMessage::system("second note"));
-        assert_eq!(h.messages().last().unwrap().role, MessageRole::System, "appended at tail");
+        assert_eq!(
+            h.messages().last().unwrap().role,
+            MessageRole::System,
+            "appended at tail"
+        );
     }
 
     #[test]

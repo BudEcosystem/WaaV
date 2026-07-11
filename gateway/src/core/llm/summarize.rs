@@ -105,11 +105,7 @@ fn split_for_summary(
             break;
         }
     }
-    (
-        system,
-        rest[..boundary].to_vec(),
-        rest[boundary..].to_vec(),
-    )
+    (system, rest[..boundary].to_vec(), rest[boundary..].to_vec())
 }
 
 /// Render the head as a plain transcript for the summarizer.
@@ -189,7 +185,10 @@ impl LlmClient {
         {
             Ok(Ok(resp)) if !resp.content.trim().is_empty() => Some(resp.content),
             Ok(Ok(_)) => {
-                warn!(session = session_id, "summary came back empty; count-trim fallback");
+                warn!(
+                    session = session_id,
+                    "summary came back empty; count-trim fallback"
+                );
                 None
             }
             Ok(Err(e)) => {
@@ -269,14 +268,20 @@ mod tests {
             fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
-        async fn chat(State(st): State<MockState>, Json(req): Json<Value>) -> impl axum::response::IntoResponse {
+        async fn chat(
+            State(st): State<MockState>,
+            Json(req): Json<Value>,
+        ) -> impl axum::response::IntoResponse {
             st.requests.lock().push(req);
             let delay = st.delay_ms.load(std::sync::atomic::Ordering::SeqCst);
             if delay > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
             if st.fail.load(std::sync::atomic::Ordering::SeqCst) {
-                return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"boom"})));
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error":"boom"})),
+                );
             }
             let reply = st.reply.lock().clone();
             (
@@ -287,7 +292,9 @@ mod tests {
                 })),
             )
         }
-        let app = Router::new().route("/chat/completions", post(chat)).with_state(st.clone());
+        let app = Router::new()
+            .route("/chat/completions", post(chat))
+            .with_state(st.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -313,16 +320,27 @@ mod tests {
         let (url, st) = start_mock("the user discussed apples and oranges").await;
         let llm = client(&url);
         let cancel = CancellationToken::new();
-        let cfg = SummaryConfig { target_tokens: 500, ..Default::default() };
+        let cfg = SummaryConfig {
+            target_tokens: 500,
+            ..Default::default()
+        };
 
         // Small context: untouched, no inference.
-        seed(&llm, "s", vec![
-            ChatMessage::system("persona"),
-            msg_of_len(MessageRole::User, 100),
-            msg_of_len(MessageRole::Assistant, 100),
-        ]).await;
+        seed(
+            &llm,
+            "s",
+            vec![
+                ChatMessage::system("persona"),
+                msg_of_len(MessageRole::User, 100),
+                msg_of_len(MessageRole::Assistant, 100),
+            ],
+        )
+        .await;
         assert!(!llm.maybe_summarize("s", &cfg, None, &cancel).await.unwrap());
-        assert!(st.requests.lock().is_empty(), "below target: no summary inference");
+        assert!(
+            st.requests.lock().is_empty(),
+            "below target: no summary inference"
+        );
         assert_eq!(llm.history_snapshot("s").await.len(), 3);
 
         // Large context: compacted.
@@ -344,24 +362,48 @@ mod tests {
         let (url, _st) = start_mock("summary text").await;
         let llm = client(&url);
         let cancel = CancellationToken::new();
-        let cfg = SummaryConfig { target_tokens: 100, min_messages_after: 2, ..Default::default() };
+        let cfg = SummaryConfig {
+            target_tokens: 100,
+            min_messages_after: 2,
+            ..Default::default()
+        };
 
         let mut msgs = vec![ChatMessage::system("THE PERSONA")];
         for i in 0..8 {
-            msgs.push(ChatMessage::user(format!("question {i} {}", "x".repeat(120))));
-            msgs.push(ChatMessage::assistant(format!("answer {i} {}", "x".repeat(120))));
+            msgs.push(ChatMessage::user(format!(
+                "question {i} {}",
+                "x".repeat(120)
+            )));
+            msgs.push(ChatMessage::assistant(format!(
+                "answer {i} {}",
+                "x".repeat(120)
+            )));
         }
         seed(&llm, "s", msgs).await;
         assert!(llm.maybe_summarize("s", &cfg, None, &cancel).await.unwrap());
 
         let after = llm.history_snapshot("s").await;
         assert_eq!(after[0].role, MessageRole::System);
-        assert_eq!(after[0].content.as_deref(), Some("THE PERSONA"), "system NEVER dropped");
+        assert_eq!(
+            after[0].content.as_deref(),
+            Some("THE PERSONA"),
+            "system NEVER dropped"
+        );
         assert!(
-            after[1].content.as_deref().unwrap().contains("[Prior conversation summary] summary text")
+            after[1]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("[Prior conversation summary] summary text")
         );
         let tail: Vec<_> = after[after.len() - 2..].iter().collect();
-        assert!(tail[0].content.as_deref().unwrap().starts_with("question 7"));
+        assert!(
+            tail[0]
+                .content
+                .as_deref()
+                .unwrap()
+                .starts_with("question 7")
+        );
         assert!(tail[1].content.as_deref().unwrap().starts_with("answer 7"));
     }
 
@@ -372,7 +414,11 @@ mod tests {
         let cancel = CancellationToken::new();
         // min_after = 2 would place the boundary BETWEEN the assistant
         // tool-call message and its result — the split must move left.
-        let cfg = SummaryConfig { target_tokens: 100, min_messages_after: 2, ..Default::default() };
+        let cfg = SummaryConfig {
+            target_tokens: 100,
+            min_messages_after: 2,
+            ..Default::default()
+        };
 
         let mut call_msg = ChatMessage::assistant("");
         call_msg.tool_calls = Some(vec![ToolCall {
@@ -413,7 +459,11 @@ mod tests {
         st.fail.store(true, std::sync::atomic::Ordering::SeqCst);
         let llm = client(&url);
         let cancel = CancellationToken::new();
-        let cfg = SummaryConfig { target_tokens: 100, min_messages_after: 3, ..Default::default() };
+        let cfg = SummaryConfig {
+            target_tokens: 100,
+            min_messages_after: 3,
+            ..Default::default()
+        };
 
         let mut msgs = vec![ChatMessage::system("p")];
         for i in 0..8 {
@@ -428,7 +478,10 @@ mod tests {
         assert_eq!(after[0].role, MessageRole::System);
         assert!(after[1].content.as_deref().unwrap().starts_with("q5"));
         assert!(!after.iter().any(|m| {
-            m.content.as_deref().unwrap_or_default().contains("Prior conversation summary")
+            m.content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Prior conversation summary")
         }));
     }
 
@@ -441,7 +494,11 @@ mod tests {
         st.delay_ms.store(150, std::sync::atomic::Ordering::SeqCst);
         let llm = Arc::new(client(&url));
         let cancel = CancellationToken::new();
-        let cfg = SummaryConfig { target_tokens: 100, min_messages_after: 2, ..Default::default() };
+        let cfg = SummaryConfig {
+            target_tokens: 100,
+            min_messages_after: 2,
+            ..Default::default()
+        };
 
         let mut big = vec![ChatMessage::system("persona")];
         for _ in 0..8 {
@@ -453,9 +510,8 @@ mod tests {
         // Kick off summarization (blocks ~150ms on the mock)...
         let llm_bg = Arc::clone(&llm);
         let cfg_bg = cfg.clone();
-        let handle = tokio::spawn(async move {
-            llm_bg.maybe_summarize("s", &cfg_bg, None, &cancel).await
-        });
+        let handle =
+            tokio::spawn(async move { llm_bg.maybe_summarize("s", &cfg_bg, None, &cancel).await });
         // ...and append a NEW turn while it's in flight (bumps the version).
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         llm.append_context(
@@ -465,7 +521,10 @@ mod tests {
         .await;
 
         let applied = handle.await.unwrap().unwrap();
-        assert!(!applied, "the stale rewrite must be refused (version moved)");
+        assert!(
+            !applied,
+            "the stale rewrite must be refused (version moved)"
+        );
 
         let after = llm.history_snapshot("s").await;
         assert!(
@@ -492,11 +551,17 @@ mod tests {
     async fn replace_context_if_unchanged_is_a_cas() {
         let (url, _st) = start_mock("x").await;
         let llm = client(&url);
-        seed(&llm, "s", vec![ChatMessage::system("p"), ChatMessage::user("hi")]).await;
+        seed(
+            &llm,
+            "s",
+            vec![ChatMessage::system("p"), ChatMessage::user("hi")],
+        )
+        .await;
         let (_snap, version) = llm.history_snapshot_versioned("s").await.unwrap();
 
         // A concurrent mutation moves the version.
-        llm.append_context("s", vec![ChatMessage::user("concurrent")]).await;
+        llm.append_context("s", vec![ChatMessage::user("concurrent")])
+            .await;
         assert!(
             !llm.replace_context_if_unchanged("s", version, vec![ChatMessage::system("rewritten")])
                 .await,

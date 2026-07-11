@@ -9,6 +9,16 @@ pub use crate::core::stt::bhashini::{
     BHASHINI_CONFIG_URL, BhashiniLanguage, BhashiniPipelineProvider, LanguageFamily,
 };
 
+fn validate_bhashini_tts_endpoint(source: &str, endpoint: &str) -> Result<(), TTSError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}")),
+    )
+}
+
 /// Default sample rate for TTS output (22.05 kHz).
 pub const DEFAULT_TTS_SAMPLE_RATE: u32 = 22050;
 
@@ -224,9 +234,10 @@ impl BhashiniTtsConfig {
             cfg.sample_rate = rate;
         }
         if let Some(lang) = f.language.as_deref()
-            && let Some(language) = BhashiniLanguage::from_code(lang) {
-                cfg.language = language;
-            }
+            && let Some(language) = BhashiniLanguage::from_code(lang)
+        {
+            cfg.language = language;
+        }
 
         // Provider-specific passthrough.
         if let Some(url) = std
@@ -248,6 +259,8 @@ impl BhashiniTtsConfig {
 
         cfg.endpoint_override = std.endpoint_override().map(String::from);
 
+        cfg.validate()?;
+
         Ok(cfg)
     }
 
@@ -262,6 +275,9 @@ impl BhashiniTtsConfig {
             return Err(TTSError::InvalidConfiguration(
                 "ULCA API key is required".to_string(),
             ));
+        }
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_bhashini_tts_endpoint("endpoint_override", endpoint)?;
         }
         Ok(())
     }
@@ -308,10 +324,7 @@ mod tests {
     fn from_standard_maps_sample_rate_language_and_extras() {
         use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
         let mut extras = serde_json::Map::new();
-        extras.insert(
-            "custom_service_id".into(),
-            serde_json::json!("svc-123"),
-        );
+        extras.insert("custom_service_id".into(), serde_json::json!("svc-123"));
         extras.insert(
             "custom_callback_url".into(),
             serde_json::json!("https://cb.example"),
@@ -434,5 +447,30 @@ mod tests {
         config.user_id = "user".to_string();
         config.ulca_api_key = "key".to_string();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = BhashiniTtsConfig {
+            user_id: "user".to_string(),
+            ulca_api_key: "key".to_string(),
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://bhashini-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
     }
 }

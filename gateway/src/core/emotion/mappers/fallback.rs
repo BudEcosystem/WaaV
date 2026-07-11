@@ -162,26 +162,28 @@ impl EmotionMapper for FallbackEmotionMapper {
 
         // Generate warning if emotion was requested
         if let Some(emotion) = &config.emotion
-            && *emotion != Emotion::Neutral {
-                mapped.add_warning(format!(
-                    "Emotion '{}' is not supported by provider '{}'; using neutral voice",
-                    emotion, self.provider_id
-                ));
-            }
+            && *emotion != Emotion::Neutral
+        {
+            mapped.add_warning(format!(
+                "Emotion '{}' is not supported by provider '{}'; using neutral voice",
+                emotion, self.provider_id
+            ));
+        }
 
         // Generate warning for free-form description
         if let Some(description) = &config.description
-            && !description.is_empty() {
-                mapped.add_warning(format!(
-                    "Emotion descriptions are not supported by provider '{}'; ignoring '{}'",
-                    self.provider_id,
-                    if description.len() > 30 {
-                        format!("{}...", &description[..27])
-                    } else {
-                        description.clone()
-                    }
-                ));
-            }
+            && !description.is_empty()
+        {
+            mapped.add_warning(format!(
+                "Emotion descriptions are not supported by provider '{}'; ignoring '{}'",
+                self.provider_id,
+                if description.len() > 30 {
+                    format!("{}...", &description[..27])
+                } else {
+                    description.clone()
+                }
+            ));
+        }
 
         // Delivery style: honor a partially-supported domain (AWS Polly), else warn.
         if let Some(style) = &config.style

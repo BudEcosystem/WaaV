@@ -197,7 +197,10 @@ impl BaseRealtime for NovaSonicRealtime {
         self.0.replay_user_audio_preroll().await
     }
 
-    async fn replay_conversation(&mut self, items: &[ReplayConversationItem]) -> RealtimeResult<()> {
+    async fn replay_conversation(
+        &mut self,
+        items: &[ReplayConversationItem],
+    ) -> RealtimeResult<()> {
         self.0.replay_conversation(items).await
     }
 }

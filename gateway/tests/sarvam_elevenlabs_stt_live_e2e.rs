@@ -44,7 +44,11 @@ async fn synth_pcm(text: &str, deepgram_key: &str) -> Vec<u8> {
         .send()
         .await
         .expect("deepgram /v1/speak");
-    assert!(resp.status().is_success(), "deepgram speak: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "deepgram speak: {}",
+        resp.status()
+    );
     resp.bytes().await.unwrap().to_vec()
 }
 
@@ -93,7 +97,9 @@ async fn transcribe(stt: &mut dyn BaseSTT, pcm: &[u8]) -> (String, Option<String
         .send_audio(Bytes::from(vec![0u8; SAMPLE_RATE as usize * 2]))
         .await;
     tokio::time::sleep(Duration::from_secs(4)).await;
-    stt.disconnect().await.ok();
+    stt.disconnect()
+        .await
+        .expect("disconnect live STT provider");
 
     let transcript = best.lock().await.clone();
     let error = err.lock().await.clone();
@@ -117,7 +123,9 @@ fn std_cfg(provider: &str, key: String, model: &str, language: &str) -> Standard
 #[ignore = "Requires SARVAM_API_KEY + DEEPGRAM_API_KEY; real billed Sarvam STT calls"]
 async fn sarvam_stt_transcribes_live() {
     ensure_crypto();
-    let (Some(sarvam), Some(dg)) = (key("SARVAM_API_KEY"), key("DEEPGRAM_API_KEY")) else { return };
+    let (Some(sarvam), Some(dg)) = (key("SARVAM_API_KEY"), key("DEEPGRAM_API_KEY")) else {
+        return;
+    };
 
     let pcm = synth_pcm(SENTENCE, &dg).await;
     assert!(pcm.len() > 8000, "synth audio too short: {} B", pcm.len());
@@ -136,7 +144,9 @@ async fn sarvam_stt_transcribes_live() {
 #[ignore = "Requires ELEVENLABS_API_KEY + DEEPGRAM_API_KEY; real billed ElevenLabs STT calls"]
 async fn elevenlabs_stt_transcribes_live() {
     ensure_crypto();
-    let (Some(el), Some(dg)) = (key("ELEVENLABS_API_KEY"), key("DEEPGRAM_API_KEY")) else { return };
+    let (Some(el), Some(dg)) = (key("ELEVENLABS_API_KEY"), key("DEEPGRAM_API_KEY")) else {
+        return;
+    };
 
     let pcm = synth_pcm(SENTENCE, &dg).await;
     assert!(pcm.len() > 8000, "synth audio too short: {} B", pcm.len());

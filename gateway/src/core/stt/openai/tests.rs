@@ -20,6 +20,8 @@ use std::sync::Arc;
 mod config_tests {
     use super::*;
 
+    static OPENAI_BASE_URL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_model_serialization() {
         // Test model enum serialization
@@ -190,8 +192,7 @@ mod config_tests {
 
     #[test]
     fn test_config_api_url() {
-        // Default (no override) and the standard OPENAI_BASE_URL override are exercised in one
-        // test so the env mutation is sequential — avoids racing the parallel test runner.
+        let _guard = OPENAI_BASE_URL_ENV_LOCK.lock().unwrap();
         let config = OpenAISTTConfig::default();
 
         // SAFETY (edition 2024): set/remove_var are unsafe; this test is single-threaded over the
@@ -203,11 +204,11 @@ mod config_tests {
         );
 
         // The override lets the provider target OpenAI-compatible endpoints
-        // (Azure OpenAI / Groq / vLLM / local server / proxy); trailing slashes are normalized.
-        unsafe { std::env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:8089/") };
+        // (Azure OpenAI / Groq / vLLM / proxy); trailing slashes are normalized.
+        unsafe { std::env::set_var("OPENAI_BASE_URL", "https://openai-compatible.invalid/") };
         assert_eq!(
-            config.api_url(),
-            "http://127.0.0.1:8089/v1/audio/transcriptions"
+            config.try_api_url().unwrap(),
+            "https://openai-compatible.invalid/v1/audio/transcriptions"
         );
 
         unsafe { std::env::remove_var("OPENAI_BASE_URL") };
@@ -215,6 +216,29 @@ mod config_tests {
             config.api_url(),
             "https://api.openai.com/v1/audio/transcriptions"
         );
+    }
+
+    #[test]
+    fn test_config_api_url_rejects_ssrf_targets() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = OpenAISTTConfig::default();
+
+        config.endpoint_override = Some("http://127.0.0.1:8089/".to_string());
+        let msg = config
+            .try_api_url()
+            .expect_err("loopback endpoint override must be rejected")
+            .to_string();
+        assert!(
+            msg.contains("SSRF protection"),
+            "error names SSRF guard: {msg}"
+        );
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let msg = config
+            .try_api_url()
+            .expect_err("non-HTTP endpoint override must be rejected")
+            .to_string();
+        assert!(msg.contains("scheme"), "error names scheme contract: {msg}");
     }
 }
 
@@ -650,7 +674,7 @@ mod client_tests {
     // standardized path doesn't drop them.
     #[tokio::test]
     async fn test_openai_new_standard_unlocks_features() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "openai".into(),

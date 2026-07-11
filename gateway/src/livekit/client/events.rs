@@ -16,6 +16,7 @@ use super::{
     ParticipantDisconnectCallback, ParticipantDisconnectEvent,
 };
 use crate::AppError;
+use crate::core::observability::{abort_and_await_task, await_task_shutdown};
 #[cfg(feature = "noise-filter")]
 use crate::utils::noise_filter::reduce_noise_async;
 
@@ -48,8 +49,15 @@ impl LiveKitClient {
                 info!("Room event handler finished");
             });
 
-            // Store the handle for cleanup during disconnect/drop
-            self.event_handler_handle = Some(handle);
+            // Store the handle for cleanup during disconnect/drop.
+            let old = self
+                .event_handler_handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .replace(handle);
+            if let Some(old) = old {
+                let _ = abort_and_await_task("livekit.event_handler.replace", old).await;
+            }
         }
 
         Ok(())
@@ -61,6 +69,7 @@ impl LiveKitClient {
         data_callback: &Option<DataCallback>,
         participant_disconnect_callback: &Option<ParticipantDisconnectCallback>,
         active_streams: &Arc<Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>>,
+        event_handler_handle: &Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
         is_connected: &Arc<Mutex<bool>>,
         config: &LiveKitConfig,
     ) {
@@ -71,7 +80,7 @@ impl LiveKitClient {
         let is_connected = Arc::clone(is_connected);
         let config = config.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             info!("Restarting room event handler after reconnect");
             while let Some(event) = room_events.recv().await {
                 if let Err(e) = LiveKitClient::handle_room_event(
@@ -90,6 +99,14 @@ impl LiveKitClient {
             }
             info!("Restarted room event handler finished");
         });
+
+        let old = event_handler_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(handle);
+        if let Some(old) = old {
+            let _ = abort_and_await_task("livekit.event_handler.reconnect_replace", old).await;
+        }
     }
 
     async fn handle_room_event(
@@ -219,7 +236,6 @@ impl LiveKitClient {
                             // subscription) aborts the old stream task
                             // BEFORE registering the new one (Pipecat
                             // close-old-before-register).
-                            let mut streams = active_streams.lock().await;
                             // Key by (participant, TRACK sid) — a participant
                             // can publish more than one audio track (mic +
                             // screenshare-audio); keying on identity alone
@@ -227,21 +243,44 @@ impl LiveKitClient {
                             // SUBSCRIBE (review wc71hewlx #6). The same key
                             // still aborts a genuine RESUBSCRIBE of the SAME
                             // track.
-                            let key = format!(
-                                "{}::{}",
-                                participant.identity(),
-                                publication.sid()
-                            );
-                            if let Some(old) = streams.insert(key.clone(), handle) {
+                            let key = format!("{}::{}", participant.identity(), publication.sid());
+                            let mut finished = Vec::new();
+                            let old = {
+                                let mut streams = active_streams.lock().await;
+                                let old = streams.insert(key.clone(), handle);
+                                let mut retained =
+                                    std::collections::HashMap::with_capacity(streams.len());
+                                for (stream_key, stream_handle) in streams.drain() {
+                                    if stream_handle.is_finished() {
+                                        finished.push((stream_key, stream_handle));
+                                    } else {
+                                        retained.insert(stream_key, stream_handle);
+                                    }
+                                }
+                                *streams = retained;
+                                old
+                            };
+                            if let Some(old) = old {
                                 if !old.is_finished() {
                                     info!(
                                         track = %key,
                                         "resubscribe: aborting the previous audio stream task"
                                     );
                                 }
-                                old.abort();
+                                let _ = abort_and_await_task(
+                                    format!("livekit.audio_stream.resubscribe.{key}"),
+                                    old,
+                                )
+                                .await;
                             }
-                            streams.retain(|_, h| !h.is_finished());
+                            for (stream_key, stream_handle) in finished {
+                                let _ = await_task_shutdown(
+                                    format!("livekit.audio_stream.finished.{stream_key}"),
+                                    stream_handle,
+                                    std::time::Duration::from_millis(10),
+                                )
+                                .await;
+                            }
                         } else {
                             warn!("No audio callback set, ignoring audio track");
                         }
@@ -269,7 +308,11 @@ impl LiveKitClient {
                 // underlying stream leaked tasks under resubscribe storms.
                 let key = format!("{}::{}", participant.identity(), publication.sid());
                 if let Some(handle) = active_streams.lock().await.remove(&key) {
-                    handle.abort();
+                    let _ = abort_and_await_task(
+                        format!("livekit.audio_stream.unsubscribe.{key}"),
+                        handle,
+                    )
+                    .await;
                 }
             }
             RoomEvent::ParticipantConnected(participant) => {

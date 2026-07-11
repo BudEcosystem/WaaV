@@ -38,7 +38,11 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{client::IntoClientRequest, http::Request, protocol::Message},
+    tungstenite::{
+        client::IntoClientRequest,
+        http::{HeaderValue, Request},
+        protocol::Message,
+    },
 };
 use tracing::{debug, error, info, warn};
 
@@ -61,7 +65,6 @@ use crate::core::tts::base::{
 const PROVIDER_INFO: &str = "Alibaba Cloud DashScope TTS (阿里云)";
 
 /// WebSocket connection timeout.
-const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Channel buffer size for text messages.
 const TEXT_CHANNEL_BUFFER: usize = 32;
@@ -159,9 +162,7 @@ impl DashScopeTts {
     /// [`DashScopeTtsConfig::from_standard`] (speed→rate, pitch, volume, sample_rate + the
     /// `region` extra) so advanced prosody reaches the WebSocket synthesis params through the
     /// standardized dispatch instead of being dropped at the flat boundary.
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let dashscope_config = DashScopeTtsConfig::from_standard(std)?;
         Self::create_from_parts(std.base.clone(), dashscope_config)
     }
@@ -184,12 +185,14 @@ impl DashScopeTts {
             "Authorization",
             format!("Bearer {}", self.config.api_key)
                 .parse()
-                .map_err(|e| TTSError::InternalError(format!("Invalid Authorization header: {e}")))?,
+                .map_err(|e| {
+                    TTSError::InternalError(format!("Invalid Authorization header: {e}"))
+                })?,
         );
-        headers.insert("User-Agent", "WaaV-Gateway/1.0".parse().unwrap());
+        headers.insert("User-Agent", HeaderValue::from_static("WaaV-Gateway/1.0"));
         // Add OpenAI-Beta header for Qwen models
         if self.config.model.is_qwen_model() {
-            headers.insert("OpenAI-Beta", "realtime=v1".parse().unwrap());
+            headers.insert("OpenAI-Beta", HeaderValue::from_static("realtime=v1"));
         }
         Ok(request)
     }
@@ -342,7 +345,14 @@ impl BaseTTS for DashScopeTts {
         let url = self.config.get_websocket_url();
 
         // Connect with timeout
-        let (ws_stream, _) = match timeout(WS_CONNECT_TIMEOUT, connect_async(request)).await {
+        // 10s dial bound (provider-historical; tighter than the canonical 15s in
+        // resilience::connect — kept to preserve behavior), via the shared helper.
+        let (ws_stream, _) = match crate::core::resilience::connect::with_timeout(
+            Duration::from_secs(10),
+            connect_async(request),
+        )
+        .await
+        {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
                 return Err(TTSError::ConnectionFailed(format!(
@@ -433,20 +443,19 @@ impl BaseTTS for DashScopeTts {
                                 .send(Message::Text(line.to_string().into()))
                                 .await
                                 .is_err()
-                            {
-                                break;
-                            }
+                        {
+                            break;
+                        }
                     }
                 }
 
                 // Send finish message for CosyVoice
-                if !is_qwen
-                    && let Some(tid) = &task_id_clone {
-                        let finish = CosyVoiceFinishTask::new(tid);
-                        let _ = write
-                            .send(Message::Text(finish.to_json().unwrap_or_default().into()))
-                            .await;
-                    }
+                if !is_qwen && let Some(tid) = &task_id_clone {
+                    let finish = CosyVoiceFinishTask::new(tid);
+                    let _ = write
+                        .send(Message::Text(finish.to_json().unwrap_or_default().into()))
+                        .await;
+                }
 
                 write
             });
@@ -549,12 +558,21 @@ impl BaseTTS for DashScopeTts {
 
         // Wait for connection task to complete
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "alibaba-cloud-tts-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         // Abort audio forwarding task
         if let Some(handle) = self.audio_forward_handle.take() {
-            handle.abort();
+            crate::core::observability::abort_and_await_task(
+                "alibaba-cloud-tts-audio-forwarder",
+                handle,
+            )
+            .await;
         }
 
         // Clear task ID
@@ -696,6 +714,25 @@ mod tests {
     }
 
     #[test]
+    fn from_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "alibaba-cloud".into(),
+            api_key: "k".into(),
+            voice_id: Some("longxiaochun".into()),
+            ..Default::default()
+        })
+        .with_endpoint_override("ws://127.0.0.1:9000");
+
+        match DashScopeTts::from_standard(&std) {
+            Ok(_) => {
+                panic!("DashScope provider construction must reject unsafe endpoint_override")
+            }
+            Err(err) => assert!(err.to_string().contains("SSRF protection")),
+        }
+    }
+
+    #[test]
     fn test_new_provider_empty_api_key() {
         let config = TTSConfig {
             api_key: "".to_string(),
@@ -834,7 +871,10 @@ mod tests {
             "enable_markdown_filter",
             "enable_aigc_tag",
         ] {
-            assert!(params.get(key).is_none(), "{key} must be omitted when unset");
+            assert!(
+                params.get(key).is_none(),
+                "{key} must be omitted when unset"
+            );
         }
         // Base prosody still present.
         assert!(params.get("voice").is_some());
@@ -884,6 +924,24 @@ mod tests {
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.starts_with("Bearer ")),
             "missing Bearer Authorization header"
+        );
+    }
+
+    #[test]
+    fn qwen_build_request_sets_static_beta_header_without_parsing() {
+        let mut config = create_test_config();
+        config.model = "qwen3-tts-flash-realtime".to_string();
+        let tts = DashScopeTts::new(config).unwrap();
+
+        let request = tts.build_request().expect("build qwen request");
+        let h = request.headers();
+        assert_eq!(
+            h.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some("WaaV-Gateway/1.0")
+        );
+        assert_eq!(
+            h.get("openai-beta").and_then(|v| v.to_str().ok()),
+            Some("realtime=v1")
         );
     }
 }

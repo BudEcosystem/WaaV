@@ -775,7 +775,11 @@ mod tests {
         for &c in CanonicalLanguage::all() {
             let key = c.as_bcp47().to_lowercase();
             let found = LANG_ALIASES.iter().find(|(k, _)| *k == key);
-            assert!(found.is_some(), "no self-alias for {} ({key})", c.as_bcp47());
+            assert!(
+                found.is_some(),
+                "no self-alias for {} ({key})",
+                c.as_bcp47()
+            );
             assert_eq!(found.unwrap().1, c, "self-alias maps elsewhere for {key}");
         }
     }

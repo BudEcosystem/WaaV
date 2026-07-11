@@ -8,6 +8,15 @@ use std::fmt;
 
 use crate::core::tts::base::{TTSConfig, TTSError, TTSResult};
 
+fn validate_yandex_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Audio Format Enum
 // =============================================================================
@@ -203,7 +212,6 @@ impl YandexVoice {
         )
     }
 }
-
 
 impl fmt::Display for YandexVoice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -555,9 +563,10 @@ impl YandexTtsConfig {
             }
         }
         if let Some(ref language) = f.language
-            && let Ok(lang) = language.parse::<YandexLanguage>() {
-                cfg.language = lang;
-            }
+            && let Ok(lang) = language.parse::<YandexLanguage>()
+        {
+            cfg.language = lang;
+        }
         if let Some(sr) = f.sample_rate {
             // Reuse from_base's normalization to Yandex's supported rates.
             cfg.sample_rate = if sr == 0 {
@@ -585,6 +594,7 @@ impl YandexTtsConfig {
 
         cfg.endpoint_override = std.endpoint_override().map(String::from);
 
+        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -640,6 +650,15 @@ impl YandexTtsConfig {
                 text.len(),
                 super::MAX_TEXT_LENGTH
             )));
+        }
+        Ok(())
+    }
+
+    /// Validate provider-specific URL surfaces.
+    pub fn validate(&self) -> TTSResult<()> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_yandex_tts_endpoint("endpoint_override", endpoint)
+                .map_err(TTSError::InvalidConfiguration)?;
         }
         Ok(())
     }
@@ -712,7 +731,9 @@ mod tests {
         .unwrap();
         let plain_params = plain.build_form_params(ssml_text);
         assert!(
-            plain_params.iter().any(|(k, v)| *k == "text" && v == ssml_text),
+            plain_params
+                .iter()
+                .any(|(k, v)| *k == "text" && v == ssml_text),
             "plain input must be under `text`"
         );
         assert!(
@@ -737,13 +758,39 @@ mod tests {
         .unwrap();
         let ssml_params = ssml_cfg.build_form_params(ssml_text);
         assert!(
-            ssml_params.iter().any(|(k, v)| *k == "ssml" && v == ssml_text),
+            ssml_params
+                .iter()
+                .any(|(k, v)| *k == "ssml" && v == ssml_text),
             "ssml input must reach the `ssml` form key"
         );
         assert!(
             !ssml_params.iter().any(|(k, _)| *k == "text"),
             "`text` must be omitted when sending SSML (mutually exclusive)"
         );
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+
+        let mk = |endpoint: &str| {
+            StandardTTSConfig {
+                base: TTSConfig {
+                    provider: "yandex".into(),
+                    api_key: "test-key".into(),
+                    ..Default::default()
+                },
+                features: TtsFeatures::default(),
+                extras: ProviderExtras::default(),
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(YandexTtsConfig::from_standard(&mk("https://tts-proxy.example.com")).is_ok());
+        assert!(YandexTtsConfig::from_standard(&mk("http://127.0.0.1:9000")).is_err());
+        assert!(YandexTtsConfig::from_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(YandexTtsConfig::from_standard(&mk("wss://tts-proxy.example.com")).is_err());
     }
 
     #[test]

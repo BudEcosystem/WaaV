@@ -36,9 +36,15 @@ use crate::core::stt::base::STTError;
 pub async fn create_tinkoff_channel(config: &TinkoffSttConfig) -> Result<Channel, STTError> {
     // A mock e2e override points the channel at a plaintext localhost endpoint (no TLS); otherwise
     // the production TLS endpoint is used unchanged.
-    let endpoint = if let Some(ep) = config.endpoint_override.as_deref() {
-        Endpoint::from_shared(ep.to_string())
-            .map_err(|e| STTError::ConfigurationError(format!("Invalid endpoint override: {}", e)))?
+    let endpoint = if let Some(ep) = config
+        .endpoint_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|ep| !ep.is_empty())
+    {
+        Endpoint::from_shared(ep.to_string()).map_err(|e| {
+            STTError::ConfigurationError(format!("Invalid endpoint override: {}", e))
+        })?
     } else {
         let tls_config = ClientTlsConfig::new().domain_name("api.tinkoff.ai");
         Endpoint::from_static(TINKOFF_GRPC_ENDPOINT)

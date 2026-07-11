@@ -20,16 +20,19 @@
 //!   SARVAM_API_KEY=… cargo test --features dag-routing,openapi --test latency_harness -- --ignored --nocapture
 
 use std::convert::Infallible;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::response::sse::{Event, Sse};
 use axum::{Json, Router, extract::State, routing::post};
-use futures::stream;
+use futures::{FutureExt, stream};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 
 use waav_gateway::core::conversation::{ConversationConfig, ConversationOrchestrator};
 use waav_gateway::core::llm::{LlmClient, LlmClientConfig, TokenCallback};
@@ -74,6 +77,47 @@ impl Recorder {
 static REC: once_cell::sync::Lazy<Arc<Recorder>> =
     once_cell::sync::Lazy::new(|| Arc::new(Recorder::default()));
 
+struct TestServer {
+    label: &'static str,
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        if self.panicked.load(Ordering::SeqCst) {
+            let msg = format!("latency_harness server '{}' panicked", self.label);
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+}
+
+fn spawn_test_server<F>(label: &'static str, future: F) -> TestServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let panicked = Arc::new(AtomicBool::new(false));
+    let panicked_in_task = Arc::clone(&panicked);
+    let handle = tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked_in_task.store(true, Ordering::SeqCst);
+            eprintln!("latency_harness server '{label}' panicked");
+        }
+    });
+    TestServer {
+        label,
+        handle,
+        panicked,
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Instant TTS mock: marks `tts_request` on speak() and `audio_out` on first frame.
 // ──────────────────────────────────────────────────────────────────────────────
@@ -86,7 +130,10 @@ struct MockTts {
 #[async_trait::async_trait]
 impl BaseTTS for MockTts {
     fn new(_c: TTSConfig) -> TTSResult<Self> {
-        Ok(Self { ready: false, callback: None })
+        Ok(Self {
+            ready: false,
+            callback: None,
+        })
     }
     async fn connect(&mut self) -> TTSResult<()> {
         self.ready = true;
@@ -214,15 +261,25 @@ impl Default for LlmMock {
 fn default_tokens() -> Vec<String> {
     // First sentence ends at "fifteen." so the streaming path can speak early.
     vec![
-        "You ", "should ", "leave ", "by ", "eight ", "fifteen. ", "That ", "gives ", "you ",
-        "plenty ", "of ", "time.",
+        "You ",
+        "should ",
+        "leave ",
+        "by ",
+        "eight ",
+        "fifteen. ",
+        "That ",
+        "gives ",
+        "you ",
+        "plenty ",
+        "of ",
+        "time.",
     ]
     .into_iter()
     .map(String::from)
     .collect()
 }
 
-async fn start_llm_mock(state: LlmMock) -> String {
+async fn start_llm_mock(state: LlmMock) -> (String, TestServer) {
     async fn chat(
         State(state): State<LlmMock>,
         Json(req): Json<Value>,
@@ -291,10 +348,10 @@ async fn start_llm_mock(state: LlmMock) -> String {
         .with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let server = spawn_test_server("llm_mock", async move {
         axum::serve(listener, app).await.unwrap();
     });
-    format!("http://127.0.0.1:{}", addr.port())
+    (format!("http://127.0.0.1:{}", addr.port()), server)
 }
 
 fn conv_config(base_url: String, streaming: bool) -> ConversationConfig {
@@ -339,7 +396,11 @@ fn build_vm() -> Arc<VoiceManager> {
 async fn wire_egress(vm: &Arc<VoiceManager>) {
     vm.on_tts_audio(move |audio: AudioData| {
         Box::pin(async move {
-            if audio.data.windows(TTS_MARKER.len()).any(|w| w == TTS_MARKER) {
+            if audio
+                .data
+                .windows(TTS_MARKER.len())
+                .any(|w| w == TTS_MARKER)
+            {
                 REC.mark("audio_out");
             }
         })
@@ -361,7 +422,7 @@ async fn run_one_turn(streaming: bool, ttft_ms: usize, inter_ms: usize) -> Vec<(
     let llm = LlmMock::default();
     llm.ttft_ms.store(ttft_ms, Ordering::SeqCst);
     llm.inter_ms.store(inter_ms, Ordering::SeqCst);
-    let base_url = start_llm_mock(llm).await;
+    let (base_url, _server) = start_llm_mock(llm).await;
 
     let vm = build_vm();
     vm.start().await.expect("vm start");
@@ -371,7 +432,8 @@ async fn run_one_turn(streaming: bool, ttft_ms: usize, inter_ms: usize) -> Vec<(
         .expect("orchestrator");
 
     REC.start(); // t0 = end of speech (stt_final)
-    orch.on_stt_result(&final_result("what time should I leave?")).await;
+    orch.on_stt_result(&final_result("what time should I leave?"))
+        .await;
 
     // The streaming path speaks via a SPAWNED pump task that runs concurrently
     // with (and outlives) on_stt_result — poll for first audio rather than racing it.
@@ -468,7 +530,9 @@ async fn a2_streaming_vs_batch_overlap() {
 
     let total_tokens = default_tokens().len() as f64;
     let full_gen_ms = ttft as f64 + inter as f64 * (total_tokens - 1.0);
-    println!("\n=== A2 STREAMING vs BATCH (TTFT={ttft}ms, {inter}ms/token, {total_tokens} tokens) ===");
+    println!(
+        "\n=== A2 STREAMING vs BATCH (TTFT={ttft}ms, {inter}ms/token, {total_tokens} tokens) ==="
+    );
     println!("  LLM full-generation time          : {full_gen_ms:.0}ms");
     println!(
         "  STREAMING first-audio (audio_out) : p50={:.1}ms  (first sentence spoken at p50={:.1}ms)",
@@ -502,7 +566,7 @@ async fn a3_overhead_under_concurrency() {
     }
     register_mocks();
     let llm = LlmMock::default(); // 0 delay → measures pure concurrent glue
-    let base_url = start_llm_mock(llm).await;
+    let (base_url, _server) = start_llm_mock(llm).await;
 
     for &n in &[1usize, 8, 32] {
         let start = Instant::now();
@@ -517,22 +581,26 @@ async fn a3_overhead_under_concurrency() {
                 vm.on_tts_audio(move |audio: AudioData| {
                     let f = f.clone();
                     Box::pin(async move {
-                        if audio.data.windows(TTS_MARKER.len()).any(|w| w == TTS_MARKER) {
+                        if audio
+                            .data
+                            .windows(TTS_MARKER.len())
+                            .any(|w| w == TTS_MARKER)
+                        {
                             f.store(true, Ordering::SeqCst);
                         }
                     })
                 })
                 .await
                 .unwrap();
-                let orch = ConversationOrchestrator::new(
-                    format!("conc-{i}"),
-                    conv_config(url, true),
-                    vm,
-                )
-                .unwrap();
+                let orch =
+                    ConversationOrchestrator::new(format!("conc-{i}"), conv_config(url, true), vm)
+                        .unwrap();
                 let t = Instant::now();
                 orch.on_stt_result(&final_result("hi")).await;
-                (t.elapsed().as_secs_f64() * 1000.0, saw.load(Ordering::SeqCst))
+                (
+                    t.elapsed().as_secs_f64() * 1000.0,
+                    saw.load(Ordering::SeqCst),
+                )
             }));
         }
         let mut per_turn = Vec::new();
@@ -573,7 +641,9 @@ async fn b_real_sarvam_llm_ttft_through_waav() {
         base_url: "https://api.sarvam.ai/v1".to_string(),
         model: "sarvam-30b".to_string(),
         api_key: Some(key.clone()),
-        system_prompt: Some("You are a concise voice assistant. Answer in one short sentence.".to_string()),
+        system_prompt: Some(
+            "You are a concise voice assistant. Answer in one short sentence.".to_string(),
+        ),
         max_tokens: Some(60),
         streaming: true,
         ..Default::default()
@@ -593,7 +663,13 @@ async fn b_real_sarvam_llm_ttft_through_waav() {
         });
         let cancel = tokio_util::sync::CancellationToken::new();
         let resp = client
-            .complete("bench", "What time should I leave for a 9am meeting downtown?", Some(&key), &cancel, Some(cb))
+            .complete(
+                "bench",
+                "What time should I leave for a 9am meeting downtown?",
+                Some(&key),
+                &cancel,
+                Some(cb),
+            )
             .await
             .expect("sarvam complete");
         let total = t0.elapsed().as_secs_f64() * 1000.0;
@@ -613,7 +689,9 @@ async fn b_real_sarvam_llm_ttft_through_waav() {
         pctl(totals.clone(), 0.5),
         pctl(totals.clone(), 0.9)
     );
-    println!("  NOTE: sarvam-30b is a REASONING model — first streamed token is reasoning, not the spoken answer.");
+    println!(
+        "  NOTE: sarvam-30b is a REASONING model — first streamed token is reasoning, not the spoken answer."
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -668,7 +746,11 @@ mod dag_e2e {
         };
 
         let pcm = synth_english_pcm(UTTERANCE, &dg).await;
-        println!("\n# synth English PCM: {} bytes ({:.2}s)", pcm.len(), pcm.len() as f32 / 2.0 / SR as f32);
+        println!(
+            "\n# synth English PCM: {} bytes ({:.2}s)",
+            pcm.len(),
+            pcm.len() as f32 / 2.0 / SR as f32
+        );
 
         let stt = NodeDefinition::new(
             "stt",
@@ -731,7 +813,12 @@ mod dag_e2e {
         let mut ctx = DAGContext::new("composed-latency");
         let t0 = Instant::now();
         let out = exec
-            .execute_from(&compiled, "stt", DAGData::Audio(bytes::Bytes::from(pcm)), &mut ctx)
+            .execute_from(
+                &compiled,
+                "stt",
+                DAGData::Audio(bytes::Bytes::from(pcm)),
+                &mut ctx,
+            )
             .await;
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -745,8 +832,14 @@ mod dag_e2e {
         println!("  node[stt] : {:?} ms", node_ms("stt"));
         println!("  node[llm] : {:?} ms", node_ms("llm"));
         println!("  node[tts] : {:?} ms", node_ms("tts"));
-        let measured: f64 = ["stt", "llm", "tts"].iter().filter_map(|n| node_ms(n)).sum();
-        println!("  Σ nodes   : {measured:.0} ms | execute_from total : {total_ms:.0} ms | DAG overhead : {:.1} ms", total_ms - measured);
+        let measured: f64 = ["stt", "llm", "tts"]
+            .iter()
+            .filter_map(|n| node_ms(n))
+            .sum();
+        println!(
+            "  Σ nodes   : {measured:.0} ms | execute_from total : {total_ms:.0} ms | DAG overhead : {:.1} ms",
+            total_ms - measured
+        );
         match out {
             Ok(DAGData::TTSAudio(a)) => println!(
                 "  ✓ full pipeline produced {} bytes of audio ({} Hz, {})",
@@ -814,11 +907,19 @@ mod dag_e2e {
         let mut ctx = DAGContext::new("llm-tts-latency");
         let t0 = Instant::now();
         let out = exec
-            .execute_from(&compiled, "llm", DAGData::Text(UTTERANCE.to_string()), &mut ctx)
+            .execute_from(
+                &compiled,
+                "llm",
+                DAGData::Text(UTTERANCE.to_string()),
+                &mut ctx,
+            )
             .await;
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let node_ms = |id: &str| {
-            ctx.timing.node_durations.get(id).map(|d| d.as_secs_f64() * 1000.0)
+            ctx.timing
+                .node_durations
+                .get(id)
+                .map(|d| d.as_secs_f64() * 1000.0)
         };
         println!("\n=== C2 REAL LLM → TTS DAG (Sarvam LLM → Aura TTS) ===");
         println!("  node[llm] : {:?} ms", node_ms("llm"));

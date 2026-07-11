@@ -13,7 +13,7 @@
  *    `node:http(s).Agent` via `agent` — for those consumers the agent is what
  *    enables reuse. It MUST match the gateway scheme: a `node:https.Agent` used
  *    against an `http://` URL throws ERR_INVALID_PROTOCOL, so we pick http vs
- *    https off the baseUrl (http://localhost:3009 is the common self-hosted case).
+ *    https off the baseUrl (http://localhost:3001 is the common self-hosted case).
  * Native fetch ignores the unused `agent` key, so attaching both is safe.
  * Everything is created LAZILY and guarded so the browser bundle never touches
  * `node:http(s)`/`undici` (rollup externalizes them).

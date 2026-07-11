@@ -154,9 +154,10 @@ impl DAGNode for TextInputNode {
 
                 // Check max length
                 if let Some(max) = self.max_length
-                    && processed.len() > max {
-                        return Ok(DAGData::Text(processed[..max].to_string()));
-                    }
+                    && processed.len() > max
+                {
+                    return Ok(DAGData::Text(processed[..max].to_string()));
+                }
 
                 Ok(DAGData::Text(processed))
             }

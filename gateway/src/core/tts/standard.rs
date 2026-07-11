@@ -10,6 +10,8 @@ use super::base::TTSConfig;
 pub use crate::core::stt::standard::ProviderExtras;
 use serde::{Deserialize, Serialize};
 
+pub(crate) const PROVIDER_AUDIO_URL_SCHEMES: &[&str] = &["http", "https"];
+
 /// Canonical, provider-agnostic advanced TTS features. Every field is `Option`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -140,6 +142,42 @@ pub fn override_rest_endpoint(default_url: &str, override_base: Option<&str>) ->
     }
 }
 
+fn validate_standard_endpoint_override(override_base: Option<&str>) -> super::base::TTSResult<()> {
+    let Some(base) = override_base else {
+        return Ok(());
+    };
+    let base = base.trim();
+    if base.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(base, &["http", "https", "ws", "wss"]).map_err(|msg| {
+        super::base::TTSError::InvalidConfiguration(format!(
+            "endpoint_override rejected (SSRF protection): {msg}"
+        ))
+    })
+}
+
+/// Validate a provider-returned audio URL before the gateway follows it.
+pub(crate) fn validate_provider_audio_url<'a>(
+    provider: &str,
+    url: &'a str,
+) -> super::base::TTSResult<&'a str> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(super::base::TTSError::ProviderError(format!(
+            "{provider} audio URL rejected (SSRF protection): empty URL"
+        )));
+    }
+
+    crate::core::net::validate_url_for_ssrf(url, PROVIDER_AUDIO_URL_SCHEMES)
+        .map(|_| url)
+        .map_err(|msg| {
+            super::base::TTSError::ProviderError(format!(
+                "{provider} audio URL rejected (SSRF protection): {msg}"
+            ))
+        })
+}
+
 impl From<TTSConfig> for StandardTTSConfig {
     fn from(base: TTSConfig) -> Self {
         Self::from_base(base)
@@ -158,6 +196,8 @@ pub fn create_tts_standard(
     provider: &str,
     config: StandardTTSConfig,
 ) -> super::base::TTSResult<Box<dyn super::base::BaseTTS>> {
+    validate_standard_endpoint_override(config.endpoint_override())?;
+
     let provider_key = provider.to_lowercase();
 
     // P1.1: `features.streaming == Some(true)` selects a provider's WebSocket
@@ -177,44 +217,56 @@ pub fn create_tts_standard(
         "deepgram" if streaming_requested => Ok(Box::new(
             super::deepgram_aura::DeepgramAuraTTS::from_standard(&config)?,
         )),
-        "deepgram" => Ok(Box::new(super::deepgram::DeepgramTTS::from_standard(&config)?)),
-        "acapela" => Ok(Box::new(super::acapela::AcapelaTts::from_standard(&config)?)),
-        "alibaba_cloud" | "alibaba-cloud" => {
-            Ok(Box::new(super::alibaba_cloud::DashScopeTts::from_standard(&config)?))
-        }
-        "aws_polly" | "aws-polly" | "amazon-polly" | "polly" => {
-            Ok(Box::new(super::aws_polly::AwsPollyTTS::from_standard(&config)?))
-        }
+        "deepgram" => Ok(Box::new(super::deepgram::DeepgramTTS::from_standard(
+            &config,
+        )?)),
+        "acapela" => Ok(Box::new(super::acapela::AcapelaTts::from_standard(
+            &config,
+        )?)),
+        "alibaba_cloud" | "alibaba-cloud" => Ok(Box::new(
+            super::alibaba_cloud::DashScopeTts::from_standard(&config)?,
+        )),
+        "aws_polly" | "aws-polly" | "amazon-polly" | "polly" => Ok(Box::new(
+            super::aws_polly::AwsPollyTTS::from_standard(&config)?,
+        )),
         "azure" | "microsoft-azure" => {
             Ok(Box::new(super::azure::AzureTTS::from_standard(&config)?))
         }
         "baidu" => Ok(Box::new(super::baidu::BaiduTts::from_standard(&config)?)),
-        "bhashini" => Ok(Box::new(super::bhashini::BhashiniTts::from_standard(&config)?)),
-        "cartesia" => Ok(Box::new(super::cartesia::CartesiaTTS::from_standard(&config)?)),
-        "cereproc" => Ok(Box::new(super::cereproc::CereprocTts::from_standard(&config)?)),
-        "elevenlabs" => {
-            Ok(Box::new(super::elevenlabs::ElevenLabsTTS::from_standard(&config)?))
-        }
+        "bhashini" => Ok(Box::new(super::bhashini::BhashiniTts::from_standard(
+            &config,
+        )?)),
+        "cartesia" => Ok(Box::new(super::cartesia::CartesiaTTS::from_standard(
+            &config,
+        )?)),
+        "cereproc" => Ok(Box::new(super::cereproc::CereprocTts::from_standard(
+            &config,
+        )?)),
+        "elevenlabs" => Ok(Box::new(super::elevenlabs::ElevenLabsTTS::from_standard(
+            &config,
+        )?)),
         "fpt_ai" | "fpt-ai" => Ok(Box::new(super::fpt_ai::FptTts::from_standard(&config)?)),
         "gnani" => Ok(Box::new(super::gnani::GnaniTTS::from_standard(&config)?)),
         "google" => Ok(Box::new(super::google::GoogleTTS::from_standard(&config)?)),
-        "huawei_cloud" | "huawei-cloud" => {
-            Ok(Box::new(super::huawei_cloud::HuaweiCloudTts::from_standard(&config)?))
-        }
+        "huawei_cloud" | "huawei-cloud" => Ok(Box::new(
+            super::huawei_cloud::HuaweiCloudTts::from_standard(&config)?,
+        )),
         "hume" => Ok(Box::new(super::hume::HumeTTS::from_standard(&config)?)),
-        "ibm_watson" | "ibm-watson" => {
-            Ok(Box::new(super::ibm_watson::IbmWatsonTTS::from_standard(&config)?))
-        }
-        "iflytek" => Ok(Box::new(super::iflytek::IFlytekTts::from_standard(&config)?)),
+        "ibm_watson" | "ibm-watson" => Ok(Box::new(
+            super::ibm_watson::IbmWatsonTTS::from_standard(&config)?,
+        )),
+        "iflytek" => Ok(Box::new(super::iflytek::IFlytekTts::from_standard(
+            &config,
+        )?)),
         "lmnt" | "lmnt-ai" | "lmnt_ai" => {
             Ok(Box::new(super::lmnt::LmntTts::from_standard(&config)?))
         }
         "murf" | "murf-ai" | "murf_ai" | "murf.ai" => {
             Ok(Box::new(super::murf::MurfTts::from_standard(&config)?))
         }
-        "naver_clova" | "naver-clova" | "naver" | "clova" => {
-            Ok(Box::new(super::naver_clova::NaverClovaTts::from_standard(&config)?))
-        }
+        "naver_clova" | "naver-clova" | "naver" | "clova" => Ok(Box::new(
+            super::naver_clova::NaverClovaTts::from_standard(&config)?,
+        )),
         "nectec" | "vaja9" | "vaja" => {
             Ok(Box::new(super::nectec::NectecTts::from_standard(&config)?))
         }
@@ -225,31 +277,39 @@ pub fn create_tts_standard(
         "prosa_ai" | "prosa-ai" | "prosa" => {
             Ok(Box::new(super::prosa_ai::ProsaTts::from_standard(&config)?))
         }
-        "resemble" | "resemble_ai" | "resemble-ai" => {
-            Ok(Box::new(super::resemble::ResembleTts::from_standard(&config)?))
-        }
-        "reverie" => Ok(Box::new(super::reverie::ReverieTts::from_standard(&config)?)),
-        "sberdevices" | "sber" | "sber_devices" | "sber-devices" => {
-            Ok(Box::new(super::sberdevices::SberDevicesTts::from_standard(&config)?))
-        }
-        "smallest" | "smallest_ai" | "smallest-ai" => {
-            Ok(Box::new(super::smallest::SmallestTts::from_standard(&config)?))
-        }
-        "speechify" => Ok(Box::new(super::speechify::SpeechifyTts::from_standard(&config)?)),
-        "speechmatics" => {
-            Ok(Box::new(super::speechmatics::SpeechmaticsTts::from_standard(&config)?))
-        }
-        "tencent" => Ok(Box::new(super::tencent::TencentTts::from_standard(&config)?)),
-        "tinkoff" => Ok(Box::new(super::tinkoff::TinkoffTts::from_standard(&config)?)),
-        "unrealspeech" | "unreal_speech" | "unreal-speech" => {
-            Ok(Box::new(super::unrealspeech::UnrealSpeechTts::from_standard(&config)?))
-        }
-        "viettel_ai" | "viettel-ai" | "viettel" => {
-            Ok(Box::new(super::viettel_ai::ViettelTts::from_standard(&config)?))
-        }
-        "wellsaid" | "wellsaid_labs" | "wellsaid-labs" => {
-            Ok(Box::new(super::wellsaid::WellSaidTts::from_standard(&config)?))
-        }
+        "resemble" | "resemble_ai" | "resemble-ai" => Ok(Box::new(
+            super::resemble::ResembleTts::from_standard(&config)?,
+        )),
+        "reverie" => Ok(Box::new(super::reverie::ReverieTts::from_standard(
+            &config,
+        )?)),
+        "sberdevices" | "sber" | "sber_devices" | "sber-devices" => Ok(Box::new(
+            super::sberdevices::SberDevicesTts::from_standard(&config)?,
+        )),
+        "smallest" | "smallest_ai" | "smallest-ai" => Ok(Box::new(
+            super::smallest::SmallestTts::from_standard(&config)?,
+        )),
+        "speechify" => Ok(Box::new(super::speechify::SpeechifyTts::from_standard(
+            &config,
+        )?)),
+        "speechmatics" => Ok(Box::new(
+            super::speechmatics::SpeechmaticsTts::from_standard(&config)?,
+        )),
+        "tencent" => Ok(Box::new(super::tencent::TencentTts::from_standard(
+            &config,
+        )?)),
+        "tinkoff" => Ok(Box::new(super::tinkoff::TinkoffTts::from_standard(
+            &config,
+        )?)),
+        "unrealspeech" | "unreal_speech" | "unreal-speech" => Ok(Box::new(
+            super::unrealspeech::UnrealSpeechTts::from_standard(&config)?,
+        )),
+        "viettel_ai" | "viettel-ai" | "viettel" => Ok(Box::new(
+            super::viettel_ai::ViettelTts::from_standard(&config)?,
+        )),
+        "wellsaid" | "wellsaid_labs" | "wellsaid-labs" => Ok(Box::new(
+            super::wellsaid::WellSaidTts::from_standard(&config)?,
+        )),
         "yandex" => Ok(Box::new(super::yandex::YandexTts::from_standard(&config)?)),
         "zalo_ai" | "zalo-ai" | "zalo" => {
             Ok(Box::new(super::zalo_ai::ZaloTts::from_standard(&config)?))
@@ -280,12 +340,18 @@ mod tests {
         );
         // Override: scheme+host swapped, path retained.
         assert_eq!(
-            override_rest_endpoint("https://api.cartesia.ai/tts/bytes", Some("http://127.0.0.1:9000")),
+            override_rest_endpoint(
+                "https://api.cartesia.ai/tts/bytes",
+                Some("http://127.0.0.1:9000")
+            ),
             "http://127.0.0.1:9000/tts/bytes"
         );
         // Trailing slash on the override base is normalized.
         assert_eq!(
-            override_rest_endpoint("https://api.openai.com/v1/audio/speech", Some("http://127.0.0.1:9000/")),
+            override_rest_endpoint(
+                "https://api.openai.com/v1/audio/speech",
+                Some("http://127.0.0.1:9000/")
+            ),
             "http://127.0.0.1:9000/v1/audio/speech"
         );
         // Query string is preserved.
@@ -298,6 +364,22 @@ mod tests {
             override_rest_endpoint("https://host/p", Some("   ")),
             "https://host/p"
         );
+    }
+
+    #[test]
+    fn validate_provider_audio_url_rejects_unsafe_targets() {
+        assert_eq!(
+            validate_provider_audio_url("test", " https://audio.example.com/file.wav ").unwrap(),
+            "https://audio.example.com/file.wav"
+        );
+
+        let err = validate_provider_audio_url("test", "file:///tmp/audio.wav")
+            .expect_err("non-HTTP audio URL must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        let err = validate_provider_audio_url("test", "   ")
+            .expect_err("empty audio URL must be rejected");
+        assert!(err.to_string().contains("empty URL"), "{err}");
     }
 
     #[test]
@@ -410,6 +492,46 @@ mod tests {
         cfg.base.provider = "elevenlabs".into();
         cfg.base.voice_id = Some("21m00Tcm4TlvDq8ikWAM".into());
         assert!(create_tts_standard("elevenlabs", cfg).is_ok());
+    }
+
+    #[test]
+    fn create_tts_standard_rejects_endpoint_override_ssrf_targets() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mk = |endpoint: &str| {
+            StandardTTSConfig {
+                base: TTSConfig {
+                    provider: "deepgram".into(),
+                    api_key: "k".into(),
+                    voice_id: Some("aura-asteria-en".into()),
+                    ..Default::default()
+                },
+                features: TtsFeatures::default(),
+                extras: ProviderExtras::default(),
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(
+            create_tts_standard("deepgram", mk("https://tts-proxy.invalid")).is_ok(),
+            "public HTTPS proxy override should remain supported"
+        );
+
+        let err = match create_tts_standard("deepgram", mk("http://127.0.0.1:9000")) {
+            Ok(_) => panic!("loopback endpoint_override must be rejected"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SSRF protection"),
+            "error names SSRF guard: {msg}"
+        );
+
+        let err = match create_tts_standard("deepgram", mk("file:///tmp/socket")) {
+            Ok(_) => panic!("non-HTTP/WS endpoint_override must be rejected"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("scheme"), "error names scheme contract: {msg}");
     }
 
     #[test]
@@ -982,7 +1104,7 @@ mod tests {
         let tinkoff = StandardTTSConfig {
             base: TTSConfig {
                 provider: "tinkoff".into(),
-                api_key: "k".into(),
+                api_key: "api_key|secret_key".into(),
                 voice_id: Some("alyona".into()),
                 ..Default::default()
             },

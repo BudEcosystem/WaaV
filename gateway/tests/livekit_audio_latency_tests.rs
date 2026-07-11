@@ -228,7 +228,10 @@ async fn test_audio_conversion_latency() {
     let channels = 2u16;
 
     // Validation
-    assert!(audio_data.len().is_multiple_of(2), "Audio data must have even length");
+    assert!(
+        audio_data.len().is_multiple_of(2),
+        "Audio data must have even length"
+    );
     assert!(channels > 0, "Channels must be > 0");
 
     let num_samples = audio_data.len() / 2;

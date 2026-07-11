@@ -130,6 +130,34 @@ export interface TrackInfo {
 }
 
 /**
+ * Response for `DELETE /livekit/participant` (gateway `RemoveParticipantResponse`,
+ * handlers/livekit/participants.rs).
+ */
+export interface RemoveParticipantResponse {
+  /** Status of the removal operation, e.g. `"removed"` (wire: `status`). */
+  status: string;
+  /** The tenant-normalized room name, e.g. `project1_room-123` (wire: `room_name`). */
+  roomName: string;
+  /** The identity of the removed participant (wire: `participant_identity`). */
+  participantIdentity: string;
+}
+
+/**
+ * Response for `POST /livekit/participant/mute` (gateway `MuteParticipantResponse`,
+ * handlers/livekit/participants.rs).
+ */
+export interface MuteParticipantResponse {
+  /** The tenant-normalized room name (wire: `room_name`). */
+  roomName: string;
+  /** The identity of the participant (wire: `participant_identity`). */
+  participantIdentity: string;
+  /** The session ID of the track (wire: `track_sid`). */
+  trackSid: string;
+  /** Current muted state after the operation (wire: `muted`). */
+  muted: boolean;
+}
+
+/**
  * LiveKit room list response
  */
 export interface RoomListResponse {

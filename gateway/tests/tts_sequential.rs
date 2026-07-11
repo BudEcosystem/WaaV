@@ -279,7 +279,7 @@ async fn create_mock_provider(
     base_url: &str,
     start_time: Instant,
 ) -> Result<(TTSProvider, RecordingCallback), Box<dyn std::error::Error + Send + Sync>> {
-    let mut provider = TTSProvider::new()?;
+    let mut provider = TTSProvider::new();
 
     // Create a real ReqManager for the provider to use
     let req_manager = ReqManager::new(10).await?;

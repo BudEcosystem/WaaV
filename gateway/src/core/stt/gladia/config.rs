@@ -9,6 +9,15 @@ use std::str::FromStr;
 
 use crate::core::stt::base::{STTConfig, STTError};
 
+fn validate_gladia_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Region
 // =============================================================================
@@ -507,15 +516,13 @@ impl GladiaSTTConfig {
     /// Create configuration from base STTConfig
     pub fn from_base(config: &STTConfig) -> Result<Self, STTError> {
         // API key is required
-        let api_key = if !config.api_key.is_empty() {
-            config.api_key.clone()
-        } else {
-            std::env::var("GLADIA_API_KEY").map_err(|_| {
+        let api_key = crate::core::credentials::explicit_api_key(&config.api_key)
+            .or_else(|| crate::core::credentials::env_api_key("GLADIA_API_KEY"))
+            .ok_or_else(|| {
                 STTError::ConfigurationError(
                     "Gladia API key required. Set api_key or GLADIA_API_KEY env var".to_string(),
                 )
-            })?
-        };
+            })?;
 
         // Parse encoding
         let encoding = config.encoding.parse().unwrap_or(GladiaEncoding::WavPcm);
@@ -639,8 +646,7 @@ impl GladiaSTTConfig {
 
         // Custom vocabulary intensity / pronunciations -> custom_vocabulary_config.
         if let Some(cvc) = ex.get("custom_vocabulary_config") {
-            if let Ok(parsed) =
-                serde_json::from_value::<GladiaCustomVocabularyConfig>(cvc.clone())
+            if let Ok(parsed) = serde_json::from_value::<GladiaCustomVocabularyConfig>(cvc.clone())
             {
                 rp.custom_vocabulary_config = Some(parsed);
             }
@@ -731,12 +737,18 @@ impl GladiaSTTConfig {
 
         // Validate pre-processing speech threshold
         if let Some(threshold) = self.pre_processing.speech_threshold
-            && !(0.0..=1.0).contains(&threshold) {
-                return Err(STTError::ConfigurationError(format!(
-                    "Speech threshold must be between 0.0 and 1.0, got {}",
-                    threshold
-                )));
-            }
+            && !(0.0..=1.0).contains(&threshold)
+        {
+            return Err(STTError::ConfigurationError(format!(
+                "Speech threshold must be between 0.0 and 1.0, got {}",
+                threshold
+            )));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_gladia_stt_endpoint("endpoint_override", endpoint)
+                .map_err(STTError::ConfigurationError)?;
+        }
 
         Ok(())
     }
@@ -745,7 +757,12 @@ impl GladiaSTTConfig {
     /// base-url override, used by the credential-free mock e2e) is set, its scheme://host replaces
     /// that of `GLADIA_LIVE_URL`; the `/v2/live` path and `?region=` query are preserved.
     pub fn api_url(&self) -> String {
-        let base = match self.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
+        let base = match self
+            .endpoint_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+        {
             Some(o) => format!("{}/v2/live", o.trim_end_matches('/')),
             None => super::GLADIA_LIVE_URL.to_string(),
         };
@@ -844,7 +861,7 @@ mod tests {
     // (custom vocabulary + word timestamps) — previously unreachable via the flat factory.
     #[test]
     fn from_standard_maps_features() {
-        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "gladia".into(),
@@ -1053,6 +1070,33 @@ mod tests {
     }
 
     #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = GladiaSTTConfig::new("test-api-key");
+
+        config.endpoint_override = Some("https://gladia-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("ws://gladia-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected for REST init");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+    }
+
+    #[test]
     fn test_config_validate_invalid_sample_rate() {
         let mut config = GladiaSTTConfig::new("test-api-key");
         config.sample_rate = 12000;
@@ -1156,6 +1200,13 @@ mod tests {
         assert_eq!(
             config.api_url(),
             "https://api.gladia.io/v2/live?region=us-west"
+        );
+
+        let mut config = GladiaSTTConfig::new("test-api-key");
+        config.endpoint_override = Some(" https://gladia-proxy.example.com/ ".to_string());
+        assert_eq!(
+            config.api_url(),
+            "https://gladia-proxy.example.com/v2/live?region=eu-west"
         );
     }
 

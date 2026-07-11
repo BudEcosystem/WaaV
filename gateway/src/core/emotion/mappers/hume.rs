@@ -217,9 +217,10 @@ impl EmotionMapper for HumeEmotionMapper {
 
         // Add style description
         if let Some(style) = &config.style
-            && let Some(style_desc) = Self::style_to_description(style) {
-                parts.push(style_desc.to_string());
-            }
+            && let Some(style_desc) = Self::style_to_description(style)
+        {
+            parts.push(style_desc.to_string());
+        }
 
         // Add context if it provides useful hints
         if let Some(context) = &config.context {

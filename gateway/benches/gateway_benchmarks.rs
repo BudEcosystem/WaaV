@@ -158,6 +158,9 @@ fn bench_message_serialization(c: &mut Criterion) {
         livekit_url: Some("ws://localhost:7880".to_string()),
         waav_participant_identity: Some("waav-ai".to_string()),
         waav_participant_name: Some("WaaV AI".to_string()),
+        resolved_alias: None,
+        audio_in_codec: None,
+        audio_out_codec: None,
     };
 
     // STT result
@@ -167,6 +170,7 @@ fn bench_message_serialization(c: &mut Criterion) {
         is_speech_final: true,
         confidence: 0.95,
         segment_transcript: None,
+        translations: Vec::new(),
     };
 
     // Error message

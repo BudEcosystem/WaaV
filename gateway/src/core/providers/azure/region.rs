@@ -89,6 +89,8 @@ pub enum AzureRegion {
 }
 
 impl AzureRegion {
+    const DEFAULT_SAFE_ENDPOINT_REGION: &'static str = "eastus";
+
     /// Get the region identifier string used in Azure URLs.
     ///
     /// # Example
@@ -129,6 +131,15 @@ impl AzureRegion {
         }
     }
 
+    fn endpoint_region_identifier(&self) -> &str {
+        let region = self.as_str();
+        if is_valid_azure_region_identifier(region) {
+            region
+        } else {
+            Self::DEFAULT_SAFE_ENDPOINT_REGION
+        }
+    }
+
     // =========================================================================
     // STT (Speech-to-Text) Endpoints
     // =========================================================================
@@ -147,7 +158,10 @@ impl AzureRegion {
     /// ```
     #[inline]
     pub fn stt_hostname(&self) -> String {
-        format!("{}.stt.speech.microsoft.com", self.as_str())
+        format!(
+            "{}.stt.speech.microsoft.com",
+            self.endpoint_region_identifier()
+        )
     }
 
     /// Get the base WebSocket URL for the Azure Speech-to-Text Service in this region.
@@ -167,7 +181,10 @@ impl AzureRegion {
     /// ```
     #[inline]
     pub fn stt_websocket_base_url(&self) -> String {
-        format!("wss://{}.stt.speech.microsoft.com", self.as_str())
+        format!(
+            "wss://{}.stt.speech.microsoft.com",
+            self.endpoint_region_identifier()
+        )
     }
 
     // =========================================================================
@@ -188,7 +205,10 @@ impl AzureRegion {
     /// ```
     #[inline]
     pub fn tts_hostname(&self) -> String {
-        format!("{}.tts.speech.microsoft.com", self.as_str())
+        format!(
+            "{}.tts.speech.microsoft.com",
+            self.endpoint_region_identifier()
+        )
     }
 
     /// Get the base REST URL for the Azure Text-to-Speech Service in this region.
@@ -212,7 +232,7 @@ impl AzureRegion {
     pub fn tts_rest_url(&self) -> String {
         format!(
             "https://{}.tts.speech.microsoft.com/cognitiveservices/v1",
-            self.as_str()
+            self.endpoint_region_identifier()
         )
     }
 
@@ -237,7 +257,7 @@ impl AzureRegion {
     pub fn voices_list_url(&self) -> String {
         format!(
             "https://{}.tts.speech.microsoft.com/cognitiveservices/voices/list",
-            self.as_str()
+            self.endpoint_region_identifier()
         )
     }
 
@@ -267,7 +287,7 @@ impl AzureRegion {
     pub fn token_endpoint(&self) -> String {
         format!(
             "https://{}.api.cognitive.microsoft.com/sts/v1.0/issueToken",
-            self.as_str()
+            self.endpoint_region_identifier()
         )
     }
 
@@ -302,14 +322,13 @@ impl AzureRegion {
 }
 
 impl std::str::FromStr for AzureRegion {
-    type Err = std::convert::Infallible;
+    type Err = String;
 
     /// Parse a region from a string identifier.
     ///
     /// Known region identifiers are matched to their explicit variants.
-    /// Unknown identifiers are wrapped in the `Custom` variant.
-    ///
-    /// This implementation never fails - unknown regions become `Custom(s)`.
+    /// Unknown safe identifiers are wrapped in the `Custom` variant.
+    /// Malformed identifiers are rejected so they cannot alter generated Azure hosts.
     ///
     /// # Example
     ///
@@ -324,7 +343,8 @@ impl std::str::FromStr for AzureRegion {
     /// assert_eq!(custom, AzureRegion::Custom("newregion".to_string()));
     /// ```
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let region = match s.to_lowercase().as_str() {
+        let normalized = s.trim().to_ascii_lowercase();
+        let region = match normalized.as_str() {
             "eastus" => Self::EastUS,
             "eastus2" => Self::EastUS2,
             "westus" => Self::WestUS,
@@ -348,10 +368,47 @@ impl std::str::FromStr for AzureRegion {
             "canadacentral" => Self::CanadaCentral,
             "brazilsouth" => Self::BrazilSouth,
             "centralindia" => Self::IndiaCentral,
-            _ => Self::Custom(s.to_string()),
+            _ => {
+                validate_azure_region_identifier(&normalized)?;
+                Self::Custom(normalized)
+            }
         };
         Ok(region)
     }
+}
+
+fn validate_azure_region_identifier(region: &str) -> Result<(), String> {
+    if is_valid_azure_region_identifier(region) {
+        Ok(())
+    } else {
+        Err(format!(
+            "custom Azure region must be a single DNS label containing only ASCII letters, digits, or hyphen, got {region:?}"
+        ))
+    }
+}
+
+fn is_valid_azure_region_identifier(region: &str) -> bool {
+    if region.is_empty() || region.len() > 63 {
+        return false;
+    }
+
+    let mut chars = region.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+
+    let mut last = first;
+    for c in chars {
+        if !(c.is_ascii_alphanumeric() || c == '-') {
+            return false;
+        }
+        last = c;
+    }
+
+    last.is_ascii_alphanumeric()
 }
 
 #[cfg(test)]
@@ -486,6 +543,53 @@ mod tests {
         assert_eq!(
             "unknown".parse::<AzureRegion>().unwrap(),
             AzureRegion::Custom("unknown".to_string())
+        );
+    }
+
+    #[test]
+    fn test_azure_region_from_str_rejects_unsafe_custom_labels() {
+        for input in [
+            "",
+            " ",
+            "-bad",
+            "bad-",
+            "bad_label",
+            "evil.com/path",
+            "evil.com@127.0.0.1",
+            "127.0.0.1:9000/foo",
+            "[::1]:9000/foo",
+        ] {
+            let err = input
+                .parse::<AzureRegion>()
+                .expect_err("unsafe custom region must be rejected");
+            assert!(
+                err.contains("single DNS label"),
+                "unexpected error for {input:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_azure_region_endpoint_builders_ignore_unsafe_direct_custom() {
+        let region = AzureRegion::Custom("127.0.0.1:9000/foo".to_string());
+
+        assert_eq!(region.stt_hostname(), "eastus.stt.speech.microsoft.com");
+        assert_eq!(
+            region.stt_websocket_base_url(),
+            "wss://eastus.stt.speech.microsoft.com"
+        );
+        assert_eq!(region.tts_hostname(), "eastus.tts.speech.microsoft.com");
+        assert_eq!(
+            region.tts_rest_url(),
+            "https://eastus.tts.speech.microsoft.com/cognitiveservices/v1"
+        );
+        assert_eq!(
+            region.voices_list_url(),
+            "https://eastus.tts.speech.microsoft.com/cognitiveservices/voices/list"
+        );
+        assert_eq!(
+            region.token_endpoint(),
+            "https://eastus.api.cognitive.microsoft.com/sts/v1.0/issueToken"
         );
     }
 

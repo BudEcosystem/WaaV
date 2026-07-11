@@ -22,7 +22,7 @@ use waav_gateway::core::stt::cartesia::CartesiaSTTConfig;
 use waav_gateway::core::stt::elevenlabs::ElevenLabsSTTConfig;
 use waav_gateway::core::stt::revai::RevAISTTConfig;
 use waav_gateway::core::stt::sarvam::SarvamSTTConfig;
-use waav_gateway::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+use waav_gateway::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
 
 /// Build a `StandardSTTConfig` for `provider` from a typed feature set + extras passthrough.
 fn std_cfg(provider: &str, features: SttFeatures, extras: ProviderExtras) -> StandardSTTConfig {
@@ -46,7 +46,10 @@ fn std_cfg(provider: &str, features: SttFeatures, extras: ProviderExtras) -> Sta
 /// Assert every needle appears in the built URL (each represents a feature reaching the wire).
 fn assert_all(url: &str, needles: &[&str]) {
     for n in needles {
-        assert!(url.contains(n), "feature param `{n}` missing from wire URL:\n{url}");
+        assert!(
+            url.contains(n),
+            "feature param `{n}` missing from wire URL:\n{url}"
+        );
     }
 }
 
@@ -68,11 +71,11 @@ fn cartesia_stt_features_reach_websocket_url() {
     assert_all(
         &url,
         &[
-            "access_token=tok-123",         // extras passthrough auth
-            "max_silence_duration_secs=",   // endpointing_ms -> typed silence
-            "model=",                       // model rides the URL
-            "encoding=",                    // codec rides the URL
-            "cartesia_version=",            // version header carried as query
+            "access_token=tok-123",       // extras passthrough auth
+            "max_silence_duration_secs=", // endpointing_ms -> typed silence
+            "model=",                     // model rides the URL
+            "encoding=",                  // codec rides the URL
+            "cartesia_version=",          // version header carried as query
         ],
     );
 }
@@ -97,12 +100,12 @@ fn elevenlabs_stt_features_reach_websocket_url() {
     assert_all(
         &url,
         &[
-            "include_timestamps=true",      // word_timestamps
-            "diarization=true",             // diarization
-            "entity_detection=true",        // entity_detection
-            "include_language_detection=",  // language_detection
-            "no_verbatim=",                 // filler_words=false -> no_verbatim
-            "keyterms=",                    // keyterm biasing
+            "include_timestamps=true",     // word_timestamps
+            "diarization=true",            // diarization
+            "entity_detection=true",       // entity_detection
+            "include_language_detection=", // language_detection
+            "no_verbatim=",                // filler_words=false -> no_verbatim
+            "keyterms=",                   // keyterm biasing
         ],
     );
 }
@@ -129,11 +132,11 @@ fn revai_stt_features_reach_websocket_url() {
     assert_all(
         &url,
         &[
-            "enable_speaker_switch=true",       // diarization
-            "filter_profanity=true",            // profanity_filter
-            "remove_disfluencies=true",         // filler_words=false
-            "priority=",                        // extras passthrough
-            "max_connection_wait_seconds=",     // extras passthrough
+            "enable_speaker_switch=true",   // diarization
+            "filter_profanity=true",        // profanity_filter
+            "remove_disfluencies=true",     // filler_words=false
+            "priority=",                    // extras passthrough
+            "max_connection_wait_seconds=", // extras passthrough
         ],
     );
 }
@@ -158,11 +161,11 @@ fn assemblyai_stt_features_reach_websocket_url() {
     assert_all(
         &url,
         &[
-            "speaker_labels=true",      // diarization
-            "language_detection=true",  // language_detection
-            "keyterms_prompt=",         // keyterm biasing
-            "domain=",                  // extras passthrough
-            "vad_threshold=",           // extras passthrough
+            "speaker_labels=true",     // diarization
+            "language_detection=true", // language_detection
+            "keyterms_prompt=",        // keyterm biasing
+            "domain=",                 // extras passthrough
+            "vad_threshold=",          // extras passthrough
         ],
     );
 }

@@ -360,11 +360,16 @@ impl STTResult {
     /// segment when present, else the raw fragment. Client egress always
     /// uses [`transcript`](Self::transcript) directly.
     pub fn turn_transcript(&self) -> &str {
-        self.segment_transcript.as_deref().unwrap_or(&self.transcript)
+        self.segment_transcript
+            .as_deref()
+            .unwrap_or(&self.transcript)
     }
 
     pub fn finalized(mut self) -> Self {
-        debug_assert!(self.is_final, "is_finalized requires is_final (finalized ⇒ final)");
+        debug_assert!(
+            self.is_final,
+            "is_finalized requires is_final (finalized ⇒ final)"
+        );
         self.is_finalized = true;
         self
     }
@@ -687,7 +692,10 @@ pub trait BaseSTT: Send + Sync {
         if changed.is_empty() {
             return Ok(changed);
         }
-        if changed.iter().any(|f| SttSettingsDelta::is_connection_relevant(f)) {
+        if changed
+            .iter()
+            .any(|f| SttSettingsDelta::is_connection_relevant(f))
+        {
             // Full update (providers reconnect inside update_config).
             self.update_config(merged).await?;
         } else {
@@ -899,7 +907,8 @@ mod tests {
 
         async fn update_config(&mut self, config: STTConfig) -> Result<(), STTError> {
             if self.is_ready() {
-                self.reconnects.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.reconnects
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.config = Some(config);
                 Ok(())
             } else {
@@ -945,11 +954,16 @@ mod tests {
         assert_eq!(merged.sample_rate, 16000);
         assert_eq!(
             changed,
-            ["language", "punctuation"].into_iter().collect::<std::collections::HashSet<_>>()
+            ["language", "punctuation"]
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
         );
 
         // A field present but EQUAL to the current value is NOT a change.
-        let noop = SttSettingsDelta { language: Some("en-US".into()), ..Default::default() };
+        let noop = SttSettingsDelta {
+            language: Some("en-US".into()),
+            ..Default::default()
+        };
         let (_, changed) = noop.merge_into(base_cfg());
         assert!(changed.is_empty(), "equal-value delta must be a no-op");
     }
@@ -958,7 +972,10 @@ mod tests {
     async fn non_connection_field_does_not_reconnect() {
         let mut stt = MockSTT::new(base_cfg()).unwrap();
         stt.connect().await.unwrap();
-        let delta = SttSettingsDelta { punctuation: Some(false), ..Default::default() };
+        let delta = SttSettingsDelta {
+            punctuation: Some(false),
+            ..Default::default()
+        };
         let changed = stt.apply_settings_delta(delta).await.unwrap();
         assert_eq!(changed.len(), 1);
         assert_eq!(
@@ -966,14 +983,20 @@ mod tests {
             0,
             "a non-connection knob must NOT reconnect"
         );
-        assert!(!stt.get_config().unwrap().punctuation, "but it must be stored");
+        assert!(
+            !stt.get_config().unwrap().punctuation,
+            "but it must be stored"
+        );
     }
 
     #[tokio::test]
     async fn connection_field_triggers_reconnect() {
         let mut stt = MockSTT::new(base_cfg()).unwrap();
         stt.connect().await.unwrap();
-        let delta = SttSettingsDelta { language: Some("hi".into()), ..Default::default() };
+        let delta = SttSettingsDelta {
+            language: Some("hi".into()),
+            ..Default::default()
+        };
         let changed = stt.apply_settings_delta(delta).await.unwrap();
         assert!(changed.contains("language"));
         assert_eq!(
@@ -987,7 +1010,9 @@ mod tests {
     #[test]
     fn extra_overflow_roundtrips() {
         let mut delta = SttSettingsDelta::default();
-        delta.extra.insert("keyterms".into(), serde_json::json!(["WaaV"]));
+        delta
+            .extra
+            .insert("keyterms".into(), serde_json::json!(["WaaV"]));
         let json = serde_json::to_string(&delta).unwrap();
         let back: SttSettingsDelta = serde_json::from_str(&json).unwrap();
         assert_eq!(back.extra["keyterms"], serde_json::json!(["WaaV"]));

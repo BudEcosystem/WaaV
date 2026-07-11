@@ -490,15 +490,9 @@ impl StreamingRecognizeResponse {
             match (field_number, wire_type) {
                 // Field 1: results (repeated message)
                 (1, 2) => {
-                    let (len, len_size) = decode_varint(&buf[pos..])?;
-                    pos += len_size;
-                    let end = pos + len as usize;
-                    if end > buf.len() {
-                        return Err(DecodeError::BufferTooShort);
-                    }
-                    let result = SpeechRecognitionResult::decode(&buf[pos..end])?;
+                    let bytes = take_len_delimited(buf, &mut pos)?;
+                    let result = SpeechRecognitionResult::decode(bytes)?;
                     response.results.push(result);
-                    pos = end;
                 }
                 // Field 2: endpoint_detection_type (enum/int32)
                 (2, 0) => {
@@ -508,18 +502,16 @@ impl StreamingRecognizeResponse {
                 }
                 // Skip unknown fields
                 (_, 0) => {
-                    let (_, size) = decode_varint(&buf[pos..])?;
-                    pos += size;
+                    skip_varint(buf, &mut pos)?;
                 }
                 (_, 2) => {
-                    let (len, len_size) = decode_varint(&buf[pos..])?;
-                    pos += len_size + len as usize;
+                    let _ = take_len_delimited(buf, &mut pos)?;
                 }
                 (_, 5) => {
-                    pos += 4;
+                    let _ = take_exact::<4>(buf, &mut pos)?;
                 }
                 (_, 1) => {
-                    pos += 8;
+                    let _ = take_exact::<8>(buf, &mut pos)?;
                 }
                 _ => {
                     return Err(DecodeError::UnknownWireType(wire_type as u8));
@@ -590,15 +582,9 @@ impl SpeechRecognitionResult {
             match (field_number, wire_type) {
                 // Field 1: alternatives (repeated message)
                 (1, 2) => {
-                    let (len, len_size) = decode_varint(&buf[pos..])?;
-                    pos += len_size;
-                    let end = pos + len as usize;
-                    if end > buf.len() {
-                        return Err(DecodeError::BufferTooShort);
-                    }
-                    let alt = SpeechRecognitionAlternative::decode(&buf[pos..end])?;
+                    let bytes = take_len_delimited(buf, &mut pos)?;
+                    let alt = SpeechRecognitionAlternative::decode(bytes)?;
                     result.alternatives.push(alt);
-                    pos = end;
                 }
                 // Field 2: is_final (bool)
                 (2, 0) => {
@@ -608,27 +594,21 @@ impl SpeechRecognitionResult {
                 }
                 // Field 3: stability (float)
                 (3, 5) => {
-                    if pos + 4 > buf.len() {
-                        return Err(DecodeError::BufferTooShort);
-                    }
-                    let bytes: [u8; 4] = buf[pos..pos + 4].try_into().unwrap();
+                    let bytes = take_exact::<4>(buf, &mut pos)?;
                     result.stability = f32::from_le_bytes(bytes);
-                    pos += 4;
                 }
                 // Skip unknown fields
                 (_, 0) => {
-                    let (_, size) = decode_varint(&buf[pos..])?;
-                    pos += size;
+                    skip_varint(buf, &mut pos)?;
                 }
                 (_, 2) => {
-                    let (len, len_size) = decode_varint(&buf[pos..])?;
-                    pos += len_size + len as usize;
+                    let _ = take_len_delimited(buf, &mut pos)?;
                 }
                 (_, 5) => {
-                    pos += 4;
+                    let _ = take_exact::<4>(buf, &mut pos)?;
                 }
                 (_, 1) => {
-                    pos += 8;
+                    let _ = take_exact::<8>(buf, &mut pos)?;
                 }
                 _ => {
                     return Err(DecodeError::UnknownWireType(wire_type as u8));
@@ -672,38 +652,26 @@ impl SpeechRecognitionAlternative {
             match (field_number, wire_type) {
                 // Field 1: transcript (string)
                 (1, 2) => {
-                    let (len, len_size) = decode_varint(&buf[pos..])?;
-                    pos += len_size;
-                    let end = pos + len as usize;
-                    if end > buf.len() {
-                        return Err(DecodeError::BufferTooShort);
-                    }
-                    alt.transcript = String::from_utf8_lossy(&buf[pos..end]).to_string();
-                    pos = end;
+                    let bytes = take_len_delimited(buf, &mut pos)?;
+                    alt.transcript = String::from_utf8_lossy(bytes).to_string();
                 }
                 // Field 2: confidence (float)
                 (2, 5) => {
-                    if pos + 4 > buf.len() {
-                        return Err(DecodeError::BufferTooShort);
-                    }
-                    let bytes: [u8; 4] = buf[pos..pos + 4].try_into().unwrap();
+                    let bytes = take_exact::<4>(buf, &mut pos)?;
                     alt.confidence = f32::from_le_bytes(bytes);
-                    pos += 4;
                 }
                 // Skip unknown fields
                 (_, 0) => {
-                    let (_, size) = decode_varint(&buf[pos..])?;
-                    pos += size;
+                    skip_varint(buf, &mut pos)?;
                 }
                 (_, 2) => {
-                    let (len, len_size) = decode_varint(&buf[pos..])?;
-                    pos += len_size + len as usize;
+                    let _ = take_len_delimited(buf, &mut pos)?;
                 }
                 (_, 5) => {
-                    pos += 4;
+                    let _ = take_exact::<4>(buf, &mut pos)?;
                 }
                 (_, 1) => {
-                    pos += 8;
+                    let _ = take_exact::<8>(buf, &mut pos)?;
                 }
                 _ => {
                     return Err(DecodeError::UnknownWireType(wire_type as u8));
@@ -758,6 +726,40 @@ pub fn decode_varint(buf: &[u8]) -> Result<(u64, usize), DecodeError> {
     }
 
     Err(DecodeError::BufferTooShort)
+}
+
+fn checked_end(pos: usize, len: usize, buf_len: usize) -> Result<usize, DecodeError> {
+    let end = pos.checked_add(len).ok_or(DecodeError::BufferTooShort)?;
+    if end > buf_len {
+        return Err(DecodeError::BufferTooShort);
+    }
+    Ok(end)
+}
+
+fn take_exact<const N: usize>(buf: &[u8], pos: &mut usize) -> Result<[u8; N], DecodeError> {
+    let end = checked_end(*pos, N, buf.len())?;
+    let bytes = buf.get(*pos..end).ok_or(DecodeError::BufferTooShort)?;
+    let out = bytes.try_into().map_err(|_| DecodeError::BufferTooShort)?;
+    *pos = end;
+    Ok(out)
+}
+
+fn take_len_delimited<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'a [u8], DecodeError> {
+    let rest = buf.get(*pos..).ok_or(DecodeError::BufferTooShort)?;
+    let (len, len_size) = decode_varint(rest)?;
+    *pos = checked_end(*pos, len_size, buf.len())?;
+    let len = usize::try_from(len).map_err(|_| DecodeError::BufferTooShort)?;
+    let end = checked_end(*pos, len, buf.len())?;
+    let bytes = buf.get(*pos..end).ok_or(DecodeError::BufferTooShort)?;
+    *pos = end;
+    Ok(bytes)
+}
+
+fn skip_varint(buf: &[u8], pos: &mut usize) -> Result<(), DecodeError> {
+    let rest = buf.get(*pos..).ok_or(DecodeError::BufferTooShort)?;
+    let (_, size) = decode_varint(rest)?;
+    *pos = checked_end(*pos, size, buf.len())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1011,6 +1013,36 @@ mod tests {
         assert_eq!(response.results.len(), 1);
         assert_eq!(response.best_transcript(), Some("world"));
         assert!(response.has_final_result());
+    }
+
+    fn assert_buffer_too_short<T: std::fmt::Debug>(result: Result<T, DecodeError>) {
+        match result {
+            Err(DecodeError::BufferTooShort) => {}
+            other => panic!("expected BufferTooShort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_tinkoff_decode_truncated_known_fixed32_fields_are_typed_errors() {
+        // SpeechRecognitionResult.stability: field 3, wire type fixed32.
+        assert_buffer_too_short(SpeechRecognitionResult::decode(&[0x1d, 0x00, 0x00]));
+
+        // SpeechRecognitionAlternative.confidence: field 2, wire type fixed32.
+        assert_buffer_too_short(SpeechRecognitionAlternative::decode(&[0x15, 0x00]));
+    }
+
+    #[test]
+    fn test_tinkoff_decode_unknown_fields_are_bounds_checked() {
+        // Unknown fixed32 field with only two payload bytes.
+        assert_buffer_too_short(StreamingRecognizeResponse::decode(&[0x4d, 0x01, 0x02]));
+
+        // Unknown fixed64 field with only three payload bytes.
+        assert_buffer_too_short(SpeechRecognitionResult::decode(&[0x49, 0x01, 0x02, 0x03]));
+
+        // Unknown length-delimited field claims five bytes but carries two.
+        assert_buffer_too_short(SpeechRecognitionAlternative::decode(&[
+            0x4a, 0x05, 0x01, 0x02,
+        ]));
     }
 
     #[test]

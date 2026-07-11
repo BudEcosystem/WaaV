@@ -9,9 +9,13 @@
 use serde_json::Value;
 
 use super::super::openai::protocol::OpenAiProtocol;
-use crate::core::realtime::base::{RealtimeConfig, RealtimeResponseOverride, RealtimeResult, ReplayConversationItem};
+use crate::core::realtime::base::{
+    RealtimeConfig, RealtimeResponseOverride, RealtimeResult, ReplayConversationItem,
+};
 use crate::core::realtime::openai::ClientEvent;
-use crate::core::realtime::scaffold::{ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol, S2sEvent};
+use crate::core::realtime::scaffold::{
+    ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol, S2sEvent,
+};
 
 /// xAI realtime WebSocket base URL. BEST-KNOWN: xAI's realtime surface is behind
 /// a key we do not hold, so this endpoint is the documented/best-known form and
@@ -221,7 +225,9 @@ mod tests {
             .unwrap();
         assert_eq!(auth, "Bearer xaikey");
         assert!(
-            !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("api-key")),
+            !headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("api-key")),
             "xAI uses Bearer, not the Azure api-key header"
         );
     }
@@ -234,11 +240,16 @@ mod tests {
             realtime_endpoint_override: Some("ws://127.0.0.1:9003/grok".into()),
             ..base_cfg()
         };
-        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap() else {
+        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap()
+        else {
             panic!("expected WebSocket")
         };
         assert_eq!(url, "ws://127.0.0.1:9003/grok");
-        assert!(headers.iter().any(|(k, v)| k == "Authorization" && v == "Bearer xaikey"));
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "Authorization" && v == "Bearer xaikey")
+        );
     }
 
     /// map_server_event override: xAI `conversation.created` ⇒ [SessionReady],

@@ -57,7 +57,6 @@ pub enum VADState {
     Stopping = 3,
 }
 
-
 impl From<u8> for VADState {
     fn from(v: u8) -> Self {
         match v {

@@ -66,7 +66,13 @@ impl Default for StreamResampler {
 
 impl StreamResampler {
     pub fn new() -> Self {
-        Self { inner: None, in_rate: 0, out_rate: 0, last_call: None, pending_in: Vec::new() }
+        Self {
+            inner: None,
+            in_rate: 0,
+            out_rate: 0,
+            last_call: None,
+            pending_in: Vec::new(),
+        }
     }
 
     /// Resample mono f32 samples. Returns `None` when `in_rate == out_rate` —
@@ -193,14 +199,28 @@ impl StreamResampler {
     }
 }
 
+fn f32_to_pcm16_le(sample: f32) -> [u8; 2] {
+    let sample = if sample.is_finite() { sample } else { 0.0 };
+    ((sample.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes()
+}
+
 /// PCM16-LE convenience for the TTS egress path (`AudioData.data` is bytes).
-/// Returns `None` when no conversion is needed (use the original bytes).
+/// Returns `None` when no conversion is needed (use the original bytes). Malformed
+/// PCM16 returns `Some(Vec::new())` so callers do not pass invalid bytes through.
 pub fn resample_pcm16(
     r: &mut StreamResampler,
     pcm: &[u8],
     in_rate: u32,
     out_rate: u32,
 ) -> Option<Vec<u8>> {
+    if pcm.len() % 2 != 0 {
+        warn!(
+            bytes = pcm.len(),
+            "malformed PCM16 egress chunk length; dropping chunk instead of truncating a partial sample"
+        );
+        r.reset();
+        return Some(Vec::new());
+    }
     if in_rate == out_rate || in_rate == 0 || out_rate == 0 {
         return None;
     }
@@ -211,8 +231,7 @@ pub fn resample_pcm16(
     let out = r.resample(&samples, in_rate, out_rate)?;
     let mut bytes = Vec::with_capacity(out.len() * 2);
     for &s in &out {
-        let v = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
-        bytes.extend_from_slice(&v.to_le_bytes());
+        bytes.extend_from_slice(&f32_to_pcm16_le(s));
     }
     Some(bytes)
 }
@@ -240,12 +259,19 @@ pub fn egress_to_client_rate(
         // through untouched: mulaw/alaw bytes are 8-bit companded samples —
         // PCM16 byte math would deliver full-scale static (review
         // wf_85659e16 #6/#12). A real G.711 transcode is a separate feature.
-        debug!(format, "egress resample skipped: non-linear-PCM16 passes through");
+        debug!(
+            format,
+            "egress resample skipped: non-linear-PCM16 passes through"
+        );
         return None;
     }
     // The chunk's own declared rate wins; the session's configured provider
     // rate is the fallback for providers that don't stamp chunks.
-    let in_rate = if chunk_rate != 0 { chunk_rate } else { configured_provider_rate };
+    let in_rate = if chunk_rate != 0 {
+        chunk_rate
+    } else {
+        configured_provider_rate
+    };
     resample_pcm16(r, data, in_rate, target_rate)
 }
 
@@ -254,8 +280,7 @@ pub fn flush_pcm16(r: &mut StreamResampler) -> Option<Vec<u8>> {
     let out = r.flush()?;
     let mut bytes = Vec::with_capacity(out.len() * 2);
     for &s in &out {
-        let v = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
-        bytes.extend_from_slice(&v.to_le_bytes());
+        bytes.extend_from_slice(&f32_to_pcm16_le(s));
     }
     Some(bytes)
 }
@@ -272,7 +297,10 @@ mod tests {
     fn identity_returns_none_zero_work() {
         let mut r = StreamResampler::new();
         assert!(r.resample(&[0.1, -0.2, 0.3], 16000, 16000).is_none());
-        assert!(r.inner.is_none(), "identity must not even build the resampler");
+        assert!(
+            r.inner.is_none(),
+            "identity must not even build the resampler"
+        );
     }
 
     #[test]
@@ -297,8 +325,14 @@ mod tests {
         let mut r = StreamResampler::new();
         let mut joined = r.resample(&input[..4800], 48000, 16000).unwrap();
         joined.extend(r.resample(&input[4800..], 48000, 16000).unwrap());
-        let max_step = joined.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
-        assert!(max_step < 0.3, "seam discontinuity (click): step {max_step}");
+        let max_step = joined
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_step < 0.3,
+            "seam discontinuity (click): step {max_step}"
+        );
     }
 
     #[test]
@@ -311,7 +345,10 @@ mod tests {
         let silence = vec![0.0f32; 4800];
         let out = r.resample(&silence, 48000, 16000).unwrap();
         let max_abs = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
-        assert!(max_abs < 1e-3, "filter tail leaked across the gap: {max_abs}");
+        assert!(
+            max_abs < 1e-3,
+            "filter tail leaked across the gap: {max_abs}"
+        );
     }
 
     #[test]
@@ -339,11 +376,45 @@ mod tests {
             .iter()
             .flat_map(|s| ((s * 32767.0) as i16).to_le_bytes())
             .collect();
-        assert!(resample_pcm16(&mut r, &pcm, 24000, 24000).is_none(), "identity → None");
+        assert!(
+            resample_pcm16(&mut r, &pcm, 24000, 24000).is_none(),
+            "identity → None"
+        );
         let out = resample_pcm16(&mut r, &pcm, 24000, 16000).unwrap();
         assert_eq!(out.len() % 2, 0, "whole samples only");
         assert!(!out.is_empty());
     }
+
+    #[test]
+    fn pcm16_resampler_rejects_odd_length_without_truncating_or_passthrough() {
+        let mut r = StreamResampler::new();
+        let _ = r.resample(&sine(10, 0.05), 24_000, 48_000);
+        assert!(!r.pending_in.is_empty(), "test must seed pending state");
+
+        let malformed = vec![0x01, 0x02, 0x03];
+        let out = resample_pcm16(&mut r, &malformed, 24_000, 48_000)
+            .expect("malformed PCM16 must not use None passthrough");
+        assert!(out.is_empty(), "malformed chunk is dropped as a unit");
+        assert!(
+            r.pending_in.is_empty(),
+            "malformed chunk must reset stale resampler state"
+        );
+
+        let mut identity = StreamResampler::new();
+        let out = resample_pcm16(&mut identity, &malformed, 24_000, 24_000)
+            .expect("identity malformed PCM16 must not pass through");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn pcm16_quantizer_silences_non_finite_samples_before_clamping() {
+        let got: Vec<i16> = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.25]
+            .into_iter()
+            .map(|sample| i16::from_le_bytes(f32_to_pcm16_le(sample)))
+            .collect();
+        assert_eq!(got, vec![0, 0, 0, 8192]);
+    }
+
     // --- C-G5 pt3: the standardized egress seam ---
 
     fn pcm16(samples: &[f32]) -> Vec<u8> {
@@ -443,4 +514,3 @@ mod tests {
         );
     }
 }
-

@@ -56,9 +56,7 @@ impl AuthClaims {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| {
-                AuthError::JwtSigningError(format!(
-                    "system clock is before the Unix epoch: {e}"
-                ))
+                AuthError::JwtSigningError(format!("system clock is before the Unix epoch: {e}"))
             })?
             .as_secs() as i64;
 

@@ -94,7 +94,10 @@ async fn openai_reasoning_model_live_round_trip() {
             "reasoning model answer (streaming={streaming}): {:?}",
             r.content
         );
-        eprintln!("[live openai] gpt-5-mini streaming={streaming} → {:?}", r.content.trim());
+        eprintln!(
+            "[live openai] gpt-5-mini streaming={streaming} → {:?}",
+            r.content.trim()
+        );
     }
 }
 
@@ -128,10 +131,19 @@ async fn round_trip(kind: AdapterKind, base_url: &str, model: &str, key: String)
     let on_token: waav_gateway::core::llm::TokenCallback =
         Arc::new(move |t: &str| sink.lock().unwrap().push(t.to_string()));
     let r1 = client
-        .complete("live-e2e", "My name is Waav. Reply OK.", None, &cancel, Some(on_token))
+        .complete(
+            "live-e2e",
+            "My name is Waav. Reply OK.",
+            None,
+            &cancel,
+            Some(on_token),
+        )
         .await
         .expect("turn 1 must succeed");
-    assert!(!r1.content.trim().is_empty(), "turn 1 produced no content: {r1:?}");
+    assert!(
+        !r1.content.trim().is_empty(),
+        "turn 1 produced no content: {r1:?}"
+    );
     assert!(
         !tokens.lock().unwrap().is_empty(),
         "streaming must deliver token deltas, got none (content: {})",
@@ -141,7 +153,13 @@ async fn round_trip(kind: AdapterKind, base_url: &str, model: &str, key: String)
     // Turn 2 — history threading: the model must remember the name from turn 1
     // (proves the rendered conversation carried prior turns correctly).
     let r2 = client
-        .complete("live-e2e", "What is my name? One word only.", None, &cancel, None)
+        .complete(
+            "live-e2e",
+            "What is my name? One word only.",
+            None,
+            &cancel,
+            None,
+        )
         .await
         .expect("turn 2 must succeed");
     assert!(
@@ -149,13 +167,18 @@ async fn round_trip(kind: AdapterKind, base_url: &str, model: &str, key: String)
         "history not threaded through the {kind:?} adapter — reply: {}",
         r2.content
     );
-    eprintln!("[live {kind:?}] turn1={:?} turn2={:?} usage={:?}", r1.content, r2.content, r2.usage);
+    eprintln!(
+        "[live {kind:?}] turn1={:?} turn2={:?} usage={:?}",
+        r1.content, r2.content, r2.usage
+    );
 }
 
 #[tokio::test]
 #[ignore = "requires ANTHROPIC_API_KEY; real billed Anthropic Messages calls"]
 async fn anthropic_live_round_trip() {
-    let Some(k) = key("ANTHROPIC_API_KEY") else { return };
+    let Some(k) = key("ANTHROPIC_API_KEY") else {
+        return;
+    };
     round_trip(
         AdapterKind::Anthropic,
         "https://api.anthropic.com",
@@ -168,7 +191,9 @@ async fn anthropic_live_round_trip() {
 #[tokio::test]
 #[ignore = "requires GOOGLE_AI_API_KEY; real billed Gemini generateContent calls"]
 async fn gemini_live_round_trip() {
-    let Some(k) = key("GOOGLE_AI_API_KEY") else { return };
+    let Some(k) = key("GOOGLE_AI_API_KEY") else {
+        return;
+    };
     round_trip(
         AdapterKind::Gemini,
         "https://generativelanguage.googleapis.com",
@@ -181,8 +206,16 @@ async fn gemini_live_round_trip() {
 #[tokio::test]
 #[ignore = "requires OPENAI_API_KEY; real billed OpenAI calls (adapter parity check)"]
 async fn openai_live_round_trip() {
-    let Some(k) = key("OPENAI_API_KEY") else { return };
-    round_trip(AdapterKind::OpenAi, "https://api.openai.com/v1", "gpt-4o-mini", k).await;
+    let Some(k) = key("OPENAI_API_KEY") else {
+        return;
+    };
+    round_trip(
+        AdapterKind::OpenAi,
+        "https://api.openai.com/v1",
+        "gpt-4o-mini",
+        k,
+    )
+    .await;
 }
 
 /// D1 LIVE (credential-free, ollama): the critical end-to-end proof that the
@@ -208,10 +241,19 @@ async fn d1_reasoning_effort_live_ollama() {
         ..Default::default()
     };
     let r = LlmClient::new(fast)
-        .complete("d1-fast", "say hello", None, &CancellationToken::new(), None)
+        .complete(
+            "d1-fast",
+            "say hello",
+            None,
+            &CancellationToken::new(),
+            None,
+        )
         .await
         .expect("fast model + reasoning_effort=Off must NOT 400");
-    assert!(!r.content.trim().is_empty(), "fast model produced no content");
+    assert!(
+        !r.content.trim().is_empty(),
+        "fast model produced no content"
+    );
 
     // (2) reasoning model + Low → thinking param accepted → non-empty answer.
     let reason = LlmClientConfig {
@@ -224,10 +266,19 @@ async fn d1_reasoning_effort_live_ollama() {
         ..Default::default()
     };
     let r2 = LlmClient::new(reason)
-        .complete("d1-reason", "What is 2+2? Reply with just the number.", None, &CancellationToken::new(), None)
+        .complete(
+            "d1-reason",
+            "What is 2+2? Reply with just the number.",
+            None,
+            &CancellationToken::new(),
+            None,
+        )
         .await
         .expect("reasoning model + reasoning_effort=Low must be accepted");
-    assert!(!r2.content.trim().is_empty(), "reasoning model produced empty content");
+    assert!(
+        !r2.content.trim().is_empty(),
+        "reasoning model produced empty content"
+    );
     eprintln!("[live d1] fast={:?} reason={:?}", r.content, r2.content);
 }
 
@@ -261,13 +312,25 @@ async fn s2_two_tier_shares_history_live_ollama() {
     let cancel = CancellationToken::new();
 
     // Turn 1 on the FAST tier seeds a fact into the conversation history.
-    fast.complete("2tier", "My name is Waav. Reply with just OK.", None, &cancel, None)
-        .await
-        .expect("fast tier turn 1");
+    fast.complete(
+        "2tier",
+        "My name is Waav. Reply with just OK.",
+        None,
+        &cancel,
+        None,
+    )
+    .await
+    .expect("fast tier turn 1");
     // Turn 2 ESCALATED to the reasoning tier — runs live against the real model
     // (proves the escalated round-trip works end to end).
     let r = reasoning
-        .complete("2tier", "What is my name? Reply with one word.", None, &cancel, None)
+        .complete(
+            "2tier",
+            "What is my name? Reply with one word.",
+            None,
+            &cancel,
+            None,
+        )
         .await
         .expect("reasoning tier turn 2");
     eprintln!("[live s2] reasoning tier replied: {:?}", r.content);
@@ -288,9 +351,10 @@ async fn s2_two_tier_shares_history_live_ollama() {
         fast_hist.len()
     );
     assert!(
-        reason_hist
-            .iter()
-            .any(|m| m.content.as_deref().is_some_and(|c| c.contains("My name is Waav"))),
+        reason_hist.iter().any(|m| m
+            .content
+            .as_deref()
+            .is_some_and(|c| c.contains("My name is Waav"))),
         "the reasoning tier must see the fast tier's turn-1 message in shared history: {reason_hist:?}"
     );
 }
@@ -320,8 +384,13 @@ async fn tool_loop_round_trip(kind: AdapterKind, base_url: &str, model: &str, ap
         ),
         Arc::new(move |p| {
             wc.fetch_add(1, Ordering::SeqCst);
-            let city = p.arguments["city"].as_str().unwrap_or("unknown").to_string();
-            Box::pin(async move { Ok(json!({"city": city, "weather": "heavy snow", "temp_c": -3})) })
+            let city = p.arguments["city"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string();
+            Box::pin(
+                async move { Ok(json!({"city": city, "weather": "heavy snow", "temp_c": -3})) },
+            )
         }),
     );
     let tc = Arc::clone(&time_calls);
@@ -384,7 +453,10 @@ async fn tool_loop_round_trip(kind: AdapterKind, base_url: &str, model: &str, ap
     .expect("tool loop");
 
     println!("[{kind:?}] tool-loop answer: {}", final_resp.content);
-    assert!(weather_calls.load(Ordering::SeqCst) >= 1, "get_weather executed");
+    assert!(
+        weather_calls.load(Ordering::SeqCst) >= 1,
+        "get_weather executed"
+    );
     assert!(time_calls.load(Ordering::SeqCst) >= 1, "get_time executed");
     let answer = final_resp.content.to_lowercase();
     assert!(
@@ -400,18 +472,21 @@ async fn tool_loop_round_trip(kind: AdapterKind, base_url: &str, model: &str, ap
 #[tokio::test]
 #[ignore = "requires OPENAI_API_KEY; real billed OpenAI calls"]
 async fn openai_live_tool_loop() {
-    let Some(k) = key("OPENAI_API_KEY") else { return };
+    let Some(k) = key("OPENAI_API_KEY") else {
+        return;
+    };
     let base = std::env::var("OPENAI_BASE_URL")
         .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-    let model =
-        std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
     tool_loop_round_trip(AdapterKind::OpenAi, &base, &model, k).await;
 }
 
 #[tokio::test]
 #[ignore = "requires ANTHROPIC_API_KEY; real billed Anthropic Messages calls"]
 async fn anthropic_live_tool_loop() {
-    let Some(k) = key("ANTHROPIC_API_KEY") else { return };
+    let Some(k) = key("ANTHROPIC_API_KEY") else {
+        return;
+    };
     tool_loop_round_trip(
         AdapterKind::Anthropic,
         "https://api.anthropic.com",
@@ -424,7 +499,9 @@ async fn anthropic_live_tool_loop() {
 #[tokio::test]
 #[ignore = "requires GOOGLE_AI_API_KEY; real billed Gemini calls"]
 async fn gemini_live_tool_loop() {
-    let Some(k) = key("GOOGLE_AI_API_KEY") else { return };
+    let Some(k) = key("GOOGLE_AI_API_KEY") else {
+        return;
+    };
     tool_loop_round_trip(
         AdapterKind::Gemini,
         "https://generativelanguage.googleapis.com",

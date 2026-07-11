@@ -43,10 +43,43 @@ export interface SIPHookCreateResponse {
 }
 
 /**
- * SIP transfer request
+ * SIP transfer request (REST `POST /sip/transfer`).
+ *
+ * Mirrors the gateway `SIPTransferRequest` (handlers/sip/transfer.rs) exactly:
+ * `{ room_name, participant_identity, transfer_to }` — all three fields are
+ * required (a body missing `room_name`/`participant_identity` 422s).
  */
 export interface SIPTransferRequest {
-  /** The destination phone number to transfer the call to */
+  /** The LiveKit room name where the SIP participant is connected (wire: `room_name`). */
+  roomName: string;
+  /**
+   * The identity of the SIP participant to transfer (wire: `participant_identity`).
+   * Obtainable by listing participants in the room via the LiveKit API.
+   */
+  participantIdentity: string;
+  /**
+   * The destination to transfer the call to (wire: `transfer_to`). Supports
+   * international format (`+1234567890`), national format (`07123456789`),
+   * or internal extensions (`1234`).
+   */
+  transferTo: string;
+}
+
+/**
+ * SIP transfer response (gateway `SIPTransferResponse`, handlers/sip/transfer.rs).
+ *
+ * A success indicates the transfer was accepted — `status` is `"completed"` or
+ * `"initiated"` (the gateway returns `initiated` when the transfer request
+ * timed out awaiting confirmation but likely succeeded).
+ */
+export interface SIPTransferResponse {
+  /** `"initiated"` or `"completed"` (wire: `status`). */
+  status: string;
+  /** The (tenant-normalized) room name the transfer ran in (wire: `room_name`). */
+  roomName: string;
+  /** The identity of the participant transferred (wire: `participant_identity`). */
+  participantIdentity: string;
+  /** The normalized destination with `tel:` prefix (wire: `transfer_to`). */
   transferTo: string;
 }
 

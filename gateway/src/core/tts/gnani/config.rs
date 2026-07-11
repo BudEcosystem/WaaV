@@ -7,6 +7,15 @@ use crate::core::tts::base::TTSConfig;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+fn validate_gnani_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 /// Gnani TTS provider-specific configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GnaniTTSConfig {
@@ -95,18 +104,26 @@ impl GnaniTTSConfig {
         // Credentials come through the standardized `api_key` (the keystone channel every provider
         // shares) as `token|access_key`; either half may be omitted to fall back to the GNANI_TOKEN
         // / GNANI_ACCESS_KEY env vars for env-configured deployments.
-        let (token, access_key) = if !base.api_key.is_empty() {
-            match base.api_key.split_once('|') {
-                Some((t, a)) => (t.to_string(), a.to_string()),
+        let explicit_api_key = crate::core::credentials::explicit_api_key(&base.api_key);
+        let (token, access_key) = if let Some(api_key) = explicit_api_key {
+            match api_key.split_once('|') {
+                Some((t, a)) => (
+                    crate::core::credentials::explicit_api_key(t)
+                        .or_else(|| crate::core::credentials::env_api_key("GNANI_TOKEN"))
+                        .unwrap_or_default(),
+                    crate::core::credentials::explicit_api_key(a)
+                        .or_else(|| crate::core::credentials::env_api_key("GNANI_ACCESS_KEY"))
+                        .unwrap_or_default(),
+                ),
                 None => (
-                    base.api_key.clone(),
-                    std::env::var("GNANI_ACCESS_KEY").unwrap_or_default(),
+                    api_key,
+                    crate::core::credentials::env_api_key("GNANI_ACCESS_KEY").unwrap_or_default(),
                 ),
             }
         } else {
             (
-                std::env::var("GNANI_TOKEN").unwrap_or_default(),
-                std::env::var("GNANI_ACCESS_KEY").unwrap_or_default(),
+                crate::core::credentials::env_api_key("GNANI_TOKEN").unwrap_or_default(),
+                crate::core::credentials::env_api_key("GNANI_ACCESS_KEY").unwrap_or_default(),
             )
         };
         let certificate_path = std::env::var("GNANI_CERTIFICATE_PATH")
@@ -157,9 +174,10 @@ impl GnaniTTSConfig {
         let mut cfg = Self::from_base(std.base.clone())?;
 
         if let Some(language) = f.language.as_deref()
-            && let Ok(lang) = GnaniTTSLanguage::from_str(language) {
-                cfg.language_code = lang;
-            }
+            && let Ok(lang) = GnaniTTSLanguage::from_str(language)
+        {
+            cfg.language_code = lang;
+        }
         if let Some(rate) = f.sample_rate {
             cfg.output_sample_rate = rate;
         }
@@ -170,6 +188,10 @@ impl GnaniTTSConfig {
         }
 
         cfg.endpoint_override = std.endpoint_override().map(String::from);
+
+        if let Some(endpoint) = &cfg.endpoint_override {
+            validate_gnani_tts_endpoint("endpoint_override", endpoint)?;
+        }
 
         Ok(cfg)
     }
@@ -187,6 +209,10 @@ impl GnaniTTSConfig {
                 "Gnani access key is required. Set GNANI_ACCESS_KEY environment variable."
                     .to_string(),
             );
+        }
+
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_gnani_tts_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -403,6 +429,31 @@ mod tests {
         assert_eq!(cfg.language_code, GnaniTTSLanguage::Tamil);
         assert_eq!(cfg.output_sample_rate, 16000);
         assert_eq!(cfg.voice_name, Some("speaker-3".to_string())); // extras passthrough
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = GnaniTTSConfig {
+            token: "test-token".to_string(),
+            access_key: "test-access-key".to_string(),
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://gnani-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
     }
 
     #[test]

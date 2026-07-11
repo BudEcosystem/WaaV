@@ -4,10 +4,12 @@ use anyhow::{Context, Result};
 use tokio::fs;
 use tracing::{error, info, warn};
 
+use crate::core::model_integrity::skip_model_hash_check_from_env;
 use crate::core::turn_detect::config::TurnDetectorConfig;
 
 const MODEL_FILENAME: &str = "model_quantized.onnx";
 const TOKENIZER_FILENAME: &str = "tokenizer.json";
+const TURN_DETECT_ARTIFACT_URL_SCHEMES: &[&str] = &["http", "https"];
 
 /// Download all turn detector artifacts (model + tokenizer) if not already cached.
 pub async fn download_assets(config: &TurnDetectorConfig) -> Result<()> {
@@ -48,8 +50,9 @@ pub async fn download_model(config: &TurnDetectorConfig) -> Result<PathBuf> {
 
     let model_url = config
         .model_url
-        .as_ref()
+        .as_deref()
         .context("No model URL specified and model not found locally")?;
+    let model_url = validate_turn_detector_artifact_url("model_url", model_url)?;
 
     info!("Downloading turn detector model from: {}", model_url);
     download_file(model_url, &model_path).await?;
@@ -84,8 +87,9 @@ pub async fn download_tokenizer(config: &TurnDetectorConfig) -> Result<PathBuf> 
 
     let tokenizer_url = config
         .tokenizer_url
-        .as_ref()
+        .as_deref()
         .context("No tokenizer URL specified and tokenizer not found locally")?;
+    let tokenizer_url = validate_turn_detector_artifact_url("tokenizer_url", tokenizer_url)?;
 
     info!(
         "Downloading turn detector tokenizer from: {}",
@@ -160,8 +164,23 @@ pub fn tokenizer_path(config: &TurnDetectorConfig) -> Result<PathBuf> {
     }
 }
 
+fn validate_turn_detector_artifact_url<'a>(label: &str, url: &'a str) -> Result<&'a str> {
+    let url = url.trim();
+    if url.is_empty() {
+        anyhow::bail!("{label} rejected (SSRF protection): empty URL");
+    }
+    crate::core::net::validate_url_for_ssrf(url, TURN_DETECT_ARTIFACT_URL_SCHEMES)
+        .map_err(|msg| anyhow::anyhow!("{label} rejected (SSRF protection): {msg}"))?;
+    Ok(url)
+}
+
 async fn download_file(url: &str, path: &Path) -> Result<()> {
-    let response = reqwest::get(url)
+    let url = validate_turn_detector_artifact_url("artifact URL", url)?;
+    let client = crate::core::net::ssrf_protected_client(TURN_DETECT_ARTIFACT_URL_SCHEMES)
+        .context("Failed to create SSRF-protected download client")?;
+    let response = client
+        .get(url)
+        .send()
         .await
         .context("Failed to download turn detector artifact")?;
 
@@ -203,12 +222,13 @@ fn verify_hash(data: &[u8], expected: &str) -> Result<()> {
     let mut hasher = Sha256::new();
     hasher.update(data);
     let actual = format!("{:x}", hasher.finalize());
+    let skip_hash_check = skip_model_hash_check_from_env()?;
 
     if actual != expected {
         // Fail CLOSED: an unexpected artifact may be tampered or corrupt and must not be
         // executed. Operators intentionally adopting a newer pinned model can override with
         // WAAV_SKIP_MODEL_HASH_CHECK=1 after verifying the source.
-        if std::env::var("WAAV_SKIP_MODEL_HASH_CHECK").is_ok() {
+        if skip_hash_check {
             warn!(
                 "Turn detector artifact hash mismatch IGNORED (WAAV_SKIP_MODEL_HASH_CHECK) - expected: {}, actual: {}",
                 expected, actual
@@ -227,18 +247,79 @@ fn verify_hash(data: &[u8], expected: &str) -> Result<()> {
 #[cfg(test)]
 mod hash_tests {
     use super::*;
+    use crate::core::model_integrity::WAAV_SKIP_MODEL_HASH_CHECK_ENV;
+    use serial_test::serial;
+
+    struct EnvGuard(Option<String>);
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.0.as_deref() {
+                Some(value) => unsafe { std::env::set_var(WAAV_SKIP_MODEL_HASH_CHECK_ENV, value) },
+                None => unsafe { std::env::remove_var(WAAV_SKIP_MODEL_HASH_CHECK_ENV) },
+            }
+        }
+    }
+
+    fn set_hash_skip_env(value: Option<&str>) -> EnvGuard {
+        let previous = std::env::var(WAAV_SKIP_MODEL_HASH_CHECK_ENV).ok();
+        match value {
+            Some(value) => unsafe { std::env::set_var(WAAV_SKIP_MODEL_HASH_CHECK_ENV, value) },
+            None => unsafe { std::env::remove_var(WAAV_SKIP_MODEL_HASH_CHECK_ENV) },
+        }
+        EnvGuard(previous)
+    }
 
     #[test]
+    #[serial]
     fn verify_hash_rejects_mismatch_by_default() {
+        let _guard = set_hash_skip_env(None);
+
         // SHA-256 of "hello" is well-known; verifying it against a wrong expected hash fails.
         let err = verify_hash(b"hello", "deadbeef");
         assert!(err.is_err(), "hash mismatch must fail closed");
     }
 
     #[test]
+    #[serial]
     fn verify_hash_accepts_match() {
+        let _guard = set_hash_skip_env(None);
+
         let expected = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"; // sha256("hello")
         assert!(verify_hash(b"hello", expected).is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn verify_hash_explicit_false_does_not_bypass_mismatch() {
+        let _guard = set_hash_skip_env(Some("0"));
+
+        let err = verify_hash(b"hello", "deadbeef").unwrap_err();
+        assert!(
+            err.to_string().contains("hash mismatch"),
+            "explicit false must keep hash verification enforced: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn verify_hash_explicit_true_bypasses_mismatch() {
+        let _guard = set_hash_skip_env(Some("yes"));
+
+        assert!(verify_hash(b"hello", "deadbeef").is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn verify_hash_rejects_malformed_skip_env() {
+        let expected = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"; // sha256("hello")
+        let _guard = set_hash_skip_env(Some("off"));
+
+        let err = verify_hash(b"hello", expected).unwrap_err();
+        assert!(
+            err.to_string().contains(WAAV_SKIP_MODEL_HASH_CHECK_ENV),
+            "malformed explicit override must be rejected: {err}"
+        );
     }
 
     #[test]
@@ -247,5 +328,30 @@ mod hash_tests {
         assert_eq!(h.len(), 64);
         assert_ne!(h, "expected_hash_here");
         assert!(get_expected_hash("https://x/tokenizer.json").is_some());
+    }
+
+    #[test]
+    fn artifact_urls_are_ssrf_checked() {
+        let _env = crate::core::net::ssrf_env_lock();
+        assert_eq!(
+            validate_turn_detector_artifact_url(
+                "model_url",
+                " https://models.example.com/model_quantized.onnx "
+            )
+            .unwrap(),
+            "https://models.example.com/model_quantized.onnx"
+        );
+
+        let err = validate_turn_detector_artifact_url(
+            "model_url",
+            "http://127.0.0.1:9000/model_quantized.onnx",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        let err =
+            validate_turn_detector_artifact_url("tokenizer_url", "file:///tmp/tokenizer.json")
+                .unwrap_err();
+        assert!(err.to_string().contains("not allowed"), "{err}");
     }
 }

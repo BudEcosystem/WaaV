@@ -10,6 +10,7 @@ use tokio::sync::{Notify, RwLock};
 use tokio::time::Duration;
 use tracing::{debug, warn};
 
+use crate::config::utils::parse_bool;
 use crate::core::cache::store::CacheStore;
 use crate::core::observability::ObserverRegistry;
 use crate::core::{
@@ -44,6 +45,22 @@ pub type SmartTurnCallback = Arc<
         + Sync
         + 'static,
 >;
+
+pub(crate) const WAAV_UNINTERRUPTIBLE_PLAYBACK_ENV: &str = "WAAV_UNINTERRUPTIBLE_PLAYBACK";
+
+fn uninterruptible_playback_from_env() -> VoiceManagerResult<bool> {
+    match std::env::var(WAAV_UNINTERRUPTIBLE_PLAYBACK_ENV) {
+        Ok(value) => parse_bool(&value).ok_or_else(|| {
+            VoiceManagerError::InitializationError(format!(
+                "{WAAV_UNINTERRUPTIBLE_PLAYBACK_ENV} must be a boolean (true/false, 1/0, yes/no), got {value:?}"
+            ))
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => Err(VoiceManagerError::InitializationError(
+            format!("{WAAV_UNINTERRUPTIBLE_PLAYBACK_ENV} must be valid UTF-8 boolean text"),
+        )),
+    }
+}
 
 /// VoiceManager provides a unified interface for managing STT and TTS providers
 /// Optimized for extreme low-latency with lock-free atomics and pre-allocated buffers
@@ -149,23 +166,27 @@ impl VoiceManager {
         config: VoiceManagerConfig,
         turn_detector: Option<Arc<RwLock<TurnDetector>>>,
     ) -> VoiceManagerResult<Self> {
+        let uninterruptible_playback = uninterruptible_playback_from_env()?;
+
         // Prefer the reachable W1 keystone path when a standardized config is present so advanced
         // features (diarization, keyterms, voice settings, …) are honored END-TO-END. Fall back to
         // the flat factory for the legacy path (and for providers not yet migrated, where
         // `create_*_standard` itself delegates to the flat factory).
         let tts = match &config.standard_tts {
-            Some(std_tts) => {
-                crate::core::tts::standard::create_tts_standard(&std_tts.base.provider, std_tts.clone())
-                    .map_err(VoiceManagerError::TTSError)?
-            }
+            Some(std_tts) => crate::core::tts::standard::create_tts_standard(
+                &std_tts.base.provider,
+                std_tts.clone(),
+            )
+            .map_err(VoiceManagerError::TTSError)?,
             None => create_tts_provider(&config.tts_config.provider, config.tts_config.clone())
                 .map_err(VoiceManagerError::TTSError)?,
         };
         let mut stt = match &config.standard_stt {
-            Some(std_stt) => {
-                crate::core::stt::standard::create_stt_standard(&std_stt.base.provider, std_stt.clone())
-                    .map_err(VoiceManagerError::STTError)?
-            }
+            Some(std_stt) => crate::core::stt::standard::create_stt_standard(
+                &std_stt.base.provider,
+                std_stt.clone(),
+            )
+            .map_err(VoiceManagerError::STTError)?,
             None => create_stt_provider(&config.stt_config.provider, config.stt_config.clone())
                 .map_err(VoiceManagerError::STTError)?,
         };
@@ -207,9 +228,9 @@ impl VoiceManager {
             #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
             smart_turn_processor: Arc::new(RwLock::new(None)), // Initialized in start() if configured
             #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
-            ingress_resampler: Arc::new(SyncRwLock::new(
-                crate::core::audio::StreamResampler::new(),
-            )),
+            ingress_resampler: Arc::new(
+                SyncRwLock::new(crate::core::audio::StreamResampler::new()),
+            ),
             #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
             smart_turn_callback: Arc::new(SyncRwLock::new(None)),
             interruption_state: Arc::new(InterruptionState {
@@ -224,11 +245,7 @@ impl VoiceManager {
             clear_epoch: Arc::new(AtomicUsize::new(0)),
             observers: Arc::new(SyncRwLock::new(None)),
             playback_pump: Arc::new(SyncRwLock::new(None)),
-            uninterruptible_playback: AtomicBool::new(
-                std::env::var("WAAV_UNINTERRUPTIBLE_PLAYBACK")
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false),
-            ),
+            uninterruptible_playback: AtomicBool::new(uninterruptible_playback),
         })
     }
 
@@ -691,7 +708,7 @@ impl VoiceManager {
         crate::core::metrics::bridge::count_tts_chars(
             &self.config.tts_config.provider,
             text.chars().count(),
-            );
+        );
         tts.speak(text, flush)
             .await
             .map_err(VoiceManagerError::TTSError)?;
@@ -708,7 +725,7 @@ impl VoiceManager {
         crate::core::metrics::bridge::count_tts_chars(
             &self.config.tts_config.provider,
             text.chars().count(),
-            );
+        );
         // Send text to TTS provider
         {
             let mut tts = self.tts.write().await;
@@ -772,7 +789,7 @@ impl VoiceManager {
         crate::core::metrics::bridge::count_tts_chars(
             &self.config.tts_config.provider,
             text.chars().count(),
-            );
+        );
         // Send text to TTS provider
         {
             let mut tts = self.tts.write().await;
@@ -1013,9 +1030,7 @@ impl VoiceManager {
                         if processed_result.is_final || processed_result.is_speech_final {
                             obs.notify_stt_result(&processed_result, 0);
                         } else {
-                            obs.notify_stt_partial(
-                                crate::core::observability::now_monotonic_ns(),
-                            );
+                            obs.notify_stt_partial(crate::core::observability::now_monotonic_ns());
                         }
                     }
                     // Call user callback with processed result
@@ -1202,8 +1217,8 @@ impl VoiceManager {
                 // AudioData math (review wf_5772cd64 #7/#8): provider
                 // duration_ms → PCM16 byte math at the CHUNK's rate (not the
                 // stale session atomic) → 250ms compressed over-estimate.
-                let chunk_duration_ms = audio_data
-                    .playback_ms(int_state.current_sample_rate.load(Ordering::Acquire));
+                let chunk_duration_ms =
+                    audio_data.playback_ms(int_state.current_sample_rate.load(Ordering::Acquire));
 
                 // Estimated bot playout deadline (EVERY chunk): the
                 // bot-speaking truth for turn policy (MinWords gating, A-G3).
@@ -1417,8 +1432,6 @@ impl VoiceManager {
         self.interruption_state.is_audibly_speaking()
     }
 
-
-
     /// Returns the current speech state from smart turn processor.
     ///
     /// Returns `None` if smart turn is not enabled.
@@ -1601,9 +1614,7 @@ impl VoiceManager {
         // Reconnect STT for continued use
         {
             let mut stt = self.stt.write().await;
-            stt.connect()
-                .await
-                .map_err(VoiceManagerError::STTError)?;
+            stt.connect().await.map_err(VoiceManagerError::STTError)?;
         }
 
         tracing::info!("STT stream finalized and reconnected");

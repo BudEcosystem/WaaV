@@ -257,7 +257,7 @@ mod tests {
     // config — previously dropped by the flat factory.
     #[test]
     fn new_standard_unlocks_recognition_features() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "huawei_cloud".into(),

@@ -341,7 +341,6 @@ pub enum AudioEncoding {
     Webm,
 }
 
-
 /// Context settings for prepopulating conversation.
 #[derive(Debug, Clone, Serialize)]
 pub struct ContextSettings {

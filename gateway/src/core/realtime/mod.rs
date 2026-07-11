@@ -5,8 +5,10 @@
 //!
 //! # Supported Providers
 //!
-//! - **OpenAI Realtime API** - Full duplex audio with GPT-4o
-//! - **Hume EVI** - Empathic Voice Interface with 48-dimension emotion analysis
+//! Twelve realtime/S2S providers ride the scaffold — the authoritative list is
+//! [`get_supported_realtime_providers`] (openai, hume, azure, grok, inworld, deepgram,
+//! elevenlabs, gemini, ultravox, nova_sonic, speechmatics, yandex); the [`RealtimeProvider`]
+//! enum mirrors it 1:1 (a `parse`/`Display` pair kept in lockstep by a unit test).
 //!
 //! # Architecture
 //!
@@ -47,8 +49,8 @@
 //! }
 //! ```
 
-mod base;
 pub mod azure;
+mod base;
 pub mod deepgram;
 pub mod elevenlabs;
 pub mod gemini;
@@ -63,16 +65,16 @@ pub mod speechmatics;
 pub mod ultravox;
 pub mod yandex;
 
+pub use azure::{AzureProtocol, AzureRealtime};
 pub use base::{
     AudioOutputCallback, BaseRealtime, BoxedRealtime, ConnectionState, FunctionCallCallback,
     FunctionCallRequest, FunctionDefinition, InputTranscriptionConfig, RealtimeAudioData,
-    RealtimeConfig, RealtimeError, RealtimeErrorCallback, RealtimeFactory, RealtimeResponseOverride,
-    RealtimeResult, ReconnectionCallback, ReconnectionEvent, ReplayConversationItem,
-    ResponseDoneCallback,
-    SpeechEvent, SpeechEventCallback, ToolDefinition, TranscriptCallback, TranscriptResult,
-    TranscriptRole, TurnDetectionConfig, clamp_truncate_ms, run_barge_in_sequence,
+    RealtimeConfig, RealtimeError, RealtimeErrorCallback, RealtimeFactory,
+    RealtimeResponseOverride, RealtimeResult, ReconnectionCallback, ReconnectionEvent,
+    ReplayConversationItem, ResponseDoneCallback, SpeechEvent, SpeechEventCallback, ToolDefinition,
+    TranscriptCallback, TranscriptResult, TranscriptRole, TurnDetectionConfig, clamp_truncate_ms,
+    run_barge_in_sequence,
 };
-pub use azure::{AzureProtocol, AzureRealtime};
 pub use deepgram::{DeepgramProtocol, DeepgramRealtime};
 pub use elevenlabs::{ElevenLabsProtocol, ElevenLabsRealtime};
 pub use gemini::{GeminiProtocol, GeminiRealtime};
@@ -92,21 +94,57 @@ pub use speechmatics::{SpeechmaticsProtocol, SpeechmaticsRealtime};
 pub use ultravox::{UltravoxProtocol, UltravoxRealtime};
 pub use yandex::{YandexProtocol, YandexRealtime};
 
-/// Supported realtime providers.
+/// Supported realtime providers — mirrors [`get_supported_realtime_providers`] 1:1.
+///
+/// This enum previously listed only OpenAI + Hume while the string registry served 12 —
+/// `parse()` silently rejected ten valid providers, so any caller reaching for the typed
+/// path could never construct azure/gemini/deepgram/…; kept in lockstep by
+/// `realtime_provider_enum_matches_registry`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RealtimeProvider {
-    /// OpenAI Realtime API
+    /// OpenAI Realtime API (GA wire)
     OpenAI,
     /// Hume EVI (Empathic Voice Interface)
     Hume,
+    /// Azure OpenAI Realtime (OpenAI-protocol clone, GA path)
+    Azure,
+    /// xAI Grok Realtime (OpenAI-protocol clone)
+    Grok,
+    /// Inworld Realtime (OpenAI-protocol clone)
+    Inworld,
+    /// Deepgram Voice Agent (raw-binary-frame S2S)
+    Deepgram,
+    /// ElevenLabs Conversational AI (base64+JSON S2S)
+    ElevenLabs,
+    /// Google Gemini Live (BidiGenerateContent S2S)
+    Gemini,
+    /// Ultravox hosted S2S (REST-then-WebSocket)
+    Ultravox,
+    /// AWS Nova Sonic (Bedrock bidirectional event stream)
+    NovaSonic,
+    /// Speechmatics Flow (raw-PCM binary S2S)
+    Speechmatics,
+    /// Yandex AI Studio Realtime (OpenAI-protocol clone)
+    Yandex,
 }
 
 impl RealtimeProvider {
-    /// Parse provider from string.
+    /// Parse provider from string (the same ids `get_supported_realtime_providers` returns,
+    /// plus historical aliases).
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "openai" => Some(RealtimeProvider::OpenAI),
             "hume" | "hume_evi" | "hume-evi" | "evi" => Some(RealtimeProvider::Hume),
+            "azure" | "azure_openai" | "azure-openai" => Some(RealtimeProvider::Azure),
+            "grok" | "xai" => Some(RealtimeProvider::Grok),
+            "inworld" => Some(RealtimeProvider::Inworld),
+            "deepgram" | "deepgram_voice_agent" => Some(RealtimeProvider::Deepgram),
+            "elevenlabs" | "elevenlabs_convai" => Some(RealtimeProvider::ElevenLabs),
+            "gemini" | "gemini_live" | "google" => Some(RealtimeProvider::Gemini),
+            "ultravox" => Some(RealtimeProvider::Ultravox),
+            "nova_sonic" | "nova-sonic" | "bedrock" => Some(RealtimeProvider::NovaSonic),
+            "speechmatics" | "speechmatics_flow" => Some(RealtimeProvider::Speechmatics),
+            "yandex" => Some(RealtimeProvider::Yandex),
             _ => None,
         }
     }
@@ -117,6 +155,16 @@ impl std::fmt::Display for RealtimeProvider {
         match self {
             RealtimeProvider::OpenAI => write!(f, "openai"),
             RealtimeProvider::Hume => write!(f, "hume"),
+            RealtimeProvider::Azure => write!(f, "azure"),
+            RealtimeProvider::Grok => write!(f, "grok"),
+            RealtimeProvider::Inworld => write!(f, "inworld"),
+            RealtimeProvider::Deepgram => write!(f, "deepgram"),
+            RealtimeProvider::ElevenLabs => write!(f, "elevenlabs"),
+            RealtimeProvider::Gemini => write!(f, "gemini"),
+            RealtimeProvider::Ultravox => write!(f, "ultravox"),
+            RealtimeProvider::NovaSonic => write!(f, "nova_sonic"),
+            RealtimeProvider::Speechmatics => write!(f, "speechmatics"),
+            RealtimeProvider::Yandex => write!(f, "yandex"),
         }
     }
 }
@@ -206,6 +254,21 @@ pub fn get_supported_realtime_providers() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The typed enum must mirror the string registry 1:1 — the enum previously listed only
+    /// 2 of 12 providers, so `parse()` silently rejected valid ids (the latent-trap class).
+    #[test]
+    fn realtime_provider_enum_matches_registry() {
+        for id in get_supported_realtime_providers() {
+            let parsed = RealtimeProvider::parse(id)
+                .unwrap_or_else(|| panic!("registry id {id:?} must parse into RealtimeProvider"));
+            assert_eq!(
+                parsed.to_string(),
+                id,
+                "Display must round-trip to the registry id"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_create_realtime_provider() {
@@ -373,7 +436,10 @@ mod tests {
             // intentionally ignored: graceful Err (typically NotConnected) — or
             // an Ok that merely buffers preroll — are both acceptable; a panic is
             // not. `is_ready()` must report not-ready.
-            assert!(!rt.is_ready(), "`{provider}` must not be ready before connect");
+            assert!(
+                !rt.is_ready(),
+                "`{provider}` must not be ready before connect"
+            );
             let _ = rt.send_audio(bytes::Bytes::from_static(&[0u8; 320])).await;
             let _ = rt.send_text("hello").await;
             let _ = rt.create_response().await;

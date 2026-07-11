@@ -23,6 +23,9 @@
 //! LLM. STT is driven by feeding `STTResult`s straight into the orchestrator
 //! (the same path the VoiceManager STT callback would take).
 
+use futures_util::FutureExt;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -31,13 +34,16 @@ use axum::{Json, Router, extract::State, routing::post};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 
-use waav_gateway::core::conversation::{ConversationConfig, ConversationOrchestrator, LatencyFiller};
+use waav_gateway::core::conversation::{
+    ConversationConfig, ConversationOrchestrator, LatencyFiller,
+};
 use waav_gateway::core::llm::{LlmClient, LlmClientConfig};
+use waav_gateway::core::stt::STTConfig;
 use waav_gateway::core::stt::{BaseSTT, STTResult};
 use waav_gateway::core::tts::{AudioCallback, AudioData, BaseTTS, TTSConfig, TTSResult};
 use waav_gateway::core::voice_manager::{VoiceManager, VoiceManagerConfig};
-use waav_gateway::core::stt::STTConfig;
 use waav_gateway::global_registry;
 use waav_gateway::plugin::metadata::ProviderMetadata;
 
@@ -214,7 +220,48 @@ struct LlmMockState {
     fail: Arc<AtomicBool>,
 }
 
-async fn start_llm_mock(state: LlmMockState) -> String {
+struct TestServer {
+    label: &'static str,
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        if self.panicked.load(Ordering::SeqCst) {
+            let msg = format!("conversation_loop test server '{}' panicked", self.label);
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+}
+
+fn spawn_test_server<F>(label: &'static str, future: F) -> TestServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let panicked = Arc::new(AtomicBool::new(false));
+    let panicked_in_task = Arc::clone(&panicked);
+    let handle = tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked_in_task.store(true, Ordering::SeqCst);
+            eprintln!("conversation_loop test server '{label}' panicked");
+        }
+    });
+    TestServer {
+        label,
+        handle,
+        panicked,
+    }
+}
+
+async fn start_llm_mock(state: LlmMockState) -> (String, TestServer) {
     async fn chat(
         State(state): State<LlmMockState>,
         Json(req): Json<Value>,
@@ -253,10 +300,10 @@ async fn start_llm_mock(state: LlmMockState) -> String {
         .with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let server = spawn_test_server("llm_mock", async move {
         axum::serve(listener, app).await.unwrap();
     });
-    format!("http://127.0.0.1:{}", addr.port())
+    (format!("http://127.0.0.1:{}", addr.port()), server)
 }
 
 fn build_voice_manager() -> Arc<VoiceManager> {
@@ -327,7 +374,7 @@ async fn final_transcript_triggers_llm_then_tts() {
 
     let llm_state = LlmMockState::default();
     *llm_state.reply.lock() = "Hi there, how can I help?".to_string();
-    let base_url = start_llm_mock(llm_state.clone()).await;
+    let (base_url, _server) = start_llm_mock(llm_state.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -339,7 +386,9 @@ async fn final_transcript_triggers_llm_then_tts() {
             .expect("orchestrator");
 
     // Feed a finalized STT result.
-    orchestrator.on_stt_result(&final_result("hello agent")).await;
+    orchestrator
+        .on_stt_result(&final_result("hello agent"))
+        .await;
 
     // The LLM mock must have been hit, and the reply must have been spoken.
     assert_eq!(
@@ -378,7 +427,7 @@ async fn barge_in_interrupts_tts() {
     *llm_state.reply.lock() = "This is a long answer.".to_string();
     // Make the LLM slow so the first turn is still in flight when we barge in.
     llm_state.delay_ms.store(1500, Ordering::SeqCst);
-    let base_url = start_llm_mock(llm_state.clone()).await;
+    let (base_url, _server) = start_llm_mock(llm_state.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -391,9 +440,7 @@ async fn barge_in_interrupts_tts() {
 
     // Kick off turn 1 (will block ~1.5s in the LLM mock).
     let orch1 = orchestrator.clone();
-    let turn1 = tokio::spawn(async move {
-        orch1.run_turn("tell me a long story").await.ok();
-    });
+    let turn1 = tokio::spawn(async move { orch1.run_turn("tell me a long story").await });
 
     // Give the turn time to start the (slow) LLM request.
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -413,7 +460,11 @@ async fn barge_in_interrupts_tts() {
 
     // The first (slow) turn must have been cancelled: it should NOT have spoken
     // its reply. Wait for the spawned task to settle.
-    let _ = tokio::time::timeout(Duration::from_secs(3), turn1).await;
+    tokio::time::timeout(Duration::from_secs(3), turn1)
+        .await
+        .expect("cancelled turn should settle within 3s")
+        .expect("cancelled turn task should not panic")
+        .expect("cancelled turn should complete successfully");
 
     let spoken = TTS_STATS.spoken.lock().clone();
     assert!(
@@ -441,22 +492,24 @@ async fn barge_in_during_protected_window_cancels_llm() {
     let llm_state = LlmMockState::default();
     *llm_state.reply.lock() = "This is a long answer.".to_string();
     llm_state.delay_ms.store(1500, Ordering::SeqCst); // slow LLM, in flight at barge-in
-    let base_url = start_llm_mock(llm_state.clone()).await;
+    let (base_url, _server) = start_llm_mock(llm_state.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
     let _ = wire_audio_egress(&vm).await;
 
     let orchestrator = Arc::new(
-        ConversationOrchestrator::new("session-protected", conv_config(base_url, false), vm.clone())
-            .expect("orchestrator"),
+        ConversationOrchestrator::new(
+            "session-protected",
+            conv_config(base_url, false),
+            vm.clone(),
+        )
+        .expect("orchestrator"),
     );
 
     // Kick off a slow turn; let it reach the (1.5s) LLM request.
     let orch1 = orchestrator.clone();
-    let turn1 = tokio::spawn(async move {
-        orch1.run_turn("think hard about this").await.ok();
-    });
+    let turn1 = tokio::spawn(async move { orch1.run_turn("think hard about this").await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Open a protected window (as a filler clip would) and confirm it blocks.
@@ -469,7 +522,11 @@ async fn barge_in_during_protected_window_cancels_llm() {
     // Barge in DURING the protected window — the slow LLM must still be cancelled.
     orchestrator.handle_barge_in().await;
 
-    let _ = tokio::time::timeout(Duration::from_secs(3), turn1).await;
+    tokio::time::timeout(Duration::from_secs(3), turn1)
+        .await
+        .expect("protected-window turn should settle within 3s")
+        .expect("protected-window turn task should not panic")
+        .expect("protected-window turn should complete successfully");
     let spoken = TTS_STATS.spoken.lock().clone();
     assert!(
         !spoken.iter().any(|s| s.contains("This is a long answer")),
@@ -493,7 +550,11 @@ fn is_filler(s: &str) -> bool {
     FILLER_PHRASES.contains(&s) || s.contains("didn't catch that")
 }
 
-async fn run_masking_turn(filler: LatencyFiller, after_ms: u64, llm_delay_ms: usize) -> Vec<String> {
+async fn run_masking_turn(
+    filler: LatencyFiller,
+    after_ms: u64,
+    llm_delay_ms: usize,
+) -> Vec<String> {
     unsafe {
         std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
     }
@@ -503,7 +564,7 @@ async fn run_masking_turn(filler: LatencyFiller, after_ms: u64, llm_delay_ms: us
     let llm_state = LlmMockState::default();
     *llm_state.reply.lock() = "Your balance is forty two dollars.".to_string();
     llm_state.delay_ms.store(llm_delay_ms, Ordering::SeqCst);
-    let base_url = start_llm_mock(llm_state.clone()).await;
+    let (base_url, _server) = start_llm_mock(llm_state.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -518,7 +579,10 @@ async fn run_masking_turn(filler: LatencyFiller, after_ms: u64, llm_delay_ms: us
     };
     let orchestrator =
         Arc::new(ConversationOrchestrator::new("session-mask", cfg, vm.clone()).expect("orch"));
-    orchestrator.run_turn("what is my balance").await.ok();
+    orchestrator
+        .run_turn("what is my balance")
+        .await
+        .expect("masking turn should complete");
     // Let any (aborted) masking task settle.
     tokio::time::sleep(Duration::from_millis(50)).await;
     TTS_STATS.spoken.lock().clone()
@@ -530,7 +594,11 @@ async fn latency_filler_speaks_one_filler_on_slow_llm() {
     // Slow LLM (600ms) with a 150ms wait → exactly ONE filler, then the answer.
     let spoken = run_masking_turn(LatencyFiller::Auto, 150, 600).await;
     let fillers: Vec<_> = spoken.iter().filter(|s| is_filler(s)).collect();
-    assert_eq!(fillers.len(), 1, "exactly one masking filler expected, got: {spoken:?}");
+    assert_eq!(
+        fillers.len(),
+        1,
+        "exactly one masking filler expected, got: {spoken:?}"
+    );
     assert!(
         spoken.iter().any(|s| s.contains("forty two")),
         "the real answer must still be spoken: {spoken:?}"
@@ -580,7 +648,7 @@ async fn latency_filler_does_not_poison_interruptibility() {
     let llm_state = LlmMockState::default();
     *llm_state.reply.lock() = "Your balance is forty two dollars.".to_string();
     llm_state.delay_ms.store(400, Ordering::SeqCst);
-    let base_url = start_llm_mock(llm_state.clone()).await;
+    let (base_url, _server) = start_llm_mock(llm_state.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -593,12 +661,18 @@ async fn latency_filler_does_not_poison_interruptibility() {
     };
     let orchestrator =
         Arc::new(ConversationOrchestrator::new("session-poison", cfg, vm.clone()).expect("orch"));
-    orchestrator.run_turn("what is my balance").await.ok();
+    orchestrator
+        .run_turn("what is my balance")
+        .await
+        .expect("masking poison test turn should complete");
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // A filler fired (slow turn past the 100ms threshold).
     let spoken = TTS_STATS.spoken.lock().clone();
-    assert!(spoken.iter().any(|s| is_filler(s)), "filler should have fired: {spoken:?}");
+    assert!(
+        spoken.iter().any(|s| is_filler(s)),
+        "filler should have fired: {spoken:?}"
+    );
     // The session must NOT be stuck non-interruptible after the masked turn.
     assert!(
         !vm.is_interruption_blocked().await,
@@ -623,10 +697,10 @@ async fn two_tier_routes_complex_to_reasoning_simple_to_fast() {
     // Two endpoints with distinct replies so we can see which tier ran.
     let fast_state = LlmMockState::default();
     *fast_state.reply.lock() = "Fast reply.".to_string();
-    let fast_url = start_llm_mock(fast_state.clone()).await;
+    let (fast_url, _fast_server) = start_llm_mock(fast_state.clone()).await;
     let reason_state = LlmMockState::default();
     *reason_state.reply.lock() = "Reasoned reply.".to_string();
-    let reason_url = start_llm_mock(reason_state.clone()).await;
+    let (reason_url, _reason_server) = start_llm_mock(reason_state.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -643,8 +717,12 @@ async fn two_tier_routes_complex_to_reasoning_simple_to_fast() {
         Arc::new(ConversationOrchestrator::new("session-2tier", cfg, vm.clone()).expect("orch"));
 
     // Simple turn → fast tier; complex turn → reasoning tier.
-    orch.run_turn("hi there").await.ok();
-    orch.run_turn("can you calculate my refund").await.ok();
+    orch.run_turn("hi there")
+        .await
+        .expect("simple two-tier turn should complete");
+    orch.run_turn("can you calculate my refund")
+        .await
+        .expect("complex two-tier turn should complete");
 
     let spoken = TTS_STATS.spoken.lock().clone();
     assert!(
@@ -682,10 +760,10 @@ async fn two_tier_sticky_followup_stays_on_reasoning() {
 
     let fast_state = LlmMockState::default();
     *fast_state.reply.lock() = "Fast reply.".to_string();
-    let fast_url = start_llm_mock(fast_state.clone()).await;
+    let (fast_url, _fast_server) = start_llm_mock(fast_state.clone()).await;
     let reason_state = LlmMockState::default();
     *reason_state.reply.lock() = "Reasoned reply.".to_string();
-    let reason_url = start_llm_mock(reason_state.clone()).await;
+    let (reason_url, _reason_server) = start_llm_mock(reason_state.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -702,8 +780,12 @@ async fn two_tier_sticky_followup_stays_on_reasoning() {
 
     // Turn 1 escalates (keyword); turn 2 is a bare continuation that would have
     // dropped to fast under the old heuristic — it must STICK to reasoning.
-    orch.run_turn("calculate my mortgage payment").await.ok();
-    orch.run_turn("and the second one?").await.ok();
+    orch.run_turn("calculate my mortgage payment")
+        .await
+        .expect("initial sticky reasoning turn should complete");
+    orch.run_turn("and the second one?")
+        .await
+        .expect("sticky follow-up turn should complete");
 
     assert_eq!(
         reason_state.requests.lock().len(),
@@ -738,14 +820,15 @@ async fn live_reasoning_before_after_measurement() {
     register_mock_tts();
 
     // (first-audio seconds, total-turn seconds, full spoken sequence)
-    async fn measure(orch: &Arc<ConversationOrchestrator>, transcript: &str) -> (f64, f64, Vec<String>) {
+    async fn measure(
+        orch: &Arc<ConversationOrchestrator>,
+        transcript: &str,
+    ) -> (f64, f64, Vec<String>) {
         reset_tts_stats();
         let t0 = Instant::now();
         let o = orch.clone();
         let tx = transcript.to_string();
-        let h = tokio::spawn(async move {
-            o.run_turn(&tx).await.ok();
-        });
+        let h = tokio::spawn(async move { o.run_turn(&tx).await });
         let mut first: Option<f64> = None;
         loop {
             if first.is_none() && !TTS_STATS.spoken.lock().is_empty() {
@@ -756,7 +839,9 @@ async fn live_reasoning_before_after_measurement() {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let _ = h.await;
+        h.await
+            .expect("live reasoning measurement turn task panicked")
+            .expect("live reasoning measurement turn failed");
         let total = t0.elapsed().as_secs_f64();
         let spoken = TTS_STATS.spoken.lock().clone();
         (first.unwrap_or(total), total, spoken)
@@ -818,7 +903,10 @@ async fn live_reasoning_before_after_measurement() {
     let (a_complex_first, a_complex_total, a_complex_spoken) =
         measure(&after, "how much is a 15% tip on a 60 dollar bill?").await;
 
-    let leaked = |s: &[String]| s.iter().any(|u| u.contains("<think>") || u.contains("</think>"));
+    let leaked = |s: &[String]| {
+        s.iter()
+            .any(|u| u.contains("<think>") || u.contains("</think>"))
+    };
     let answer_correct = a_complex_spoken
         .iter()
         .chain(b_complex_spoken.iter())
@@ -832,9 +920,13 @@ async fn live_reasoning_before_after_measurement() {
     eprintln!("  complex 'tip': first audio {b_complex_first:6.2}s | total {b_complex_total:6.2}s");
     eprintln!("                 spoke: {b_complex_spoken:?}");
     eprintln!("\nAFTER (two-tier + masking auto + routing auto):");
-    eprintln!("  simple 'hi':   first audio {a_simple_first:6.2}s | total {a_simple_total:6.2}s  (→ FAST tier)");
+    eprintln!(
+        "  simple 'hi':   first audio {a_simple_first:6.2}s | total {a_simple_total:6.2}s  (→ FAST tier)"
+    );
     eprintln!("                 spoke: {a_simple_spoken:?}");
-    eprintln!("  complex 'tip': PERCEIVED first audio {a_complex_first:6.2}s | full answer {a_complex_total:6.2}s  (filler→answer)");
+    eprintln!(
+        "  complex 'tip': PERCEIVED first audio {a_complex_first:6.2}s | full answer {a_complex_total:6.2}s  (filler→answer)"
+    );
     eprintln!("                 spoke: {a_complex_spoken:?}");
     eprintln!("\nUX / perceived-intelligence validation:");
     eprintln!(
@@ -844,7 +936,10 @@ async fn live_reasoning_before_after_measurement() {
     );
     eprintln!(
         "  AFTER-complex 1st utterance is a masking filler? {}",
-        a_complex_spoken.first().map(|s| is_filler(s)).unwrap_or(false)
+        a_complex_spoken
+            .first()
+            .map(|s| is_filler(s))
+            .unwrap_or(false)
     );
     eprintln!("  reasoned answer got the math right (mentions 9/nine)? {answer_correct}");
     eprintln!(
@@ -858,9 +953,18 @@ async fn live_reasoning_before_after_measurement() {
     eprintln!("========================================================================\n");
 
     // Hard invariants.
-    assert!(!leaked(&b_complex_spoken), "BEFORE: chain-of-thought must NEVER be spoken");
-    assert!(!leaked(&a_complex_spoken), "AFTER: chain-of-thought must NEVER be spoken");
-    assert!(!a_complex_spoken.is_empty(), "the complex turn must speak something");
+    assert!(
+        !leaked(&b_complex_spoken),
+        "BEFORE: chain-of-thought must NEVER be spoken"
+    );
+    assert!(
+        !leaked(&a_complex_spoken),
+        "AFTER: chain-of-thought must NEVER be spoken"
+    );
+    assert!(
+        !a_complex_spoken.is_empty(),
+        "the complex turn must speak something"
+    );
     assert!(
         a_simple_first < b_simple_first,
         "routing must make the simple turn faster ({a_simple_first:.2}s vs {b_simple_first:.2}s)"
@@ -882,10 +986,10 @@ async fn two_tier_stickiness_is_one_shot() {
 
     let fast_state = LlmMockState::default();
     *fast_state.reply.lock() = "Fast reply.".to_string();
-    let fast_url = start_llm_mock(fast_state.clone()).await;
+    let (fast_url, _fast_server) = start_llm_mock(fast_state.clone()).await;
     let reason_state = LlmMockState::default();
     *reason_state.reply.lock() = "Reasoned reply.".to_string();
-    let reason_url = start_llm_mock(reason_state.clone()).await;
+    let (reason_url, _reason_server) = start_llm_mock(reason_state.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -900,9 +1004,15 @@ async fn two_tier_stickiness_is_one_shot() {
     let orch =
         Arc::new(ConversationOrchestrator::new("session-oneshot", cfg, vm.clone()).expect("orch"));
 
-    orch.run_turn("calculate my mortgage payment").await.ok(); // intrinsic → reasoning
-    orch.run_turn("and the second one?").await.ok(); // sticks → reasoning
-    orch.run_turn("and the third?").await.ok(); // one-shot expired → FAST
+    orch.run_turn("calculate my mortgage payment")
+        .await
+        .expect("initial sticky-expiration turn should complete"); // intrinsic -> reasoning
+    orch.run_turn("and the second one?")
+        .await
+        .expect("sticky-expiration follow-up turn should complete"); // sticks -> reasoning
+    orch.run_turn("and the third?")
+        .await
+        .expect("post-expiration fast turn should complete"); // one-shot expired -> FAST
 
     assert_eq!(
         reason_state.requests.lock().len(),
@@ -930,10 +1040,10 @@ async fn two_tier_negation_stays_fast() {
 
     let fast_state = LlmMockState::default();
     *fast_state.reply.lock() = "Fast reply.".to_string();
-    let fast_url = start_llm_mock(fast_state.clone()).await;
+    let (fast_url, _fast_server) = start_llm_mock(fast_state.clone()).await;
     let reason_state = LlmMockState::default();
     *reason_state.reply.lock() = "Reasoned reply.".to_string();
-    let reason_url = start_llm_mock(reason_state.clone()).await;
+    let (reason_url, _reason_server) = start_llm_mock(reason_state.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -948,7 +1058,9 @@ async fn two_tier_negation_stays_fast() {
     let orch =
         Arc::new(ConversationOrchestrator::new("session-neg", cfg, vm.clone()).expect("orch"));
 
-    orch.run_turn("i said no refund please").await.ok();
+    orch.run_turn("i said no refund please")
+        .await
+        .expect("negation routing turn should complete");
 
     assert_eq!(
         fast_state.requests.lock().len(),
@@ -981,7 +1093,7 @@ async fn p1_single_tier_failure_speaks_canned_apology() {
 
     let st = LlmMockState::default();
     st.fail.store(true, Ordering::SeqCst); // the (only) tier is down (500)
-    let url = start_llm_mock(st.clone()).await;
+    let (url, _server) = start_llm_mock(st.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -991,7 +1103,8 @@ async fn p1_single_tier_failure_speaks_canned_apology() {
         latency_filler: LatencyFiller::Off,
         ..conv_config(url, false)
     };
-    let orch = Arc::new(ConversationOrchestrator::new("p1-apology", cfg, vm.clone()).expect("orch"));
+    let orch =
+        Arc::new(ConversationOrchestrator::new("p1-apology", cfg, vm.clone()).expect("orch"));
     let fatal_fired = Arc::new(AtomicUsize::new(0));
     let ff = Arc::clone(&fatal_fired);
     orch.set_fatal_handler(Arc::new(move |_e| {
@@ -1027,10 +1140,10 @@ async fn p1_fast_tier_failure_degrades_to_reasoning() {
 
     let fast = LlmMockState::default();
     fast.fail.store(true, Ordering::SeqCst); // fast tier down
-    let fast_url = start_llm_mock(fast.clone()).await;
+    let (fast_url, _fast_server) = start_llm_mock(fast.clone()).await;
     let reason = LlmMockState::default();
     *reason.reply.lock() = "Reasoned fallback.".to_string();
-    let reason_url = start_llm_mock(reason.clone()).await;
+    let (reason_url, _reason_server) = start_llm_mock(reason.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -1084,11 +1197,11 @@ async fn p1_reasoner_over_budget_degrades_to_fast_draft() {
 
     let fast = LlmMockState::default();
     *fast.reply.lock() = "Fast draft answer.".to_string();
-    let fast_url = start_llm_mock(fast.clone()).await;
+    let (fast_url, _fast_server) = start_llm_mock(fast.clone()).await;
     let reason = LlmMockState::default();
     *reason.reply.lock() = "Slow reasoned answer.".to_string();
     reason.delay_ms.store(3000, Ordering::SeqCst); // 3s ≫ the 200ms budget
-    let reason_url = start_llm_mock(reason.clone()).await;
+    let (reason_url, _reason_server) = start_llm_mock(reason.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -1136,27 +1249,29 @@ async fn p2_reasoning_token_ceiling_clamps_reasoning_tier() {
 
     let fast = LlmMockState::default();
     *fast.reply.lock() = "Fast.".to_string();
-    let fast_url = start_llm_mock(fast.clone()).await;
+    let (fast_url, _fast_server) = start_llm_mock(fast.clone()).await;
     let reason = LlmMockState::default();
     *reason.reply.lock() = "Reasoned.".to_string();
-    let reason_url = start_llm_mock(reason.clone()).await;
+    let (reason_url, _reason_server) = start_llm_mock(reason.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
     let _ = wire_audio_egress(&vm).await;
 
     let cfg = ConversationConfig {
-        max_tokens: Some(8000),                  // generous base budget
+        max_tokens: Some(8000), // generous base budget
         reasoning_model: Some("reasoning-mock".to_string()),
         reasoning_base_url: Some(reason_url),
-        reasoning_route: RoutingMode::Always,    // force the reasoner
-        max_reasoning_tokens: Some(2048),        // P2 ceiling ≪ base
+        reasoning_route: RoutingMode::Always, // force the reasoner
+        max_reasoning_tokens: Some(2048),     // P2 ceiling ≪ base
         latency_filler: LatencyFiller::Off,
         ..conv_config(fast_url, false)
     };
     let orch = Arc::new(ConversationOrchestrator::new("p2-clamp", cfg, vm.clone()).expect("orch"));
 
-    orch.run_turn("reason about this please").await.ok();
+    orch.run_turn("reason about this please")
+        .await
+        .expect("reasoning budget turn should complete");
 
     let reqs = reason.requests.lock().clone();
     assert_eq!(reqs.len(), 1, "the reasoning tier served the turn");
@@ -1185,7 +1300,7 @@ async fn s3_async_result_volunteered_when_idle_gated_when_superseded() {
 
     let st = LlmMockState::default();
     *st.reply.lock() = "Here is your async result.".to_string();
-    let url = start_llm_mock(st.clone()).await;
+    let (url, _server) = start_llm_mock(st.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -1197,7 +1312,9 @@ async fn s3_async_result_volunteered_when_idle_gated_when_superseded() {
     let orch = Arc::new(ConversationOrchestrator::new("s3-async", cfg, vm.clone()).expect("orch"));
 
     // Turn 0 runs and ends → next_turn_id advances to 1, line goes idle.
-    orch.run_turn("hello").await.ok();
+    orch.run_turn("hello")
+        .await
+        .expect("async-result seed turn should complete");
 
     // CASE A — async final for the STILL-LATEST turn 0, line idle → VOLUNTEERED.
     reset_tts_stats();
@@ -1214,20 +1331,27 @@ async fn s3_async_result_volunteered_when_idle_gated_when_superseded() {
     .await;
     let spoken = TTS_STATS.spoken.lock().clone();
     assert!(
-        spoken.iter().any(|s| s.contains("Here is your async result")),
+        spoken
+            .iter()
+            .any(|s| s.contains("Here is your async result")),
         "idle + still-latest turn ⇒ the async result is volunteered: {spoken:?}"
     );
     // The follow-up inference must have run AND carried the recorded result note.
     let reqs = st.requests.lock().clone();
     assert!(reqs.len() > before, "a follow-up inference must have run");
     assert!(
-        reqs.last().unwrap().to_string().contains("Async tool 'lookup' completed"),
+        reqs.last()
+            .unwrap()
+            .to_string()
+            .contains("Async tool 'lookup' completed"),
         "the async result must be recorded into the conversation context"
     );
 
     // CASE B — a NEW turn starts (conversation moves on), then the OLD async final
     // arrives → SUPERSEDED ⇒ recorded but NOT spoken (never talks over the topic).
-    orch.run_turn("completely different question").await.ok();
+    orch.run_turn("completely different question")
+        .await
+        .expect("superseding async-result turn should complete");
     reset_tts_stats();
     orch.handle_async_final(AsyncToolResult {
         session_id: "s3-async".into(),
@@ -1260,7 +1384,7 @@ async fn multi_turn_history_preserved() {
 
     let llm_state = LlmMockState::default();
     *llm_state.reply.lock() = "Reply one.".to_string();
-    let base_url = start_llm_mock(llm_state.clone()).await;
+    let (base_url, _server) = start_llm_mock(llm_state.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -1329,8 +1453,8 @@ async fn llm_client_streams_tokens_to_callback() {
     use axum::response::sse::{Event, Sse};
     use futures::stream;
 
-    async fn sse_chat(
-    ) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    async fn sse_chat() -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>
+    {
         let chunks = vec![
             json!({"id":"1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}),
             json!({"id":"1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":"stop"}]}),
@@ -1346,7 +1470,7 @@ async fn llm_client_streams_tokens_to_callback() {
     let app = Router::new().route("/chat/completions", post(sse_chat));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _server = spawn_test_server("llm_client_streams_tokens_to_callback", async move {
         axum::serve(listener, app).await.unwrap();
     });
     let base_url = format!("http://127.0.0.1:{}", addr.port());
@@ -1398,7 +1522,7 @@ async fn eager_confirmed_speaks_and_commits_once() {
     let llm_state = LlmMockState::default();
     *llm_state.reply.lock() = "The capital is Paris.".to_string();
     llm_state.delay_ms.store(150, Ordering::SeqCst); // speculation in flight at confirm
-    let base_url = start_llm_mock(llm_state.clone()).await;
+    let (base_url, _server) = start_llm_mock(llm_state.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -1410,7 +1534,8 @@ async fn eager_confirmed_speaks_and_commits_once() {
     orch.trigger_eager_turn("what is the capital");
     tokio::time::sleep(Duration::from_millis(30)).await;
     // …and the provider final CONFIRMS the same transcript.
-    orch.on_stt_result(&final_result("what is the capital")).await;
+    orch.on_stt_result(&final_result("what is the capital"))
+        .await;
 
     assert_eq!(
         llm_state.requests.lock().len(),
@@ -1437,12 +1562,18 @@ async fn eager_confirmed_speaks_and_commits_once() {
         .filter_map(|m| m["content"].as_str().map(String::from))
         .collect();
     assert_eq!(
-        contents.iter().filter(|c| c.contains("what is the capital")).count(),
+        contents
+            .iter()
+            .filter(|c| c.contains("what is the capital"))
+            .count(),
         1,
         "confirmed turn committed exactly once, got {contents:?}"
     );
     assert_eq!(
-        contents.iter().filter(|c| c.contains("The capital is Paris.")).count(),
+        contents
+            .iter()
+            .filter(|c| c.contains("The capital is Paris."))
+            .count(),
         1,
         "assistant reply committed exactly once, got {contents:?}"
     );
@@ -1461,7 +1592,7 @@ async fn eager_divergent_transcript_discards_without_history_pollution() {
 
     let llm_state = LlmMockState::default();
     *llm_state.reply.lock() = "Full answer.".to_string();
-    let base_url = start_llm_mock(llm_state.clone()).await;
+    let (base_url, _server) = start_llm_mock(llm_state.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -1472,7 +1603,8 @@ async fn eager_divergent_transcript_discards_without_history_pollution() {
     orch.trigger_eager_turn("tell me about");
     tokio::time::sleep(Duration::from_millis(30)).await;
     // The user kept talking — the final transcript is longer.
-    orch.on_stt_result(&final_result("tell me about France please")).await;
+    orch.on_stt_result(&final_result("tell me about France please"))
+        .await;
 
     let requests = llm_state.requests.lock().clone();
     assert_eq!(requests.len(), 2, "speculative + real call");
@@ -1509,14 +1641,13 @@ async fn eager_supersede_confirms_on_fuller_prediction() {
     let llm_state = LlmMockState::default();
     *llm_state.reply.lock() = "Paris is the capital.".to_string();
     llm_state.delay_ms.store(120, Ordering::SeqCst);
-    let base_url = start_llm_mock(llm_state.clone()).await;
+    let (base_url, _server) = start_llm_mock(llm_state.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
     let saw_audio = wire_audio_egress(&vm).await;
 
-    let orch =
-        ConversationOrchestrator::new("eager-3", eager_config(base_url), vm).expect("orch");
+    let orch = ConversationOrchestrator::new("eager-3", eager_config(base_url), vm).expect("orch");
 
     // First (short) prediction…
     orch.trigger_eager_turn("what is the");
@@ -1550,7 +1681,10 @@ async fn eager_supersede_confirms_on_fuller_prediction() {
         .filter_map(|m| m["content"].as_str().map(String::from))
         .collect();
     assert_eq!(
-        users.iter().filter(|c| c.contains("capital of France")).count(),
+        users
+            .iter()
+            .filter(|c| c.contains("capital of France"))
+            .count(),
         1,
         "exactly one capital-question user message (the FINAL transcript): {users:?}"
     );
@@ -1566,12 +1700,12 @@ async fn eager_supersede_confirms_on_fuller_prediction() {
 
 /// Slow SSE mock: emits an early delta, then stalls long enough for the test
 /// to barge in mid-stream, then (if still connected) finishes.
-async fn start_slow_sse_llm_mock() -> String {
+async fn start_slow_sse_llm_mock() -> (String, TestServer) {
     use axum::response::sse::{Event, Sse};
     use futures::stream;
 
-    async fn sse_chat(
-    ) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    async fn sse_chat() -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>
+    {
         let early = json!({"id":"1","object":"chat.completion.chunk","created":1,"model":"m",
             "choices":[{"index":0,"delta":{"content":"The capital of France is"},"finish_reason":null}]});
         let late = json!({"id":"1","object":"chat.completion.chunk","created":1,"model":"m",
@@ -1598,19 +1732,19 @@ async fn start_slow_sse_llm_mock() -> String {
     let app = Router::new().route("/chat/completions", post(sse_chat));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let server = spawn_test_server("slow_sse_llm_mock", async move {
         axum::serve(listener, app).await.unwrap();
     });
-    format!("http://127.0.0.1:{}", addr.port())
+    (format!("http://127.0.0.1:{}", addr.port()), server)
 }
 
 /// A7 SSE mock: streams ONE complete sentence (spoken immediately — the trailing
 /// "Now" confirms the boundary), then STALLS far past the budget, then more.
-async fn start_sentence_then_stall_sse_mock() -> String {
+async fn start_sentence_then_stall_sse_mock() -> (String, TestServer) {
     use axum::response::sse::{Event, Sse};
     use futures::stream;
-    async fn sse_chat(
-    ) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    async fn sse_chat() -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>
+    {
         let early = json!({"id":"1","object":"chat.completion.chunk","created":1,"model":"m",
             "choices":[{"index":0,"delta":{"content":"The answer is forty two. Now"},"finish_reason":null}]});
         let late = json!({"id":"1","object":"chat.completion.chunk","created":1,"model":"m",
@@ -1634,19 +1768,19 @@ async fn start_sentence_then_stall_sse_mock() -> String {
     let app = Router::new().route("/chat/completions", post(sse_chat));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let server = spawn_test_server("sentence_then_stall_sse_mock", async move {
         axum::serve(listener, app).await.unwrap();
     });
-    format!("http://127.0.0.1:{}", addr.port())
+    (format!("http://127.0.0.1:{}", addr.port()), server)
 }
 
 /// A7 SSE mock: streams 5 sentences ~80ms apart — a HEALTHY reasoner that must
 /// NOT trip a 300ms stall watchdog (each chunk resets the silence gap).
-async fn start_steady_stream_sse_mock() -> String {
+async fn start_steady_stream_sse_mock() -> (String, TestServer) {
     use axum::response::sse::{Event, Sse};
     use futures::stream;
-    async fn sse_chat(
-    ) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    async fn sse_chat() -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>
+    {
         let events = stream::unfold(0u8, move |step| async move {
             if step < 5 {
                 tokio::time::sleep(Duration::from_millis(80)).await;
@@ -1667,10 +1801,10 @@ async fn start_steady_stream_sse_mock() -> String {
     let app = Router::new().route("/chat/completions", post(sse_chat));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let server = spawn_test_server("steady_stream_sse_mock", async move {
         axum::serve(listener, app).await.unwrap();
     });
-    format!("http://127.0.0.1:{}", addr.port())
+    (format!("http://127.0.0.1:{}", addr.port()), server)
 }
 
 /// A7: a reasoner that streams a coherent partial sentence then STALLS past the
@@ -1688,8 +1822,8 @@ async fn a7_reasoner_stall_after_partial_commits_not_restart() {
 
     let fast = LlmMockState::default();
     *fast.reply.lock() = "Fast draft answer.".to_string();
-    let fast_url = start_llm_mock(fast.clone()).await;
-    let reason_url = start_sentence_then_stall_sse_mock().await;
+    let (fast_url, _fast_server) = start_llm_mock(fast.clone()).await;
+    let (reason_url, _reason_server) = start_sentence_then_stall_sse_mock().await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -1705,7 +1839,9 @@ async fn a7_reasoner_stall_after_partial_commits_not_restart() {
     let orch = Arc::new(ConversationOrchestrator::new("a7-stall", cfg, vm.clone()).expect("orch"));
 
     let t0 = std::time::Instant::now();
-    orch.run_turn("reason about this please").await.ok();
+    orch.run_turn("reason about this please")
+        .await
+        .expect("stalling reasoner turn should complete");
     let elapsed = t0.elapsed();
 
     assert!(
@@ -1741,8 +1877,8 @@ async fn a7_healthy_stream_does_not_trip_watchdog() {
 
     let fast = LlmMockState::default();
     *fast.reply.lock() = "Fast draft answer.".to_string();
-    let fast_url = start_llm_mock(fast.clone()).await;
-    let reason_url = start_steady_stream_sse_mock().await;
+    let (fast_url, _fast_server) = start_llm_mock(fast.clone()).await;
+    let (reason_url, _reason_server) = start_steady_stream_sse_mock().await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -1758,7 +1894,9 @@ async fn a7_healthy_stream_does_not_trip_watchdog() {
     let orch =
         Arc::new(ConversationOrchestrator::new("a7-healthy", cfg, vm.clone()).expect("orch"));
 
-    orch.run_turn("reason about this please").await.ok();
+    orch.run_turn("reason about this please")
+        .await
+        .expect("healthy streaming reasoner turn should complete");
 
     let spoken = TTS_STATS.spoken.lock().clone();
     assert!(
@@ -1780,7 +1918,7 @@ async fn barge_in_commits_partial_assistant_text() {
     register_mock_tts();
     reset_tts_stats();
 
-    let base_url = start_slow_sse_llm_mock().await;
+    let (base_url, _server) = start_slow_sse_llm_mock().await;
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
     let _ = wire_audio_egress(&vm).await;
@@ -1802,13 +1940,15 @@ async fn barge_in_commits_partial_assistant_text() {
     ));
 
     let orch1 = orchestrator.clone();
-    let turn = tokio::spawn(async move {
-        orch1.run_turn("what is the capital of France?").await.ok();
-    });
+    let turn = tokio::spawn(async move { orch1.run_turn("what is the capital of France?").await });
     // Let the first delta arrive, then barge in mid-stream.
     tokio::time::sleep(Duration::from_millis(400)).await;
     orchestrator.handle_barge_in().await;
-    let _ = tokio::time::timeout(Duration::from_secs(3), turn).await;
+    tokio::time::timeout(Duration::from_secs(3), turn)
+        .await
+        .expect("partial-history turn should settle within 3s")
+        .expect("partial-history turn task should not panic")
+        .expect("partial-history turn should complete successfully");
 
     let history = llm.history_snapshot("session-partial").await;
     let last = history.last().expect("history must not be empty");
@@ -1842,7 +1982,7 @@ async fn barge_in_before_any_token_commits_nothing() {
     let llm_state = LlmMockState::default();
     *llm_state.reply.lock() = "Never delivered.".to_string();
     llm_state.delay_ms.store(1_500, Ordering::SeqCst);
-    let base_url = start_llm_mock(llm_state.clone()).await;
+    let (base_url, _server) = start_llm_mock(llm_state.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -1865,12 +2005,14 @@ async fn barge_in_before_any_token_commits_nothing() {
     ));
 
     let orch1 = orchestrator.clone();
-    let turn = tokio::spawn(async move {
-        orch1.run_turn("hello?").await.ok();
-    });
+    let turn = tokio::spawn(async move { orch1.run_turn("hello?").await });
     tokio::time::sleep(Duration::from_millis(200)).await;
     orchestrator.handle_barge_in().await;
-    let _ = tokio::time::timeout(Duration::from_secs(3), turn).await;
+    tokio::time::timeout(Duration::from_secs(3), turn)
+        .await
+        .expect("non-partial-history turn should settle within 3s")
+        .expect("non-partial-history turn task should not panic")
+        .expect("non-partial-history turn should complete successfully");
 
     let history = llm.history_snapshot("session-nopartial").await;
     assert!(
@@ -1892,7 +2034,7 @@ async fn normal_completion_does_not_double_commit() {
 
     let llm_state = LlmMockState::default();
     *llm_state.reply.lock() = "Complete answer.".to_string();
-    let base_url = start_llm_mock(llm_state.clone()).await;
+    let (base_url, _server) = start_llm_mock(llm_state.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -1920,7 +2062,11 @@ async fn normal_completion_does_not_double_commit() {
         .iter()
         .filter(|m| matches!(m.role, waav_gateway::core::llm::MessageRole::Assistant))
         .collect();
-    assert_eq!(assistants.len(), 1, "exactly one assistant message: {history:?}");
+    assert_eq!(
+        assistants.len(),
+        1,
+        "exactly one assistant message: {history:?}"
+    );
     assert_eq!(assistants[0].content.as_deref(), Some("Complete answer."));
 }
 
@@ -1959,8 +2105,10 @@ async fn tool_loop_final_answer_is_spoken_after_streamed_preamble() {
                         "function":{"name":"get_weather","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
             ]
         } else {
-            vec![json!({"id":"2","object":"chat.completion.chunk","created":1,"model":"m",
-                "choices":[{"index":0,"delta":{"content":"It is sunny and minus three."},"finish_reason":"stop"}]})]
+            vec![
+                json!({"id":"2","object":"chat.completion.chunk","created":1,"model":"m",
+                "choices":[{"index":0,"delta":{"content":"It is sunny and minus three."},"finish_reason":"stop"}]}),
+            ]
         };
         let events = chunks
             .into_iter()
@@ -1975,7 +2123,9 @@ async fn tool_loop_final_answer_is_spoken_after_streamed_preamble() {
         .with_state(hits.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let _server = spawn_test_server("tool_loop_streaming_mock", async move {
+        axum::serve(listener, app).await.unwrap();
+    });
     let base_url = format!("http://127.0.0.1:{}", addr.port());
 
     let vm = build_voice_manager();
@@ -2005,11 +2155,16 @@ async fn tool_loop_final_answer_is_spoken_after_streamed_preamble() {
         llm.clone(),
         vm.clone(),
     ));
-    orchestrator.run_turn("what's the weather?").await.expect("turn");
+    orchestrator
+        .run_turn("what's the weather?")
+        .await
+        .expect("turn");
 
     let spoken = TTS_STATS.spoken.lock().clone();
     assert!(
-        spoken.iter().any(|s| s.contains("Let me check the weather")),
+        spoken
+            .iter()
+            .any(|s| s.contains("Let me check the weather")),
         "preamble spoken: {spoken:?}"
     );
     assert!(
@@ -2053,7 +2208,7 @@ async fn idle_fires_after_bot_silence() {
 
     let llm_state = LlmMockState::default();
     *llm_state.reply.lock() = "Are you still there?".to_string();
-    let base_url = start_llm_mock(llm_state.clone()).await;
+    let (base_url, _server) = start_llm_mock(llm_state.clone()).await;
 
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
@@ -2069,7 +2224,11 @@ async fn idle_fires_after_bot_silence() {
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     let requests = llm_state.requests.lock().clone();
-    assert_eq!(requests.len(), 1, "exactly one idle re-engagement inference");
+    assert_eq!(
+        requests.len(),
+        1,
+        "exactly one idle re-engagement inference"
+    );
     let msgs = requests[0]["messages"].as_array().unwrap();
     assert!(
         msgs.iter().any(|m| m["content"]
@@ -2097,7 +2256,7 @@ async fn idle_suppressed_mid_turn_and_disabled_when_zero() {
     // Disabled (0): no inference ever.
     let llm_state = LlmMockState::default();
     *llm_state.reply.lock() = "never".to_string();
-    let base_url = start_llm_mock(llm_state.clone()).await;
+    let (base_url, _server) = start_llm_mock(llm_state.clone()).await;
     let vm = build_voice_manager();
     vm.start().await.expect("vm start");
     let _ = wire_audio_egress(&vm).await;
@@ -2114,19 +2273,13 @@ async fn idle_suppressed_mid_turn_and_disabled_when_zero() {
     let llm_state2 = LlmMockState::default();
     *llm_state2.reply.lock() = "slow answer".to_string();
     llm_state2.delay_ms.store(300, Ordering::SeqCst);
-    let base_url2 = start_llm_mock(llm_state2.clone()).await;
+    let (base_url2, _server2) = start_llm_mock(llm_state2.clone()).await;
     let orch2 = Arc::new(
-        ConversationOrchestrator::new(
-            "session-idle-busy",
-            idle_config(base_url2, 60),
-            vm.clone(),
-        )
-        .expect("orchestrator"),
+        ConversationOrchestrator::new("session-idle-busy", idle_config(base_url2, 60), vm.clone())
+            .expect("orchestrator"),
     );
     let o = orch2.clone();
-    let turn = tokio::spawn(async move {
-        o.run_turn("a question").await.ok();
-    });
+    let turn = tokio::spawn(async move { o.run_turn("a question").await });
     tokio::time::sleep(Duration::from_millis(30)).await;
     orch2.poke_idle_timer(); // fires at +60ms — mid-turn
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -2135,7 +2288,11 @@ async fn idle_suppressed_mid_turn_and_disabled_when_zero() {
         1,
         "no idle inference while a turn is active"
     );
-    let _ = tokio::time::timeout(Duration::from_secs(2), turn).await;
+    tokio::time::timeout(Duration::from_secs(2), turn)
+        .await
+        .expect("active turn should settle within 2s")
+        .expect("active turn task should not panic")
+        .expect("active turn should complete successfully");
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2162,7 +2319,10 @@ async fn recoverable_stage_error_aborts_turn_not_session() {
         Json(_req): Json<Value>,
     ) -> (StatusCode, Json<Value>) {
         if st.hits.fetch_add(1, Ordering::SeqCst) == 0 {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"boom"})));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"boom"})),
+            );
         }
         (
             StatusCode::OK,
@@ -2173,10 +2333,14 @@ async fn recoverable_stage_error_aborts_turn_not_session() {
         )
     }
     let st = FlakyState::default();
-    let app = Router::new().route("/chat/completions", post(chat)).with_state(st.clone());
+    let app = Router::new()
+        .route("/chat/completions", post(chat))
+        .with_state(st.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let _server = spawn_test_server("recoverable_stage_error_mock", async move {
+        axum::serve(listener, app).await.unwrap();
+    });
     let base_url = format!("http://127.0.0.1:{}", addr.port());
 
     let vm = build_voice_manager();
@@ -2194,7 +2358,11 @@ async fn recoverable_stage_error_aborts_turn_not_session() {
 
     // Turn 1: 500 → recoverable, no fatal, session continues.
     orch.on_stt_result(&final_result("first question")).await;
-    assert_eq!(fatal_fired.load(Ordering::SeqCst), 0, "a 500 is RECOVERABLE");
+    assert_eq!(
+        fatal_fired.load(Ordering::SeqCst),
+        0,
+        "a 500 is RECOVERABLE"
+    );
     // Turn 2 on the SAME session: works.
     orch.on_stt_result(&final_result("second question")).await;
     let spoken = TTS_STATS.spoken.lock().clone();
@@ -2224,7 +2392,9 @@ async fn fatal_stage_error_fires_handler_once() {
     let app = Router::new().route("/chat/completions", post(chat));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let _server = spawn_test_server("fatal_stage_error_mock", async move {
+        axum::serve(listener, app).await.unwrap();
+    });
     let base_url = format!("http://127.0.0.1:{}", addr.port());
 
     let vm = build_voice_manager();
@@ -2242,7 +2412,11 @@ async fn fatal_stage_error_fires_handler_once() {
     }));
 
     orch.on_stt_result(&final_result("hello?")).await;
-    assert_eq!(fatal_fired.load(Ordering::SeqCst), 1, "401 fires the fatal handler");
+    assert_eq!(
+        fatal_fired.load(Ordering::SeqCst),
+        1,
+        "401 fires the fatal handler"
+    );
     // P1 composes with the fatal-stop: the caller hears the apology BEFORE the
     // session tears down — a fatal stop is never silent.
     let spoken = TTS_STATS.spoken.lock().clone();
@@ -2252,5 +2426,9 @@ async fn fatal_stage_error_fires_handler_once() {
     );
     // A second failing turn does NOT re-fire (handler taken once).
     orch.on_stt_result(&final_result("still there?")).await;
-    assert_eq!(fatal_fired.load(Ordering::SeqCst), 1, "fatal fires exactly once");
+    assert_eq!(
+        fatal_fired.load(Ordering::SeqCst),
+        1,
+        "fatal fires exactly once"
+    );
 }

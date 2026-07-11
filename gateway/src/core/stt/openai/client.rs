@@ -48,6 +48,27 @@ const MAX_BUFFER_SIZE_BYTES: usize = 20 * 1024 * 1024;
 /// Scale factor for converting PCM 16-bit samples to normalized float (-1.0 to 1.0)
 const PCM_TO_FLOAT_SCALE: f32 = 1.0 / 32768.0;
 
+fn openai_stt_http_client() -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(4)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()
+}
+
+fn default_openai_stt_http_client() -> Option<Client> {
+    match openai_stt_http_client() {
+        Ok(client) => Some(client),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to create default OpenAI STT HTTP client; default instance is inert until rebuilt with a valid config"
+            );
+            None
+        }
+    }
+}
+
 // =============================================================================
 // Type Aliases
 // =============================================================================
@@ -116,7 +137,7 @@ pub struct OpenAISTT {
     pub(crate) config: Option<OpenAISTTConfig>,
 
     /// HTTP client for API requests (reused for connection pooling).
-    http_client: Client,
+    http_client: Option<Client>,
 
     /// Audio buffer for accumulating PCM data.
     /// Uses Vec for efficient appending with pre-allocated capacity.
@@ -177,14 +198,9 @@ impl OpenAISTT {
 
         // Create HTTP client with sensible defaults
         // 30s timeout balances long audio transcription with timely failure detection
-        let http_client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .pool_max_idle_per_host(4) // Connection pooling
-            .pool_idle_timeout(Duration::from_secs(90)) // Close idle connections after 90s
-            .build()
-            .map_err(|e| {
-                STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
-            })?;
+        let http_client = openai_stt_http_client().map_err(|e| {
+            STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         // Pre-allocate audio buffer with expected capacity
         // Typical audio: 16kHz, 16-bit mono = 32KB/sec
@@ -193,7 +209,7 @@ impl OpenAISTT {
 
         Ok(Self {
             config: Some(config),
-            http_client,
+            http_client: Some(http_client),
             audio_buffer: Vec::with_capacity(initial_capacity),
             connected: AtomicBool::new(false),
             result_callback: Arc::new(Mutex::new(None)),
@@ -366,11 +382,12 @@ impl OpenAISTT {
         }
 
         // Create WAV file from buffered PCM data
-        let wav_data = wav::create_wav(
+        let wav_data = wav::try_create_wav(
             &self.audio_buffer,
             config.base.sample_rate,
             config.base.channels,
-        );
+        )
+        .map_err(|err| STTError::AudioProcessingError(format!("Invalid WAV parameters: {err}")))?;
 
         // Build multipart form
         let file_part = Part::bytes(wav_data)
@@ -388,10 +405,17 @@ impl OpenAISTT {
             form = form.text(key, value);
         }
 
+        let api_url = config.try_api_url().map_err(STTError::ConfigurationError)?;
+
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            STTError::ConfigurationError(
+                "OpenAI STT default HTTP client is unavailable; construct with OpenAISTT::new or with_config".to_string(),
+            )
+        })?;
+
         // Send request to OpenAI API
-        let response = self
-            .http_client
-            .post(config.api_url())
+        let response = http_client
+            .post(api_url)
             .header("Authorization", format!("Bearer {}", config.base.api_key))
             .multipart(form)
             .send()
@@ -717,7 +741,7 @@ impl Default for OpenAISTT {
     fn default() -> Self {
         Self {
             config: None,
-            http_client: Client::new(),
+            http_client: default_openai_stt_http_client(),
             audio_buffer: Vec::with_capacity(32 * 1024 * 30),
             connected: AtomicBool::new(false),
             result_callback: Arc::new(Mutex::new(None)),
@@ -1093,6 +1117,116 @@ mod tests {
         assert_eq!(stored_config.model, OpenAISTTModel::Gpt4oTranscribe);
         assert_eq!(stored_config.response_format, ResponseFormat::VerboseJson);
         assert_eq!(stored_config.temperature, Some(0.2));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn openai_stt_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 8192];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let config = OpenAISTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let stt = OpenAISTT::with_config(config).expect("construct OpenAI STT");
+        let err = stt
+            .http_client
+            .as_ref()
+            .expect("strict constructor builds an HTTP client")
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected OpenAI STT redirect error: {error_chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_without_http_client_returns_typed_error_without_panic() {
+        let mut stt = OpenAISTT::default();
+        stt.http_client = None;
+        stt.config = Some(OpenAISTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                sample_rate: 16_000,
+                channels: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        stt.audio_buffer.extend_from_slice(&[0, 0, 1, 0]);
+
+        let err = stt
+            .flush_buffer()
+            .await
+            .expect_err("inert default client must fail with a typed error");
+
+        match err {
+            STTError::ConfigurationError(msg) => {
+                assert!(msg.contains("default HTTP client"), "{msg}");
+            }
+            other => panic!("expected ConfigurationError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_buffer_rejects_invalid_wav_geometry_without_panic() {
+        let mut stt = OpenAISTT::default();
+        stt.http_client = None;
+        stt.config = Some(OpenAISTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                sample_rate: u32::MAX,
+                channels: u16::MAX,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        stt.audio_buffer.extend_from_slice(&[0, 0, 1, 0]);
+
+        let err = stt
+            .flush_buffer()
+            .await
+            .expect_err("invalid WAV geometry must fail with a typed error");
+
+        match err {
+            STTError::AudioProcessingError(msg) => {
+                assert!(msg.contains("Invalid WAV parameters"), "{msg}");
+                assert!(msg.contains("WAV header arithmetic overflowed"), "{msg}");
+            }
+            other => panic!("expected AudioProcessingError, got {other:?}"),
+        }
     }
 
     #[test]

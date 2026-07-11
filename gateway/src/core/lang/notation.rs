@@ -84,10 +84,7 @@ impl NotationMap {
     /// Build from explicit `(canonical, native)` pairs.
     pub fn new(pairs: impl IntoIterator<Item = (CanonicalLanguage, String)>) -> Self {
         Self {
-            to_native: pairs
-                .into_iter()
-                .map(|(c, n)| (c.as_bcp47(), n))
-                .collect(),
+            to_native: pairs.into_iter().map(|(c, n)| (c.as_bcp47(), n)).collect(),
             auto_native: None,
         }
     }

@@ -268,7 +268,8 @@ pub struct WebhookOutputNode {
     /// Whether to wait for response
     fire_and_forget: bool,
     /// Pooled HTTP client for connection reuse
-    client: reqwest::Client,
+    client: Option<reqwest::Client>,
+    http_client_init_error: Option<String>,
 }
 
 impl std::fmt::Debug for WebhookOutputNode {
@@ -289,13 +290,16 @@ impl WebhookOutputNode {
     /// The HTTP client is created once during construction with default settings
     /// for connection pooling and keep-alive.
     pub fn new(id: impl Into<String>, url: impl Into<String>) -> Self {
+        let (client, http_client_init_error) =
+            super::endpoint::optional_ssrf_protected_http_client();
         Self {
             id: id.into(),
             url: url.into(),
             headers: std::collections::HashMap::new(),
             timeout_ms: 5000,
             fire_and_forget: true,
-            client: reqwest::Client::new(),
+            client,
+            http_client_init_error,
         }
     }
 
@@ -311,14 +315,15 @@ impl WebhookOutputNode {
         url: impl Into<String>,
     ) -> crate::dag::error::DAGResult<Self> {
         let url_str: String = url.into();
-        super::endpoint::validate_url_for_ssrf(&url_str)?;
+        super::endpoint::validate_http_url_for_ssrf(&url_str)?;
         Ok(Self {
             id: id.into(),
             url: url_str,
             headers: std::collections::HashMap::new(),
             timeout_ms: 5000,
             fire_and_forget: true,
-            client: reqwest::Client::new(),
+            client: Some(super::endpoint::ssrf_protected_http_client()?),
+            http_client_init_error: None,
         })
     }
 
@@ -370,6 +375,15 @@ impl DAGNode for WebhookOutputNode {
     }
 
     async fn execute(&self, input: DAGData, ctx: &mut DAGContext) -> DAGResult<DAGData> {
+        let Some(client) = &self.client else {
+            return Err(DAGError::WebhookDeliveryError {
+                url: self.url.clone(),
+                error: self
+                    .http_client_init_error
+                    .clone()
+                    .unwrap_or_else(|| "DAG webhook HTTP client was not initialized".to_string()),
+            });
+        };
         // Convert input to JSON for webhook payload
         let payload = input.to_json();
 
@@ -381,8 +395,7 @@ impl DAGNode for WebhookOutputNode {
         );
 
         // Use the pre-created pooled client for connection reuse
-        let mut request = self
-            .client
+        let mut request = client
             .post(&self.url)
             .timeout(std::time::Duration::from_millis(self.timeout_ms))
             .header("Content-Type", "application/json")
@@ -404,7 +417,7 @@ impl DAGNode for WebhookOutputNode {
             // Spawn task and don't wait
             let url = self.url.clone();
             let node_id = self.id.clone();
-            tokio::spawn(async move {
+            crate::core::observability::spawn_observed_detached("dag.webhook-output", async move {
                 match request.send().await {
                     Ok(response) => {
                         if !response.status().is_success() {
@@ -526,13 +539,43 @@ mod tests {
     // SSRF targets (loopback, link-local cloud metadata, RFC1918) and accept public URLs.
     #[test]
     fn test_webhook_try_new_blocks_ssrf() {
-        assert!(WebhookOutputNode::try_new("w", "http://169.254.169.254/latest/meta-data").is_err());
+        let _env = crate::core::net::ssrf_env_lock();
+        assert!(
+            WebhookOutputNode::try_new("w", "http://169.254.169.254/latest/meta-data").is_err()
+        );
         assert!(WebhookOutputNode::try_new("w", "http://127.0.0.1:8080/admin").is_err());
         assert!(WebhookOutputNode::try_new("w", "http://localhost/internal").is_err());
         assert!(WebhookOutputNode::try_new("w", "http://10.0.0.5/").is_err());
         assert!(WebhookOutputNode::try_new("w", "http://192.168.1.1/").is_err());
+        assert!(WebhookOutputNode::try_new("w", "wss://example.com/hook").is_err());
         // Public URL is allowed.
         assert!(WebhookOutputNode::try_new("w", "https://example.com/hook").is_ok());
+    }
+
+    #[tokio::test]
+    async fn webhook_output_client_init_failure_returns_typed_error() {
+        let node = WebhookOutputNode {
+            id: "webhook".to_string(),
+            url: "https://hooks.example.com".to_string(),
+            headers: std::collections::HashMap::new(),
+            timeout_ms: 5000,
+            fire_and_forget: true,
+            client: None,
+            http_client_init_error: Some("client build failed".to_string()),
+        };
+        let mut ctx = DAGContext::new("client-init-failure");
+
+        let error = node
+            .execute(DAGData::Text("payload".to_string()), &mut ctx)
+            .await
+            .expect_err("missing client must return a webhook delivery error");
+
+        match error {
+            DAGError::WebhookDeliveryError { error, .. } => {
+                assert!(error.contains("client build failed"), "{error}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]

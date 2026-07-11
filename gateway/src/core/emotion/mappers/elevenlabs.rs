@@ -145,7 +145,9 @@ impl ElevenLabsEmotionMapper {
             DeliveryStyle::Loud => (stability - 0.1, similarity_boost - 0.05, style_value + 0.1),
             DeliveryStyle::Formal => (0.6, similarity_boost + 0.05, style_value),
             // Gentle / relaxed narration → softer, more stable.
-            DeliveryStyle::Gentle | DeliveryStyle::NarrationRelaxed | DeliveryStyle::PoetryReading => {
+            DeliveryStyle::Gentle
+            | DeliveryStyle::NarrationRelaxed
+            | DeliveryStyle::PoetryReading => {
                 (stability + 0.1, similarity_boost + 0.05, style_value - 0.1)
             }
             // Animated scenario reads → more expressive.

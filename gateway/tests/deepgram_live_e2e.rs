@@ -8,19 +8,67 @@
 //! Run with:
 //!   DEEPGRAM_API_KEY=… cargo test --test deepgram_live_e2e -- --ignored --nocapture --test-threads=1
 
+use futures::FutureExt;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use waav_gateway::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+use tokio::task::JoinHandle;
+use waav_gateway::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
 use waav_gateway::core::stt::{BaseSTT, DeepgramSTT, STTConfig, STTResult};
-use waav_gateway::core::tts::{AudioCallback, AudioData, BaseTTS, DeepgramTTS, TTSConfig, TTSError};
+use waav_gateway::core::tts::{
+    AudioCallback, AudioData, BaseTTS, DeepgramTTS, TTSConfig, TTSError,
+};
 
 const SENTENCE: &str = "The quick brown fox jumps over the lazy dog.";
 const SAMPLE_RATE: u32 = 24000;
 
 fn api_key() -> String {
     std::env::var("DEEPGRAM_API_KEY").expect("DEEPGRAM_API_KEY must be set for live tests")
+}
+
+struct TestServer {
+    label: &'static str,
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        if self.panicked.load(Ordering::SeqCst) {
+            let msg = format!("deepgram_live_e2e server '{}' panicked", self.label);
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+}
+
+fn spawn_test_server<F>(label: &'static str, future: F) -> TestServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let panicked = Arc::new(AtomicBool::new(false));
+    let panicked_in_task = Arc::clone(&panicked);
+    let handle = tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked_in_task.store(true, Ordering::SeqCst);
+            eprintln!("deepgram_live_e2e server '{label}' panicked");
+        }
+    });
+    TestServer {
+        label,
+        handle,
+        panicked,
+    }
 }
 
 fn ensure_crypto() {
@@ -103,7 +151,7 @@ async fn transcribe_via_waav(
         .send_audio(Bytes::from(vec![0u8; sample_rate as usize * 2]))
         .await;
     tokio::time::sleep(Duration::from_secs(3)).await;
-    stt.disconnect().await.ok();
+    stt.disconnect().await.expect("disconnect DeepgramSTT");
 
     let transcript = best.lock().await.clone();
     let error = err.lock().await.clone();
@@ -156,7 +204,12 @@ async fn test_deepgram_tts_aura_voices_live() {
     }
 
     // A representative spread of Aura voices (different genders/timbres).
-    for voice in ["aura-asteria-en", "aura-luna-en", "aura-orion-en", "aura-arcas-en"] {
+    for voice in [
+        "aura-asteria-en",
+        "aura-luna-en",
+        "aura-orion-en",
+        "aura-arcas-en",
+    ] {
         let config = TTSConfig {
             provider: "deepgram".to_string(),
             api_key: api_key(),
@@ -182,9 +235,12 @@ async fn test_deepgram_tts_aura_voices_live() {
                 break;
             }
         }
-        tts.disconnect().await.ok();
+        tts.disconnect().await.expect("disconnect DeepgramTTS");
         println!("Aura {voice}: {total} bytes of real audio");
-        assert!(total > 2000, "voice {voice} produced too little audio: {total} B");
+        assert!(
+            total > 2000,
+            "voice {voice} produced too little audio: {total} B"
+        );
     }
 }
 
@@ -194,7 +250,11 @@ async fn test_deepgram_tts_aura_voices_live() {
 
 async fn roundtrip_model(model: &str) {
     let pcm = synth_pcm(SENTENCE, SAMPLE_RATE).await;
-    assert!(pcm.len() > 8000, "synthesized audio too short: {} B", pcm.len());
+    assert!(
+        pcm.len() > 8000,
+        "synthesized audio too short: {} B",
+        pcm.len()
+    );
 
     let std_cfg = StandardSTTConfig {
         base: base_stt(model),
@@ -235,7 +295,11 @@ async fn test_deepgram_stt_roundtrip_nova3_live() {
 #[tokio::test]
 #[ignore = "Requires DEEPGRAM_API_KEY; real billed Deepgram STT+TTS calls"]
 async fn test_deepgram_stt_all_features_live() {
-    let pcm = synth_pcm("My name is John Smith and my number is 555 123 4567.", SAMPLE_RATE).await;
+    let pcm = synth_pcm(
+        "My name is John Smith and my number is 555 123 4567.",
+        SAMPLE_RATE,
+    )
+    .await;
 
     // Turn on the full advertised feature surface at once. If Deepgram rejected any single
     // parameter it would close the stream with a 4xx → on_error fires and the transcript is empty.
@@ -286,7 +350,11 @@ async fn test_deepgram_numerals_live() {
     // Aura clearly speaks digits as words; numerals=true should render them as digits.
     let spoken = "I have twenty three apples and forty seven oranges.";
     let pcm = synth_pcm(spoken, SAMPLE_RATE).await;
-    assert!(pcm.len() > 8000, "synthesized audio too short: {} B", pcm.len());
+    assert!(
+        pcm.len() > 8000,
+        "synthesized audio too short: {} B",
+        pcm.len()
+    );
 
     // Baseline: numerals OFF — Deepgram returns the number words (or at least no forced digits).
     let off_cfg = StandardSTTConfig {
@@ -340,7 +408,11 @@ async fn test_deepgram_numerals_live() {
 #[ignore = "Requires DEEPGRAM_API_KEY; real billed Deepgram STT+TTS calls"]
 async fn test_deepgram_multichannel_live() {
     let pcm = synth_pcm(SENTENCE, SAMPLE_RATE).await;
-    assert!(pcm.len() > 8000, "synthesized audio too short: {} B", pcm.len());
+    assert!(
+        pcm.len() > 8000,
+        "synthesized audio too short: {} B",
+        pcm.len()
+    );
 
     let std_cfg = StandardSTTConfig {
         base: base_stt("nova-3"),
@@ -494,14 +566,18 @@ async fn test_deepgram_gateway_ws_live() {
 
     // Boot the real gateway (AppState installs the rustls CryptoProvider).
     let app_state = AppState::new(gateway_config()).await;
-    let ws_routes = routes::ws::create_ws_router()
-        .layer(middleware::from_fn_with_state(app_state.clone(), auth_middleware));
+    let ws_routes = routes::ws::create_ws_router().layer(middleware::from_fn_with_state(
+        app_state.clone(),
+        auth_middleware,
+    ));
     let app = routes::api::create_api_router()
         .merge(ws_routes)
         .with_state(app_state);
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind gateway");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gateway");
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _server = spawn_test_server("deepgram_gateway_ws_live", async move {
         axum::serve(listener, app).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -552,7 +628,10 @@ async fn test_deepgram_gateway_ws_live() {
     }
     // Trailing silence to trigger finalization.
     write
-        .send(Message::Binary(Bytes::from(vec![0u8; SAMPLE_RATE as usize * 2])))
+        .send(Message::Binary(Bytes::from(vec![
+            0u8;
+            SAMPLE_RATE as usize * 2
+        ])))
         .await
         .unwrap();
 
@@ -575,10 +654,11 @@ async fn test_deepgram_gateway_ws_live() {
                 Message::Text(t) => {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t)
                         && v.get("type").and_then(|x| x.as_str()) == Some("stt_result")
-                            && let Some(tr) = v.get("transcript").and_then(|x| x.as_str())
-                                && tr.len() > transcript.len() {
-                                    transcript = tr.to_string();
-                                }
+                        && let Some(tr) = v.get("transcript").and_then(|x| x.as_str())
+                        && tr.len() > transcript.len()
+                    {
+                        transcript = tr.to_string();
+                    }
                 }
                 Message::Binary(b) => audio_bytes += b.len(),
                 Message::Close(_) => break,
@@ -589,8 +669,10 @@ async fn test_deepgram_gateway_ws_live() {
             }
         }
     };
-    let _ = timeout(Duration::from_secs(15), collect).await;
-    let _ = write.close().await;
+    timeout(Duration::from_secs(15), collect)
+        .await
+        .expect("timed out collecting gateway Deepgram live frames");
+    write.close().await.expect("close gateway WebSocket");
 
     println!("gateway STT transcript: {transcript:?}");
     println!("gateway TTS audio bytes: {audio_bytes}");
@@ -662,9 +744,7 @@ async fn test_egress_client_playback_rate_live() {
     let mut in_bytes = 0usize;
     let mut out_bytes = 0usize;
     let mut chunks = 0usize;
-    while let Ok(Some(a)) =
-        tokio::time::timeout(Duration::from_secs(10), rx.recv()).await
-    {
+    while let Ok(Some(a)) = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
         in_bytes += a.data.len();
         chunks += 1;
         let converted = egress_to_client_rate(
@@ -681,12 +761,15 @@ async fn test_egress_client_playback_rate_live() {
             break;
         }
     }
-    tts.disconnect().await.ok();
+    tts.disconnect().await.expect("disconnect DeepgramTTS");
 
     println!(
         "[egress] {chunks} live chunks: {in_bytes} B @{SAMPLE_RATE} -> {out_bytes} B @{target}"
     );
-    assert!(chunks >= 2, "expected a streamed (multi-chunk) synthesis, got {chunks}");
+    assert!(
+        chunks >= 2,
+        "expected a streamed (multi-chunk) synthesis, got {chunks}"
+    );
     assert!(in_bytes > 8_000, "synthesis too short: {in_bytes} B");
     // 2x rate => ~2x bytes; the resampler may still hold < one chunk (1024
     // frames = 4096 output bytes) of tail.
@@ -699,8 +782,15 @@ async fn test_egress_client_playback_rate_live() {
     // Identity contract live: a client at the provider rate costs nothing.
     let mut id = StreamResampler::new();
     assert!(
-        egress_to_client_rate(&mut id, &[0u8; 4096], "linear16", SAMPLE_RATE, SAMPLE_RATE, SAMPLE_RATE)
-            .is_none(),
+        egress_to_client_rate(
+            &mut id,
+            &[0u8; 4096],
+            "linear16",
+            SAMPLE_RATE,
+            SAMPLE_RATE,
+            SAMPLE_RATE
+        )
+        .is_none(),
         "identity must be zero-work"
     );
 }

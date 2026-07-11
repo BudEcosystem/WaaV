@@ -60,16 +60,20 @@ fn openapi_spec_matches_committed_artifact() {
         let committed_lines: Vec<&str> = committed.lines().collect();
         let generated_lines: Vec<&str> = generated.lines().collect();
         let mut first_diff = None;
-        for (i, (c, g)) in committed_lines.iter().zip(generated_lines.iter()).enumerate() {
+        for (i, (c, g)) in committed_lines
+            .iter()
+            .zip(generated_lines.iter())
+            .enumerate()
+        {
             if c != g {
                 first_diff = Some((i + 1, *c, *g));
                 break;
             }
         }
         let detail = match first_diff {
-            Some((line, c, g)) => format!(
-                "first divergence at line {line}:\n  committed: {c}\n  generated: {g}"
-            ),
+            Some((line, c, g)) => {
+                format!("first divergence at line {line}:\n  committed: {c}\n  generated: {g}")
+            }
             None => format!(
                 "line counts differ (committed {} vs generated {})",
                 committed_lines.len(),

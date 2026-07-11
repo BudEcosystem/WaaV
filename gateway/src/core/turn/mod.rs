@@ -41,4 +41,7 @@ pub mod strategy;
 
 pub use controller::{TurnController, TurnEvent};
 pub use signal::ControllerSignal;
-pub use strategy::{StartVerdict, StopVerdict, TurnCtx, UserMuteStrategy, UserTurnStartStrategy, UserTurnStopStrategy};
+pub use strategy::{
+    StartVerdict, StopVerdict, TurnCtx, UserMuteStrategy, UserTurnStartStrategy,
+    UserTurnStopStrategy,
+};

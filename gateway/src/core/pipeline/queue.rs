@@ -57,7 +57,6 @@ impl FramePriority {
     }
 }
 
-
 impl PartialOrd for FramePriority {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -236,10 +235,8 @@ impl FramePriorityQueue {
     /// Create a new queue with the specified capacity.
     ///
     /// # Arguments
-    /// * `capacity` - Maximum number of frames to hold. Must be > 0.
+    /// * `capacity` - Maximum number of frames to hold. A zero-capacity queue drops every frame.
     pub fn new(capacity: usize) -> Self {
-        assert!(capacity > 0, "Queue capacity must be greater than 0");
-
         Self {
             heap: Mutex::new(BinaryHeap::with_capacity(capacity)),
             capacity,
@@ -261,21 +258,27 @@ impl FramePriorityQueue {
         let frame = frame.with_sequence(seq);
         let frame_bytes = frame.len() as u64;
 
-        let mut heap = self.heap.lock();
         self.total_pushed.fetch_add(1, AtomicOrdering::Relaxed);
         self.total_bytes_pushed
             .fetch_add(frame_bytes, AtomicOrdering::Relaxed);
 
+        if self.capacity == 0 {
+            self.total_dropped.fetch_add(1, AtomicOrdering::Relaxed);
+            return false;
+        }
+
+        let mut heap = self.heap.lock();
         if heap.len() >= self.capacity {
             // Queue is full, need to drop something
             // Find the minimum (lowest priority, oldest) frame in the queue
             let min_priority = self.find_min_priority_locked(&heap);
             if let Some(min_prio) = min_priority
-                && frame.priority < min_prio {
-                    // New frame has lower priority than everything in queue, drop it
-                    self.total_dropped.fetch_add(1, AtomicOrdering::Relaxed);
-                    return false;
-                }
+                && frame.priority < min_prio
+            {
+                // New frame has lower priority than everything in queue, drop it
+                self.total_dropped.fetch_add(1, AtomicOrdering::Relaxed);
+                return false;
+            }
             // Evict the lowest priority frame (which is the minimum)
             // Since BinaryHeap is a max-heap, we need to find and remove the min
             // This is O(n) but acceptable for bounded small queues
@@ -294,19 +297,25 @@ impl FramePriorityQueue {
         let frame = frame.with_sequence(seq);
         let frame_bytes = frame.len() as u64;
 
-        let mut heap = self.heap.lock();
         self.total_pushed.fetch_add(1, AtomicOrdering::Relaxed);
         self.total_bytes_pushed
             .fetch_add(frame_bytes, AtomicOrdering::Relaxed);
 
+        if self.capacity == 0 {
+            self.total_dropped.fetch_add(1, AtomicOrdering::Relaxed);
+            return (false, Some(frame));
+        }
+
+        let mut heap = self.heap.lock();
         if heap.len() >= self.capacity {
             // Find the minimum (lowest priority, oldest) frame in the queue
             let min_priority = self.find_min_priority_locked(&heap);
             if let Some(min_prio) = min_priority
-                && frame.priority < min_prio {
-                    self.total_dropped.fetch_add(1, AtomicOrdering::Relaxed);
-                    return (false, Some(frame));
-                }
+                && frame.priority < min_prio
+            {
+                self.total_dropped.fetch_add(1, AtomicOrdering::Relaxed);
+                return (false, Some(frame));
+            }
             let evicted = self.evict_min_locked(&mut heap);
             if evicted.is_some() {
                 self.total_dropped.fetch_add(1, AtomicOrdering::Relaxed);
@@ -666,9 +675,37 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "capacity must be greater than 0")]
-    fn test_queue_zero_capacity_panics() {
-        let _ = FramePriorityQueue::new(0);
+    fn test_queue_zero_capacity_drops_every_push() {
+        let queue = FramePriorityQueue::new(0);
+
+        assert_eq!(queue.capacity(), 0);
+        assert!(queue.is_full());
+        assert!(!queue.push(PriorityFrame::critical(Bytes::from_static(b"drop"))));
+        assert_eq!(queue.len(), 0);
+        assert!(queue.pop().is_none());
+
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.current_len, 0);
+        assert_eq!(snapshot.total_pushed, 1);
+        assert_eq!(snapshot.total_dropped, 1);
+        assert_eq!(snapshot.total_bytes_pushed, 4);
+        assert_eq!(snapshot.drop_rate(), 100.0);
+        assert_eq!(snapshot.utilization(), 0.0);
+    }
+
+    #[test]
+    fn test_queue_zero_capacity_push_with_evicted_returns_rejected_frame() {
+        let queue = FramePriorityQueue::new(0);
+        let frame = PriorityFrame::high(Bytes::from_static(b"reject")).with_id(7);
+
+        let (added, evicted) = queue.push_with_evicted(frame);
+
+        assert!(!added);
+        let evicted = evicted.expect("zero-capacity queue returns the rejected frame");
+        assert_eq!(evicted.frame_id, Some(7));
+        assert_eq!(evicted.data, Bytes::from_static(b"reject"));
+        assert_eq!(queue.len(), 0);
+        assert_eq!(queue.snapshot().total_dropped, 1);
     }
 
     #[test]

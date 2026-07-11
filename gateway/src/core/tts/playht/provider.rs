@@ -475,7 +475,7 @@ impl PlayHtTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             request_builder,
             config_hash,
         })
@@ -524,7 +524,7 @@ impl PlayHtTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             request_builder,
             config_hash,
         })
@@ -538,9 +538,7 @@ impl PlayHtTts {
     /// through the `extras` passthrough), then constructs the provider via [`Self::with_config`].
     /// Capability gaps (pitch, volume, stability, similarity_boost, use_speaker_boost, emotion,
     /// instructions, ssml, word_timestamps, streaming) have no Play.ht field and are skipped.
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let playht_config = PlayHtTtsConfig::from_standard(std);
         Self::with_config(playht_config)
     }
@@ -777,7 +775,10 @@ impl BaseTTS for PlayHtTts {
             .generic_connect_with_config(
                 &crate::core::tts::standard::override_rest_endpoint(
                     PLAYHT_TTS_URL,
-                    self.request_builder.playht_config.endpoint_override.as_deref(),
+                    self.request_builder
+                        .playht_config
+                        .endpoint_override
+                        .as_deref(),
                 ),
                 &self.request_builder.config,
             )
@@ -957,6 +958,29 @@ mod tests {
         assert_eq!(cfg.base.api_key, "k");
     }
 
+    #[test]
+    fn from_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut extras = serde_json::Map::new();
+        extras.insert("user_id".into(), serde_json::json!("user-123"));
+        let std = crate::core::tts::standard::StandardTTSConfig {
+            base: TTSConfig {
+                provider: "playht".into(),
+                api_key: "k".into(),
+                voice_id: Some("s3://test-voice/manifest.json".into()),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        }
+        .with_endpoint_override("http://127.0.0.1:9000");
+
+        match PlayHtTts::from_standard(&std) {
+            Ok(_) => panic!("PlayHT provider construction must reject unsafe endpoint_override"),
+            Err(err) => assert!(err.to_string().contains("SSRF protection")),
+        }
+    }
+
     // WIRE-LEVEL (recurring bug class: assert the request BODY, not just the config struct): the
     // standardized `emotion` feature must reach the `emotion` field of the JSON body POSTed to
     // https://api.play.ht/api/v2/tts/stream — the exact body `build_request_body` serializes.
@@ -996,7 +1020,10 @@ mod tests {
         use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
         let mut extras = serde_json::Map::new();
         extras.insert("user_id".into(), serde_json::json!("user-123"));
-        extras.insert("voice_conditioning_seconds_2".into(), serde_json::json!(15.0));
+        extras.insert(
+            "voice_conditioning_seconds_2".into(),
+            serde_json::json!(15.0),
+        );
         let std = StandardTTSConfig {
             base: TTSConfig {
                 provider: "playht".into(),

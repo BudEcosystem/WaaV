@@ -12,6 +12,15 @@ use super::{
     MIN_TEMPERATURE,
 };
 
+fn validate_playht_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Voice Engine / Model
 // =============================================================================
@@ -707,6 +716,10 @@ impl PlayHtTtsConfig {
             ));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_playht_tts_endpoint("endpoint_override", endpoint)?;
+        }
+
         Ok(())
     }
 
@@ -773,6 +786,57 @@ mod tests {
         assert_eq!(cfg.seed, Some(42));
         assert_eq!(cfg.sample_rate, 24000);
         assert_eq!(cfg.user_id, "user-123"); // from provider_extras passthrough
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = PlayHtTtsConfig::from_base(
+            TTSConfig {
+                provider: "playht".into(),
+                api_key: "k".into(),
+                voice_id: Some("s3://test-voice/manifest.json".into()),
+                ..Default::default()
+            },
+            "user-123".to_string(),
+        );
+
+        config.endpoint_override = Some("https://playht-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://playht-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected for REST PlayHT");
+        assert!(err.contains("URL scheme"));
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("user_id".into(), serde_json::json!("user-123"));
+        let std = crate::core::tts::standard::StandardTTSConfig {
+            base: TTSConfig {
+                provider: "playht".into(),
+                api_key: "k".into(),
+                voice_id: Some("s3://test-voice/manifest.json".into()),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        }
+        .with_endpoint_override("file:///tmp/socket");
+        let cfg = PlayHtTtsConfig::from_standard(&std);
+        assert!(cfg.validate().is_err());
     }
 
     // =========================================================================

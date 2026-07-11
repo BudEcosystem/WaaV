@@ -26,7 +26,7 @@ import type {
  */
 export function parseConfigFromAttributes(element: HTMLElement): WidgetConfig {
   const config: WidgetConfig = {
-    gatewayUrl: element.dataset.gatewayUrl || 'ws://localhost:3009/ws',
+    gatewayUrl: element.dataset.gatewayUrl || 'ws://localhost:3001/ws',
     apiKey: element.dataset.apiKey || element.dataset.authToken,
     // P3 proxy/alias: a server-defined name resolved to a full agent bundle.
     alias: element.dataset.alias,
@@ -164,7 +164,18 @@ function parseConversationFromAttributes(
 
   // Core LLM
   if (d.llmSystemPrompt !== undefined) conv.systemPrompt = d.llmSystemPrompt;
-  if (d.llmApiKey !== undefined) conv.apiKey = d.llmApiKey;
+  if (d.llmApiKey !== undefined) {
+    // SECURITY: a data-llm-api-key attribute puts a RAW upstream provider key in the page DOM —
+    // any end user can read it via view-source/devtools, and it is forwarded on the wire. The safe
+    // pattern is a server-side alias (the gateway's `alias` config resolves provider keys
+    // server-side; the page only ever carries the gateway auth token). Warn loudly; do not block
+    // (self-hosted demos may accept the tradeoff knowingly).
+    console.warn(
+      '[waav-widget] data-llm-api-key embeds a raw LLM provider key in the page DOM — any visitor ' +
+        'can read it. Use a server-side alias config on the gateway instead and drop this attribute.'
+    );
+    conv.apiKey = d.llmApiKey;
+  }
   const temperature = parseFloatAttr(d.llmTemperature);
   if (temperature !== undefined) conv.temperature = temperature;
   const maxTokens = parseIntAttr(d.llmMaxTokens);
@@ -202,7 +213,13 @@ function parseConversationFromAttributes(
     conv.reasoningEffort = d.llmReasoningEffort as ReasoningEffort;
   if (d.llmReasoningModel !== undefined) conv.reasoningModel = d.llmReasoningModel;
   if (d.llmReasoningBaseUrl !== undefined) conv.reasoningBaseUrl = d.llmReasoningBaseUrl;
-  if (d.llmReasoningApiKey !== undefined) conv.reasoningApiKey = d.llmReasoningApiKey;
+  if (d.llmReasoningApiKey !== undefined) {
+    console.warn(
+      '[waav-widget] data-llm-reasoning-api-key embeds a raw provider key in the page DOM — any ' +
+        'visitor can read it. Use a server-side alias config on the gateway instead.'
+    );
+    conv.reasoningApiKey = d.llmReasoningApiKey;
+  }
   if (d.llmReasoningProviderKind !== undefined)
     conv.reasoningProviderKind = d.llmReasoningProviderKind as AdapterKind;
   if (d.llmReasoningRoute !== undefined) conv.reasoningRoute = d.llmReasoningRoute as RoutingMode;
@@ -374,7 +391,7 @@ function parseMode(value: string | undefined): 'push-to-talk' | 'vad' | 'realtim
  */
 export function mergeConfig(config: Partial<WidgetConfig>): WidgetConfig {
   return {
-    gatewayUrl: config.gatewayUrl || 'ws://localhost:3009/ws',
+    gatewayUrl: config.gatewayUrl || 'ws://localhost:3001/ws',
     apiKey: config.apiKey,
     // P3 proxy/alias: carry the server-defined alias name through (it was being
     // dropped by this explicit-field rebuild — a real bug the alias test caught).

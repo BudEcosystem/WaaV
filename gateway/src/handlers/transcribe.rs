@@ -28,10 +28,13 @@ use serde_json::json;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::config::ServerConfig;
+#[cfg(test)]
+use crate::core::stt::batch::decode_inline_batch_audio_with_limit;
 use crate::core::stt::batch::{
     BatchHttpBody, BatchJob, BatchStatus, BatchSubmission, BatchTranscribeRequest,
     batch_provider_supported, build_assemblyai_transcript, build_deepgram_prerecorded,
-    build_openai_transcription,
+    build_openai_transcription, decode_inline_batch_audio, validate_batch_base_url,
 };
 use crate::state::AppState;
 
@@ -68,13 +71,15 @@ pub async fn submit_batch(
     let job_id = Uuid::new_v4().to_string();
 
     // Build the provider-native submission. AssemblyAI bytes need a prior upload (done below).
-    let base_url = endpoint_override(&req).map(|s| s.to_string());
-    let submission = match build_submission(&provider, &req, &api_key, base_url.as_deref(), &state)
-        .await
-    {
-        Ok(s) => s,
+    let base_url = match endpoint_override(&req, &provider) {
+        Ok(url) => url,
         Err(e) => return err(StatusCode::BAD_REQUEST, &e),
     };
+    let submission =
+        match build_submission(&provider, &req, &api_key, base_url.as_deref(), &state).await {
+            Ok(s) => s,
+            Err(e) => return err(StatusCode::BAD_REQUEST, &e),
+        };
 
     let warnings = submission.config_warnings.clone();
     if submission.is_async {
@@ -84,8 +89,7 @@ pub async fn submit_batch(
             Ok((status, body)) if status.is_success() => {
                 // Provider job-id (Deepgram `request_id` / AssemblyAI `id`) is recorded inside the
                 // stored job's result so a later poll/callback can be correlated.
-                let provider_job =
-                    body.get("request_id").or_else(|| body.get("id")).cloned();
+                let provider_job = body.get("request_id").or_else(|| body.get("id")).cloned();
                 let mut job = BatchJob::queued(&job_id, warnings);
                 job.result = provider_job.map(|pj| json!({ "provider_job": pj }));
                 state.batch_jobs.insert(job_id.clone(), job.clone());
@@ -123,10 +127,7 @@ pub async fn submit_batch(
 }
 
 /// `GET /transcribe/batch/{job_id}`
-pub async fn get_batch(
-    State(state): State<Arc<AppState>>,
-    Path(job_id): Path<String>,
-) -> Response {
+pub async fn get_batch(State(state): State<Arc<AppState>>, Path(job_id): Path<String>) -> Response {
     match state.batch_jobs.get(&job_id) {
         Some(job) => ok(job.value()),
         None => err(
@@ -141,20 +142,50 @@ pub async fn get_batch(
 // ---------------------------------------------------------------------------------------------
 
 /// The endpoint override (mock/proxy host) from the standardized `extras`, if present.
-fn endpoint_override(req: &BatchTranscribeRequest) -> Option<&str> {
-    req.config.endpoint_override()
+fn endpoint_override(
+    req: &BatchTranscribeRequest,
+    provider: &str,
+) -> Result<Option<String>, String> {
+    let Some(raw) = req.config.endpoint_override() else {
+        return Ok(None);
+    };
+    let endpoint = raw.trim();
+    if endpoint.is_empty() {
+        return Ok(None);
+    }
+    validate_batch_base_url(provider, endpoint)?;
+    Ok(Some(endpoint.to_string()))
 }
 
 /// Resolve the provider credential (client-supplied first, then server config).
 fn resolve_key(state: &AppState, req: &BatchTranscribeRequest) -> Result<String, String> {
+    resolve_key_from_config(&state.config, req)
+}
+
+fn resolve_key_from_config(
+    config: &ServerConfig,
+    req: &BatchTranscribeRequest,
+) -> Result<String, String> {
     let provider = req.config.base.provider.to_lowercase();
-    if !req.config.base.api_key.trim().is_empty() {
-        return Ok(req.config.base.api_key.trim().to_string());
+    if let Some(client_key) = client_batch_api_key(&provider, &req.config.base.api_key)? {
+        return Ok(client_key);
     }
-    state
-        .config
+    config
         .get_api_key(&provider)
         .map_err(|e| format!("{e} (set a client `api_key` or configure the server)"))
+}
+
+fn client_batch_api_key(provider: &str, api_key: &str) -> Result<Option<String>, String> {
+    let key = api_key.trim();
+    if key.is_empty() {
+        return Ok(None);
+    }
+    if provider != "google" && crate::config::utils::is_placeholder_credential(key) {
+        return Err(format!(
+            "{provider} API key is a placeholder/empty - set a real client `api_key` or configure the server"
+        ));
+    }
+    Ok(Some(key.to_string()))
 }
 
 /// Build the per-provider submission, performing the AssemblyAI bytes→upload step when needed.
@@ -195,14 +226,7 @@ async fn upload_assemblyai(
     api_key: &str,
     audio_base64: &str,
 ) -> Result<String, String> {
-    use base64::Engine;
-    let payload = audio_base64
-        .rsplit_once("base64,")
-        .map(|(_, b)| b)
-        .unwrap_or(audio_base64);
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(payload.trim())
-        .map_err(|e| format!("invalid base64 audio: {e}"))?;
+    let bytes = decode_assemblyai_upload_audio(audio_base64)?;
     let client = http_client()?;
     let resp = client
         .post(format!("{}/v2/upload", host.trim_end_matches('/')))
@@ -224,6 +248,18 @@ async fn upload_assemblyai(
         .and_then(|u| u.as_str())
         .map(str::to_string)
         .ok_or_else(|| "assemblyai upload returned no upload_url".to_string())
+}
+
+fn decode_assemblyai_upload_audio(audio_base64: &str) -> Result<Vec<u8>, String> {
+    decode_inline_batch_audio(audio_base64)
+}
+
+#[cfg(test)]
+fn decode_assemblyai_upload_audio_with_limit(
+    audio_base64: &str,
+    max_decoded_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    decode_inline_batch_audio_with_limit(audio_base64, max_decoded_bytes)
 }
 
 /// Execute a built submission with `reqwest`, returning `(status, json_body)`. A non-JSON body is
@@ -270,7 +306,7 @@ async fn execute(sub: &BatchSubmission) -> Result<(StatusCode, serde_json::Value
 
 /// A reqwest client with the batch timeout.
 fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
         .timeout(Duration::from_secs(BATCH_HTTP_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("http client build failed: {e}"))
@@ -297,4 +333,230 @@ fn ok(job: &BatchJob) -> Response {
 /// A plain error response.
 fn err(code: StatusCode, msg: &str) -> Response {
     (code, Json(json!({ "error": msg }))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{DAGTimeoutsConfig, PluginConfig};
+    use crate::core::stt::STTConfig;
+    use crate::core::stt::batch::{BatchAudioSource, BatchFeatures};
+    use crate::core::stt::standard::StandardSTTConfig;
+
+    fn req_with_endpoint(endpoint: &str) -> BatchTranscribeRequest {
+        BatchTranscribeRequest {
+            audio: BatchAudioSource::Bytes {
+                audio_base64: "AAAA".into(),
+                content_type: None,
+            },
+            config: StandardSTTConfig::from_base(STTConfig {
+                provider: "openai".into(),
+                ..Default::default()
+            })
+            .with_endpoint_override(endpoint),
+            batch: BatchFeatures::default(),
+            callback_url: None,
+            callback_method: None,
+            translation: None,
+        }
+    }
+
+    fn req_with_api_key(provider: &str, api_key: &str) -> BatchTranscribeRequest {
+        BatchTranscribeRequest {
+            audio: BatchAudioSource::Bytes {
+                audio_base64: "AAAA".into(),
+                content_type: None,
+            },
+            config: StandardSTTConfig::from_base(STTConfig {
+                provider: provider.into(),
+                api_key: api_key.into(),
+                ..Default::default()
+            }),
+            batch: BatchFeatures::default(),
+            callback_url: None,
+            callback_method: None,
+            translation: None,
+        }
+    }
+
+    fn server_config_with_openai_key(api_key: Option<&str>) -> ServerConfig {
+        ServerConfig {
+            host: "localhost".to_string(),
+            port: 3001,
+            tls: None,
+            livekit_url: "ws://localhost:7880".to_string(),
+            livekit_public_url: "http://localhost:7880".to_string(),
+            livekit_api_key: None,
+            livekit_api_secret: None,
+            deepgram_api_key: None,
+            elevenlabs_api_key: None,
+            google_credentials: None,
+            azure_speech_subscription_key: None,
+            azure_speech_region: None,
+            cartesia_api_key: None,
+            openai_api_key: api_key.map(str::to_string),
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
+            assemblyai_api_key: None,
+            hume_api_key: None,
+            lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
+            recording_s3_bucket: None,
+            recording_s3_region: None,
+            recording_s3_endpoint: None,
+            recording_s3_access_key: None,
+            recording_s3_secret_key: None,
+            recording_s3_prefix: None,
+            cache_path: None,
+            cache_ttl_seconds: Some(3600),
+            auth_service_url: None,
+            auth_signing_key_path: None,
+            auth_api_secrets: Vec::new(),
+            auth_timeout_seconds: 5,
+            auth_required: false,
+            sip: None,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
+            plugins: PluginConfig::default(),
+            dag_timeouts: DAGTimeoutsConfig::default(),
+        }
+    }
+
+    #[test]
+    fn batch_client_placeholder_api_key_is_rejected_before_provider_call() {
+        let config = server_config_with_openai_key(Some("server-openai-key"));
+        let req = req_with_api_key("openai", "  your-openai-api-key  ");
+
+        let err = resolve_key_from_config(&config, &req)
+            .expect_err("placeholder BYOK must not be forwarded to providers");
+
+        assert!(
+            err.contains("placeholder"),
+            "error should explain placeholder rejection: {err}"
+        );
+    }
+
+    #[test]
+    fn batch_blank_client_api_key_falls_back_to_server_config() {
+        let config = server_config_with_openai_key(Some("server-openai-key"));
+        let req = req_with_api_key("openai", " \n\t ");
+
+        let key = resolve_key_from_config(&config, &req)
+            .expect("blank BYOK should be treated as absent and use server config");
+
+        assert_eq!(key, "server-openai-key");
+    }
+
+    #[test]
+    fn batch_real_client_api_key_is_trimmed_and_used() {
+        let config = server_config_with_openai_key(Some("server-openai-key"));
+        let req = req_with_api_key("openai", "  sk-client  ");
+
+        let key = resolve_key_from_config(&config, &req)
+            .expect("real BYOK should override server config");
+
+        assert_eq!(key, "sk-client");
+    }
+
+    #[test]
+    fn assemblyai_upload_audio_decode_is_size_bounded_before_allocation() {
+        let ok = decode_assemblyai_upload_audio_with_limit("data:audio/wav;base64,QUJD", 3)
+            .expect("three decoded bytes should fit limit");
+        assert_eq!(ok, b"ABC");
+
+        let err = decode_assemblyai_upload_audio_with_limit("QUJD", 2)
+            .expect_err("decoded payload above limit must be rejected");
+        assert!(
+            err.contains("decoded size limit"),
+            "unexpected limit error: {err}"
+        );
+    }
+
+    #[test]
+    fn batch_endpoint_override_is_ssrf_checked_before_submission() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let ok = endpoint_override(&req_with_endpoint("https://example.com/proxy"), "openai")
+            .expect("public endpoint override should pass");
+        assert_eq!(ok.as_deref(), Some("https://example.com/proxy"));
+
+        let err = endpoint_override(&req_with_endpoint("http://127.0.0.1:9000"), "openai")
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        let err = endpoint_override(&req_with_endpoint("file:///tmp/socket"), "openai")
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+
+        let none = endpoint_override(&req_with_endpoint("  "), "openai")
+            .expect("empty endpoint_override is ignored");
+        assert!(none.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_http_client_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let client = http_client().expect("batch HTTP client");
+        let err = client
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
+    }
 }

@@ -23,6 +23,11 @@
 use crate::core::stt::base::STTConfig;
 use serde::{Deserialize, Serialize};
 
+fn validate_amivoice_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    crate::core::net::validate_url_for_ssrf(endpoint, &["ws", "wss"])
+        .map_err(|e| format!("{source} rejected (SSRF protection): {e}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -656,8 +661,17 @@ impl AmiVoiceSTTConfig {
     /// endpoint. The override carries only `scheme://host[:port]`, so the AmiVoice `/v1/` (or
     /// `/v1/nolog/`) path is re-appended — a path-less URL would fail the WS handshake.
     pub fn get_websocket_url(&self) -> String {
-        let path = if self.no_logging { "/v1/nolog/" } else { "/v1/" };
-        match self.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
+        let path = if self.no_logging {
+            "/v1/nolog/"
+        } else {
+            "/v1/"
+        };
+        match self
+            .endpoint_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+        {
             Some(o) => format!("{}{}", o.trim_end_matches('/'), path),
             None if self.no_logging => AMIVOICE_WS_NOLOG_URL.to_string(),
             None => AMIVOICE_WS_URL.to_string(),
@@ -764,6 +778,15 @@ impl AmiVoiceSTTConfig {
             return Err("result_updated_interval must be at least 100ms".to_string());
         }
 
+        if let Some(endpoint) = self
+            .endpoint_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|endpoint| !endpoint.is_empty())
+        {
+            validate_amivoice_stt_endpoint("endpoint_override", endpoint)?;
+        }
+
         Ok(())
     }
 
@@ -788,7 +811,7 @@ mod tests {
     // surface — previously unreachable via the flat factory.
     #[test]
     fn from_standard_maps_features() {
-        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "amivoice".into(),
@@ -814,7 +837,7 @@ mod tests {
     // on the wire (not merely on the config struct — the recurring bug class).
     #[test]
     fn from_standard_advanced_params_reach_start_command() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let extras = ProviderExtras(
             serde_json::json!({
                 "no_input_timeout": 5000,
@@ -856,15 +879,42 @@ mod tests {
         assert_eq!(cfg.recognition_timeout, Some(60000));
         // ...and reach the actual `s` start command sent on the wire.
         let cmd = cfg.build_start_command();
-        assert!(cmd.contains("keepFillerToken=1"), "keepFillerToken missing: {cmd}");
-        assert!(cmd.contains("noInputTimeout=5000"), "noInputTimeout missing: {cmd}");
-        assert!(cmd.contains("extension=tenant-acme"), "extension missing: {cmd}");
-        assert!(cmd.contains("maxDecodingTime=12000"), "maxDecodingTime missing: {cmd}");
-        assert!(cmd.contains("maxResponseTime=8000"), "maxResponseTime missing: {cmd}");
-        assert!(cmd.contains("maxDecodingRate=1.5"), "maxDecodingRate missing: {cmd}");
-        assert!(cmd.contains("targetResponseTime=3000"), "targetResponseTime missing: {cmd}");
-        assert!(cmd.contains("targetDecodingRate=1.2"), "targetDecodingRate missing: {cmd}");
-        assert!(cmd.contains("recognitionTimeout=60000"), "recognitionTimeout missing: {cmd}");
+        assert!(
+            cmd.contains("keepFillerToken=1"),
+            "keepFillerToken missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("noInputTimeout=5000"),
+            "noInputTimeout missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("extension=tenant-acme"),
+            "extension missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("maxDecodingTime=12000"),
+            "maxDecodingTime missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("maxResponseTime=8000"),
+            "maxResponseTime missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("maxDecodingRate=1.5"),
+            "maxDecodingRate missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("targetResponseTime=3000"),
+            "targetResponseTime missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("targetDecodingRate=1.2"),
+            "targetDecodingRate missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("recognitionTimeout=60000"),
+            "recognitionTimeout missing: {cmd}"
+        );
     }
 
     // WIRE-LEVEL negative guard: keepFillerToken must reflect false as `0`, and unset advanced
@@ -876,8 +926,14 @@ mod tests {
         // Nothing set => none of the advanced tokens appear.
         let cmd = cfg.build_start_command();
         for tok in [
-            "keepFillerToken=", "noInputTimeout=", "extension=", "maxDecodingTime=",
-            "maxResponseTime=", "maxDecodingRate=", "targetResponseTime=", "targetDecodingRate=",
+            "keepFillerToken=",
+            "noInputTimeout=",
+            "extension=",
+            "maxDecodingTime=",
+            "maxResponseTime=",
+            "maxDecodingRate=",
+            "targetResponseTime=",
+            "targetDecodingRate=",
             "recognitionTimeout=",
         ] {
             assert!(!cmd.contains(tok), "{tok} leaked when unset: {cmd}");
@@ -885,7 +941,10 @@ mod tests {
         // filler_words=false => keepFillerToken=0 (explicitly retain-off on the wire).
         cfg.keep_filler_words = Some(false);
         let cmd = cfg.build_start_command();
-        assert!(cmd.contains("keepFillerToken=0"), "filler false not emitted as 0: {cmd}");
+        assert!(
+            cmd.contains("keepFillerToken=0"),
+            "filler false not emitted as 0: {cmd}"
+        );
     }
 
     #[test]
@@ -983,6 +1042,53 @@ mod tests {
     }
 
     #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = AmiVoiceSTTConfig {
+            app_key: "test_key".to_string(),
+            endpoint_override: Some("wss://amivoice-proxy.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://amivoice-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-WebSocket endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("https://amivoice-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("HTTP endpoint_override must be rejected for AmiVoice WebSocket dial");
+        assert!(err.contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
+    }
+
+    #[test]
     fn test_build_start_command() {
         let mut config = AmiVoiceSTTConfig::default();
         config.app_key = "TEST_APP_KEY".to_string();
@@ -1020,6 +1126,25 @@ mod tests {
 
         config.no_logging = true;
         assert_eq!(config.get_websocket_url(), AMIVOICE_WS_NOLOG_URL);
+    }
+
+    #[test]
+    fn test_websocket_url_trims_endpoint_override() {
+        let mut config = AmiVoiceSTTConfig {
+            endpoint_override: Some(" wss://amivoice-proxy.example.com/ ".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.get_websocket_url(),
+            "wss://amivoice-proxy.example.com/v1/"
+        );
+
+        config.no_logging = true;
+        assert_eq!(
+            config.get_websocket_url(),
+            "wss://amivoice-proxy.example.com/v1/nolog/"
+        );
     }
 
     #[test]

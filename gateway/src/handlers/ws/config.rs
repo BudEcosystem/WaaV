@@ -15,6 +15,17 @@ use crate::{
     livekit::LiveKitConfig,
 };
 
+/// Normalize a client-supplied BYOK value.
+///
+/// `None`, empty strings, and whitespace-only strings mean "fall back to server
+/// config"; non-empty values are trimmed before being forwarded to providers.
+pub(crate) fn client_api_key(api_key: Option<&str>) -> Option<String> {
+    api_key
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+}
+
 /// DAG configuration for WebSocket messages
 ///
 /// Allows clients to specify a DAG pipeline for audio processing.
@@ -410,7 +421,11 @@ impl STTWebSocketConfig {
     /// provider already handles). See [`crate::core::lang`].
     pub(crate) fn mapped_stt_language(&self) -> String {
         let mapped = self.language_mapping();
-        if mapped.omit { String::new() } else { mapped.native }
+        if mapped.omit {
+            String::new()
+        } else {
+            mapped.native
+        }
     }
 
     /// The full language mapping result (native + warnings) for this STT config. Pure/cheap;
@@ -430,7 +445,10 @@ impl STTWebSocketConfig {
     ///
     /// # Arguments
     /// * `api_key` - The resolved API key (client-provided or server config) for this provider.
-    pub fn to_standard_stt(&self, api_key: String) -> crate::core::stt::standard::StandardSTTConfig {
+    pub fn to_standard_stt(
+        &self,
+        api_key: String,
+    ) -> crate::core::stt::standard::StandardSTTConfig {
         crate::core::stt::standard::StandardSTTConfig {
             base: self.to_stt_config(api_key),
             features: self.features.clone(),
@@ -680,7 +698,10 @@ impl TTSWebSocketConfig {
     ///
     /// # Arguments
     /// * `api_key` - The resolved API key (client-provided or server config) for this provider.
-    pub fn to_standard_tts(&self, api_key: String) -> crate::core::tts::standard::StandardTTSConfig {
+    pub fn to_standard_tts(
+        &self,
+        api_key: String,
+    ) -> crate::core::tts::standard::StandardTTSConfig {
         let mut features = self.features.clone();
         // P2: map the client's TTS `features.language` to THIS provider's native notation at the
         // config→provider boundary (TTS language rides `TtsFeatures.language`, the typed slot every
@@ -688,7 +709,11 @@ impl TTSWebSocketConfig {
         // clears the field so the provider keeps its default. Warnings surface as `config_warning`
         // (see `config_handler::emit_language_config_warnings`).
         if let Some(mapped) = self.mapped_tts_language() {
-            features.language = if mapped.omit { None } else { Some(mapped.native) };
+            features.language = if mapped.omit {
+                None
+            } else {
+                Some(mapped.native)
+            };
         }
         crate::core::tts::standard::StandardTTSConfig {
             base: self.to_tts_config(api_key),
@@ -891,7 +916,10 @@ mod config_tests {
         }))
         .unwrap();
         assert_eq!(c.reasoning_effort, Some(ReasoningEffort::Minimal));
-        assert_eq!(c.to_conversation_config().reasoning_effort, Some(ReasoningEffort::Minimal));
+        assert_eq!(
+            c.to_conversation_config().reasoning_effort,
+            Some(ReasoningEffort::Minimal)
+        );
 
         // Omitted → None (backward-compatible).
         let c2: ConversationWebSocketConfig = serde_json::from_value(serde_json::json!({
@@ -927,7 +955,11 @@ mod config_tests {
             stability: Some(0.9),
             ..Default::default()
         };
-        assert_ne!(h0, compute_tts_config_hash(&with_feat), "features must affect the cache key");
+        assert_ne!(
+            h0,
+            compute_tts_config_hash(&with_feat),
+            "features must affect the cache key"
+        );
 
         // A provider-specific EXTRA must change the cache key too.
         let mut with_extra = base.clone();
@@ -935,7 +967,11 @@ mod config_tests {
             .extras
             .0
             .insert("seed".to_string(), serde_json::json!(424242));
-        assert_ne!(h0, compute_tts_config_hash(&with_extra), "extras must affect the cache key");
+        assert_ne!(
+            h0,
+            compute_tts_config_hash(&with_extra),
+            "extras must affect the cache key"
+        );
 
         // Identical configs hash equal (stable).
         assert_eq!(h0, compute_tts_config_hash(&base.clone()));
@@ -952,8 +988,8 @@ mod config_tests {
             "channels": 1,
             "punctuation": true
         });
-        let cfg: STTWebSocketConfig =
-            serde_json::from_value(json).expect("stt_config should deserialize without encoding/model");
+        let cfg: STTWebSocketConfig = serde_json::from_value(json)
+            .expect("stt_config should deserialize without encoding/model");
         assert_eq!(cfg.encoding, "linear16");
         assert_eq!(cfg.model, "");
         assert_eq!(cfg.provider, "deepgram");
@@ -973,6 +1009,17 @@ mod config_tests {
         let cfg: STTWebSocketConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.encoding, "mulaw");
         assert_eq!(cfg.model, "scribe_v2_realtime");
+    }
+
+    #[test]
+    fn p5_client_api_key_trims_and_treats_blank_as_absent() {
+        assert_eq!(super::client_api_key(None), None);
+        assert_eq!(super::client_api_key(Some("")), None);
+        assert_eq!(super::client_api_key(Some("   \n\t")), None);
+        assert_eq!(
+            super::client_api_key(Some("  sk-live  ")),
+            Some("sk-live".to_string())
+        );
     }
 
     /// Helper: a minimal STT WS config for a provider + raw language.
@@ -1053,19 +1100,34 @@ mod config_tests {
     fn p2_tts_features_language_is_mapped() {
         // TTS language rides features.language. ElevenLabs downgrade: "es-ES" -> "es".
         let el = tts_ws("elevenlabs", "eleven_turbo_v2_5", Some("es-ES"));
-        assert_eq!(el.to_standard_tts("k".into()).features.language.as_deref(), Some("es"));
+        assert_eq!(
+            el.to_standard_tts("k".into()).features.language.as_deref(),
+            Some("es")
+        );
 
         // Reverie TTS composite: the {lang} half is canonical.iso639_1() — "hi-IN" -> "hi".
         let rv = tts_ws("reverie", "indian", Some("hi-IN"));
-        assert_eq!(rv.to_standard_tts("k".into()).features.language.as_deref(), Some("hi"));
+        assert_eq!(
+            rv.to_standard_tts("k".into()).features.language.as_deref(),
+            Some("hi")
+        );
 
         // Google TTS keeps cmn-CN (no script subtag), diverging from Google STT's cmn-Hans-CN.
         let gt = tts_ws("google", "", Some("cmn-CN"));
-        assert_eq!(gt.to_standard_tts("k".into()).features.language.as_deref(), Some("cmn-CN"));
+        assert_eq!(
+            gt.to_standard_tts("k".into()).features.language.as_deref(),
+            Some("cmn-CN")
+        );
 
         // A name spelling resolves too: "spanish" -> es-ES -> elevenlabs "es".
         let name = tts_ws("elevenlabs", "eleven_turbo_v2_5", Some("spanish"));
-        assert_eq!(name.to_standard_tts("k".into()).features.language.as_deref(), Some("es"));
+        assert_eq!(
+            name.to_standard_tts("k".into())
+                .features
+                .language
+                .as_deref(),
+            Some("es")
+        );
     }
 
     #[test]

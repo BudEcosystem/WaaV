@@ -80,7 +80,7 @@ impl Default for STTProcessingConfig {
             stt_speech_final_wait_ms: 1800, // Wait 1.8s for real speech_final from STT (reduced from 2s)
             turn_detection_inference_timeout_ms: 100, // 100ms max for model inference
             speech_final_hard_timeout_ms: 2500, // 2.5s hard upper bound (reduced from 5s for faster response)
-            duplicate_window_ms: 500,       // 500ms duplicate prevention window
+            duplicate_window_ms: 500,           // 500ms duplicate prevention window
             stt_ttfs_p99_ms: None,
         }
     }
@@ -509,8 +509,7 @@ impl STTResultProcessor {
     ) {
         let claimed = {
             let mut state = speech_final_state.write();
-            let generation_ok =
-                state.fire_generation.load(Ordering::Relaxed) == segment_generation;
+            let generation_ok = state.fire_generation.load(Ordering::Relaxed) == segment_generation;
             let still_waiting = state.waiting_for_speech_final.load(Ordering::Acquire);
             if !generation_ok || !still_waiting {
                 debug!(
@@ -605,8 +604,9 @@ impl STTResultProcessor {
         if late.is_empty() {
             return true;
         }
-        let forced: std::collections::HashSet<String> =
-            normalize_words(&state.last_forced_text).into_iter().collect();
+        let forced: std::collections::HashSet<String> = normalize_words(&state.last_forced_text)
+            .into_iter()
+            .collect();
         late.iter().all(|w| forced.contains(w))
     }
 
@@ -734,7 +734,11 @@ mod tests {
         // segment armed then would read as "no active segment" on the next
         // is_final, silently RESTARTING the hard-timeout backstop. The pin
         // is on the PURE clamp (a warm process can't reproduce raw 0).
-        assert_eq!(clamp_clock(0), 1, "first-millisecond clock must not store the sentinel");
+        assert_eq!(
+            clamp_clock(0),
+            1,
+            "first-millisecond clock must not store the sentinel"
+        );
         assert_eq!(clamp_clock(1), 1);
         assert_eq!(clamp_clock(123_456), 123_456);
         assert!(STTResultProcessor::get_current_time_ms_static() >= 1);
@@ -771,8 +775,7 @@ mod tests {
     /// forced fire happens at the floor, not the TTFS-extended wait.
     #[tokio::test]
     async fn finalized_shortens_live_detection_wait() {
-        let config = STTProcessingConfig::new(40, 30, 5000, 100)
-            .with_stt_ttfs_p99_ms(Some(10_000)); // extension would exceed the test budget
+        let config = STTProcessingConfig::new(40, 30, 5000, 100).with_stt_ttfs_p99_ms(Some(10_000)); // extension would exceed the test budget
         let processor = STTResultProcessor::new(config);
         let fires = Arc::new(AtomicUsize::new(0));
         let fires_cb = fires.clone();
@@ -790,7 +793,9 @@ mod tests {
         // finalized flag it would be clamped to 2/3 × 5000 ≈ 3333ms — far
         // beyond this test's window).
         let finalized = STTResult::new("done now".into(), true, false, 0.9).finalized();
-        let _ = processor.process_result(finalized, state.clone(), None).await;
+        let _ = processor
+            .process_result(finalized, state.clone(), None)
+            .await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
             fires.load(Ordering::SeqCst),
@@ -1040,7 +1045,10 @@ mod tests {
                 None,
             )
             .await;
-        assert!(dup.is_none(), "formatting-only differences are still duplicates");
+        assert!(
+            dup.is_none(),
+            "formatting-only differences are still duplicates"
+        );
 
         // But genuinely NEW words within the window are NOT a duplicate.
         let fresh = processor
@@ -1095,7 +1103,10 @@ mod tests {
                 None,
             )
             .await;
-        assert!(dup.is_none(), "fragment of the forced text within the window is a dup");
+        assert!(
+            dup.is_none(),
+            "fragment of the forced text within the window is a dup"
+        );
     }
 
     #[test]

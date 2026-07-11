@@ -894,18 +894,29 @@ impl BaseSTT for AwsTranscribeSTT {
 
         // Wait for the supervisor task to finish
         if let Some(handle) = self.connection_handle.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "aws-transcribe-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         // Clean up forwarding tasks
         if let Some(handle) = self.result_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task(
+                "aws-transcribe-stt-result-forwarder",
+                handle,
+            )
+            .await;
         }
 
         if let Some(handle) = self.error_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task(
+                "aws-transcribe-stt-error-forwarder",
+                handle,
+            )
+            .await;
         }
 
         // Clean up channels and state
@@ -1075,7 +1086,7 @@ mod tests {
     // config — both were hardcoded off on the flat path.
     #[test]
     fn test_new_standard_unlocks_diarization_and_redaction() {
-        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "aws-transcribe".to_string(),
@@ -1101,6 +1112,48 @@ mod tests {
         assert_eq!(cfg.max_speaker_labels, Some(10));
         assert!(cfg.enable_content_redaction);
         assert_eq!(cfg.pii_entity_types, vec!["NAME", "PHONE"]);
+    }
+
+    #[test]
+    fn test_new_standard_rejects_ssrf_endpoint_override() {
+        use crate::core::stt::standard::StandardSTTConfig;
+
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mk = |endpoint: &str| {
+            StandardSTTConfig::from_base(STTConfig {
+                provider: "aws-transcribe".into(),
+                api_key: String::new(),
+                language: "en-US".into(),
+                sample_rate: 16000,
+                channels: 1,
+                punctuation: true,
+                encoding: "pcm".into(),
+                model: String::new(),
+            })
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(
+            AwsTranscribeSTT::new_standard(&mk("https://transcribe-proxy.example.com")).is_ok()
+        );
+        assert!(AwsTranscribeSTT::new_standard(&mk("http://127.0.0.1:9000")).is_err());
+        assert!(AwsTranscribeSTT::new_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(AwsTranscribeSTT::new_standard(&mk("ws://transcribe-proxy.example.com")).is_err());
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[tokio::test]
@@ -1192,7 +1245,7 @@ mod tests {
     // the exact same `apply_request_params` the live `start_connection` path uses.
     // =========================================================================
 
-    use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+    use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
     use aws_sdk_transcribestreaming::operation::start_stream_transcription::StartStreamTranscriptionInput;
 
     /// Build the SDK request-input builder the way the live path does, from a standardized config.
@@ -1229,8 +1282,14 @@ mod tests {
 
         // Array form.
         let mut ex = serde_json::Map::new();
-        ex.insert("language_options".into(), serde_json::json!(["en-US", "es-US"]));
-        ex.insert("identify_multiple_languages".into(), serde_json::json!(true));
+        ex.insert(
+            "language_options".into(),
+            serde_json::json!(["en-US", "es-US"]),
+        );
+        ex.insert(
+            "identify_multiple_languages".into(),
+            serde_json::json!(true),
+        );
         let b = wire_input(SttFeatures::default(), ex);
         assert_eq!(
             b.get_language_options().as_deref(),
@@ -1255,7 +1314,10 @@ mod tests {
         assert!(b.get_language_code().is_some());
 
         let mut ex = serde_json::Map::new();
-        ex.insert("identify_multiple_languages".into(), serde_json::json!(true));
+        ex.insert(
+            "identify_multiple_languages".into(),
+            serde_json::json!(true),
+        );
         let b = wire_input(SttFeatures::default(), ex);
         assert_eq!(
             b.get_identify_multiple_languages(),
@@ -1276,7 +1338,10 @@ mod tests {
         assert!(b.get_vocabulary_names().is_none());
 
         let mut ex = serde_json::Map::new();
-        ex.insert("vocabulary_names".into(), serde_json::json!("medical-en,medical-es"));
+        ex.insert(
+            "vocabulary_names".into(),
+            serde_json::json!("medical-en,medical-es"),
+        );
         let b = wire_input(SttFeatures::default(), ex);
         assert_eq!(
             b.get_vocabulary_names().as_deref(),
@@ -1292,7 +1357,10 @@ mod tests {
         assert!(b.get_vocabulary_filter_names().is_none());
 
         let mut ex = serde_json::Map::new();
-        ex.insert("vocabulary_filter_names".into(), serde_json::json!("filt-en,filt-es"));
+        ex.insert(
+            "vocabulary_filter_names".into(),
+            serde_json::json!("filt-en,filt-es"),
+        );
         let b = wire_input(SttFeatures::default(), ex);
         assert_eq!(
             b.get_vocabulary_filter_names().as_deref(),
@@ -1326,7 +1394,10 @@ mod tests {
         assert!(b.get_content_identification_type().is_none());
 
         let mut ex = serde_json::Map::new();
-        ex.insert("content_identification_type".into(), serde_json::json!("PII"));
+        ex.insert(
+            "content_identification_type".into(),
+            serde_json::json!("PII"),
+        );
         // Even if redaction is ALSO requested, identification wins and redaction stays off.
         let b = wire_input(
             SttFeatures {
@@ -1350,18 +1421,33 @@ mod tests {
     #[test]
     fn from_standard_all_six_streaming_features_reach_the_request() {
         let mut ex = serde_json::Map::new();
-        ex.insert("language_options".into(), serde_json::json!(["en-US", "es-US"]));
-        ex.insert("identify_multiple_languages".into(), serde_json::json!(true));
+        ex.insert(
+            "language_options".into(),
+            serde_json::json!(["en-US", "es-US"]),
+        );
+        ex.insert(
+            "identify_multiple_languages".into(),
+            serde_json::json!(true),
+        );
         ex.insert("vocabulary_names".into(), serde_json::json!("v-en,v-es"));
-        ex.insert("vocabulary_filter_names".into(), serde_json::json!("f-en,f-es"));
+        ex.insert(
+            "vocabulary_filter_names".into(),
+            serde_json::json!("f-en,f-es"),
+        );
         ex.insert("session_resume_window".into(), serde_json::json!(45));
-        ex.insert("content_identification_type".into(), serde_json::json!("PII"));
+        ex.insert(
+            "content_identification_type".into(),
+            serde_json::json!("PII"),
+        );
 
         let b = wire_input(SttFeatures::default(), ex);
         assert_eq!(b.get_language_options().as_deref(), Some("en-US,es-US"));
         assert_eq!(b.get_identify_multiple_languages(), &Some(true));
         assert_eq!(b.get_vocabulary_names().as_deref(), Some("v-en,v-es"));
-        assert_eq!(b.get_vocabulary_filter_names().as_deref(), Some("f-en,f-es"));
+        assert_eq!(
+            b.get_vocabulary_filter_names().as_deref(),
+            Some("f-en,f-es")
+        );
         assert_eq!(b.get_session_resume_window(), &Some(45));
         assert_eq!(
             b.get_content_identification_type(),

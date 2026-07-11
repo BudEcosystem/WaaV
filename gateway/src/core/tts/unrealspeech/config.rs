@@ -7,6 +7,17 @@ use std::fmt;
 
 use crate::core::tts::base::{TTSConfig, TTSError, TTSResult};
 
+fn validate_unrealspeech_tts_endpoint(source: &str, endpoint: &str) -> TTSResult<()> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}")),
+    )
+}
+
 // =============================================================================
 // Voice Types
 // =============================================================================
@@ -449,11 +460,9 @@ impl UnrealSpeechTtsConfig {
     /// Create configuration from base TTSConfig
     pub fn from_base(config: &TTSConfig) -> TTSResult<Self> {
         // Get API key from config or environment
-        let api_key = if !config.api_key.is_empty() {
-            config.api_key.clone()
-        } else {
-            std::env::var("UNREALSPEECH_API_KEY").unwrap_or_default()
-        };
+        let api_key = crate::core::credentials::explicit_api_key(&config.api_key)
+            .or_else(|| crate::core::credentials::env_api_key("UNREALSPEECH_API_KEY"))
+            .unwrap_or_default();
 
         if api_key.is_empty() {
             return Err(TTSError::InvalidConfiguration(
@@ -535,6 +544,7 @@ impl UnrealSpeechTtsConfig {
         }
 
         cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate()?;
 
         Ok(cfg)
     }
@@ -595,6 +605,9 @@ impl UnrealSpeechTtsConfig {
 
         Self::validate_speed(self.speed)?;
         Self::validate_pitch(self.pitch)?;
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_unrealspeech_tts_endpoint("endpoint_override", endpoint)?;
+        }
 
         Ok(())
     }
@@ -737,14 +750,23 @@ mod tests {
             extras: ProviderExtras(extras),
         };
         let cfg = UnrealSpeechTtsConfig::from_standard(&std).unwrap();
-        let body = serde_json::to_string(&UnrealSpeechStreamRequest::from_config(&cfg, "hi")).unwrap();
-        assert!(body.contains("\"Codec\":\"pcm_s16le\""), "codec missing from body: {body}");
-        assert!(body.contains("\"Temperature\":0.35"), "temperature missing from body: {body}");
+        let body =
+            serde_json::to_string(&UnrealSpeechStreamRequest::from_config(&cfg, "hi")).unwrap();
+        assert!(
+            body.contains("\"Codec\":\"pcm_s16le\""),
+            "codec missing from body: {body}"
+        );
+        assert!(
+            body.contains("\"Temperature\":0.35"),
+            "temperature missing from body: {body}"
+        );
 
         // Default config (no temperature): the `Temperature` field must be omitted entirely.
-        let default_body =
-            serde_json::to_string(&UnrealSpeechStreamRequest::from_config(&UnrealSpeechTtsConfig::default(), "hi"))
-                .unwrap();
+        let default_body = serde_json::to_string(&UnrealSpeechStreamRequest::from_config(
+            &UnrealSpeechTtsConfig::default(),
+            "hi",
+        ))
+        .unwrap();
         assert!(
             !default_body.contains("Temperature"),
             "Temperature must be omitted when unset: {default_body}"
@@ -928,6 +950,48 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = UnrealSpeechTtsConfig {
+            api_key: "test-key".to_string(),
+            voice: UnrealSpeechVoice::Scarlett,
+            speed: 0.0,
+            pitch: 1.0,
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://unrealspeech-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://unrealspeech-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected for REST UnrealSpeech");
+        assert!(err.to_string().contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "unrealspeech".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("Dan".into()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(UnrealSpeechTtsConfig::from_standard(&std).is_err());
     }
 
     #[test]

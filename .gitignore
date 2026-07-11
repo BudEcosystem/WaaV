@@ -182,3 +182,7 @@ data/
 # -----------------------------------------------------------------------------
 .cursor/cache/
 .cursor/tmp/
+
+# Regeneratable byte-identity golden dumps (produced by torch_runtime/dump_*_golden.py /
+# the model onboarding harnesses) — never committed, rebuild on demand.
+inferv2/REVIEW/*_golden*/

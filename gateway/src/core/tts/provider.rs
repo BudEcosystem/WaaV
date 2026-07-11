@@ -21,6 +21,33 @@ use xxhash_rust::xxh3::xxh3_128;
 /// truth instead of the declaration.
 type AudioPayload = (Vec<u8>, Option<&'static str>);
 
+fn pcm_bytes_per_sample(format: &str) -> Option<usize> {
+    match format {
+        "linear16" | "pcm" | "pcm16" => Some(2),
+        "mulaw" | "ulaw" | "alaw" => Some(1),
+        _ => None,
+    }
+}
+
+fn pcm_stream_chunk_bytes(sample_rate: u32, bytes_per_sample: usize) -> usize {
+    let bytes_per_sample = bytes_per_sample.max(1);
+    let samples = (sample_rate.max(100) / 100).max(1) as usize;
+    samples
+        .saturating_mul(bytes_per_sample)
+        .max(bytes_per_sample)
+}
+
+fn pcm_duration_ms_for_bytes(bytes_len: usize, format: &str, sample_rate: u32) -> Option<u32> {
+    let bytes_per_sample = pcm_bytes_per_sample(format)?;
+    if sample_rate == 0 {
+        return None;
+    }
+
+    let samples = bytes_len / bytes_per_sample;
+    let duration_ms = (samples as u128).saturating_mul(1000) / u128::from(sample_rate);
+    Some(duration_ms.min(u128::from(u32::MAX)) as u32)
+}
+
 /// Request entry for ordered processing
 struct RequestEntry {
     receiver: mpsc::Receiver<Result<AudioPayload, TTSError>>,
@@ -56,6 +83,9 @@ trait TTSRequestBuilderDyn: Send + Sync {
     ) -> reqwest::RequestBuilder;
     fn get_config(&self) -> &TTSConfig;
     fn get_pronunciation_replacer(&self) -> Option<&PronunciationReplacer>;
+    fn expects_provider_audio_url_response(&self) -> bool;
+    fn provider_audio_url_label(&self) -> &'static str;
+    fn parse_provider_audio_url_response(&self, body: &[u8]) -> TTSResult<Option<String>>;
 }
 
 /// Blanket implementation to convert any TTSRequestBuilder to the trait object version
@@ -75,6 +105,18 @@ impl<T: TTSRequestBuilder> TTSRequestBuilderDyn for T {
 
     fn get_pronunciation_replacer(&self) -> Option<&PronunciationReplacer> {
         TTSRequestBuilder::get_pronunciation_replacer(self)
+    }
+
+    fn expects_provider_audio_url_response(&self) -> bool {
+        TTSRequestBuilder::expects_provider_audio_url_response(self)
+    }
+
+    fn provider_audio_url_label(&self) -> &'static str {
+        TTSRequestBuilder::provider_audio_url_label(self)
+    }
+
+    fn parse_provider_audio_url_response(&self, body: &[u8]) -> TTSResult<Option<String>> {
+        TTSRequestBuilder::parse_provider_audio_url_response(self, body)
     }
 }
 
@@ -160,6 +202,22 @@ pub trait TTSRequestBuilder: Send + Sync {
     fn get_pronunciation_replacer(&self) -> Option<&PronunciationReplacer> {
         None
     }
+
+    /// Whether a successful HTTP response is a JSON envelope containing a provider-hosted audio URL
+    /// instead of the audio bytes themselves.
+    fn expects_provider_audio_url_response(&self) -> bool {
+        false
+    }
+
+    /// Human-readable provider label used in SSRF rejection errors for provider-hosted audio URLs.
+    fn provider_audio_url_label(&self) -> &'static str {
+        "TTS provider"
+    }
+
+    /// Parse a successful response body and return the provider-hosted audio URL, when applicable.
+    fn parse_provider_audio_url_response(&self, _body: &[u8]) -> TTSResult<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// Generic HTTP-based TTS provider implementation using ReqManager
@@ -198,8 +256,8 @@ pub struct TTSProvider {
 
 impl TTSProvider {
     /// Create a new HTTP-based TTS provider instance
-    pub fn new() -> TTSResult<Self> {
-        Ok(Self {
+    pub fn new() -> Self {
+        Self {
             connected: Arc::new(AtomicBool::new(false)),
             audio_callback: Arc::new(RwLock::new(None)),
             pending_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -215,7 +273,106 @@ impl TTSProvider {
             cache: Arc::new(RwLock::new(None)),
             tts_config_hash: Arc::new(RwLock::new(None)),
             previous_text: Arc::new(RwLock::new(None)),
-        })
+        }
+    }
+
+    async fn download_provider_audio_url(
+        provider: &'static str,
+        audio_url: &str,
+    ) -> TTSResult<Vec<u8>> {
+        let audio_url =
+            crate::core::tts::standard::validate_provider_audio_url(provider, audio_url)?;
+        let client = crate::core::net::ssrf_protected_client_builder(
+            crate::core::tts::standard::PROVIDER_AUDIO_URL_SCHEMES,
+        )
+        .build()
+        .map_err(|e| TTSError::NetworkError(format!("Failed to build HTTP client: {e}")))?;
+
+        let response = client
+            .get(audio_url)
+            .send()
+            .await
+            .map_err(|e| TTSError::NetworkError(format!("Failed to download audio: {e}")))?;
+
+        if !response.status().is_success() {
+            return Err(TTSError::ProviderError(format!(
+                "Failed to download audio: status {}",
+                response.status()
+            )));
+        }
+
+        let audio = response
+            .bytes()
+            .await
+            .map_err(|e| TTSError::NetworkError(format!("Failed to read downloaded audio: {e}")))?
+            .to_vec();
+        if audio.is_empty() {
+            return Err(TTSError::AudioGenerationFailed(
+                "Received empty downloaded audio data".to_string(),
+            ));
+        }
+
+        Ok(audio)
+    }
+
+    async fn send_buffered_audio_payload(
+        audio: Vec<u8>,
+        config: &TTSConfig,
+        sender: &mpsc::Sender<Result<AudioPayload, TTSError>>,
+        token: &CancellationToken,
+        cache_and_key: Option<(Arc<CacheStore>, String)>,
+    ) -> TTSResult<()> {
+        if audio.is_empty() {
+            return Err(TTSError::AudioGenerationFailed(
+                "Received empty audio data".to_string(),
+            ));
+        }
+
+        let encoding = config.audio_format.as_deref().unwrap_or("linear16");
+        let sample_rate = config.sample_rate.unwrap_or(24000);
+        let mut chunk_target_bytes = pcm_bytes_per_sample(encoding)
+            .map(|bytes_per_sample| pcm_stream_chunk_bytes(sample_rate, bytes_per_sample))
+            .unwrap_or(0);
+
+        let mut format_override: Option<&'static str> = None;
+        if crate::core::tts::sniff::is_pcm_family(encoding)
+            && let Some(container) = crate::core::tts::sniff::sniff_container(&audio)
+        {
+            error!(
+                declared = encoding,
+                actual = container.as_format_str(),
+                "TTS provider returned a container mislabeled as PCM — passing through unsliced \
+                 with the sniffed format"
+            );
+            crate::core::metrics::bridge::record_tts_format_mismatch(&config.provider, "http");
+            chunk_target_bytes = 0;
+            format_override = Some(container.as_format_str());
+        }
+
+        if chunk_target_bytes == 0 {
+            if !token.is_cancelled() {
+                let _ = sender.send(Ok((audio.clone(), format_override))).await;
+            }
+        } else {
+            for chunk in audio.chunks(chunk_target_bytes) {
+                if token.is_cancelled() {
+                    break;
+                }
+                let _ = sender.send(Ok((chunk.to_vec(), None))).await;
+            }
+        }
+
+        if let Some((cache, key)) = cache_and_key {
+            if format_override.is_some() {
+                tracing::warn!(
+                    "skipping TTS cache write: payload format differs from the declared key format"
+                );
+            } else if let Err(e) = cache.put(key, audio).await {
+                error!("Failed to cache TTS audio: {:?}", e);
+            }
+        }
+
+        Ok(())
     }
 
     /// Generic send_request implementation that handles all the common logic
@@ -375,22 +532,79 @@ impl TTSProvider {
                     return;
                 }
 
+                if request_builder.expects_provider_audio_url_response() {
+                    let body = match response.bytes().await {
+                        Ok(body) => body,
+                        Err(e) => {
+                            let _ = sender
+                                .send(Err(TTSError::NetworkError(format!(
+                                    "Failed to read response body: {e}"
+                                ))))
+                                .await;
+                            return;
+                        }
+                    };
+                    let audio_url = match request_builder.parse_provider_audio_url_response(&body) {
+                        Ok(Some(audio_url)) => audio_url,
+                        Ok(None) => {
+                            let _ = sender
+                                .send(Err(TTSError::ProviderError(format!(
+                                    "{} response did not include an audio URL",
+                                    request_builder.provider_audio_url_label()
+                                ))))
+                                .await;
+                            return;
+                        }
+                        Err(e) => {
+                            let _ = sender.send(Err(e)).await;
+                            return;
+                        }
+                    };
+
+                    match Self::download_provider_audio_url(
+                        request_builder.provider_audio_url_label(),
+                        &audio_url,
+                    )
+                    .await
+                    {
+                        Ok(audio) => {
+                            match Self::send_buffered_audio_payload(
+                                audio,
+                                config,
+                                &sender,
+                                &token,
+                                cache_and_key,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    if !token.is_cancelled() {
+                                        *previous_text_store.write().await =
+                                            Some(processed_text.clone());
+                                        debug!(
+                                            "Updated previous_text for next request: '{}'",
+                                            processed_text
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = sender.send(Err(e)).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = sender.send(Err(e)).await;
+                        }
+                    }
+                    return;
+                }
+
                 // Stream body in chunks
                 let encoding = config.audio_format.as_deref().unwrap_or("linear16");
-                let sample_rate = config.sample_rate.unwrap_or(24000) as usize;
-                let (mut chunk_target_bytes, bytes_per_sample) = match encoding {
-                    // Assume mono. Keep this family in lockstep with
-                    // sniff::is_pcm_family (review-found: "pcm16" was missing,
-                    // bypassing both 10ms framing and container detection).
-                    "linear16" | "pcm" | "pcm16" => ((sample_rate / 100) * 2, 2usize), // ~10ms
-                    "mulaw" | "ulaw" | "alaw" => ((sample_rate / 100), 1usize),
-                    _ => (0usize, 0usize),
-                };
-
-                // Guard against tiny sample rates
-                if chunk_target_bytes == 0 && crate::core::tts::sniff::is_pcm_family(encoding) {
-                    chunk_target_bytes = (sample_rate.max(100) / 100) * bytes_per_sample.max(1);
-                }
+                let sample_rate = config.sample_rate.unwrap_or(24000);
+                let mut chunk_target_bytes = pcm_bytes_per_sample(encoding)
+                    .map(|bytes_per_sample| pcm_stream_chunk_bytes(sample_rate, bytes_per_sample))
+                    .unwrap_or(0);
 
                 let mut buffer: Vec<u8> = Vec::with_capacity(chunk_target_bytes.max(512));
                 // Only allocate full_audio buffer if we're caching
@@ -592,18 +806,7 @@ impl TTSProvider {
 
     /// Process audio chunks with duration calculation
     pub fn process_audio_chunk(bytes: Vec<u8>, format: &str, sample_rate: u32) -> AudioData {
-        let duration_ms = if matches!(format, "linear16" | "pcm" | "mulaw" | "ulaw" | "alaw") {
-            // Approximate duration for this chunk based on sample_rate and bytes per sample
-            let bytes_per_sample = if matches!(format, "linear16" | "pcm") {
-                2
-            } else {
-                1
-            };
-            let samples = (bytes.len() / bytes_per_sample) as u32;
-            Some((samples * 1000) / sample_rate)
-        } else {
-            None
-        };
+        let duration_ms = pcm_duration_ms_for_bytes(bytes.len(), format, sample_rate);
 
         AudioData {
             data: bytes,
@@ -685,15 +888,11 @@ impl TTSProvider {
                                         // PCM duration math (meaningless for containers).
                                         let effective_format: &str =
                                             format_override.unwrap_or(format.as_str());
-                                        let duration_ms = if crate::core::tts::sniff::is_pcm_family(
+                                        let duration_ms = pcm_duration_ms_for_bytes(
+                                            bytes.len(),
                                             effective_format,
-                                        ) {
-                                            let bytes_per_sample = if matches!(effective_format, "linear16" | "pcm" | "pcm16") { 2 } else { 1 };
-                                            let samples = (bytes.len() / bytes_per_sample) as u32;
-                                            Some((samples * 1000) / sample_rate)
-                                        } else {
-                                            None
-                                        };
+                                            sample_rate,
+                                        );
 
                                         let audio_data = AudioData {
                                             data: bytes,
@@ -910,8 +1109,7 @@ impl TTSProvider {
             if let Some(handle) = worker.take() {
                 // Notify to wake the worker so it can exit
                 self.speak_queue_notify.notify_one();
-                handle.abort();
-                let _ = handle.await;
+                crate::core::observability::abort_and_await_task("tts-queue-worker", handle).await;
             }
             self.queue_worker_running.store(false, Ordering::Release);
         }
@@ -920,8 +1118,7 @@ impl TTSProvider {
         {
             let mut disp = self.dispatcher_task.lock().await;
             if let Some(handle) = disp.take() {
-                handle.abort();
-                let _ = handle.await;
+                crate::core::observability::abort_and_await_task("tts-dispatcher", handle).await;
             }
             self.dispatcher_running.store(false, Ordering::Release);
         }
@@ -1076,8 +1273,7 @@ impl TTSProvider {
             if let Some(handle) = worker.take() {
                 // Notify to wake the worker so it can exit
                 self.speak_queue_notify.notify_one();
-                handle.abort();
-                let _ = handle.await;
+                crate::core::observability::abort_and_await_task("tts-queue-worker", handle).await;
             }
             self.queue_worker_running.store(false, Ordering::Release);
         }
@@ -1086,8 +1282,7 @@ impl TTSProvider {
         {
             let mut disp = self.dispatcher_task.lock().await;
             if let Some(handle) = disp.take() {
-                handle.abort();
-                let _ = handle.await;
+                crate::core::observability::abort_and_await_task("tts-dispatcher", handle).await;
             }
             self.dispatcher_running.store(false, Ordering::Release);
         }
@@ -1218,5 +1413,57 @@ impl Drop for TTSProvider {
         {
             handle.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pcm_stream_chunk_bytes_never_returns_zero_for_pcm_family() {
+        assert_eq!(pcm_stream_chunk_bytes(0, 2), 2);
+        assert_eq!(pcm_stream_chunk_bytes(50, 1), 1);
+        assert_eq!(pcm_stream_chunk_bytes(24_000, 2), 480);
+    }
+
+    #[test]
+    fn process_audio_chunk_rejects_zero_sample_rate_duration() {
+        let audio = TTSProvider::process_audio_chunk(vec![0; 320], "linear16", 0);
+        assert_eq!(audio.duration_ms, None);
+        assert_eq!(audio.sample_rate, 0);
+    }
+
+    #[test]
+    fn process_audio_chunk_calculates_pcm16_duration() {
+        let audio = TTSProvider::process_audio_chunk(vec![0; 480], "pcm16", 24_000);
+        assert_eq!(audio.duration_ms, Some(10));
+    }
+
+    #[test]
+    fn pcm_duration_ms_saturates_instead_of_overflowing() {
+        let bytes_len = ((u32::MAX as usize) + 1000) * 2;
+        assert_eq!(
+            pcm_duration_ms_for_bytes(bytes_len, "linear16", 1),
+            Some(u32::MAX)
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_audio_url_download_rejects_unsafe_targets() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let err = TTSProvider::download_provider_audio_url(
+            "test provider",
+            "http://127.0.0.1:9000/audio.wav",
+        )
+        .await
+        .expect_err("loopback provider audio URL must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        let err =
+            TTSProvider::download_provider_audio_url("test provider", "file:///tmp/audio.wav")
+                .await
+                .expect_err("non-HTTP provider audio URL must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
     }
 }

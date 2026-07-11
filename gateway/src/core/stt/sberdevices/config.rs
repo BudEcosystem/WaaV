@@ -6,6 +6,15 @@
 use crate::core::stt::base::{STTConfig, STTError};
 use std::str::FromStr;
 
+fn validate_sber_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -340,11 +349,24 @@ impl SberSTTConfig {
         }
         // Acoustic recognition model/domain via the open passthrough (`extras["model"]`).
         if let Some(m) = std.extras.0.get("model").and_then(|v| v.as_str()) {
-            cfg.recognition_model = Some(m.to_string());
+            let model = m.trim();
+            if !model.is_empty() {
+                cfg.recognition_model = Some(model.to_string());
+            }
         }
         // Standardized endpoint override → both Sber hosts (OAuth + recognize) for mock e2e.
         cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Validate provider-specific URL surfaces.
+    pub fn validate(&self) -> Result<(), STTError> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_sber_stt_endpoint("endpoint_override", endpoint)
+                .map_err(STTError::ConfigurationError)?;
+        }
+        Ok(())
     }
 
     /// Build the `speech:recognize` request URL with the recognition options as query params.
@@ -353,28 +375,33 @@ impl SberSTTConfig {
     /// the request body). `language` and `sample_rate` are always emitted; the standardized
     /// options (`enable_profanity_filter`, `channels_count`, `model`) are emitted only when set so
     /// unset knobs fall back to the provider default. This is the URL that actually reaches Sber.
-    pub fn recognize_url(&self) -> String {
+    pub fn recognize_url(&self) -> Result<String, STTError> {
         // When overridden, keep the production path (`/rest/v1/speech:recognize`) but swap the host.
         let base = match self.endpoint_override {
             Some(ref ov) => format!("{}/rest/v1/speech:recognize", ov.trim_end_matches('/')),
             None => STT_RECOGNIZE_ENDPOINT.to_string(),
         };
-        let mut url = format!(
-            "{}?language={}&sample_rate={}",
-            base,
-            self.language.as_code(),
-            self.sample_rate
-        );
-        if self.enable_profanity_filter {
-            url.push_str("&enable_profanity_filter=true");
+        let mut url = url::Url::parse(&base).map_err(|e| {
+            STTError::ConfigurationError(format!("Invalid SberDevices recognize URL '{base}': {e}"))
+        })?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("language", self.language.as_code());
+            pairs.append_pair("sample_rate", &self.sample_rate.to_string());
+            if self.enable_profanity_filter {
+                pairs.append_pair("enable_profanity_filter", "true");
+            }
+            if let Some(channels) = self.channels_count {
+                pairs.append_pair("channels_count", &channels.to_string());
+            }
+            if let Some(ref model) = self.recognition_model {
+                let model = model.trim();
+                if !model.is_empty() {
+                    pairs.append_pair("model", model);
+                }
+            }
         }
-        if let Some(channels) = self.channels_count {
-            url.push_str(&format!("&channels_count={}", channels));
-        }
-        if let Some(ref model) = self.recognition_model {
-            url.push_str(&format!("&model={}", model));
-        }
-        url
+        Ok(url.to_string())
     }
 
     /// Get the Authorization header for OAuth token request
@@ -411,7 +438,7 @@ mod tests {
     // knobs (diarization, interim_results) remain capability gaps. The base still carries through.
     #[test]
     fn from_standard_passthrough_carries_base() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "sberdevices".into(),
@@ -447,9 +474,12 @@ mod tests {
     // Guards the recurring "set on the struct but never emitted to the wire" gap class.
     #[test]
     fn standardized_options_reach_recognize_url() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let mut extras = serde_json::Map::new();
-        extras.insert("model".into(), serde_json::json!("callcenter"));
+        extras.insert(
+            "model".into(),
+            serde_json::json!(" callcenter&sample_rate=8000 "),
+        );
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "sberdevices".into(),
@@ -471,25 +501,36 @@ mod tests {
         // Config carried the mapping...
         assert!(cfg.enable_profanity_filter);
         assert_eq!(cfg.channels_count, Some(2));
-        assert_eq!(cfg.recognition_model, Some("callcenter".to_string()));
+        assert_eq!(
+            cfg.recognition_model,
+            Some("callcenter&sample_rate=8000".to_string())
+        );
         // ...and crucially the params reach the wire (recognize URL).
-        let url = cfg.recognize_url();
+        let url = cfg.recognize_url().expect("recognize URL is valid");
         assert!(
             url.starts_with("https://smartspeech.sber.ru/rest/v1/speech:recognize?"),
             "url: {url}"
         );
-        assert!(
-            url.contains("enable_profanity_filter=true"),
-            "profanity filter missing from URL: {url}"
+        let parsed = url::Url::parse(&url).unwrap();
+        let pairs: Vec<_> = parsed.query_pairs().collect();
+        assert!(pairs.contains(&("enable_profanity_filter".into(), "true".into())));
+        assert!(pairs.contains(&("channels_count".into(), "2".into())));
+        assert!(pairs.contains(&("model".into(), "callcenter&sample_rate=8000".into())));
+        // Sanity: base language + sample_rate are always emitted, and the model value did not
+        // splice a second sample_rate query param into the provider URL.
+        assert!(pairs.contains(&("language".into(), "ru-RU".into())));
+        assert_eq!(
+            pairs
+                .iter()
+                .filter(|(key, value)| key == "sample_rate" && value == "16000")
+                .count(),
+            1,
+            "url: {url}"
         );
         assert!(
-            url.contains("channels_count=2"),
-            "channels_count missing from URL: {url}"
+            !url.contains("model=callcenter&sample_rate=8000"),
+            "model must be encoded as one query value: {url}"
         );
-        assert!(url.contains("model=callcenter"), "model missing from URL: {url}");
-        // Sanity: base language + sample_rate are always emitted.
-        assert!(url.contains("language=ru-RU"), "language missing: {url}");
-        assert!(url.contains("sample_rate=16000"), "sample_rate missing: {url}");
 
         // And when the features are NOT requested, the optional params are omitted (defaults).
         let bare = SberSTTConfig::from_standard(&StandardSTTConfig::from_base(STTConfig {
@@ -499,10 +540,53 @@ mod tests {
             ..Default::default()
         }))
         .unwrap()
-        .recognize_url();
+        .recognize_url()
+        .expect("recognize URL is valid");
         assert!(!bare.contains("enable_profanity_filter"), "url: {bare}");
         assert!(!bare.contains("channels_count"), "url: {bare}");
         assert!(!bare.contains("model="), "url: {bare}");
+    }
+
+    #[test]
+    fn recognize_url_rejects_malformed_override_without_panic() {
+        let mut cfg = SberSTTConfig::from_base(&STTConfig {
+            api_key: "client:secret".into(),
+            ..Default::default()
+        })
+        .expect("base config");
+        cfg.endpoint_override = Some("http://[::1".to_string());
+
+        let err = cfg.recognize_url().expect_err("malformed URL must fail");
+        assert!(matches!(
+            err,
+            STTError::ConfigurationError(message)
+                if message.contains("Invalid SberDevices recognize URL")
+        ));
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        let mk = |endpoint: &str| {
+            StandardSTTConfig {
+                base: STTConfig {
+                    provider: "sberdevices".into(),
+                    api_key: "test_client:test_secret".into(),
+                    ..Default::default()
+                },
+                features: SttFeatures::default(),
+                extras: ProviderExtras::default(),
+                translation: None,
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(SberSTTConfig::from_standard(&mk("https://sber-proxy.example.com")).is_ok());
+        assert!(SberSTTConfig::from_standard(&mk("http://127.0.0.1:9000")).is_err());
+        assert!(SberSTTConfig::from_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(SberSTTConfig::from_standard(&mk("wss://sber-proxy.example.com")).is_err());
     }
 
     #[test]

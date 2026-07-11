@@ -12,6 +12,15 @@ use super::{
 };
 use crate::core::tts::base::{TTSConfig, TTSError};
 
+fn validate_smallest_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // SmallestModel
 // =============================================================================
@@ -78,7 +87,6 @@ impl SmallestModel {
         }
     }
 }
-
 
 impl fmt::Display for SmallestModel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -455,8 +463,9 @@ impl SmallestTtsConfig {
     /// `speed` -> `speed` (reusing `from_base`'s `MIN_SPEED..=model.max_speed()` clamp so 1.0 stays
     /// normal), the ElevenLabs-style `stability` -> `consistency` and `similarity_boost` ->
     /// `similarity` (both direct 0-1 levels, clamped to their valid ranges), `language` -> the
-    /// `SmallestLanguage` enum (only when it parses), and `sample_rate` -> `sample_rate` (snapped to
-    /// the nearest supported rate). Smallest's non-standard `enhancement` level and the
+    /// `SmallestLanguage` enum (rejecting unknown non-empty values), and `sample_rate` ->
+    /// `sample_rate` (snapped to the nearest supported rate). Smallest's non-standard
+    /// `enhancement` level and the
     /// lightning-v2 streaming `max_buffer_flush_ms` knob are read from the `extras` passthrough.
     /// Features without a Smallest field (pitch, volume, style, use_speaker_boost, emotion,
     /// instructions, ssml, word_timestamps, streaming, seed) are skipped.
@@ -478,8 +487,13 @@ impl SmallestTtsConfig {
             // Smallest voice similarity is a direct 0-1 level (lightning-large only).
             cfg.similarity = similarity_boost.clamp(MIN_SIMILARITY, MAX_SIMILARITY);
         }
-        if let Some(lang) = f.language.as_deref().and_then(|l| l.parse().ok()) {
-            cfg.language = lang;
+        if let Some(language) = f
+            .language
+            .as_deref()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+        {
+            cfg.language = language.parse()?;
         }
         if let Some(rate) = f.sample_rate {
             cfg.sample_rate = super::nearest_sample_rate(rate);
@@ -500,6 +514,7 @@ impl SmallestTtsConfig {
         }
 
         cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate()?;
 
         Ok(cfg)
     }
@@ -547,6 +562,11 @@ impl SmallestTtsConfig {
                 "Enhancement must be between {} and {}",
                 MIN_ENHANCEMENT, MAX_ENHANCEMENT
             )));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_smallest_tts_endpoint("endpoint_override", endpoint)
+                .map_err(TTSError::InvalidConfiguration)?;
         }
 
         Ok(())
@@ -690,6 +710,55 @@ mod tests {
         };
         let cfg = SmallestTtsConfig::from_standard(&std).unwrap();
         assert_eq!(cfg.max_buffer_flush_ms, Some(1000));
+    }
+
+    #[test]
+    fn from_standard_rejects_unknown_language() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                language: Some("klingon".into()),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+
+        let err = SmallestTtsConfig::from_standard(&std)
+            .expect_err("unknown Smallest.ai language must be rejected");
+        assert!(err.to_string().contains("Unknown language: klingon"));
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = SmallestTtsConfig::from_base(create_test_config()).unwrap();
+
+        config.endpoint_override = Some("https://smallest-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://smallest-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(create_test_config())
+            .with_endpoint_override("file:///tmp/socket");
+        assert!(SmallestTtsConfig::from_standard(&std).is_err());
     }
 
     // =========================================================================

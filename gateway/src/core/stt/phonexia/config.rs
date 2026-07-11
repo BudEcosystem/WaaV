@@ -12,13 +12,14 @@ use super::{
     MAX_SAMPLE_RATE, MIN_CHANNELS, MIN_SAMPLE_RATE, WEBSOCKET_PATH,
 };
 
+const PHONEXIA_SERVER_URL_SCHEMES: &[&str] = &["http", "https"];
+
 // =============================================================================
 // Enums
 // =============================================================================
 
 /// Authentication method for Phonexia server
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PhonexiaAuth {
     /// Token-based authentication (login first, then use X-SessionID)
     Token {
@@ -36,7 +37,6 @@ pub enum PhonexiaAuth {
     #[default]
     None,
 }
-
 
 /// Result type format for transcription
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -279,14 +279,12 @@ impl PhonexiaSTTConfig {
             ));
         }
 
-        // Validate URL format
-        let url_lower = self.server_url.to_lowercase();
-        if !url_lower.starts_with("http://") && !url_lower.starts_with("https://") {
-            return Err(STTError::ConfigurationError(format!(
-                "Invalid server URL: {}. Must start with http:// or https://",
-                self.server_url
-            )));
-        }
+        crate::core::net::validate_url_for_ssrf(&self.server_url, PHONEXIA_SERVER_URL_SCHEMES)
+            .map_err(|msg| {
+                STTError::ConfigurationError(format!(
+                    "Phonexia server URL rejected (SSRF protection): {msg}"
+                ))
+            })?;
 
         // Validate sample rate
         if self.sample_rate < MIN_SAMPLE_RATE || self.sample_rate > MAX_SAMPLE_RATE {
@@ -426,9 +424,10 @@ impl PhonexiaSTTConfig {
 
         // Parse model field for result type
         if !config.model.is_empty()
-            && let Ok(result_type) = config.model.parse::<PhonexiaResultType>() {
-                phonexia_config = phonexia_config.with_result_type(result_type);
-            }
+            && let Ok(result_type) = config.model.parse::<PhonexiaResultType>()
+        {
+            phonexia_config = phonexia_config.with_result_type(result_type);
+        }
 
         phonexia_config.validate()?;
         Ok(phonexia_config)
@@ -456,7 +455,12 @@ impl PhonexiaSTTConfig {
         // Provider extra `multiple_result_types` → result_types[]. Each entry is parsed against
         // the known result-type vocabulary; an unrecognized entry fails loudly (it would silently
         // neutralize the feature otherwise — the open-passthrough contract in standard.rs).
-        if let Some(arr) = std.extras.0.get("multiple_result_types").and_then(|v| v.as_array()) {
+        if let Some(arr) = std
+            .extras
+            .0
+            .get("multiple_result_types")
+            .and_then(|v| v.as_array())
+        {
             let mut types = Vec::with_capacity(arr.len());
             for v in arr {
                 let s = v.as_str().ok_or_else(|| {
@@ -500,7 +504,7 @@ mod tests {
     // express — per-word timestamps (`enable_timestamps`) and phrase hints (`preferred_phrases`).
     #[test]
     fn from_standard_maps_features() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "phonexia".into(),
@@ -529,7 +533,7 @@ mod tests {
     // `result_types[]=<type>` api_param is present in the query string.
     #[test]
     fn multiple_result_types_reach_websocket_url() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
 
         let mut extras = serde_json::Map::new();
         extras.insert(
@@ -578,7 +582,10 @@ mod tests {
             .with_channels(1)
             .with_language("en-US");
         let url = config.build_websocket_url();
-        assert!(!url.contains("result_types"), "result_types[] should be omitted: {url}");
+        assert!(
+            !url.contains("result_types"),
+            "result_types[] should be omitted: {url}"
+        );
     }
 
     #[test]
@@ -647,11 +654,33 @@ mod tests {
 
     #[test]
     fn test_phonexia_config_validate_invalid_url() {
+        let _env = crate::core::net::ssrf_env_lock();
         let config = PhonexiaSTTConfig::new("not-a-valid-url");
         let result = config.validate();
         assert!(result.is_err());
         if let Err(STTError::ConfigurationError(msg)) = result {
-            assert!(msg.contains("Must start with http://"));
+            assert!(msg.contains("SSRF protection"));
+            assert!(msg.contains("invalid URL"));
+        }
+    }
+
+    #[test]
+    fn test_phonexia_config_validate_rejects_ssrf_targets() {
+        let _env = crate::core::net::ssrf_env_lock();
+        for url in [
+            "http://127.0.0.1:8080",
+            "http://localhost:8080",
+            "http://169.254.169.254",
+            "file:///tmp/socket",
+        ] {
+            let err = PhonexiaSTTConfig::new(url)
+                .validate()
+                .expect_err("unsafe Phonexia server URL must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("SSRF protection") || msg.contains("not allowed"),
+                "{url}: {msg}"
+            );
         }
     }
 

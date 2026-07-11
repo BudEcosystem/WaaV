@@ -567,7 +567,7 @@ mod client_tests {
     // `new_standard` into the provider-specific config (previously dropped by the flat factory).
     #[test]
     fn new_standard_propagates_advanced_features() {
-        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "elevenlabs".into(),
@@ -597,6 +597,49 @@ mod client_tests {
             ..Default::default()
         });
         assert!(ElevenLabsSTT::new_standard(&bad).is_err());
+    }
+
+    #[test]
+    fn test_new_standard_rejects_ssrf_endpoint_override() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mk = |endpoint: &str| {
+            StandardSTTConfig {
+                base: STTConfig {
+                    provider: "elevenlabs".into(),
+                    api_key: "test-key".into(),
+                    language: "en".into(),
+                    sample_rate: 16000,
+                    encoding: "pcm_s16le".into(),
+                    ..Default::default()
+                },
+                features: SttFeatures::default(),
+                extras: ProviderExtras::default(),
+                translation: None,
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(ElevenLabsSTT::new_standard(&mk("wss://elevenlabs-proxy.example.com")).is_ok());
+        assert!(ElevenLabsSTT::new_standard(&mk("ws://127.0.0.1:9000")).is_err());
+        assert!(ElevenLabsSTT::new_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(ElevenLabsSTT::new_standard(&mk("https://elevenlabs-proxy.example.com")).is_err());
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]
@@ -666,6 +709,18 @@ mod client_tests {
     }
 
     #[test]
+    fn test_build_websocket_url_trims_endpoint_override() {
+        let stt = ElevenLabsSTT::default();
+        let config = ElevenLabsSTTConfig {
+            endpoint_override: Some(" wss://elevenlabs-proxy.example.com/ ".to_string()),
+            ..Default::default()
+        };
+
+        let url = stt.build_websocket_url(&config).unwrap();
+        assert!(url.starts_with("wss://elevenlabs-proxy.example.com/v1/speech-to-text/realtime?"));
+    }
+
+    #[test]
     fn test_url_building_us_region() {
         let stt = ElevenLabsSTT::default();
         let config = ElevenLabsSTTConfig {
@@ -692,21 +747,15 @@ mod client_tests {
     }
 
     #[test]
-    fn test_get_host_from_region() {
+    fn test_region_host() {
+        assert_eq!(ElevenLabsRegion::Default.host(), "api.elevenlabs.io");
+        assert_eq!(ElevenLabsRegion::Us.host(), "api.us.elevenlabs.io");
         assert_eq!(
-            ElevenLabsSTT::get_host_from_region(&ElevenLabsRegion::Default),
-            "api.elevenlabs.io"
-        );
-        assert_eq!(
-            ElevenLabsSTT::get_host_from_region(&ElevenLabsRegion::Us),
-            "api.us.elevenlabs.io"
-        );
-        assert_eq!(
-            ElevenLabsSTT::get_host_from_region(&ElevenLabsRegion::Eu),
+            ElevenLabsRegion::Eu.host(),
             "api.eu.residency.elevenlabs.io"
         );
         assert_eq!(
-            ElevenLabsSTT::get_host_from_region(&ElevenLabsRegion::India),
+            ElevenLabsRegion::India.host(),
             "api.in.residency.elevenlabs.io"
         );
     }

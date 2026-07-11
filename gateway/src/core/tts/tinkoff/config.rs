@@ -6,6 +6,16 @@
 use crate::core::tts::base::TTSConfig;
 use serde::{Deserialize, Serialize};
 
+fn validate_tinkoff_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 /// Tinkoff TTS provider-specific configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TinkoffTtsConfig {
@@ -261,6 +271,10 @@ impl TinkoffTtsConfig {
                 "Invalid volume gain: {}. Must be between -96.0 and 16.0 dB",
                 self.volume_gain_db
             ));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_tinkoff_tts_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -546,6 +560,41 @@ mod tests {
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("secret key"));
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = TinkoffTtsConfig {
+            api_key: "test-api-key".to_string(),
+            secret_key: "test-secret-key".to_string(),
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://tinkoff-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("SSRF protection"), "unexpected error: {err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("URL scheme"), "unexpected error: {err}");
+
+        config.endpoint_override = Some("ws://tinkoff-proxy.example.com".to_string());
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("URL scheme"), "unexpected error: {err}");
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "tinkoff".into(),
+            api_key: "test-api-key|test-secret-key".into(),
+            voice_id: Some("alyona".into()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        let cfg = TinkoffTtsConfig::from_standard(&std).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

@@ -6,23 +6,43 @@ use anyhow::{Context, Result};
 use ndarray::{Array1, Array2, Array3};
 use ort::session::{Session, builder::SessionBuilder};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, trace};
 
 use super::config::SileroVADConfig;
 
+use crate::core::model_integrity::skip_model_hash_check_from_env;
 // Import SIMD-optimized operations
 use crate::utils::simd_ops;
 
 /// Default URL for downloading the Silero VAD model.
 const SILERO_VAD_MODEL_URL: &str =
     "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx";
+const SILERO_VAD_MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Silero VAD v5 model dimensions.
 /// Silero v5 uses a single unified recurrent `state` tensor of shape [2, 1, 128]
 /// (NOT the v4-style separate h/c tensors of [2,1,64] each, and NOT inputs named "h"/"c").
 /// Feeding v4 inputs to the v5 model fails at inference with `Invalid input name: h`.
 const SILERO_V5_STATE_SIZE: usize = 128;
+
+fn validate_audio_chunk_len(audio_len: usize, expected_len: usize) -> Result<()> {
+    if audio_len != expected_len {
+        anyhow::bail!(
+            "Audio chunk must be exactly {} samples, got {}",
+            expected_len,
+            audio_len
+        );
+    }
+    Ok(())
+}
+
+fn silero_vad_model_http_client() -> Result<reqwest::Client> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(SILERO_VAD_MODEL_DOWNLOAD_TIMEOUT)
+        .build()
+        .context("Failed to create Silero VAD model download HTTP client")
+}
 
 /// Result of VAD processing for a single chunk.
 #[derive(Debug, Clone, Copy)]
@@ -192,9 +212,13 @@ impl SileroVAD {
 
         info!("Downloading Silero VAD model to {:?}", model_path);
 
-        let response = reqwest::get(SILERO_VAD_MODEL_URL)
+        let response = silero_vad_model_http_client()?
+            .get(SILERO_VAD_MODEL_URL)
+            .send()
             .await
-            .context("Failed to download Silero VAD model")?;
+            .context("Failed to download Silero VAD model")?
+            .error_for_status()
+            .context("Silero VAD model download returned an error status")?;
 
         let bytes = response
             .bytes()
@@ -208,9 +232,7 @@ impl SileroVAD {
         // intentionally-updated models.
         const SILERO_VAD_MODEL_SHA256: &str =
             "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3";
-        let skip_check = std::env::var("WAAV_SKIP_MODEL_HASH_CHECK")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let skip_check = skip_model_hash_check_from_env()?;
         let actual = {
             use sha2::{Digest, Sha256};
             let mut h = Sha256::new();
@@ -258,17 +280,8 @@ impl SileroVAD {
     /// based on the `state_reset_interval_secs` configuration to prevent
     /// state drift in long conversations.
     ///
-    /// # Panics
-    ///
-    /// Panics if `audio.len() != config.chunk_size`.
     pub fn process(&mut self, audio: &[f32]) -> Result<SileroVADResult> {
-        assert_eq!(
-            audio.len(),
-            self.config.chunk_size,
-            "Audio chunk must be exactly {} samples, got {}",
-            self.config.chunk_size,
-            audio.len()
-        );
+        validate_audio_chunk_len(audio.len(), self.config.chunk_size)?;
 
         let start = Instant::now();
 
@@ -280,8 +293,9 @@ impl SileroVAD {
         let input_slice = self
             .input_buffer
             .as_slice_mut()
-            .expect("Input buffer should be contiguous");
-        simd_ops::copy_to_tensor_simd(audio, input_slice);
+            .context("Silero VAD input buffer is not contiguous")?;
+        simd_ops::copy_to_tensor_simd(audio, input_slice)
+            .context("Silero VAD input buffer is smaller than the validated audio chunk")?;
 
         // Run inference
         let probability = self.run_inference()?;
@@ -351,7 +365,8 @@ impl SileroVAD {
 
         // Sample rate: scalar i64 (shape []). v5 expects a rank-0 / single-element sr.
         let sr_value = self.sample_rate_tensor[0];
-        let sr_tensor = ort::value::Tensor::from_array(([1usize], vec![sr_value].into_boxed_slice()))?;
+        let sr_tensor =
+            ort::value::Tensor::from_array(([1usize], vec![sr_value].into_boxed_slice()))?;
 
         // Unified recurrent state: shape [2, 1, 128]
         let state_data: Vec<f32> = self.state.iter().copied().collect();
@@ -494,6 +509,7 @@ impl SileroVAD {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
 
     // Note: Most tests require the ONNX model file.
     // These are integration tests that should be run with the model available.
@@ -552,6 +568,70 @@ mod tests {
         // 512 samples at 16kHz = 32ms
         let duration = config.chunk_duration_ms();
         assert!((duration - 32.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_validate_audio_chunk_len_returns_error_instead_of_panicking() {
+        assert!(validate_audio_chunk_len(512, 512).is_ok());
+
+        let error = validate_audio_chunk_len(511, 512).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Audio chunk must be exactly 512 samples, got 511"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn silero_vad_model_http_client_rejects_private_redirect() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!(
+                        "Skipping silero_vad_model_http_client_rejects_private_redirect: {err}"
+                    );
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = silero_vad_model_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
     }
 
     // Integration tests (require model file)

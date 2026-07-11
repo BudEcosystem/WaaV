@@ -21,9 +21,9 @@ pub mod resampler;
 pub mod vad;
 
 pub use codec::{AudioCodec, CodecNegotiation, negotiate as negotiate_codec};
-pub use ring_buffer::AudioRingBuffer;
 pub use output_chunker::{DEFAULT_AUDIO_OUT_CHUNK_MS, OutputChunker};
 pub use playback_pump::{DEFAULT_PLAYBACK_LEAD, PlaybackEnqueuer, PlaybackPump, PlaybackSink};
 pub use playback_queue::{PlaybackQueue, PlaybackUnit};
 pub use resampler::{StreamResampler, egress_to_client_rate, resample_pcm16};
+pub use ring_buffer::AudioRingBuffer;
 pub use vad::{VADAnalyzer, VADParams, VADState, VADTransition};

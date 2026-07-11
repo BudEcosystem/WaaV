@@ -33,6 +33,17 @@
 use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 
+fn validate_cartesia_tts_endpoint(source: &str, endpoint: &str) -> Result<(), TTSError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}")),
+    )
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -644,6 +655,13 @@ pub struct CartesiaTTSConfig {
 }
 
 impl CartesiaTTSConfig {
+    pub(crate) fn validate_endpoint_override(&self) -> Result<(), TTSError> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_cartesia_tts_endpoint("endpoint_override", endpoint)?;
+        }
+        Ok(())
+    }
+
     /// Build from the standardized config (W1 keystone for TTS — uniform entry point).
     ///
     /// Cartesia's request body (confirmed against the `POST /tts/bytes` reference) exposes a
@@ -823,6 +841,7 @@ impl CartesiaTTSConfig {
 
         // Validate output format (includes sample rate validation)
         self.output_format.validate()?;
+        self.validate_endpoint_override()?;
 
         Ok(())
     }
@@ -924,6 +943,48 @@ mod tests {
             Some(Emotion::Happy) // "cheerful" parses to Emotion::Happy
         );
         assert_eq!(cfg.output_format.sample_rate, 44100);
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = CartesiaTTSConfig::from_base(TTSConfig {
+            provider: "cartesia".into(),
+            api_key: "k".into(),
+            voice_id: Some("a0e99841-438c-4a64-b679-ae501e7d6091".into()),
+            ..Default::default()
+        });
+
+        config.endpoint_override = Some("https://cartesia-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://cartesia-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected for REST Cartesia");
+        assert!(err.to_string().contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "cartesia".into(),
+            api_key: "k".into(),
+            voice_id: Some("a0e99841-438c-4a64-b679-ae501e7d6091".into()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        let cfg = CartesiaTTSConfig::from_standard(&std);
+        assert!(cfg.validate_endpoint_override().is_err());
     }
 
     #[test]

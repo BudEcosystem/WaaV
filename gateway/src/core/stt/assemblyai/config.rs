@@ -8,7 +8,7 @@
 
 use std::str::FromStr;
 
-use super::super::base::STTConfig;
+use super::super::base::{STTConfig, STTError};
 
 /// AssemblyAI streaming keyterms limits (per the keyterms-prompting docs):
 /// at most 100 terms per session, each at most 50 characters.
@@ -22,6 +22,15 @@ const MAX_KEYTERM_CHARS: usize = 50;
 #[inline]
 fn encode_query_value(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+fn validate_assemblyai_ws_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, &["ws", "wss"])
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
 }
 
 // =============================================================================
@@ -303,7 +312,12 @@ impl AssemblyAISTTConfig {
     /// to minimize allocations during URL construction.
     pub fn build_websocket_url(&self) -> String {
         // An explicit override (mock/proxy) wins over the regional production endpoint.
-        let base_url: &str = match &self.endpoint_override {
+        let base_url: &str = match self
+            .endpoint_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+        {
             Some(o) => o.trim_end_matches('/'),
             None => self.region.websocket_base_url(),
         };
@@ -412,6 +426,14 @@ impl AssemblyAISTTConfig {
         }
 
         url
+    }
+
+    pub fn validate_endpoint_override(&self) -> Result<(), STTError> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_assemblyai_ws_endpoint("endpoint_override", endpoint)
+                .map_err(STTError::ConfigurationError)?;
+        }
+        Ok(())
     }
 
     /// Create a new configuration from base STTConfig.
@@ -549,7 +571,7 @@ mod tests {
     // W1 keystone (2nd provider): the standardized `word_timestamps` feature is honored.
     #[test]
     fn from_standard_maps_word_timestamps() {
-        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "assemblyai".into(),
@@ -569,9 +591,8 @@ mod tests {
             "word_timestamps=false must reach the AssemblyAI config"
         );
         // And the default (unset) keeps the provider default (true).
-        let cfg2 = AssemblyAISTTConfig::from_standard(&StandardSTTConfig::from_base(
-            std.base.clone(),
-        ));
+        let cfg2 =
+            AssemblyAISTTConfig::from_standard(&StandardSTTConfig::from_base(std.base.clone()));
         assert!(cfg2.include_word_timestamps);
     }
 
@@ -709,6 +730,49 @@ mod tests {
     }
 
     #[test]
+    fn test_endpoint_override_validation_rejects_ssrf_targets() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = AssemblyAISTTConfig {
+            endpoint_override: Some("wss://assemblyai-proxy.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate_endpoint_override().is_ok());
+
+        config.endpoint_override = Some("ws://127.0.0.1:9000".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("non-WebSocket endpoint_override must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("https://assemblyai-proxy.example.com".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("HTTP endpoint_override must be rejected for WebSocket dial");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+    }
+
+    #[test]
+    fn test_build_websocket_url_trims_endpoint_override() {
+        let config = AssemblyAISTTConfig {
+            base: STTConfig {
+                sample_rate: 16000,
+                ..Default::default()
+            },
+            endpoint_override: Some(" wss://assemblyai-proxy.example.com/ ".to_string()),
+            ..Default::default()
+        };
+
+        let url = config.build_websocket_url();
+        assert!(url.starts_with("wss://assemblyai-proxy.example.com/v3/ws?"));
+    }
+
+    #[test]
     fn test_from_base_english() {
         let base = STTConfig {
             api_key: "test_key".to_string(),
@@ -788,7 +852,7 @@ mod tests {
     // the struct.
     // =========================================================================
 
-    use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+    use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
 
     /// keyterms (standardized) → `keyterms_prompt` connection query param. AssemblyAI v3
     /// streaming uses `keyterms_prompt` (a URL-encoded JSON array), NOT the batch-only
@@ -814,8 +878,7 @@ mod tests {
         );
         // The canonical wire form is a JSON array, URL-encoded: `["AssemblyAI","John Smith"]`
         // → `%5B%22AssemblyAI%22%2C%22John+Smith%22%5D` (space → `+`, brackets/quotes/comma escaped).
-        let expected =
-            encode_query_value(r#"["AssemblyAI","John Smith"]"#);
+        let expected = encode_query_value(r#"["AssemblyAI","John Smith"]"#);
         assert!(
             url.contains(&format!("keyterms_prompt={expected}")),
             "keyterms_prompt not encoded as a JSON array: {url}"
@@ -850,7 +913,10 @@ mod tests {
                 .next();
         // Easier: assert the over-length term's content is absent and "ok" present.
         let _ = decoded;
-        assert!(url.contains("keyterms_prompt="), "expected keyterms on wire");
+        assert!(
+            url.contains("keyterms_prompt="),
+            "expected keyterms on wire"
+        );
         let encoded_ok = encode_query_value(r#"["ok"]"#);
         assert!(
             url.contains(&format!("keyterms_prompt={encoded_ok}")),
@@ -923,7 +989,10 @@ mod tests {
 
         let url = cfg.build_websocket_url();
         // Supported features reach the wire.
-        assert!(url.contains("keyterms_prompt="), "keyterms not on wire: {url}");
+        assert!(
+            url.contains("keyterms_prompt="),
+            "keyterms not on wire: {url}"
+        );
         let expected = encode_query_value(r#"["WaaV","Universal-3"]"#);
         assert!(
             url.contains(&format!("keyterms_prompt={expected}")),
@@ -943,7 +1012,10 @@ mod tests {
             "entity_detection is batch-only and must not appear on the streaming URL: {url}"
         );
         // And `word_boost` is never emitted (streaming uses keyterms_prompt).
-        assert!(!url.contains("word_boost"), "word_boost must not appear: {url}");
+        assert!(
+            !url.contains("word_boost"),
+            "word_boost must not appear: {url}"
+        );
     }
 
     // =========================================================================
@@ -1005,7 +1077,9 @@ mod tests {
         assert!(!config.build_websocket_url().contains("max_turn_silence"));
         config.max_turn_silence = Some(700);
         assert!(
-            config.build_websocket_url().contains("max_turn_silence=700"),
+            config
+                .build_websocket_url()
+                .contains("max_turn_silence=700"),
             "max_turn_silence=700 missing from URL"
         );
     }
@@ -1017,7 +1091,9 @@ mod tests {
         assert!(!config.build_websocket_url().contains("min_turn_silence"));
         config.min_turn_silence = Some(160);
         assert!(
-            config.build_websocket_url().contains("min_turn_silence=160"),
+            config
+                .build_websocket_url()
+                .contains("min_turn_silence=160"),
             "min_turn_silence=160 missing from URL"
         );
     }
@@ -1041,11 +1117,17 @@ mod tests {
         assert!(!config.build_websocket_url().contains("inactivity_timeout"));
         config.inactivity_timeout = Some(30);
         assert!(
-            config.build_websocket_url().contains("inactivity_timeout=30"),
+            config
+                .build_websocket_url()
+                .contains("inactivity_timeout=30"),
             "inactivity_timeout=30 missing from URL"
         );
         config.inactivity_timeout = Some(1); // below min → clamp to 5
-        assert!(config.build_websocket_url().contains("inactivity_timeout=5"));
+        assert!(
+            config
+                .build_websocket_url()
+                .contains("inactivity_timeout=5")
+        );
     }
 
     /// domain (extras) → `domain=...` (URL-encoded).
@@ -1079,8 +1161,8 @@ mod tests {
                 ..Default::default()
             },
             features: SttFeatures {
-                diarization: Some(true),     // → speaker_labels=true
-                endpointing_ms: Some(640),   // → max_turn_silence=640
+                diarization: Some(true),   // → speaker_labels=true
+                endpointing_ms: Some(640), // → max_turn_silence=640
                 ..Default::default()
             },
             extras: ProviderExtras(extras),
@@ -1089,8 +1171,14 @@ mod tests {
         let cfg = AssemblyAISTTConfig::from_standard(&std);
         let url = cfg.build_websocket_url();
 
-        assert!(url.contains("speaker_labels=true"), "diarization not on wire: {url}");
-        assert!(url.contains("max_speakers=6"), "max_speakers not on wire: {url}");
+        assert!(
+            url.contains("speaker_labels=true"),
+            "diarization not on wire: {url}"
+        );
+        assert!(
+            url.contains("max_speakers=6"),
+            "max_speakers not on wire: {url}"
+        );
         assert!(
             url.contains("max_turn_silence=640"),
             "endpointing_ms not on wire: {url}"
@@ -1099,11 +1187,17 @@ mod tests {
             url.contains("min_turn_silence=120"),
             "min_turn_silence not on wire: {url}"
         );
-        assert!(url.contains("vad_threshold=0.55"), "vad_threshold not on wire: {url}");
+        assert!(
+            url.contains("vad_threshold=0.55"),
+            "vad_threshold not on wire: {url}"
+        );
         assert!(
             url.contains("inactivity_timeout=45"),
             "inactivity_timeout not on wire: {url}"
         );
-        assert!(url.contains("domain=medical-v1"), "domain not on wire: {url}");
+        assert!(
+            url.contains("domain=medical-v1"),
+            "domain not on wire: {url}"
+        );
     }
 }

@@ -4,6 +4,16 @@
 
 use crate::core::stt::base::{STTConfig, STTError};
 use serde::{Deserialize, Serialize};
+use url::form_urlencoded;
+
+fn validate_baidu_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, &["ws", "wss"])
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
 
 // =============================================================================
 // Constants
@@ -48,6 +58,14 @@ pub const RECOMMENDED_CHUNK_DURATION_MS: u32 = 160;
 
 /// Maximum time between audio frames before timeout (5 seconds).
 pub const MAX_FRAME_INTERVAL_SECS: u32 = 5;
+
+pub(crate) fn build_baidu_oauth_url(api_key: &str, secret_key: &str) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("grant_type", "client_credentials");
+    serializer.append_pair("client_id", api_key);
+    serializer.append_pair("client_secret", secret_key);
+    format!("{BAIDU_OAUTH_URL}?{}", serializer.finish())
+}
 
 // =============================================================================
 // Recognition Models
@@ -355,11 +373,12 @@ impl BaiduSttConfig {
             && !matches!(
                 self.model,
                 BaiduSttModel::Mandarin | BaiduSttModel::MandarinNoPunctuation
-            ) {
-                return Err(STTError::ConfigurationError(
-                    "8kHz sample rate is only supported for Mandarin models".to_string(),
-                ));
-            }
+            )
+        {
+            return Err(STTError::ConfigurationError(
+                "8kHz sample rate is only supported for Mandarin models".to_string(),
+            ));
+        }
 
         // Custom vocabulary only for Mandarin
         if self.lm_id.is_some() && !self.model.supports_custom_vocabulary() {
@@ -368,15 +387,17 @@ impl BaiduSttConfig {
             ));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_baidu_stt_endpoint("endpoint_override", endpoint)
+                .map_err(STTError::ConfigurationError)?;
+        }
+
         Ok(())
     }
 
     /// Get the OAuth URL for token retrieval.
     pub fn get_oauth_url(&self) -> String {
-        format!(
-            "{}?grant_type=client_credentials&client_id={}&client_secret={}",
-            BAIDU_OAUTH_URL, self.api_key, self.secret_key
-        )
+        build_baidu_oauth_url(&self.api_key, &self.secret_key)
     }
 
     /// Get the REST API URL for short audio recognition.
@@ -495,6 +516,7 @@ impl BaiduSttConfig {
             cfg.lm_id = Some(lm_id as u32);
         }
         cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        cfg.validate()?;
         Ok(cfg)
     }
 }
@@ -545,7 +567,7 @@ mod tests {
     // base-derived field (model) reach the right config fields.
     #[test]
     fn from_standard_maps_features() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let mut extras = serde_json::Map::new();
         extras.insert("lm_id".into(), serde_json::json!(98765));
         let std = StandardSTTConfig {
@@ -562,6 +584,32 @@ mod tests {
         let cfg = BaiduSttConfig::from_standard(&std).unwrap();
         assert_eq!(cfg.lm_id, Some(98765)); // custom vocabulary model id from provider_extras
         assert_eq!(cfg.model, BaiduSttModel::Mandarin); // base-derived field
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        let mk = |endpoint: &str| {
+            StandardSTTConfig {
+                base: STTConfig {
+                    provider: "baidu".into(),
+                    api_key: "my_api_key|my_secret_key".into(),
+                    model: "mandarin".into(),
+                    ..Default::default()
+                },
+                features: SttFeatures::default(),
+                extras: ProviderExtras::default(),
+                translation: None,
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(BaiduSttConfig::from_standard(&mk("wss://baidu-proxy.example.com")).is_ok());
+        assert!(BaiduSttConfig::from_standard(&mk("ws://127.0.0.1:9000")).is_err());
+        assert!(BaiduSttConfig::from_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(BaiduSttConfig::from_standard(&mk("https://baidu-proxy.example.com")).is_err());
     }
 
     #[test]
@@ -667,6 +715,48 @@ mod tests {
         assert!(url.contains("grant_type=client_credentials"));
         assert!(url.contains("client_id=my_api_key"));
         assert!(url.contains("client_secret=my_secret_key"));
+    }
+
+    #[test]
+    fn test_oauth_url_encodes_credentials() {
+        let config = BaiduSttConfig::new("my_api_key&client_secret=evil", "my secret&scope=all");
+        let url = config.get_oauth_url();
+        assert!(url.contains("client_id=my_api_key%26client_secret%3Devil"));
+        assert!(url.contains("client_secret=my+secret%26scope%3Dall"));
+
+        let parsed = url::Url::parse(&url).expect("Baidu OAuth URL should parse");
+        let query_pairs = parsed.query_pairs().into_owned().collect::<Vec<_>>();
+
+        assert!(
+            query_pairs
+                .iter()
+                .any(|(key, value)| key == "grant_type" && value == "client_credentials")
+        );
+        assert_eq!(
+            query_pairs
+                .iter()
+                .filter(|(key, _)| key == "client_id")
+                .count(),
+            1
+        );
+        assert!(
+            query_pairs
+                .iter()
+                .any(|(key, value)| key == "client_id" && value == "my_api_key&client_secret=evil")
+        );
+        assert_eq!(
+            query_pairs
+                .iter()
+                .filter(|(key, _)| key == "client_secret")
+                .count(),
+            1
+        );
+        assert!(
+            query_pairs
+                .iter()
+                .any(|(key, value)| key == "client_secret" && value == "my secret&scope=all")
+        );
+        assert!(!query_pairs.iter().any(|(key, _)| key == "scope"));
     }
 
     #[test]

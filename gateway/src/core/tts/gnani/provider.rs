@@ -66,9 +66,7 @@ impl GnaniTTS {
     /// by [`GnaniTTSConfig::from_standard`] and reach the live synthesis request — previously
     /// unreachable through the flat factory. Speed/pitch/volume/stability/emotion/instructions/
     /// SSML-text-mode have no Gnani field and are skipped (capability gaps).
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let gnani_config =
             GnaniTTSConfig::from_standard(std).map_err(TTSError::InvalidConfiguration)?;
 
@@ -80,16 +78,18 @@ impl GnaniTTS {
 
     /// Build HTTP client
     fn build_client(config: &GnaniTTSConfig) -> TTSResult<reqwest::Client> {
-        let mut builder = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(config.request_timeout_secs));
+        let mut builder =
+            crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+                .timeout(std::time::Duration::from_secs(config.request_timeout_secs));
 
         // Add certificate if provided (optional for TTS)
         if let Some(ref path) = config.certificate_path
             && path.exists()
-                && let Ok(cert_pem) = std::fs::read(path)
-                    && let Ok(cert) = reqwest::Certificate::from_pem(&cert_pem) {
-                        builder = builder.add_root_certificate(cert);
-                    }
+            && let Ok(cert_pem) = std::fs::read(path)
+            && let Ok(cert) = reqwest::Certificate::from_pem(&cert_pem)
+        {
+            builder = builder.add_root_certificate(cert);
+        }
 
         builder.build().map_err(|e| {
             TTSError::InvalidConfiguration(format!("Failed to build HTTP client: {}", e))
@@ -376,6 +376,53 @@ mod tests {
         let config = create_test_config();
         let result = GnaniTTS::create(config);
         assert!(result.is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gnani_tts_redirect_policy_rejects_private_hop() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let mut config = GnaniTTSConfig::default();
+        config.token = "test-token".to_string();
+        config.access_key = "test-access-key".to_string();
+        let client = GnaniTTS::build_client(&config).expect("construct Gnani TTS client");
+        let err = client
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(err) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&err.to_string());
+            source = err.source();
+        }
+        assert!(error_chain.contains("SSRF protection"), "{error_chain}");
     }
 
     // W1 keystone (struct-level, mirrors DeepgramTTS::from_standard): the standardized `language`

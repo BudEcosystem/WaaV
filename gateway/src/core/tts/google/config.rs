@@ -28,8 +28,22 @@
 //! assert_eq!(google_config.audio_encoding.as_str(), "MP3");
 //! ```
 
-use crate::core::tts::base::TTSConfig;
+use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
+
+fn validate_google_tts_endpoint(source: &str, endpoint: &str) -> Result<(), TTSError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}")),
+    )
+}
+
+pub const MIN_SAMPLE_RATE_HERTZ: u32 = 1;
+pub const MAX_SAMPLE_RATE_HERTZ: u32 = 192_000;
 
 /// Audio encoding formats supported by Google Cloud Text-to-Speech API.
 ///
@@ -316,7 +330,41 @@ impl GoogleTTSConfig {
             cfg.base.sample_rate = Some(sr);
         }
         cfg.apply_standard_synthesis_features(std);
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.static_access_token = std
+            .extras
+            .0
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         cfg
+    }
+
+    pub(crate) fn validate_endpoint_override(&self) -> Result<(), TTSError> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_google_tts_endpoint("endpoint_override", endpoint)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_sample_rate(&self) -> Result<(), TTSError> {
+        let Some(sample_rate) = self.base.sample_rate else {
+            return Ok(());
+        };
+
+        if !(MIN_SAMPLE_RATE_HERTZ..=MAX_SAMPLE_RATE_HERTZ).contains(&sample_rate) {
+            return Err(TTSError::InvalidConfiguration(format!(
+                "Google TTS sample_rate must be between {} and {} Hz, got {}",
+                MIN_SAMPLE_RATE_HERTZ, MAX_SAMPLE_RATE_HERTZ, sample_rate
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn validate_runtime_config(&self) -> Result<(), TTSError> {
+        self.validate_sample_rate()?;
+        self.validate_endpoint_override()
     }
 
     /// Maps the standardized `ssml`/`instructions` typed features and the Google-unique `extras`
@@ -594,6 +642,74 @@ mod tests {
         assert_eq!(cfg.base.sample_rate, Some(48000));
     }
 
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = GoogleTTSConfig::from_base_config(
+            TTSConfig {
+                provider: "google".into(),
+                voice_id: Some("en-US-Wavenet-D".to_string()),
+                ..Default::default()
+            },
+            "test-project".to_string(),
+        );
+
+        config.endpoint_override = Some("https://google-proxy.example.com".to_string());
+        assert!(config.validate_endpoint_override().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://google-proxy.example.com".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("WebSocket endpoint_override must be rejected for REST Google");
+        assert!(err.to_string().contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "google".into(),
+            voice_id: Some("en-US-Wavenet-D".to_string()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        let cfg = GoogleTTSConfig::from_standard(&std);
+        assert!(cfg.validate_endpoint_override().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_invalid_sample_rate() {
+        let mut config = GoogleTTSConfig::from_base_config(
+            TTSConfig {
+                provider: "google".into(),
+                sample_rate: Some(24_000),
+                ..Default::default()
+            },
+            "test-project".to_string(),
+        );
+        assert!(config.validate_sample_rate().is_ok());
+
+        config.base.sample_rate = Some(0);
+        let err = config
+            .validate_sample_rate()
+            .expect_err("zero sample_rate must be rejected");
+        assert!(err.to_string().contains("sample_rate"), "{err}");
+
+        config.base.sample_rate = Some(u32::MAX);
+        let err = config
+            .validate_sample_rate()
+            .expect_err("pathological sample_rate must be rejected");
+        assert!(err.to_string().contains("sample_rate"), "{err}");
+    }
+
     // WIRE-LEVEL: the provider-unique `effects_profile_id` extras passthrough must reach the
     // SERIALIZED `audioConfig.effectsProfileId` the body builder emits — not just sit in the
     // config struct (the bug class the last review caught). Accepts an array or a single string.
@@ -626,7 +742,10 @@ mod tests {
         // Struct-level (necessary but NOT sufficient).
         assert_eq!(
             cfg.effects_profile_id,
-            vec!["headphone-class-device".to_string(), "wearable-class-device".to_string()]
+            vec![
+                "headphone-class-device".to_string(),
+                "wearable-class-device".to_string()
+            ]
         );
 
         // Wire-level: serialize the actual request body the builder produces and assert the param
@@ -677,7 +796,10 @@ mod tests {
         };
 
         let cfg = GoogleTTSConfig::from_standard(&std);
-        assert_eq!(cfg.effects_profile_id, vec!["telephony-class-application".to_string()]);
+        assert_eq!(
+            cfg.effects_profile_id,
+            vec!["telephony-class-application".to_string()]
+        );
 
         let builder = crate::core::tts::google::GoogleRequestBuilder::new(
             std.base.clone(),

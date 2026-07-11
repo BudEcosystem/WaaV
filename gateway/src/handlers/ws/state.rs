@@ -53,8 +53,7 @@ pub struct ConnectionState {
     /// to PCM16 (at the negotiated rate) BEFORE STT. `tokio::sync::Mutex` for `&mut` access under
     /// the connection read-lock on the audio hot path.
     #[cfg(feature = "opus-codec")]
-    pub opus_decoder:
-        Option<tokio::sync::Mutex<crate::core::audio::opus_codec::OpusStreamDecoder>>,
+    pub opus_decoder: Option<tokio::sync::Mutex<crate::core::audio::opus_codec::OpusStreamDecoder>>,
 
     // DAG routing state (feature-gated)
     /// Compiled DAG for this connection
@@ -203,7 +202,11 @@ mod tests {
             0,
             "a cancellable session loop is stopped without being flagged dangling"
         );
-        assert_eq!(state.task_tracker.tracked_count(), 0, "audit drains the tracker");
+        assert_eq!(
+            state.task_tracker.tracked_count(),
+            0,
+            "audit drains the tracker"
+        );
     }
 
     #[test]

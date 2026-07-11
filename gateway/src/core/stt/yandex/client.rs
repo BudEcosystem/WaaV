@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
@@ -16,6 +16,12 @@ use super::messages::{YandexSTTApiError, YandexSTTStatusCode, YandexSyncResponse
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
+
+fn yandex_stt_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+}
 
 // =============================================================================
 // Constants
@@ -33,6 +39,21 @@ pub const MAX_SYNC_AUDIO_DURATION_SECS: u32 = 30;
 
 /// Audio chunk collection interval for pseudo-streaming (ms)
 const CHUNK_COLLECTION_INTERVAL_MS: u64 = 100;
+
+fn yandex_stt_recognize_request(
+    client: &reqwest::Client,
+    yandex_config: &YandexSTTConfig,
+    audio_data: Vec<u8>,
+) -> reqwest::RequestBuilder {
+    let params = yandex_config.build_query_params();
+
+    client
+        .post(yandex_config.recognize_url())
+        .header(AUTHORIZATION, yandex_config.auth_header_value())
+        .header(CONTENT_TYPE, yandex_config.audio_format.content_type())
+        .query(&params)
+        .body(audio_data)
+}
 
 // =============================================================================
 // Yandex STT Provider
@@ -81,9 +102,7 @@ impl YandexSTT {
         Ok(Self {
             config,
             yandex_config,
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .build()
+            client: yandex_stt_http_client()
                 .map_err(|e| STTError::ConnectionFailed(e.to_string()))?,
             connected: AtomicBool::new(false),
             result_callback: Arc::new(RwLock::new(None)),
@@ -111,9 +130,7 @@ impl YandexSTT {
         Ok(Self {
             config: std.base.clone(),
             yandex_config,
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .build()
+            client: yandex_stt_http_client()
                 .map_err(|e| STTError::ConnectionFailed(e.to_string()))?,
             connected: AtomicBool::new(false),
             result_callback: Arc::new(RwLock::new(None)),
@@ -126,23 +143,6 @@ impl YandexSTT {
 
     /// Recognize audio using synchronous API
     async fn recognize_sync(&self, audio_data: &[u8]) -> Result<String, STTError> {
-        // Build headers
-        let mut headers = HeaderMap::new();
-
-        // Authorization header
-        if let Ok(auth) = HeaderValue::from_str(&self.yandex_config.auth_header_value()) {
-            headers.insert(AUTHORIZATION, auth);
-        }
-
-        // Content-Type for audio
-        headers.insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static(self.yandex_config.audio_format.content_type()),
-        );
-
-        // Build query parameters
-        let params = self.yandex_config.build_query_params();
-
         debug!(
             "Yandex STT request: lang={}, format={}, audio_len={}",
             self.yandex_config.language.as_code(),
@@ -151,15 +151,11 @@ impl YandexSTT {
         );
 
         // Send request
-        let response = self
-            .client
-            .post(self.yandex_config.recognize_url())
-            .headers(headers)
-            .query(&params)
-            .body(audio_data.to_vec())
-            .send()
-            .await
-            .map_err(|e| STTError::NetworkError(format!("Failed to send request: {}", e)))?;
+        let response =
+            yandex_stt_recognize_request(&self.client, &self.yandex_config, audio_data.to_vec())
+                .send()
+                .await
+                .map_err(|e| STTError::NetworkError(format!("Failed to send request: {}", e)))?;
 
         let status = response.status();
         let status_code = YandexSTTStatusCode::from_http_status(status.as_u16());
@@ -243,24 +239,8 @@ impl YandexSTT {
                 debug!("Processing {} bytes of accumulated audio", audio_data.len());
                 last_process_time = std::time::Instant::now();
 
-                // Build request
-                let mut headers = HeaderMap::new();
-                if let Ok(auth) = HeaderValue::from_str(&yandex_config.auth_header_value()) {
-                    headers.insert(AUTHORIZATION, auth);
-                }
-                headers.insert(
-                    CONTENT_TYPE,
-                    HeaderValue::from_static(yandex_config.audio_format.content_type()),
-                );
-
-                let params = yandex_config.build_query_params();
-
                 // Send request
-                let result = client
-                    .post(yandex_config.recognize_url())
-                    .headers(headers)
-                    .query(&params)
-                    .body(audio_data)
+                let result = yandex_stt_recognize_request(&client, &yandex_config, audio_data)
                     .send()
                     .await;
 
@@ -271,20 +251,19 @@ impl YandexSTT {
                             if let Ok(text) = response.text().await
                                 && let Ok(sync_response) =
                                     serde_json::from_str::<YandexSyncResponse>(&text)
-                                    && let Some(transcript) = sync_response.result
-                                        && !transcript.is_empty() {
-                                            let stt_result = STTResult::new(
-                                                transcript, true, // is_final
-                                                true, // is_speech_final
-                                                0.95, // confidence (Yandex doesn't return this for sync)
-                                            );
+                                && let Some(transcript) = sync_response.result
+                                && !transcript.is_empty()
+                            {
+                                let stt_result = STTResult::new(
+                                    transcript, true, // is_final
+                                    true, // is_speech_final
+                                    0.95, // confidence (Yandex doesn't return this for sync)
+                                );
 
-                                            if let Some(callback) =
-                                                result_callback.read().await.as_ref()
-                                            {
-                                                callback(stt_result).await;
-                                            }
-                                        }
+                                if let Some(callback) = result_callback.read().await.as_ref() {
+                                    callback(stt_result).await;
+                                }
+                            }
                         } else {
                             let body = response.text().await.unwrap_or_default();
                             let api_error =
@@ -450,6 +429,7 @@ impl BaseSTT for YandexSTT {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
 
     fn create_test_config() -> STTConfig {
         STTConfig {
@@ -470,7 +450,7 @@ mod tests {
     // maps them.
     #[test]
     fn test_yandex_new_standard_unlocks_advanced_features() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "yandex".into(),
@@ -562,6 +542,20 @@ mod tests {
     }
 
     #[test]
+    fn invalid_yandex_stt_api_key_header_value_is_request_build_error() {
+        let mut config = create_test_config();
+        config.api_key = "bad\nkey".to_string();
+
+        let yandex_config = YandexSTTConfig::from_base(&config).unwrap();
+        let err =
+            yandex_stt_recognize_request(&reqwest::Client::new(), &yandex_config, vec![0u8; 1600])
+                .build()
+                .expect_err("malformed Yandex STT API key must not omit the Authorization header");
+
+        assert!(err.is_builder(), "unexpected reqwest error: {err}");
+    }
+
+    #[test]
     fn test_yandex_stt_provider_info() {
         let config = create_test_config();
         let stt = YandexSTT::new(config).unwrap();
@@ -602,6 +596,56 @@ mod tests {
         let stored_config = stt.get_config().unwrap();
         assert_eq!(stored_config.api_key, "new-api-key");
         assert_eq!(stored_config.language, "en-US");
+    }
+
+    #[tokio::test]
+    async fn yandex_stt_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!("Skipping yandex_stt_redirect_policy_rejects_private_hop: {err}");
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = yandex_stt_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
     }
 
     #[tokio::test]

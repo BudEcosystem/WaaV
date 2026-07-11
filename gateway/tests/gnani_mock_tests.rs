@@ -23,9 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
 use waav_gateway::core::stt::{STTConfig, STTError, create_stt_provider};
-use waav_gateway::core::tts::{
-    AudioCallback, AudioData, TTSConfig, TTSError, create_tts_provider,
-};
+use waav_gateway::core::tts::{AudioCallback, AudioData, TTSConfig, TTSError, create_tts_provider};
 
 // ============================================================================
 // Test Helpers

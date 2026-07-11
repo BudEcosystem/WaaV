@@ -35,9 +35,12 @@ use crate::dag::{
 use super::{
     config::{
         ConversationWebSocketConfig, DAGWebSocketConfig, LiveKitWebSocketConfig,
-        STTWebSocketConfig, TTSWebSocketConfig, compute_tts_config_hash,
+        STTWebSocketConfig, TTSWebSocketConfig, client_api_key, compute_tts_config_hash,
     },
-    messages::{MessageRoute, OutgoingMessage, ParticipantDisconnectedInfo, UnifiedMessage},
+    messages::{
+        MessageClass, MessageRoute, OutgoingMessage, ParticipantDisconnectedInfo, UnifiedMessage,
+        send_with_policy,
+    },
     state::ConnectionState,
 };
 
@@ -53,6 +56,37 @@ const LIVEKIT_POLL_INTERVAL_MS: u64 = 100;
 /// Lock timeout for LiveKit operations (in milliseconds)
 const LIVEKIT_LOCK_TIMEOUT_MS: u64 = 100;
 
+async fn send_critical(message_tx: &mpsc::Sender<MessageRoute>, route: MessageRoute) {
+    send_with_policy(message_tx, route, MessageClass::Critical).await;
+}
+
+async fn send_error(message_tx: &mpsc::Sender<MessageRoute>, message: impl Into<String>) {
+    send_critical(
+        message_tx,
+        MessageRoute::Outgoing(OutgoingMessage::Error {
+            message: message.into(),
+        }),
+    )
+    .await;
+}
+
+async fn send_config_warning(
+    message_tx: &mpsc::Sender<MessageRoute>,
+    code: impl Into<String>,
+    message: impl Into<String>,
+    detail: Option<serde_json::Value>,
+) {
+    send_critical(
+        message_tx,
+        MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
+            code: code.into(),
+            message: message.into(),
+            detail,
+        }),
+    )
+    .await;
+}
+
 /// Resolve the stream identifier for the current session
 fn resolve_stream_id(stream_id: Option<String>) -> String {
     stream_id.unwrap_or_else(|| {
@@ -60,6 +94,43 @@ fn resolve_stream_id(stream_id: Option<String>) -> String {
         debug!("Generated stream_id: {}", generated);
         generated
     })
+}
+
+fn explicit_voice_id(voice_id: Option<&str>) -> bool {
+    voice_id.is_some_and(|id| !id.trim().is_empty())
+}
+
+fn voice_descriptor_to_resolve(
+    tts: &TTSWebSocketConfig,
+) -> Option<crate::core::voice::VoiceDescriptor> {
+    if explicit_voice_id(tts.voice_id.as_deref()) {
+        return None;
+    }
+    tts.voice_descriptor
+        .clone()
+        .filter(|descriptor| descriptor.is_set())
+}
+
+fn heartbeat_period_from_env() -> Result<Option<Duration>, String> {
+    match std::env::var("WAAV_HEARTBEAT_PERIOD_MS") {
+        Ok(value) => value
+            .parse::<u64>()
+            .map_err(|e| format!("Invalid WAAV_HEARTBEAT_PERIOD_MS environment variable: {e}"))
+            .and_then(|period_ms| {
+                if period_ms > 0 {
+                    Ok(Some(Duration::from_millis(period_ms)))
+                } else {
+                    Err(
+                        "WAAV_HEARTBEAT_PERIOD_MS environment variable must be greater than zero"
+                            .to_string(),
+                    )
+                }
+            }),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("WAAV_HEARTBEAT_PERIOD_MS environment variable must be valid UTF-8".to_string())
+        }
+    }
 }
 
 /// Handle configuration message and initialize providers
@@ -106,13 +177,12 @@ pub async fn handle_config_message(
         let state_guard = state.read().await;
         if state_guard.voice_manager.is_some() || state_guard.stream_id.is_some() {
             warn!("Rejecting second config message on an already-configured session");
-            let _ = message_tx
-                .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                    message: "Session already configured — open a new connection to \
-                              reconfigure (one config message per session)"
-                        .to_string(),
-                }))
-                .await;
+            send_error(
+                message_tx,
+                "Session already configured — open a new connection to \
+                 reconfigure (one config message per session)",
+            )
+            .await;
             return true;
         }
     }
@@ -144,13 +214,13 @@ pub async fn handle_config_message(
                 // config and surface a `config_warning` advisory (reusing the P0/P2
                 // advisory channel) instead of a hard 400.
                 let (code, message) = crate::core::alias::unknown_alias_message(alias_name);
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
-                        code,
-                        message,
-                        detail: Some(serde_json::json!({ "alias": alias_name })),
-                    }))
-                    .await;
+                send_config_warning(
+                    message_tx,
+                    code,
+                    message,
+                    Some(serde_json::json!({ "alias": alias_name })),
+                )
+                .await;
                 None
             }
         }
@@ -199,11 +269,15 @@ pub async fn handle_config_message(
     // the C-G5 resampler and the egress chunker. The effective tokens are echoed in `ready`; an
     // unsupported request degrades to linear16 with a warning (never a hard error).
     let uplink_codec = crate::core::audio::codec::negotiate(
-        stt_ws_config.as_ref().and_then(|s| s.audio_in_codec.as_deref()),
+        stt_ws_config
+            .as_ref()
+            .and_then(|s| s.audio_in_codec.as_deref()),
         "uplink",
     );
     let downlink_codec = crate::core::audio::codec::negotiate(
-        tts_ws_config.as_ref().and_then(|t| t.audio_out_codec.as_deref()),
+        tts_ws_config
+            .as_ref()
+            .and_then(|t| t.audio_out_codec.as_deref()),
         "downlink",
     );
     emit_codec_warning("uplink", &uplink_codec, message_tx).await;
@@ -222,15 +296,29 @@ pub async fn handle_config_message(
 
     // Initialize voice manager if audio is enabled
     let voice_manager = if audio_enabled {
-        match initialize_voice_manager(
-            stt_ws_config.as_ref().unwrap(),
-            tts_ws_config.as_ref().unwrap(),
-            app_state,
-            message_tx,
-        )
-        .await
-        {
+        let (Some(stt_config), Some(tts_config)) = (stt_ws_config.as_ref(), tts_ws_config.as_ref())
+        else {
+            let error_msg = "STT and TTS configurations are required when audio=true";
+            error!("Audio enabled but STT/TTS config missing after validation; rejecting config");
+            send_error(message_tx, error_msg).await;
+            return true;
+        };
+
+        match initialize_voice_manager(stt_config, tts_config, app_state, message_tx).await {
             Some(vm) => {
+                let heartbeat_period = match heartbeat_period_from_env() {
+                    Ok(period) => period,
+                    Err(e) => {
+                        error!(error = %e, "Invalid heartbeat environment configuration");
+                        send_error(
+                            message_tx,
+                            format!("Server heartbeat configuration invalid: {e}"),
+                        )
+                        .await;
+                        return true;
+                    }
+                };
+
                 // Store in connection state
                 let mut state_guard = state.write().await;
                 state_guard.voice_manager = Some(vm.clone());
@@ -240,7 +328,10 @@ pub async fn handle_config_message(
                 // before STT. The sample rate was already coerced to an opus-valid value above.
                 #[cfg(feature = "opus-codec")]
                 if uplink_codec.effective == crate::core::audio::AudioCodec::Opus {
-                    let rate = stt_ws_config.as_ref().map(|s| s.sample_rate).unwrap_or(16_000);
+                    let rate = stt_ws_config
+                        .as_ref()
+                        .map(|s| s.sample_rate)
+                        .unwrap_or(16_000);
                     match crate::core::audio::opus_codec::OpusStreamDecoder::new(rate) {
                         Ok(decoder) => {
                             state_guard.opus_decoder = Some(tokio::sync::Mutex::new(decoder));
@@ -254,11 +345,7 @@ pub async fn handle_config_message(
                 // D-G10: optional pipeline liveness heartbeat (env-gated, off
                 // by default) probing audio-provider readiness; aborted when
                 // the connection state drops.
-                if let Some(period_ms) = std::env::var("WAAV_HEARTBEAT_PERIOD_MS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v > 0)
-                {
+                if let Some(period) = heartbeat_period {
                     use crate::core::observability::{
                         HeartbeatConfig, HeartbeatMonitor, LivenessProbe,
                     };
@@ -268,14 +355,11 @@ pub async fn handle_config_message(
                         Box::pin(async move { vm.is_ready().await })
                     });
                     let cfg = HeartbeatConfig {
-                        period: std::time::Duration::from_millis(period_ms),
-                        timeout: std::time::Duration::from_secs(5),
+                        period,
+                        timeout: Duration::from_secs(5),
                     };
-                    state_guard.heartbeat = Some(HeartbeatMonitor::spawn(
-                        cfg,
-                        stream_id.clone(),
-                        probe,
-                    ));
+                    state_guard.heartbeat =
+                        Some(HeartbeatMonitor::spawn(cfg, stream_id.clone(), probe));
                 }
                 Some(vm)
             }
@@ -294,8 +378,7 @@ pub async fn handle_config_message(
 
     // Register early TTS callback for cached audio
     if let Some(ref vm) = voice_manager {
-        register_early_tts_callback(vm, message_tx, egress_audio.clone(), ws_chunker.clone())
-            .await;
+        register_early_tts_callback(vm, message_tx, egress_audio.clone(), ws_chunker.clone()).await;
         // E-G2: on barge-in clear, the chunker's carried remainder is STALE
         // bot audio — drop it. Raw-WS sessions have a free audio-clear slot;
         // LiveKit sessions overwrite this with their own clear callback
@@ -333,7 +416,10 @@ pub async fn handle_config_message(
             // tracker so the LiveKit audio forwarder is audited at teardown.
             let (auth_id, task_tracker) = {
                 let state_guard = state.read().await;
-                (state_guard.auth.id.clone(), state_guard.task_tracker.clone())
+                (
+                    state_guard.auth.id.clone(),
+                    state_guard.task_tracker.clone(),
+                )
             };
 
             match initialize_livekit_client(
@@ -341,7 +427,10 @@ pub async fn handle_config_message(
                 tts_ws_config.as_ref(),
                 // INGRESS: deliver remote-participant audio at the rate the
                 // STT pipeline declares downstream (16k default).
-                stt_ws_config.as_ref().map(|s| s.sample_rate).unwrap_or(16_000),
+                stt_ws_config
+                    .as_ref()
+                    .map(|s| s.sample_rate)
+                    .unwrap_or(16_000),
                 &app_state.config.livekit_url,
                 voice_manager.as_ref(),
                 message_tx,
@@ -434,11 +523,7 @@ pub async fn handle_config_message(
             Ok(false) => false,
             Err(e) => {
                 error!("DAG routing initialization failed: {}", e);
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                        message: format!("DAG initialization failed: {}", e),
-                    }))
-                    .await;
+                send_error(message_tx, format!("DAG initialization failed: {}", e)).await;
                 false
             }
         }
@@ -453,12 +538,11 @@ pub async fn handle_config_message(
             warn!(
                 "DAG routing requested but feature not enabled. Build with --features dag-routing"
             );
-            let _ = message_tx
-                .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                    message: "DAG routing is not enabled. Build with --features dag-routing"
-                        .to_string(),
-                }))
-                .await;
+            send_error(
+                message_tx,
+                "DAG routing is not enabled. Build with --features dag-routing",
+            )
+            .await;
         }
         false
     };
@@ -488,11 +572,11 @@ pub async fn handle_config_message(
             Ok(false) => false,
             Err(e) => {
                 error!("Conversation loop initialization failed: {}", e);
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                        message: format!("Conversation loop initialization failed: {}", e),
-                    }))
-                    .await;
+                send_error(
+                    message_tx,
+                    format!("Conversation loop initialization failed: {}", e),
+                )
+                .await;
                 false
             }
         }
@@ -505,8 +589,9 @@ pub async fn handle_config_message(
 
     // Send ready message with optional LiveKit room information
     // (D8 audio_in_codec/audio_out_codec were negotiated early, before the audio pipeline.)
-    let _ = message_tx
-        .send(MessageRoute::Outgoing(OutgoingMessage::Ready {
+    send_critical(
+        message_tx,
+        MessageRoute::Outgoing(OutgoingMessage::Ready {
             protocol_version: crate::handlers::ws::messages::PROTOCOL_VERSION.to_string(),
             stream_id: stream_id.clone(),
             livekit_room_name: livekit_room_name.clone(),
@@ -516,8 +601,9 @@ pub async fn handle_config_message(
             resolved_alias: resolved_alias.map(Box::new),
             audio_in_codec,
             audio_out_codec,
-        }))
-        .await;
+        }),
+    )
+    .await;
 
     info!(
         stream_id = %stream_id,
@@ -562,57 +648,59 @@ async fn emit_reasoning_config_warnings(
             model = %conv_config.model,
             "a reasoning model is on the spoken path — first-audio latency will be seconds"
         );
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
-                code: "reasoning_model_on_voice_path".to_string(),
-                message: format!(
-                    "model '{}' is a reasoning model on the spoken path; first-audio latency \
-                     will be seconds. Keep a FAST model on `model` (add a `reasoning_model` for \
-                     two-tier when available), or lower `reasoning_effort`.",
-                    conv_config.model
-                ),
-                detail: None,
-            }))
-            .await;
+        send_config_warning(
+            message_tx,
+            "reasoning_model_on_voice_path",
+            format!(
+                "model '{}' is a reasoning model on the spoken path; first-audio latency \
+                 will be seconds. Keep a FAST model on `model` (add a `reasoning_model` for \
+                 two-tier when available), or lower `reasoning_effort`.",
+                conv_config.model
+            ),
+            None,
+        )
+        .await;
     }
     // D5: eager speculation is auto-disabled on a reasoning model (it would pay
     // full think-time per speculative fire) — tell the operator so it isn't a
     // silent no-op.
     if conv_config.eager_eot && is_known_reasoning_model(&conv_config.model) {
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
-                code: "eager_eot_disabled_for_reasoning_model".to_string(),
-                message: format!(
-                    "eager_eot is ignored for reasoning model '{}' — each speculative \
-                     turn would pay full think-time and be discarded on resume. Use a \
-                     fast `model` to benefit from eager.",
-                    conv_config.model
-                ),
-                detail: None,
-            }))
-            .await;
+        send_config_warning(
+            message_tx,
+            "eager_eot_disabled_for_reasoning_model",
+            format!(
+                "eager_eot is ignored for reasoning model '{}' — each speculative \
+                 turn would pay full think-time and be discarded on resume. Use a \
+                 fast `model` to benefit from eager.",
+                conv_config.model
+            ),
+            None,
+        )
+        .await;
     }
     // Floor-clamp echo: surface when the applied effort differs from the request
     // (an adaptive-only model can't go as low as asked).
     if let Some(req) = conv_config.reasoning_effort {
-        let (applied, floor) = conv_config.to_conversation_config().resolved_reasoning_effort();
+        let (applied, floor) = conv_config
+            .to_conversation_config()
+            .resolved_reasoning_effort();
         if applied != Some(req) {
-            let _ = message_tx
-                .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
-                    code: "reasoning_effort_clamped".to_string(),
-                    message: format!(
-                        "model '{}' cannot honor reasoning_effort '{}'; clamped to its floor '{}'.",
-                        conv_config.model,
-                        req.as_str(),
-                        floor.as_str()
-                    ),
-                    detail: Some(serde_json::json!({
-                        "requested": req.as_str(),
-                        "applied": applied.map(|e| e.as_str()),
-                        "floor": floor.as_str(),
-                    })),
-                }))
-                .await;
+            send_config_warning(
+                message_tx,
+                "reasoning_effort_clamped",
+                format!(
+                    "model '{}' cannot honor reasoning_effort '{}'; clamped to its floor '{}'.",
+                    conv_config.model,
+                    req.as_str(),
+                    floor.as_str()
+                ),
+                Some(serde_json::json!({
+                    "requested": req.as_str(),
+                    "applied": applied.map(|e| e.as_str()),
+                    "floor": floor.as_str(),
+                })),
+            )
+            .await;
         }
     }
     // Reasoning-tier sub-knobs are INERT without a `reasoning_model`:
@@ -642,18 +730,18 @@ async fn emit_reasoning_config_warnings(
         }
         if !inert.is_empty() {
             warn!(fields = ?inert, "reasoning-tier fields set without reasoning_model — inert");
-            let _ = message_tx
-                .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
-                    code: "reasoning_tier_without_model".to_string(),
-                    message: format!(
-                        "these reasoning-tier fields are ignored because no `reasoning_model` is \
-                         set, so every turn uses the fast `model`: {}. Set `reasoning_model` to \
-                         enable the two-tier router.",
-                        inert.join(", ")
-                    ),
-                    detail: Some(serde_json::json!({ "ignored_fields": inert })),
-                }))
-                .await;
+            send_config_warning(
+                message_tx,
+                "reasoning_tier_without_model",
+                format!(
+                    "these reasoning-tier fields are ignored because no `reasoning_model` is \
+                     set, so every turn uses the fast `model`: {}. Set `reasoning_model` to \
+                     enable the two-tier router.",
+                    inert.join(", ")
+                ),
+                Some(serde_json::json!({ "ignored_fields": inert })),
+            )
+            .await;
         }
     }
 }
@@ -708,17 +796,17 @@ async fn emit_language_config_warnings(
             "language config advisory: {message}"
         );
         crate::core::metrics::bridge::record_degraded("language_mapping", side);
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
-                code: "language_unsupported_or_degraded".to_string(),
-                message,
-                detail: Some(serde_json::json!({
-                    "side": side,
-                    "provider": provider,
-                    "requested_language": raw,
-                })),
-            }))
-            .await;
+        send_config_warning(
+            message_tx,
+            "language_unsupported_or_degraded",
+            message,
+            Some(serde_json::json!({
+                "side": side,
+                "provider": provider,
+                "requested_language": raw,
+            })),
+        )
+        .await;
     }
 }
 
@@ -733,17 +821,17 @@ async fn emit_codec_warning(
     if let Some(message) = neg.warning.clone() {
         warn!(side = side, "audio codec advisory: {message}");
         crate::core::metrics::bridge::record_degraded("audio_codec", side);
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
-                code: "audio_codec_unsupported_or_degraded".to_string(),
-                message,
-                detail: Some(serde_json::json!({
-                    "side": side,
-                    "requested": neg.requested.as_str(),
-                    "effective": neg.effective.as_str(),
-                })),
-            }))
-            .await;
+        send_config_warning(
+            message_tx,
+            "audio_codec_unsupported_or_degraded",
+            message,
+            Some(serde_json::json!({
+                "side": side,
+                "requested": neg.requested.as_str(),
+                "effective": neg.effective.as_str(),
+            })),
+        )
+        .await;
     }
 }
 
@@ -770,8 +858,14 @@ async fn coerce_opus_rates(
         && !is_opus_rate(stt.sample_rate)
     {
         let to = nearest_opus_rate(stt.sample_rate);
-        emit_codec_coercion("uplink", "sample_rate", stt.sample_rate as u64, to as u64, message_tx)
-            .await;
+        emit_codec_coercion(
+            "uplink",
+            "sample_rate",
+            stt.sample_rate as u64,
+            to as u64,
+            message_tx,
+        )
+        .await;
         stt.sample_rate = to;
     }
 
@@ -780,7 +874,11 @@ async fn coerce_opus_rates(
     {
         // client_playback_rate drives both the resampler target and the opus rate; default 48k.
         let rate = tts.client_playback_rate.unwrap_or(48_000);
-        let snapped = if is_opus_rate(rate) { rate } else { nearest_opus_rate(rate) };
+        let snapped = if is_opus_rate(rate) {
+            rate
+        } else {
+            nearest_opus_rate(rate)
+        };
         if Some(snapped) != tts.client_playback_rate {
             if tts.client_playback_rate.is_some() {
                 emit_codec_coercion(
@@ -796,7 +894,11 @@ async fn coerce_opus_rates(
         }
         // audio_out_chunk_ms is the opus frame size; default 20ms.
         let chunk = tts.audio_out_chunk_ms.unwrap_or(20);
-        let snapped_ms = if is_opus_frame_ms(chunk) { chunk } else { nearest_opus_frame_ms(chunk) };
+        let snapped_ms = if is_opus_frame_ms(chunk) {
+            chunk
+        } else {
+            nearest_opus_frame_ms(chunk)
+        };
         if Some(snapped_ms) != tts.audio_out_chunk_ms {
             if tts.audio_out_chunk_ms.is_some() {
                 emit_codec_coercion(
@@ -823,13 +925,13 @@ async fn emit_codec_coercion(
     message_tx: &mpsc::Sender<MessageRoute>,
 ) {
     warn!(side, field, from, to, "opus param coerced to a valid value");
-    let _ = message_tx
-        .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
-            code: "audio_codec_param_coerced".to_string(),
-            message: format!("opus {side}: {field} {from} is not opus-valid; using {to}"),
-            detail: Some(serde_json::json!({ "side": side, "field": field, "from": from, "to": to })),
-        }))
-        .await;
+    send_config_warning(
+        message_tx,
+        "audio_codec_param_coerced",
+        format!("opus {side}: {field} {from} is not opus-valid; using {to}"),
+        Some(serde_json::json!({ "side": side, "field": field, "from": from, "to": to })),
+    )
+    .await;
 }
 
 /// P4 voice-descriptor resolution: when a [`TTSWebSocketConfig`] carries a
@@ -844,18 +946,11 @@ async fn resolve_voice_descriptor(
     message_tx: &mpsc::Sender<MessageRoute>,
 ) {
     // Escape hatch / nothing to resolve.
-    if tts.voice_id.as_ref().is_some_and(|v| !v.trim().is_empty()) {
-        return;
-    }
-    let Some(descriptor) = tts.voice_descriptor.clone() else {
+    let Some(descriptor) = voice_descriptor_to_resolve(tts) else {
         return;
     };
-    if !descriptor.is_set() {
-        return;
-    }
 
-    let catalog =
-        crate::handlers::voices::fetch_provider_catalog(app_state, &tts.provider).await;
+    let catalog = crate::handlers::voices::fetch_provider_catalog(app_state, &tts.provider).await;
     let default_id = crate::handlers::voices::provider_default_voice(&tts.provider);
     let resolved = crate::core::voice::resolve_voice(&descriptor, &catalog, default_id);
 
@@ -872,18 +967,18 @@ async fn resolve_voice_descriptor(
             resolved = %resolved.voice_id,
             "voice descriptor advisory: {warning}"
         );
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
-                code: "voice_descriptor_unmatched".to_string(),
-                message: warning,
-                detail: Some(serde_json::json!({
-                    "provider": tts.provider,
-                    "descriptor": descriptor.describe(),
-                    "resolved_voice_id": resolved.voice_id,
-                    "used_default": resolved.used_default,
-                })),
-            }))
-            .await;
+        send_config_warning(
+            message_tx,
+            "voice_descriptor_unmatched",
+            warning,
+            Some(serde_json::json!({
+                "provider": tts.provider,
+                "descriptor": descriptor.describe(),
+                "resolved_voice_id": resolved.voice_id,
+                "used_default": resolved.used_default,
+            })),
+        )
+        .await;
     } else {
         info!(
             provider = %tts.provider,
@@ -923,9 +1018,7 @@ async fn initialize_conversation_loop(
     // VoiceManager's live playout estimate (probe), not a stale flag.
     let start_strategy: Box<dyn crate::core::turn::UserTurnStartStrategy> =
         match conv_config.barge_in_min_words {
-            Some(n) if n >= 1 => {
-                Box::new(crate::core::turn::strategies::MinWordsStart::new(n))
-            }
+            Some(n) if n >= 1 => Box::new(crate::core::turn::strategies::MinWordsStart::new(n)),
             _ => Box::new(crate::core::turn::strategies::AnySpeechStart),
         };
     // D-G3: a FATAL turn error (auth/config — every turn would fail
@@ -934,15 +1027,16 @@ async fn initialize_conversation_loop(
         let message_tx = message_tx.clone();
         orchestrator.set_fatal_handler(Arc::new(move |error: String| {
             let message_tx = message_tx.clone();
-            tokio::spawn(async move {
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                        message: format!(
-                            "fatal provider error (session cannot recover): {error}"
-                        ),
-                    }))
+            crate::core::observability::spawn_observed_detached(
+                "conversation.fatal-handler",
+                async move {
+                    send_error(
+                        &message_tx,
+                        format!("fatal provider error (session cannot recover): {error}"),
+                    )
                     .await;
-            });
+                },
+            );
         }));
     }
 
@@ -1043,16 +1137,19 @@ async fn initialize_conversation_loop(
                 // side-effect of this callback — the actor-bug guardrail
                 // (PIPECAT_FIX_PLAN §6.2 X3): the controller only decides
                 // turn policy, it never owns transcript delivery.
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::STTResult {
+                send_with_policy(
+                    &message_tx,
+                    MessageRoute::Outgoing(OutgoingMessage::STTResult {
                         transcript: stt.transcript.clone(),
                         is_final: stt.is_final,
                         is_speech_final: stt.is_speech_final,
                         confidence: stt.confidence,
                         segment_transcript: stt.segment_transcript.clone(),
                         translations: stt.translations.clone(),
-                    }))
-                    .await;
+                    }),
+                    MessageClass::Transcript,
+                )
+                .await;
 
                 // Turn policy via the controller; the orchestrator acts on the
                 // events from THIS task (caller-fires-callback preserved).
@@ -1094,29 +1191,45 @@ async fn validate_audio_configs(
     tts_config: &Option<TTSWebSocketConfig>,
     message_tx: &mpsc::Sender<MessageRoute>,
 ) -> bool {
-    if stt_config.is_none() {
+    let Some(stt_config) = stt_config.as_ref() else {
         let error_msg = "STT configuration is required when audio=true".to_string();
         error!("{}", error_msg);
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: error_msg,
-            }))
-            .await;
+        send_error(message_tx, error_msg).await;
         return false;
-    }
+    };
 
-    if tts_config.is_none() {
+    let Some(tts_config) = tts_config.as_ref() else {
         let error_msg = "TTS configuration is required when audio=true".to_string();
         error!("{}", error_msg);
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: error_msg,
-            }))
-            .await;
+        send_error(message_tx, error_msg).await;
+        return false;
+    };
+
+    if let Err(error_msg) = validate_audio_config_values(stt_config, tts_config) {
+        error!("{}", error_msg);
+        send_error(message_tx, error_msg).await;
         return false;
     }
 
     true
+}
+
+fn validate_audio_config_values(
+    stt_config: &STTWebSocketConfig,
+    tts_config: &TTSWebSocketConfig,
+) -> Result<(), String> {
+    if stt_config.sample_rate == 0 {
+        return Err("STT sample_rate must be greater than 0 when audio=true".to_string());
+    }
+    if stt_config.channels == 0 {
+        return Err("STT channels must be greater than 0 when audio=true".to_string());
+    }
+    if matches!(tts_config.sample_rate, Some(0)) {
+        return Err(
+            "TTS sample_rate must be greater than 0 when provided and audio=true".to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Initialize voice manager with STT and TTS providers
@@ -1132,73 +1245,35 @@ async fn initialize_voice_manager(
     );
 
     // Get API keys - prefer client-provided keys, fall back to server config
-    let stt_api_key = if let Some(ref client_key) = stt_ws_config.api_key {
-        if !client_key.is_empty() {
-            info!(
-                "Using client-provided API key for STT provider: {}",
-                stt_ws_config.provider
-            );
-            client_key.clone()
-        } else {
-            match app_state.config.get_api_key(&stt_ws_config.provider) {
-                Ok(key) => key,
-                Err(error_msg) => {
-                    error!("{}", error_msg);
-                    let _ = message_tx
-                        .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                            message: error_msg,
-                        }))
-                        .await;
-                    return None;
-                }
-            }
-        }
+    let stt_api_key = if let Some(client_key) = client_api_key(stt_ws_config.api_key.as_deref()) {
+        info!(
+            "Using client-provided API key for STT provider: {}",
+            stt_ws_config.provider
+        );
+        client_key
     } else {
         match app_state.config.get_api_key(&stt_ws_config.provider) {
             Ok(key) => key,
             Err(error_msg) => {
                 error!("{}", error_msg);
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                        message: error_msg,
-                    }))
-                    .await;
+                send_error(message_tx, error_msg).await;
                 return None;
             }
         }
     };
 
-    let tts_api_key = if let Some(ref client_key) = tts_ws_config.api_key {
-        if !client_key.is_empty() {
-            info!(
-                "Using client-provided API key for TTS provider: {}",
-                tts_ws_config.provider
-            );
-            client_key.clone()
-        } else {
-            match app_state.config.get_api_key(&tts_ws_config.provider) {
-                Ok(key) => key,
-                Err(error_msg) => {
-                    error!("{}", error_msg);
-                    let _ = message_tx
-                        .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                            message: error_msg,
-                        }))
-                        .await;
-                    return None;
-                }
-            }
-        }
+    let tts_api_key = if let Some(client_key) = client_api_key(tts_ws_config.api_key.as_deref()) {
+        info!(
+            "Using client-provided API key for TTS provider: {}",
+            tts_ws_config.provider
+        );
+        client_key
     } else {
         match app_state.config.get_api_key(&tts_ws_config.provider) {
             Ok(key) => key,
             Err(error_msg) => {
                 error!("{}", error_msg);
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                        message: error_msg,
-                    }))
-                    .await;
+                send_error(message_tx, error_msg).await;
                 return None;
             }
         }
@@ -1211,13 +1286,9 @@ async fn initialize_voice_manager(
     // (never a 400). The resolved id is folded into a local clone so it rides
     // `to_standard_tts` → the provider exactly like an explicit `voice_id`.
     let tts_ws_config_owned;
-    let tts_ws_config: &TTSWebSocketConfig = if tts_ws_config.voice_id.is_none()
-        && tts_ws_config
-            .voice_descriptor
-            .as_ref()
-            .is_some_and(|d| d.is_set())
+    let tts_ws_config: &TTSWebSocketConfig = if let Some(descriptor) =
+        voice_descriptor_to_resolve(tts_ws_config)
     {
-        let descriptor = tts_ws_config.voice_descriptor.clone().unwrap();
         let provider = tts_ws_config.provider.clone();
         let catalog = crate::handlers::voices::fetch_provider_catalog(app_state, &provider).await;
         let default_id = crate::handlers::voices::provider_default_voice(&provider);
@@ -1230,19 +1301,19 @@ async fn initialize_voice_manager(
                 "voice descriptor config advisory: {warning}"
             );
             crate::core::metrics::bridge::record_degraded("voice_descriptor", "tts");
-            let _ = message_tx
-                .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
-                    code: "voice_descriptor_unmatched".to_string(),
-                    message: warning.clone(),
-                    detail: Some(serde_json::json!({
-                        "side": "tts",
-                        "provider": provider,
-                        "descriptor": descriptor.describe(),
-                        "resolved_voice_id": resolved.voice_id,
-                        "used_default": resolved.used_default,
-                    })),
-                }))
-                .await;
+            send_config_warning(
+                message_tx,
+                "voice_descriptor_unmatched",
+                warning.clone(),
+                Some(serde_json::json!({
+                    "side": "tts",
+                    "provider": provider,
+                    "descriptor": descriptor.describe(),
+                    "resolved_voice_id": resolved.voice_id,
+                    "used_default": resolved.used_default,
+                })),
+            )
+            .await;
         } else {
             info!(
                 provider = provider.as_str(),
@@ -1252,23 +1323,23 @@ async fn initialize_voice_manager(
             );
             // Echo the resolved id back so the client can see what it got (alias-ack
             // pattern), even on a clean match.
-            let _ = message_tx
-                .send(MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
-                    code: "voice_descriptor_resolved".to_string(),
-                    message: format!(
-                        "resolved voice descriptor {{{}}} to '{}'",
-                        descriptor.describe(),
-                        resolved.voice_id
-                    ),
-                    detail: Some(serde_json::json!({
-                        "side": "tts",
-                        "provider": provider,
-                        "descriptor": descriptor.describe(),
-                        "resolved_voice_id": resolved.voice_id,
-                        "used_default": false,
-                    })),
-                }))
-                .await;
+            send_config_warning(
+                message_tx,
+                "voice_descriptor_resolved",
+                format!(
+                    "resolved voice descriptor {{{}}} to '{}'",
+                    descriptor.describe(),
+                    resolved.voice_id
+                ),
+                Some(serde_json::json!({
+                    "side": "tts",
+                    "provider": provider,
+                    "descriptor": descriptor.describe(),
+                    "resolved_voice_id": resolved.voice_id,
+                    "used_default": false,
+                })),
+            )
+            .await;
         }
 
         let mut cfg = tts_ws_config.clone();
@@ -1322,8 +1393,8 @@ async fn initialize_voice_manager(
             // always constructed at 16 kHz — non-16k clients (8 kHz
             // telephony, 48 kHz WebRTC) no longer fail the processor's
             // config validation (the silero/vad rate cross-check).
-            let mut st_cfg = crate::core::smart_turn::SmartTurnProcessorConfig::new()
-                .with_sample_rate(16_000);
+            let mut st_cfg =
+                crate::core::smart_turn::SmartTurnProcessorConfig::new().with_sample_rate(16_000);
             if let Some(threshold) = td.threshold {
                 st_cfg = st_cfg.with_threshold(threshold);
             }
@@ -1340,10 +1411,7 @@ async fn initialize_voice_manager(
                 "turn_detection requested but this build lacks the smart-turn/\
                  silero-vad features — session degrades to timer fallback"
             );
-            crate::core::metrics::bridge::record_degraded(
-                "turn_detection",
-                "feature_not_built",
-            );
+            crate::core::metrics::bridge::record_degraded("turn_detection", "feature_not_built");
         }
     }
 
@@ -1354,11 +1422,7 @@ async fn initialize_voice_manager(
         Ok(vm) => Arc::new(vm),
         Err(e) => {
             error!("Failed to create voice manager: {}", e);
-            let _ = message_tx
-                .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                    message: format!("Failed to create voice manager: {e}"),
-                }))
-                .await;
+            send_error(message_tx, format!("Failed to create voice manager: {e}")).await;
             return None;
         }
     };
@@ -1421,11 +1485,7 @@ async fn initialize_voice_manager(
     // Start voice manager (callbacks above are live for any connect-time error)
     if let Err(e) = voice_manager.start().await {
         error!("Failed to start voice manager: {}", e);
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: format!("Failed to start voice manager: {e}"),
-            }))
-            .await;
+        send_error(message_tx, format!("Failed to start voice manager: {e}")).await;
         return None;
     }
 
@@ -1455,17 +1515,18 @@ async fn register_stt_callback(
                     segment_transcript: result.segment_transcript,
                     translations: result.translations,
                 };
-                let _ = message_tx.send(MessageRoute::Outgoing(msg)).await;
+                send_with_policy(
+                    &message_tx,
+                    MessageRoute::Outgoing(msg),
+                    MessageClass::Transcript,
+                )
+                .await;
             })
         })
         .await
     {
         error!("Failed to set up STT callback: {}", e);
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: format!("Failed to set up STT callback: {e}"),
-            }))
-            .await;
+        send_error(message_tx, format!("Failed to set up STT callback: {e}")).await;
         return false;
     }
     true
@@ -1484,17 +1545,22 @@ async fn register_stt_error_callback(
                 let msg = OutgoingMessage::Error {
                     message: format!("STT streaming error: {error}"),
                 };
-                let _ = message_tx.send(MessageRoute::Outgoing(msg)).await;
+                send_with_policy(
+                    &message_tx,
+                    MessageRoute::Outgoing(msg),
+                    MessageClass::Critical,
+                )
+                .await;
             })
         })
         .await
     {
         error!("Failed to set up STT error callback: {}", e);
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: format!("Failed to set up STT error callback: {e}"),
-            }))
-            .await;
+        send_error(
+            message_tx,
+            format!("Failed to set up STT error callback: {e}"),
+        )
+        .await;
         return false;
     }
     true
@@ -1513,17 +1579,22 @@ async fn register_tts_error_callback(
                 let msg = OutgoingMessage::Error {
                     message: format!("TTS error: {error}"),
                 };
-                let _ = message_tx.send(MessageRoute::Outgoing(msg)).await;
+                send_with_policy(
+                    &message_tx,
+                    MessageRoute::Outgoing(msg),
+                    MessageClass::Critical,
+                )
+                .await;
             })
         })
         .await
     {
         error!("Failed to set up TTS error callback: {}", e);
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: format!("Failed to set up TTS error callback: {e}"),
-            }))
-            .await;
+        send_error(
+            message_tx,
+            format!("Failed to set up TTS error callback: {e}"),
+        )
+        .await;
         return false;
     }
     true
@@ -1559,8 +1630,12 @@ async fn register_tts_complete_callback(
                 // Send completion message to WebSocket client
                 let msg = OutgoingMessage::TTSPlaybackComplete { timestamp };
 
-                // Ignore send errors - client may have disconnected
-                let _ = message_tx.send(MessageRoute::Outgoing(msg)).await;
+                send_with_policy(
+                    &message_tx,
+                    MessageRoute::Outgoing(msg),
+                    MessageClass::Critical,
+                )
+                .await;
 
                 debug!(
                     "TTS playback completion event sent at timestamp {}",
@@ -1571,11 +1646,11 @@ async fn register_tts_complete_callback(
         .await
     {
         error!("Failed to set up TTS completion callback: {}", e);
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: format!("Failed to set up TTS completion callback: {e}"),
-            }))
-            .await;
+        send_error(
+            message_tx,
+            format!("Failed to set up TTS completion callback: {e}"),
+        )
+        .await;
         return false;
     }
 
@@ -1596,11 +1671,11 @@ async fn wait_for_providers_ready(
 
     if timeout(ready_timeout, ready_check).await.is_err() {
         error!("Timeout waiting for voice providers to be ready");
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: "Timeout waiting for voice providers to be ready".to_string(),
-            }))
-            .await;
+        send_error(
+            message_tx,
+            "Timeout waiting for voice providers to be ready",
+        )
+        .await;
         return false;
     }
 
@@ -1630,10 +1705,9 @@ async fn register_early_tts_callback(
 
                 // C-G5: client playback rate (passthrough when unset);
                 // 0-byte frames (sub-chunk buffering) are never sent.
+                let format = audio_data.format.clone();
                 let data = match &egress_audio {
-                    Some(e) => {
-                        e.convert(audio_data.data, &audio_data.format, audio_data.sample_rate)
-                    }
+                    Some(e) => e.convert(audio_data.data, &format, audio_data.sample_rate),
                     None => audio_data.data,
                 };
                 if data.is_empty() {
@@ -1645,7 +1719,7 @@ async fn register_early_tts_callback(
                 // DroppableAudio policy (RC8): a slow client sheds stale
                 // frames instead of stalling the voice path.
                 let frames: Vec<Bytes> = match &ws_chunker {
-                    Some(c) => c.push(&data),
+                    Some(c) => c.push(&data, &format),
                     None => vec![Bytes::from(data)],
                 };
                 for frame in frames {
@@ -1701,7 +1775,10 @@ impl WsEgressChunker {
         let tts = tts?;
         let chunk_ms = tts.audio_out_chunk_ms?;
         if chunk_ms == 0 || chunk_ms > 1000 {
-            warn!(chunk_ms, "audio_out_chunk_ms outside (0,1000]; WS chunking disabled");
+            warn!(
+                chunk_ms,
+                "audio_out_chunk_ms outside (0,1000]; WS chunking disabled"
+            );
             return None;
         }
         // The chunk size follows the rate of the bytes actually delivered:
@@ -1718,12 +1795,10 @@ impl WsEgressChunker {
         // frame; the encoder is defensive about any residual.
         #[cfg(feature = "opus-codec")]
         let encoder = {
-            let want_opus = crate::core::audio::codec::negotiate(
-                tts.audio_out_codec.as_deref(),
-                "downlink",
-            )
-            .effective
-                == crate::core::audio::AudioCodec::Opus;
+            let want_opus =
+                crate::core::audio::codec::negotiate(tts.audio_out_codec.as_deref(), "downlink")
+                    .effective
+                    == crate::core::audio::AudioCodec::Opus;
             want_opus
                 .then(|| {
                     crate::core::audio::opus_codec::OpusStreamEncoder::new(
@@ -1739,16 +1814,26 @@ impl WsEgressChunker {
         };
 
         Some(Arc::new(Self {
-            inner: parking_lot::Mutex::new(crate::core::audio::OutputChunker::new(
-                chunk_ms, rate,
-            )),
+            inner: parking_lot::Mutex::new(crate::core::audio::OutputChunker::new(chunk_ms, rate)),
             #[cfg(feature = "opus-codec")]
             encoder,
         }))
     }
 
-    /// Re-frame `data` to fixed chunks; encode each to an opus packet when opus egress is active.
-    fn push(&self, data: &[u8]) -> Vec<bytes::Bytes> {
+    /// Re-frame linear PCM16 `data` to fixed chunks; encode each to an opus packet when opus egress
+    /// is active. Container/compressed formats pass through verbatim because PCM byte math would
+    /// corrupt them.
+    fn push(&self, data: &[u8], format: &str) -> Vec<bytes::Bytes> {
+        if !crate::core::tts::sniff::is_linear_pcm16(format) {
+            debug!(
+                format,
+                bytes = data.len(),
+                "WS egress chunking skipped: non-linear-PCM16 audio passes through"
+            );
+            self.clear();
+            return vec![bytes::Bytes::copy_from_slice(data)];
+        }
+
         let frames = self.inner.lock().push(data);
         #[cfg(feature = "opus-codec")]
         if let Some(enc) = &self.encoder {
@@ -1769,11 +1854,27 @@ impl WsEgressChunker {
     /// full frame) when opus egress is active.
     fn flush(&self) -> Option<bytes::Bytes> {
         let remainder = self.inner.lock().flush_remainder();
+        if let Some(rem) = &remainder
+            && rem.len() % 2 != 0
+        {
+            warn!(
+                bytes = rem.len(),
+                "malformed PCM16 WS egress tail length; dropping remainder instead of sending a partial sample"
+            );
+            #[cfg(feature = "opus-codec")]
+            if let Some(enc) = &self.encoder {
+                enc.lock().reset_buffer();
+            }
+            return None;
+        }
         #[cfg(feature = "opus-codec")]
         if let Some(enc) = &self.encoder {
             let mut enc = enc.lock();
             if let Some(rem) = &remainder {
-                let _ = enc.push_pcm(rem); // a sub-frame tail buffers; flush() pads + emits it
+                if let Err(e) = enc.push_pcm(rem) {
+                    warn!("opus egress tail encode failed: {e}; frame dropped");
+                    return None;
+                }
             }
             return match enc.flush() {
                 Ok(packet) => packet.map(bytes::Bytes::from),
@@ -1848,6 +1949,7 @@ impl EgressAudio {
 /// `DagOutput::Audio` produced by a DAG `audio_output` node lands here.
 async fn deliver_tts_audio(
     audio: Vec<u8>,
+    format: &str,
     livekit_client: Option<&Arc<RwLock<LiveKitClient>>>,
     operation_queue: Option<&crate::livekit::OperationQueue>,
     message_tx: &mpsc::Sender<MessageRoute>,
@@ -1919,11 +2021,14 @@ async fn deliver_tts_audio(
 
     // Fall back to WebSocket if LiveKit is not available or failed
     if !sent_to_livekit {
-        debug!("Sending TTS audio to WebSocket client: {} bytes", audio.len());
+        debug!(
+            "Sending TTS audio to WebSocket client: {} bytes",
+            audio.len()
+        );
         // E-G2: re-frame on the RAW-WS path only — LiveKit frames at 10ms
         // internally and clear_buffer flushes its queue.
         let frames: Vec<Bytes> = match ws_chunker {
-            Some(c) => c.push(&audio),
+            Some(c) => c.push(&audio, format),
             None => vec![Bytes::from(audio)],
         };
         for frame in frames {
@@ -1968,6 +2073,7 @@ async fn register_tts_complete_with_flush(
                 if !tail.is_empty() {
                     deliver_tts_audio(
                         tail,
+                        "linear16",
                         livekit_client.as_ref(),
                         operation_queue.as_ref(),
                         &message_tx,
@@ -1991,11 +2097,12 @@ async fn register_tts_complete_with_flush(
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::TTSPlaybackComplete {
-                        timestamp,
-                    }))
-                    .await;
+                send_with_policy(
+                    &message_tx,
+                    MessageRoute::Outgoing(OutgoingMessage::TTSPlaybackComplete { timestamp }),
+                    MessageClass::Critical,
+                )
+                .await;
             })
         })
         .await
@@ -2030,10 +2137,9 @@ async fn register_final_tts_callback(
                 // sub-chunk input may convert to NOTHING yet (buffered in
                 // the resampler; emitted with a later chunk or the
                 // utterance-end flush) — never deliver a 0-byte frame.
+                let format = audio_data.format.clone();
                 let data = match &egress_audio {
-                    Some(e) => {
-                        e.convert(audio_data.data, &audio_data.format, audio_data.sample_rate)
-                    }
+                    Some(e) => e.convert(audio_data.data, &format, audio_data.sample_rate),
                     None => audio_data.data,
                 };
                 if data.is_empty() {
@@ -2041,6 +2147,7 @@ async fn register_final_tts_callback(
                 }
                 deliver_tts_audio(
                     data,
+                    &format,
                     livekit_client.as_ref(),
                     operation_queue.as_ref(),
                     &message_tx,
@@ -2052,11 +2159,11 @@ async fn register_final_tts_callback(
         .await
     {
         error!("Failed to set up TTS audio callback: {}", e);
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: format!("Failed to set up TTS audio callback: {e}"),
-            }))
-            .await;
+        send_error(
+            message_tx,
+            format!("Failed to set up TTS audio callback: {e}"),
+        )
+        .await;
     }
 }
 
@@ -2091,12 +2198,11 @@ async fn initialize_livekit_client(
         Some(handler) => handler,
         None => {
             error!("LiveKit room handler not initialized. Check API keys configuration.");
-            let _ = message_tx
-                .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                    message: "LiveKit room handler not initialized. Check API keys configuration."
-                        .to_string(),
-                }))
-                .await;
+            send_error(
+                message_tx,
+                "LiveKit room handler not initialized. Check API keys configuration.",
+            )
+            .await;
             return None;
         }
     };
@@ -2104,11 +2210,7 @@ async fn initialize_livekit_client(
     // Create the room
     if let Err(e) = room_handler.create_room(&livekit_ws_config.room_name).await {
         error!("Failed to create LiveKit room: {:?}", e);
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: format!("Failed to create LiveKit room: {e:?}"),
-            }))
-            .await;
+        send_error(message_tx, format!("Failed to create LiveKit room: {e:?}")).await;
         return None;
     }
 
@@ -2136,11 +2238,7 @@ async fn initialize_livekit_client(
         Ok(token) => token,
         Err(e) => {
             error!("Failed to generate agent token: {:?}", e);
-            let _ = message_tx
-                .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                    message: format!("Failed to generate agent token: {e:?}"),
-                }))
-                .await;
+            send_error(message_tx, format!("Failed to generate agent token: {e:?}")).await;
             return None;
         }
     };
@@ -2179,7 +2277,7 @@ async fn initialize_livekit_client(
         audio_format: None,
         sample_rate: Some(24000), // Default sample rate for LiveKit
         client_playback_rate: None,
-            audio_out_chunk_ms: None,
+        audio_out_chunk_ms: None,
         connection_timeout: None,
         request_timeout: None,
         model: "".to_string(),
@@ -2196,13 +2294,12 @@ async fn initialize_livekit_client(
     };
 
     let tts_config_for_livekit = tts_config.unwrap_or(&default_tts_config);
-    let livekit_config =
-        livekit_ws_config.to_livekit_config(
-            agent_token,
-            tts_config_for_livekit,
-            ingress_sample_rate,
-            livekit_url,
-        );
+    let livekit_config = livekit_ws_config.to_livekit_config(
+        agent_token,
+        tts_config_for_livekit,
+        ingress_sample_rate,
+        livekit_url,
+    );
     let mut livekit_client = LiveKitClient::new(livekit_config);
 
     // Set up audio callback to forward to STT processing
@@ -2219,11 +2316,11 @@ async fn initialize_livekit_client(
     // Connect to LiveKit room
     if let Err(e) = livekit_client.connect().await {
         error!("Failed to connect to LiveKit room: {:?}", e);
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: format!("Failed to connect to LiveKit room: {e:?}"),
-            }))
-            .await;
+        send_error(
+            message_tx,
+            format!("Failed to connect to LiveKit room: {e:?}"),
+        )
+        .await;
         return None;
     }
 
@@ -2282,11 +2379,11 @@ fn setup_livekit_audio_callback(
             debug!("Received LiveKit audio: {} bytes", audio_data.len());
             if let Err(e) = voice_manager.receive_audio(audio_data.into()).await {
                 error!("Failed to process LiveKit audio: {:?}", e);
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                        message: format!("Failed to process LiveKit audio: {e:?}"),
-                    }))
-                    .await;
+                send_error(
+                    &message_tx,
+                    format!("Failed to process LiveKit audio: {e:?}"),
+                )
+                .await;
             }
         }
     });
@@ -2301,7 +2398,10 @@ fn setup_livekit_audio_callback(
             // per 100 sheds — per-frame warns flood at frame rate.
             let n = dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n.is_multiple_of(100) {
-                warn!(total_dropped = n + 1, "LiveKit ingress queue full; shedding frames");
+                warn!(
+                    total_dropped = n + 1,
+                    "LiveKit ingress queue full; shedding frames"
+                );
             }
         }
     });
@@ -2317,8 +2417,9 @@ fn setup_livekit_data_callback(
     livekit_client.set_data_callback(move |data_message| {
         let message_tx = message_tx_clone.clone();
 
-        // Spawn task for async send to ensure delivery
-        tokio::spawn(async move {
+        // Spawn task for async send to ensure delivery; observe panics even though this callback has no
+        // retained JoinHandle owner.
+        crate::core::observability::spawn_observed_detached("livekit.data-callback", async move {
             debug!(
                 "Received LiveKit data from {}: {} bytes",
                 data_message.participant_identity,
@@ -2359,8 +2460,12 @@ fn setup_livekit_data_callback(
                 message: unified_message,
             };
 
-            // Use send for guaranteed delivery
-            let _ = message_tx.send(MessageRoute::Outgoing(outgoing_msg)).await;
+            send_with_policy(
+                &message_tx,
+                MessageRoute::Outgoing(outgoing_msg),
+                MessageClass::Critical,
+            )
+            .await;
         });
     });
 }
@@ -2375,8 +2480,9 @@ fn setup_livekit_disconnect_callback(
     livekit_client.set_participant_disconnect_callback(move |disconnect_event| {
         let message_tx = message_tx_clone.clone();
 
-        // Spawn task for async send to ensure delivery
-        tokio::spawn(async move {
+        // Spawn task for async send to ensure delivery; observe panics even though this callback has no
+        // retained JoinHandle owner.
+        crate::core::observability::spawn_observed_detached("livekit.disconnect-callback", async move {
             info!(
                 "Participant {} disconnected from LiveKit room {} - closing WebSocket connection",
                 disconnect_event.participant_identity, disconnect_event.room_name
@@ -2394,14 +2500,18 @@ fn setup_livekit_disconnect_callback(
                 participant: participant_info,
             };
 
-            // Send notification about participant disconnection
-            let _ = message_tx.send(MessageRoute::Outgoing(outgoing_msg)).await;
+            send_with_policy(
+                &message_tx,
+                MessageRoute::Outgoing(outgoing_msg),
+                MessageClass::Critical,
+            )
+            .await;
 
             // Give a brief moment for the message to be sent
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
             // Close the WebSocket connection to trigger cleanup
-            let _ = message_tx.send(MessageRoute::Close).await;
+            send_with_policy(&message_tx, MessageRoute::Close, MessageClass::Critical).await;
         });
     });
 }
@@ -2638,11 +2748,9 @@ async fn initialize_dag_routing(
                         // C-G5: client playback rate (passthrough when unset)
                         // — the SAME standardized seam as the simple path.
                         let data = match &egress_audio {
-                            Some(e) => e.convert(
-                                audio.data.to_vec(),
-                                &audio.format,
-                                audio.sample_rate,
-                            ),
+                            Some(e) => {
+                                e.convert(audio.data.to_vec(), &audio.format, audio.sample_rate)
+                            }
                             None => audio.data.to_vec(),
                         };
                         if data.is_empty() {
@@ -2650,6 +2758,7 @@ async fn initialize_dag_routing(
                         }
                         deliver_tts_audio(
                             data,
+                            &audio.format,
                             livekit_client.as_ref(),
                             operation_queue.as_ref(),
                             &message_tx,
@@ -2664,8 +2773,9 @@ async fn initialize_dag_routing(
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
-                        let _ = message_tx
-                            .send(MessageRoute::Outgoing(OutgoingMessage::Message {
+                        send_critical(
+                            &message_tx,
+                            MessageRoute::Outgoing(OutgoingMessage::Message {
                                 message: UnifiedMessage {
                                     message: Some(text),
                                     data: None,
@@ -2674,8 +2784,9 @@ async fn initialize_dag_routing(
                                     room: String::new(),
                                     timestamp: now_ms,
                                 },
-                            }))
-                            .await;
+                            }),
+                        )
+                        .await;
                     }
                 }
             }
@@ -2767,7 +2878,9 @@ async fn register_dag_stream_driver(
     // turn across policy + profiling on this path).
     let turn_controller = Arc::new(crate::core::turn::TurnController::new(
         vec![Box::new(crate::core::turn::strategies::AnySpeechStart)],
-        vec![Box::new(crate::core::turn::strategies::LegacySpeechFinalStop)],
+        vec![Box::new(
+            crate::core::turn::strategies::LegacySpeechFinalStop,
+        )],
         vec![],
     ));
     let result = voice_manager
@@ -2787,16 +2900,19 @@ async fn register_dag_stream_driver(
                 // matching the simple path. The pipeline (LLM→TTS→audio) only runs on a
                 // finalized turn below; there is no double delivery because in DAG mode
                 // the simple path never calls `speak()`.
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::STTResult {
+                send_with_policy(
+                    &message_tx,
+                    MessageRoute::Outgoing(OutgoingMessage::STTResult {
                         transcript: stt.transcript.clone(),
                         is_final: stt.is_final,
                         is_speech_final: stt.is_speech_final,
                         confidence: stt.confidence,
                         segment_transcript: stt.segment_transcript.clone(),
                         translations: stt.translations.clone(),
-                    }))
-                    .await;
+                    }),
+                    MessageClass::Transcript,
+                )
+                .await;
 
                 // Turn policy via the controller (legacy set ≡ the previous
                 // inline `is_speech_final && !empty` gate); the DAG runs on
@@ -2816,34 +2932,33 @@ async fn register_dag_stream_driver(
                     }
                 };
                 let events = turn_controller.feed(&signal);
-                let Some((turn_id, turn_transcript)) =
-                    events.into_iter().find_map(|e| match e {
-                        crate::core::turn::TurnEvent::Stopped { turn_id, transcript } => {
-                            Some((turn_id, transcript))
-                        }
-                        // Started/barge-in has no DAG-side action today. ROOT
-                        // CAUSE (traced, review wc023gbbz#1): DAG turns execute
-                        // SERIALLY — the STT provider's result-forwarding loop
-                        // (`while recv { callback(result).await }`,
-                        // e.g. stt/deepgram.rs:1109) awaits THIS callback, whose
-                        // `executor.execute_from(..).await` below runs the whole
-                        // turn. So a barge-in's STT result QUEUES behind the
-                        // in-flight turn and this `Started` cannot even fire until
-                        // the prior turn's response completes (≤ its done/30s).
-                        // A persistent S2S node (B-G2) therefore streams its full
-                        // response before barge-in is processed. Closing this is
-                        // NOT the naive "fire ctx.cancel_token here" (the event
-                        // never arrives mid-turn, and clone_for_branch SHARES the
-                        // token so cancelling it poisons the session template): it
-                        // needs the turn to run as a SPAWNED, per-turn-child-token
-                        // cancellable task so the next Started can cancel it — an
-                        // architectural change affecting ALL DAG paths (LLM/TTS
-                        // too), out of scope for the B-G2 wiring. Cascade/
-                        // conversation path handles barge-in in its orchestrator,
-                        // not here.
-                        _ => None,
-                    })
-                else {
+                let Some((turn_id, turn_transcript)) = events.into_iter().find_map(|e| match e {
+                    crate::core::turn::TurnEvent::Stopped {
+                        turn_id,
+                        transcript,
+                    } => Some((turn_id, transcript)),
+                    // Started/barge-in has no DAG-side action today. ROOT
+                    // CAUSE (traced, review wc023gbbz#1): DAG turns execute
+                    // SERIALLY — the STT provider's result-forwarding loop
+                    // (`while recv { callback(result).await }`,
+                    // e.g. stt/deepgram.rs:1109) awaits THIS callback, whose
+                    // `executor.execute_from(..).await` below runs the whole
+                    // turn. So a barge-in's STT result QUEUES behind the
+                    // in-flight turn and this `Started` cannot even fire until
+                    // the prior turn's response completes (≤ its done/30s).
+                    // A persistent S2S node (B-G2) therefore streams its full
+                    // response before barge-in is processed. Closing this is
+                    // NOT the naive "fire ctx.cancel_token here" (the event
+                    // never arrives mid-turn, and clone_for_branch SHARES the
+                    // token so cancelling it poisons the session template): it
+                    // needs the turn to run as a SPAWNED, per-turn-child-token
+                    // cancellable task so the next Started can cancel it — an
+                    // architectural change affecting ALL DAG paths (LLM/TTS
+                    // too), out of scope for the B-G2 wiring. Cascade/
+                    // conversation path handles barge-in in its orchestrator,
+                    // not here.
+                    _ => None,
+                }) else {
                     return;
                 };
 
@@ -2910,6 +3025,13 @@ async fn register_dag_stream_driver(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    fn cleanup_heartbeat_env() {
+        unsafe {
+            std::env::remove_var("WAAV_HEARTBEAT_PERIOD_MS");
+        }
+    }
 
     #[test]
     fn is_known_reasoning_model_matrix() {
@@ -2924,7 +3046,10 @@ mod tests {
             "DeepSeek-Reasoner",
             "qwq-32b",
         ] {
-            assert!(is_known_reasoning_model(m), "{m} should be flagged reasoning");
+            assert!(
+                is_known_reasoning_model(m),
+                "{m} should be flagged reasoning"
+            );
         }
         // Fast / non-reasoning models → false.
         for m in [
@@ -2953,12 +3078,285 @@ mod tests {
         assert_eq!(stream_id, "my-custom-stream-id");
     }
 
+    fn valid_stt_ws_config() -> STTWebSocketConfig {
+        STTWebSocketConfig {
+            provider: "deepgram".to_string(),
+            language: "en-US".to_string(),
+            sample_rate: 16_000,
+            channels: 1,
+            punctuation: true,
+            encoding: crate::handlers::ws::config::default_stt_encoding(),
+            audio_in_codec: None,
+            model: "nova-3".to_string(),
+            api_key: None,
+            features: Default::default(),
+            extras: Default::default(),
+            translation: None,
+            turn_detection: None,
+        }
+    }
+
+    fn valid_tts_ws_config() -> TTSWebSocketConfig {
+        TTSWebSocketConfig {
+            provider: "deepgram".to_string(),
+            voice_id: None,
+            voice_descriptor: None,
+            speaking_rate: None,
+            audio_format: Some("linear16".to_string()),
+            sample_rate: Some(24_000),
+            audio_out_chunk_ms: None,
+            client_playback_rate: None,
+            audio_out_codec: None,
+            connection_timeout: None,
+            request_timeout: None,
+            model: "aura-asteria-en".to_string(),
+            pronunciations: Vec::new(),
+            api_key: None,
+            emotion: None,
+            emotion_intensity: None,
+            delivery_style: None,
+            emotion_description: None,
+            features: Default::default(),
+            extras: Default::default(),
+        }
+    }
+
+    #[test]
+    fn validate_audio_config_values_rejects_impossible_audio_metadata() {
+        let stt = valid_stt_ws_config();
+        let tts = valid_tts_ws_config();
+        validate_audio_config_values(&stt, &tts).expect("positive audio metadata is valid");
+
+        let mut zero_stt_rate = stt.clone();
+        zero_stt_rate.sample_rate = 0;
+        assert!(
+            validate_audio_config_values(&zero_stt_rate, &tts)
+                .expect_err("zero STT rate must fail")
+                .contains("STT sample_rate")
+        );
+
+        let mut zero_channels = stt.clone();
+        zero_channels.channels = 0;
+        assert!(
+            validate_audio_config_values(&zero_channels, &tts)
+                .expect_err("zero STT channels must fail")
+                .contains("STT channels")
+        );
+
+        let mut zero_tts_rate = tts.clone();
+        zero_tts_rate.sample_rate = Some(0);
+        assert!(
+            validate_audio_config_values(&stt, &zero_tts_rate)
+                .expect_err("zero TTS rate must fail")
+                .contains("TTS sample_rate")
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_audio_configs_sends_error_for_zero_tts_sample_rate() {
+        let stt = Some(valid_stt_ws_config());
+        let mut tts = valid_tts_ws_config();
+        tts.sample_rate = Some(0);
+        let tts = Some(tts);
+        let (tx, mut rx) = mpsc::channel(4);
+
+        assert!(
+            !validate_audio_configs(&stt, &tts, &tx).await,
+            "zero TTS sample_rate must reject the session config"
+        );
+
+        let route = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("config error should be sent")
+            .expect("config error route");
+        match route {
+            MessageRoute::Outgoing(OutgoingMessage::Error { message }) => {
+                assert!(
+                    message.contains("TTS sample_rate"),
+                    "error should name the invalid field: {message}"
+                );
+            }
+            other => panic!("expected config error route, got {other:?}"),
+        }
+    }
+
+    fn descriptor_test_tts_config(
+        voice_id: Option<&str>,
+        descriptor: Option<crate::core::voice::VoiceDescriptor>,
+    ) -> TTSWebSocketConfig {
+        TTSWebSocketConfig {
+            provider: "deepgram".to_string(),
+            voice_id: voice_id.map(str::to_string),
+            speaking_rate: None,
+            audio_format: None,
+            sample_rate: None,
+            client_playback_rate: None,
+            audio_out_chunk_ms: None,
+            connection_timeout: None,
+            request_timeout: None,
+            model: String::new(),
+            pronunciations: Vec::new(),
+            api_key: None,
+            emotion: None,
+            emotion_intensity: None,
+            delivery_style: None,
+            emotion_description: None,
+            voice_descriptor: descriptor,
+            features: Default::default(),
+            extras: Default::default(),
+            audio_out_codec: None,
+        }
+    }
+
+    #[test]
+    fn voice_descriptor_resolution_treats_blank_voice_id_as_absent() {
+        let descriptor = crate::core::voice::VoiceDescriptor {
+            name_hint: Some("asteria".to_string()),
+            ..Default::default()
+        };
+
+        assert!(
+            voice_descriptor_to_resolve(&descriptor_test_tts_config(
+                None,
+                Some(descriptor.clone())
+            ))
+            .is_some()
+        );
+        assert!(
+            voice_descriptor_to_resolve(&descriptor_test_tts_config(
+                Some(""),
+                Some(descriptor.clone())
+            ))
+            .is_some()
+        );
+        assert!(
+            voice_descriptor_to_resolve(&descriptor_test_tts_config(
+                Some(" \t\n"),
+                Some(descriptor.clone())
+            ))
+            .is_some()
+        );
+        assert!(
+            voice_descriptor_to_resolve(&descriptor_test_tts_config(
+                Some("aura-asteria-en"),
+                Some(descriptor.clone())
+            ))
+            .is_none()
+        );
+        assert!(
+            voice_descriptor_to_resolve(&descriptor_test_tts_config(
+                Some(""),
+                Some(Default::default())
+            ))
+            .is_none()
+        );
+    }
+
     #[test]
     fn test_stream_id_generation_uniqueness() {
         let id1 = Uuid::new_v4().to_string();
         let id2 = Uuid::new_v4().to_string();
 
         assert_ne!(id1, id2, "Generated UUIDs should be unique");
+    }
+
+    #[test]
+    #[serial]
+    fn heartbeat_period_env_rejects_malformed_value() {
+        cleanup_heartbeat_env();
+        unsafe {
+            std::env::set_var("WAAV_HEARTBEAT_PERIOD_MS", "fast");
+        }
+
+        let err = heartbeat_period_from_env().expect_err("malformed heartbeat must fail");
+        assert!(
+            err.contains("WAAV_HEARTBEAT_PERIOD_MS"),
+            "error should name bad env var: {err}"
+        );
+
+        cleanup_heartbeat_env();
+    }
+
+    #[test]
+    #[serial]
+    fn heartbeat_period_env_rejects_zero_value() {
+        cleanup_heartbeat_env();
+        unsafe {
+            std::env::set_var("WAAV_HEARTBEAT_PERIOD_MS", "0");
+        }
+
+        let err = heartbeat_period_from_env().expect_err("zero heartbeat must fail");
+        assert!(
+            err.contains("WAAV_HEARTBEAT_PERIOD_MS"),
+            "error should name bad env var: {err}"
+        );
+
+        cleanup_heartbeat_env();
+    }
+
+    #[test]
+    #[serial]
+    fn heartbeat_period_env_accepts_positive_value() {
+        cleanup_heartbeat_env();
+        unsafe {
+            std::env::set_var("WAAV_HEARTBEAT_PERIOD_MS", "250");
+        }
+
+        assert_eq!(
+            heartbeat_period_from_env().expect("valid heartbeat"),
+            Some(Duration::from_millis(250))
+        );
+
+        cleanup_heartbeat_env();
+    }
+
+    #[test]
+    fn ws_egress_chunker_passes_container_formats_verbatim_and_clears_pcm_tail() {
+        let tts: TTSWebSocketConfig = serde_json::from_value(serde_json::json!({
+            "provider": "deepgram",
+            "model": "aura-asteria-en",
+            "audio_format": "linear16",
+            "sample_rate": 16000,
+            "audio_out_chunk_ms": 20,
+        }))
+        .expect("deserialize tts config");
+        let chunker = WsEgressChunker::from_tts_config(Some(&tts)).expect("ws egress chunker");
+
+        assert!(
+            chunker.push(&[0x11, 0x22], "linear16").is_empty(),
+            "sub-chunk PCM tail should buffer"
+        );
+
+        let mp3 = b"ID3\x04\x00mp3-data";
+        let frames = chunker.push(mp3, "mp3");
+        assert_eq!(frames.len(), 1, "container bytes must not be PCM-sliced");
+        assert_eq!(frames[0].as_ref(), mp3);
+        assert!(
+            chunker.flush().is_none(),
+            "container passthrough clears stale PCM carry"
+        );
+    }
+
+    #[test]
+    fn ws_egress_chunker_drops_odd_linear16_tail_instead_of_flushing_partial_sample() {
+        let tts: TTSWebSocketConfig = serde_json::from_value(serde_json::json!({
+            "provider": "deepgram",
+            "model": "aura-asteria-en",
+            "audio_format": "linear16",
+            "sample_rate": 16000,
+            "audio_out_chunk_ms": 20,
+        }))
+        .expect("deserialize tts config");
+        let chunker = WsEgressChunker::from_tts_config(Some(&tts)).expect("ws egress chunker");
+
+        assert!(
+            chunker.push(&[0x01, 0x02, 0x03], "linear16").is_empty(),
+            "malformed sub-chunk tail should buffer until utterance end"
+        );
+        assert!(
+            chunker.flush().is_none(),
+            "odd PCM16 tail must be dropped instead of sent as invalid linear16"
+        );
     }
 
     // D8: the egress chunker, built from an opus-negotiated TTS config, encodes each PCM16 chunk to
@@ -2983,10 +3381,13 @@ mod tests {
             let s = ((i as f32 * 0.05).sin() * 8000.0) as i16;
             pcm.extend_from_slice(&s.to_le_bytes());
         }
-        let frames = chunker.push(&pcm);
+        let frames = chunker.push(&pcm, "linear16");
         assert_eq!(frames.len(), 3, "one opus packet per 20ms PCM frame");
         for f in &frames {
-            assert!(!f.is_empty() && f.len() < spf * 2, "opus packet compresses vs PCM");
+            assert!(
+                !f.is_empty() && f.len() < spf * 2,
+                "opus packet compresses vs PCM"
+            );
         }
         // Exact frames consumed → no padded tail on flush.
         assert!(chunker.flush().is_none());

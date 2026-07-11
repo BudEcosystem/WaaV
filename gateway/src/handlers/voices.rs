@@ -3,10 +3,37 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 
+use crate::core::providers::azure::AzureRegion;
 use crate::core::providers::google::{
     CredentialSource, GOOGLE_CLOUD_PLATFORM_SCOPE, GoogleAuthClient, TokenProvider,
 };
 use crate::state::AppState;
+
+/// Maximum decoded bytes for any single base64 voice-clone sample.
+const MAX_VOICE_CLONE_SAMPLE_BYTES: usize = 25 * 1024 * 1024;
+/// Maximum total decoded bytes across all voice-clone samples in one request.
+const MAX_VOICE_CLONE_TOTAL_AUDIO_BYTES: usize = 250 * 1024 * 1024;
+/// JSON body budget for base64 clone samples plus request metadata.
+pub const VOICE_CLONE_JSON_BODY_LIMIT_BYTES: usize =
+    ((MAX_VOICE_CLONE_TOTAL_AUDIO_BYTES + 2) / 3) * 4 + (1024 * 1024);
+
+fn voice_handler_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES).build()
+}
+
+fn voice_catalog_http_client() -> Result<reqwest::Client, Box<dyn std::error::Error + Send + Sync>>
+{
+    voice_handler_http_client()
+        .map_err(|e| format!("Failed to create voice handler HTTP client: {e}").into())
+}
+
+fn voice_clone_http_client() -> Result<reqwest::Client, VoiceCloneError> {
+    voice_handler_http_client().map_err(|e| VoiceCloneError {
+        code: "INTERNAL_ERROR".to_string(),
+        message: format!("Failed to create voice clone HTTP client: {e}"),
+        details: None,
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -262,7 +289,7 @@ fn extract_accent_from_code(code: &str) -> String {
 async fn fetch_elevenlabs_voices(
     api_key: &str,
 ) -> Result<Vec<Voice>, Box<dyn std::error::Error + Send + Sync>> {
-    let client = reqwest::Client::new();
+    let client = voice_catalog_http_client()?;
 
     let response = client
         .get("https://api.elevenlabs.io/v2/voices")
@@ -353,7 +380,7 @@ async fn fetch_elevenlabs_voices(
 async fn fetch_deepgram_voices(
     api_key: &str,
 ) -> Result<Vec<Voice>, Box<dyn std::error::Error + Send + Sync>> {
-    let client = reqwest::Client::new();
+    let client = voice_catalog_http_client()?;
 
     let response = client
         .get("https://api.deepgram.com/v1/models")
@@ -434,7 +461,7 @@ async fn fetch_google_voices(
     // Get OAuth2 token
     let token = auth_client.get_token().await?;
 
-    let client = reqwest::Client::new();
+    let client = voice_catalog_http_client()?;
 
     let response = client
         .get("https://texttospeech.googleapis.com/v1/voices")
@@ -503,13 +530,10 @@ async fn fetch_azure_voices(
     subscription_key: &str,
     region: &str,
 ) -> Result<Vec<Voice>, Box<dyn std::error::Error + Send + Sync>> {
-    let client = reqwest::Client::new();
+    let client = voice_catalog_http_client()?;
 
-    // Azure TTS voices list endpoint
-    let url = format!(
-        "https://{}.tts.speech.microsoft.com/cognitiveservices/voices/list",
-        region
-    );
+    let url = azure_voices_list_url(region)
+        .map_err(|msg| -> Box<dyn std::error::Error + Send + Sync> { msg.into() })?;
 
     let response = client
         .get(&url)
@@ -548,11 +572,18 @@ async fn fetch_azure_voices(
     Ok(voices)
 }
 
+fn azure_voices_list_url(region: &str) -> Result<String, String> {
+    let region = region
+        .parse::<AzureRegion>()
+        .map_err(|msg| format!("Azure TTS region rejected (SSRF protection): {msg}"))?;
+    Ok(region.voices_list_url())
+}
+
 // Helper function to fetch voices from LMNT API
 async fn fetch_lmnt_voices(
     api_key: &str,
 ) -> Result<Vec<Voice>, Box<dyn std::error::Error + Send + Sync>> {
-    let client = reqwest::Client::new();
+    let client = voice_catalog_http_client()?;
 
     // LMNT voice list endpoint
     let response = client
@@ -750,10 +781,7 @@ pub(crate) fn provider_default_voice(provider: &str) -> &'static str {
 /// Fetch the voice catalog for a SINGLE provider (cached). Returns an empty Vec
 /// when the provider is not configured / unreachable / has no catalog endpoint —
 /// the resolver maps empty → provider default + warning, so this never errors.
-pub(crate) async fn fetch_provider_catalog(
-    state: &Arc<AppState>,
-    provider: &str,
-) -> Vec<Voice> {
+pub(crate) async fn fetch_provider_catalog(state: &Arc<AppState>, provider: &str) -> Vec<Voice> {
     let provider_key = provider.to_lowercase();
     let cache_key = format!("voice_catalog:{provider_key}");
 
@@ -1094,7 +1122,11 @@ impl VoiceCloneRequest {
         if let Some(s) = self.structured_labels.as_ref().filter(|s| s.is_set()) {
             merged.extend(s.to_map());
         }
-        if merged.is_empty() { None } else { Some(merged) }
+        if merged.is_empty() {
+            None
+        } else {
+            Some(merged)
+        }
     }
 
     /// Validate the request against per-provider/mode requirements WITHOUT a network
@@ -1107,6 +1139,38 @@ impl VoiceCloneRequest {
                 message: "Voice name cannot be empty".to_string(),
                 details: None,
             });
+        }
+
+        // Hume's public REST API is voice DESIGN, not audio-sample cloning. Validate
+        // this before credential resolution so malformed client requests are 400s
+        // instead of being masked by missing API-key errors or deferred provider calls.
+        if self.provider == VoiceCloneProvider::Hume {
+            if !self.audio_samples.is_empty() {
+                return Err(VoiceCloneError {
+                    code: "AUDIO_SAMPLES_NOT_SUPPORTED".to_string(),
+                    message: "Hume API does not support audio-based voice cloning via REST API; \
+                              use the description field for voice design"
+                        .to_string(),
+                    details: Some(serde_json::json!({
+                        "hint": "Provide a non-empty 'description' field with natural language voice characteristics"
+                    })),
+                });
+            }
+
+            if self
+                .description
+                .as_deref()
+                .is_none_or(|d| d.trim().is_empty())
+            {
+                return Err(VoiceCloneError {
+                    code: "MISSING_DESCRIPTION".to_string(),
+                    message: "Hume voice design requires a non-empty 'description' field"
+                        .to_string(),
+                    details: Some(serde_json::json!({
+                        "hint": "Describe the voice you want to create"
+                    })),
+                });
+            }
         }
 
         // Speechify mandates consent {full_name, email} at create time.
@@ -1139,6 +1203,54 @@ impl VoiceCloneRequest {
                 details: None,
             });
         }
+
+        if self.audio_samples.is_empty() {
+            let missing_audio = match self.provider {
+                VoiceCloneProvider::ElevenLabs if self.mode == CloneMode::Professional => {
+                    Some("ElevenLabs PVC requires audio samples (30-60 min recommended)")
+                }
+                VoiceCloneProvider::ElevenLabs => {
+                    Some("ElevenLabs voice cloning requires at least one audio sample")
+                }
+                VoiceCloneProvider::Lmnt => {
+                    Some("LMNT voice cloning requires at least one audio sample (5+ seconds)")
+                }
+                VoiceCloneProvider::Cartesia => {
+                    Some("Cartesia voice cloning requires one audio clip (~5-20s)")
+                }
+                VoiceCloneProvider::PlayHt => {
+                    Some("PlayHT voice cloning requires at least one audio sample")
+                }
+                VoiceCloneProvider::Speechify => {
+                    Some("Speechify voice cloning requires one audio sample (10-30s)")
+                }
+                VoiceCloneProvider::Hume | VoiceCloneProvider::Resemble => None,
+            };
+
+            if let Some(message) = missing_audio {
+                return Err(VoiceCloneError {
+                    code: "MISSING_AUDIO".to_string(),
+                    message: message.to_string(),
+                    details: Some(serde_json::json!({
+                        "provider": self.provider.to_string(),
+                        "mode": self.mode.to_string(),
+                    })),
+                });
+            }
+        }
+
+        if self.provider == VoiceCloneProvider::Lmnt && self.audio_samples.len() > 20 {
+            return Err(VoiceCloneError {
+                code: "TOO_MANY_FILES".to_string(),
+                message: format!(
+                    "LMNT supports max 20 audio files, got {}",
+                    self.audio_samples.len()
+                ),
+                details: None,
+            });
+        }
+
+        validate_voice_clone_audio_size_limits(&self.audio_samples)?;
 
         // ElevenLabs/Resemble professional require the consent.verified gate before
         // the verification/training step.
@@ -1241,7 +1353,7 @@ async fn clone_voice_elevenlabs(
         });
     }
 
-    let client = reqwest::Client::new();
+    let client = voice_clone_http_client()?;
 
     // Build multipart form
     let mut form = Form::new().text("name", request.name.clone());
@@ -1264,26 +1376,7 @@ async fn clone_voice_elevenlabs(
 
     // Decode and add audio samples
     for (i, sample_b64) in request.audio_samples.iter().enumerate() {
-        // Handle potential data URL prefix
-        let audio_data = if sample_b64.contains(',') {
-            // Data URL format: data:audio/wav;base64,xxxxx
-            let parts: Vec<&str> = sample_b64.splitn(2, ',').collect();
-            if parts.len() == 2 {
-                parts[1]
-            } else {
-                sample_b64.as_str()
-            }
-        } else {
-            sample_b64.as_str()
-        };
-
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(audio_data)
-            .map_err(|e| VoiceCloneError {
-                code: "INVALID_AUDIO".to_string(),
-                message: format!("Failed to decode audio sample {}: {}", i, e),
-                details: None,
-            })?;
+        let decoded = decode_audio_sample(sample_b64, i)?;
 
         // Detect format from magic bytes
         let (mime_type, extension) = detect_audio_format(&decoded);
@@ -1399,8 +1492,16 @@ async fn clone_voice_hume(
         });
     }
 
-    // Validate we have a description for voice design
-    if request.description.is_none() {
+    // Validate we have a non-empty description for voice design. The public route
+    // already enforces this via `VoiceCloneRequest::validate`; keep the helper
+    // defensive for direct unit/helper calls.
+    let Some(description) = request
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+        .map(str::to_string)
+    else {
         return Err(VoiceCloneError {
             code: "MISSING_DESCRIPTION".to_string(),
             message: "Hume voice design requires a 'description' field with natural language \
@@ -1415,18 +1516,15 @@ async fn clone_voice_hume(
                 ]
             })),
         });
-    }
+    };
 
-    let client = reqwest::Client::new();
+    let client = voice_clone_http_client()?;
 
     // Step 1: Generate TTS with voice description to get generation_id
     let sample_text = request
         .sample_text
         .clone()
         .unwrap_or_else(|| "Hello, this is a sample of my custom voice.".to_string());
-
-    // Description is guaranteed to be Some due to validation above
-    let description = request.description.clone().unwrap();
 
     // Build TTS request body
     let tts_request = serde_json::json!({
@@ -1576,7 +1674,7 @@ async fn clone_voice_lmnt(
         });
     }
 
-    let client = reqwest::Client::new();
+    let client = voice_clone_http_client()?;
 
     // Build multipart form
     let mut form = Form::new().text("name", request.name.clone());
@@ -1589,26 +1687,7 @@ async fn clone_voice_lmnt(
 
     // Decode and add audio samples
     for (i, sample_b64) in request.audio_samples.iter().enumerate() {
-        // Handle potential data URL prefix
-        let audio_data = if sample_b64.contains(',') {
-            // Data URL format: data:audio/wav;base64,xxxxx
-            let parts: Vec<&str> = sample_b64.splitn(2, ',').collect();
-            if parts.len() == 2 {
-                parts[1]
-            } else {
-                sample_b64.as_str()
-            }
-        } else {
-            sample_b64.as_str()
-        };
-
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(audio_data)
-            .map_err(|e| VoiceCloneError {
-                code: "INVALID_AUDIO".to_string(),
-                message: format!("Failed to decode audio sample {}: {}", i, e),
-                details: None,
-            })?;
+        let decoded = decode_audio_sample(sample_b64, i)?;
 
         // Detect format from magic bytes
         let (mime_type, extension) = detect_audio_format(&decoded);
@@ -1692,11 +1771,14 @@ async fn clone_voice_cartesia(
 ) -> Result<VoiceCloneResponse, VoiceCloneError> {
     use reqwest::multipart::{Form, Part};
 
-    let sample = request.audio_samples.first().ok_or_else(|| VoiceCloneError {
-        code: "MISSING_AUDIO".to_string(),
-        message: "Cartesia voice cloning requires one audio clip (~5-20s)".to_string(),
-        details: None,
-    })?;
+    let sample = request
+        .audio_samples
+        .first()
+        .ok_or_else(|| VoiceCloneError {
+            code: "MISSING_AUDIO".to_string(),
+            message: "Cartesia voice cloning requires one audio clip (~5-20s)".to_string(),
+            details: None,
+        })?;
     let decoded = decode_audio_sample(sample, 0)?;
     let (mime, ext) = detect_audio_format(&decoded);
 
@@ -1704,7 +1786,12 @@ async fn clone_voice_cartesia(
         .structured_labels
         .as_ref()
         .and_then(|l| l.language.clone())
-        .or_else(|| request.labels.as_ref().and_then(|m| m.get("language").cloned()))
+        .or_else(|| {
+            request
+                .labels
+                .as_ref()
+                .and_then(|m| m.get("language").cloned())
+        })
         .unwrap_or_else(|| "en".to_string());
 
     let clip = Part::bytes(decoded)
@@ -1725,7 +1812,7 @@ async fn clone_voice_cartesia(
         form = form.text("description", desc.clone());
     }
 
-    let client = reqwest::Client::new();
+    let client = voice_clone_http_client()?;
     let response = client
         .post("https://api.cartesia.ai/voices/clone")
         .header("X-API-Key", api_key)
@@ -1749,11 +1836,12 @@ async fn clone_voice_cartesia(
         });
     }
 
-    let parsed: CartesiaVoiceCreateResponse = response.json().await.map_err(|e| VoiceCloneError {
-        code: "PARSE_ERROR".to_string(),
-        message: format!("Failed to parse Cartesia response: {e}"),
-        details: None,
-    })?;
+    let parsed: CartesiaVoiceCreateResponse =
+        response.json().await.map_err(|e| VoiceCloneError {
+            code: "PARSE_ERROR".to_string(),
+            message: format!("Failed to parse Cartesia response: {e}"),
+            details: None,
+        })?;
 
     Ok(VoiceCloneResponse {
         voice_id: parsed.id,
@@ -1786,11 +1874,14 @@ async fn clone_voice_playht(
 ) -> Result<VoiceCloneResponse, VoiceCloneError> {
     use reqwest::multipart::{Form, Part};
 
-    let sample = request.audio_samples.first().ok_or_else(|| VoiceCloneError {
-        code: "MISSING_AUDIO".to_string(),
-        message: "PlayHT voice cloning requires at least one audio sample".to_string(),
-        details: None,
-    })?;
+    let sample = request
+        .audio_samples
+        .first()
+        .ok_or_else(|| VoiceCloneError {
+            code: "MISSING_AUDIO".to_string(),
+            message: "PlayHT voice cloning requires at least one audio sample".to_string(),
+            details: None,
+        })?;
     let decoded = decode_audio_sample(sample, 0)?;
     let (mime, ext) = detect_audio_format(&decoded);
 
@@ -1821,7 +1912,7 @@ async fn clone_voice_playht(
         "https://api.play.ht/api/v2/cloned-voices/instant"
     };
 
-    let client = reqwest::Client::new();
+    let client = voice_clone_http_client()?;
     let response = client
         .post(url)
         .header("Authorization", format!("Bearer {api_key}"))
@@ -1905,11 +1996,14 @@ async fn clone_voice_speechify(
         }
     };
 
-    let sample = request.audio_samples.first().ok_or_else(|| VoiceCloneError {
-        code: "MISSING_AUDIO".to_string(),
-        message: "Speechify voice cloning requires one audio sample (10-30s)".to_string(),
-        details: None,
-    })?;
+    let sample = request
+        .audio_samples
+        .first()
+        .ok_or_else(|| VoiceCloneError {
+            code: "MISSING_AUDIO".to_string(),
+            message: "Speechify voice cloning requires one audio sample (10-30s)".to_string(),
+            details: None,
+        })?;
     let decoded = decode_audio_sample(sample, 0)?;
     let (mime, ext) = detect_audio_format(&decoded);
 
@@ -1942,7 +2036,7 @@ async fn clone_voice_speechify(
         form = form.text("gender", g);
     }
 
-    let client = reqwest::Client::new();
+    let client = voice_clone_http_client()?;
     let response = client
         .post("https://api.sws.speechify.com/v1/voices")
         .header("Authorization", format!("Bearer {api_key}"))
@@ -2015,10 +2109,15 @@ async fn clone_voice_elevenlabs_pvc(
         .structured_labels
         .as_ref()
         .and_then(|l| l.language.clone())
-        .or_else(|| request.labels.as_ref().and_then(|m| m.get("language").cloned()))
+        .or_else(|| {
+            request
+                .labels
+                .as_ref()
+                .and_then(|m| m.get("language").cloned())
+        })
         .unwrap_or_else(|| "en".to_string());
 
-    let client = reqwest::Client::new();
+    let client = voice_clone_http_client()?;
 
     // Step 1: create the PVC voice resource.
     let mut create_body = serde_json::json!({ "name": request.name, "language": language });
@@ -2048,11 +2147,12 @@ async fn clone_voice_elevenlabs_pvc(
             details: Some(serde_json::json!({ "status": create_status.as_u16() })),
         });
     }
-    let created: ElevenLabsPvcCreateResponse = create.json().await.map_err(|e| VoiceCloneError {
-        code: "PARSE_ERROR".to_string(),
-        message: format!("Failed to parse ElevenLabs PVC create response: {e}"),
-        details: None,
-    })?;
+    let created: ElevenLabsPvcCreateResponse =
+        create.json().await.map_err(|e| VoiceCloneError {
+            code: "PARSE_ERROR".to_string(),
+            message: format!("Failed to parse ElevenLabs PVC create response: {e}"),
+            details: None,
+        })?;
     let voice_id = created.voice_id;
 
     // Step 2: upload samples.
@@ -2160,7 +2260,7 @@ async fn clone_voice_resemble(
         "default_language": language,
     });
 
-    let client = reqwest::Client::new();
+    let client = voice_clone_http_client()?;
     let response = client
         .post("https://app.resemble.ai/api/v2/voices")
         .header("Authorization", format!("Token {api_key}"))
@@ -2227,18 +2327,128 @@ fn now_rfc3339() -> String {
 
 /// Decode one (optionally data-URL-prefixed) base64 audio sample to bytes.
 fn decode_audio_sample(sample_b64: &str, index: usize) -> Result<Vec<u8>, VoiceCloneError> {
-    // Strip an optional data-URL prefix ("data:audio/wav;base64,XXXX").
-    let audio_data = sample_b64
-        .split_once(',')
-        .map(|x| x.1)
-        .unwrap_or(sample_b64);
-    base64::engine::general_purpose::STANDARD
+    decode_audio_sample_with_limit(sample_b64, index, MAX_VOICE_CLONE_SAMPLE_BYTES)
+}
+
+fn decode_audio_sample_with_limit(
+    sample_b64: &str,
+    index: usize,
+    max_decoded_bytes: usize,
+) -> Result<Vec<u8>, VoiceCloneError> {
+    let audio_data = voice_clone_audio_payload(sample_b64);
+    let estimated = estimated_decoded_base64_len(audio_data);
+    if estimated > max_decoded_bytes {
+        return Err(voice_clone_audio_too_large(
+            index,
+            estimated,
+            max_decoded_bytes,
+        ));
+    }
+
+    let decoded = base64::engine::general_purpose::STANDARD
         .decode(audio_data)
         .map_err(|e| VoiceCloneError {
             code: "INVALID_AUDIO".to_string(),
             message: format!("Failed to decode audio sample {index}: {e}"),
             details: None,
-        })
+        })?;
+
+    if decoded.len() > max_decoded_bytes {
+        return Err(voice_clone_audio_too_large(
+            index,
+            decoded.len(),
+            max_decoded_bytes,
+        ));
+    }
+
+    Ok(decoded)
+}
+
+fn voice_clone_audio_payload(sample_b64: &str) -> &str {
+    sample_b64
+        .split_once(',')
+        .map(|x| x.1)
+        .unwrap_or(sample_b64)
+        .trim()
+}
+
+fn estimated_decoded_base64_len(payload: &str) -> usize {
+    let padding = payload
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|&&b| b == b'=')
+        .count()
+        .min(2);
+    ((payload.len().saturating_add(3)) / 4)
+        .saturating_mul(3)
+        .saturating_sub(padding)
+}
+
+fn validate_voice_clone_audio_size_limits(samples: &[String]) -> Result<(), VoiceCloneError> {
+    validate_voice_clone_audio_size_limits_with_limits(
+        samples,
+        MAX_VOICE_CLONE_SAMPLE_BYTES,
+        MAX_VOICE_CLONE_TOTAL_AUDIO_BYTES,
+    )
+}
+
+fn validate_voice_clone_audio_size_limits_with_limits(
+    samples: &[String],
+    max_sample_bytes: usize,
+    max_total_bytes: usize,
+) -> Result<(), VoiceCloneError> {
+    let mut total = 0usize;
+    for (index, sample) in samples.iter().enumerate() {
+        let decoded_estimate = estimated_decoded_base64_len(voice_clone_audio_payload(sample));
+        if decoded_estimate > max_sample_bytes {
+            return Err(voice_clone_audio_too_large(
+                index,
+                decoded_estimate,
+                max_sample_bytes,
+            ));
+        }
+
+        total = total
+            .checked_add(decoded_estimate)
+            .ok_or_else(|| voice_clone_audio_total_too_large(usize::MAX, max_total_bytes))?;
+        if total > max_total_bytes {
+            return Err(voice_clone_audio_total_too_large(total, max_total_bytes));
+        }
+    }
+
+    Ok(())
+}
+
+fn voice_clone_audio_too_large(
+    index: usize,
+    decoded_bytes: usize,
+    limit: usize,
+) -> VoiceCloneError {
+    VoiceCloneError {
+        code: "AUDIO_TOO_LARGE".to_string(),
+        message: format!(
+            "Voice clone audio sample {index} exceeds decoded size limit of {limit} bytes"
+        ),
+        details: Some(serde_json::json!({
+            "sample_index": index,
+            "decoded_bytes": decoded_bytes,
+            "limit_bytes": limit,
+        })),
+    }
+}
+
+fn voice_clone_audio_total_too_large(decoded_bytes: usize, limit: usize) -> VoiceCloneError {
+    VoiceCloneError {
+        code: "AUDIO_TOO_LARGE".to_string(),
+        message: format!(
+            "Voice clone audio samples exceed decoded total size limit of {limit} bytes"
+        ),
+        details: Some(serde_json::json!({
+            "decoded_total_bytes": decoded_bytes,
+            "limit_bytes": limit,
+        })),
+    }
 }
 
 // =============================================================================
@@ -2416,6 +2626,7 @@ pub async fn clone_voice(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
 
     #[test]
     fn test_voice_clone_provider_display() {
@@ -2539,6 +2750,24 @@ mod tests {
     }
 
     #[test]
+    fn voice_clone_audio_decode_is_size_bounded_before_allocation() {
+        let ok = decode_audio_sample_with_limit("data:audio/wav;base64,QUJD", 0, 3).unwrap();
+        assert_eq!(ok, b"ABC");
+
+        let err = decode_audio_sample_with_limit("QUJD", 0, 2).unwrap_err();
+        assert_eq!(err.code, "AUDIO_TOO_LARGE");
+        assert_eq!(err.details.unwrap()["sample_index"], 0);
+    }
+
+    #[test]
+    fn voice_clone_validation_enforces_total_decoded_audio_limit() {
+        let samples = vec!["QUJD".to_string(), "QUJD".to_string()];
+        let err = validate_voice_clone_audio_size_limits_with_limits(&samples, 3, 5).unwrap_err();
+        assert_eq!(err.code, "AUDIO_TOO_LARGE");
+        assert!(err.message.contains("total"));
+    }
+
+    #[test]
     fn test_voice_clone_error_serialization() {
         let error = VoiceCloneError {
             code: "TEST_ERROR".to_string(),
@@ -2598,6 +2827,73 @@ mod tests {
         assert!(json.contains("\"voice_id\":\"voice_lmnt_123\""));
         assert!(json.contains("\"provider\":\"lmnt\""));
         assert!(json.contains("\"status\":\"ready\""));
+    }
+
+    #[test]
+    fn azure_voices_region_is_ssrf_checked() {
+        let _env = crate::core::net::ssrf_env_lock();
+        assert_eq!(
+            azure_voices_list_url(" westeurope ").unwrap(),
+            "https://westeurope.tts.speech.microsoft.com/cognitiveservices/voices/list"
+        );
+
+        let err = azure_voices_list_url("127.0.0.1:9000/foo").unwrap_err();
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        let err = azure_voices_list_url("evil.com@127.0.0.1").unwrap_err();
+        assert!(err.contains("single DNS label"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn voice_handler_http_client_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!(
+                        "Skipping voice_handler_http_client_redirect_policy_rejects_private_hop: {err}"
+                    );
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = voice_handler_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
     }
 
     // ---- P4 canonical VoiceClone widening ----------------------------------
@@ -2718,6 +3014,70 @@ mod tests {
     }
 
     #[test]
+    fn p4_hume_voice_design_requires_description_and_rejects_audio_samples() {
+        let missing: VoiceCloneRequest =
+            serde_json::from_str(r#"{ "provider": "hume", "name": "V" }"#).unwrap();
+        let err = missing.validate().unwrap_err();
+        assert_eq!(err.code, "MISSING_DESCRIPTION");
+
+        let blank: VoiceCloneRequest =
+            serde_json::from_str(r#"{ "provider": "hume", "name": "V", "description": "   " }"#)
+                .unwrap();
+        let err = blank.validate().unwrap_err();
+        assert_eq!(err.code, "MISSING_DESCRIPTION");
+
+        let audio: VoiceCloneRequest = serde_json::from_str(
+            r#"{ "provider": "hume", "name": "V", "description": "warm", "audio_samples": ["YWJj"] }"#,
+        )
+        .unwrap();
+        let err = audio.validate().unwrap_err();
+        assert_eq!(err.code, "AUDIO_SAMPLES_NOT_SUPPORTED");
+
+        let ok: VoiceCloneRequest = serde_json::from_str(
+            r#"{ "provider": "hume", "name": "V", "description": "warm narrator" }"#,
+        )
+        .unwrap();
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn p4_audio_clone_providers_require_audio_before_credentials() {
+        let cases = [
+            (r#"{ "provider": "elevenlabs", "name": "V" }"#, "elevenlabs"),
+            (r#"{ "provider": "lmnt", "name": "V" }"#, "lmnt"),
+            (r#"{ "provider": "cartesia", "name": "V" }"#, "cartesia"),
+            (r#"{ "provider": "playht", "name": "V" }"#, "playht"),
+            (
+                r#"{ "provider": "speechify", "name": "V",
+                     "consent": { "full_name": "Jane", "email": "j@x.com" } }"#,
+                "speechify",
+            ),
+            (
+                r#"{ "provider": "elevenlabs", "name": "V", "mode": "professional",
+                     "consent": { "verified": true } }"#,
+                "elevenlabs",
+            ),
+        ];
+
+        for (json, provider) in cases {
+            let req: VoiceCloneRequest = serde_json::from_str(json).unwrap();
+            let err = req.validate().unwrap_err();
+            assert_eq!(err.code, "MISSING_AUDIO", "provider {provider}");
+            assert!(err.message.to_lowercase().contains(provider));
+        }
+    }
+
+    #[test]
+    fn p4_lmnt_rejects_too_many_audio_samples_before_credentials() {
+        let samples = (0..21).map(|_| "\"YWJj\"").collect::<Vec<_>>().join(",");
+        let json =
+            format!(r#"{{ "provider": "lmnt", "name": "V", "audio_samples": [{samples}] }}"#);
+        let req: VoiceCloneRequest = serde_json::from_str(&json).unwrap();
+        let err = req.validate().unwrap_err();
+        assert_eq!(err.code, "TOO_MANY_FILES");
+    }
+
+    #[test]
     fn p4_pvc_requires_verified_consent_validation() {
         // ElevenLabs professional without consent.verified → 400.
         let req: VoiceCloneRequest = serde_json::from_str(
@@ -2762,7 +3122,10 @@ mod tests {
         assert_eq!(req.mode, CloneMode::Instant);
         assert!(req.consent.is_none());
         assert_eq!(
-            req.merged_labels().unwrap().get("accent").map(String::as_str),
+            req.merged_labels()
+                .unwrap()
+                .get("accent")
+                .map(String::as_str),
             Some("british")
         );
         assert!(req.validate().is_ok());

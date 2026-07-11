@@ -424,6 +424,17 @@ pub struct CartesiaTTS {
 }
 
 impl CartesiaTTS {
+    fn from_parts_unchecked(config: TTSConfig, cartesia_config: CartesiaTTSConfig) -> Self {
+        let request_builder = CartesiaRequestBuilder::new(config.clone(), cartesia_config.clone());
+        let config_hash = compute_cartesia_tts_config_hash(&config, &cartesia_config);
+
+        Self {
+            provider: TTSProvider::new(),
+            request_builder,
+            config_hash,
+        }
+    }
+
     /// Creates a new Cartesia TTS provider instance.
     ///
     /// # Arguments
@@ -467,7 +478,7 @@ impl CartesiaTTS {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             request_builder,
             config_hash,
         })
@@ -492,10 +503,9 @@ impl CartesiaTTS {
     /// reads. Features Cartesia can't express are skipped (capability gaps).
     ///
     /// [`DeepgramTTS::from_standard`]: crate::core::tts::deepgram::DeepgramTTS::from_standard
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let cartesia_config = CartesiaTTSConfig::from_standard(std);
+        cartesia_config.validate_endpoint_override()?;
         // The standardized mapping mutates the carried base (speaking_rate / emotion_config); the
         // request builder and hash read those from the base, so use the config's mutated base.
         let base = cartesia_config.base.clone();
@@ -510,7 +520,7 @@ impl CartesiaTTS {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             request_builder,
             config_hash,
         })
@@ -527,8 +537,10 @@ impl CartesiaTTS {
 
 impl Default for CartesiaTTS {
     fn default() -> Self {
-        Self::new(TTSConfig::default())
-            .expect("Default CartesiaTTS should have valid configuration")
+        let config = TTSConfig::default();
+        let cartesia_config = CartesiaTTSConfig::from_base(config.clone());
+
+        Self::from_parts_unchecked(config, cartesia_config)
     }
 }
 
@@ -761,10 +773,24 @@ mod tests {
         // emotion reaches the base emotion_config the request builder reads.
         assert!(tts.request_builder.config.emotion_config.is_some());
         // sample_rate reaches the Cartesia output format.
-        assert_eq!(
-            tts.cartesia_config().output_format.sample_rate,
-            16000
-        );
+        assert_eq!(tts.cartesia_config().output_format.sample_rate, 16000);
+    }
+
+    #[test]
+    fn from_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "cartesia".into(),
+            api_key: "k".into(),
+            voice_id: Some("a0e99841-438c-4a64-b679-ae501e7d6091".into()),
+            ..Default::default()
+        })
+        .with_endpoint_override("http://127.0.0.1:9000");
+
+        match CartesiaTTS::from_standard(&std) {
+            Ok(_) => panic!("Cartesia provider construction must reject unsafe endpoint_override"),
+            Err(err) => assert!(err.to_string().contains("SSRF protection")),
+        }
     }
 
     // WIRE-LEVEL: volume must reach the serialized request body as
@@ -909,7 +935,10 @@ mod tests {
     fn from_standard_pronunciation_dict_id_reaches_request_body() {
         use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
         let mut extras = serde_json::Map::new();
-        extras.insert("pronunciation_dict_id".into(), serde_json::json!("dict-123"));
+        extras.insert(
+            "pronunciation_dict_id".into(),
+            serde_json::json!("dict-123"),
+        );
         let std = StandardTTSConfig {
             base: create_test_config(),
             features: TtsFeatures::default(),
@@ -1357,10 +1386,11 @@ mod tests {
     }
 
     #[test]
-    fn test_cartesia_tts_default() {
+    fn cartesia_tts_default_does_not_depend_on_result_unwrap() {
         let tts = CartesiaTTS::default();
 
         assert!(!tts.is_ready());
+        assert_eq!(tts.cartesia_config().base.api_key, "");
         assert_eq!(tts.cartesia_config().model, "sonic-3");
     }
 

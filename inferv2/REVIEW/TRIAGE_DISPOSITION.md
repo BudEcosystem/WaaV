@@ -39,13 +39,28 @@ pyannote/speaker-diarization(-3.1) — all are re-serializations/quant repacks o
 - **No clean full-pipeline ONNX + license**: coqui/XTTS-v2 (the LLM+GPT backbone isn't cleanly exported; CPML license).
 - (parakeet-cpp-gguf double-counted in D.)
 
-## F. HARD-tier deferred — big ports / new stacks (10)
-Each a genuine multi-day port, not a config add; deferred with the honest cost noted:
-- **MisoLabs/MisoTTS** (8B CSM-clone) — a csm-sized AR + depth-decoder port.
-- **Zyphra/ZONOS2 · IndexTeam/IndexTTS-2** — new codec-AR TTS stacks.
-- **kyutai/hibiki-zero-3b** — Moshi-class full-duplex S2S (the DuplexStepModel seam exists; the model is a big port).
-- **Aratako/Irodori-TTS · Semantic-DACVAE** — JP voice-design TTS + a new DAC-VAE.
-- **Yorch233/RSB** — new stack.
+## F. HARD-tier — DRIVEN to byte-faithful (no longer deferred) + the last few in-flight
+The 2026-06-24 session drove the HARD ports byte-faithful (the user's no-compromise bar), not deferred:
+- **MisoLabs/MisoTTS** (8B CSM-clone) → ONBOARDED + byte-identical. 8B greedy codes 1024/1024 match the torchtune
+  golden (f32 LAW); the port was bit-faithful — the initial divergence RCA'd to the REFERENCE golden's
+  reset_caches-in-loop bug, not WaaV. (commits 829b97b + 11ce647)
+- **kyutai/hibiki-zero-3b** → ONBOARDED + byte-faithful. Moshi-class full-duplex S2S: Mimi encode 0/128, decode
+  maxΔ=0, greedy duplex codes 0/96, real DuplexStep turn; csm/dia2 non-regressing (4000/4000, 608/608). NEW
+  codec/mimi_encoder.rs. (commit e3b2f49) + now first-class ENGINE-SERVED via the S2sModel endpoint (commit 56254bf).
+- **Zyphra/ZONOS2** → ONBOARDED + byte-faithful. Dense-attention MoE ("sonic", 16-expert top-1 + EDA router; the
+  triage's "SSM/Mamba" was the v0.1 arch) — greedy codes 288/288; an f32-bisection caught + fixed a real
+  non-causal-mask bug (nan_to_num zeroed -inf). DAC codec reused verbatim. (commit a39841b)
+- **IndexTeam/IndexTTS-2 · Aratako/Irodori-TTS** → IN FLIGHT (scope-then-port agents running 2026-06-24).
+- **Semantic-DACVAE · Yorch233/RSB** — remaining; to be driven next at the same byte-faithful bar.
+
+## H. Cross-cutting fixes this session (the 7 system issues + integration)
+- **Item 1 (fp16/quant on CUDA) → SOLVED on the ONNX path**, not just the tch bypass: voxtral-q4f16 + cohere-fp16
+  now run on the ORT CUDA EP byte-faithful via graph surgery (the rejected GQA attention_bias is an all-zero
+  padding slot the drivers never populate; removing it is a mathematical no-op that unblocks CUDA). Corrected the
+  B59 "upstream-infeasible" verdict. (commit 59f1adc, eval/onnx_drop_gqa_bias.py)
+- **Item 3 (S2S shelfware) → wired**: hibiki + lfm2.5-audio are first-class engine-served S2S (S2sModel trait +
+  load_model_at dispatch + native-WS Task::S2s), live-gated byte-faithful. CodecArDuplexModel left unwired (an
+  honest synthetic seam-exerciser, not a checkpoint). (commit 56254bf)
 
 ## G. TANGENTIAL — outside core Voice-AI scope (dispositioned, not onboarded) — ~8
 Music/audio tasks beyond STT/TTS/STS/diar/enhance; reuse paths exist but low priority for a *Voice* engine:
@@ -58,7 +73,11 @@ Music/audio tasks beyond STT/TTS/STS/diar/enhance; reuse paths exist but low pri
   extension to the single-graph enhance seam — a bounded enhancement follow-up (in scope, deferred for effort).
 
 ## Bottom line
-**The core Voice-AI fleet (~60 models, 9 arch families, 5 task families) is onboarded, live, byte-faithful, and
-fully engine-integrated.** The remainder is honestly accounted: 5 duplicates (no work), 12 blocked (MLX/RL/gated/
-music/no-clean-ONNX), 10 HARD big-ports (cost-noted), ~8 tangential-to-Voice-AI (super-res/RVC/music-sep/singing).
-The one clean winnable-next is canary-qwen-2.5b (qwen3-asr template). Nothing is faked or silently dropped.
+**The core Voice-AI fleet (66 models, 9 arch families, 5 task families incl. real S2S, onboarded, live,
+byte-faithful, fully engine-integrated)** — and the HARD-tier is now being DRIVEN byte-faithful, not deferred:
+MisoTTS-8B, hibiki-3B (full-duplex S2S), and ZONOS2 (MoE) all landed bit-exact this session; IndexTTS-2 + Irodori
+in flight; Semantic-DACVAE + RSB next. The 7 system issues are closed (item 1 fixed at the ROOT on the ONNX-CUDA
+path; item 3 S2S wired engine-served). The honestly-accounted remainder: 5 duplicates (no work), 12 blocked
+(MLX/RL/gated/music/no-clean-ONNX = format/access/scope walls, not skipped work), ~8 tangential-to-Voice-AI
+(super-res/RVC/music-sep/singing). Nothing is faked or silently dropped; the only true walls are non-CUDA silicon
+(no device present) and gated/MLX weights (access/format) — stated, not papered over.

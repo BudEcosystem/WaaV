@@ -4,7 +4,7 @@
 //! using HTTP streaming for real-time audio synthesis.
 
 use async_trait::async_trait;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use tracing::{debug, info};
 
 use super::config::{SpeechmaticsGenerateRequest, SpeechmaticsTtsConfig};
@@ -64,16 +64,8 @@ impl TTSRequestBuilder for SpeechmaticsRequestBuilder {
         // Build request body
         let request_body = SpeechmaticsGenerateRequest::from_config(&self.config, text);
 
-        // Build headers
-        let mut headers = HeaderMap::new();
-
-        // Speechmatics uses Bearer token authentication
+        // Speechmatics uses Bearer token authentication.
         let auth_value = format!("Bearer {}", self.config.api_key);
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&auth_value).unwrap_or_else(|_| HeaderValue::from_static("")),
-        );
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         let url = self.streaming_url();
 
@@ -88,7 +80,8 @@ impl TTSRequestBuilder for SpeechmaticsRequestBuilder {
                 &url,
                 self.config.endpoint_override.as_deref(),
             ))
-            .headers(headers)
+            .header(AUTHORIZATION, auth_value)
+            .header(CONTENT_TYPE, "application/json")
             .json(&request_body)
     }
 
@@ -158,9 +151,7 @@ impl SpeechmaticsTts {
     ///
     /// [`SpeechmaticsTtsConfig::from_standard`]: super::config::SpeechmaticsTtsConfig::from_standard
     /// [`TtsFeatures`]: crate::core::tts::standard::TtsFeatures
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let speechmatics_config = SpeechmaticsTtsConfig::from_standard(std)?;
 
         info!(
@@ -169,7 +160,7 @@ impl SpeechmaticsTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             speechmatics_config,
             base_config: std.base.clone(),
         })
@@ -202,7 +193,7 @@ impl BaseTTS for SpeechmaticsTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             speechmatics_config,
             base_config: config,
         })
@@ -308,6 +299,44 @@ mod tests {
         );
         // Output stays fixed at 16 kHz: the sample_rate feature has no field to land in.
         assert_eq!(tts.speechmatics_config().output_format.sample_rate(), 16000);
+    }
+
+    #[test]
+    fn invalid_speechmatics_api_key_header_value_is_request_build_error() {
+        let config = TTSConfig {
+            api_key: "bad\nkey".into(),
+            voice_id: Some("jack".into()),
+            ..Default::default()
+        };
+        let speechmatics_config = SpeechmaticsTtsConfig::from_base(&config).unwrap();
+        let builder = SpeechmaticsRequestBuilder::new(speechmatics_config, config);
+        let err = builder
+            .build_http_request(&reqwest::Client::new(), "hello")
+            .build()
+            .expect_err(
+                "malformed Speechmatics API key must not become an empty Authorization header",
+            );
+
+        assert!(err.is_builder(), "unexpected reqwest error: {err}");
+    }
+
+    #[test]
+    fn from_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "speechmatics".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("jack".into()),
+            ..Default::default()
+        })
+        .with_endpoint_override("http://127.0.0.1:9000");
+
+        match SpeechmaticsTts::from_standard(&std) {
+            Ok(_) => {
+                panic!("Speechmatics provider construction must reject unsafe endpoint_override")
+            }
+            Err(err) => assert!(err.to_string().contains("SSRF protection")),
+        }
     }
 
     #[test]

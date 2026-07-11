@@ -19,11 +19,14 @@
 //! task registers it through the same [`track`](SessionTaskTracker::track) API.
 
 use std::borrow::Cow;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use tokio::task::JoinHandle;
-use tracing::warn;
+use futures::FutureExt;
+use tokio::task::{JoinError, JoinHandle};
+use tracing::{error, warn};
 
 /// Grace window after aborting tracked tasks before declaring survivors
 /// "dangling". Cancellation is a yield point, so a `recv`-blocked loop finishes
@@ -44,6 +47,129 @@ struct TrackedTask {
 /// mutex is held only for `push`/`take`, never across an `.await`.
 pub struct SessionTaskTracker {
     tasks: Mutex<Vec<TrackedTask>>,
+}
+
+/// Result of auditing tracked session-lifetime tasks at teardown.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SessionTaskAudit {
+    /// Tasks still running after abort + grace. This is the leak signal.
+    pub dangling: usize,
+    /// Tasks whose [`JoinHandle`] had already completed with a panic.
+    pub panicked: usize,
+}
+
+/// Outcome from explicitly observing an owned [`JoinHandle`] during shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskShutdownOutcome {
+    /// The task completed normally before the shutdown grace expired.
+    Completed,
+    /// The task had been cancelled and its handle was observed.
+    Cancelled,
+    /// The task panicked and its handle was observed.
+    Panicked,
+    /// The task was aborted and its cancellation was observed.
+    Aborted,
+    /// The task missed the grace window and still did not finish after abort.
+    TimedOutStillRunning,
+}
+
+/// Await a provider/background task during shutdown without accidentally
+/// detaching it on timeout.
+///
+/// Important: this times out `&mut handle`, not `handle`, so an elapsed timeout
+/// leaves the handle owned here. That lets us abort and observe cancellation
+/// rather than dropping the handle and detaching the task.
+pub async fn await_task_shutdown(
+    label: impl Into<Cow<'static, str>>,
+    mut handle: JoinHandle<()>,
+    grace: Duration,
+) -> TaskShutdownOutcome {
+    let label = label.into();
+    match tokio::time::timeout(grace, &mut handle).await {
+        Ok(Ok(())) => TaskShutdownOutcome::Completed,
+        Ok(Err(e)) => classify_join_error(&label, e),
+        Err(_) => {
+            warn!(
+                task = %label,
+                grace_ms = grace.as_millis() as u64,
+                "task did not finish during shutdown grace; aborting"
+            );
+            handle.abort();
+            await_aborted_task(&label, &mut handle).await
+        }
+    }
+}
+
+/// Abort a provider/background task and observe its join result.
+pub async fn abort_and_await_task(
+    label: impl Into<Cow<'static, str>>,
+    mut handle: JoinHandle<()>,
+) -> TaskShutdownOutcome {
+    let label = label.into();
+    handle.abort();
+    await_aborted_task(&label, &mut handle).await
+}
+
+/// Spawn a task whose handle is intentionally detached, but still log panics.
+///
+/// This is for FFI/event callbacks where no owner exists to retain a
+/// [`JoinHandle`]. Owned background loops should use [`await_task_shutdown`] or
+/// [`abort_and_await_task`] instead.
+pub fn spawn_observed_detached<F>(label: impl Into<Cow<'static, str>>, future: F)
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let label = label.into();
+    tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            error!(
+                task = %label,
+                "detached task panicked"
+            );
+        }
+    });
+}
+
+async fn await_aborted_task(
+    label: &Cow<'static, str>,
+    handle: &mut JoinHandle<()>,
+) -> TaskShutdownOutcome {
+    match tokio::time::timeout(DEFAULT_TEARDOWN_GRACE, handle).await {
+        Ok(Ok(())) => TaskShutdownOutcome::Aborted,
+        Ok(Err(e)) => match classify_join_error(label, e) {
+            TaskShutdownOutcome::Cancelled => TaskShutdownOutcome::Aborted,
+            other => other,
+        },
+        Err(_) => {
+            warn!(
+                task = %label,
+                grace_ms = DEFAULT_TEARDOWN_GRACE.as_millis() as u64,
+                "task still running after abort; handle will detach"
+            );
+            TaskShutdownOutcome::TimedOutStillRunning
+        }
+    }
+}
+
+fn classify_join_error(label: &Cow<'static, str>, e: JoinError) -> TaskShutdownOutcome {
+    if e.is_panic() {
+        error!(
+            task = %label,
+            error = %e,
+            "task panicked during shutdown"
+        );
+        TaskShutdownOutcome::Panicked
+    } else if e.is_cancelled() {
+        TaskShutdownOutcome::Cancelled
+    } else {
+        warn!(
+            task = %label,
+            error = %e,
+            "task finished with an unexpected join error"
+        );
+        TaskShutdownOutcome::Cancelled
+    }
 }
 
 impl SessionTaskTracker {
@@ -70,14 +196,18 @@ impl SessionTaskTracker {
 
     /// Teardown audit. **Aborts** every tracked task (the intended cancellation
     /// of session-lifetime loops), waits `grace` for the cancellations to land,
-    /// then warns about + counts (`waav_session_dangling_tasks_total`) only the
-    /// tasks that *still* haven't finished — i.e. resisted cancellation. Drains
-    /// the tracker (so the [`Drop`] backstop is a no-op afterward) and returns
-    /// the number of genuinely-dangling tasks.
-    pub async fn abort_and_audit(&self, grace: Duration) -> usize {
+    /// then:
+    ///
+    /// - warns about + counts (`waav_session_dangling_tasks_total`) only tasks
+    ///   that *still* haven't finished — i.e. resisted cancellation;
+    /// - joins finished handles so a pre-teardown panic is observed instead of
+    ///   being silently skipped by `JoinHandle::is_finished`.
+    ///
+    /// Drains the tracker so the [`Drop`] backstop is a no-op afterward.
+    pub async fn abort_and_audit_details(&self, grace: Duration) -> SessionTaskAudit {
         let drained: Vec<TrackedTask> = std::mem::take(&mut *self.lock());
         if drained.is_empty() {
-            return 0;
+            return SessionTaskAudit::default();
         }
         // Cancel everything first — this is how session-lifetime loops (blocked
         // on a recv whose sender ConnectionState still holds) are stopped.
@@ -88,20 +218,46 @@ impl SessionTaskTracker {
         // point and finishes almost immediately; this bounds the wait at a
         // single `grace` regardless of task count.
         tokio::time::sleep(grace).await;
-        let mut dangling = 0;
+        let mut audit = SessionTaskAudit::default();
         for task in drained {
-            if task.handle.is_finished() {
+            if !task.handle.is_finished() {
+                audit.dangling += 1;
+                warn!(
+                    task = %task.label,
+                    grace_ms = grace.as_millis() as u64,
+                    "session task resisted cancellation at teardown — leaked (D-G4)"
+                );
+                crate::core::metrics::bridge::record_session_dangling_task();
                 continue;
             }
-            dangling += 1;
-            warn!(
-                task = %task.label,
-                grace_ms = grace.as_millis() as u64,
-                "session task resisted cancellation at teardown — leaked (D-G4)"
-            );
-            crate::core::metrics::bridge::record_session_dangling_task();
+
+            match task.handle.await {
+                Ok(()) => {}
+                Err(e) if e.is_panic() => {
+                    audit.panicked += 1;
+                    error!(
+                        task = %task.label,
+                        error = %e,
+                        "session task panicked before teardown — observed by task tracker (W-E1/D-G4)"
+                    );
+                    crate::core::metrics::bridge::record_session_task_panic();
+                }
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    warn!(
+                        task = %task.label,
+                        error = %e,
+                        "session task finished with an unexpected join error"
+                    );
+                }
+            }
         }
-        dangling
+        audit
+    }
+
+    /// Compatibility helper for callers that only need the D-G4 dangling count.
+    pub async fn abort_and_audit(&self, grace: Duration) -> usize {
+        self.abort_and_audit_details(grace).await.dangling
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<TrackedTask>> {
@@ -201,14 +357,96 @@ mod tests {
     #[tokio::test]
     async fn finished_task_is_not_dangling() {
         let tracker = SessionTaskTracker::new();
-        let mut h = tokio::spawn(async {});
+        let h = tokio::spawn(async {});
         while !h.is_finished() {
             tokio::task::yield_now().await;
-            let _ = futures::poll!(&mut h);
         }
         tracker.track("done", h);
         assert_eq!(tracker.abort_and_audit(TEST_GRACE).await, 0);
         assert_eq!(tracker.tracked_count(), 0, "audit drains the tracker");
+    }
+
+    #[tokio::test]
+    async fn panicked_task_is_observed_but_not_counted_dangling() {
+        // A panicked task is already `is_finished()` by teardown. The audit must
+        // still join the handle; otherwise detached task panics look identical to
+        // clean exits and disappear from the test/prod signal.
+        let tracker = SessionTaskTracker::new();
+        let h = tokio::spawn(async {
+            panic!("tracked task panic regression");
+        });
+        while !h.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        tracker.track("panic-task", h);
+
+        let audit = tracker.abort_and_audit_details(TEST_GRACE).await;
+        assert_eq!(audit.dangling, 0, "a panic is not a cancellation leak");
+        assert_eq!(
+            audit.panicked, 1,
+            "finished panicked handles are joined and counted"
+        );
+        assert_eq!(tracker.tracked_count(), 0, "audit drains the tracker");
+    }
+
+    #[tokio::test]
+    async fn await_task_shutdown_observes_clean_completion() {
+        let handle = tokio::spawn(async {});
+        assert_eq!(
+            await_task_shutdown("clean-provider-task", handle, TEST_GRACE).await,
+            TaskShutdownOutcome::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn await_task_shutdown_observes_task_panic() {
+        let handle = tokio::spawn(async {
+            panic!("provider task panic regression");
+        });
+        assert_eq!(
+            await_task_shutdown("panicked-provider-task", handle, TEST_GRACE).await,
+            TaskShutdownOutcome::Panicked
+        );
+    }
+
+    #[tokio::test]
+    async fn await_task_shutdown_aborts_instead_of_detaching_on_timeout() {
+        let aborted = Arc::new(AtomicBool::new(false));
+        let handle = cancellable_task(aborted.clone());
+
+        assert_eq!(
+            await_task_shutdown("slow-provider-task", handle, Duration::from_millis(5)).await,
+            TaskShutdownOutcome::Aborted
+        );
+        assert!(
+            await_flag(&aborted).await,
+            "timed-out async tasks are aborted and joined instead of detached"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_and_await_task_observes_preexisting_panic() {
+        let handle = tokio::spawn(async {
+            panic!("pre-abort provider task panic regression");
+        });
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            abort_and_await_task("pre-panicked-provider-task", handle).await,
+            TaskShutdownOutcome::Panicked
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_observed_detached_catches_callback_panic() {
+        // The assertion is intentionally minimal: the helper must catch the
+        // panic inside the detached wrapper so the test task can continue.
+        spawn_observed_detached("detached-callback", async {
+            panic!("detached callback panic regression");
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     #[tokio::test]
@@ -256,14 +494,16 @@ mod tests {
     async fn mixed_finished_cancellable_and_resisting() {
         let tracker = SessionTaskTracker::new();
         // finished
-        let mut done = tokio::spawn(async {});
+        let done = tokio::spawn(async {});
         while !done.is_finished() {
             tokio::task::yield_now().await;
-            let _ = futures::poll!(&mut done);
         }
         tracker.track("done", done);
         // cancellable
-        tracker.track("recv-loop", cancellable_task(Arc::new(AtomicBool::new(false))));
+        tracker.track(
+            "recv-loop",
+            cancellable_task(Arc::new(AtomicBool::new(false))),
+        );
         // resisting
         let (handle, release_tx, started) = resists_cancellation();
         tracker.track("blocking", handle);

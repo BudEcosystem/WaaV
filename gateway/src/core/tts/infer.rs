@@ -107,7 +107,10 @@ mod tests {
     #[tokio::test]
     async fn speak_returns_typed_error_not_panic() {
         let mut tts = InferTTS::new(infer_config()).unwrap();
-        let err = tts.speak("hello", true).await.expect_err("transport not wired yet");
+        let err = tts
+            .speak("hello", true)
+            .await
+            .expect_err("transport not wired yet");
         assert!(matches!(err, TTSError::ProviderNotReady(_)));
     }
 

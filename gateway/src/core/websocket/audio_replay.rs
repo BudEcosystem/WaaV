@@ -70,7 +70,10 @@ impl Default for AudioReplayBuffer {
 
 impl AudioReplayBuffer {
     pub fn new(cap_bytes: usize) -> Self {
-        Self { inner: Mutex::new(Inner::default()), cap_bytes: cap_bytes.max(1) }
+        Self {
+            inner: Mutex::new(Inner::default()),
+            cap_bytes: cap_bytes.max(1),
+        }
     }
 
     /// Record a chunk that was just written to the socket. Evicts the OLDEST

@@ -20,7 +20,7 @@
 
 use base64::prelude::*;
 use bytes::Bytes;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::core::realtime::base::{
     FunctionCallRequest, RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult,
@@ -32,8 +32,7 @@ use crate::core::realtime::scaffold::{
 
 /// ElevenLabs ConvAI WebSocket base endpoint. The `agent_id` query is appended
 /// in `connect_spec`. LIVE-probed working endpoint.
-pub(crate) const ELEVENLABS_CONVAI_URL: &str =
-    "wss://api.elevenlabs.io/v1/convai/conversation";
+pub(crate) const ELEVENLABS_CONVAI_URL: &str = "wss://api.elevenlabs.io/v1/convai/conversation";
 
 /// ConvAI uses `pcm_16000` both directions: 16 kHz mono 16-bit ⇒ 2 B/sample ×
 /// 16 samples/ms = 32 B/ms.
@@ -421,11 +420,16 @@ mod tests {
             realtime_endpoint_override: Some("ws://127.0.0.1:9006/11".into()),
             ..base_cfg()
         };
-        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap() else {
+        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap()
+        else {
             panic!("expected WebSocket")
         };
         assert_eq!(url, "ws://127.0.0.1:9006/11");
-        assert!(headers.iter().any(|(k, v)| k == "xi-api-key" && v == "xikey"));
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "xi-api-key" && v == "xikey")
+        );
     }
 
     /// caps: server-VAD turn frames, 32 B/ms @ 16 kHz, NO truncate, NO input buffer.
@@ -444,7 +448,11 @@ mod tests {
     #[test]
     fn build_session_config_override_or_empty() {
         // No instructions ⇒ empty.
-        assert!(proto(&base_cfg()).build_session_config(&base_cfg(), None).is_empty());
+        assert!(
+            proto(&base_cfg())
+                .build_session_config(&base_cfg(), None)
+                .is_empty()
+        );
         // Instructions ⇒ one init message carrying the prompt override.
         let cfg = RealtimeConfig {
             instructions: Some("Be terse.".into()),
@@ -468,7 +476,11 @@ mod tests {
         let pcm: Vec<u8> = vec![0x00, 0x01, 0xFE, 0xFF, 0x7F, 0x80];
         let wire = p.encode_user_audio(&pcm);
         let b64 = wire["user_audio_chunk"].as_str().expect("user_audio_chunk");
-        assert_eq!(BASE64_STANDARD.decode(b64).unwrap(), pcm, "base64 round-trips");
+        assert_eq!(
+            BASE64_STANDARD.decode(b64).unwrap(),
+            pcm,
+            "base64 round-trips"
+        );
         // And it serializes to a TEXT frame (JSON), never binary.
         match p.serialize(&wire).unwrap() {
             OutFrame::Text(s) => assert!(s.contains("user_audio_chunk")),
@@ -497,12 +509,14 @@ mod tests {
         let p = proto(&base_cfg());
         let user = r#"{"type":"user_transcript","user_transcription_event":{"user_transcript":"hello there"}}"#;
         match p.map_server_event(Inbound::Text(user)).as_slice() {
-            [S2sEvent::Transcript {
-                role,
-                text,
-                is_final,
-                item_id,
-            }] => {
+            [
+                S2sEvent::Transcript {
+                    role,
+                    text,
+                    is_final,
+                    item_id,
+                },
+            ] => {
                 assert_eq!(*role, TranscriptRole::User);
                 assert_eq!(text, "hello there");
                 assert!(*is_final);
@@ -512,12 +526,14 @@ mod tests {
         }
         let asst = r#"{"type":"agent_response","agent_response_event":{"agent_response":"hi!"}}"#;
         match p.map_server_event(Inbound::Text(asst)).as_slice() {
-            [S2sEvent::Transcript {
-                role,
-                text,
-                is_final,
-                ..
-            }] => {
+            [
+                S2sEvent::Transcript {
+                    role,
+                    text,
+                    is_final,
+                    ..
+                },
+            ] => {
                 assert_eq!(*role, TranscriptRole::Assistant);
                 assert_eq!(text, "hi!");
                 assert!(*is_final);
@@ -532,15 +548,16 @@ mod tests {
         let p = proto(&base_cfg());
         let pcm: &[u8] = &[1, 2, 3, 4, 250, 251];
         let b64 = BASE64_STANDARD.encode(pcm);
-        let raw = format!(
-            r#"{{"type":"audio","audio_event":{{"audio_base_64":"{b64}","event_id":7}}}}"#
-        );
+        let raw =
+            format!(r#"{{"type":"audio","audio_event":{{"audio_base_64":"{b64}","event_id":7}}}}"#);
         match p.map_server_event(Inbound::Text(&raw)).as_slice() {
-            [S2sEvent::Audio {
-                data,
-                item_id,
-                response_id,
-            }] => {
+            [
+                S2sEvent::Audio {
+                    data,
+                    item_id,
+                    response_id,
+                },
+            ] => {
                 assert_eq!(data.as_ref(), pcm, "audio is base64-decoded");
                 assert!(item_id.is_none());
                 assert!(response_id.is_none());
@@ -605,8 +622,10 @@ mod tests {
             [S2sEvent::Ignore]
         ));
         assert!(matches!(
-            p.map_server_event(Inbound::Text(r#"{"type":"vad_score","vad_score_event":{"vad_score":0.9}}"#))
-                .as_slice(),
+            p.map_server_event(Inbound::Text(
+                r#"{"type":"vad_score","vad_score_event":{"vad_score":0.9}}"#
+            ))
+            .as_slice(),
             [S2sEvent::Ignore]
         ));
         assert!(matches!(

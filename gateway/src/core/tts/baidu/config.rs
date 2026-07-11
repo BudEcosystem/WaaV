@@ -19,6 +19,15 @@
 use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 
+fn validate_baidu_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -440,6 +449,11 @@ impl BaiduTtsConfig {
             ));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_baidu_tts_endpoint("endpoint_override", endpoint)
+                .map_err(TTSError::InvalidConfiguration)?;
+        }
+
         Ok(())
     }
 
@@ -521,7 +535,9 @@ impl BaiduTtsConfig {
     /// `cuid` and `use_https` knobs are read from the `extras` passthrough. Features without a Baidu
     /// field (stability, similarity_boost, style, use_speaker_boost, emotion, instructions, ssml,
     /// language, word_timestamps, streaming, seed, sample_rate) are skipped.
-    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Result<Self, TTSError> {
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
         let f = &std.features;
         let mut cfg = Self::from_base(std.base.clone())?;
 
@@ -549,6 +565,7 @@ impl BaiduTtsConfig {
 
         cfg.endpoint_override = std.endpoint_override().map(String::from);
 
+        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -615,6 +632,30 @@ mod tests {
         assert_eq!(cfg.volume, 12);
         assert_eq!(cfg.cuid, "device-123"); // from extras passthrough
         assert!(!cfg.use_https);
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+
+        let mk = |endpoint: &str| {
+            StandardTTSConfig {
+                base: TTSConfig {
+                    provider: "baidu".into(),
+                    api_key: "test_api_key|test_secret_key".into(),
+                    ..Default::default()
+                },
+                features: TtsFeatures::default(),
+                extras: ProviderExtras::default(),
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(BaiduTtsConfig::from_standard(&mk("https://baidu-proxy.example.com")).is_ok());
+        assert!(BaiduTtsConfig::from_standard(&mk("http://127.0.0.1:9000")).is_err());
+        assert!(BaiduTtsConfig::from_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(BaiduTtsConfig::from_standard(&mk("wss://baidu-proxy.example.com")).is_err());
     }
 
     #[test]

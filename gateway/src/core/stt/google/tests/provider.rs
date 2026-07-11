@@ -11,7 +11,7 @@ fn test_google_stt_default() {
     assert!(stt.config.is_none());
     assert!(!stt.is_ready());
     assert!(stt.audio_sender.is_none());
-    assert!(stt.shutdown_tx.is_none());
+    assert!(stt.shutdown_token.is_none());
     assert!(stt.result_tx.is_none());
     assert!(stt.connection_handle.is_none());
     assert!(stt.result_forward_handle.is_none());
@@ -115,7 +115,7 @@ const TEST_SERVICE_ACCOUNT_JSON: &str = r#"{
 // provider-specific config — previously dropped by the flat factory path.
 #[tokio::test]
 async fn new_standard_unlocks_features_and_project_id() {
-    use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+    use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
     let mut extras = serde_json::Map::new();
     extras.insert("project_id".into(), serde_json::json!("proj-xyz"));
     let std = StandardSTTConfig {
@@ -145,6 +145,68 @@ async fn new_standard_unlocks_features_and_project_id() {
         ..Default::default()
     });
     assert!(GoogleSTT::new_standard(&bad).is_err());
+}
+
+#[tokio::test]
+async fn test_new_standard_rejects_ssrf_endpoint_override() {
+    use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+    let _guard = crate::core::net::test_env_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+    // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+    unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+    let mk = |endpoint: &str| {
+        let mut extras = serde_json::Map::new();
+        extras.insert("project_id".into(), serde_json::json!("proj-xyz"));
+        StandardSTTConfig {
+            base: STTConfig {
+                provider: "google".into(),
+                api_key: TEST_SERVICE_ACCOUNT_JSON.into(),
+                language: "en-US".into(),
+                sample_rate: 16000,
+                ..Default::default()
+            },
+            features: SttFeatures::default(),
+            extras: ProviderExtras(extras),
+            translation: None,
+        }
+        .with_endpoint_override(endpoint)
+    };
+
+    assert!(GoogleSTT::new_standard(&mk("https://google-stt-proxy.example.com")).is_ok());
+    assert!(GoogleSTT::new_standard(&mk("http://127.0.0.1:9000")).is_err());
+    assert!(GoogleSTT::new_standard(&mk("file:///tmp/socket")).is_err());
+    assert!(GoogleSTT::new_standard(&mk("ws://google-stt-proxy.example.com")).is_err());
+
+    // SAFETY: restore the process env before releasing the test env lock.
+    unsafe {
+        if let Some(previous) = previous {
+            std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+        } else {
+            std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        }
+    }
+}
+
+#[test]
+fn google_speech_grpc_endpoint_trims_endpoint_override() {
+    let config = GoogleSTTConfig::default();
+    assert_eq!(
+        super::super::provider::google_speech_grpc_endpoint(&config),
+        "https://speech.googleapis.com"
+    );
+
+    let config = GoogleSTTConfig {
+        endpoint_override: Some(" https://google-stt-proxy.example.com ".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        super::super::provider::google_speech_grpc_endpoint(&config),
+        "https://google-stt-proxy.example.com"
+    );
 }
 
 #[test]

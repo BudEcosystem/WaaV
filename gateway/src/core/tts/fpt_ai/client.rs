@@ -43,7 +43,7 @@ pub struct FptTts {
     /// Provider configuration.
     config: FptTtsConfig,
     /// HTTP client for REST API calls.
-    http_client: Client,
+    http_client: Option<Client>,
     /// Whether the client is ready to receive requests.
     is_ready: AtomicBool,
     /// Audio callback for streaming audio to caller.
@@ -52,17 +52,33 @@ pub struct FptTts {
     connection_state: Arc<RwLock<ConnectionState>>,
 }
 
+fn fpt_tts_http_client(timeout_secs: u64) -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+}
+
+fn default_fpt_tts_http_client() -> Option<Client> {
+    match fpt_tts_http_client(super::config::DEFAULT_REQUEST_TIMEOUT) {
+        Ok(client) => Some(client),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to create default FPT TTS HTTP client; default instance is inert until rebuilt with a valid config"
+            );
+            None
+        }
+    }
+}
+
 impl FptTts {
     /// Build an `FptTts` from an already-resolved provider config (shared by `new` and
     /// `from_standard`).
     fn from_fpt_config(fpt_config: FptTtsConfig) -> TTSResult<Self> {
         let timeout_secs = fpt_config.request_timeout_secs;
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| {
-                TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
-            })?;
+        let http_client = fpt_tts_http_client(timeout_secs).map_err(|e| {
+            TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         info!(
             "FPT TTS: Initialized with voice='{}', speed={}, format={}",
@@ -73,7 +89,7 @@ impl FptTts {
 
         Ok(Self {
             config: fpt_config,
-            http_client,
+            http_client: Some(http_client),
             is_ready: AtomicBool::new(false),
             audio_callback: Arc::new(RwLock::new(None)),
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
@@ -85,9 +101,7 @@ impl FptTts {
     /// and the provider-specific `callback_url` extra are mapped by [`FptTtsConfig::from_standard`]
     /// and reach the live synthesis headers. Pitch/volume/stability/emotion/instructions/SSML/
     /// language/word-timestamp/seed/sample-rate have no FPT.AI parameter and are skipped.
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let fpt_config = FptTtsConfig::from_standard(std)?;
         Self::from_fpt_config(fpt_config)
     }
@@ -109,8 +123,13 @@ impl FptTts {
         );
 
         // Step 1: Request audio URL
-        let mut request_builder = self
-            .http_client
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            TTSError::InvalidConfiguration(
+                "FPT TTS default HTTP client is unavailable; construct with FptTts::new or from_standard".to_string(),
+            )
+        })?;
+
+        let mut request_builder = http_client
             .post(crate::core::tts::standard::override_rest_endpoint(
                 FPT_TTS_ENDPOINT,
                 self.config.endpoint_override.as_deref(),
@@ -210,6 +229,7 @@ impl FptTts {
 
     /// Download audio from URL with retry logic for async processing.
     async fn download_audio_with_retry(&self, url: &str) -> TTSResult<Vec<u8>> {
+        let url = crate::core::tts::standard::validate_provider_audio_url("FPT.AI TTS", url)?;
         let mut last_error = None;
 
         for attempt in 1..=MAX_DOWNLOAD_RETRIES {
@@ -248,8 +268,17 @@ impl FptTts {
 
     /// Try to download audio from URL once.
     async fn try_download_audio(&self, url: &str) -> TTSResult<Vec<u8>> {
-        let audio_response = self
-            .http_client
+        let audio_client = crate::core::net::ssrf_protected_client_builder(
+            crate::core::tts::standard::PROVIDER_AUDIO_URL_SCHEMES,
+        )
+        .timeout(std::time::Duration::from_secs(
+            self.config.request_timeout_secs,
+        ))
+        .build()
+        .map_err(|e| {
+            TTSError::NetworkError(format!("Failed to create SSRF-protected audio client: {e}"))
+        })?;
+        let audio_response = audio_client
             .get(url)
             .send()
             .await
@@ -303,7 +332,7 @@ impl Default for FptTts {
     fn default() -> Self {
         Self {
             config: FptTtsConfig::default(),
-            http_client: Client::new(),
+            http_client: default_fpt_tts_http_client(),
             is_ready: AtomicBool::new(false),
             audio_callback: Arc::new(RwLock::new(None)),
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
@@ -552,6 +581,53 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn fpt_tts_redirect_policy_rejects_private_hop() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let tts = FptTts::new(make_test_config()).expect("construct FPT TTS");
+        let err = tts
+            .http_client
+            .as_ref()
+            .expect("strict constructor builds an HTTP client")
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(err) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&err.to_string());
+            source = err.source();
+        }
+        assert!(error_chain.contains("SSRF protection"), "{error_chain}");
+    }
+
     // W1 keystone (struct-level, mirrors DeepgramTTS::from_standard): the standardized `speed`
     // feature and `callback_url` extra reach the live `FptTts` config through the provider STRUCT's
     // `from_standard` — the path the dispatch helper constructs.
@@ -628,6 +704,24 @@ mod tests {
     fn test_default_state() {
         let tts = FptTts::default();
         assert!(!tts.is_ready());
+    }
+
+    #[tokio::test]
+    async fn default_without_http_client_returns_typed_error_without_panic() {
+        let mut tts = FptTts::default();
+        tts.http_client = None;
+
+        let err = tts
+            .synthesize("Xin chao")
+            .await
+            .expect_err("inert default client must fail with a typed error");
+
+        match err {
+            TTSError::InvalidConfiguration(msg) => {
+                assert!(msg.contains("default HTTP client"), "{msg}");
+            }
+            other => panic!("expected InvalidConfiguration, got {other:?}"),
+        }
     }
 
     #[test]

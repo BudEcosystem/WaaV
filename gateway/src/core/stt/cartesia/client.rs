@@ -26,10 +26,12 @@ use futures::{SinkExt, StreamExt};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::config::CartesiaSTTConfig;
-use super::messages::CartesiaMessage;
+use super::messages::{CartesiaCommand, CartesiaMessage};
+use crate::core::resilience::connect::{WS_CONNECT_TIMEOUT, with_timeout};
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
@@ -52,6 +54,11 @@ const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
 /// The concrete WebSocket stream type Cartesia dials.
 type CartesiaWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
+enum CartesiaOutbound {
+    Audio(Bytes),
+    Command(CartesiaCommand),
+}
+
 /// A [`WsTransport`] that adapts Cartesia's streaming event loop to the generic
 /// [`ReconnectableStream`] supervisor (W-D1 fleet adoption). Like ElevenLabs, Cartesia carries
 /// every feature (model, encoding, sample rate, endpointing, language, auth) in the connect URL,
@@ -61,14 +68,27 @@ type CartesiaWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 struct CartesiaTransport {
     ws_sink: SplitSink<CartesiaWs, Message>,
     ws_stream: SplitStream<CartesiaWs>,
-    /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
-    audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
-    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
-    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    /// Shared outbound receiver (single-consumer; locked for the duration of `run`).
+    outbound_rx: Arc<Mutex<mpsc::Receiver<CartesiaOutbound>>>,
+    /// Shared shutdown token (fires once; an intentional close must not reconnect).
+    shutdown_token: CancellationToken,
     result_tx: mpsc::Sender<STTResult>,
     error_tx: mpsc::Sender<STTError>,
     /// Fires once on the first successful connect, unblocking `start_connection`.
     connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+impl CartesiaTransport {
+    async fn send_done(ws_sink: &mut SplitSink<CartesiaWs, Message>) {
+        let done_message = Message::Text(
+            serde_json::to_string(&CartesiaCommand::Done)
+                .unwrap_or_else(|_| "\"done\"".to_string())
+                .into(),
+        );
+        if let Err(e) = ws_sink.send(done_message).await {
+            warn!("Failed to send done command: {}", e);
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -83,20 +103,47 @@ impl WsTransport for CartesiaTransport {
     }
 
     async fn run(&mut self) -> ReconnectOutcome {
-        let mut audio_rx = self.audio_rx.lock().await;
-        let mut shutdown_rx = self.shutdown_rx.lock().await;
+        let mut outbound_rx = self.outbound_rx.lock().await;
+        let shutdown_token = self.shutdown_token.clone();
         loop {
+            if shutdown_token.is_cancelled() {
+                info!("Received shutdown signal for Cartesia STT");
+                Self::send_done(&mut self.ws_sink).await;
+                return ReconnectOutcome::Completed;
+            }
+
             tokio::select! {
-                // Handle outgoing audio data
-                Some(audio_data) = audio_rx.recv() => {
-                    // Send audio as raw binary (NOT base64 encoded)
-                    if let Err(e) = self.ws_sink.send(Message::Binary(audio_data)).await {
+                // Handle outgoing audio data and control commands.
+                Some(outbound) = outbound_rx.recv() => {
+                    let send_result = match outbound {
+                        CartesiaOutbound::Audio(audio_data) => {
+                            // Send audio as raw binary (NOT base64 encoded).
+                            self.ws_sink.send(Message::Binary(audio_data)).await
+                        }
+                        CartesiaOutbound::Command(command) => {
+                            let command_name = format!("{command:?}");
+                            match serde_json::to_string(&command) {
+                                Ok(json) => self.ws_sink.send(Message::Text(json.into())).await,
+                                Err(e) => {
+                                    let stt_error = STTError::ProviderError(format!(
+                                        "Failed to serialize Cartesia command {command_name}: {e}"
+                                    ));
+                                    error!("{}", stt_error);
+                                    let _ = self.error_tx.try_send(stt_error);
+                                    return ReconnectOutcome::Fatal(StreamError::new(
+                                        "command serialization failed",
+                                    ));
+                                }
+                            }
+                        }
+                    };
+                    if let Err(e) = send_result {
                         let stt_error = STTError::NetworkError(format!(
                             "Failed to send WebSocket message: {e}"
                         ));
                         error!("{}", stt_error);
                         let _ = self.error_tx.try_send(stt_error);
-                        return ReconnectOutcome::Reconnectable(StreamError::new("audio send failed"));
+                        return ReconnectOutcome::Reconnectable(StreamError::new("websocket send failed"));
                     }
                 }
 
@@ -147,13 +194,9 @@ impl WsTransport for CartesiaTransport {
                 }
 
                 // Handle shutdown signal (intentional close — must NOT reconnect)
-                _ = &mut *shutdown_rx => {
+                _ = shutdown_token.cancelled() => {
                     info!("Received shutdown signal for Cartesia STT");
-                    // Send "done" command to gracefully close the session
-                    let done_message = Message::Text("\"done\"".into());
-                    if let Err(e) = self.ws_sink.send(done_message).await {
-                        warn!("Failed to send done command: {}", e);
-                    }
+                    Self::send_done(&mut self.ws_sink).await;
                     return ReconnectOutcome::Completed;
                 }
             }
@@ -252,14 +295,14 @@ pub struct CartesiaSTT {
     /// State change notification.
     state_notify: Arc<Notify>,
 
-    /// WebSocket sender for audio data (bounded channel for backpressure).
-    ws_sender: Option<mpsc::Sender<Bytes>>,
+    /// WebSocket sender for audio data and control commands (bounded channel for backpressure).
+    ws_sender: Option<mpsc::Sender<CartesiaOutbound>>,
 
-    /// Shutdown signal sender.
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Shutdown signal token.
+    shutdown_token: Option<CancellationToken>,
 
     /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
-    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// `connect()`, set in `disconnect()` before cancelling `shutdown_token`, so a client close racing a
     /// server-side close can never trigger a spurious reconnect.
     intentional_disconnect: Arc<AtomicBool>,
 
@@ -315,8 +358,11 @@ impl CartesiaSTT {
         }
         // `Self` implements `Drop`, so the struct-update (`..Default::default()`) move is illegal;
         // start from the Default value and overwrite only the config.
+        let cartesia_config = CartesiaSTTConfig::from_standard(std);
+        cartesia_config.validate()?;
+
         let mut stt = Self::default();
-        stt.config = Some(CartesiaSTTConfig::from_standard(std));
+        stt.config = Some(cartesia_config);
         Ok(stt)
     }
 
@@ -404,8 +450,8 @@ impl CartesiaSTT {
         let ws_url = config.build_websocket_url(&config.base.api_key);
 
         // Create channels for communication (bounded for backpressure on audio)
-        let (ws_tx, ws_rx) = mpsc::channel::<Bytes>(32);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (ws_tx, ws_rx) = mpsc::channel::<CartesiaOutbound>(32);
+        let shutdown_token = CancellationToken::new();
         // Bounded channels for backpressure - 256 should handle bursts while preventing memory exhaustion
         let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
         let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
@@ -413,15 +459,14 @@ impl CartesiaSTT {
 
         // Store channels
         self.ws_sender = Some(ws_tx);
-        self.shutdown_tx = Some(shutdown_tx);
+        self.shutdown_token = Some(shutdown_token.clone());
         self.result_tx = Some(result_tx.clone());
         self.error_tx = Some(error_tx.clone());
 
         // Shared state the supervised transport re-uses across reconnect attempts: a single-
-        // consumer audio receiver + shutdown oneshot (locked per `run`) and the one-shot connected
+        // consumer outbound receiver + shutdown token and the one-shot connected
         // signal that fires on the first successful connect.
-        let audio_rx = Arc::new(Mutex::new(ws_rx));
-        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
+        let outbound_rx = Arc::new(Mutex::new(ws_rx));
         let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
 
         // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor (the
@@ -449,22 +494,31 @@ impl CartesiaSTT {
             let exit = supervisor
                 .run(|| {
                     let ws_url = ws_url.clone();
-                    let audio_rx = Arc::clone(&audio_rx);
-                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let outbound_rx = Arc::clone(&outbound_rx);
+                    let shutdown_token = shutdown_token.clone();
                     let connected_tx = Arc::clone(&connected_tx);
                     let result_tx = result_tx.clone();
                     let error_tx = error_tx.clone();
                     async move {
-                        let (ws_stream, _) = connect_async(&ws_url).await.map_err(|e| {
-                            StreamError::new(format!("Failed to connect to Cartesia: {e}"))
-                        })?;
+                        let (ws_stream, _) =
+                            with_timeout(WS_CONNECT_TIMEOUT, connect_async(&ws_url))
+                                .await
+                                .map_err(|_| {
+                                    StreamError::new(format!(
+                                        "connect to Cartesia timed out after {}s",
+                                        WS_CONNECT_TIMEOUT.as_secs()
+                                    ))
+                                })?
+                                .map_err(|e| {
+                                    StreamError::new(format!("Failed to connect to Cartesia: {e}"))
+                                })?;
                         info!("Connected to Cartesia WebSocket");
                         let (ws_sink, ws_stream) = ws_stream.split();
                         Ok(CartesiaTransport {
                             ws_sink,
                             ws_stream,
-                            audio_rx,
-                            shutdown_rx,
+                            outbound_rx,
+                            shutdown_token,
                             result_tx,
                             error_tx,
                             connected_tx,
@@ -535,14 +589,6 @@ impl CartesiaSTT {
         }
     }
 
-    /// Send a finalize command to flush buffered audio.
-    ///
-    /// This triggers Cartesia to finalize any pending transcription
-    /// without closing the connection.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if the command was sent, or an error if not connected.
     #[allow(dead_code)]
     pub async fn finalize(&mut self) -> Result<(), STTError> {
         if !self.is_ready() {
@@ -551,16 +597,13 @@ impl CartesiaSTT {
             ));
         }
 
-        // The finalize command is sent as a text message
-        // We'll send it through a separate channel or directly
-        // For now, we can use the ws_sender with a special marker
-        // But since ws_sender only accepts Bytes (audio), we need
-        // to handle this differently.
-        //
-        // Note: In a full implementation, we might want a separate
-        // command channel. For now, this is left as a TODO for
-        // advanced use cases.
-        warn!("finalize() is not yet fully implemented - consider disconnecting and reconnecting");
+        let ws_sender = self.ws_sender.as_ref().ok_or_else(|| {
+            STTError::ConnectionFailed("Not connected to Cartesia STT".to_string())
+        })?;
+        ws_sender
+            .send(CartesiaOutbound::Command(CartesiaCommand::Finalize))
+            .await
+            .map_err(|e| STTError::NetworkError(format!("Failed to send finalize command: {e}")))?;
         Ok(())
     }
 }
@@ -572,7 +615,7 @@ impl Default for CartesiaSTT {
             state: ConnectionState::Disconnected,
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
             result_tx: None,
             error_tx: None,
@@ -611,7 +654,7 @@ impl BaseSTT for CartesiaSTT {
             state: ConnectionState::Disconnected,
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
             result_tx: None,
             error_tx: None,
@@ -640,25 +683,36 @@ impl BaseSTT for CartesiaSTT {
         self.intentional_disconnect.store(true, Ordering::SeqCst);
 
         // Send shutdown signal
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
 
         // Wait for connection task to finish with timeout
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "cartesia-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         // Clean up result forwarding task
         if let Some(handle) = self.result_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task(
+                "cartesia-stt-result-forwarder",
+                handle,
+            )
+            .await;
         }
 
         // Clean up error forwarding task
         if let Some(handle) = self.error_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task(
+                "cartesia-stt-error-forwarder",
+                handle,
+            )
+            .await;
         }
 
         // Clean up channels and callbacks
@@ -692,7 +746,7 @@ impl BaseSTT for CartesiaSTT {
 
             // Zero-copy - Bytes passed directly to WebSocket
             ws_sender
-                .send(audio_data)
+                .send(CartesiaOutbound::Audio(audio_data))
                 .await
                 .map_err(|e| STTError::NetworkError(format!("Failed to send audio data: {e}")))?;
 
@@ -756,9 +810,7 @@ impl CartesiaSTT {
     /// The shared circuit breaker this session feeds into the generic supervisor, if the
     /// process-global resilience handles have been injected (W-D1/W-D2). Two `CartesiaSTT` built
     /// from the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
-    pub fn resilience_breaker(
-        &self,
-    ) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
         self.resilience.as_ref().map(|r| &r.breaker)
     }
 }
@@ -769,9 +821,10 @@ impl CartesiaSTT {
 
 impl Drop for CartesiaSTT {
     fn drop(&mut self) {
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
         // Send shutdown signal if still connected
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
 
         // Abort any running tasks
@@ -799,7 +852,7 @@ mod tests {
     // new_standard onto the stored provider config (ms -> seconds); the flat factory path drops it.
     #[test]
     fn new_standard_carries_endpointing_to_config() {
-        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "cartesia".into(),
@@ -825,6 +878,44 @@ mod tests {
             ..Default::default()
         });
         assert!(CartesiaSTT::new_standard(&bad).is_err());
+    }
+
+    #[test]
+    fn new_standard_rejects_ssrf_endpoint_override() {
+        use crate::core::stt::standard::StandardSTTConfig;
+
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mk = |endpoint: &str| {
+            StandardSTTConfig::from_base(STTConfig {
+                provider: "cartesia".into(),
+                api_key: "test_key".into(),
+                language: "en".into(),
+                sample_rate: 16000,
+                encoding: "pcm_s16le".into(),
+                model: "ink-whisper".into(),
+                ..Default::default()
+            })
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(CartesiaSTT::new_standard(&mk("wss://cartesia-proxy.example.com")).is_ok());
+        assert!(CartesiaSTT::new_standard(&mk("ws://127.0.0.1:9000")).is_err());
+        assert!(CartesiaSTT::new_standard(&mk("file:///tmp/socket")).is_err());
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
     use tokio::time::Duration;
 

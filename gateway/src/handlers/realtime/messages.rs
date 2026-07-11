@@ -340,6 +340,91 @@ pub enum RealtimeMessageRoute {
     Close,
 }
 
+/// Delivery class for outbound realtime WebSocket messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealtimeMessageClass {
+    /// Realtime audio egress. Stale audio is worthless if the client is not
+    /// reading, so a full channel drops the frame immediately.
+    DroppableAudio,
+    /// Transcript-bearing events. These can wait briefly for the client but must
+    /// not wedge provider callback tasks indefinitely.
+    Transcript,
+    /// Errors, lifecycle, function-call, speech-event and close messages.
+    Critical,
+}
+
+impl RealtimeMessageRoute {
+    fn class(&self) -> RealtimeMessageClass {
+        match self {
+            Self::Audio(_) => RealtimeMessageClass::DroppableAudio,
+            Self::Outgoing(RealtimeOutgoingMessage::Transcript { .. }) => {
+                RealtimeMessageClass::Transcript
+            }
+            Self::Outgoing(_) | Self::Close => RealtimeMessageClass::Critical,
+        }
+    }
+}
+
+/// Send a realtime route under its delivery policy.
+///
+/// This mirrors the voice WebSocket `send_with_policy` behavior for the
+/// realtime endpoint's route type: audio is shed on full queues, transcripts
+/// wait a bounded window, and critical messages apply backpressure.
+pub async fn send_realtime_with_policy(
+    tx: &tokio::sync::mpsc::Sender<RealtimeMessageRoute>,
+    route: RealtimeMessageRoute,
+) {
+    use tokio::sync::mpsc::error::{SendTimeoutError, TrySendError};
+
+    match route.class() {
+        RealtimeMessageClass::DroppableAudio => match tx.try_send(route) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                metrics::counter!(
+                    crate::handlers::ws::messages::WS_DROPPED_FRAMES_TOTAL,
+                    "class" => "realtime_audio"
+                )
+                .increment(1);
+                tracing::debug!("Realtime WS egress channel full; dropped droppable audio frame");
+            }
+            Err(TrySendError::Closed(_)) => {
+                tracing::debug!("Realtime WS egress channel closed; dropped audio frame");
+            }
+        },
+        RealtimeMessageClass::Transcript => {
+            match tx
+                .send_timeout(
+                    route,
+                    crate::handlers::ws::messages::TRANSCRIPT_SEND_TIMEOUT,
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(SendTimeoutError::Timeout(_)) => {
+                    metrics::counter!(
+                        crate::handlers::ws::messages::WS_DROPPED_FRAMES_TOTAL,
+                        "class" => "realtime_transcript"
+                    )
+                    .increment(1);
+                    tracing::warn!(
+                        timeout_ms = crate::handlers::ws::messages::TRANSCRIPT_SEND_TIMEOUT
+                            .as_millis() as u64,
+                        "Realtime WS egress channel full beyond transcript timeout; dropped transcript"
+                    );
+                }
+                Err(SendTimeoutError::Closed(_)) => {
+                    tracing::debug!("Realtime WS egress channel closed; dropped transcript");
+                }
+            }
+        }
+        RealtimeMessageClass::Critical => {
+            if tx.send(route).await.is_err() {
+                tracing::warn!("Realtime WS egress channel closed; critical message not delivered");
+            }
+        }
+    }
+}
+
 // =============================================================================
 // Validation
 // =============================================================================
@@ -584,5 +669,121 @@ mod tests {
             }
             _ => panic!("Expected Config variant"),
         }
+    }
+
+    use tokio::sync::mpsc;
+
+    fn full_realtime_channel() -> (
+        mpsc::Sender<RealtimeMessageRoute>,
+        mpsc::Receiver<RealtimeMessageRoute>,
+    ) {
+        let (tx, rx) = mpsc::channel::<RealtimeMessageRoute>(1);
+        tx.try_send(RealtimeMessageRoute::Audio(Bytes::from_static(b"prefill")))
+            .expect("capacity-1 channel accepts the first message");
+        (tx, rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn p5_realtime_send_policy_drops_audio_on_full_channel() {
+        let (tx, mut rx) = full_realtime_channel();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            send_realtime_with_policy(
+                &tx,
+                RealtimeMessageRoute::Audio(Bytes::from_static(b"dropped")),
+            ),
+        )
+        .await
+        .expect("droppable realtime audio must not block on a full channel");
+
+        match rx.try_recv().expect("prefill frame present") {
+            RealtimeMessageRoute::Audio(b) => assert_eq!(b.as_ref(), b"prefill"),
+            _ => panic!("expected prefill audio frame"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "dropped realtime audio must not be delivered"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn p5_realtime_send_policy_transcript_times_out_on_full_channel() {
+        let (tx, mut rx) = full_realtime_channel();
+
+        let start = tokio::time::Instant::now();
+        send_realtime_with_policy(
+            &tx,
+            RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Transcript {
+                text: "hello".to_string(),
+                role: "assistant".to_string(),
+                is_final: true,
+            }),
+        )
+        .await;
+
+        assert!(
+            start.elapsed() >= crate::handlers::ws::messages::TRANSCRIPT_SEND_TIMEOUT,
+            "realtime transcript send must wait the bounded window before dropping"
+        );
+        match rx.try_recv().expect("prefill frame present") {
+            RealtimeMessageRoute::Audio(b) => assert_eq!(b.as_ref(), b"prefill"),
+            _ => panic!("expected prefill audio frame"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "timed-out realtime transcript must not be delivered"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn p5_realtime_send_policy_critical_waits_for_capacity() {
+        let (tx, mut rx) = full_realtime_channel();
+
+        let reader = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let first = rx.recv().await;
+            (rx, first)
+        });
+
+        send_realtime_with_policy(
+            &tx,
+            RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                code: Some("critical".to_string()),
+                message: "deliver me".to_string(),
+            }),
+        )
+        .await;
+
+        let (mut rx, first) = reader.await.expect("reader task");
+        assert!(matches!(first, Some(RealtimeMessageRoute::Audio(_))));
+        match rx.recv().await.expect("critical message delivered") {
+            RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error { message, .. }) => {
+                assert_eq!(message, "deliver me");
+            }
+            _ => panic!("expected critical error message"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn p5_realtime_send_policy_survives_closed_channel() {
+        let (tx, rx) = mpsc::channel::<RealtimeMessageRoute>(1);
+        drop(rx);
+
+        send_realtime_with_policy(
+            &tx,
+            RealtimeMessageRoute::Audio(Bytes::from_static(b"audio")),
+        )
+        .await;
+        send_realtime_with_policy(
+            &tx,
+            RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Transcript {
+                text: "gone".to_string(),
+                role: "user".to_string(),
+                is_final: false,
+            }),
+        )
+        .await;
+        send_realtime_with_policy(&tx, RealtimeMessageRoute::Close).await;
     }
 }

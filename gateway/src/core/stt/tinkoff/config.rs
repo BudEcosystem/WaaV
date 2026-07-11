@@ -113,15 +113,22 @@ fn value_as_f32(v: &serde_json::Value) -> Option<f32> {
 }
 
 /// Read a string-valued `ProviderExtras` key.
-fn extras_str(
-    std: &crate::core::stt::standard::StandardSTTConfig,
-    key: &str,
-) -> Option<String> {
+fn extras_str(std: &crate::core::stt::standard::StandardSTTConfig, key: &str) -> Option<String> {
     std.extras
         .0
         .get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+fn validate_tinkoff_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|e| format!("{source} rejected (SSRF protection): {e}"))
 }
 
 impl Default for TinkoffSttConfig {
@@ -210,17 +217,17 @@ impl TinkoffSttConfig {
             if !phrases.is_empty() {
                 cfg.speech_contexts.push(SpeechContextConfig {
                     phrases,
-                    speech_context_dictionary_id: extras_str(
-                        std,
-                        "speech_context_dictionary_id",
-                    ),
+                    speech_context_dictionary_id: extras_str(std, "speech_context_dictionary_id"),
                 });
             }
         }
 
         // ---- ProviderExtras passthrough ----
         let extras = &std.extras.0;
-        if let Some(v) = extras.get("interim_results_config.interval").and_then(value_as_f32) {
+        if let Some(v) = extras
+            .get("interim_results_config.interval")
+            .and_then(value_as_f32)
+        {
             cfg.interim_results_interval = Some(v);
         }
         if let Some(b) = extras.get("do_not_perform_vad").and_then(|v| v.as_bool()) {
@@ -246,6 +253,9 @@ impl TinkoffSttConfig {
         }
 
         cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        if let Some(endpoint) = cfg.endpoint_override.as_deref() {
+            validate_tinkoff_stt_endpoint("endpoint_override", endpoint)?;
+        }
 
         Ok(cfg)
     }
@@ -321,6 +331,10 @@ impl TinkoffSttConfig {
                 "Unsupported sample rate: {}. Supported: {:?}",
                 self.base.sample_rate, SUPPORTED_SAMPLE_RATES
             ));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_tinkoff_stt_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -459,7 +473,7 @@ mod tests {
     // at the provider default rather than silently mapping to an unrelated field.
     #[test]
     fn from_standard_maps_features() {
-        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "tinkoff".into(),
@@ -557,6 +571,54 @@ mod tests {
     }
 
     #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = TinkoffSttConfig {
+            api_key: "test-key".to_string(),
+            secret_key: "test-secret".to_string(),
+            endpoint_override: Some("https://tinkoff-proxy.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://tinkoff-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("grpc://tinkoff-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP tonic endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
+    }
+
+    #[test]
     fn test_vad_config_default() {
         let vad = VadConfig::default();
         assert_eq!(vad.min_speech_duration, 0.0);
@@ -572,11 +634,17 @@ mod tests {
     // wire-level test via `create_streaming_config(..).encode()`.)
     #[test]
     fn from_standard_maps_new_features_onto_config() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let mut extras = serde_json::Map::new();
-        extras.insert("interim_results_config.interval".into(), serde_json::json!(0.3));
+        extras.insert(
+            "interim_results_config.interval".into(),
+            serde_json::json!(0.3),
+        );
         extras.insert("do_not_perform_vad".into(), serde_json::json!(true));
-        extras.insert("enable_gender_identification".into(), serde_json::json!(true));
+        extras.insert(
+            "enable_gender_identification".into(),
+            serde_json::json!(true),
+        );
         extras.insert("vad_config.silence_max".into(), serde_json::json!(1.5));
         extras.insert("vad_config.silence_min".into(), serde_json::json!(0.2));
         extras.insert(
@@ -610,10 +678,15 @@ mod tests {
         assert_eq!(cfg.speech_contexts[0].phrases.len(), 2);
         assert_eq!(cfg.speech_contexts[0].phrases[0].text, "Тинькофф");
         assert_eq!(
-            cfg.speech_contexts[0].speech_context_dictionary_id.as_deref(),
+            cfg.speech_contexts[0]
+                .speech_context_dictionary_id
+                .as_deref(),
             Some("dict-7")
         );
-        let vad = cfg.vad_config.as_ref().expect("vad config built from extras");
+        let vad = cfg
+            .vad_config
+            .as_ref()
+            .expect("vad config built from extras");
         assert_eq!(vad.silence_max, 1.5);
         assert_eq!(vad.silence_min, 0.2);
     }

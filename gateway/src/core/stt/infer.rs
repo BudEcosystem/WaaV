@@ -129,7 +129,10 @@ mod tests {
     #[test]
     fn constructs_and_reports_provider_info() {
         let stt = InferSTT::new(infer_config()).expect("infer STT constructs");
-        assert_eq!(stt.get_provider_info(), "waav-infer (self-hosted cascade STT)");
+        assert_eq!(
+            stt.get_provider_info(),
+            "waav-infer (self-hosted cascade STT)"
+        );
         assert_eq!(
             stt.get_config().map(|c| c.model.as_str()),
             Some("parakeet-tdt")

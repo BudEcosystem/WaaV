@@ -259,9 +259,9 @@ impl utoipa::PartialSchema for ProviderExtras {
                     "Open provider-specific passthrough (string→JSON value map). \
                      Keys not modeled by the typed feature vocabulary are forwarded verbatim.",
                 ))
-                .additional_properties(Some(utoipa::openapi::schema::AdditionalProperties::FreeForm(
-                    true,
-                )))
+                .additional_properties(Some(
+                    utoipa::openapi::schema::AdditionalProperties::FreeForm(true),
+                ))
                 .build()
                 .into(),
         )
@@ -363,6 +363,23 @@ impl From<STTConfig> for StandardSTTConfig {
     }
 }
 
+fn validate_standard_endpoint_override(
+    override_base: Option<&str>,
+) -> Result<(), super::base::STTError> {
+    let Some(base) = override_base else {
+        return Ok(());
+    };
+    let base = base.trim();
+    if base.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(base, &["http", "https", "ws", "wss"]).map_err(|msg| {
+        super::base::STTError::ConfigurationError(format!(
+            "endpoint_override rejected (SSRF protection): {msg}"
+        ))
+    })
+}
+
 /// Create an STT provider from the standardized config (the reachable W1 keystone path).
 ///
 /// For providers that implement `from_standard`, advanced features (diarization, keyterms,
@@ -374,12 +391,18 @@ pub fn create_stt_standard(
     provider: &str,
     config: StandardSTTConfig,
 ) -> Result<Box<dyn super::base::BaseSTT>, super::base::STTError> {
+    validate_standard_endpoint_override(config.endpoint_override())?;
+
     match provider.to_lowercase().as_str() {
-        "deepgram" => Ok(Box::new(super::deepgram::DeepgramSTT::new_standard(&config)?)),
+        "deepgram" => Ok(Box::new(super::deepgram::DeepgramSTT::new_standard(
+            &config,
+        )?)),
         "alibaba-cloud" | "alibaba_cloud" => Ok(Box::new(
             super::alibaba_cloud::DashScopeStt::new_standard(&config)?,
         )),
-        "amivoice" => Ok(Box::new(super::amivoice::AmiVoiceSTT::new_standard(&config)?)),
+        "amivoice" => Ok(Box::new(super::amivoice::AmiVoiceSTT::new_standard(
+            &config,
+        )?)),
         "assemblyai" => Ok(Box::new(super::assemblyai::AssemblyAISTT::new_standard(
             &config,
         )?)),
@@ -413,9 +436,11 @@ pub fn create_stt_standard(
         "iflytek" | "ifly" | "xfyun" | "xunfei" | "科大讯飞" | "讯飞" => {
             Ok(Box::new(super::iflytek::IFlytekStt::new_standard(&config)?))
         }
-        "naver-clova" | "naver_clova" | "naverclova" | "naver" | "clova" | "csr" | "네이버" => Ok(
-            Box::new(super::naver_clova::NaverClovaStt::new_standard(&config)?),
-        ),
+        "naver-clova" | "naver_clova" | "naverclova" | "naver" | "clova" | "csr" | "네이버" => {
+            Ok(Box::new(super::naver_clova::NaverClovaStt::new_standard(
+                &config,
+            )?))
+        }
         "nectec" | "aiforthai" | "ai4thai" | "partii" | "partii5" | "partii4" => {
             Ok(Box::new(super::nectec::NectecStt::new_standard(&config)?))
         }
@@ -429,16 +454,16 @@ pub fn create_stt_standard(
         "revai" | "rev-ai" | "rev_ai" | "rev.ai" => {
             Ok(Box::new(super::revai::RevAISTT::new_standard(&config)?))
         }
-        "reverie" | "reverie-ai" | "reverie_ai" | "reverie-stt" | "reverieinc" => Ok(Box::new(
-            super::reverie::ReverieSTT::new_standard(&config)?,
-        )),
+        "reverie" | "reverie-ai" | "reverie_ai" | "reverie-stt" | "reverieinc" => {
+            Ok(Box::new(super::reverie::ReverieSTT::new_standard(&config)?))
+        }
         "sarvam" => Ok(Box::new(super::sarvam::SarvamSTT::new_standard(&config)?)),
         "sberdevices" | "sber_devices" | "sber" | "salutespeech" | "salute_speech" => Ok(Box::new(
             super::sberdevices::SberDevicesSTT::new_standard(&config)?,
         )),
-        "speechmatics" => Ok(Box::new(super::speechmatics::SpeechmaticsSTT::new_standard(
-            &config,
-        )?)),
+        "speechmatics" => Ok(Box::new(
+            super::speechmatics::SpeechmaticsSTT::new_standard(&config)?,
+        )),
         "tencent" | "tencent-cloud" | "tencent_cloud" | "tencentcloud" | "腾讯" | "腾讯云" => {
             Ok(Box::new(super::tencent::TencentStt::new_standard(&config)?))
         }
@@ -516,9 +541,21 @@ mod tests {
         let f = SttFeatures::default();
         for (semantic, providers, present) in [
             ("keyterms", 4, f.keyterms.is_some() || f.keyterms.is_none()),
-            ("alternatives", 3, f.alternatives.is_some() || f.alternatives.is_none()),
-            ("filler_words", 3, f.filler_words.is_some() || f.filler_words.is_none()),
-            ("diarization", 3, f.diarization.is_some() || f.diarization.is_none()),
+            (
+                "alternatives",
+                3,
+                f.alternatives.is_some() || f.alternatives.is_none(),
+            ),
+            (
+                "filler_words",
+                3,
+                f.filler_words.is_some() || f.filler_words.is_none(),
+            ),
+            (
+                "diarization",
+                3,
+                f.diarization.is_some() || f.diarization.is_none(),
+            ),
             (
                 "profanity_filter",
                 3,
@@ -590,6 +627,47 @@ mod tests {
             ..Default::default()
         });
         assert!(create_stt_standard("deepgram", bad).is_err());
+    }
+
+    #[test]
+    fn create_stt_standard_rejects_endpoint_override_ssrf_targets() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mk = |endpoint: &str| {
+            StandardSTTConfig {
+                base: STTConfig {
+                    provider: "deepgram".into(),
+                    model: "nova-3".into(),
+                    api_key: "k".into(),
+                    ..Default::default()
+                },
+                features: SttFeatures::default(),
+                extras: ProviderExtras::default(),
+                translation: None,
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(
+            create_stt_standard("deepgram", mk("wss://stt-proxy.invalid")).is_ok(),
+            "public WSS proxy override should remain supported"
+        );
+
+        let err = match create_stt_standard("deepgram", mk("http://127.0.0.1:9000")) {
+            Ok(_) => panic!("loopback endpoint_override must be rejected"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SSRF protection"),
+            "error names SSRF guard: {msg}"
+        );
+
+        let err = match create_stt_standard("deepgram", mk("file:///tmp/socket")) {
+            Ok(_) => panic!("non-HTTP/WS endpoint_override must be rejected"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("scheme"), "error names scheme contract: {msg}");
     }
 
     #[test]
@@ -690,7 +768,8 @@ mod tests {
         assert_eq!(warns.len(), 1);
         assert!(warns[0].contains("at most 5"));
         assert_eq!(
-            t.target_iso639_1(Some(SPEECHMATICS_MAX_TRANSLATION_TARGETS)).len(),
+            t.target_iso639_1(Some(SPEECHMATICS_MAX_TRANSLATION_TARGETS))
+                .len(),
             5
         );
     }
@@ -732,9 +811,7 @@ mod tests {
             ..Default::default()
         };
         // AssemblyAI translation is batch-only → streaming warns (no 400), batch is clean.
-        assert!(
-            t.warnings_for("assemblyai", true)[0].contains("streaming mode")
-        );
+        assert!(t.warnings_for("assemblyai", true)[0].contains("streaming mode"));
         assert!(t.warnings_for("assemblyai", false).is_empty());
     }
 

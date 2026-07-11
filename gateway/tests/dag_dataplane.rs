@@ -20,15 +20,18 @@
 
 #![cfg(feature = "dag-routing")]
 
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::{Json, Router, routing::post};
 use bytes::Bytes;
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use waav_gateway::{
@@ -42,6 +45,47 @@ use waav_gateway::{
     routes,
     state::AppState,
 };
+
+struct TestServer {
+    label: &'static str,
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        if self.panicked.load(Ordering::SeqCst) {
+            let msg = format!("dag_dataplane server '{}' panicked", self.label);
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+}
+
+fn spawn_test_server<F>(label: &'static str, future: F) -> TestServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let panicked = Arc::new(AtomicBool::new(false));
+    let panicked_in_task = Arc::clone(&panicked);
+    let handle = tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked_in_task.store(true, Ordering::SeqCst);
+            eprintln!("dag_dataplane server '{label}' panicked");
+        }
+    });
+    TestServer {
+        label,
+        handle,
+        panicked,
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Mock STT provider: on the first audio frame, fire a final/speech-final transcript.
@@ -83,10 +127,11 @@ impl BaseSTT for MockStt {
             .fired
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
-            && let Some(cb) = &self.callback {
-                let result = STTResult::new("hello agent".to_string(), true, true, 0.99);
-                cb(result).await;
-            }
+            && let Some(cb) = &self.callback
+        {
+            let result = STTResult::new("hello agent".to_string(), true, true, 0.99);
+            cb(result).await;
+        }
         Ok(())
     }
 
@@ -180,22 +225,18 @@ fn register_mock_providers() {
     let registry = global_registry();
     registry.register_stt(
         "mock-stt",
-        Arc::new(|config: STTConfig| {
-            MockStt::new(config).map(|s| Box::new(s) as Box<dyn BaseSTT>)
-        }),
+        Arc::new(|config: STTConfig| MockStt::new(config).map(|s| Box::new(s) as Box<dyn BaseSTT>)),
         ProviderMetadata::stt("mock-stt", "Mock STT"),
     );
     registry.register_tts(
         "mock-tts",
-        Arc::new(|config: TTSConfig| {
-            MockTts::new(config).map(|t| Box::new(t) as Box<dyn BaseTTS>)
-        }),
+        Arc::new(|config: TTSConfig| MockTts::new(config).map(|t| Box::new(t) as Box<dyn BaseTTS>)),
         ProviderMetadata::tts("mock-tts", "Mock TTS"),
     );
 }
 
 /// Start a tiny OpenAI-compatible chat-completions mock. Returns its base URL.
-async fn start_llm_mock() -> String {
+async fn start_llm_mock() -> (String, TestServer) {
     async fn chat(Json(_req): Json<Value>) -> Json<Value> {
         Json(json!({
             "id": "chatcmpl-mock",
@@ -214,10 +255,10 @@ async fn start_llm_mock() -> String {
     let app = Router::new().route("/chat/completions", post(chat));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let server = spawn_test_server("llm_mock", async move {
         axum::serve(listener, app).await.unwrap();
     });
-    format!("http://127.0.0.1:{}", addr.port())
+    (format!("http://127.0.0.1:{}", addr.port()), server)
 }
 
 fn test_server_config() -> ServerConfig {
@@ -299,7 +340,7 @@ async fn dag_session_transcribes_and_speaks() {
     }
 
     register_mock_providers();
-    let llm_base = start_llm_mock().await;
+    let (llm_base, _llm_server) = start_llm_mock().await;
 
     let config = test_server_config();
     let app_state = AppState::new(config.clone()).await;
@@ -314,7 +355,7 @@ async fn dag_session_transcribes_and_speaks() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _gateway_server = spawn_test_server("gateway_mock", async move {
         axum::serve(listener, app).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -387,9 +428,7 @@ async fn dag_session_transcribes_and_speaks() {
     // Wait for the ready message (boot complete).
     let mut ready = false;
     for _ in 0..50 {
-        if let Ok(Some(Ok(msg))) =
-            tokio::time::timeout(Duration::from_secs(5), read.next()).await
-        {
+        if let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_secs(5), read.next()).await {
             if let Message::Text(text) = &msg {
                 let parsed: Value = serde_json::from_str(text).unwrap();
                 match parsed["type"].as_str() {
@@ -398,7 +437,10 @@ async fn dag_session_transcribes_and_speaks() {
                         break;
                     }
                     Some("error") => {
-                        panic!("Gateway returned error during DAG boot: {}", parsed["message"]);
+                        panic!(
+                            "Gateway returned error during DAG boot: {}",
+                            parsed["message"]
+                        );
                     }
                     _ => {}
                 }
@@ -407,7 +449,10 @@ async fn dag_session_transcribes_and_speaks() {
             break;
         }
     }
-    assert!(ready, "Gateway never sent a ready message for the DAG session");
+    assert!(
+        ready,
+        "Gateway never sent a ready message for the DAG session"
+    );
 
     // Stream a single audio frame; the mock STT will produce a finalized turn.
     let audio_frame = vec![0u8; 3200]; // 100ms of 16kHz/16-bit mono silence

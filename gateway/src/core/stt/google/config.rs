@@ -2,6 +2,16 @@ use std::time::Duration;
 
 use crate::core::stt::base::STTConfig;
 
+fn validate_google_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|e| format!("{source} rejected (SSRF protection): {e}"))
+}
+
 /// A single transcript-normalization replacement entry (Google v2
 /// `TranscriptNormalization.Entry`): replace `search` with `replace`, optionally case-sensitive.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -175,7 +185,10 @@ impl GoogleSTTConfig {
             cfg.adaptation_phrases = k.clone();
         }
         // --- Provider-extras passthrough (no shared SttFeatures field) -------------------------
-        if let Some(b) = ex.get("enable_spoken_punctuation").and_then(|v| v.as_bool()) {
+        if let Some(b) = ex
+            .get("enable_spoken_punctuation")
+            .and_then(|v| v.as_bool())
+        {
             cfg.enable_spoken_punctuation = b;
         }
         if let Some(b) = ex.get("enable_spoken_emojis").and_then(|v| v.as_bool()) {
@@ -185,13 +198,23 @@ impl GoogleSTTConfig {
             cfg.enable_word_confidence = b;
         }
         // transcript_normalization: array of {search, replace, case_sensitive}.
-        if let Some(arr) = ex.get("transcript_normalization").and_then(|v| v.as_array()) {
+        if let Some(arr) = ex
+            .get("transcript_normalization")
+            .and_then(|v| v.as_array())
+        {
             cfg.transcript_normalization = arr
                 .iter()
                 .filter_map(|e| serde_json::from_value::<TranscriptNormEntry>(e.clone()).ok())
                 .collect();
         }
         cfg
+    }
+
+    pub(crate) fn validate_endpoint_override(&self) -> Result<(), String> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_google_stt_endpoint("endpoint_override", endpoint)?;
+        }
+        Ok(())
     }
 
     pub fn recognizer_path(&self) -> String {
@@ -252,7 +275,7 @@ mod tests {
     // event flags, and the non-standard `project_id` is read from the provider_extras passthrough.
     #[test]
     fn from_standard_maps_features() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let mut extras = serde_json::Map::new();
         extras.insert("project_id".into(), serde_json::json!("proj-123"));
         let std = StandardSTTConfig {
@@ -272,5 +295,54 @@ mod tests {
         assert!(!cfg.interim_results);
         assert!(!cfg.enable_voice_activity_events);
         assert_eq!(cfg.project_id, "proj-123"); // from provider_extras passthrough
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = GoogleSTTConfig {
+            endpoint_override: Some("https://google-stt-proxy.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate_endpoint_override().is_ok());
+
+        config.endpoint_override = Some("http://google-stt-proxy.example.com".to_string());
+        assert!(config.validate_endpoint_override().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("ws://google-stt-proxy.example.com".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("WebSocket endpoint_override must be rejected for Google STT gRPC");
+        assert!(err.contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("   ".to_string());
+        assert!(config.validate_endpoint_override().is_ok());
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 }

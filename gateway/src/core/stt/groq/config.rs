@@ -49,6 +49,29 @@ pub const DEFAULT_MODEL: &str = "whisper-large-v3-turbo";
 /// Maximum prompt length in tokens.
 pub const MAX_PROMPT_TOKENS: usize = 224;
 
+fn validate_groq_http_url(source: &str, url: &str) -> Result<(), String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(format!("{source} must not be empty"));
+    }
+    crate::core::net::validate_url_for_ssrf(url, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
+fn validate_groq_audio_source_url(source: &str, url: &str) -> Result<(), String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(format!("{source} must not be empty"));
+    }
+    if url
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+    {
+        return Ok(());
+    }
+    validate_groq_http_url(source, url)
+}
+
 /// Minimum audio length in seconds (below this, 10 second minimum is billed).
 pub const MIN_BILLED_DURATION_SECONDS: f32 = 10.0;
 
@@ -532,8 +555,7 @@ impl GroqSTTConfig {
                 .timestamp_granularities
                 .contains(&TimestampGranularity::Word)
             {
-                cfg.timestamp_granularities
-                    .push(TimestampGranularity::Word);
+                cfg.timestamp_granularities.push(TimestampGranularity::Word);
             }
         }
         // Audio source by URL / Base64 data-URL → `url` form field (extras passthrough).
@@ -541,7 +563,7 @@ impl GroqSTTConfig {
         // vocabulary has no analog (Groq has no streaming WS STT endpoint), so this rides the
         // open `extras` passthrough rather than a typed feature.
         if let Some(url) = std.extras.0.get("url").and_then(|v| v.as_str()) {
-            cfg.audio_url = Some(url.to_string());
+            cfg.audio_url = Some(url.trim().to_string());
         }
         cfg
     }
@@ -564,7 +586,7 @@ impl GroqSTTConfig {
 
         // Remote audio source: emit `url` instead of an uploaded `file` part.
         if let Some(ref url) = self.audio_url {
-            fields.push(("url".to_string(), url.clone()));
+            fields.push(("url".to_string(), url.trim().to_string()));
         }
 
         if !self.base.language.is_empty() {
@@ -631,6 +653,16 @@ impl GroqSTTConfig {
             ));
         }
 
+        if let Some(custom_endpoint) = self.custom_endpoint.as_deref() {
+            validate_groq_http_url("custom_endpoint", custom_endpoint)?;
+        }
+        if let Some(endpoint_override) = self.endpoint_override.as_deref() {
+            validate_groq_http_url("endpoint_override", endpoint_override)?;
+        }
+        if let Some(audio_url) = self.audio_url.as_deref() {
+            validate_groq_audio_source_url("audio_url", audio_url)?;
+        }
+
         if let Some(ref prompt) = self.prompt {
             // Token estimation is language-dependent:
             // - English: ~4 chars per token (words avg 4-5 chars + spaces)
@@ -689,7 +721,7 @@ mod tests {
     // feature it can express — word-level timestamps — and otherwise delegates to `from_base`.
     #[test]
     fn from_standard_maps_word_timestamps() {
-        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "groq".into(),
@@ -707,9 +739,10 @@ mod tests {
         let cfg = GroqSTTConfig::from_standard(&std);
         // The one mappable feature reaches its field.
         assert_eq!(cfg.response_format, GroqResponseFormat::VerboseJson);
-        assert!(cfg
-            .timestamp_granularities
-            .contains(&TimestampGranularity::Word));
+        assert!(
+            cfg.timestamp_granularities
+                .contains(&TimestampGranularity::Word)
+        );
         // Base carried through via from_base.
         assert_eq!(cfg.base.api_key, "gsk_test");
         assert_eq!(cfg.model, GroqSTTModel::WhisperLargeV3);
@@ -877,6 +910,48 @@ mod tests {
 
         config.custom_endpoint = Some("https://custom.endpoint.com".to_string());
         assert_eq!(config.api_url(), "https://custom.endpoint.com");
+    }
+
+    #[test]
+    fn test_config_rejects_ssrf_endpoint_targets() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = GroqSTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            custom_endpoint: Some("http://127.0.0.1:8089/openai/v1/audio/transcriptions".into()),
+            ..Default::default()
+        };
+        let msg = config
+            .validate()
+            .expect_err("loopback custom_endpoint must be rejected");
+        assert!(
+            msg.contains("SSRF protection"),
+            "error names SSRF guard: {msg}"
+        );
+
+        config.custom_endpoint = Some("file:///tmp/socket".into());
+        let msg = config
+            .validate()
+            .expect_err("non-HTTP custom_endpoint must be rejected");
+        assert!(msg.contains("scheme"), "error names scheme contract: {msg}");
+
+        config.custom_endpoint = None;
+        config.endpoint_override = Some("http://127.0.0.1:8089".into());
+        let msg = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(
+            msg.contains("SSRF protection"),
+            "error names SSRF guard: {msg}"
+        );
+
+        config.endpoint_override = Some("ws://groq-proxy.invalid".into());
+        let msg = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(msg.contains("scheme"), "error names scheme contract: {msg}");
     }
 
     #[test]

@@ -20,6 +20,17 @@
 use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 
+fn validate_tencent_tts_endpoint(source: &str, endpoint: &str) -> Result<(), TTSError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}")),
+    )
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -596,6 +607,10 @@ impl TencentTtsConfig {
             )));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_tencent_tts_endpoint("endpoint_override", endpoint)?;
+        }
+
         Ok(())
     }
 
@@ -738,7 +753,12 @@ impl TencentTtsConfig {
         {
             cfg.emotion_intensity = Some(intensity.clamp(0, 200));
         }
-        if let Some(lang) = std.extras.0.get("primary_language").and_then(|v| v.as_i64()) {
+        if let Some(lang) = std
+            .extras
+            .0
+            .get("primary_language")
+            .and_then(|v| v.as_i64())
+        {
             cfg.primary_language = Some(lang);
         }
         if let Some(region) = std.extras.0.get("region").and_then(|v| v.as_str()) {
@@ -748,12 +768,7 @@ impl TencentTtsConfig {
         if let Some(model_type) = std.extras.0.get("ModelType").and_then(|v| v.as_i64()) {
             cfg.model_type = Some(model_type);
         }
-        if let Some(fast_voice_type) = std
-            .extras
-            .0
-            .get("FastVoiceType")
-            .and_then(|v| v.as_str())
-        {
+        if let Some(fast_voice_type) = std.extras.0.get("FastVoiceType").and_then(|v| v.as_str()) {
             cfg.fast_voice_type = Some(fast_voice_type.to_string());
         }
         if let Some(segment_rate) = std.extras.0.get("SegmentRate").and_then(|v| v.as_i64()) {
@@ -834,6 +849,42 @@ mod tests {
         assert_eq!(cfg.model_type, Some(1));
         assert_eq!(cfg.fast_voice_type, Some("clone-voice-42".to_string()));
         assert_eq!(cfg.segment_rate, Some(2));
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = TencentTtsConfig::new("secret_id", "secret_key");
+
+        config.endpoint_override = Some("https://tencent-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://tencent-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected for REST Tencent");
+        assert!(err.to_string().contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "tencent".into(),
+            api_key: "secret_id|secret_key".into(),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        let cfg = TencentTtsConfig::from_standard(&std).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     // =========================================================================

@@ -15,7 +15,11 @@ pub enum ControllerSignal {
     /// the timer/turn-detector's forced) end-of-utterance; `is_finalized` =
     /// the provider explicitly acked a finalize handshake (A-G1) and has
     /// nothing more for this segment.
-    SttFinal { text: String, is_speech_final: bool, is_finalized: bool },
+    SttFinal {
+        text: String,
+        is_speech_final: bool,
+        is_finalized: bool,
+    },
     /// The smart-turn ensemble's verdict, consumed OPAQUE
     /// (`TurnDecisionEngine.is_turn_complete`) — see the module docs for why
     /// no raw probability crosses this boundary.

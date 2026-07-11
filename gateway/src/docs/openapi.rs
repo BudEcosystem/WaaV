@@ -6,7 +6,9 @@
 
 use utoipa::OpenApi;
 
-use crate::core::emotion::{DeliveryStyle, Emotion, EmotionConfig, EmotionIntensity, IntensityLevel};
+use crate::core::emotion::{
+    DeliveryStyle, Emotion, EmotionConfig, EmotionIntensity, IntensityLevel,
+};
 use crate::core::stt::standard::{ProviderExtras, SttFeatures};
 use crate::core::tts::Pronunciation;
 use crate::core::tts::standard::TtsFeatures;

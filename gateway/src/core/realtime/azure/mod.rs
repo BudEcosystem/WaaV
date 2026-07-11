@@ -26,7 +26,9 @@ use crate::core::realtime::base::{
     RealtimeErrorCallback, RealtimeResponseOverride, RealtimeResult, ReconnectionCallback,
     ReplayConversationItem, ResponseDoneCallback, SpeechEventCallback, TranscriptCallback,
 };
-use crate::core::realtime::openai::{OpenAIRealtimeAudioFormat, OpenAIRealtimeModel, OpenAIRealtimeVoice};
+use crate::core::realtime::openai::{
+    OpenAIRealtimeAudioFormat, OpenAIRealtimeModel, OpenAIRealtimeVoice,
+};
 use crate::core::realtime::scaffold::RealtimeSession;
 
 /// Azure OpenAI Realtime client — a newtype over the generic [`RealtimeSession`]
@@ -190,7 +192,10 @@ impl BaseRealtime for AzureRealtime {
         self.0.replay_user_audio_preroll().await
     }
 
-    async fn replay_conversation(&mut self, items: &[ReplayConversationItem]) -> RealtimeResult<()> {
+    async fn replay_conversation(
+        &mut self,
+        items: &[ReplayConversationItem],
+    ) -> RealtimeResult<()> {
         self.0.replay_conversation(items).await
     }
 }

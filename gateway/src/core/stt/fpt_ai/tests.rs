@@ -69,7 +69,7 @@ fn test_new_empty_api_key() {
 // through to the provider-specific config unchanged — even when advanced features are requested.
 #[test]
 fn new_standard_carries_base_through() {
-    use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+    use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
     let std = StandardSTTConfig {
         base: STTConfig {
             provider: "fpt_ai".into(),

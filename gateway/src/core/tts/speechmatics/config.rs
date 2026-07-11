@@ -8,6 +8,17 @@ use std::str::FromStr;
 
 use crate::core::tts::base::{TTSConfig, TTSError, TTSResult};
 
+fn validate_speechmatics_tts_endpoint(source: &str, endpoint: &str) -> TTSResult<()> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}")),
+    )
+}
+
 // =============================================================================
 // Voice Enum
 // =============================================================================
@@ -171,8 +182,7 @@ impl FromStr for SpeechmaticsOutputFormat {
 // =============================================================================
 
 /// Speechmatics TTS-specific configuration
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SpeechmaticsTtsConfig {
     /// API key for authentication
     pub api_key: String,
@@ -233,17 +243,18 @@ impl SpeechmaticsTtsConfig {
                     .to_string(),
             ));
         }
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_speechmatics_tts_endpoint("endpoint_override", endpoint)?;
+        }
         Ok(())
     }
 
     /// Create from base TTSConfig
     pub fn from_base(config: &TTSConfig) -> TTSResult<Self> {
         // Get API key
-        let api_key = if !config.api_key.is_empty() {
-            config.api_key.clone()
-        } else {
-            std::env::var("SPEECHMATICS_API_KEY").unwrap_or_default()
-        };
+        let api_key = crate::core::credentials::explicit_api_key(&config.api_key)
+            .or_else(|| crate::core::credentials::env_api_key("SPEECHMATICS_API_KEY"))
+            .unwrap_or_default();
 
         if api_key.is_empty() {
             return Err(TTSError::InvalidConfiguration(
@@ -294,6 +305,7 @@ impl SpeechmaticsTtsConfig {
     pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let mut cfg = Self::from_base(&std.base)?;
         cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -308,7 +320,6 @@ impl SpeechmaticsTtsConfig {
         Ok(())
     }
 }
-
 
 // =============================================================================
 // Request Types
@@ -541,6 +552,42 @@ mod tests {
     fn test_config_validate_valid() {
         let config = SpeechmaticsTtsConfig::new("test-key");
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = SpeechmaticsTtsConfig::new("test-key");
+
+        config.endpoint_override = Some("https://speechmatics-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://speechmatics-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected for REST Speechmatics");
+        assert!(err.to_string().contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "speechmatics".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("jack".into()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(SpeechmaticsTtsConfig::from_standard(&std).is_err());
     }
 
     #[test]

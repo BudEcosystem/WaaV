@@ -40,10 +40,13 @@ pub async fn create_gnani_channel(config: &GnaniSTTConfig) -> Result<Channel, ST
     // With an endpoint override set (mock e2e), connect PLAINTEXT — no cert is loaded, no TLS.
     // Otherwise use the production cert + TLS path.
     let endpoint = if let Some(ep) = config.endpoint_override.as_deref() {
-        Endpoint::from_shared(ep.to_string())
-            .map_err(|e| STTError::ConfigurationError(format!("Invalid endpoint override: {}", e)))?
+        Endpoint::from_shared(ep.to_string()).map_err(|e| {
+            STTError::ConfigurationError(format!("Invalid endpoint override: {}", e))
+        })?
     } else {
-        let cert_pem = config.load_certificate().map_err(STTError::ConfigurationError)?;
+        let cert_pem = config
+            .load_certificate()
+            .map_err(STTError::ConfigurationError)?;
         let tls_config = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(&cert_pem))
             .domain_name("asr.gnani.ai");
@@ -153,8 +156,8 @@ impl GnaniGrpcClient {
         );
 
         // Create metadata
-        let metadata =
-            create_gnani_metadata(&self.config).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let metadata = create_gnani_metadata(&self.config)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         // Create the gRPC request with metadata
         let mut request = Request::new(request_stream);
@@ -564,8 +567,14 @@ mod tests {
     fn wire_sensitive_and_filename_absent_by_default() {
         // Defaults must NOT add the optional headers (no accidental always-on wiring).
         let md = create_gnani_metadata(&base_cfg()).expect("metadata");
-        assert!(md.get("sensitive").is_none(), "sensitive must be omitted by default");
-        assert!(md.get("filename").is_none(), "filename must be omitted by default");
+        assert!(
+            md.get("sensitive").is_none(),
+            "sensitive must be omitted by default"
+        );
+        assert!(
+            md.get("filename").is_none(),
+            "filename must be omitted by default"
+        );
     }
 
     #[test]
@@ -592,7 +601,10 @@ mod tests {
         };
         let cfg = GnaniSTTConfig::from_standard(&std).expect("from_standard");
         let md = create_gnani_metadata(&cfg).expect("metadata");
-        assert_eq!(md.get("sensitive").map(|v| v.to_str().unwrap()), Some("true"));
+        assert_eq!(
+            md.get("sensitive").map(|v| v.to_str().unwrap()),
+            Some("true")
+        );
         assert_eq!(
             md.get("filename").map(|v| v.to_str().unwrap()),
             Some("debug.wav")

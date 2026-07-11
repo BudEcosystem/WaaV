@@ -9,9 +9,13 @@
 //! `connect_spec`.
 
 use super::super::openai::protocol::OpenAiProtocol;
-use crate::core::realtime::base::{RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult, ReplayConversationItem};
+use crate::core::realtime::base::{
+    RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult, ReplayConversationItem,
+};
 use crate::core::realtime::openai::ClientEvent;
-use crate::core::realtime::scaffold::{ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol, S2sEvent};
+use crate::core::realtime::scaffold::{
+    ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol, S2sEvent,
+};
 
 /// Azure OpenAI Realtime GA endpoint path. WaaV sends the OpenAI **GA** wire
 /// (the nested `session.update` etc.), and Microsoft's docs state the GA message
@@ -285,7 +289,9 @@ mod tests {
         let names: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
         assert!(names.contains(&"api-key"));
         assert!(
-            !names.iter().any(|n| n.eq_ignore_ascii_case("Authorization")),
+            !names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case("Authorization")),
             "Azure uses api-key, not Authorization: Bearer"
         );
         let api_key = headers
@@ -324,7 +330,8 @@ mod tests {
             realtime_endpoint_override: Some("ws://127.0.0.1:9002/azure".into()),
             ..base_cfg()
         };
-        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap() else {
+        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap()
+        else {
             panic!("expected WebSocket")
         };
         assert_eq!(url, "ws://127.0.0.1:9002/azure");

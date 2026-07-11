@@ -14,7 +14,11 @@ pub struct ElevenLabsLanguageMapper;
 fn model_honors_language(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
     // Empty model == provider default (which is a v2.5-capable multilingual model) → assume honored.
-    m.is_empty() || m.contains("v2_5") || m.contains("v2.5") || m.contains("turbo") || m.contains("flash")
+    m.is_empty()
+        || m.contains("v2_5")
+        || m.contains("v2.5")
+        || m.contains("turbo")
+        || m.contains("flash")
 }
 
 impl LanguageMapper for ElevenLabsLanguageMapper {
@@ -62,9 +66,18 @@ mod tests {
     fn elevenlabs_downgrades_to_iso639_1() {
         let m = ElevenLabsLanguageMapper;
         // en-US -> "en" (region dropped) — the headline downgrade case.
-        assert_eq!(m.map(CanonicalLanguage::EnUs, "eleven_turbo_v2_5").native, "en");
-        assert_eq!(m.map(CanonicalLanguage::EsEs, "eleven_turbo_v2_5").native, "es");
-        assert_eq!(m.map(CanonicalLanguage::CmnCn, "eleven_turbo_v2_5").native, "zh");
+        assert_eq!(
+            m.map(CanonicalLanguage::EnUs, "eleven_turbo_v2_5").native,
+            "en"
+        );
+        assert_eq!(
+            m.map(CanonicalLanguage::EsEs, "eleven_turbo_v2_5").native,
+            "es"
+        );
+        assert_eq!(
+            m.map(CanonicalLanguage::CmnCn, "eleven_turbo_v2_5").native,
+            "zh"
+        );
     }
 
     #[test]
@@ -72,7 +85,10 @@ mod tests {
         let m = ElevenLabsLanguageMapper;
         let r = m.map(CanonicalLanguage::EnUs, "eleven_multilingual_v2");
         assert_eq!(r.native, "en");
-        assert!(r.has_warnings(), "non-v2.5 model must warn it ignores language");
+        assert!(
+            r.has_warnings(),
+            "non-v2.5 model must warn it ignores language"
+        );
     }
 
     #[test]
@@ -91,6 +107,10 @@ mod tests {
 
     #[test]
     fn elevenlabs_auto_omits() {
-        assert!(ElevenLabsLanguageMapper.map(CanonicalLanguage::Auto, "").omit);
+        assert!(
+            ElevenLabsLanguageMapper
+                .map(CanonicalLanguage::Auto, "")
+                .omit
+        );
     }
 }

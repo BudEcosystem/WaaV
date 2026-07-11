@@ -343,7 +343,7 @@ impl ElevenLabsTTS {
         };
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             request_builder,
         })
     }
@@ -383,9 +383,7 @@ impl ElevenLabsTTS {
     /// `use_pvc_as_ivc` all change the produced audio. ElevenLabs uses the generic [`TTSProvider`],
     /// whose cache key is computed externally (`voice_manager`) — there is no per-provider config
     /// hash to extend in this file. (`enable_logging` is a retention/policy flag, not audio-changing.)
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let voice_settings = VoiceSettings::from_standard(std);
         let mut base = std.base.clone();
         // Honor an explicit features.sample_rate (the output-format derivation reads
@@ -411,7 +409,10 @@ impl ElevenLabsTTS {
             Self::extract_request_ids(extras.get("previous_request_ids"));
         tts.request_builder.next_request_ids =
             Self::extract_request_ids(extras.get("next_request_ids"));
-        if let Some(s) = extras.get("apply_text_normalization").and_then(|v| v.as_str()) {
+        if let Some(s) = extras
+            .get("apply_text_normalization")
+            .and_then(|v| v.as_str())
+        {
             tts.request_builder.apply_text_normalization = Some(s.to_string());
         }
         if let Some(b) = extras
@@ -453,7 +454,30 @@ impl ElevenLabsTTS {
 
 impl Default for ElevenLabsTTS {
     fn default() -> Self {
-        Self::new(TTSConfig::default()).unwrap()
+        let config = TTSConfig {
+            api_key: "__waav_default_elevenlabs_unused__".to_string(),
+            ..TTSConfig::default()
+        };
+        match Self::new(config) {
+            Ok(tts) => tts,
+            Err(_) => Self {
+                provider: TTSProvider::new(),
+                request_builder: ElevenLabsRequestBuilder {
+                    config: TTSConfig::default(),
+                    voice_settings: VoiceSettings::default(),
+                    seed: None,
+                    optimize_streaming_latency: None,
+                    language_code: None,
+                    next_text: None,
+                    previous_request_ids: None,
+                    next_request_ids: None,
+                    apply_text_normalization: None,
+                    apply_language_text_normalization: None,
+                    use_pvc_as_ivc: None,
+                    enable_logging: None,
+                },
+            },
+        }
     }
 }
 
@@ -614,7 +638,10 @@ mod tests {
         assert_eq!(vs.use_speaker_boost, Some(true));
         assert_eq!(vs.speed, Some(1.4));
         // base carried through
-        assert_eq!(tts.request_builder.config.voice_id.as_deref(), Some("test_voice"));
+        assert_eq!(
+            tts.request_builder.config.voice_id.as_deref(),
+            Some("test_voice")
+        );
     }
 
     #[tokio::test]
@@ -637,6 +664,17 @@ mod tests {
         };
         let result = ElevenLabsTTS::new(config);
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn elevenlabs_default_is_disconnected_and_does_not_panic_on_empty_base_config() {
+        let tts = ElevenLabsTTS::default();
+        assert!(!tts.is_ready());
+        assert_eq!(tts.get_connection_state(), ConnectionState::Disconnected);
+        assert!(
+            !tts.request_builder.config.api_key.is_empty(),
+            "Default must not call ElevenLabsTTS::new with the empty base API key"
+        );
     }
 
     #[tokio::test]
@@ -734,7 +772,10 @@ mod tests {
             enable_logging: None,
         };
         let client = reqwest::Client::new();
-        let built_request = builder.build_http_request(&client, "Test text").build().unwrap();
+        let built_request = builder
+            .build_http_request(&client, "Test text")
+            .build()
+            .unwrap();
 
         let body_bytes = built_request.body().and_then(|b| b.as_bytes()).unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(body_bytes).unwrap();
@@ -1086,7 +1127,12 @@ mod tests {
         };
         let client = reqwest::Client::new();
         let built = builder.build_http_request(&client, "x").build().unwrap();
-        assert!(!built.url().to_string().contains("optimize_streaming_latency"));
+        assert!(
+            !built
+                .url()
+                .to_string()
+                .contains("optimize_streaming_latency")
+        );
     }
 
     // ---- WIRE-LEVEL through the STRUCT's from_standard (the dispatch-constructed path) ----------
@@ -1141,7 +1187,10 @@ mod tests {
     async fn from_standard_wires_elevenlabs_extended_features_to_the_wire() {
         use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
         let mut extras = serde_json::Map::new();
-        extras.insert("next_text".into(), serde_json::json!("the following sentence"));
+        extras.insert(
+            "next_text".into(),
+            serde_json::json!("the following sentence"),
+        );
         extras.insert(
             "previous_request_ids".into(),
             serde_json::json!(["req-prev-1", "req-prev-2"]),
@@ -1230,7 +1279,10 @@ mod tests {
             std::str::from_utf8(built.body().and_then(|b| b.as_bytes()).unwrap()).unwrap(),
         )
         .unwrap();
-        assert_eq!(body["previous_request_ids"], serde_json::json!(["only-one"]));
+        assert_eq!(
+            body["previous_request_ids"],
+            serde_json::json!(["only-one"])
+        );
         // Unset extended features are omitted entirely.
         assert!(body.get("language_code").is_none());
         assert!(body.get("next_text").is_none());

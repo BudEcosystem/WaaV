@@ -9,6 +9,15 @@ use std::str::FromStr;
 
 use crate::core::tts::base::TTSConfig;
 
+fn validate_reverie_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Audio Format Enum
 // =============================================================================
@@ -417,6 +426,7 @@ impl ReverieTtsConfig {
             cfg.format = fmt.parse().unwrap_or(cfg.format);
         }
         cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate()?;
 
         Ok(cfg)
     }
@@ -499,6 +509,10 @@ impl ReverieTtsConfig {
                 self.sample_rate,
                 super::SUPPORTED_SAMPLE_RATES
             ));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_reverie_tts_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -683,7 +697,7 @@ mod tests {
                 pitch: Some(2.0),
                 sample_rate: Some(16000),
                 language: Some("en".to_string()),
-                ssml: Some(true), // SSML input mode -> ssml_input (now wired)
+                ssml: Some(true),  // SSML input mode -> ssml_input (now wired)
                 volume: Some(0.5), // capability gap: Reverie has no volume knob, must be ignored
                 ..Default::default()
             },
@@ -696,6 +710,37 @@ mod tests {
         assert_eq!(cfg.speaker.language, "en"); // language override onto speaker
         assert!(cfg.ssml_input); // ssml feature mapped to ssml_input
         assert_eq!(cfg.format, ReverieTtsAudioFormat::Mp3); // from extras passthrough
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = ReverieTtsConfig::from_base(create_test_config()).unwrap();
+
+        config.endpoint_override = Some("https://reverie-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://reverie-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(err.contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(create_test_config())
+            .with_endpoint_override("file:///tmp/socket");
+        assert!(ReverieTtsConfig::from_standard(&std).is_err());
     }
 
     #[test]

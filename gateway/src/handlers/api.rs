@@ -8,6 +8,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::config::utils::parse_bool;
 use crate::core::readiness::{self, ReadinessReport};
 use crate::state::AppState;
 
@@ -61,6 +62,32 @@ pub async fn health_check() -> Result<Json<HealthResponse>, StatusCode> {
     livez().await
 }
 
+fn parse_readiness_skip_network_env() -> Result<bool, String> {
+    match std::env::var("WAAV_READINESS_SKIP_NETWORK") {
+        Ok(value) => parse_bool(&value).ok_or_else(|| {
+            "WAAV_READINESS_SKIP_NETWORK must be one of true/false/1/0/yes/no".to_string()
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("WAAV_READINESS_SKIP_NETWORK must be valid UTF-8".to_string())
+        }
+    }
+}
+
+fn readiness_config_error_report(error: String) -> ReadinessReport {
+    ReadinessReport {
+        status: "not_ready".to_string(),
+        config_loaded: false,
+        providers: vec![readiness::ProviderReadiness {
+            provider: "readiness_config".to_string(),
+            credential_present: false,
+            reachable: None,
+            ready: false,
+            detail: Some(error),
+        }],
+    }
+}
+
 /// Readiness handler (`/readyz`).
 ///
 /// Answers "should this instance receive traffic right now?". Evaluates config + each enabled
@@ -83,10 +110,18 @@ pub async fn health_check() -> Result<Json<HealthResponse>, StatusCode> {
 pub async fn readyz(State(state): State<Arc<AppState>>) -> Response {
     // Reachability probes are blocking (TCP connect with a short timeout); run them off the
     // async runtime worker. Network probing is enabled by default and can be disabled with
-    // WAAV_READINESS_SKIP_NETWORK=1 (credential-only readiness).
-    let skip_network = std::env::var("WAAV_READINESS_SKIP_NETWORK")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    // WAAV_READINESS_SKIP_NETWORK=1/true/yes (credential-only readiness).
+    let skip_network = match parse_readiness_skip_network_env() {
+        Ok(skip_network) => skip_network,
+        Err(e) => {
+            tracing::error!(error = %e, "invalid readiness environment configuration");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(readiness_config_error_report(e)),
+            )
+                .into_response();
+        }
+    };
     let config = state.config.clone();
 
     let report = tokio::task::spawn_blocking(move || readiness::evaluate(&config, !skip_network))
@@ -159,7 +194,9 @@ fn cached_metrics_body(
     ttl: Duration,
     render: impl FnOnce() -> String,
 ) -> String {
-    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some((rendered_at, body)) = guard.as_ref()
         && rendered_at.elapsed() < ttl
     {
@@ -225,7 +262,57 @@ fn metrics_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn cleanup_readiness_env() {
+        unsafe {
+            std::env::remove_var("WAAV_READINESS_SKIP_NETWORK");
+        }
+    }
+
+    // ============== /readyz env parsing ==============
+
+    #[test]
+    #[serial]
+    fn readiness_skip_network_env_defaults_to_false_when_unset() {
+        cleanup_readiness_env();
+        assert!(!parse_readiness_skip_network_env().expect("unset env parses"));
+    }
+
+    #[test]
+    #[serial]
+    fn readiness_skip_network_env_accepts_documented_values() {
+        cleanup_readiness_env();
+        unsafe {
+            std::env::set_var("WAAV_READINESS_SKIP_NETWORK", "yes");
+        }
+        assert!(parse_readiness_skip_network_env().expect("truthy env parses"));
+
+        unsafe {
+            std::env::set_var("WAAV_READINESS_SKIP_NETWORK", "0");
+        }
+        assert!(!parse_readiness_skip_network_env().expect("false env parses"));
+
+        cleanup_readiness_env();
+    }
+
+    #[test]
+    #[serial]
+    fn readiness_skip_network_env_rejects_malformed_value() {
+        cleanup_readiness_env();
+        unsafe {
+            std::env::set_var("WAAV_READINESS_SKIP_NETWORK", "tru");
+        }
+
+        let err = parse_readiness_skip_network_env().expect_err("malformed bool must fail");
+        assert!(
+            err.contains("WAAV_READINESS_SKIP_NETWORK"),
+            "error should name bad env var: {err}"
+        );
+
+        cleanup_readiness_env();
+    }
 
     // ============== /metrics exposition cache (RC8) ==============
 
@@ -280,7 +367,10 @@ mod tests {
     fn metrics_auth_rejects_missing_wrong_or_malformed_credentials() {
         assert!(!metrics_auth_ok(Some("s3cret"), None));
         assert!(!metrics_auth_ok(Some("s3cret"), Some("Bearer wrong")));
-        assert!(!metrics_auth_ok(Some("s3cret"), Some("Bearer s3cret-longer")));
+        assert!(!metrics_auth_ok(
+            Some("s3cret"),
+            Some("Bearer s3cret-longer")
+        ));
         assert!(!metrics_auth_ok(Some("s3cret"), Some("Basic s3cret")));
         assert!(!metrics_auth_ok(Some("s3cret"), Some("s3cret")));
     }

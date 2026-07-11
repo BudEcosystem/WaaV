@@ -227,7 +227,7 @@ mod config_tests {
 
         match result {
             Err(STTError::ConfigurationError(msg)) => {
-                assert!(msg.contains("API key is required"));
+                assert!(msg.contains("API key or access_token is required"));
             }
             _ => panic!("Expected ConfigurationError"),
         }
@@ -822,6 +822,87 @@ mod client_tests {
             Err(STTError::ConnectionFailed(_)) => {}
             _ => panic!("Expected ConnectionFailed error"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_finalize_not_connected() {
+        let config = STTConfig {
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+
+        let mut stt = <CartesiaSTT as BaseSTT>::new(config).unwrap();
+        let result = stt.finalize().await;
+
+        assert!(matches!(result, Err(STTError::ConnectionFailed(_))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_finalize_sends_wire_command() {
+        use crate::core::stt::standard::StandardSTTConfig;
+        use futures::StreamExt;
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+        use tokio_tungstenite::accept_async;
+        use tokio_tungstenite::tungstenite::protocol::Message;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (command_tx, command_rx) = oneshot::channel::<String>();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept mock client");
+            let mut ws = accept_async(stream).await.expect("accept websocket");
+            while let Some(Ok(frame)) = ws.next().await {
+                if let Message::Text(text) = frame {
+                    let _ = command_tx.send(text.to_string());
+                    break;
+                }
+            }
+        });
+
+        let endpoint = format!("ws://127.0.0.1:{port}");
+        let std_cfg = StandardSTTConfig::from_base(STTConfig {
+            provider: "cartesia".into(),
+            api_key: "test_key".into(),
+            language: "en".into(),
+            sample_rate: 16000,
+            encoding: "pcm_s16le".into(),
+            model: "ink-whisper".into(),
+            ..Default::default()
+        })
+        .with_endpoint_override(&endpoint);
+
+        let mut stt = {
+            let _guard = crate::core::net::test_env_lock()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+            unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
+
+            let mut stt = CartesiaSTT::new_standard(&std_cfg).unwrap();
+            stt.connect().await.expect("connect to mock endpoint");
+
+            // SAFETY: restore the process env before releasing the test env lock.
+            unsafe {
+                if let Some(previous) = previous {
+                    std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+                } else {
+                    std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+                }
+            }
+            stt
+        };
+        stt.finalize().await.expect("send finalize command");
+
+        let command = tokio::time::timeout(std::time::Duration::from_secs(2), command_rx)
+            .await
+            .expect("mock should receive a command")
+            .expect("command channel should stay open");
+        assert_eq!(command, "\"finalize\"");
+
+        let _ = stt.disconnect().await;
     }
 
     #[tokio::test]

@@ -305,7 +305,10 @@ mod tests {
         assert!(voices.contains(&OpenAIVoice::Verse));
         assert!(voices.contains(&OpenAIVoice::Marin));
         assert!(voices.contains(&OpenAIVoice::Cedar));
-        assert_eq!(OpenAIVoice::from_str_or_default("cedar"), OpenAIVoice::Cedar);
+        assert_eq!(
+            OpenAIVoice::from_str_or_default("cedar"),
+            OpenAIVoice::Cedar
+        );
     }
 
     #[test]

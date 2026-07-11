@@ -402,19 +402,31 @@ impl GoogleRequestBuilder {
         let mut input = serde_json::Map::new();
         if let Some(markup) = &self.google_config.markup {
             // Markup for HD voices → `input.markup`.
-            input.insert("markup".to_string(), serde_json::Value::String(markup.clone()));
+            input.insert(
+                "markup".to_string(),
+                serde_json::Value::String(markup.clone()),
+            );
         } else if let Some(ms) = &self.google_config.multi_speaker_markup {
             // Multi-speaker dialogue input → `input.multiSpeakerMarkup` (object).
             input.insert("multiSpeakerMarkup".to_string(), ms.clone());
         } else if self.google_config.ssml {
             // SSML input → `input.ssml` instead of `input.text` (typed `ssml` feature).
-            input.insert("ssml".to_string(), serde_json::Value::String(text.to_string()));
+            input.insert(
+                "ssml".to_string(),
+                serde_json::Value::String(text.to_string()),
+            );
         } else {
-            input.insert("text".to_string(), serde_json::Value::String(text.to_string()));
+            input.insert(
+                "text".to_string(),
+                serde_json::Value::String(text.to_string()),
+            );
         }
         // Prompt / system instruction for promptable voices → `input.prompt` (typed `instructions`).
         if let Some(prompt) = &self.google_config.prompt {
-            input.insert("prompt".to_string(), serde_json::Value::String(prompt.clone()));
+            input.insert(
+                "prompt".to_string(),
+                serde_json::Value::String(prompt.clone()),
+            );
         }
         // API-side custom pronunciations → `input.customPronunciations` (object).
         if let Some(cp) = &self.google_config.custom_pronunciations {
@@ -425,7 +437,10 @@ impl GoogleRequestBuilder {
         let mut body = serde_json::Map::new();
         body.insert("input".to_string(), serde_json::Value::Object(input));
         body.insert("voice".to_string(), serde_json::Value::Object(voice));
-        body.insert("audioConfig".to_string(), serde_json::Value::Object(audio_config));
+        body.insert(
+            "audioConfig".to_string(),
+            serde_json::Value::Object(audio_config),
+        );
 
         // Journey low-latency synthesis toggle → `advancedVoiceOptions.lowLatencyJourneySynthesis`.
         // Doc: SynthesizeSpeechRequest.advancedVoiceOptions (AdvancedVoiceOptions).
@@ -501,6 +516,12 @@ struct GoogleTTSResponse {
     /// Base64-encoded audio content
     #[serde(rename = "audioContent")]
     audio_content: String,
+}
+
+fn google_tts_http_client() -> TTSResult<reqwest::Client> {
+    crate::core::net::ssrf_protected_client(crate::core::net::HTTP_URL_SCHEMES).map_err(|e| {
+        TTSError::ConnectionFailed(format!("Failed to create Google TTS HTTP client: {e}"))
+    })
 }
 
 /// Computes a hash of the TTS configuration for cache keying.
@@ -649,11 +670,15 @@ impl GoogleTTS {
             )
         })?;
 
+        // Create Google-specific config from base config and VALIDATE BEFORE building the
+        // auth client: config validation must be pure (google-cloud-auth's token cache needs a
+        // tokio reactor, so constructing it first turns a bad sample_rate into a runtime panic
+        // in sync contexts, and pays OAuth setup for a config that was never valid).
+        let google_config = GoogleTTSConfig::from_base_config(config.clone(), project_id);
+        google_config.validate_sample_rate()?;
+
         // Create auth client for OAuth2 token management
         let auth_client = TTSGoogleAuthClient::new(credential_source)?;
-
-        // Create Google-specific config from base config
-        let google_config = GoogleTTSConfig::from_base_config(config.clone(), project_id);
 
         // Create pronunciation replacer if pronunciations are configured
         let pronunciation_replacer = if !config.pronunciations.is_empty() {
@@ -669,7 +694,7 @@ impl GoogleTTS {
             config,
             google_config,
             auth_client: Arc::new(auth_client),
-            http_client: reqwest::Client::new(),
+            http_client: google_tts_http_client()?,
             req_manager: Arc::new(RwLock::new(None)),
             connected: Arc::new(AtomicBool::new(false)),
             audio_callback: Arc::new(RwLock::new(None)),
@@ -692,9 +717,7 @@ impl GoogleTTS {
     /// `seed`) are skipped (capability gaps).
     ///
     /// [`TtsFeatures`]: crate::core::tts::standard::TtsFeatures
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let f = &std.features;
 
         // Apply base-level feature overrides up front so the credential-derived constructor and the
@@ -711,12 +734,7 @@ impl GoogleTTS {
         // path — no service-account JSON needed), else extract it from the Google Cloud credentials
         // (mirrors `new`), else surface the existing error.
         let credential_source = CredentialSource::from_api_key(&config.api_key);
-        let project_id = match std
-            .extras
-            .0
-            .get("project_id")
-            .and_then(|v| v.as_str())
-        {
+        let project_id = match std.extras.0.get("project_id").and_then(|v| v.as_str()) {
             Some(p) => p.to_string(),
             None => credential_source.extract_project_id().ok_or_else(|| {
                 TTSError::InvalidConfiguration(
@@ -756,6 +774,7 @@ impl GoogleTTS {
             .get("access_token")
             .and_then(|v| v.as_str())
             .map(String::from);
+        google_config.validate_runtime_config()?;
 
         let pronunciation_replacer = if !config.pronunciations.is_empty() {
             Some(PronunciationReplacer::new(&config.pronunciations))
@@ -769,7 +788,7 @@ impl GoogleTTS {
             config,
             google_config,
             auth_client: Arc::new(auth_client),
-            http_client: reqwest::Client::new(),
+            http_client: google_tts_http_client()?,
             req_manager: Arc::new(RwLock::new(None)),
             connected: Arc::new(AtomicBool::new(false)),
             audio_callback: Arc::new(RwLock::new(None)),
@@ -1752,6 +1771,23 @@ mod tests {
         assert!(tts.google_config.prompt.is_none());
     }
 
+    #[tokio::test]
+    async fn from_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "google".into(),
+            api_key: TEST_SERVICE_ACCOUNT_JSON.to_string(),
+            voice_id: Some("en-US-Wavenet-D".to_string()),
+            ..Default::default()
+        })
+        .with_endpoint_override("http://127.0.0.1:9000");
+
+        match GoogleTTS::from_standard(&std) {
+            Ok(_) => panic!("Google provider construction must reject unsafe endpoint_override"),
+            Err(err) => assert!(err.to_string().contains("SSRF protection")),
+        }
+    }
+
     // ===== WIRE-LEVEL tests for the standardized (`from_standard`) path =====
     //
     // These assert the feature value reaches the SERIALIZED `text:synthesize` request body
@@ -1760,7 +1796,10 @@ mod tests {
     // Each builds the body from the `from_standard`-produced `google_config` and inspects both
     // the parsed `audioConfig` and the raw serialized bytes.
 
-    fn std_with(features: crate::core::tts::standard::TtsFeatures, extras: serde_json::Map<String, serde_json::Value>) -> crate::core::tts::standard::StandardTTSConfig {
+    fn std_with(
+        features: crate::core::tts::standard::TtsFeatures,
+        extras: serde_json::Map<String, serde_json::Value>,
+    ) -> crate::core::tts::standard::StandardTTSConfig {
         use crate::core::stt::standard::ProviderExtras;
         use crate::core::tts::standard::StandardTTSConfig;
         StandardTTSConfig {
@@ -1792,7 +1831,10 @@ mod tests {
     async fn wire_from_standard_emits_pitch_in_body() {
         use crate::core::tts::standard::TtsFeatures;
         let std = std_with(
-            TtsFeatures { pitch: Some(7.5), ..Default::default() },
+            TtsFeatures {
+                pitch: Some(7.5),
+                ..Default::default()
+            },
             Default::default(),
         );
         let tts = GoogleTTS::from_standard(&std).unwrap();
@@ -1801,7 +1843,10 @@ mod tests {
         assert_eq!(body["audioConfig"]["pitch"], 7.5);
         // Raw serialized-bytes assertion: the param is actually emitted on the wire.
         let raw = serde_json::to_string(&body).unwrap();
-        assert!(raw.contains("\"pitch\":7.5"), "pitch not in serialized body: {raw}");
+        assert!(
+            raw.contains("\"pitch\":7.5"),
+            "pitch not in serialized body: {raw}"
+        );
     }
 
     // speaking_rate (features.speed -> audioConfig.speakingRate). Doc: AudioConfig.speakingRate,
@@ -1810,14 +1855,20 @@ mod tests {
     async fn wire_from_standard_emits_speaking_rate_in_body() {
         use crate::core::tts::standard::TtsFeatures;
         let std = std_with(
-            TtsFeatures { speed: Some(1.75), ..Default::default() },
+            TtsFeatures {
+                speed: Some(1.75),
+                ..Default::default()
+            },
             Default::default(),
         );
         let tts = GoogleTTS::from_standard(&std).unwrap();
         let body = wire_body(&tts);
         assert_eq!(body["audioConfig"]["speakingRate"], 1.75);
         let raw = serde_json::to_string(&body).unwrap();
-        assert!(raw.contains("\"speakingRate\":1.75"), "speakingRate not in serialized body: {raw}");
+        assert!(
+            raw.contains("\"speakingRate\":1.75"),
+            "speakingRate not in serialized body: {raw}"
+        );
     }
 
     // effects_profile_id (extras["effects_profile_id"] -> audioConfig.effectsProfileId).
@@ -1828,14 +1879,20 @@ mod tests {
         let mut extras = serde_json::Map::new();
         extras.insert(
             "effects_profile_id".into(),
-            serde_json::json!(["headphone-class-device", "small-bluetooth-speaker-class-device"]),
+            serde_json::json!([
+                "headphone-class-device",
+                "small-bluetooth-speaker-class-device"
+            ]),
         );
         let std = std_with(Default::default(), extras);
         let tts = GoogleTTS::from_standard(&std).unwrap();
         let body = wire_body(&tts);
         assert_eq!(
             body["audioConfig"]["effectsProfileId"],
-            serde_json::json!(["headphone-class-device", "small-bluetooth-speaker-class-device"])
+            serde_json::json!([
+                "headphone-class-device",
+                "small-bluetooth-speaker-class-device"
+            ])
         );
         let raw = serde_json::to_string(&body).unwrap();
         assert!(
@@ -1848,7 +1905,10 @@ mod tests {
     #[tokio::test]
     async fn wire_from_standard_emits_effects_profile_id_single_string_in_body() {
         let mut extras = serde_json::Map::new();
-        extras.insert("effects_profile_id".into(), serde_json::json!("telephony-class-application"));
+        extras.insert(
+            "effects_profile_id".into(),
+            serde_json::json!("telephony-class-application"),
+        );
         let std = std_with(Default::default(), extras);
         let tts = GoogleTTS::from_standard(&std).unwrap();
         let body = wire_body(&tts);
@@ -1872,7 +1932,10 @@ mod tests {
         let body = wire_body(&tts);
         assert!(body["audioConfig"].get("effectsProfileId").is_none());
         let raw = serde_json::to_string(&body).unwrap();
-        assert!(!raw.contains("effectsProfileId"), "effectsProfileId should be absent: {raw}");
+        assert!(
+            !raw.contains("effectsProfileId"),
+            "effectsProfileId should be absent: {raw}"
+        );
     }
 
     // ===== WIRE-LEVEL: the 9 newly-wired synthesis features reach the serialized body =====
@@ -1884,14 +1947,26 @@ mod tests {
     #[tokio::test]
     async fn wire_from_standard_emits_input_ssml() {
         use crate::core::tts::standard::TtsFeatures;
-        let std = std_with(TtsFeatures { ssml: Some(true), ..Default::default() }, Default::default());
+        let std = std_with(
+            TtsFeatures {
+                ssml: Some(true),
+                ..Default::default()
+            },
+            Default::default(),
+        );
         let tts = GoogleTTS::from_standard(&std).unwrap();
         let body = wire_body(&tts);
         // The synthesis source is `input.ssml`, NOT `input.text`.
         assert_eq!(body["input"]["ssml"], "wire-text");
-        assert!(body["input"].get("text").is_none(), "must not also emit input.text");
+        assert!(
+            body["input"].get("text").is_none(),
+            "must not also emit input.text"
+        );
         let raw = serde_json::to_string(&body).unwrap();
-        assert!(raw.contains("\"ssml\":\"wire-text\""), "input.ssml not on wire: {raw}");
+        assert!(
+            raw.contains("\"ssml\":\"wire-text\""),
+            "input.ssml not on wire: {raw}"
+        );
     }
 
     // Prompt / system instruction for promptable voices → `input.prompt` (typed `instructions`).
@@ -1899,7 +1974,10 @@ mod tests {
     async fn wire_from_standard_emits_input_prompt() {
         use crate::core::tts::standard::TtsFeatures;
         let std = std_with(
-            TtsFeatures { instructions: Some("Speak like a calm narrator".into()), ..Default::default() },
+            TtsFeatures {
+                instructions: Some("Speak like a calm narrator".into()),
+                ..Default::default()
+            },
             Default::default(),
         );
         let tts = GoogleTTS::from_standard(&std).unwrap();
@@ -1908,7 +1986,10 @@ mod tests {
         // prompt is a sibling of text — both present.
         assert_eq!(body["input"]["text"], "wire-text");
         let raw = serde_json::to_string(&body).unwrap();
-        assert!(raw.contains("\"prompt\":\"Speak like a calm narrator\""), "input.prompt not on wire: {raw}");
+        assert!(
+            raw.contains("\"prompt\":\"Speak like a calm narrator\""),
+            "input.prompt not on wire: {raw}"
+        );
     }
 
     // Voice gender preference → `voice.ssmlGender` (extras).
@@ -1921,18 +2002,27 @@ mod tests {
         let body = wire_body(&tts);
         assert_eq!(body["voice"]["ssmlGender"], "FEMALE");
         let raw = serde_json::to_string(&body).unwrap();
-        assert!(raw.contains("\"ssmlGender\":\"FEMALE\""), "voice.ssmlGender not on wire: {raw}");
+        assert!(
+            raw.contains("\"ssmlGender\":\"FEMALE\""),
+            "voice.ssmlGender not on wire: {raw}"
+        );
     }
 
     // Chirp 3 Instant Custom Voice clone → `voice.voiceClone.voiceCloningKey` (extras).
     #[tokio::test]
     async fn wire_from_standard_emits_voice_clone_key() {
         let mut extras = serde_json::Map::new();
-        extras.insert("voice_cloning_key".into(), serde_json::json!("clone-key-abc123"));
+        extras.insert(
+            "voice_cloning_key".into(),
+            serde_json::json!("clone-key-abc123"),
+        );
         let std = std_with(Default::default(), extras);
         let tts = GoogleTTS::from_standard(&std).unwrap();
         let body = wire_body(&tts);
-        assert_eq!(body["voice"]["voiceClone"]["voiceCloningKey"], "clone-key-abc123");
+        assert_eq!(
+            body["voice"]["voiceClone"]["voiceCloningKey"],
+            "clone-key-abc123"
+        );
         let raw = serde_json::to_string(&body).unwrap();
         assert!(
             raw.contains("\"voiceClone\":{\"voiceCloningKey\":\"clone-key-abc123\"}"),
@@ -1951,7 +2041,10 @@ mod tests {
         let std = std_with(Default::default(), extras);
         let tts = GoogleTTS::from_standard(&std).unwrap();
         let body = wire_body(&tts);
-        assert_eq!(body["voice"]["customVoice"]["model"], "projects/p/locations/us/models/m");
+        assert_eq!(
+            body["voice"]["customVoice"]["model"],
+            "projects/p/locations/us/models/m"
+        );
         assert_eq!(body["voice"]["customVoice"]["reportedUsage"], "REALTIME");
     }
 
@@ -1966,9 +2059,15 @@ mod tests {
         let std = std_with(Default::default(), extras);
         let tts = GoogleTTS::from_standard(&std).unwrap();
         let body = wire_body(&tts);
-        assert_eq!(body["input"]["customPronunciations"]["pronunciations"][0]["phrase"], "WaaV");
+        assert_eq!(
+            body["input"]["customPronunciations"]["pronunciations"][0]["phrase"],
+            "WaaV"
+        );
         let raw = serde_json::to_string(&body).unwrap();
-        assert!(raw.contains("customPronunciations"), "input.customPronunciations not on wire: {raw}");
+        assert!(
+            raw.contains("customPronunciations"),
+            "input.customPronunciations not on wire: {raw}"
+        );
     }
 
     // Markup for HD voices → `input.markup` (extras). Takes precedence over plain text.
@@ -1980,9 +2079,15 @@ mod tests {
         let tts = GoogleTTS::from_standard(&std).unwrap();
         let body = wire_body(&tts);
         assert_eq!(body["input"]["markup"], "Hello [pause] world");
-        assert!(body["input"].get("text").is_none(), "markup must replace text");
+        assert!(
+            body["input"].get("text").is_none(),
+            "markup must replace text"
+        );
         let raw = serde_json::to_string(&body).unwrap();
-        assert!(raw.contains("\"markup\":\"Hello [pause] world\""), "input.markup not on wire: {raw}");
+        assert!(
+            raw.contains("\"markup\":\"Hello [pause] world\""),
+            "input.markup not on wire: {raw}"
+        );
     }
 
     // Multi-speaker dialogue input → `input.multiSpeakerMarkup` (extras, object).
@@ -1996,21 +2101,36 @@ mod tests {
         let std = std_with(Default::default(), extras);
         let tts = GoogleTTS::from_standard(&std).unwrap();
         let body = wire_body(&tts);
-        assert_eq!(body["input"]["multiSpeakerMarkup"]["turns"][0]["speaker"], "R");
-        assert!(body["input"].get("text").is_none(), "multiSpeakerMarkup must replace text");
+        assert_eq!(
+            body["input"]["multiSpeakerMarkup"]["turns"][0]["speaker"],
+            "R"
+        );
+        assert!(
+            body["input"].get("text").is_none(),
+            "multiSpeakerMarkup must replace text"
+        );
         let raw = serde_json::to_string(&body).unwrap();
-        assert!(raw.contains("multiSpeakerMarkup"), "input.multiSpeakerMarkup not on wire: {raw}");
+        assert!(
+            raw.contains("multiSpeakerMarkup"),
+            "input.multiSpeakerMarkup not on wire: {raw}"
+        );
     }
 
     // Journey low-latency synthesis toggle → `advancedVoiceOptions.lowLatencyJourneySynthesis`.
     #[tokio::test]
     async fn wire_from_standard_emits_advanced_voice_options_low_latency() {
         let mut extras = serde_json::Map::new();
-        extras.insert("low_latency_journey_synthesis".into(), serde_json::json!(true));
+        extras.insert(
+            "low_latency_journey_synthesis".into(),
+            serde_json::json!(true),
+        );
         let std = std_with(Default::default(), extras);
         let tts = GoogleTTS::from_standard(&std).unwrap();
         let body = wire_body(&tts);
-        assert_eq!(body["advancedVoiceOptions"]["lowLatencyJourneySynthesis"], true);
+        assert_eq!(
+            body["advancedVoiceOptions"]["lowLatencyJourneySynthesis"],
+            true
+        );
         let raw = serde_json::to_string(&body).unwrap();
         assert!(
             raw.contains("\"advancedVoiceOptions\":{\"lowLatencyJourneySynthesis\":true}"),
@@ -2030,7 +2150,10 @@ mod tests {
             .clone();
 
         let ssml = GoogleTTS::from_standard(&std_with(
-            TtsFeatures { ssml: Some(true), ..Default::default() },
+            TtsFeatures {
+                ssml: Some(true),
+                ..Default::default()
+            },
             Default::default(),
         ))
         .unwrap()
@@ -2047,7 +2170,10 @@ mod tests {
         assert_ne!(plain, gender, "ssmlGender must change the cache key");
 
         let prompt = GoogleTTS::from_standard(&std_with(
-            TtsFeatures { instructions: Some("calm".into()), ..Default::default() },
+            TtsFeatures {
+                instructions: Some("calm".into()),
+                ..Default::default()
+            },
             Default::default(),
         ))
         .unwrap()
@@ -2068,6 +2194,24 @@ mod tests {
 
         let result = GoogleTTS::new(config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_google_tts_creation_rejects_zero_sample_rate_before_streaming_math() {
+        let config = TTSConfig {
+            provider: "google".to_string(),
+            api_key: TEST_SERVICE_ACCOUNT_JSON.to_string(),
+            voice_id: Some("en-US-Wavenet-D".to_string()),
+            audio_format: Some("linear16".to_string()),
+            sample_rate: Some(0),
+            ..Default::default()
+        };
+
+        let err = match GoogleTTS::new(config) {
+            Ok(_) => panic!("constructor must reject zero sample_rate"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("sample_rate"), "{err}");
     }
 
     #[test]

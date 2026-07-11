@@ -4,16 +4,21 @@
 //! helpers for querying connection-related state.
 
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use livekit::prelude::{DataPacketKind, Room, RoomOptions};
 use tracing::{debug, error, info, warn};
 
 use super::{LiveKitClient, LiveKitOperation, RELIABLE_BUFFER_THRESHOLD_BYTES};
 use crate::AppError;
+use crate::core::observability::{abort_and_await_task, await_task_shutdown};
+
+const LIVEKIT_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
 impl LiveKitClient {
     /// Connect to the LiveKit room and bootstrap background workers.
     pub async fn connect(&mut self) -> Result<(), AppError> {
+        Self::validate_audio_config(&self.config)?;
         info!("Connecting to LiveKit room with URL: {}", self.config.url);
 
         match Room::connect(&self.config.url, &self.config.token, RoomOptions::default()).await {
@@ -72,18 +77,26 @@ impl LiveKitClient {
                 })
                 .await;
             // Wait for acknowledgement with timeout
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), ack_rx).await;
+            let _ = tokio::time::timeout(LIVEKIT_SHUTDOWN_GRACE, ack_rx).await;
         }
 
-        // Abort event handler task if running
-        if let Some(handle) = self.event_handler_handle.take() {
-            handle.abort();
+        // Abort and observe event handler task if running
+        let event_handler = self
+            .event_handler_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(handle) = event_handler {
+            let _ = abort_and_await_task("livekit.event_handler", handle).await;
         }
 
-        // Abort active streams
-        let mut streams = self.active_streams.lock().await;
-        for (_participant, handle) in streams.drain() {
-            handle.abort();
+        // Abort active streams without holding the registry lock across awaits.
+        let stream_handles: Vec<_> = {
+            let mut streams = self.active_streams.lock().await;
+            streams.drain().collect()
+        };
+        for (key, handle) in stream_handles {
+            let _ = abort_and_await_task(format!("livekit.audio_stream.{key}"), handle).await;
         }
 
         // Close the room
@@ -94,7 +107,8 @@ impl LiveKitClient {
         // Wait for worker to finish
         if let Some(handle) = self.operation_worker_handle.take() {
             // Worker should exit gracefully after receiving Shutdown
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+            let _ = await_task_shutdown("livekit.operation_worker", handle, LIVEKIT_SHUTDOWN_GRACE)
+                .await;
         }
 
         // Clear the operation queue

@@ -280,10 +280,7 @@ impl RealtimeProtocol for OpenAiProtocol {
                     "Authorization".to_string(),
                     format!("Bearer {}", cfg.api_key),
                 ),
-                (
-                    "Sec-WebSocket-Protocol".to_string(),
-                    "realtime".to_string(),
-                ),
+                ("Sec-WebSocket-Protocol".to_string(), "realtime".to_string()),
             ],
         })
     }
@@ -639,7 +636,10 @@ mod tests {
             "out_of_band ⇒ conversation:none: {oob_json}"
         );
         assert!(oob_json.contains("output_modalities"));
-        assert!(oob_json.contains("verse"), "per-response voice on audio.output");
+        assert!(
+            oob_json.contains("verse"),
+            "per-response voice on audio.output"
+        );
 
         // ── conversation.item.truncate ──
         // GA field names: item_id, content_index:0, audio_end_ms.
@@ -755,11 +755,16 @@ mod tests {
             realtime_endpoint_override: Some("ws://127.0.0.1:9001/x".into()),
             ..base_cfg()
         };
-        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap() else {
+        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap()
+        else {
             panic!("expected WebSocket")
         };
         assert_eq!(url, "ws://127.0.0.1:9001/x");
-        assert!(headers.iter().any(|(k, v)| k == "Authorization" && v == "Bearer k"));
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "Authorization" && v == "Bearer k")
+        );
     }
 
     /// Unset override ⇒ the normal GA host (no behavior change).
@@ -784,7 +789,10 @@ mod tests {
         assert_eq!(evs.len(), 1);
         assert!(matches!(
             evs[0],
-            S2sEvent::Speech(SpeechEvent::Started { audio_start_ms: 120, .. })
+            S2sEvent::Speech(SpeechEvent::Started {
+                audio_start_ms: 120,
+                ..
+            })
         ));
     }
 

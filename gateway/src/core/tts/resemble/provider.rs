@@ -4,13 +4,17 @@
 //! using HTTP streaming for real-time audio synthesis.
 
 use async_trait::async_trait;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use tracing::{debug, info};
 
 use super::RESEMBLE_TTS_STREAM_URL;
 use super::config::{ResembleStreamRequest, ResembleTtsConfig, ResembleVoicesResponse};
 use crate::core::tts::base::{BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult};
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
+
+fn resemble_tts_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES).build()
+}
 
 // =============================================================================
 // Request Builder
@@ -58,15 +62,8 @@ impl TTSRequestBuilder for ResembleRequestBuilder {
         // Build request body
         let request_body = ResembleStreamRequest::from_config(&self.config, text);
 
-        // Build headers
-        // Resemble uses Bearer token authentication
-        let mut headers = HeaderMap::new();
+        // Resemble uses Bearer token authentication.
         let auth_value = format!("Bearer {}", self.config.api_key);
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&auth_value).unwrap_or_else(|_| HeaderValue::from_static("")),
-        );
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         debug!(
             "Resemble AI TTS request: voice_uuid={}, model={}, text_len={}",
@@ -81,7 +78,8 @@ impl TTSRequestBuilder for ResembleRequestBuilder {
                 RESEMBLE_TTS_STREAM_URL,
                 self.config.endpoint_override.as_deref(),
             ))
-            .headers(headers)
+            .header(AUTHORIZATION, auth_value)
+            .header(CONTENT_TYPE, "application/json")
             .json(&request_body)
     }
 
@@ -155,7 +153,8 @@ impl ResembleTts {
         page: u32,
         page_size: u32,
     ) -> TTSResult<ResembleVoicesResponse> {
-        let client = reqwest::Client::new();
+        let client = resemble_tts_http_client()
+            .map_err(|e| TTSError::NetworkError(format!("Failed to build HTTP client: {e}")))?;
 
         let url = format!(
             "{}?page={}&page_size={}",
@@ -199,9 +198,7 @@ impl ResembleTts {
     /// real field; the non-standard `project_uuid`/`use_hd` knobs flow through the `extras`
     /// passthrough). Voice-tone features (stability, style, emotion, instructions, SSML,
     /// speed/pitch/volume, word_timestamps, streaming, seed) have no Resemble field and are skipped.
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let resemble_config = ResembleTtsConfig::from_standard(std)?;
 
         info!(
@@ -210,7 +207,7 @@ impl ResembleTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             resemble_config,
             base_config: std.base.clone(),
         })
@@ -233,7 +230,7 @@ impl BaseTTS for ResembleTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             resemble_config,
             base_config: config,
         })
@@ -312,6 +309,7 @@ mod tests {
     use super::*;
     use crate::core::tts::base::Pronunciation;
     use crate::core::tts::resemble::config::ResembleModel;
+    use std::io::ErrorKind;
 
     // W1 keystone (TTS): the standardized `sample_rate` override reaches the built provider's
     // Resemble config through the struct-level `from_standard`, and the non-standard
@@ -342,6 +340,23 @@ mod tests {
         assert_eq!(cfg.sample_rate, 44100);
         assert_eq!(cfg.project_uuid, Some("proj-123".to_string()));
         assert!(cfg.use_hd);
+    }
+
+    #[test]
+    fn invalid_resemble_api_key_header_value_is_request_build_error() {
+        let config = TTSConfig {
+            api_key: "bad\nkey".to_string(),
+            voice_id: Some("voice-uuid".to_string()),
+            ..Default::default()
+        };
+        let resemble_config = ResembleTtsConfig::from_base(&config).unwrap();
+        let builder = ResembleRequestBuilder::new(resemble_config, config);
+        let err = builder
+            .build_http_request(&reqwest::Client::new(), "hello")
+            .build()
+            .expect_err("malformed Resemble API key must not become an empty Authorization header");
+
+        assert!(err.is_builder(), "unexpected reqwest error: {err}");
     }
 
     // WIRE-LEVEL (S1/S5 recurring bug class): assert the `apply_custom_pronunciations` flag set via
@@ -402,6 +417,56 @@ mod tests {
         let request = ResembleStreamRequest::from_config(&resemble_config, "Hi");
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("apply_custom_pronunciations"));
+    }
+
+    #[tokio::test]
+    async fn resemble_tts_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!("Skipping resemble_tts_redirect_policy_rejects_private_hop: {err}");
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = resemble_tts_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
     }
 
     #[test]

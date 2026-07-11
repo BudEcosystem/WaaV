@@ -65,6 +65,59 @@ export interface LanguageCapabilities {
   canonicalLanguages: readonly CanonicalLanguage[];
 }
 
+// =============================================================================
+// Live capability surface (`GET /capabilities/languages`, gateway
+// handlers/capabilities.rs) — the always-current server-side matrix, as opposed
+// to the static offline mirror below.
+// =============================================================================
+
+/**
+ * One canonical language entry from the live endpoint (gateway
+ * `CanonicalLanguageInfo`): the BCP-47 token a developer passes + its
+ * decomposed subtags.
+ */
+export interface CanonicalLanguageInfo {
+  /** The canonical region-qualified BCP-47 token (`en-US`, `cmn-CN`, `or-IN`). */
+  bcp47: string;
+  /** The bare language subtag (`en`, `cmn`, `yue`) (wire: `lang_subtag`). */
+  langSubtag: string;
+  /** The ISO-639-1 downgrade form (`en`, `zh`, `yue`) (wire: `iso639_1`). */
+  iso6391: string;
+  /** The UPPERCASE region subtag (`US`, `CN`, `IN`). */
+  region: string;
+}
+
+/**
+ * One per-provider row of the live matrix (gateway `LanguageSupportRow`,
+ * core/lang/mod.rs): how the provider spells languages natively.
+ */
+export interface ProviderLanguageSupport {
+  /** Provider id (e.g. `"deepgram"`). */
+  provider: string;
+  /** Native notation kind (`bcp47` / `iso6391` / `underscore` / `none`). */
+  notation: LanguageNotation;
+  /** Whether the provider honors the canonical `auto` natively (wire: `supports_auto`). */
+  supportsAuto: boolean;
+  /** Canonical `cmn-CN` rendered natively; null if the provider takes no language param (wire: `example_cmn_cn`). */
+  exampleCmnCn: string | null;
+  /** Canonical `en-US` rendered natively; null if no language param (wire: `example_en_us`). */
+  exampleEnUs: string | null;
+}
+
+/**
+ * The `GET /capabilities/languages` response (gateway
+ * `LanguageCapabilitiesResponse`, handlers/capabilities.rs): the canonical
+ * value space + the per-provider native-notation matrix.
+ */
+export interface LanguageCapabilitiesResponse {
+  /** Every canonical language a developer may pass (wire: `canonical_languages`). */
+  canonicalLanguages: CanonicalLanguageInfo[];
+  /** The per-provider native-notation matrix (wire: `providers`). */
+  providers: ProviderLanguageSupport[];
+  /** Count of canonical languages (wire: `canonical_count`). */
+  canonicalCount: number;
+}
+
 // Per-provider native-notation summary, mirroring the gateway language support matrix. This is the
 // CANONICAL contract (how a provider spells languages + whether it auto-detects), NOT a stale
 // per-provider language whitelist — passing any canonical token is supported for every provider
@@ -102,10 +155,12 @@ const LANGUAGE_NOTATION: Record<string, [LanguageNotation, boolean]> = {
 };
 
 /**
- * Canonical language capabilities for a provider (P2 standardization).
+ * Canonical language capabilities for a provider (P2 standardization) — the STATIC, offline
+ * lookup.
  *
- * The SDK's documented stand-in for the gateway `GET /capabilities/languages` endpoint (not shipped
- * this phase): it tells a developer (a) that the FULL canonical value space
+ * For the authoritative, always-current server-side matrix call
+ * `RestClient.getLanguageCapabilities()` (`GET /capabilities/languages`); this local table is the
+ * connection-free mirror. It tells a developer (a) that the FULL canonical value space
  * ({@link CANONICAL_LANGUAGES}) is accepted for every provider — the gateway maps it — and (b) how
  * the provider spells languages natively (`notation`) + whether it `autoDetect`s. It intentionally
  * does NOT return a stale per-provider language whitelist (the thing the SDK used to hardcode and

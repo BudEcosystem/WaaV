@@ -170,7 +170,10 @@ impl BaseRealtime for InferRealtime {
         self.0.replay_user_audio_preroll().await
     }
 
-    async fn replay_conversation(&mut self, items: &[ReplayConversationItem]) -> RealtimeResult<()> {
+    async fn replay_conversation(
+        &mut self,
+        items: &[ReplayConversationItem],
+    ) -> RealtimeResult<()> {
         self.0.replay_conversation(items).await
     }
 }
@@ -286,14 +289,13 @@ mod tests {
 
     #[async_trait]
     impl RealtimeTransportFactory for DuplexFactory {
-        async fn connect(
-            &self,
-            _spec: ConnectSpec,
-        ) -> RealtimeResult<Box<dyn RealtimeTransport>> {
+        async fn connect(&self, _spec: ConnectSpec) -> RealtimeResult<Box<dyn RealtimeTransport>> {
             self.obs.connects.fetch_add(1, Ordering::SeqCst);
-            let script: VecDeque<InStep> =
-                std::mem::take(&mut *self.script.lock().unwrap());
-            Ok(Box::new(DuplexTransport { script, obs: self.obs.clone() }))
+            let script: VecDeque<InStep> = std::mem::take(&mut *self.script.lock().unwrap());
+            Ok(Box::new(DuplexTransport {
+                script,
+                obs: self.obs.clone(),
+            }))
         }
     }
 
@@ -315,7 +317,10 @@ mod tests {
             })
         }
         fn transport_factory(&self) -> Arc<dyn RealtimeTransportFactory> {
-            Arc::new(DuplexFactory { script: self.script.clone(), obs: self.obs.clone() })
+            Arc::new(DuplexFactory {
+                script: self.script.clone(),
+                obs: self.obs.clone(),
+            })
         }
         fn provider_id(&self) -> &'static str {
             self.inner.provider_id()
@@ -326,11 +331,7 @@ mod tests {
         fn connect_spec(&self, cfg: &RealtimeConfig) -> RealtimeResult<ConnectSpec> {
             self.inner.connect_spec(cfg)
         }
-        fn build_session_config(
-            &self,
-            cfg: &RealtimeConfig,
-            r: Option<&str>,
-        ) -> Vec<Self::Wire> {
+        fn build_session_config(&self, cfg: &RealtimeConfig, r: Option<&str>) -> Vec<Self::Wire> {
             self.inner.build_session_config(cfg, r)
         }
         fn map_server_event(
@@ -345,10 +346,7 @@ mod tests {
         fn send_text(&self, text: &str) -> Vec<Self::Wire> {
             self.inner.send_text(text)
         }
-        fn create_response(
-            &self,
-            o: Option<&RealtimeResponseOverride>,
-        ) -> Vec<Self::Wire> {
+        fn create_response(&self, o: Option<&RealtimeResponseOverride>) -> Vec<Self::Wire> {
             self.inner.create_response(o)
         }
         fn commit_turn(&self) -> Vec<Self::Wire> {
@@ -425,7 +423,12 @@ mod tests {
             session.connect().await.unwrap();
             assert!(session.is_ready(), "ready immediately after connect()");
             // (1) the handshake went OUT — the s2s duplex is set up.
-            until(|| obs.sent_text().iter().any(|t| t.contains("\"task\":\"s2s\""))).await;
+            until(|| {
+                obs.sent_text()
+                    .iter()
+                    .any(|t| t.contains("\"task\":\"s2s\""))
+            })
+            .await;
 
             // (2) INBOUND assistant audio drives on_audio byte-exact (the IN half) — both chunks arrive.
             until(|| {
@@ -435,11 +438,18 @@ mod tests {
             .await;
             {
                 let got = audio_in.lock().await;
-                assert_eq!(got.as_slice(), &[asst_a.clone(), asst_b.clone()], "assistant audio IN is byte-exact, in order");
+                assert_eq!(
+                    got.as_slice(),
+                    &[asst_a.clone(), asst_b.clone()],
+                    "assistant audio IN is byte-exact, in order"
+                );
             }
             // the interleaved assistant transcript also arrived (the model transcribes what it spoke).
             until(|| {
-                transcripts.try_lock().map(|g| g.iter().any(|t| t == "hi there")).unwrap_or(false)
+                transcripts
+                    .try_lock()
+                    .map(|g| g.iter().any(|t| t == "hi there"))
+                    .unwrap_or(false)
             })
             .await;
 
@@ -461,7 +471,10 @@ mod tests {
             assert!(out.contains(&user2), "user audio OUT #2 byte-exact");
 
             // (4) the gateway got out of the way: the model owns turns.
-            assert!(session.emits_user_turn_frames(), "S2S model owns turn-taking (§6.1/§6.4)");
+            assert!(
+                session.emits_user_turn_frames(),
+                "S2S model owns turn-taking (§6.1/§6.4)"
+            );
 
             session.disconnect().await.unwrap();
         })
@@ -486,8 +499,8 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(20), async {
             // A unique UDS path for this test process.
-            let path = std::env::temp_dir()
-                .join(format!("waav_infer_s2s_{}.sock", std::process::id()));
+            let path =
+                std::env::temp_dir().join(format!("waav_infer_s2s_{}.sock", std::process::id()));
             let _ = std::fs::remove_file(&path);
             let listener = tokio::net::UnixListener::bind(&path).expect("bind UDS");
 
@@ -512,11 +525,15 @@ mod tests {
                 // Reply: a `ready` text control frame (kind 0).
                 let ready = br#"{"type":"ready","session_id":"s_uds"}"#;
                 sock.write_all(&[0u8]).await.unwrap();
-                sock.write_all(&(ready.len() as u32).to_be_bytes()).await.unwrap();
+                sock.write_all(&(ready.len() as u32).to_be_bytes())
+                    .await
+                    .unwrap();
                 sock.write_all(ready).await.unwrap();
                 // Then a raw-binary assistant-audio frame (kind 1) byte-exact.
                 sock.write_all(&[1u8]).await.unwrap();
-                sock.write_all(&(asst.len() as u32).to_be_bytes()).await.unwrap();
+                sock.write_all(&(asst.len() as u32).to_be_bytes())
+                    .await
+                    .unwrap();
                 sock.write_all(&asst).await.unwrap();
                 sock.flush().await.unwrap();
                 // Keep the socket open so the client's recv loop stays live until
@@ -526,8 +543,7 @@ mod tests {
 
             // Point the infer protocol at the UDS via a SERVER-CONFIG override.
             let mut over = cfg();
-            over.realtime_endpoint_override =
-                Some(format!("unix://{}", path.to_string_lossy()));
+            over.realtime_endpoint_override = Some(format!("unix://{}", path.to_string_lossy()));
 
             // Drive the REAL session over its DEFAULT (UDS-capable) transport.
             let mut session = InferRealtime::new(over.clone()).unwrap();
@@ -606,10 +622,14 @@ mod tests {
                         // ready ack + this tenant's distinct audio frame.
                         let ready = br#"{"type":"ready"}"#;
                         sock.write_all(&[0u8]).await.unwrap();
-                        sock.write_all(&(ready.len() as u32).to_be_bytes()).await.unwrap();
+                        sock.write_all(&(ready.len() as u32).to_be_bytes())
+                            .await
+                            .unwrap();
                         sock.write_all(ready).await.unwrap();
                         sock.write_all(&[1u8]).await.unwrap();
-                        sock.write_all(&(asst.len() as u32).to_be_bytes()).await.unwrap();
+                        sock.write_all(&(asst.len() as u32).to_be_bytes())
+                            .await
+                            .unwrap();
                         sock.write_all(&asst).await.unwrap();
                         sock.flush().await.unwrap();
                         tokio::time::sleep(Duration::from_secs(15)).await;
@@ -617,7 +637,8 @@ mod tests {
                     });
 
                     let mut over = cfg();
-                    over.realtime_endpoint_override = Some(format!("unix://{}", path.to_string_lossy()));
+                    over.realtime_endpoint_override =
+                        Some(format!("unix://{}", path.to_string_lossy()));
                     let mut session = InferRealtime::new(over).unwrap();
                     let got: Arc<TMutex<Vec<Bytes>>> = Arc::new(TMutex::new(Vec::new()));
                     {
@@ -629,7 +650,10 @@ mod tests {
                             }))
                             .unwrap();
                     }
-                    session.connect().await.expect("tenant S2S connects over its UDS");
+                    session
+                        .connect()
+                        .await
+                        .expect("tenant S2S connects over its UDS");
 
                     // bounded wait for this tenant's one audio frame.
                     for _ in 0..400 {
@@ -656,7 +680,9 @@ mod tests {
             }
         })
         .await
-        .expect("the concurrent multi-tenant UDS test must complete within the bound (no deadlock)");
+        .expect(
+            "the concurrent multi-tenant UDS test must complete within the bound (no deadlock)",
+        );
     }
 
     // ── the InferRealtime newtype surface ──
@@ -666,14 +692,20 @@ mod tests {
         let rt = InferRealtime::new(cfg()).unwrap();
         assert!(!rt.is_ready());
         assert_eq!(rt.get_provider_info()["provider"], "waav-infer");
-        assert_eq!(rt.get_provider_info()["features"]["full_duplex_audio"], true);
+        assert_eq!(
+            rt.get_provider_info()["features"]["full_duplex_audio"],
+            true
+        );
         // the model owns turns ⇒ the cascade Smart-Turn is bypassed (§6.1).
         assert!(rt.emits_user_turn_frames());
     }
 
     #[tokio::test]
     async fn requires_model_id() {
-        let bad = RealtimeConfig { model: String::new(), ..cfg() };
+        let bad = RealtimeConfig {
+            model: String::new(),
+            ..cfg()
+        };
         assert!(matches!(
             InferRealtime::new(bad),
             Err(RealtimeError::InvalidConfiguration(_))

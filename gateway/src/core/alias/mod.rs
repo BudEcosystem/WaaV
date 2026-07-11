@@ -376,14 +376,61 @@ fn default_alias_tts() -> TTSWebSocketConfig {
     }
 }
 
+fn fallback_alias_conversation() -> ConversationWebSocketConfig {
+    ConversationWebSocketConfig {
+        base_url: String::new(),
+        model: String::new(),
+        system_prompt: None,
+        api_key: None,
+        temperature: None,
+        max_tokens: None,
+        streaming: true,
+        max_history: 20,
+        allow_interruption: true,
+        eager_eot: false,
+        provider_kind: None,
+        barge_in_min_words: None,
+        summarize_target_tokens: 0,
+        mute_strategy: None,
+        strip_markdown: true,
+        user_idle_timeout_ms: 0,
+        reasoning_effort: None,
+        latency_filler: Default::default(),
+        latency_filler_after_ms: None,
+        latency_filler_phrases: Vec::new(),
+        reasoning_model: None,
+        reasoning_base_url: None,
+        reasoning_api_key: None,
+        reasoning_provider_kind: None,
+        reasoning_route: Default::default(),
+        reasoning_budget_ms: None,
+        degradation_message: None,
+        max_llm_calls_per_turn: None,
+        max_reasoning_tokens: None,
+    }
+}
+
+fn alias_conversation_from_wire_defaults(value: serde_json::Value) -> ConversationWebSocketConfig {
+    match serde_json::from_value(value) {
+        Ok(config) => config,
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to materialize alias conversation wire defaults; using inert empty conversation defaults"
+            );
+            fallback_alias_conversation()
+        }
+    }
+}
+
 /// A fresh conversation config carrying the EXACT serde defaults a client would get by
 /// sending `{"base_url":"","model":""}` (streaming on, allow_interruption on,
-/// strip_markdown on, max_history default, …). Built by round-tripping through serde so
-/// it can never drift from the wire defaults, rather than re-listing ~20 fields here.
-/// `base_url`/`model` are left empty for the alias (then the client) to fill.
+/// strip_markdown on, max_history default, ...). Built by round-tripping through serde
+/// on the normal path so it tracks wire defaults, with a non-panicking fallback for
+/// future schema drift. `base_url`/`model` are left empty for the alias (then the
+/// client) to fill.
 fn default_alias_conversation() -> ConversationWebSocketConfig {
-    serde_json::from_value(serde_json::json!({ "base_url": "", "model": "" }))
-        .expect("empty base_url/model conversation config is always valid")
+    alias_conversation_from_wire_defaults(serde_json::json!({ "base_url": "", "model": "" }))
 }
 
 /// Splice a resolved alias definition into the four optional WS config fragments,

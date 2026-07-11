@@ -35,6 +35,12 @@ pub struct NaverClovaTts {
     connection_state: Arc<RwLock<ConnectionState>>,
 }
 
+fn naver_clova_tts_http_client(timeout_secs: u64) -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+}
+
 impl NaverClovaTts {
     /// Build from the standardized config (W1 keystone for TTS), mirroring
     /// `DeepgramTTS::from_standard`. Delegates to the config-level
@@ -42,18 +48,13 @@ impl NaverClovaTts {
     /// -5..=5 integer prosody deltas and reads the non-standard `custom_endpoint` extra) so the
     /// mapped prosody is honored end-to-end through the dispatch path, then assembles the REST
     /// client exactly like [`BaseTTS::new`].
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let naver_config = NaverClovaTtsConfig::from_standard(std)?;
 
         let timeout_secs = naver_config.request_timeout_secs;
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| {
-                TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
-            })?;
+        let http_client = naver_clova_tts_http_client(timeout_secs).map_err(|e| {
+            TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         Ok(Self {
             config: naver_config,
@@ -160,12 +161,9 @@ impl BaseTTS for NaverClovaTts {
         let naver_config = NaverClovaTtsConfig::from_base(config.clone())?;
 
         let timeout_secs = naver_config.request_timeout_secs;
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| {
-                TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
-            })?;
+        let http_client = naver_clova_tts_http_client(timeout_secs).map_err(|e| {
+            TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         info!(
             "NAVER CLOVA TTS: Initialized with voice='{}', format='{}'",
@@ -409,7 +407,7 @@ mod tests {
 
         let mut extras = serde_json::Map::new();
         extras.insert(
-            "custom_endpoint".into(),
+            crate::core::tts::naver_clova::config::CUSTOM_ENDPOINT_EXTRA_KEY.into(),
             serde_json::json!("https://enterprise.example.com/tts"),
         );
         let std = StandardTTSConfig {
@@ -469,6 +467,51 @@ mod tests {
             body.contains("sampling-rate=48000"),
             "sample_rate must reach the tts-premium/v1/tts `sampling-rate` form param, got: {body}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn naver_clova_tts_redirect_policy_rejects_private_hop() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let tts = NaverClovaTts::new(make_test_config()).expect("construct NAVER CLOVA TTS");
+        let err = tts
+            .http_client
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(err) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&err.to_string());
+            source = err.source();
+        }
+        assert!(error_chain.contains("SSRF protection"), "{error_chain}");
     }
 
     #[test]

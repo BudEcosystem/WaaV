@@ -562,7 +562,11 @@ mod tests {
         let deltas = t.stage_deltas();
         // Only stt_to_llm(10) and llm_ttft(240) are computable here (deltas are
         // u64, so non-negativity is guaranteed by the type).
-        assert_eq!(deltas.len(), 2, "exactly the two computable stages: {deltas:?}");
+        assert_eq!(
+            deltas.len(),
+            2,
+            "exactly the two computable stages: {deltas:?}"
+        );
         let ttft = deltas.iter().find(|(s, _)| *s == Stage::LlmTtft).unwrap().1;
         assert_eq!(ttft, 240);
         assert!(deltas.iter().any(|(s, _)| *s == Stage::SttToLlm));
@@ -604,7 +608,11 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         prof.on_audio_out(now_monotonic_ns()); // closes the turn
 
-        assert_eq!(sink.count.load(Ordering::Relaxed), 1, "exactly one turn closed");
+        assert_eq!(
+            sink.count.load(Ordering::Relaxed),
+            1,
+            "exactly one turn closed"
+        );
         let traces = sink.traces.lock();
         let t = &traces[0];
         assert_eq!(t.turn_id, 0);

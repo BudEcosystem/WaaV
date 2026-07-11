@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use tokio::sync::broadcast;
 
+use crate::config::utils::parse_bool;
 use crate::core::metrics::bridge;
 use crate::core::observability::observer::VoiceObserver;
 use crate::core::observability::turn_profile::{Stage, TurnSink, TurnSummary, TurnTrace};
@@ -132,7 +133,9 @@ impl StageAggregates {
     fn new() -> Self {
         Self {
             headline: RollingWindow::new(WINDOW_SAMPLES),
-            stages: (0..N_STAGES).map(|_| RollingWindow::new(WINDOW_SAMPLES)).collect(),
+            stages: (0..N_STAGES)
+                .map(|_| RollingWindow::new(WINDOW_SAMPLES))
+                .collect(),
             turns: 0,
             streaming_turns: 0,
         }
@@ -157,28 +160,67 @@ pub struct ProfilingConfig {
 }
 
 impl ProfilingConfig {
-    pub fn from_env() -> Self {
-        let flag = |k: &str, default: bool| {
-            std::env::var(k)
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(default)
-        };
-        Self {
-            enabled: flag("WAAV_TURN_PROFILING", true),
-            sample_n: std::env::var("WAAV_DEBUG_PROFILE_SAMPLE_N")
+    pub fn try_from_env() -> Result<Self, String> {
+        let enabled = parse_env_bool("WAAV_TURN_PROFILING", true)?;
+        let sample_n = parse_env_positive_u64("WAAV_DEBUG_PROFILE_SAMPLE_N", 1)?;
+        let debug_routes = parse_env_bool("WAAV_DEBUG_PROFILE", false)?;
+
+        Ok(Self {
+            enabled,
+            sample_n,
+            debug_routes,
+            token: std::env::var("WAAV_DEBUG_PROFILE_TOKEN")
                 .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|&n| n > 0)
-                .unwrap_or(1),
-            debug_routes: flag("WAAV_DEBUG_PROFILE", false),
-            token: std::env::var("WAAV_DEBUG_PROFILE_TOKEN").ok().filter(|s| !s.is_empty()),
+                .filter(|s| !s.is_empty()),
+        })
+    }
+
+    pub fn from_env() -> Self {
+        Self::try_from_env().unwrap_or_else(|e| panic!("invalid profiling config: {e}"))
+    }
+}
+
+fn parse_env_bool(name: &str, default: bool) -> Result<bool, String> {
+    match std::env::var(name) {
+        Ok(value) => parse_bool(&value).ok_or_else(|| {
+            format!("Invalid {name} environment variable: expected true/false/1/0/yes/no")
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{name} environment variable must be valid UTF-8"))
+        }
+    }
+}
+
+fn parse_env_positive_u64(name: &str, default: u64) -> Result<u64, String> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .map_err(|e| format!("Invalid {name} environment variable: {e}"))
+            .and_then(|n| {
+                if n > 0 {
+                    Ok(n)
+                } else {
+                    Err(format!(
+                        "{name} environment variable must be greater than zero"
+                    ))
+                }
+            }),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{name} environment variable must be valid UTF-8"))
         }
     }
 }
 
 impl Default for ProfilingConfig {
     fn default() -> Self {
-        Self { enabled: true, sample_n: 1, debug_routes: false, token: None }
+        Self {
+            enabled: true,
+            sample_n: 1,
+            debug_routes: false,
+            token: None,
+        }
     }
 }
 
@@ -271,7 +313,9 @@ impl LatencyProfiler {
 
     pub fn record_smart_turn(&self, inference_us: u64) {
         bridge::observe_smart_turn_inference_ms(inference_us as f64 / 1000.0);
-        self.smart_turn.lock().record(inference_us.saturating_mul(1000));
+        self.smart_turn
+            .lock()
+            .record(inference_us.saturating_mul(1000));
     }
 
     pub fn record_frame_stage(&self, stage: &'static str, dur_ns: u64) {
@@ -299,7 +343,10 @@ impl LatencyProfiler {
         let agg = self.agg.lock();
         let stages: Vec<StageStat> = Stage::ALL
             .iter()
-            .map(|&s| StageStat { stage: s.as_str(), stats: agg.stages[s.index()].stats() })
+            .map(|&s| StageStat {
+                stage: s.as_str(),
+                stats: agg.stages[s.index()].stats(),
+            })
             .collect();
         let bottleneck_histogram: Vec<BottleneckBucket> = Stage::RESPONSE_STAGES
             .iter()
@@ -340,7 +387,11 @@ impl LatencyProfiler {
             recent_slow_turns,
             realtime_blockers: RealtimeBlockers {
                 smart_turn_inference_ms_p99: smart_turn.p99_ms,
-                frame_skip_rate: if frames > 0 { skips as f64 / frames as f64 } else { 0.0 },
+                frame_skip_rate: if frames > 0 {
+                    skips as f64 / frames as f64
+                } else {
+                    0.0
+                },
                 frames_total: frames,
                 frame_skips_total: skips,
                 llm_ttft_p50_ms: llm_ttft.p50_ms,
@@ -536,6 +587,16 @@ pub struct RealtimeBlockers {
 mod tests {
     use super::*;
     use crate::core::observability::turn_profile::{TurnOutcome, TurnPath};
+    use serial_test::serial;
+
+    fn cleanup_profile_env() {
+        unsafe {
+            std::env::remove_var("WAAV_TURN_PROFILING");
+            std::env::remove_var("WAAV_DEBUG_PROFILE_SAMPLE_N");
+            std::env::remove_var("WAAV_DEBUG_PROFILE");
+            std::env::remove_var("WAAV_DEBUG_PROFILE_TOKEN");
+        }
+    }
 
     fn trace_with_latency(turn_id: u64, stt_final_ns: u64, audio_out_ns: u64) -> TurnTrace {
         let mut t = TurnTrace::open(turn_id, "s".into(), TurnPath::Conversation, stt_final_ns);
@@ -552,6 +613,49 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn profiling_config_rejects_invalid_bool_env() {
+        cleanup_profile_env();
+        unsafe {
+            std::env::set_var("WAAV_DEBUG_PROFILE", "sure");
+        }
+
+        let err = ProfilingConfig::try_from_env().expect_err("invalid bool must fail");
+        assert!(
+            err.contains("WAAV_DEBUG_PROFILE"),
+            "error should name bad env var: {err}"
+        );
+
+        cleanup_profile_env();
+    }
+
+    #[test]
+    #[serial]
+    fn profiling_config_rejects_invalid_sample_n_env() {
+        cleanup_profile_env();
+        unsafe {
+            std::env::set_var("WAAV_DEBUG_PROFILE_SAMPLE_N", "0");
+        }
+
+        let err = ProfilingConfig::try_from_env().expect_err("zero sample_n must fail");
+        assert!(
+            err.contains("WAAV_DEBUG_PROFILE_SAMPLE_N"),
+            "error should name bad env var: {err}"
+        );
+
+        unsafe {
+            std::env::set_var("WAAV_DEBUG_PROFILE_SAMPLE_N", "many");
+        }
+        let err = ProfilingConfig::try_from_env().expect_err("non-numeric sample_n must fail");
+        assert!(
+            err.contains("WAAV_DEBUG_PROFILE_SAMPLE_N"),
+            "error should name bad env var: {err}"
+        );
+
+        cleanup_profile_env();
+    }
+
+    #[test]
     fn rolling_window_percentiles() {
         let mut w = RollingWindow::new(1000);
         for i in 1..=100u64 {
@@ -561,8 +665,16 @@ mod tests {
         assert_eq!(s.count, 100);
         assert_eq!(s.min_ms, 1);
         assert_eq!(s.max_ms, 100);
-        assert!(s.p50_ms >= 49 && s.p50_ms <= 51, "p50 ~50ms, got {}", s.p50_ms);
-        assert!(s.p90_ms >= 89 && s.p90_ms <= 91, "p90 ~90ms, got {}", s.p90_ms);
+        assert!(
+            s.p50_ms >= 49 && s.p50_ms <= 51,
+            "p50 ~50ms, got {}",
+            s.p50_ms
+        );
+        assert!(
+            s.p90_ms >= 89 && s.p90_ms <= 91,
+            "p90 ~90ms, got {}",
+            s.p90_ms
+        );
         assert!(s.p99_ms >= 98, "p99 near 100ms, got {}", s.p99_ms);
     }
 

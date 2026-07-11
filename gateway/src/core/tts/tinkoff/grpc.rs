@@ -40,8 +40,9 @@ type HmacSha256 = Hmac<Sha256>;
 /// Establishes a secure TLS connection to Tinkoff's TTS service.
 pub async fn create_tinkoff_tts_channel(config: &TinkoffTtsConfig) -> Result<Channel, TTSError> {
     let endpoint = if let Some(ep) = config.endpoint_override.as_deref() {
-        Endpoint::from_shared(ep.to_string())
-            .map_err(|e| TTSError::InvalidConfiguration(format!("Invalid endpoint override: {}", e)))?
+        Endpoint::from_shared(ep.to_string()).map_err(|e| {
+            TTSError::InvalidConfiguration(format!("Invalid endpoint override: {}", e))
+        })?
     } else {
         let tls_config = ClientTlsConfig::new().domain_name("api.tinkoff.ai");
         Endpoint::from_static(TINKOFF_GRPC_ENDPOINT)
@@ -407,7 +408,10 @@ mod tests {
         let mut mac_ok = super::HmacSha256::new_from_slice(raw_bytes).unwrap();
         mac_ok.update(signing_input.as_bytes());
         let expected = URL_SAFE_NO_PAD.encode(mac_ok.finalize().into_bytes());
-        assert_eq!(parts[2], expected, "signature must use the base64-decoded secret");
+        assert_eq!(
+            parts[2], expected,
+            "signature must use the base64-decoded secret"
+        );
 
         // ...and NOT over the raw base64 string bytes (the old bug).
         let mut mac_wrong = super::HmacSha256::new_from_slice(secret_b64.as_bytes()).unwrap();

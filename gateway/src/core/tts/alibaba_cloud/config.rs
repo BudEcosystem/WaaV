@@ -5,6 +5,18 @@
 use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 
+fn validate_dashscope_tts_endpoint(source: &str, endpoint: &str) -> Result<(), TTSError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_WS_URL_SCHEMES)
+        .map_err(|msg| {
+            TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}"))
+        })
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -346,6 +358,10 @@ impl DashScopeTtsConfig {
             ));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_dashscope_tts_endpoint("endpoint_override", endpoint)?;
+        }
+
         Ok(())
     }
 
@@ -434,7 +450,9 @@ impl DashScopeTtsConfig {
     /// and `enable_aigc_tag` (AIGC watermark). The Qwen3 realtime endpoint (session.update) is
     /// instruction-driven and only honors voice/format/sample_rate/speed; CosyVoice-only knobs are
     /// emitted only on the inference path (see `create_cosyvoice_run_task`).
-    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Result<Self, TTSError> {
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
         let f = &std.features;
         let mut cfg = Self::from_base(std.base.clone())?;
 
@@ -486,11 +504,17 @@ impl DashScopeTtsConfig {
         {
             cfg.enable_markdown_filter = Some(flag);
         }
-        if let Some(flag) = std.extras.0.get("enable_aigc_tag").and_then(|v| v.as_bool()) {
+        if let Some(flag) = std
+            .extras
+            .0
+            .get("enable_aigc_tag")
+            .and_then(|v| v.as_bool())
+        {
             cfg.enable_aigc_tag = Some(flag);
         }
 
         cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate()?;
 
         Ok(cfg)
     }
@@ -577,6 +601,45 @@ mod tests {
         assert_eq!(cfg.volume, 80);
         assert_eq!(cfg.sample_rate, 24000);
         assert_eq!(cfg.region, DashScopeRegion::Singapore); // extras passthrough
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = DashScopeTtsConfig::from_base(TTSConfig {
+            provider: "alibaba-cloud".into(),
+            api_key: "k".into(),
+            voice_id: Some("longxiaochun".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        config.endpoint_override = Some("wss://dashscope-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("https://dashscope-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "alibaba-cloud".into(),
+            api_key: "k".into(),
+            voice_id: Some("longxiaochun".into()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(DashScopeTtsConfig::from_standard(&std).is_err());
     }
 
     // The CosyVoice inference-protocol knobs map from the shared typed fields + extras onto the

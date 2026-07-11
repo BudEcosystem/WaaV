@@ -143,11 +143,17 @@ fn nesting_hint(path: &str) -> Option<String> {
     let home = match path {
         "turn_detection" => "stt_config",
         "features" => "stt_config or tts_config",
-        "reasoning_effort" | "reasoning_model" | "reasoning_route" | "reasoning_budget_ms"
-        | "latency_filler" | "latency_filler_after_ms" | "eager_eot" | "mute_strategy"
-        | "barge_in_min_words" | "system_prompt" | "max_llm_calls_per_turn" => {
-            "conversation_config"
-        }
+        "reasoning_effort"
+        | "reasoning_model"
+        | "reasoning_route"
+        | "reasoning_budget_ms"
+        | "latency_filler"
+        | "latency_filler_after_ms"
+        | "eager_eot"
+        | "mute_strategy"
+        | "barge_in_min_words"
+        | "system_prompt"
+        | "max_llm_calls_per_turn" => "conversation_config",
         "enable_recording" => "livekit",
         _ => return None,
     };
@@ -232,7 +238,10 @@ mod tests {
 
     #[test]
     fn correct_config_yields_no_warnings() {
-        assert!(lint(VALID_CORE).is_empty(), "a correct config must lint clean");
+        assert!(
+            lint(VALID_CORE).is_empty(),
+            "a correct config must lint clean"
+        );
     }
 
     #[test]
@@ -248,7 +257,11 @@ mod tests {
             "tts_config": {"provider":"deepgram","model":"aura-asteria-en"},
             "conversation_config": {"base_url":"http://x/v1","model":"qwen2.5","reasoning_effort":"minimal"}
         }"#;
-        assert!(lint(json).is_empty(), "correctly-nested config must lint clean: {:?}", lint(json));
+        assert!(
+            lint(json).is_empty(),
+            "correctly-nested config must lint clean: {:?}",
+            lint(json)
+        );
     }
 
     #[test]
@@ -275,7 +288,10 @@ mod tests {
         assert_eq!(paths, vec!["turn_detection".to_string()]);
         // And the operator gets a targeted nesting hint.
         let hint = nesting_hint("turn_detection").expect("turn_detection has a nesting hint");
-        assert!(hint.contains("stt_config"), "hint should point at stt_config: {hint}");
+        assert!(
+            hint.contains("stt_config"),
+            "hint should point at stt_config: {hint}"
+        );
     }
 
     #[test]
@@ -316,7 +332,10 @@ mod tests {
                 "features": {"diarizationn": true}
             }
         }"#;
-        assert_eq!(lint(json), vec!["stt_config.features.diarizationn".to_string()]);
+        assert_eq!(
+            lint(json),
+            vec!["stt_config.features.diarizationn".to_string()]
+        );
     }
 
     #[test]
@@ -331,7 +350,11 @@ mod tests {
             },
             "tts_config": {"provider":"elevenlabs","model":"eleven_multilingual_v2","extras":{"seed":42}}
         }"#;
-        assert!(lint(json).is_empty(), "extras keys must never be flagged: {:?}", lint(json));
+        assert!(
+            lint(json).is_empty(),
+            "extras keys must never be flagged: {:?}",
+            lint(json)
+        );
     }
 
     #[test]
@@ -345,7 +368,11 @@ mod tests {
             "stt_config": {"provider":"deepgram","language":"en-US","sample_rate":16000,"channels":1,"punctuation":true,"api_key": null},
             "conversation_config": {"base_url":"http://x/v1","model":"m","reasoning_model": null, "system_prompt": null}
         }"#;
-        assert!(lint(json).is_empty(), "explicit nulls must not be flagged: {:?}", lint(json));
+        assert!(
+            lint(json).is_empty(),
+            "explicit nulls must not be flagged: {:?}",
+            lint(json)
+        );
     }
 
     #[test]
@@ -357,6 +384,10 @@ mod tests {
             "audio_disabled": true,
             "stt_config": {"provider":"deepgram","language":"en-US","sample_rate":16000,"channels":1,"punctuation":true}
         }"#;
-        assert!(lint(json).is_empty(), "deprecated audio_disabled must not be flagged: {:?}", lint(json));
+        assert!(
+            lint(json).is_empty(),
+            "deprecated audio_disabled must not be flagged: {:?}",
+            lint(json)
+        );
     }
 }

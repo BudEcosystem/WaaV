@@ -55,7 +55,7 @@
 //!   <https://github.com/speechmatics/speechmatics-flow>
 
 use bytes::Bytes;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::core::realtime::base::{
     FunctionCallRequest, RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult,
@@ -348,7 +348,10 @@ impl RealtimeProtocol for SpeechmaticsProtocol {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let arguments = match func.and_then(|f| f.get("arguments")).or_else(|| value.get("arguments")) {
+                let arguments = match func
+                    .and_then(|f| f.get("arguments"))
+                    .or_else(|| value.get("arguments"))
+                {
                     Some(Value::String(s)) => s.clone(),
                     Some(other) => other.to_string(),
                     None => String::new(),
@@ -437,10 +440,11 @@ impl RealtimeProtocol for SpeechmaticsProtocol {
 
     fn serialize(&self, msg: &Self::Wire) -> RealtimeResult<OutFrame> {
         match msg {
-            SpeechmaticsClientMsg::Json(v) => Ok(OutFrame::Text(
-                serde_json::to_string(v)
-                    .map_err(|e| RealtimeError::SerializationError(e.to_string()))?,
-            )),
+            SpeechmaticsClientMsg::Json(v) => {
+                Ok(OutFrame::Text(serde_json::to_string(v).map_err(|e| {
+                    RealtimeError::SerializationError(e.to_string())
+                })?))
+            }
             // THE binary path: audio frames serialize to a raw binary frame.
             SpeechmaticsClientMsg::Audio(b) => Ok(OutFrame::Binary(b.clone())),
         }
@@ -583,11 +587,16 @@ mod tests {
             realtime_endpoint_override: Some("ws://127.0.0.1:9010/sm".into()),
             ..base_cfg()
         };
-        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap() else {
+        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap()
+        else {
             panic!("expected WebSocket")
         };
         assert_eq!(url, "ws://127.0.0.1:9010/sm");
-        assert!(headers.iter().any(|(k, v)| k == "Authorization" && v == "Bearer sm-token"));
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "Authorization" && v == "Bearer sm-token")
+        );
     }
 
     /// build_session_config serializes to the SDK `StartConversation` shape:
@@ -682,12 +691,14 @@ mod tests {
         let p = proto(&base_cfg());
         let fin = r#"{"message":"AddTranscript","metadata":{"transcript":"hello there","start_time":0.0,"end_time":1.0},"results":[]}"#;
         match p.map_server_event(Inbound::Text(fin)).as_slice() {
-            [S2sEvent::Transcript {
-                role,
-                text,
-                is_final,
-                item_id,
-            }] => {
+            [
+                S2sEvent::Transcript {
+                    role,
+                    text,
+                    is_final,
+                    item_id,
+                },
+            ] => {
                 assert_eq!(*role, TranscriptRole::User);
                 assert_eq!(text, "hello there");
                 assert!(*is_final);
@@ -695,14 +706,17 @@ mod tests {
             }
             other => panic!("expected final user Transcript, got {other:?}"),
         }
-        let part = r#"{"message":"AddPartialTranscript","metadata":{"transcript":"hel"},"results":[]}"#;
+        let part =
+            r#"{"message":"AddPartialTranscript","metadata":{"transcript":"hel"},"results":[]}"#;
         match p.map_server_event(Inbound::Text(part)).as_slice() {
-            [S2sEvent::Transcript {
-                role,
-                text,
-                is_final,
-                ..
-            }] => {
+            [
+                S2sEvent::Transcript {
+                    role,
+                    text,
+                    is_final,
+                    ..
+                },
+            ] => {
                 assert_eq!(*role, TranscriptRole::User);
                 assert_eq!(text, "hel");
                 assert!(!*is_final);
@@ -729,12 +743,14 @@ mod tests {
         let p = proto(&base_cfg());
         let raw = r#"{"message":"ResponseStarted","content":"Good evening, sir."}"#;
         match p.map_server_event(Inbound::Text(raw)).as_slice() {
-            [S2sEvent::Transcript {
-                role,
-                text,
-                is_final,
-                ..
-            }] => {
+            [
+                S2sEvent::Transcript {
+                    role,
+                    text,
+                    is_final,
+                    ..
+                },
+            ] => {
                 assert_eq!(*role, TranscriptRole::Assistant);
                 assert_eq!(text, "Good evening, sir.");
                 assert!(!*is_final, "ResponseStarted ⇒ non-final");
@@ -833,7 +849,10 @@ mod tests {
             r#"{"message":"Info","type":"recognition_quality"}"#,
         ] {
             assert!(
-                matches!(p.map_server_event(Inbound::Text(raw)).as_slice(), [S2sEvent::Ignore]),
+                matches!(
+                    p.map_server_event(Inbound::Text(raw)).as_slice(),
+                    [S2sEvent::Ignore]
+                ),
                 "expected Ignore for {raw}"
             );
         }

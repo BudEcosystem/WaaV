@@ -11,6 +11,7 @@ use super::config::{
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
+use crate::core::stt::wav as stt_wav;
 
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -23,8 +24,11 @@ use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
+use url::form_urlencoded;
 
+use crate::core::resilience::connect::{WS_CONNECT_TIMEOUT, with_timeout};
 use crate::core::websocket::ReconnectionConfig;
 use crate::core::websocket::reconnectable_stream::{
     ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
@@ -56,8 +60,8 @@ struct ProsaTransport {
     ws_stream: SplitStream<ProsaWs>,
     /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
     audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
-    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
-    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    /// Shared shutdown token (fires once; an intentional close must not reconnect).
+    shutdown_token: CancellationToken,
     result_callback: Arc<RwLock<Option<STTResultCallback>>>,
     error_callback: Arc<RwLock<Option<STTErrorCallback>>>,
     current_job_id: Arc<RwLock<Option<String>>>,
@@ -65,6 +69,13 @@ struct ProsaTransport {
     connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     /// The serialized streaming `config` frame (the featured session), re-sent on every restore.
     config_json: String,
+}
+
+impl ProsaTransport {
+    async fn send_end_and_close(ws_sink: &mut SplitSink<ProsaWs, Message>) {
+        let _ = ws_sink.send(Message::Binary(Bytes::new())).await;
+        let _ = ws_sink.send(Message::Close(None)).await;
+    }
 }
 
 #[async_trait]
@@ -87,8 +98,14 @@ impl WsTransport for ProsaTransport {
 
     async fn run(&mut self) -> ReconnectOutcome {
         let mut audio_rx = self.audio_rx.lock().await;
-        let mut shutdown_rx = self.shutdown_rx.lock().await;
+        let shutdown_token = self.shutdown_token.clone();
         loop {
+            if shutdown_token.is_cancelled() {
+                info!("Received shutdown signal for Prosa.ai STT");
+                Self::send_end_and_close(&mut self.ws_sink).await;
+                return ReconnectOutcome::Completed;
+            }
+
             tokio::select! {
                 // Handle outgoing audio data (raw binary chunks).
                 Some(audio_data) = audio_rx.recv() => {
@@ -146,11 +163,9 @@ impl WsTransport for ProsaTransport {
                 }
 
                 // Handle shutdown signal (intentional close — must NOT reconnect).
-                _ = &mut *shutdown_rx => {
+                _ = shutdown_token.cancelled() => {
                     info!("Received shutdown signal for Prosa.ai STT");
-                    // Signal end of audio stream, then close gracefully.
-                    let _ = self.ws_sink.send(Message::Binary(Bytes::new())).await;
-                    let _ = self.ws_sink.send(Message::Close(None)).await;
+                    Self::send_end_and_close(&mut self.ws_sink).await;
                     return ReconnectOutcome::Completed;
                 }
             }
@@ -179,14 +194,14 @@ pub struct ProsaStt {
     base_config: Option<STTConfig>,
 
     /// HTTP client for REST API.
-    http_client: Client,
+    http_client: Option<Client>,
 
     /// Outbound audio channel to the supervised streaming transport (bounded for backpressure).
     /// `None` until the streaming session is started.
     audio_tx: Arc<RwLock<Option<mpsc::Sender<Bytes>>>>,
 
-    /// Shutdown signal sender for the supervised streaming task.
-    shutdown_tx: Arc<RwLock<Option<oneshot::Sender<()>>>>,
+    /// Shutdown signal token for the supervised streaming task.
+    shutdown_token: Arc<RwLock<Option<CancellationToken>>>,
 
     /// Supervised streaming connection task handle.
     connection_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
@@ -198,7 +213,7 @@ pub struct ProsaStt {
     is_connected: Arc<AtomicBool>,
 
     /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
-    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// `connect()`, set in `disconnect()` before cancelling `shutdown_token`, so a client close racing a
     /// server-side close can never trigger a spurious reconnect.
     intentional_disconnect: Arc<AtomicBool>,
 
@@ -219,6 +234,25 @@ pub struct ProsaStt {
     resilience: Option<crate::core::resilience::ResilienceHandles>,
 }
 
+fn prosa_stt_http_client(timeout_secs: u64) -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+}
+
+fn default_prosa_stt_http_client() -> Option<Client> {
+    match prosa_stt_http_client(super::config::DEFAULT_REQUEST_TIMEOUT) {
+        Ok(client) => Some(client),
+        Err(err) => {
+            error!(
+                error = %err,
+                "failed to create default Prosa STT HTTP client; default instance is inert until rebuilt with a valid config"
+            );
+            None
+        }
+    }
+}
+
 impl ProsaStt {
     /// Create a new Prosa.ai STT client.
     pub fn new(config: STTConfig) -> Result<Self, STTError> {
@@ -233,21 +267,17 @@ impl ProsaStt {
         prosa_config: ProsaSttConfig,
         base_config: Option<STTConfig>,
     ) -> Result<Self, STTError> {
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(
-                prosa_config.request_timeout_secs,
-            ))
-            .build()
-            .map_err(|e| {
+        let http_client =
+            prosa_stt_http_client(prosa_config.request_timeout_secs).map_err(|e| {
                 STTError::ConnectionFailed(format!("Failed to create HTTP client: {}", e))
             })?;
 
         Ok(Self {
             config: prosa_config,
             base_config,
-            http_client,
+            http_client: Some(http_client),
             audio_tx: Arc::new(RwLock::new(None)),
-            shutdown_tx: Arc::new(RwLock::new(None)),
+            shutdown_token: Arc::new(RwLock::new(None)),
             connection_handle: Arc::new(RwLock::new(None)),
             audio_buffer: Arc::new(RwLock::new(Vec::new())),
             is_connected: Arc::new(AtomicBool::new(false)),
@@ -300,9 +330,30 @@ impl ProsaStt {
         self.config.speaker_count = count;
     }
 
+    fn build_websocket_url(&self) -> String {
+        // Honor an `endpoint_override` (scheme://host[:port]) for the in-repo mock/proxy: swap the
+        // dialed base while re-appending Prosa.ai's WS path (a path-less URL fails the handshake),
+        // keeping the `?x-api-key=` query. `None` uses the production endpoint.
+        let base = match self
+            .config
+            .endpoint_override
+            .as_deref()
+            .filter(|o| !o.is_empty())
+        {
+            Some(o) => format!("{}/v2/speech/stt", o.trim_end_matches('/')),
+            None => PROSA_STT_WS_ENDPOINT.to_string(),
+        };
+        let encoded_key: String =
+            form_urlencoded::byte_serialize(self.config.api_key.as_bytes()).collect();
+        format!("{base}?x-api-key={encoded_key}")
+    }
+
     /// Process audio using REST API (synchronous mode).
     async fn process_audio_rest(&self, audio_data: &[u8]) -> Result<String, STTError> {
-        let url = PROSA_STT_BASE_URL;
+        let url = crate::core::tts::standard::override_rest_endpoint(
+            PROSA_STT_BASE_URL,
+            self.config.endpoint_override.as_deref(),
+        );
 
         // Encode audio as base64
         let encoded_audio = BASE64.encode(audio_data);
@@ -330,8 +381,13 @@ impl ProsaStt {
 
         debug!("Sending STT request to Prosa.ai REST API");
 
-        let response = self
-            .http_client
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            STTError::ConfigurationError(
+                "Prosa STT default HTTP client is unavailable; construct with ProsaStt::new or new_standard".to_string(),
+            )
+        })?;
+
+        let response = http_client
             .post(url)
             .header("x-api-key", &self.config.api_key)
             .header("Content-Type", "application/json")
@@ -383,15 +439,23 @@ impl ProsaStt {
 
     /// Poll for job result (async mode).
     async fn poll_job_result(&self, job_id: &str) -> Result<String, STTError> {
-        let url = format!("{}/{}", PROSA_STT_BASE_URL, job_id);
+        let base = crate::core::tts::standard::override_rest_endpoint(
+            PROSA_STT_BASE_URL,
+            self.config.endpoint_override.as_deref(),
+        );
+        let url = format!("{}/{}", base.trim_end_matches('/'), job_id);
         let max_attempts = 60; // Poll for up to 60 seconds
         let poll_interval = std::time::Duration::from_secs(1);
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            STTError::ConfigurationError(
+                "Prosa STT default HTTP client is unavailable; construct with ProsaStt::new or new_standard".to_string(),
+            )
+        })?;
 
         for attempt in 0..max_attempts {
             debug!("Polling job {} (attempt {})", job_id, attempt + 1);
 
-            let response = self
-                .http_client
+            let response = http_client
                 .get(&url)
                 .header("x-api-key", &self.config.api_key)
                 .send()
@@ -433,16 +497,17 @@ impl ProsaStt {
     fn parse_error_response(&self, status: u16, body: &str) -> STTError {
         // Try to parse as JSON error
         if let Ok(response) = serde_json::from_str::<ProsaSttResponse>(body)
-            && let Some(err) = response.error {
-                return match err.code.as_str() {
-                    "auth_invalid_api_key" | "auth_unauthorized" => {
-                        STTError::AuthenticationFailed(err.message)
-                    }
-                    "forbidden" => STTError::AuthenticationFailed("Access forbidden".to_string()),
-                    "quota_insufficient" | "quota_empty" => STTError::ProviderError(err.message),
-                    _ => STTError::ProviderError(err.message),
-                };
-            }
+            && let Some(err) = response.error
+        {
+            return match err.code.as_str() {
+                "auth_invalid_api_key" | "auth_unauthorized" => {
+                    STTError::AuthenticationFailed(err.message)
+                }
+                "forbidden" => STTError::AuthenticationFailed("Access forbidden".to_string()),
+                "quota_insufficient" | "quota_empty" => STTError::ProviderError(err.message),
+                _ => STTError::ProviderError(err.message),
+            };
+        }
 
         // Fallback to status code based error
         match status {
@@ -570,14 +635,7 @@ impl ProsaStt {
             ));
         }
 
-        // Honor an `endpoint_override` (scheme://host[:port]) for the in-repo mock/proxy: swap the
-        // dialed base while re-appending Prosa.ai's WS path (a path-less URL fails the handshake),
-        // keeping the `?x-api-key=` query. `None` uses the production endpoint.
-        let base = match self.config.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
-            Some(o) => format!("{}/v2/speech/stt", o.trim_end_matches('/')),
-            None => PROSA_STT_WS_ENDPOINT.to_string(),
-        };
-        let url = format!("{}?x-api-key={}", base, self.config.api_key);
+        let url = self.build_websocket_url();
 
         debug!(
             "Connecting to Prosa.ai WebSocket: {}",
@@ -589,9 +647,9 @@ impl ProsaStt {
             STTError::ConnectionFailed(format!("Failed to serialize config: {}", e))
         })?;
 
-        // Outbound audio channel + shutdown signal + connected oneshot, mirroring the templates.
+        // Outbound audio channel + shutdown token + connected oneshot, mirroring the templates.
         let (audio_tx, audio_rx) = mpsc::channel::<Bytes>(32);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_token = CancellationToken::new();
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         {
@@ -599,13 +657,12 @@ impl ProsaStt {
             *tx = Some(audio_tx);
         }
         {
-            let mut tx = self.shutdown_tx.write().await;
-            *tx = Some(shutdown_tx);
+            let mut token = self.shutdown_token.write().await;
+            *token = Some(shutdown_token.clone());
         }
 
         // Shared state the supervised transport re-uses across reconnect attempts.
         let audio_rx = Arc::new(Mutex::new(audio_rx));
-        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
         let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
         let result_callback = self.result_callback.clone();
         let error_callback = self.error_callback.clone();
@@ -635,22 +692,30 @@ impl ProsaStt {
                     let url = url.clone();
                     let config_json = config_json.clone();
                     let audio_rx = Arc::clone(&audio_rx);
-                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let shutdown_token = shutdown_token.clone();
                     let connected_tx = Arc::clone(&connected_tx);
                     let result_callback = result_callback.clone();
                     let error_callback = error_callback.clone();
                     let current_job_id = current_job_id.clone();
                     async move {
-                        let (ws_stream, _) = connect_async(&url).await.map_err(|e| {
-                            StreamError::new(format!("WebSocket connection failed: {e}"))
-                        })?;
+                        let (ws_stream, _) = with_timeout(WS_CONNECT_TIMEOUT, connect_async(&url))
+                            .await
+                            .map_err(|_| {
+                                StreamError::new(format!(
+                                    "connect to Prosa.ai timed out after {}s",
+                                    WS_CONNECT_TIMEOUT.as_secs()
+                                ))
+                            })?
+                            .map_err(|e| {
+                                StreamError::new(format!("WebSocket connection failed: {e}"))
+                            })?;
                         info!("Connected to Prosa.ai STT WebSocket");
                         let (ws_sink, ws_stream) = ws_stream.split();
                         Ok(ProsaTransport {
                             ws_sink,
                             ws_stream,
                             audio_rx,
-                            shutdown_rx,
+                            shutdown_token,
                             result_callback,
                             error_callback,
                             current_job_id,
@@ -716,7 +781,7 @@ impl ProsaStt {
     pub async fn flush(&mut self) -> Result<String, STTError> {
         let audio_data = {
             let mut buffer = self.audio_buffer.write().await;
-            
+
             std::mem::take(&mut *buffer)
         };
 
@@ -738,7 +803,7 @@ impl ProsaStt {
             Ok(String::new()) // Results come via callback
         } else {
             // For batch mode, send to REST API
-            let wav_data = self.wrap_in_wav(&audio_data);
+            let wav_data = self.wrap_in_wav(&audio_data)?;
             self.process_audio_rest(&wav_data).await
         }
     }
@@ -750,38 +815,9 @@ impl ProsaStt {
     }
 
     /// Wrap raw PCM audio in WAV header.
-    fn wrap_in_wav(&self, pcm_data: &[u8]) -> Vec<u8> {
-        let sample_rate = self.config.sample_rate;
-        let channels = self.config.channels;
-        let bits_per_sample: u16 = 16;
-        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
-        let block_align = channels * bits_per_sample / 8;
-        let data_size = pcm_data.len() as u32;
-        let file_size = 36 + data_size;
-
-        let mut wav = Vec::with_capacity(44 + pcm_data.len());
-
-        // RIFF header
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&file_size.to_le_bytes());
-        wav.extend_from_slice(b"WAVE");
-
-        // fmt chunk
-        wav.extend_from_slice(b"fmt ");
-        wav.extend_from_slice(&16u32.to_le_bytes()); // chunk size
-        wav.extend_from_slice(&1u16.to_le_bytes()); // audio format (PCM)
-        wav.extend_from_slice(&channels.to_le_bytes());
-        wav.extend_from_slice(&sample_rate.to_le_bytes());
-        wav.extend_from_slice(&byte_rate.to_le_bytes());
-        wav.extend_from_slice(&block_align.to_le_bytes());
-        wav.extend_from_slice(&bits_per_sample.to_le_bytes());
-
-        // data chunk
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&data_size.to_le_bytes());
-        wav.extend_from_slice(pcm_data);
-
-        wav
+    fn wrap_in_wav(&self, pcm_data: &[u8]) -> Result<Vec<u8>, STTError> {
+        stt_wav::encode_pcm16_wav(pcm_data, self.config.sample_rate, self.config.channels)
+            .map_err(|e| STTError::AudioProcessingError(format!("Invalid WAV parameters: {e}")))
     }
 }
 
@@ -790,9 +826,9 @@ impl Default for ProsaStt {
         Self {
             config: ProsaSttConfig::default(),
             base_config: None,
-            http_client: Client::new(),
+            http_client: default_prosa_stt_http_client(),
             audio_tx: Arc::new(RwLock::new(None)),
-            shutdown_tx: Arc::new(RwLock::new(None)),
+            shutdown_token: Arc::new(RwLock::new(None)),
             connection_handle: Arc::new(RwLock::new(None)),
             audio_buffer: Arc::new(RwLock::new(Vec::new())),
             is_connected: Arc::new(AtomicBool::new(false)),
@@ -851,8 +887,8 @@ impl BaseSTT for ProsaStt {
         if self.config.model.supports_streaming() {
             let _ = self.end_audio_stream().await;
 
-            if let Some(shutdown_tx) = self.shutdown_tx.write().await.take() {
-                let _ = shutdown_tx.send(());
+            if let Some(shutdown_token) = self.shutdown_token.write().await.take() {
+                shutdown_token.cancel();
             }
 
             // Drop the outbound audio sender so the transport's recv() also unblocks.
@@ -860,7 +896,12 @@ impl BaseSTT for ProsaStt {
 
             // Wait for the supervised connection task to wind down, with a timeout.
             if let Some(handle) = self.connection_handle.write().await.take() {
-                let _ = timeout(Duration::from_secs(5), handle).await;
+                crate::core::observability::await_task_shutdown(
+                    "prosa-ai-stt-connection",
+                    handle,
+                    Duration::from_secs(5),
+                )
+                .await;
             }
         }
 
@@ -946,10 +987,27 @@ impl ProsaStt {
     /// The shared circuit breaker this session feeds into the generic supervisor, if the
     /// process-global resilience handles have been injected (W-D1/W-D2). Two `ProsaStt` built from
     /// the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
-    pub fn resilience_breaker(
-        &self,
-    ) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
         self.resilience.as_ref().map(|r| &r.breaker)
+    }
+}
+
+impl Drop for ProsaStt {
+    fn drop(&mut self) {
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+        if let Ok(mut shutdown_token) = self.shutdown_token.try_write()
+            && let Some(token) = shutdown_token.take()
+        {
+            token.cancel();
+        }
+        if let Ok(mut audio_tx) = self.audio_tx.try_write() {
+            *audio_tx = None;
+        }
+        if let Ok(mut handle) = self.connection_handle.try_write()
+            && let Some(handle) = handle.take()
+        {
+            handle.abort();
+        }
     }
 }
 
@@ -983,6 +1041,91 @@ mod tests {
         assert!(!stt.is_ready());
     }
 
+    #[test]
+    fn websocket_url_encodes_api_key_query_value() {
+        let mut config = make_test_config();
+        config.api_key = "key&session=evil".to_string();
+        let stt = ProsaStt::new(config).unwrap();
+
+        let url = stt.build_websocket_url();
+        let parsed = url::Url::parse(&url).unwrap();
+        let pairs: Vec<_> = parsed.query_pairs().collect();
+        assert!(pairs.contains(&("x-api-key".into(), "key&session=evil".into())));
+        assert!(
+            !pairs.iter().any(|(key, _)| key == "session"),
+            "api key must not create sibling query params: {url}"
+        );
+        assert!(
+            !url.contains("x-api-key=key&session=evil"),
+            "api key must be encoded as one query value: {url}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prosa_stt_redirect_policy_rejects_private_hop() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let stt = ProsaStt::new(make_test_config()).expect("construct Prosa STT");
+        let err = stt
+            .http_client
+            .as_ref()
+            .expect("strict constructor builds an HTTP client")
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(err) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&err.to_string());
+            source = err.source();
+        }
+        assert!(error_chain.contains("SSRF protection"), "{error_chain}");
+    }
+
+    #[tokio::test]
+    async fn default_without_http_client_returns_typed_error_without_panic() {
+        let mut stt = ProsaStt::default();
+        stt.http_client = None;
+
+        let err = stt
+            .process_audio_rest(&[0u8; MIN_AUDIO_BUFFER_SIZE])
+            .await
+            .expect_err("inert default client must fail with a typed error");
+
+        match err {
+            STTError::ConfigurationError(msg) => {
+                assert!(msg.contains("default HTTP client"), "{msg}");
+            }
+            other => panic!("expected ConfigurationError, got {other:?}"),
+        }
+    }
+
     // WIRE-LEVEL (streaming): the standardized `filler_words` feature must reach the streaming WS
     // session-config FRAME that `connect_websocket` sends, not just the REST request body. This
     // serializes exactly what goes on the wire (`build_stream_config`) and asserts the
@@ -990,7 +1133,7 @@ mod tests {
     // "mapped onto the config struct but never serialized to the streaming wire" gap class.
     #[test]
     fn test_filler_words_reaches_streaming_ws_config_frame() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
 
         // filler_words = true  =>  include_filler:true on the streaming frame.
         let std_on = StandardSTTConfig {
@@ -1319,7 +1462,7 @@ mod tests {
         let stt = ProsaStt::new(make_test_config()).unwrap();
         let pcm_data = vec![0u8; 1000];
 
-        let wav_data = stt.wrap_in_wav(&pcm_data);
+        let wav_data = stt.wrap_in_wav(&pcm_data).expect("valid WAV header");
 
         // WAV header is 44 bytes
         assert_eq!(wav_data.len(), 44 + 1000);

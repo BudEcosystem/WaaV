@@ -43,6 +43,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// User-Agent header value.
 const USER_AGENT: &str = "WaaV-Gateway/1.0 (Huawei-Cloud-TTS)";
 
+fn huawei_tts_http_client() -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .user_agent(USER_AGENT)
+        .timeout(REQUEST_TIMEOUT)
+        .pool_max_idle_per_host(4)
+        .pool_idle_timeout(Duration::from_secs(60))
+        .build()
+}
+
 // =============================================================================
 // Huawei Cloud TTS Provider
 // =============================================================================
@@ -112,19 +121,13 @@ impl HuaweiCloudTts {
     ) -> TTSResult<Self> {
         huawei_config.validate()?;
 
-        // Create HTTP client with connection pooling
-        let client = Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(REQUEST_TIMEOUT)
-            .pool_max_idle_per_host(4)
-            .pool_idle_timeout(Duration::from_secs(60))
-            .build()
+        let client = huawei_tts_http_client()
             .map_err(|e| TTSError::InternalError(format!("Failed to create HTTP client: {}", e)))?;
 
         Ok(Self {
             base_config,
             config: huawei_config,
-            token_manager: Arc::new(HuaweiTokenManager::new()),
+            token_manager: Arc::new(HuaweiTokenManager::with_client(client.clone())),
             client,
             connected: Arc::new(AtomicBool::new(false)),
             audio_callback: Arc::new(Mutex::new(None)),
@@ -137,9 +140,7 @@ impl HuaweiCloudTts {
     /// Delegates feature mapping to [`HuaweiCloudTtsConfig::from_standard`] (speed/pitch/volume,
     /// sample_rate, plus the `region` extras passthrough) so advanced features reach the provider
     /// config the request builder reads.
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let huawei_config = HuaweiCloudTtsConfig::from_standard(std)?;
         Self::create_from_huawei_config(std.base.clone(), huawei_config)
     }
@@ -238,18 +239,19 @@ impl HuaweiCloudTts {
         if !status.is_success() {
             // Try to parse error response
             if let Ok(tts_response) = HuaweiTtsResponse::from_json(&body)
-                && let Some(error) = tts_response.get_error() {
-                    // Handle specific error codes
-                    if error.contains("SIS.0001") || error.contains("SIS.0002") {
-                        return Err(TTSError::AuthenticationFailed(error));
-                    } else if error.contains("SIS.0006") || error.contains("SIS.0007") {
-                        return Err(TTSError::RateLimited {
-                            retry_after_secs: None,
-                            message: error,
-                        });
-                    }
-                    return Err(TTSError::ProviderError(error));
+                && let Some(error) = tts_response.get_error()
+            {
+                // Handle specific error codes
+                if error.contains("SIS.0001") || error.contains("SIS.0002") {
+                    return Err(TTSError::AuthenticationFailed(error));
+                } else if error.contains("SIS.0006") || error.contains("SIS.0007") {
+                    return Err(TTSError::RateLimited {
+                        retry_after_secs: None,
+                        message: error,
+                    });
                 }
+                return Err(TTSError::ProviderError(error));
+            }
             return Err(TTSError::ProviderError(format!(
                 "TTS request failed with status {}: {}",
                 status, body
@@ -474,6 +476,7 @@ impl BaseTTS for HuaweiCloudTts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
 
     fn create_test_config() -> TTSConfig {
         TTSConfig {
@@ -490,6 +493,58 @@ mod tests {
         let config = create_test_config();
         let result = HuaweiCloudTts::new(config);
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn huawei_cloud_tts_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!(
+                        "Skipping huawei_cloud_tts_redirect_policy_rejects_private_hop: {err}"
+                    );
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = huawei_tts_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
     }
 
     // W1 keystone: the provider struct's `from_standard` maps prosody features through onto the

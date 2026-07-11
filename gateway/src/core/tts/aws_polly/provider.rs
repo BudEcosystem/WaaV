@@ -53,8 +53,8 @@ use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
 use aws_sdk_polly::Client as PollyClient;
 use aws_sdk_polly::config::Builder as PollyConfigBuilder;
-use aws_sdk_polly::primitives::ByteStream;
 use aws_sdk_polly::operation::synthesize_speech::builders::SynthesizeSpeechInputBuilder;
+use aws_sdk_polly::primitives::ByteStream;
 use aws_sdk_polly::types::{
     Engine, OutputFormat, SpeechMarkType, TextType as PollyTextType, VoiceId,
 };
@@ -269,9 +269,7 @@ impl AwsPollyTTS {
     /// sample_rate + voice/engine and the `region` extra) so advanced features reach the live
     /// SynthesizeSpeech request through the standardized dispatch instead of being dropped at the
     /// flat boundary.
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let polly_config = AwsPollyTTSConfig::from_standard(std);
         Self::new_from_polly_config(polly_config)
     }
@@ -368,12 +366,13 @@ impl AwsPollyTTS {
             OutputFormat::Json
         };
 
-        let mut input = aws_sdk_polly::operation::synthesize_speech::SynthesizeSpeechInput::builder()
-            .text(text)
-            .voice_id(voice_to_sdk(&self.config.voice))
-            .engine(engine_to_sdk(self.config.engine))
-            .output_format(output_format)
-            .text_type(text_type_to_sdk(self.config.text_type));
+        let mut input =
+            aws_sdk_polly::operation::synthesize_speech::SynthesizeSpeechInput::builder()
+                .text(text)
+                .voice_id(voice_to_sdk(&self.config.voice))
+                .engine(engine_to_sdk(self.config.engine))
+                .output_format(output_format)
+                .text_type(text_type_to_sdk(self.config.text_type));
 
         // Add sample rate if specified and supported
         if let Some(sample_rate) = self.config.base.sample_rate {
@@ -766,6 +765,23 @@ mod tests {
         assert_eq!(tts.polly_config().base.sample_rate, Some(16000));
         assert_eq!(tts.voice(), PollyVoice::Matthew);
         assert_eq!(tts.engine(), PollyEngine::Neural);
+    }
+
+    #[tokio::test]
+    async fn from_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "aws-polly".into(),
+            voice_id: Some("Joanna".to_string()),
+            sample_rate: Some(16000),
+            ..Default::default()
+        })
+        .with_endpoint_override("http://127.0.0.1:9000");
+
+        match AwsPollyTTS::from_standard(&std) {
+            Ok(_) => panic!("AWS Polly provider construction must reject unsafe endpoint_override"),
+            Err(err) => assert!(err.to_string().contains("SSRF protection")),
+        }
     }
 
     // WIRE-LEVEL: the `speech_mark_types` knob must reach the actual `SynthesizeSpeech` request

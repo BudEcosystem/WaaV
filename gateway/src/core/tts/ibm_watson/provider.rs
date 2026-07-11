@@ -64,6 +64,19 @@ use crate::utils::req_manager::ReqManager;
 /// IBM Watson TTS API base URL (for documentation purposes).
 pub const IBM_WATSON_TTS_URL: &str = "https://api.us-south.text-to-speech.watson.cloud.ibm.com";
 
+fn ibm_tts_http_client(config: &IbmWatsonTTSConfig) -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(Duration::from_secs(
+            config.base.request_timeout.unwrap_or(60),
+        ))
+        .connect_timeout(Duration::from_secs(
+            config.base.connection_timeout.unwrap_or(30),
+        ))
+        .pool_max_idle_per_host(config.base.request_pool_size.unwrap_or(4))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()
+}
+
 // =============================================================================
 // IAM Token Management
 // =============================================================================
@@ -96,9 +109,7 @@ struct IamTokenResponse {
 ///
 /// `iam_url` is the (possibly override-rewritten) IAM token endpoint; callers pass
 /// `IBM_IAM_URL` for production or a mock-rewritten URL via `override_rest_endpoint`.
-async fn fetch_iam_token(api_key: &str, iam_url: &str) -> TTSResult<IamToken> {
-    let client = Client::new();
-
+async fn fetch_iam_token(client: &Client, api_key: &str, iam_url: &str) -> TTSResult<IamToken> {
     // URL-encode the API key
     let encoded_api_key: String = form_urlencoded::byte_serialize(api_key.as_bytes()).collect();
 
@@ -211,6 +222,9 @@ impl IbmWatsonTTS {
             spell_out_mode: None,
             endpoint_override: None,
         };
+        ibm_config
+            .validate_sample_rate()
+            .map_err(TTSError::InvalidConfiguration)?;
 
         Ok(Self {
             config: ibm_config,
@@ -226,6 +240,10 @@ impl IbmWatsonTTS {
     ///
     /// Use this when you want full control over IBM-specific settings.
     pub fn new_from_ibm_config(config: IbmWatsonTTSConfig) -> TTSResult<Self> {
+        config
+            .validate_sample_rate()
+            .map_err(TTSError::InvalidConfiguration)?;
+
         Ok(Self {
             config,
             client: Arc::new(RwLock::new(None)),
@@ -240,10 +258,10 @@ impl IbmWatsonTTS {
     /// Delegates feature mapping to [`IbmWatsonTTSConfig::from_standard`] (speed -> `rate_percentage`,
     /// pitch -> `pitch_percentage`, sample_rate, voice, plus the `instance_id` extras passthrough)
     /// so advanced prosody reaches the provider config the request builder reads.
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
-        Self::new_from_ibm_config(IbmWatsonTTSConfig::from_standard(std))
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let ibm_config =
+            IbmWatsonTTSConfig::from_standard(std).map_err(TTSError::InvalidConfiguration)?;
+        Self::new_from_ibm_config(ibm_config)
     }
 
     /// Set the instance ID (required before connecting).
@@ -308,7 +326,13 @@ impl IbmWatsonTTS {
             IBM_IAM_URL,
             self.config.endpoint_override.as_deref(),
         );
-        let new_token = fetch_iam_token(&self.config.base.api_key, &iam_url).await?;
+        let client = self
+            .client
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| TTSError::ProviderNotReady("HTTP client not initialized".into()))?;
+        let new_token = fetch_iam_token(&client, &self.config.base.api_key, &iam_url).await?;
         let access_token = new_token.access_token.clone();
 
         // Cache the token
@@ -567,20 +591,9 @@ impl BaseTTS for IbmWatsonTTS {
             "Connecting to IBM Watson TTS"
         );
 
-        // Build HTTP client with timeouts
-        let client = Client::builder()
-            .timeout(Duration::from_secs(
-                self.config.base.request_timeout.unwrap_or(60),
-            ))
-            .connect_timeout(Duration::from_secs(
-                self.config.base.connection_timeout.unwrap_or(30),
-            ))
-            .pool_max_idle_per_host(self.config.base.request_pool_size.unwrap_or(4))
-            .pool_idle_timeout(Duration::from_secs(90)) // Close idle connections after 90s
-            .build()
-            .map_err(|e| {
-                TTSError::ConnectionFailed(format!("Failed to create HTTP client: {}", e))
-            })?;
+        let client = ibm_tts_http_client(&self.config).map_err(|e| {
+            TTSError::ConnectionFailed(format!("Failed to create HTTP client: {}", e))
+        })?;
 
         *self.client.write().await = Some(client);
 
@@ -750,6 +763,58 @@ impl BaseTTS for IbmWatsonTTS {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
+
+    #[tokio::test]
+    async fn ibm_watson_tts_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!("Skipping ibm_watson_tts_redirect_policy_rejects_private_hop: {err}");
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let config = IbmWatsonTTSConfig::default();
+        let err = ibm_tts_http_client(&config)
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
+    }
 
     #[tokio::test]
     async fn test_ibm_watson_tts_creation() {
@@ -767,6 +832,24 @@ mod tests {
         assert_eq!(tts.get_connection_state(), ConnectionState::Disconnected);
         assert_eq!(tts.voice(), IbmVoice::EnUsAllisonV3Voice);
         assert_eq!(tts.output_format(), IbmOutputFormat::Wav);
+    }
+
+    #[tokio::test]
+    async fn test_ibm_watson_tts_creation_rejects_zero_sample_rate_before_chunking() {
+        let config = TTSConfig {
+            provider: "ibm-watson".to_string(),
+            api_key: "test_key".to_string(),
+            voice_id: Some("en-US_AllisonV3Voice".to_string()),
+            audio_format: Some("l16".to_string()),
+            sample_rate: Some(0),
+            ..Default::default()
+        };
+
+        let err = match IbmWatsonTTS::new(config) {
+            Ok(_) => panic!("constructor must reject zero sample_rate"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("Sample rate"), "{err}");
     }
 
     #[tokio::test]

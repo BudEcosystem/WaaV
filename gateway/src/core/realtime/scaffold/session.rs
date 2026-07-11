@@ -13,15 +13,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
 
 use super::super::base::{
-    clamp_truncate_ms, AudioOutputCallback, BaseRealtime, ConnectionState, FunctionCallCallback,
-    RealtimeAudioData, RealtimeConfig, RealtimeError, RealtimeErrorCallback, RealtimeResponseOverride,
-    RealtimeResult, ReconnectionCallback, ReconnectionConfig, ReconnectionEvent,
-    ReplayConversationItem, ResponseDoneCallback, SpeechEventCallback, TranscriptCallback,
-    TranscriptResult, TranscriptRole,
+    AudioOutputCallback, BaseRealtime, ConnectionState, FunctionCallCallback, RealtimeAudioData,
+    RealtimeConfig, RealtimeError, RealtimeErrorCallback, RealtimeResponseOverride, RealtimeResult,
+    ReconnectionCallback, ReconnectionConfig, ReconnectionEvent, ReplayConversationItem,
+    ResponseDoneCallback, SpeechEventCallback, TranscriptCallback, TranscriptResult,
+    TranscriptRole, clamp_truncate_ms,
 };
 use super::event::{OutFrame, ProtocolCaps, S2sEvent};
 use super::protocol::RealtimeProtocol;
@@ -50,6 +50,29 @@ struct ItemPlayback {
     item_id: String,
     first_delta: Instant,
     duration_ms: u64,
+}
+
+fn lock_playback(
+    playback: &StdMutex<Option<ItemPlayback>>,
+) -> std::sync::MutexGuard<'_, Option<ItemPlayback>> {
+    playback.lock().unwrap_or_else(|poisoned| {
+        tracing::error!("realtime playback state lock poisoned; recovering state");
+        poisoned.into_inner()
+    })
+}
+
+fn read_connection_state(state: &StdRwLock<ConnectionState>) -> ConnectionState {
+    *state.read().unwrap_or_else(|poisoned| {
+        tracing::error!("realtime connection state read lock poisoned; recovering state");
+        poisoned.into_inner()
+    })
+}
+
+fn write_connection_state(state: &StdRwLock<ConnectionState>, value: ConnectionState) {
+    *state.write().unwrap_or_else(|poisoned| {
+        tracing::error!("realtime connection state write lock poisoned; recovering state");
+        poisoned.into_inner()
+    }) = value;
 }
 
 /// The 6 shared callbacks + the bookkeeping the receive loop drives. Cloned (Arc)
@@ -91,7 +114,9 @@ impl DispatchCtx {
                 let delivered = if is_final {
                     // Reset the running accumulator for this role; log the final.
                     match role {
-                        TranscriptRole::Assistant => *self.assistant_accum.write().await = String::new(),
+                        TranscriptRole::Assistant => {
+                            *self.assistant_accum.write().await = String::new()
+                        }
                         TranscriptRole::User => *self.user_accum.write().await = String::new(),
                     }
                     let mut log = self.conversation_log.write().await;
@@ -137,7 +162,7 @@ impl DispatchCtx {
                     } else {
                         0
                     };
-                    let mut pb = self.playback.lock().unwrap();
+                    let mut pb = lock_playback(&self.playback);
                     match pb.as_mut() {
                         Some(p) if item_id.as_deref() == Some(p.item_id.as_str()) => {
                             p.duration_ms += chunk_ms;
@@ -191,7 +216,7 @@ impl DispatchCtx {
             S2sEvent::InterruptedByServer => {
                 // The server already stopped its own output; clear local playback
                 // so a follow-up truncate doesn't double-count.
-                *self.playback.lock().unwrap() = None;
+                *lock_playback(&self.playback) = None;
             }
             S2sEvent::ResumptionHandle(h) => {
                 *self.resumption.write().await = Some(h);
@@ -272,7 +297,7 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
     }
 
     fn set_state(&self, s: ConnectionState) {
-        *self.state.write().unwrap() = s;
+        write_connection_state(&self.state, s);
     }
 
     /// Borrow the per-provider protocol (lets a provider newtype expose its own
@@ -356,7 +381,10 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(provider = provider_id, error = %e, "connect_spec failed");
-                    Self::signal_ready(&mut ready_tx, Err(RealtimeError::ConnectionFailed(e.to_string())));
+                    Self::signal_ready(
+                        &mut ready_tx,
+                        Err(RealtimeError::ConnectionFailed(e.to_string())),
+                    );
                     break 'outer;
                 }
             };
@@ -367,9 +395,13 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
             if is_reconnect {
                 if let Some(r) = &resilience {
                     if !r.breaker.allow_request() {
-                        tracing::warn!(provider = provider_id, "circuit breaker open; deferring dial");
+                        tracing::warn!(
+                            provider = provider_id,
+                            "circuit breaker open; deferring dial"
+                        );
                         crate::core::metrics::bridge::record_reconnect(provider_id, "circuit_open");
-                        if !Self::should_continue(&intentional_disconnect, &reconnect_cfg, attempt) {
+                        if !Self::should_continue(&intentional_disconnect, &reconnect_cfg, attempt)
+                        {
                             break 'outer;
                         }
                         attempt += 1;
@@ -384,7 +416,10 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
 
             let resumption = ctx.resumption.read().await.clone();
             // The governor permit is scoped to the DIAL ONLY (not the backoff
-            // sleep), and only on reconnects (review findings #2, #3).
+            // sleep), and only on reconnects (review findings #2, #3). The dial
+            // is deadline-bounded: a blackholed handshake must fail (releasing
+            // the permit + recording on the breaker) instead of pinning the
+            // supervisor inside `connect()` forever.
             let dial = {
                 let _permit = if is_reconnect {
                     match &resilience {
@@ -394,7 +429,18 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
                 } else {
                     None
                 };
-                factory.connect(spec).await
+                match crate::core::resilience::connect::with_timeout(
+                    crate::core::resilience::connect::FACTORY_CONNECT_TIMEOUT,
+                    factory.connect(spec),
+                )
+                .await
+                {
+                    Ok(res) => res,
+                    Err(_) => Err(RealtimeError::ConnectionFailed(format!(
+                        "transport connect timed out after {}s",
+                        crate::core::resilience::connect::FACTORY_CONNECT_TIMEOUT.as_secs()
+                    ))),
+                }
             };
             let mut transport = match dial {
                 Ok(t) => t,
@@ -406,12 +452,24 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
                     }
                     tracing::warn!(provider = provider_id, error = %e, attempt, "dial failed");
                     if !Self::should_continue(&intentional_disconnect, &reconnect_cfg, attempt) {
-                        Self::signal_ready(&mut ready_tx, Err(RealtimeError::ConnectionFailed(e.to_string())));
-                        Self::notify_reconnect(&reconnection_cb, attempt, false, Some(e.to_string())).await;
+                        Self::signal_ready(
+                            &mut ready_tx,
+                            Err(RealtimeError::ConnectionFailed(e.to_string())),
+                        );
+                        Self::notify_reconnect(
+                            &reconnection_cb,
+                            attempt,
+                            false,
+                            Some(e.to_string()),
+                        )
+                        .await;
                         break 'outer;
                     }
                     attempt += 1;
-                    tokio::time::sleep(Duration::from_millis(reconnect_cfg.calculate_delay(attempt))).await;
+                    tokio::time::sleep(Duration::from_millis(
+                        reconnect_cfg.calculate_delay(attempt),
+                    ))
+                    .await;
                     continue 'outer;
                 }
             };
@@ -439,7 +497,7 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
             }
             crate::core::metrics::bridge::record_reconnect(provider_id, "connected");
             connected.store(true, Ordering::SeqCst);
-            *state.write().unwrap() = ConnectionState::Connected;
+            write_connection_state(&state, ConnectionState::Connected);
             // First connect succeeded → unblock connect().
             Self::signal_ready(&mut ready_tx, Ok(()));
             attempt = 0;
@@ -487,7 +545,7 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
                                 // protocol + transport.
                                 if matches!(ev, S2sEvent::InterruptedByServer) {
                                     let target = {
-                                        let mut pb = ctx.playback.lock().unwrap();
+                                        let mut pb = lock_playback(&ctx.playback);
                                         pb.take().map(|p| {
                                             let elapsed = p.first_delta.elapsed().as_millis() as u64;
                                             (p.item_id, clamp_truncate_ms(elapsed, p.duration_ms))
@@ -547,7 +605,7 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
             }
 
             if intentional_disconnect.load(Ordering::SeqCst) {
-                *state.write().unwrap() = ConnectionState::Disconnected;
+                write_connection_state(&state, ConnectionState::Disconnected);
                 break 'outer;
             }
 
@@ -556,8 +614,14 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
                 quick_failures += 1;
                 if quick_failures >= MAX_CONSECUTIVE_QUICK_FAILURES {
                     tracing::error!(provider = provider_id, "too many quick failures; giving up");
-                    *state.write().unwrap() = ConnectionState::Failed;
-                    Self::notify_reconnect(&reconnection_cb, attempt, false, Some("quick-failure cutoff".into())).await;
+                    write_connection_state(&state, ConnectionState::Failed);
+                    Self::notify_reconnect(
+                        &reconnection_cb,
+                        attempt,
+                        false,
+                        Some("quick-failure cutoff".into()),
+                    )
+                    .await;
                     break 'outer;
                 }
             } else {
@@ -565,14 +629,17 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
             }
 
             if !Self::should_continue(&intentional_disconnect, &reconnect_cfg, attempt) {
-                *state.write().unwrap() = ConnectionState::Failed;
+                write_connection_state(&state, ConnectionState::Failed);
                 Self::notify_reconnect(&reconnection_cb, attempt, false, None).await;
                 break 'outer;
             }
-            *state.write().unwrap() = ConnectionState::Reconnecting;
+            write_connection_state(&state, ConnectionState::Reconnecting);
             attempt += 1;
             is_reconnect = true;
-            tokio::time::sleep(Duration::from_millis(reconnect_cfg.calculate_delay(attempt))).await;
+            tokio::time::sleep(Duration::from_millis(
+                reconnect_cfg.calculate_delay(attempt),
+            ))
+            .await;
         }
     }
 
@@ -587,11 +654,7 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
         }
     }
 
-    fn should_continue(
-        intentional: &AtomicBool,
-        cfg: &ReconnectionConfig,
-        attempt: u32,
-    ) -> bool {
+    fn should_continue(intentional: &AtomicBool, cfg: &ReconnectionConfig, attempt: u32) -> bool {
         !intentional.load(Ordering::SeqCst) && cfg.should_retry(attempt)
     }
 
@@ -661,7 +724,8 @@ impl<P: RealtimeProtocol> BaseRealtime for RealtimeSession<P> {
         self.connected.store(false, Ordering::SeqCst);
         *self.out_tx.lock().await = None; // drop sender → supervisor stops
         if let Some(h) = self.connection_handle.lock().await.take() {
-            h.abort();
+            crate::core::observability::abort_and_await_task("realtime-session-supervisor", h)
+                .await;
         }
         self.set_state(ConnectionState::Disconnected);
         Ok(())
@@ -672,12 +736,13 @@ impl<P: RealtimeProtocol> BaseRealtime for RealtimeSession<P> {
     }
 
     fn get_connection_state(&self) -> ConnectionState {
-        *self.state.read().unwrap()
+        read_connection_state(&self.state)
     }
 
     async fn send_audio(&mut self, audio_data: Bytes) -> RealtimeResult<()> {
         self.preroll.push(audio_data.clone());
-        self.push_wire(self.protocol.encode_user_audio(&audio_data)).await
+        self.push_wire(self.protocol.encode_user_audio(&audio_data))
+            .await
     }
 
     async fn send_text(&mut self, text: &str) -> RealtimeResult<()> {
@@ -692,7 +757,8 @@ impl<P: RealtimeProtocol> BaseRealtime for RealtimeSession<P> {
         &mut self,
         overrides: RealtimeResponseOverride,
     ) -> RealtimeResult<()> {
-        self.push_wires(self.protocol.create_response(Some(&overrides))).await
+        self.push_wires(self.protocol.create_response(Some(&overrides)))
+            .await
     }
 
     async fn cancel_response(&mut self) -> RealtimeResult<()> {
@@ -752,11 +818,13 @@ impl<P: RealtimeProtocol> BaseRealtime for RealtimeSession<P> {
 
     async fn update_session(&mut self, config: RealtimeConfig) -> RealtimeResult<()> {
         self.config = config;
-        self.push_wires(self.protocol.build_session_config(&self.config, None)).await
+        self.push_wires(self.protocol.build_session_config(&self.config, None))
+            .await
     }
 
     async fn submit_function_result(&mut self, call_id: &str, result: &str) -> RealtimeResult<()> {
-        self.push_wires(self.protocol.format_tool_result(call_id, result)).await
+        self.push_wires(self.protocol.format_tool_result(call_id, result))
+            .await
     }
 
     fn get_provider_info(&self) -> serde_json::Value {
@@ -779,7 +847,8 @@ impl<P: RealtimeProtocol> BaseRealtime for RealtimeSession<P> {
         if !self.caps.supports_truncate {
             return Ok(());
         }
-        self.push_wires(self.protocol.truncate(item_id, audio_end_ms)).await
+        self.push_wires(self.protocol.truncate(item_id, audio_end_ms))
+            .await
     }
 
     async fn truncate_current_response(&mut self) -> RealtimeResult<Option<(String, u64)>> {
@@ -787,7 +856,7 @@ impl<P: RealtimeProtocol> BaseRealtime for RealtimeSession<P> {
             return Ok(None);
         }
         let target = {
-            let mut pb = self.cb.playback.lock().unwrap();
+            let mut pb = lock_playback(&self.cb.playback);
             pb.take().map(|p| {
                 // Clamp to what the user ACTUALLY heard: min(wall-clock elapsed
                 // since the first audio delta, received duration).
@@ -797,7 +866,8 @@ impl<P: RealtimeProtocol> BaseRealtime for RealtimeSession<P> {
             })
         };
         if let Some((item_id, end_ms)) = &target {
-            self.push_wires(self.protocol.truncate(item_id, *end_ms)).await?;
+            self.push_wires(self.protocol.truncate(item_id, *end_ms))
+                .await?;
         }
         Ok(target)
     }
@@ -807,15 +877,65 @@ impl<P: RealtimeProtocol> BaseRealtime for RealtimeSession<P> {
             return Ok(());
         }
         for chunk in self.preroll.snapshot() {
-            self.push_wire(self.protocol.encode_user_audio(&chunk)).await?;
+            self.push_wire(self.protocol.encode_user_audio(&chunk))
+                .await?;
         }
         Ok(())
     }
 
-    async fn replay_conversation(&mut self, items: &[ReplayConversationItem]) -> RealtimeResult<()> {
+    async fn replay_conversation(
+        &mut self,
+        items: &[ReplayConversationItem],
+    ) -> RealtimeResult<()> {
         for item in items {
             self.push_wires(self.protocol.replay_item(item)).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_state_helpers_recover_from_poisoned_rwlock() {
+        let state = Arc::new(StdRwLock::new(ConnectionState::Connected));
+        let poison_target = state.clone();
+        let result = std::thread::spawn(move || {
+            let _guard = poison_target.write().unwrap();
+            panic!("poison realtime connection state lock");
+        })
+        .join();
+        assert!(result.is_err(), "test setup must poison the state lock");
+
+        assert_eq!(read_connection_state(&state), ConnectionState::Connected);
+        write_connection_state(&state, ConnectionState::Failed);
+        assert_eq!(read_connection_state(&state), ConnectionState::Failed);
+    }
+
+    #[test]
+    fn playback_lock_recovers_from_poisoned_mutex() {
+        let playback = Arc::new(StdMutex::new(Some(ItemPlayback {
+            item_id: "item1".to_string(),
+            first_delta: Instant::now(),
+            duration_ms: 2,
+        })));
+        let poison_target = playback.clone();
+        let result = std::thread::spawn(move || {
+            let mut guard = poison_target.lock().unwrap();
+            guard.as_mut().unwrap().duration_ms = 7;
+            panic!("poison realtime playback lock");
+        })
+        .join();
+        assert!(result.is_err(), "test setup must poison the playback lock");
+
+        let mut guard = lock_playback(&playback);
+        let current = guard
+            .as_ref()
+            .expect("poisoned playback state remains readable");
+        assert_eq!(current.item_id, "item1");
+        assert_eq!(current.duration_ms, 7);
+        *guard = None;
     }
 }

@@ -59,6 +59,26 @@ pub(crate) fn resolve_node_credential(config: &serde_json::Value, field: &str) -
     Some(raw.to_string())
 }
 
+fn resolve_configured_node_credential(
+    config: &serde_json::Value,
+    field: &str,
+    node_id: &str,
+    provider: &str,
+    kind: &str,
+) -> DAGResult<Option<String>> {
+    if config.get(field).is_none() {
+        return Ok(None);
+    }
+
+    match resolve_node_credential(config, field) {
+        Some(value) if !value.trim().is_empty() => Ok(Some(value)),
+        _ => Err(DAGError::MissingConfiguration(format!(
+            "{kind} provider node '{node_id}' ({provider}) has config.{field}, but it is empty, \
+             non-string, blocked, or references an unset env var"
+        ))),
+    }
+}
+
 /// Callback bridge for TTS provider to DAG node
 ///
 /// This struct implements the `AudioCallback` trait and bridges
@@ -233,14 +253,21 @@ impl DAGNode for STTProviderNode {
         // Get STT provider from registry
         let registry = crate::plugin::global_registry();
 
-        // Build STT configuration. The credential comes from the node's `config` blob
-        // (`"api_key"`, literal or `${ENV_VAR}`); without it the provider would reject the
-        // connection with "API key is required".
+        // Build STT configuration. A configured credential must resolve; when no
+        // DAG credential is supplied, provider-specific fallback may still apply.
+        let api_key = resolve_configured_node_credential(
+            &self.config,
+            "api_key",
+            &self.id,
+            &self.provider,
+            "STT",
+        )?
+        .unwrap_or_default();
         let stt_config = crate::core::stt::STTConfig {
             provider: self.provider.clone(),
             model: self.model.clone().unwrap_or_default(),
             language: self.language.clone().unwrap_or_else(|| "en-US".to_string()),
-            api_key: resolve_node_credential(&self.config, "api_key").unwrap_or_default(),
+            api_key,
             ..Default::default()
         };
 
@@ -604,13 +631,21 @@ impl DAGNode for TTSProviderNode {
         // Get TTS provider from registry
         let registry = crate::plugin::global_registry();
 
-        // Build TTS configuration. The credential comes from the node's `config` blob
-        // (`"api_key"`, literal or `${ENV_VAR}`); without it the provider could not authenticate.
+        // Build TTS configuration. A configured credential must resolve; when no
+        // DAG credential is supplied, provider-specific fallback may still apply.
+        let api_key = resolve_configured_node_credential(
+            &self.config,
+            "api_key",
+            &self.id,
+            &self.provider,
+            "TTS",
+        )?
+        .unwrap_or_default();
         let tts_config = crate::core::tts::TTSConfig {
             provider: self.provider.clone(),
             voice_id: self.voice_id.clone(),
             model: self.model.clone().unwrap_or_default(),
-            api_key: resolve_node_credential(&self.config, "api_key").unwrap_or_default(),
+            api_key,
             ..Default::default()
         };
 
@@ -889,9 +924,8 @@ pub struct SessionRealtime {
 /// [`disconnect_realtime_sessions`] (called from `handle_disconnect`). A caller
 /// that builds a context WITHOUT this resource (direct executor use, unit tests)
 /// falls back to the legacy per-turn path — both are supported.
-pub type RealtimeSessionMap = parking_lot::Mutex<
-    std::collections::HashMap<String, Arc<SessionRealtime>>,
->;
+pub type RealtimeSessionMap =
+    parking_lot::Mutex<std::collections::HashMap<String, Arc<SessionRealtime>>>;
 
 /// Resource key for the [`RealtimeSessionMap`].
 pub fn realtime_sessions_key() -> String {
@@ -985,7 +1019,6 @@ impl RealtimeProviderNode {
             config: serde_json::Value::Null,
         }
     }
-
 
     /// Set the model
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
@@ -1112,12 +1145,13 @@ impl RealtimeProviderNode {
         let mut done_rx = session.response_done_tx.subscribe();
         let baseline = *done_rx.borrow();
         if let Some(audio) = audio_data {
-            provider.send_audio(audio).await.map_err(|e| {
-                DAGError::RealtimeProviderError {
+            provider
+                .send_audio(audio)
+                .await
+                .map_err(|e| DAGError::RealtimeProviderError {
                     provider: self.provider.clone(),
                     error: format!("Failed to send audio: {e}"),
-                }
-            })?;
+                })?;
             // Manual mode needs an explicit commit; server-VAD providers
             // commit on their own.
             if !provider.emits_user_turn_frames()
@@ -1127,19 +1161,21 @@ impl RealtimeProviderNode {
             }
         }
         if let Some(text) = text_data {
-            provider.send_text(&text).await.map_err(|e| {
-                DAGError::RealtimeProviderError {
+            provider
+                .send_text(&text)
+                .await
+                .map_err(|e| DAGError::RealtimeProviderError {
                     provider: self.provider.clone(),
                     error: format!("Failed to send text: {e}"),
-                }
-            })?;
+                })?;
         }
-        provider.create_response().await.map_err(|e| {
-            DAGError::RealtimeProviderError {
+        provider
+            .create_response()
+            .await
+            .map_err(|e| DAGError::RealtimeProviderError {
                 provider: self.provider.clone(),
                 error: format!("Failed to create response: {e}"),
-            }
-        })?;
+            })?;
         drop(provider);
 
         // Audio streams to the sink as it arrives; here we only wait for the
@@ -1206,7 +1242,16 @@ impl RealtimeProviderNode {
             }
 
             // Audio → the cascade sink: downstream cannot tell S2S from TTS.
-            let output_tx = ctx.output_tx.clone().expect("checked by caller");
+            let output_tx =
+                ctx.output_tx
+                    .clone()
+                    .ok_or_else(|| DAGError::RealtimeProviderError {
+                        provider: self.provider.clone(),
+                        error: format!(
+                            "persistent realtime session '{}' requires output_tx for audio sink",
+                            self.id
+                        ),
+                    })?;
             let audio_cb: AudioOutputCallback = Arc::new(move |audio: RealtimeAudioData| {
                 let tx = output_tx.clone();
                 Box::pin(async move {
@@ -1223,10 +1268,12 @@ impl RealtimeProviderNode {
                         .await;
                 }) as Pin<Box<dyn Future<Output = ()> + Send>>
             });
-            provider.on_audio(audio_cb).map_err(|e| DAGError::RealtimeProviderError {
-                provider: self.provider.clone(),
-                error: format!("Failed to register audio callback: {e}"),
-            })?;
+            provider
+                .on_audio(audio_cb)
+                .map_err(|e| DAGError::RealtimeProviderError {
+                    provider: self.provider.clone(),
+                    error: format!("Failed to register audio callback: {e}"),
+                })?;
 
             // Finalized ASSISTANT transcripts → the per-turn slot.
             let transcript_slot = Arc::clone(&session);
@@ -1240,12 +1287,12 @@ impl RealtimeProviderNode {
                     }
                 }) as Pin<Box<dyn Future<Output = ()> + Send>>
             });
-            provider.on_transcript(transcript_cb).map_err(|e| {
-                DAGError::RealtimeProviderError {
+            provider
+                .on_transcript(transcript_cb)
+                .map_err(|e| DAGError::RealtimeProviderError {
                     provider: self.provider.clone(),
                     error: format!("Failed to register transcript callback: {e}"),
-                }
-            })?;
+                })?;
 
             // response.done → the turn boundary.
             let done = Arc::clone(&session);
@@ -1256,17 +1303,20 @@ impl RealtimeProviderNode {
                         session.response_done_tx.send_modify(|c| *c += 1);
                     }) as Pin<Box<dyn Future<Output = ()> + Send>>
                 });
-            provider.on_response_done(done_cb).map_err(|e| {
-                DAGError::RealtimeProviderError {
+            provider
+                .on_response_done(done_cb)
+                .map_err(|e| DAGError::RealtimeProviderError {
                     provider: self.provider.clone(),
                     error: format!("Failed to register response-done callback: {e}"),
-                }
-            })?;
+                })?;
 
-            provider.connect().await.map_err(|e| DAGError::RealtimeProviderError {
-                provider: self.provider.clone(),
-                error: format!("Failed to connect: {e}"),
-            })?;
+            provider
+                .connect()
+                .await
+                .map_err(|e| DAGError::RealtimeProviderError {
+                    provider: self.provider.clone(),
+                    error: format!("Failed to connect: {e}"),
+                })?;
             info!(
                 node_id = %self.id,
                 provider = %self.provider,
@@ -1477,13 +1527,14 @@ impl DAGNode for RealtimeProviderNode {
         }
 
         if let Some(text) = text_data
-            && let Err(e) = realtime.send_text(&text).await {
-                let _ = realtime.disconnect().await;
-                return Err(DAGError::RealtimeProviderError {
-                    provider: self.provider.clone(),
-                    error: format!("Failed to send text: {}", e),
-                });
-            }
+            && let Err(e) = realtime.send_text(&text).await
+        {
+            let _ = realtime.disconnect().await;
+            return Err(DAGError::RealtimeProviderError {
+                provider: self.provider.clone(),
+                error: format!("Failed to send text: {}", e),
+            });
+        }
 
         // Request a response from the model
         if let Err(e) = realtime.create_response().await {
@@ -1688,6 +1739,100 @@ mod tests {
     }
 
     #[test]
+    fn configured_node_credential_allows_absent_key_but_rejects_bad_present_key() {
+        assert!(
+            resolve_configured_node_credential(
+                &serde_json::json!({}),
+                "api_key",
+                "stt",
+                "deepgram",
+                "STT"
+            )
+            .unwrap()
+            .is_none(),
+            "absent config.api_key is left to provider-specific fallback"
+        );
+
+        assert_eq!(
+            resolve_configured_node_credential(
+                &serde_json::json!({ "api_key": "sk-node" }),
+                "api_key",
+                "stt",
+                "deepgram",
+                "STT"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("sk-node")
+        );
+
+        for config in [
+            serde_json::json!({ "api_key": "" }),
+            serde_json::json!({ "api_key": "   " }),
+            serde_json::json!({ "api_key": 42 }),
+            serde_json::json!({ "api_key": "${PATH}" }),
+        ] {
+            let err =
+                resolve_configured_node_credential(&config, "api_key", "stt", "deepgram", "STT")
+                    .expect_err("bad configured api_key must fail closed");
+            assert!(matches!(err, DAGError::MissingConfiguration(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn stt_provider_rejects_unresolved_configured_api_key_before_provider_creation() {
+        let var = "WAAV_TEST_DAG_STT_UNSET_API_TOKEN";
+        let previous = std::env::var_os(var);
+        // SAFETY: test-only mutation of a unique variable, restored before return.
+        unsafe {
+            std::env::remove_var(var);
+        }
+
+        let node = STTProviderNode::new("stt", "deepgram")
+            .with_config(serde_json::json!({ "api_key": format!("${{{var}}}") }));
+        let mut ctx = DAGContext::new("stt-missing-key");
+        let result = node
+            .execute(DAGData::Audio(bytes::Bytes::from_static(b"pcm")), &mut ctx)
+            .await;
+
+        if let Some(value) = previous {
+            // SAFETY: restores the unique variable mutated above.
+            unsafe {
+                std::env::set_var(var, value);
+            }
+        }
+
+        let err = result
+            .expect_err("unresolved configured credential must fail before provider creation");
+        match err {
+            DAGError::MissingConfiguration(msg) => {
+                assert!(msg.contains("STT provider node 'stt'"));
+                assert!(msg.contains("unset env var"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tts_provider_rejects_blank_configured_api_key_before_provider_creation() {
+        let node = TTSProviderNode::new("tts", "elevenlabs")
+            .with_config(serde_json::json!({ "api_key": "   " }));
+        let mut ctx = DAGContext::new("tts-blank-key");
+        let err = node
+            .execute(DAGData::Text("hello".to_string()), &mut ctx)
+            .await
+            .expect_err("blank configured credential must fail before provider creation");
+
+        match err {
+            DAGError::MissingConfiguration(msg) => {
+                assert!(msg.contains("TTS provider node 'tts'"));
+                assert!(msg.contains("empty"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_realtime_capabilities() {
         let node = RealtimeProviderNode::new("rt", "openai");
         let caps = node.capabilities();
@@ -1745,9 +1890,14 @@ mod tests {
             "turn_detection not plumbed: {:?}",
             cfg.turn_detection
         );
-        assert_eq!(cfg.input_audio_noise_reduction.as_deref(), Some("near_field"));
         assert_eq!(
-            cfg.input_audio_transcription.as_ref().map(|t| t.model.as_str()),
+            cfg.input_audio_noise_reduction.as_deref(),
+            Some("near_field")
+        );
+        assert_eq!(
+            cfg.input_audio_transcription
+                .as_ref()
+                .map(|t| t.model.as_str()),
             Some("whisper-1")
         );
         assert_eq!(cfg.instructions.as_deref(), Some("X"));
@@ -1774,6 +1924,7 @@ mod tests {
     /// `RealtimeConfig::default()` rather than erroring.
     #[test]
     fn realtime_node_config_cannot_override_authoritative_fields_or_ssrf() {
+        let _env = crate::core::net::ssrf_env_lock();
         // Null config → default (no panic / error path).
         let bare = RealtimeProviderNode::new("rt-null", "openai");
         let cfg = bare.build_node_realtime_config();
@@ -1791,7 +1942,10 @@ mod tests {
                 "endpoint": "wss://attacker.example/exfil2",
             }));
         let cfg = node.build_node_realtime_config();
-        assert_eq!(cfg.provider, "openai", "node provider must win over config blob");
+        assert_eq!(
+            cfg.provider, "openai",
+            "node provider must win over config blob"
+        );
         assert_eq!(
             cfg.model, "authoritative-model",
             "with_model must win over config blob"
@@ -1834,8 +1988,8 @@ mod tests {
 mod session_realtime_tests {
     use super::*;
     use crate::core::realtime::{
-        AudioOutputCallback as RtAudioCb, BaseRealtime, ConnectionState as RtConn,
-        RealtimeResult, TranscriptCallback as RtTranscriptCb, TranscriptRole,
+        AudioOutputCallback as RtAudioCb, BaseRealtime, ConnectionState as RtConn, RealtimeResult,
+        TranscriptCallback as RtTranscriptCb, TranscriptRole,
     };
     use crate::dag::context::DagOutput;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1860,7 +2014,12 @@ mod session_realtime_tests {
     #[async_trait::async_trait]
     impl BaseRealtime for MockS2S {
         fn new(_c: RealtimeConfig) -> RealtimeResult<Self> {
-            Ok(Self { audio_cb: None, transcript_cb: None, done_cb: None, turn: 0 })
+            Ok(Self {
+                audio_cb: None,
+                transcript_cb: None,
+                done_cb: None,
+                turn: 0,
+            })
         }
         async fn connect(&mut self) -> RealtimeResult<()> {
             CONNECTS.fetch_add(1, Ordering::SeqCst);
@@ -2010,13 +2169,19 @@ mod session_realtime_tests {
             .execute(DAGData::Text("hello".into()), &mut ctx)
             .await
             .expect("turn 1");
-        assert!(matches!(&out, DAGData::Text(t) if t == "answer 1"), "got {out:?}");
+        assert!(
+            matches!(&out, DAGData::Text(t) if t == "answer 1"),
+            "got {out:?}"
+        );
         // Turn 2 — the SAME session (no reconnect).
         let out = node
             .execute(DAGData::Text("again".into()), &mut ctx)
             .await
             .expect("turn 2");
-        assert!(matches!(&out, DAGData::Text(t) if t == "answer 2"), "got {out:?}");
+        assert!(
+            matches!(&out, DAGData::Text(t) if t == "answer 2"),
+            "got {out:?}"
+        );
 
         assert_eq!(
             CONNECTS.load(Ordering::SeqCst),
@@ -2039,7 +2204,10 @@ mod session_realtime_tests {
                 sink_audio += 1;
             }
         }
-        assert_eq!(sink_audio, 2, "one audio chunk per turn through DagOutput::Audio");
+        assert_eq!(
+            sink_audio, 2,
+            "one audio chunk per turn through DagOutput::Audio"
+        );
 
         // create_session wired the shared resilience handles exactly once (on the
         // single connect) — proving bug wc023gbbz#3's fix on the production-shaped
@@ -2071,7 +2239,7 @@ mod session_realtime_tests {
             let (done_tx, _) = tokio::sync::watch::channel(0u64);
             let session = Arc::new(SessionRealtime {
                 provider: tokio::sync::Mutex::new(
-                    Box::new(mock) as crate::core::realtime::BoxedRealtime,
+                    Box::new(mock) as crate::core::realtime::BoxedRealtime
                 ),
                 response_done_tx: done_tx,
                 last_transcript: parking_lot::Mutex::new(String::new()),
@@ -2080,11 +2248,8 @@ mod session_realtime_tests {
         }
         assert_eq!(sessions.lock().len(), 2, "two persistent sessions staged");
 
-        let closed = disconnect_realtime_sessions(
-            &sessions,
-            std::time::Duration::from_secs(1),
-        )
-        .await;
+        let closed =
+            disconnect_realtime_sessions(&sessions, std::time::Duration::from_secs(1)).await;
 
         assert_eq!(closed, 2, "both sessions reported closed");
         assert_eq!(
@@ -2114,7 +2279,10 @@ mod session_realtime_tests {
     #[async_trait::async_trait]
     impl BaseRealtime for MockS2SLegacy {
         fn new(_c: RealtimeConfig) -> RealtimeResult<Self> {
-            Ok(Self { transcript_cb: None, turn: 0 })
+            Ok(Self {
+                transcript_cb: None,
+                turn: 0,
+            })
         }
         async fn connect(&mut self) -> RealtimeResult<()> {
             LEGACY_CONNECTS.fetch_add(1, Ordering::SeqCst);
@@ -2233,17 +2401,30 @@ mod session_realtime_tests {
         let mut ctx = DAGContext::new("legacy-rt".to_string());
         ctx.set_output_tx(output_tx);
         assert!(
-            ctx.get_resource_as::<RealtimeSessionMap>(&realtime_sessions_key()).is_none(),
+            ctx.get_resource_as::<RealtimeSessionMap>(&realtime_sessions_key())
+                .is_none(),
             "this fallback context is built WITHOUT the session-map resource"
         );
 
         let node = RealtimeProviderNode::new("rt-legacy", "mock-s2s-legacy");
-        let out = node.execute(DAGData::Text("turn one".into()), &mut ctx).await.expect("turn 1");
-        assert!(matches!(&out, DAGData::Text(t) if t == "legacy 1"), "got {out:?}");
-        let out = node.execute(DAGData::Text("turn two".into()), &mut ctx).await.expect("turn 2");
+        let out = node
+            .execute(DAGData::Text("turn one".into()), &mut ctx)
+            .await
+            .expect("turn 1");
+        assert!(
+            matches!(&out, DAGData::Text(t) if t == "legacy 1"),
+            "got {out:?}"
+        );
+        let out = node
+            .execute(DAGData::Text("turn two".into()), &mut ctx)
+            .await
+            .expect("turn 2");
         // Each legacy turn builds a FRESH provider, so the per-provider turn
         // counter restarts at 1 — proving the session is NOT reused.
-        assert!(matches!(&out, DAGData::Text(t) if t == "legacy 1"), "got {out:?}");
+        assert!(
+            matches!(&out, DAGData::Text(t) if t == "legacy 1"),
+            "got {out:?}"
+        );
 
         assert_eq!(
             LEGACY_CONNECTS.load(Ordering::SeqCst),

@@ -57,7 +57,12 @@ impl MuteUntilFirstBotComplete {
     /// on the first bot-utterance completion.
     pub fn new() -> (Self, Arc<std::sync::atomic::AtomicBool>) {
         let latch = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        (Self { first_complete: Arc::clone(&latch) }, latch)
+        (
+            Self {
+                first_complete: Arc::clone(&latch),
+            },
+            latch,
+        )
     }
 }
 
@@ -82,7 +87,11 @@ impl UserMuteStrategy for FirstSpeechMute {
         if self.first_segment_done {
             return true;
         }
-        if let ControllerSignal::SttFinal { is_speech_final: true, .. } = sig {
+        if let ControllerSignal::SttFinal {
+            is_speech_final: true,
+            ..
+        } = sig
+        {
             // This signal still passes (it completes the first segment);
             // muting begins with the NEXT signal.
             self.first_segment_done = true;
@@ -113,7 +122,9 @@ impl FunctionCallActivity {
     /// (drop = RAII — success, error, panic, cancel all drain).
     pub fn begin(self: &Arc<Self>) -> FunctionCallGuard {
         self.in_flight.fetch_add(1, Ordering::AcqRel);
-        FunctionCallGuard { activity: Arc::clone(self) }
+        FunctionCallGuard {
+            activity: Arc::clone(self),
+        }
     }
 
     pub fn in_flight(&self) -> usize {
@@ -155,10 +166,17 @@ mod tests {
     use super::*;
 
     fn ctx(bot_speaking: bool) -> TurnCtx {
-        TurnCtx { bot_speaking, turn_active: false, stt_ttfs_p99_ms: None }
+        TurnCtx {
+            bot_speaking,
+            turn_active: false,
+            stt_ttfs_p99_ms: None,
+        }
     }
     fn interim(text: &str) -> ControllerSignal {
-        ControllerSignal::SttInterim { text: text.into(), confidence: 0.9 }
+        ControllerSignal::SttInterim {
+            text: text.into(),
+            confidence: 0.9,
+        }
     }
     fn speech_final(text: &str) -> ControllerSignal {
         ControllerSignal::SttFinal {
@@ -171,8 +189,14 @@ mod tests {
     #[test]
     fn always_mute_blocks_during_bot_speech() {
         let mut s = AlwaysMuteWhileBotSpeaks;
-        assert!(s.on_signal(&interim("stop"), &ctx(true)), "muted while bot speaks");
-        assert!(!s.on_signal(&interim("hello"), &ctx(false)), "open while silent");
+        assert!(
+            s.on_signal(&interim("stop"), &ctx(true)),
+            "muted while bot speaks"
+        );
+        assert!(
+            !s.on_signal(&interim("hello"), &ctx(false)),
+            "open while silent"
+        );
     }
 
     #[test]
@@ -182,7 +206,10 @@ mod tests {
         // Muted from session start (before the bot even starts).
         assert!(s.on_signal(&interim("hi"), &ctx(false)));
         // Bot speaks its greeting; the user barges in — still muted.
-        assert!(s.on_signal(&interim("interrupting!"), &ctx(true)), "greeting protected");
+        assert!(
+            s.on_signal(&interim("interrupting!"), &ctx(true)),
+            "greeting protected"
+        );
         // The greeting's first TTS-complete flips the shared latch...
         latch.store(true, Ordering::Release);
         assert!(!s.on_signal(&interim("now I can talk"), &ctx(false)));
@@ -224,7 +251,10 @@ mod tests {
 
         let g1 = activity.begin();
         let g2 = activity.begin();
-        assert!(s.on_signal(&interim("muted"), &ctx(false)), "in-flight calls mute");
+        assert!(
+            s.on_signal(&interim("muted"), &ctx(false)),
+            "in-flight calls mute"
+        );
         drop(g1); // success path
         assert!(s.on_signal(&interim("still one left"), &ctx(false)));
         drop(g2); // cancel/error path — SAME guard, RAII drains every exit

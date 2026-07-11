@@ -56,6 +56,8 @@ pub const SESSION_TEARDOWN_TIMEOUTS_TOTAL: &str = "waav_session_teardown_timeout
 
 /// D-G4: session-lifetime tasks still running at teardown (leak signal).
 pub const SESSION_DANGLING_TASKS_TOTAL: &str = "waav_session_dangling_tasks_total";
+/// W-E1 / D-G4: tracked session-lifetime tasks that panicked before teardown.
+pub const SESSION_TASK_PANICS_TOTAL: &str = "waav_session_task_panics_total";
 
 /// D-G10: pipeline liveness-probe round-trip time (ms).
 pub const PIPELINE_HEARTBEAT_MS: &str = "waav_pipeline_heartbeat_ms";
@@ -151,6 +153,50 @@ const FRAME_BUCKETS_MS: &[f64] = &[0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50
 
 static HANDLE: OnceLock<Option<PrometheusHandle>> = OnceLock::new();
 
+fn validate_static_buckets(name: &'static str, buckets: &[f64]) -> Result<(), String> {
+    if buckets.is_empty() {
+        return Err(format!("{name} bucket list must not be empty"));
+    }
+    let mut prev = None;
+    for &bucket in buckets {
+        if !bucket.is_finite() || bucket <= 0.0 {
+            return Err(format!("{name} bucket {bucket:?} must be finite and > 0"));
+        }
+        if let Some(prev) = prev
+            && bucket <= prev
+        {
+            return Err(format!(
+                "{name} buckets must be strictly increasing; {bucket} follows {prev}"
+            ));
+        }
+        prev = Some(bucket);
+    }
+    Ok(())
+}
+
+fn set_static_buckets(
+    builder: PrometheusBuilder,
+    metric: &'static str,
+    buckets: &'static [f64],
+) -> Result<PrometheusBuilder, String> {
+    validate_static_buckets(metric, buckets)?;
+    builder
+        .set_buckets_for_metric(Matcher::Full(metric.to_string()), buckets)
+        .map_err(|e| format!("{metric} bucket registration failed: {e}"))
+}
+
+fn prometheus_builder() -> Result<PrometheusBuilder, String> {
+    let builder = PrometheusBuilder::new();
+    let builder = set_static_buckets(builder, TTFB_MS, TTFB_BUCKETS_MS)?;
+    let builder = set_static_buckets(builder, TURN_RESPONSE_LATENCY_MS, TURN_LATENCY_BUCKETS_MS)?;
+    let builder = set_static_buckets(builder, TURN_STAGE_MS, STAGE_BUCKETS_MS)?;
+    let builder = set_static_buckets(builder, DAG_NODE_MS, STAGE_BUCKETS_MS)?;
+    let builder = set_static_buckets(builder, LLM_TTFT_MS, LLM_TTFT_BUCKETS_MS)?;
+    let builder = set_static_buckets(builder, TTS_TTFB_MS, TTS_TTFB_BUCKETS_MS)?;
+    let builder = set_static_buckets(builder, SMART_TURN_INFERENCE_MS, SMART_TURN_BUCKETS_MS)?;
+    set_static_buckets(builder, FRAME_STAGE_MS, FRAME_BUCKETS_MS)
+}
+
 /// Install (once) the process-global Prometheus recorder and return a render handle.
 ///
 /// Returns `None` only if a *different* global recorder was already installed by something
@@ -160,29 +206,16 @@ static HANDLE: OnceLock<Option<PrometheusHandle>> = OnceLock::new();
 pub fn metrics_handle() -> Option<PrometheusHandle> {
     HANDLE
         .get_or_init(|| {
-            let builder = PrometheusBuilder::new()
-                .set_buckets_for_metric(Matcher::Full(TTFB_MS.to_string()), TTFB_BUCKETS_MS)
-                .expect("static TTFB bucket list is non-empty and valid")
-                .set_buckets_for_metric(
-                    Matcher::Full(TURN_RESPONSE_LATENCY_MS.to_string()),
-                    TURN_LATENCY_BUCKETS_MS,
-                )
-                .expect("static turn-latency bucket list is valid")
-                .set_buckets_for_metric(Matcher::Full(TURN_STAGE_MS.to_string()), STAGE_BUCKETS_MS)
-                .expect("static stage bucket list is valid")
-                .set_buckets_for_metric(Matcher::Full(DAG_NODE_MS.to_string()), STAGE_BUCKETS_MS)
-                .expect("static dag-node bucket list is valid")
-                .set_buckets_for_metric(Matcher::Full(LLM_TTFT_MS.to_string()), LLM_TTFT_BUCKETS_MS)
-                .expect("static llm-ttft bucket list is valid")
-                .set_buckets_for_metric(Matcher::Full(TTS_TTFB_MS.to_string()), TTS_TTFB_BUCKETS_MS)
-                .expect("static tts-ttfb bucket list is valid")
-                .set_buckets_for_metric(
-                    Matcher::Full(SMART_TURN_INFERENCE_MS.to_string()),
-                    SMART_TURN_BUCKETS_MS,
-                )
-                .expect("static smart-turn bucket list is valid")
-                .set_buckets_for_metric(Matcher::Full(FRAME_STAGE_MS.to_string()), FRAME_BUCKETS_MS)
-                .expect("static frame bucket list is valid");
+            let builder = match prometheus_builder() {
+                Ok(builder) => builder,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "Invalid static Prometheus bucket configuration; metrics exporter unavailable"
+                    );
+                    return None;
+                }
+            };
 
             match builder.install_recorder() {
                 Ok(handle) => {
@@ -321,6 +354,10 @@ fn describe_series() {
         "Session-lifetime tasks still running at teardown, warned and aborted (D-G4)"
     );
     metrics::describe_counter!(
+        SESSION_TASK_PANICS_TOTAL,
+        "Tracked session-lifetime tasks whose JoinHandle completed with panic before teardown (W-E1/D-G4)"
+    );
+    metrics::describe_counter!(
         TTS_CHARS_TOTAL,
         "Characters submitted to TTS synthesis, per provider (D-G9)"
     );
@@ -411,6 +448,12 @@ pub fn record_session_teardown_timeout() {
 /// `_print_dangling_tasks` parity) — warned and aborted by the task tracker.
 pub fn record_session_dangling_task() {
     counter!(SESSION_DANGLING_TASKS_TOTAL).increment(1);
+}
+
+/// W-E1 / D-G4: a tracked session-lifetime task panicked before teardown and was
+/// observed by joining its finished handle.
+pub fn record_session_task_panic() {
+    counter!(SESSION_TASK_PANICS_TOTAL).increment(1);
 }
 
 /// D-G10: a successful pipeline liveness probe took `ms`.
@@ -552,6 +595,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn static_bucket_validation_rejects_bad_tables_without_panicking() {
+        for buckets in [
+            &[][..],
+            &[0.0][..],
+            &[1.0, f64::NAN][..],
+            &[1.0, 1.0][..],
+            &[2.0, 1.0][..],
+        ] {
+            let err = validate_static_buckets("unit_bucket_metric", buckets)
+                .expect_err("bad static bucket table must be rejected");
+            assert!(
+                err.contains("unit_bucket_metric"),
+                "error should identify the metric: {err}"
+            );
+        }
+        validate_static_buckets("unit_bucket_metric", &[0.1, 1.0, 10.0])
+            .expect("strictly increasing positive finite buckets are valid");
+    }
+
+    #[test]
     fn handle_is_installed_and_renders() {
         // First touch installs the global recorder; subsequent calls reuse it.
         let h = metrics_handle();
@@ -571,7 +634,10 @@ mod tests {
             text.contains(CIRCUIT_BREAKER_STATE),
             "circuit-breaker gauge present"
         );
-        assert!(text.contains(RECONNECTS_TOTAL), "reconnects counter present: {text}");
+        assert!(
+            text.contains(RECONNECTS_TOTAL),
+            "reconnects counter present: {text}"
+        );
         assert!(
             text.contains("unit-provider"),
             "provider label present in exposition"
@@ -590,6 +656,7 @@ mod tests {
         count_llm_tokens("unit-llm", "reasoning", 7);
         record_session_teardown_timeout();
         record_session_dangling_task();
+        record_session_task_panic();
 
         let text = render();
         let chars_line = text
@@ -617,6 +684,10 @@ mod tests {
         assert!(
             text.contains(SESSION_DANGLING_TASKS_TOTAL),
             "D-G4 dangling-task counter present"
+        );
+        assert!(
+            text.contains(SESSION_TASK_PANICS_TOTAL),
+            "W-E1/D-G4 task-panic counter present"
         );
     }
 
@@ -653,9 +724,15 @@ mod tests {
             QUEUE_DEPTH,
             QUEUE_LATENCY_MS,
         ] {
-            assert!(text.contains(series), "series `{series}` must render: {text}");
+            assert!(
+                text.contains(series),
+                "series `{series}` must render: {text}"
+            );
         }
-        assert!(text.contains("path=\"conversation\""), "path label rendered");
+        assert!(
+            text.contains("path=\"conversation\""),
+            "path label rendered"
+        );
         assert!(text.contains("stage=\"llm_ttft\""), "stage label rendered");
     }
 }

@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use tracing::warn;
 
 use super::{CircuitBreaker, ReconnectGovernor};
 
@@ -75,20 +76,30 @@ impl ResilienceRegistry {
     pub fn breaker_for(&self, provider: &str) -> Arc<CircuitBreaker> {
         let key = provider.to_lowercase();
         // Fast path: already present.
-        if let Some(b) = self
-            .breakers
-            .read()
-            .expect("resilience breaker map poisoned")
-            .get(&key)
         {
-            return Arc::clone(b);
+            let map = match self.breakers.read() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    warn!("Resilience breaker map read lock was poisoned, recovering");
+                    poisoned.into_inner()
+                }
+            };
+            if let Some(b) = map.get(&key) {
+                return Arc::clone(b);
+            }
         }
         // Slow path: insert under the write lock, re-checking in case of a race. The breaker is
         // stamped with the provider label so every state transition self-publishes the
         // `waav_circuit_breaker_state{provider}` gauge (W-C1) — this is what makes the gauge
         // truthful for the inline Deepgram/AssemblyAI reconnect loops (and every other provider),
         // not just the ones routed through the ReconnectableStream supervisor.
-        let mut map = self.breakers.write().expect("resilience breaker map poisoned");
+        let mut map = match self.breakers.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("Resilience breaker map write lock was poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
         Arc::clone(map.entry(key.clone()).or_insert_with(|| {
             Arc::new(CircuitBreaker::with_label(
                 super::CircuitBreakerConfig::default(),
@@ -205,5 +216,29 @@ mod tests {
             "all sessions must share one process-global governor"
         );
         assert_eq!(a.governor.max_concurrent(), 8);
+    }
+
+    #[test]
+    fn poisoned_breaker_map_recovers_for_lookup_and_insert() {
+        let reg = ResilienceRegistry::new(8);
+        let deepgram = reg.breaker_for("deepgram");
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = reg.breakers.write().expect("initial write lock");
+            panic!("poison resilience registry for recovery test");
+        }));
+        assert!(poisoned.is_err(), "test must poison the registry lock");
+
+        let after_poison = reg.breaker_for("Deepgram");
+        assert!(
+            Arc::ptr_eq(&deepgram, &after_poison),
+            "poison recovery must preserve existing provider breaker"
+        );
+
+        let assemblyai = reg.breaker_for("assemblyai");
+        assert!(
+            !Arc::ptr_eq(&deepgram, &assemblyai),
+            "poison recovery must still allow inserting a new provider breaker"
+        );
     }
 }

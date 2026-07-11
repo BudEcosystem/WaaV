@@ -18,19 +18,25 @@ const MAX_PACKET_BYTES: usize = 4000;
 /// Default uplink/downlink target bitrate (bits/s) — 24 kbps is transparent-enough wideband voice.
 pub const DEFAULT_OPUS_BITRATE: i32 = 24_000;
 
-/// A codec error (construction or a per-packet encode/decode failure).
+/// A codec error (construction, per-packet encode/decode failure, or PCM framing failure).
 #[derive(Debug)]
-pub struct OpusCodecError(pub opus::Error);
+pub enum OpusCodecError {
+    Codec(opus::Error),
+    Framing(String),
+}
 
 impl std::fmt::Display for OpusCodecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "opus codec error: {}", self.0)
+        match self {
+            OpusCodecError::Codec(e) => write!(f, "opus codec error: {e}"),
+            OpusCodecError::Framing(e) => write!(f, "opus PCM framing error: {e}"),
+        }
     }
 }
 impl std::error::Error for OpusCodecError {}
 impl From<opus::Error> for OpusCodecError {
     fn from(e: opus::Error) -> Self {
-        OpusCodecError(e)
+        OpusCodecError::Codec(e)
     }
 }
 
@@ -49,7 +55,11 @@ impl OpusStreamDecoder {
     pub fn new(sample_rate: u32) -> Result<Self, OpusCodecError> {
         let rate = nearest_opus_rate(sample_rate);
         let decoder = opus::Decoder::new(rate, opus::Channels::Mono)?;
-        Ok(Self { decoder, rate, out: vec![0i16; MAX_DECODE_SAMPLES] })
+        Ok(Self {
+            decoder,
+            rate,
+            out: vec![0i16; MAX_DECODE_SAMPLES],
+        })
     }
 
     /// The PCM16 sample rate this decoder emits.
@@ -112,12 +122,21 @@ impl OpusStreamEncoder {
     /// Feed little-endian PCM16 bytes; return zero or more opus packets — one per full frame now
     /// available. Any sub-frame tail is buffered for the next call (or [`Self::flush`]).
     pub fn push_pcm(&mut self, pcm: &[u8]) -> Result<Vec<Vec<u8>>, OpusCodecError> {
+        if pcm.len() % 2 != 0 {
+            self.reset_buffer();
+            return Err(OpusCodecError::Framing(format!(
+                "PCM16 input length must be a multiple of 2 bytes, got {}",
+                pcm.len()
+            )));
+        }
         for ch in pcm.chunks_exact(2) {
             self.buf.push(i16::from_le_bytes([ch[0], ch[1]]));
         }
         let mut packets = Vec::new();
         while self.buf.len() >= self.samples_per_frame {
-            let n = self.encoder.encode(&self.buf[..self.samples_per_frame], &mut self.out)?;
+            let n = self
+                .encoder
+                .encode(&self.buf[..self.samples_per_frame], &mut self.out)?;
             packets.push(self.out[..n].to_vec());
             self.buf.drain(..self.samples_per_frame);
         }
@@ -137,7 +156,9 @@ impl OpusStreamEncoder {
             return Ok(None);
         }
         self.buf.resize(self.samples_per_frame, 0);
-        let n = self.encoder.encode(&self.buf[..self.samples_per_frame], &mut self.out)?;
+        let n = self
+            .encoder
+            .encode(&self.buf[..self.samples_per_frame], &mut self.out)?;
         self.buf.clear();
         Ok(Some(self.out[..n].to_vec()))
     }
@@ -152,7 +173,8 @@ mod tests {
     fn tone_pcm(rate: u32, samples: usize) -> Vec<u8> {
         let mut v = Vec::with_capacity(samples * 2);
         for i in 0..samples {
-            let s = (0.4 * (2.0 * PI * 440.0 * i as f32 / rate as f32).sin() * i16::MAX as f32) as i16;
+            let s =
+                (0.4 * (2.0 * PI * 440.0 * i as f32 / rate as f32).sin() * i16::MAX as f32) as i16;
             v.extend_from_slice(&s.to_le_bytes());
         }
         v
@@ -192,16 +214,26 @@ mod tests {
         let mut decoded_samples = 0usize;
         let mut peak_rms = 0.0f64;
         for p in &packets {
-            assert!(!p.is_empty() && p.len() < spf * 2, "packet should compress vs PCM");
+            assert!(
+                !p.is_empty() && p.len() < spf * 2,
+                "packet should compress vs PCM"
+            );
             let pcm_out = dec.decode_packet(p).unwrap();
-            assert_eq!(pcm_out.len(), spf * 2, "each packet decodes to one PCM16 frame");
+            assert_eq!(
+                pcm_out.len(),
+                spf * 2,
+                "each packet decodes to one PCM16 frame"
+            );
             decoded_samples += pcm_out.len() / 2;
             peak_rms = peak_rms.max(rms_i16_le(&pcm_out));
         }
         assert_eq!(decoded_samples, spf * frames, "sample count preserved");
         // Opus is lossy + has warmup, but a steady tone must come back with real energy.
         let in_rms = rms_i16_le(&pcm);
-        assert!(peak_rms > in_rms * 0.3, "decoded energy {peak_rms} vs input {in_rms}");
+        assert!(
+            peak_rms > in_rms * 0.3,
+            "decoded energy {peak_rms} vs input {in_rms}"
+        );
     }
 
     #[test]
@@ -219,12 +251,39 @@ mod tests {
 
         // Feed HALF a frame — no packet yet, buffered.
         let half = tone_pcm(rate, spf / 2);
-        assert!(enc.push_pcm(&half).unwrap().is_empty(), "half a frame emits nothing");
+        assert!(
+            enc.push_pcm(&half).unwrap().is_empty(),
+            "half a frame emits nothing"
+        );
         // Flush zero-pads the tail to one full frame → exactly one packet.
         let tail = enc.flush().unwrap();
         assert!(tail.is_some(), "flush emits the padded tail");
         // A second flush with an empty buffer emits nothing.
         assert!(enc.flush().unwrap().is_none());
+    }
+
+    #[test]
+    fn push_rejects_odd_pcm16_without_truncating_or_flushing_stale_tail() {
+        let rate: u32 = 24000;
+        let frame_ms: u32 = 20;
+        let mut enc = OpusStreamEncoder::new(rate, frame_ms, DEFAULT_OPUS_BITRATE).unwrap();
+
+        let half = tone_pcm(rate, 240);
+        assert!(enc.push_pcm(&half).unwrap().is_empty());
+        assert!(!enc.buf.is_empty(), "test must seed a buffered tail");
+
+        let err = enc
+            .push_pcm(&[0x01, 0x02, 0x03])
+            .expect_err("odd PCM16 input must fail closed");
+        assert!(
+            err.to_string().contains("multiple of 2"),
+            "error should name PCM16 alignment, got {err}"
+        );
+        assert!(enc.buf.is_empty(), "malformed input clears stale PCM tail");
+        assert!(
+            enc.flush().unwrap().is_none(),
+            "cleared stale tail must not be emitted after malformed input"
+        );
     }
 
     #[test]

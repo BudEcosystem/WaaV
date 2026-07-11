@@ -8,11 +8,12 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::{Instant, interval, timeout};
-use tokio_tungstenite::tungstenite::handshake::client::generate_key;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
 
 use super::base::{BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback};
+use crate::core::resilience::connect::{WS_CONNECT_TIMEOUT, with_timeout};
 use crate::core::resilience::{CircuitBreaker, ReconnectGovernor};
 use crate::core::websocket::{ReconnectionConfig, ReconnectionManager};
 
@@ -26,23 +27,6 @@ enum DeepgramInnerOutcome {
     Reconnect,
     /// A provider `Error` frame (bad config/auth). Stop; reconnecting would fail identically.
     Fatal,
-}
-
-/// Extract the `host[:port]` authority from a `ws://`/`wss://` base URL, for the `Host`
-/// header when an `endpoint_override` is in effect.
-fn ws_authority(base: &str) -> Option<String> {
-    let rest = base
-        .strip_prefix("wss://")
-        .or_else(|| base.strip_prefix("ws://"))
-        .or_else(|| base.strip_prefix("https://"))
-        .or_else(|| base.strip_prefix("http://"))
-        .unwrap_or(base);
-    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
-    if authority.is_empty() {
-        None
-    } else {
-        Some(authority.to_string())
-    }
 }
 
 /// Type alias for the complex callback function type
@@ -235,15 +219,27 @@ impl DeepgramSTTConfig {
             detect_entities: f.entity_detection.unwrap_or(false),
             replace: str_vec("replace"),
             search: str_vec("search"),
-            dictation: ex.get("dictation").and_then(|v| v.as_bool()).unwrap_or(false),
-            callback: ex.get("callback").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            dictation: ex
+                .get("dictation")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            callback: ex
+                .get("callback")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             callback_method: ex
                 .get("callback_method")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            mip_opt_out: ex.get("mip_opt_out").and_then(|v| v.as_bool()).unwrap_or(false),
+            mip_opt_out: ex
+                .get("mip_opt_out")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             extra: str_vec("extra"),
-            version: ex.get("version").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            version: ex
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             // CAPABILITY GAP — intentionally NOT mapped to the wire:
             //   * `alternatives` (N-best): absent from Deepgram's streaming AsyncAPI
             //     query-parameter schema and from the streaming feature overview — it is a
@@ -384,6 +380,41 @@ fn encode_query_value(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
+fn validate_deepgram_streaming_callback_url(callback: &str) -> Result<String, STTError> {
+    let callback = callback.trim();
+    if callback.is_empty() {
+        return Err(STTError::ConfigurationError(
+            "Deepgram callback rejected (SSRF protection): empty URL".to_string(),
+        ));
+    }
+
+    crate::core::net::validate_url_for_ssrf(callback, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| {
+            STTError::ConfigurationError(format!(
+                "Deepgram callback rejected (SSRF protection): {msg}"
+            ))
+        },
+    )?;
+    Ok(callback.to_string())
+}
+
+fn normalize_deepgram_streaming_callback_method(method: &str) -> Result<String, STTError> {
+    let method = method.trim();
+    if method.is_empty() {
+        return Err(STTError::ConfigurationError(
+            "Deepgram callback_method rejected: empty method".to_string(),
+        ));
+    }
+
+    let method = method.to_ascii_uppercase();
+    match method.as_str() {
+        "POST" | "PUT" => Ok(method),
+        _ => Err(STTError::ConfigurationError(format!(
+            "Deepgram callback_method rejected: expected POST or PUT, got {method}"
+        ))),
+    }
+}
+
 impl DeepgramSTT {
     /// Internal: construct the provider from an already-mapped Deepgram config.
     fn from_deepgram_config(deepgram_config: DeepgramSTTConfig) -> Self {
@@ -426,9 +457,9 @@ impl DeepgramSTT {
                 "API key is required".to_string(),
             ));
         }
-        Ok(Self::from_deepgram_config(DeepgramSTTConfig::from_standard(
-            std,
-        )))
+        Ok(Self::from_deepgram_config(
+            DeepgramSTTConfig::from_standard(std),
+        ))
     }
 
     /// Build the WebSocket URL with query parameters (optimized string building)
@@ -454,22 +485,30 @@ impl DeepgramSTT {
         if config.base.model.is_empty() {
             url.push_str("nova-2");
         } else {
-            url.push_str(&config.base.model);
+            url.push_str(&encode_query_value(&config.base.model));
         }
         url.push_str("&language=");
-        url.push_str(&config.base.language);
+        url.push_str(&encode_query_value(&config.base.language));
         url.push_str("&sample_rate=");
         url.push_str(&config.base.sample_rate.to_string());
         url.push_str("&channels=");
         url.push_str(&config.base.channels.to_string());
         url.push_str("&punctuate=");
-        url.push_str(if config.base.punctuation { "true" } else { "false" });
+        url.push_str(if config.base.punctuation {
+            "true"
+        } else {
+            "false"
+        });
         url.push_str("&interim_results=");
-        url.push_str(if config.interim_results { "true" } else { "false" });
+        url.push_str(if config.interim_results {
+            "true"
+        } else {
+            "false"
+        });
         url.push_str("&smart_format=");
         url.push_str(if config.smart_format { "true" } else { "false" });
         url.push_str("&encoding=");
-        url.push_str(&config.base.encoding);
+        url.push_str(&encode_query_value(&config.base.encoding));
 
         // Add optional parameters only if they're set
         if let Some(endpointing) = config.endpointing {
@@ -496,8 +535,11 @@ impl DeepgramSTT {
                 }
             } else {
                 url.push_str("&keywords=");
-                let encoded: Vec<String> =
-                    config.keywords.iter().map(|k| encode_query_value(k)).collect();
+                let encoded: Vec<String> = config
+                    .keywords
+                    .iter()
+                    .map(|k| encode_query_value(k))
+                    .collect();
                 url.push_str(&encoded.join(","));
             }
         }
@@ -556,14 +598,16 @@ impl DeepgramSTT {
 
         // Callback URL — Deepgram POSTs results to this URL (percent-encoded).
         if let Some(callback) = &config.callback {
+            let callback = validate_deepgram_streaming_callback_url(callback)?;
             url.push_str("&callback=");
-            url.push_str(&encode_query_value(callback));
+            url.push_str(&encode_query_value(&callback));
         }
 
         // Callback HTTP method (POST/PUT).
         if let Some(method) = &config.callback_method {
+            let method = normalize_deepgram_streaming_callback_method(method)?;
             url.push_str("&callback_method=");
-            url.push_str(&encode_query_value(method));
+            url.push_str(&encode_query_value(&method));
         }
 
         // Model Improvement Program opt-out.
@@ -732,16 +776,6 @@ impl DeepgramSTT {
 
         // Clone necessary data for the connection task
         let api_key = config.base.api_key.clone();
-        let use_eu_endpoint = config.use_eu_endpoint;
-        // The Host header must match the endpoint actually being dialed. For an override
-        // (mock/proxy) derive it from the override authority; otherwise the production host.
-        let host: String = if let Some(o) = &config.endpoint_override {
-            ws_authority(o).unwrap_or_else(|| "api.deepgram.com".to_string())
-        } else if use_eu_endpoint {
-            "api.eu.deepgram.com".to_string()
-        } else {
-            "api.deepgram.com".to_string()
-        };
         // Per-connection reconnection policy (backoff/jitter is inherently per-connection). The
         // STORM-CONTROL governor and the PROVIDER circuit breaker, however, are the single
         // process-global handles injected from CoreState (W-D2) so every Deepgram session trips
@@ -797,17 +831,20 @@ impl DeepgramSTT {
                 manager.start_attempt();
 
                 // --- Dial + restore the featured session (re-send via the featured URL) ---
-                let request = match tokio_tungstenite::tungstenite::http::Request::builder()
-                    .method("GET")
-                    .uri(&ws_url)
-                    .header("Host", host.clone())
-                    .header("Upgrade", "websocket")
-                    .header("Connection", "upgrade")
-                    .header("Sec-WebSocket-Key", generate_key())
-                    .header("Sec-WebSocket-Version", "13")
-                    .header("Authorization", format!("Token {api_key}"))
-                    .body(())
-                {
+                // Build the upgrade request via `into_client_request` (repo convention): it
+                // derives the 5 mandatory WS handshake headers (`Host`, `Connection`, `Upgrade`,
+                // `Sec-WebSocket-Version`, `Sec-WebSocket-Key`) from the dial URL; only
+                // Deepgram's auth header rides on top.
+                let built = ws_url
+                    .as_str()
+                    .into_client_request()
+                    .and_then(|mut request| {
+                        request
+                            .headers_mut()
+                            .insert("Authorization", format!("Token {api_key}").parse()?);
+                        Ok(request)
+                    });
+                let request = match built {
                     Ok(request) => request,
                     Err(e) => {
                         // A malformed request is fatal — retrying is pointless.
@@ -820,13 +857,20 @@ impl DeepgramSTT {
                     }
                 };
 
-                let ws_stream = match connect_async(request).await {
+                // Deadline-bounded dial: flatten timeout + connect error into one
+                // message so both take the same reconnect-eligible path below.
+                let dial = match with_timeout(WS_CONNECT_TIMEOUT, connect_async(request)).await {
+                    Ok(res) => res.map_err(|e| format!("Failed to connect to Deepgram: {e}")),
+                    Err(_) => Err(format!(
+                        "connect to Deepgram timed out after {}s",
+                        WS_CONNECT_TIMEOUT.as_secs()
+                    )),
+                };
+                let ws_stream = match dial {
                     Ok((s, _)) => s,
-                    Err(e) => {
+                    Err(msg) => {
                         // Eligible for reconnection: the upstream may just be flapping.
-                        let stt_error = STTError::ConnectionFailed(format!(
-                            "Failed to connect to Deepgram: {e}"
-                        ));
+                        let stt_error = STTError::ConnectionFailed(msg);
                         error!("{}", stt_error);
                         breaker.record_failure();
                         crate::core::metrics::bridge::record_reconnect("deepgram", "failure");
@@ -1240,7 +1284,12 @@ impl BaseSTT for DeepgramSTT {
 
         // Wait for connection task to finish (this now includes waiting for speech_final)
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "deepgram-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         // CRITICAL: Give result forwarding task time to process any pending results
@@ -1250,14 +1299,20 @@ impl BaseSTT for DeepgramSTT {
 
         // Clean up result forwarding task
         if let Some(handle) = self.result_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task(
+                "deepgram-stt-result-forwarder",
+                handle,
+            )
+            .await;
         }
 
         // Clean up error forwarding task
         if let Some(handle) = self.error_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task(
+                "deepgram-stt-error-forwarder",
+                handle,
+            )
+            .await;
         }
 
         // Clean up channels but PRESERVE callbacks
@@ -1536,6 +1591,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_deepgram_base_query_values_are_encoded() {
+        let stt = DeepgramSTT::default();
+        let config = DeepgramSTTConfig {
+            base: STTConfig {
+                model: "nova-3&sample_rate=8000".to_string(),
+                provider: "deepgram".to_string(),
+                api_key: "test_key".to_string(),
+                language: "en-US&channels=9".to_string(),
+                sample_rate: 16000,
+                channels: 1,
+                punctuation: true,
+                encoding: "linear16&punctuate=false".to_string(),
+            },
+            ..Default::default()
+        };
+
+        let url = stt.build_websocket_url(&config).unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+        let pairs: Vec<_> = parsed.query_pairs().collect();
+        assert!(pairs.contains(&("model".into(), "nova-3&sample_rate=8000".into())));
+        assert!(pairs.contains(&("language".into(), "en-US&channels=9".into())));
+        assert!(pairs.contains(&("encoding".into(), "linear16&punctuate=false".into())));
+        assert_eq!(
+            pairs
+                .iter()
+                .filter(|(key, value)| key == "sample_rate" && value == "16000")
+                .count(),
+            1,
+            "url: {url}"
+        );
+        assert_eq!(
+            pairs
+                .iter()
+                .filter(|(key, value)| key == "channels" && value == "1")
+                .count(),
+            1,
+            "url: {url}"
+        );
+        assert!(
+            !url.contains("model=nova-3&sample_rate=8000"),
+            "model must be encoded as one query value: {url}"
+        );
+        assert!(
+            !url.contains("language=en-US&channels=9"),
+            "language must be encoded as one query value: {url}"
+        );
+        assert!(
+            !url.contains("encoding=linear16&punctuate=false"),
+            "encoding must be encoded as one query value: {url}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_deepgram_url_encodes_keyterms_and_gates_utterance_end() {
         let stt = DeepgramSTT::default();
         let base = |model: &str| STTConfig {
@@ -1552,8 +1660,14 @@ mod tests {
             ..Default::default()
         };
         let url = stt.build_websocket_url(&cfg).unwrap();
-        assert!(url.contains("keyterm=John+Smith"), "keyterm not encoded: {url}");
-        assert!(!url.contains("keyterm=John Smith"), "raw space leaked into URL: {url}");
+        assert!(
+            url.contains("keyterm=John+Smith"),
+            "keyterm not encoded: {url}"
+        );
+        assert!(
+            !url.contains("keyterm=John Smith"),
+            "raw space leaked into URL: {url}"
+        );
 
         // Legacy keywords on nova-2 are encoded per-term and comma-joined.
         let cfg2 = DeepgramSTTConfig {
@@ -1562,7 +1676,10 @@ mod tests {
             ..Default::default()
         };
         let url2 = stt.build_websocket_url(&cfg2).unwrap();
-        assert!(url2.contains("keywords=New+York,L.A."), "keywords not encoded: {url2}");
+        assert!(
+            url2.contains("keywords=New+York,L.A."),
+            "keywords not encoded: {url2}"
+        );
 
         // utterance_end_ms gating: below 1000 OR interim_results=false ⇒ NOT emitted.
         let below = DeepgramSTTConfig {
@@ -1571,7 +1688,11 @@ mod tests {
             utterance_end_ms: Some(500),
             ..Default::default()
         };
-        assert!(!stt.build_websocket_url(&below).unwrap().contains("utterance_end_ms"));
+        assert!(
+            !stt.build_websocket_url(&below)
+                .unwrap()
+                .contains("utterance_end_ms")
+        );
 
         let no_interim = DeepgramSTTConfig {
             base: base("nova-3"),
@@ -1626,7 +1747,7 @@ mod tests {
     // for Deepgram via StandardSTTConfig and actually reach the wire.
     #[tokio::test]
     async fn test_deepgram_from_standard_unlocks_advanced_features() {
-        use super::super::standard::{SttFeatures, StandardSTTConfig};
+        use super::super::standard::{StandardSTTConfig, SttFeatures};
         let stt = DeepgramSTT::default();
         let std_cfg = StandardSTTConfig {
             base: STTConfig {
@@ -1678,8 +1799,14 @@ mod tests {
             ..Default::default()
         };
         let url_off = stt.build_websocket_url(&off).unwrap();
-        assert!(!url_off.contains("numerals="), "numerals leaked when off: {url_off}");
-        assert!(!url_off.contains("multichannel="), "multichannel leaked when off: {url_off}");
+        assert!(
+            !url_off.contains("numerals="),
+            "numerals leaked when off: {url_off}"
+        );
+        assert!(
+            !url_off.contains("multichannel="),
+            "multichannel leaked when off: {url_off}"
+        );
 
         // On => exact wire params MUST appear.
         let on = DeepgramSTTConfig {
@@ -1689,8 +1816,14 @@ mod tests {
             ..Default::default()
         };
         let url_on = stt.build_websocket_url(&on).unwrap();
-        assert!(url_on.contains("&numerals=true"), "numerals missing from URL: {url_on}");
-        assert!(url_on.contains("&multichannel=true"), "multichannel missing from URL: {url_on}");
+        assert!(
+            url_on.contains("&numerals=true"),
+            "numerals missing from URL: {url_on}"
+        );
+        assert!(
+            url_on.contains("&multichannel=true"),
+            "multichannel missing from URL: {url_on}"
+        );
     }
 
     // WIRE-LEVEL keystone test: the standardized SttFeatures -> from_standard -> URL path.
@@ -1699,7 +1832,7 @@ mod tests {
     // NOT appear on the wire even when requested in the standardized features.
     #[tokio::test]
     async fn test_deepgram_from_standard_numerals_multichannel_and_gaps() {
-        use super::super::standard::{SttFeatures, StandardSTTConfig};
+        use super::super::standard::{StandardSTTConfig, SttFeatures};
         let stt = DeepgramSTT::default();
         let std_cfg = StandardSTTConfig {
             base: STTConfig {
@@ -1724,12 +1857,24 @@ mod tests {
         assert!(cfg.multichannel);
         // ...and they reach the actual request URL.
         let url = stt.build_websocket_url(&cfg).unwrap();
-        assert!(url.contains("&numerals=true"), "numerals not on wire: {url}");
-        assert!(url.contains("&multichannel=true"), "multichannel not on wire: {url}");
+        assert!(
+            url.contains("&numerals=true"),
+            "numerals not on wire: {url}"
+        );
+        assert!(
+            url.contains("&multichannel=true"),
+            "multichannel not on wire: {url}"
+        );
         // Capability gaps: these params must NEVER appear on the streaming URL, even though the
         // standardized features requested them (Deepgram does not support them on streaming).
-        assert!(!url.contains("alternatives="), "alternatives must be a streaming gap: {url}");
-        assert!(!url.contains("detect_language="), "detect_language must be a streaming gap: {url}");
+        assert!(
+            !url.contains("alternatives="),
+            "alternatives must be a streaming gap: {url}"
+        );
+        assert!(
+            !url.contains("detect_language="),
+            "detect_language must be a streaming gap: {url}"
+        );
     }
 
     // WIRE-LEVEL guard: entity detection + find/replace + search + dictation + callback +
@@ -1751,8 +1896,15 @@ mod tests {
         };
         let url_off = stt.build_websocket_url(&off).unwrap();
         for p in [
-            "detect_entities=", "replace=", "search=", "dictation=", "callback=",
-            "callback_method=", "mip_opt_out=", "extra=", "version=",
+            "detect_entities=",
+            "replace=",
+            "search=",
+            "dictation=",
+            "callback=",
+            "callback_method=",
+            "mip_opt_out=",
+            "extra=",
+            "version=",
         ] {
             assert!(!url_off.contains(p), "{p} leaked when unset: {url_off}");
         }
@@ -1772,20 +1924,44 @@ mod tests {
             ..Default::default()
         };
         let url = stt.build_websocket_url(&on).unwrap();
-        assert!(url.contains("&detect_entities=true"), "detect_entities missing: {url}");
+        assert!(
+            url.contains("&detect_entities=true"),
+            "detect_entities missing: {url}"
+        );
         // find/replace + search values are percent-encoded (space -> +, ':' escaped).
-        assert!(url.contains("&replace=John+Smith%3AJon+Smith"), "replace not encoded: {url}");
-        assert!(url.contains("&search=medication"), "search[0] missing: {url}");
-        assert!(url.contains("&search=blood+pressure"), "search[1] not encoded: {url}");
+        assert!(
+            url.contains("&replace=John+Smith%3AJon+Smith"),
+            "replace not encoded: {url}"
+        );
+        assert!(
+            url.contains("&search=medication"),
+            "search[0] missing: {url}"
+        );
+        assert!(
+            url.contains("&search=blood+pressure"),
+            "search[1] not encoded: {url}"
+        );
         assert!(url.contains("&dictation=true"), "dictation missing: {url}");
         assert!(
             url.contains("&callback=https%3A%2F%2Fexample.com%2Fcb%3Fx%3D1"),
             "callback not encoded: {url}"
         );
-        assert!(url.contains("&callback_method=PUT"), "callback_method missing: {url}");
-        assert!(url.contains("&mip_opt_out=true"), "mip_opt_out missing: {url}");
-        assert!(url.contains("&extra=session%3Aabc+123"), "extra not encoded: {url}");
-        assert!(url.contains("&version=2024-01-09.0"), "version missing: {url}");
+        assert!(
+            url.contains("&callback_method=PUT"),
+            "callback_method missing: {url}"
+        );
+        assert!(
+            url.contains("&mip_opt_out=true"),
+            "mip_opt_out missing: {url}"
+        );
+        assert!(
+            url.contains("&extra=session%3Aabc+123"),
+            "extra not encoded: {url}"
+        );
+        assert!(
+            url.contains("&version=2024-01-09.0"),
+            "version missing: {url}"
+        );
     }
 
     // WIRE-LEVEL keystone: SttFeatures (typed entity_detection) + ProviderExtras passthrough ->
@@ -1793,14 +1969,14 @@ mod tests {
     // wire, end-to-end through the reachable path.
     #[tokio::test]
     async fn test_deepgram_from_standard_extended_features_reach_the_wire() {
-        use super::super::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use super::super::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let stt = DeepgramSTT::default();
         let extras = ProviderExtras(
             serde_json::json!({
                 "replace": ["color:colour"],
                 "search": "refund",
                 "dictation": true,
-                "callback": "https://cb.test/hook",
+                "callback": "https://example.com/hook",
                 "callback_method": "POST",
                 "mip_opt_out": true,
                 "extra": ["tenant:acme", "trace:42"],
@@ -1829,10 +2005,13 @@ mod tests {
         assert_eq!(cfg.replace, vec!["color:colour".to_string()]);
         assert_eq!(cfg.search, vec!["refund".to_string()]);
         assert!(cfg.dictation);
-        assert_eq!(cfg.callback.as_deref(), Some("https://cb.test/hook"));
+        assert_eq!(cfg.callback.as_deref(), Some("https://example.com/hook"));
         assert_eq!(cfg.callback_method.as_deref(), Some("POST"));
         assert!(cfg.mip_opt_out);
-        assert_eq!(cfg.extra, vec!["tenant:acme".to_string(), "trace:42".to_string()]);
+        assert_eq!(
+            cfg.extra,
+            vec!["tenant:acme".to_string(), "trace:42".to_string()]
+        );
         assert_eq!(cfg.version.as_deref(), Some("beta"));
         // ...and reach the request URL.
         let url = stt.build_websocket_url(&cfg).unwrap();
@@ -1840,12 +2019,79 @@ mod tests {
         assert!(url.contains("&replace=color%3Acolour"), "{url}");
         assert!(url.contains("&search=refund"), "{url}");
         assert!(url.contains("&dictation=true"), "{url}");
-        assert!(url.contains("&callback=https%3A%2F%2Fcb.test%2Fhook"), "{url}");
+        assert!(
+            url.contains("&callback=https%3A%2F%2Fexample.com%2Fhook"),
+            "{url}"
+        );
         assert!(url.contains("&callback_method=POST"), "{url}");
         assert!(url.contains("&mip_opt_out=true"), "{url}");
         assert!(url.contains("&extra=tenant%3Aacme"), "{url}");
         assert!(url.contains("&extra=trace%3A42"), "{url}");
         assert!(url.contains("&version=beta"), "{url}");
+    }
+
+    #[tokio::test]
+    async fn test_deepgram_streaming_callback_validation() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let stt = DeepgramSTT::default();
+        let base = STTConfig {
+            model: "nova-3".to_string(),
+            api_key: "k".to_string(),
+            ..Default::default()
+        };
+
+        let ok = DeepgramSTTConfig {
+            base: base.clone(),
+            callback: Some(" https://example.com/cb?x=1&y=two words ".to_string()),
+            callback_method: Some("put".to_string()),
+            ..Default::default()
+        };
+        let url = stt.build_websocket_url(&ok).unwrap();
+        assert!(
+            url.contains("&callback=https%3A%2F%2Fexample.com%2Fcb%3Fx%3D1%26y%3Dtwo+words"),
+            "{url}"
+        );
+        assert!(url.contains("&callback_method=PUT"), "{url}");
+
+        let loopback = DeepgramSTTConfig {
+            base: base.clone(),
+            callback: Some("http://127.0.0.1:9000/cb".to_string()),
+            ..Default::default()
+        };
+        let err = stt
+            .build_websocket_url(&loopback)
+            .expect_err("loopback callback URL must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        let file = DeepgramSTTConfig {
+            base: base.clone(),
+            callback: Some("file:///tmp/cb".to_string()),
+            ..Default::default()
+        };
+        let err = stt
+            .build_websocket_url(&file)
+            .expect_err("non-HTTP callback URL must be rejected");
+        assert!(err.to_string().contains("URL scheme"), "{err}");
+
+        let blank = DeepgramSTTConfig {
+            base: base.clone(),
+            callback: Some("   ".to_string()),
+            ..Default::default()
+        };
+        let err = stt
+            .build_websocket_url(&blank)
+            .expect_err("blank callback URL must be rejected");
+        assert!(err.to_string().contains("empty URL"), "{err}");
+
+        let invalid_method = DeepgramSTTConfig {
+            base,
+            callback_method: Some("DELETE".to_string()),
+            ..Default::default()
+        };
+        let err = stt
+            .build_websocket_url(&invalid_method)
+            .expect_err("invalid callback method must be rejected");
+        assert!(err.to_string().contains("expected POST or PUT"), "{err}");
     }
 
     #[tokio::test]
@@ -1978,9 +2224,7 @@ mod tests {
 
     /// Build a `DeepgramSTT` the same way the VoiceManager does for a live session: construct
     /// from a standardized config, then inject the shared resilience handles from the registry.
-    fn session_from_registry(
-        reg: &crate::core::resilience::ResilienceRegistry,
-    ) -> DeepgramSTT {
+    fn session_from_registry(reg: &crate::core::resilience::ResilienceRegistry) -> DeepgramSTT {
         use crate::core::stt::base::BaseSTT;
         let std = crate::core::stt::standard::StandardSTTConfig::from_base(STTConfig {
             provider: "deepgram".to_string(),
@@ -2000,8 +2244,12 @@ mod tests {
         let session_a = session_from_registry(&reg);
         let session_b = session_from_registry(&reg);
 
-        let breaker_a = session_a.resilience_breaker().expect("A has shared breaker");
-        let breaker_b = session_b.resilience_breaker().expect("B has shared breaker");
+        let breaker_a = session_a
+            .resilience_breaker()
+            .expect("A has shared breaker");
+        let breaker_b = session_b
+            .resilience_breaker()
+            .expect("B has shared breaker");
         assert!(
             Arc::ptr_eq(breaker_a, breaker_b),
             "both Deepgram sessions must share the one provider breaker"
@@ -2011,7 +2259,10 @@ mod tests {
         for _ in 0..10 {
             breaker_a.record_failure();
         }
-        assert_eq!(breaker_a.state(), crate::core::resilience::CircuitState::Open);
+        assert_eq!(
+            breaker_a.state(),
+            crate::core::resilience::CircuitState::Open
+        );
         // Session B — a different session — sees the open breaker and is denied a reconnect.
         assert!(
             !breaker_b.allow_request(),
@@ -2033,7 +2284,11 @@ mod tests {
             Arc::ptr_eq(gov_a, gov_b),
             "both sessions must share one process-global governor"
         );
-        assert_eq!(gov_a.max_concurrent(), 3, "the cap is the registry's, not a per-session default");
+        assert_eq!(
+            gov_a.max_concurrent(),
+            3,
+            "the cap is the registry's, not a per-session default"
+        );
 
         // A permit taken via session A's governor is visible as in-flight via session B's
         // governor handle — proving the cap is shared, not per-session.

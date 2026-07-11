@@ -3,13 +3,56 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 
-use super::base::{AudioCallback, BaseTTS, ConnectionState, TTSConfig, TTSResult};
+use super::base::{AudioCallback, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult};
 use super::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
 use crate::utils::req_manager::ReqManager;
 use xxhash_rust::xxh3::xxh3_128;
 
 /// Deepgram TTS endpoint
 pub const DEEPGRAM_TTS_URL: &str = "https://api.deepgram.com/v1/speak";
+
+fn validate_deepgram_tts_endpoint(source: &str, endpoint: &str) -> TTSResult<()> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}")),
+    )
+}
+
+fn validate_deepgram_callback_url<'a>(source: &str, callback: &'a str) -> TTSResult<&'a str> {
+    let callback = callback.trim();
+    if callback.is_empty() {
+        return Err(TTSError::InvalidConfiguration(format!(
+            "{source} rejected (SSRF protection): empty URL"
+        )));
+    }
+
+    crate::core::net::validate_url_for_ssrf(callback, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}")),
+    )?;
+
+    Ok(callback)
+}
+
+fn normalize_deepgram_callback_method(method: &str) -> TTSResult<String> {
+    let method = method.trim();
+    if method.is_empty() {
+        return Err(TTSError::InvalidConfiguration(
+            "callback_method rejected: empty method".to_string(),
+        ));
+    }
+
+    let method = method.to_ascii_uppercase();
+    match method.as_str() {
+        "POST" | "PUT" => Ok(method),
+        _ => Err(TTSError::InvalidConfiguration(format!(
+            "callback_method rejected: expected POST or PUT, got {method}"
+        ))),
+    }
+}
 
 /// Deepgram-specific request builder
 #[derive(Clone)]
@@ -47,59 +90,63 @@ impl TTSRequestBuilder for DeepgramRequestBuilder {
             DEEPGRAM_TTS_URL,
             self.speak.endpoint_override.as_deref(),
         );
-        let mut params = Vec::new();
+        let mut params: Vec<(&str, String)> = Vec::new();
 
         // Use model field if provided, otherwise fall back to voice_id
         if !self.config.model.is_empty() {
-            params.push(format!("model={}", self.config.model));
+            params.push(("model", self.config.model.clone()));
         } else if let Some(voice_id) = &self.config.voice_id {
-            params.push(format!("model={voice_id}"));
+            params.push(("model", voice_id.clone()));
         }
 
         // Encoding (default to raw linear PCM)
         let encoding = self.config.audio_format.as_deref().unwrap_or("linear16");
-        params.push(format!("encoding={encoding}"));
+        params.push(("encoding", encoding.to_string()));
 
         // Ensure no container when requesting raw PCM to avoid WAV headers
         // Aligns with WS behavior which delivers raw binary frames without headers
         match encoding {
             "linear16" | "pcm" | "mulaw" | "ulaw" | "alaw" => {
-                params.push("container=none".to_string());
+                params.push(("container", "none".to_string()));
             }
             _ => {}
         }
 
         if let Some(sample_rate) = self.config.sample_rate {
-            params.push(format!("sample_rate={sample_rate}"));
+            params.push(("sample_rate", sample_rate.to_string()));
         } else {
             // Use 24000 to match defaults elsewhere (e.g., WS path)
-            params.push("sample_rate=24000".to_string());
+            params.push(("sample_rate", "24000".to_string()));
         }
 
         // Speaking speed/rate (`speed`, Deepgram range 0.7–1.5). Only emitted when explicitly set
         // via the standardized features, so existing default behavior (no `speed` param) is kept.
         if let Some(speed) = self.speak.speed {
-            params.push(format!("speed={speed}"));
+            params.push(("speed", speed.to_string()));
         }
 
         // Output audio bitrate (`bit_rate`, bits/sec).
         if let Some(bit_rate) = self.speak.bit_rate {
-            params.push(format!("bit_rate={bit_rate}"));
+            params.push(("bit_rate", bit_rate.to_string()));
         }
 
         // Async result callback URL (`callback`).
         if let Some(callback) = &self.speak.callback {
-            params.push(format!("callback={callback}"));
+            params.push(("callback", callback.clone()));
         }
 
         // Callback HTTP method (`callback_method`, POST|PUT).
         if let Some(method) = &self.speak.callback_method {
-            params.push(format!("callback_method={method}"));
+            params.push(("callback_method", method.clone()));
         }
 
         if !params.is_empty() {
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            for (key, value) in &params {
+                serializer.append_pair(key, value);
+            }
             url.push('?');
-            url.push_str(&params.join("&"));
+            url.push_str(&serializer.finish());
         }
 
         // Determine Accept header based on encoding format
@@ -185,6 +232,10 @@ impl DeepgramTTS {
 
     /// Create a new Deepgram TTS instance with advanced `/v1/speak` query parameters.
     fn new_with_speak(config: TTSConfig, speak: DeepgramSpeakParams) -> TTSResult<Self> {
+        Ok(Self::build_with_speak(config, speak))
+    }
+
+    fn build_with_speak(config: TTSConfig, speak: DeepgramSpeakParams) -> Self {
         let pronunciation_replacer = if !config.pronunciations.is_empty() {
             Some(PronunciationReplacer::new(&config.pronunciations))
         } else {
@@ -196,11 +247,11 @@ impl DeepgramTTS {
             pronunciation_replacer,
             speak,
         };
-        Ok(Self {
-            provider: TTSProvider::new()?,
+        Self {
+            provider: TTSProvider::new(),
             request_builder,
             config_hash: hash,
-        })
+        }
     }
 
     /// Build from the standardized config (W1 keystone). Deepgram's flat `TTSConfig` is the
@@ -216,16 +267,28 @@ impl DeepgramTTS {
     ///
     /// Pitch/volume, emotion, instructions, SSML, voice settings, word timestamps, streaming, seed
     /// and language have no Deepgram `/v1/speak` parameter and are skipped (capability gaps).
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let f = &std.features;
         let mut base = std.base.clone();
         if let Some(sr) = f.sample_rate {
             base.sample_rate = Some(sr);
         }
 
+        if let Some(endpoint) = std.endpoint_override() {
+            validate_deepgram_tts_endpoint("endpoint_override", endpoint)?;
+        }
+
         let extras = &std.extras.0;
+        let callback = match extras.get("callback").and_then(|v| v.as_str()) {
+            Some(callback) => {
+                Some(validate_deepgram_callback_url("callback", callback).map(str::to_string)?)
+            }
+            None => None,
+        };
+        let callback_method = match extras.get("callback_method").and_then(|v| v.as_str()) {
+            Some(method) => Some(normalize_deepgram_callback_method(method)?),
+            None => None,
+        };
         let speak = DeepgramSpeakParams {
             // Typed speed → mirror onto `speaking_rate` (so the flat config stays consistent) and
             // emit `speed=` on the wire.
@@ -234,14 +297,8 @@ impl DeepgramTTS {
                 .get("bit_rate")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as u32),
-            callback: extras
-                .get("callback")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            callback_method: extras
-                .get("callback_method")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
+            callback,
+            callback_method,
             endpoint_override: std.endpoint_override().map(String::from),
         };
         if let Some(speed) = f.speed {
@@ -259,7 +316,7 @@ impl DeepgramTTS {
 
 impl Default for DeepgramTTS {
     fn default() -> Self {
-        Self::new(TTSConfig::default()).unwrap()
+        Self::build_with_speak(TTSConfig::default(), DeepgramSpeakParams::default())
     }
 }
 
@@ -362,6 +419,13 @@ mod tests {
         assert_eq!(tts.get_connection_state(), ConnectionState::Disconnected);
     }
 
+    #[tokio::test]
+    async fn deepgram_default_is_disconnected_and_does_not_depend_on_result_unwrap() {
+        let tts = DeepgramTTS::default();
+        assert!(!tts.is_ready());
+        assert_eq!(tts.get_connection_state(), ConnectionState::Disconnected);
+    }
+
     // W1 keystone: Deepgram's narrow `/v1/speak` surface only expresses `sample_rate`; the
     // standardized feature reaches the flat config the request builder reads. Other features are
     // capability gaps (no Deepgram parameter) and are intentionally skipped.
@@ -381,12 +445,52 @@ mod tests {
             extras: Default::default(),
         };
         let tts = DeepgramTTS::from_standard(&std).unwrap();
-        assert_eq!(
-            tts.request_builder.config.sample_rate,
-            Some(48000)
-        );
+        assert_eq!(tts.request_builder.config.sample_rate, Some(48000));
         // base carried through.
         assert_eq!(tts.request_builder.config.api_key, "k");
+    }
+
+    #[tokio::test]
+    async fn from_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mk = |endpoint: &str| {
+            crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+                provider: "deepgram".into(),
+                api_key: "k".into(),
+                voice_id: Some("aura-asteria-en".into()),
+                ..Default::default()
+            })
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(DeepgramTTS::from_standard(&mk("https://deepgram-proxy.example.com")).is_ok());
+
+        let err = match DeepgramTTS::from_standard(&mk("http://127.0.0.1:9000")) {
+            Ok(_) => panic!("loopback endpoint override should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("SSRF protection"),
+            "unexpected error: {err}"
+        );
+
+        let err = match DeepgramTTS::from_standard(&mk("file:///tmp/socket")) {
+            Ok(_) => panic!("file endpoint override should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("URL scheme"),
+            "unexpected error: {err}"
+        );
+
+        let err = match DeepgramTTS::from_standard(&mk("ws://deepgram-proxy.example.com")) {
+            Ok(_) => panic!("websocket endpoint override should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("URL scheme"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -431,9 +535,9 @@ mod tests {
         extras.insert("bit_rate".into(), serde_json::json!(48000));
         extras.insert(
             "callback".into(),
-            serde_json::json!("https://example.com/cb"),
+            serde_json::json!("https://example.com/cb?x=1&y=two words"),
         );
-        extras.insert("callback_method".into(), serde_json::json!("PUT"));
+        extras.insert("callback_method".into(), serde_json::json!("put"));
 
         let std = StandardTTSConfig {
             base: TTSConfig {
@@ -461,14 +565,117 @@ mod tests {
             .to_string();
 
         assert!(url.contains("speed=0.9"), "speed missing from URL: {url}");
-        assert!(url.contains("bit_rate=48000"), "bit_rate missing from URL: {url}");
         assert!(
-            url.contains("callback=https") || url.contains("callback=https%3A"),
-            "callback missing from URL: {url}"
+            url.contains("bit_rate=48000"),
+            "bit_rate missing from URL: {url}"
+        );
+        let parsed = url::Url::parse(&url).unwrap();
+        let callback = parsed
+            .query_pairs()
+            .find(|(key, _)| key == "callback")
+            .map(|(_, value)| value.into_owned());
+        assert_eq!(
+            callback.as_deref(),
+            Some("https://example.com/cb?x=1&y=two words"),
+            "callback missing or corrupted in URL: {url}"
+        );
+        assert!(
+            url.contains("callback=https%3A%2F%2F"),
+            "callback URL was not form-encoded: {url}"
         );
         assert!(
             url.contains("callback_method=PUT"),
             "callback_method missing from URL: {url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_standard_rejects_ssrf_callback_url() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig};
+
+        let mk = |callback: &str| {
+            let mut extras = serde_json::Map::new();
+            extras.insert("callback".into(), serde_json::json!(callback));
+            StandardTTSConfig {
+                base: TTSConfig {
+                    provider: "deepgram".into(),
+                    api_key: "k".into(),
+                    voice_id: Some("aura-2-thalia-en".into()),
+                    ..Default::default()
+                },
+                features: Default::default(),
+                extras: ProviderExtras(extras),
+            }
+        };
+
+        assert!(DeepgramTTS::from_standard(&mk("https://example.com/cb")).is_ok());
+
+        let err = match DeepgramTTS::from_standard(&mk("http://127.0.0.1:9000/cb")) {
+            Ok(_) => panic!("loopback callback URL should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("SSRF protection"),
+            "unexpected error: {err}"
+        );
+
+        let err = match DeepgramTTS::from_standard(&mk("file:///tmp/cb")) {
+            Ok(_) => panic!("file callback URL should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("URL scheme"),
+            "unexpected error: {err}"
+        );
+
+        let err = match DeepgramTTS::from_standard(&mk("   ")) {
+            Ok(_) => panic!("blank callback URL should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("empty URL"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_standard_rejects_invalid_callback_method() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig};
+
+        let mk = |method: &str| {
+            let mut extras = serde_json::Map::new();
+            extras.insert("callback_method".into(), serde_json::json!(method));
+            StandardTTSConfig {
+                base: TTSConfig {
+                    provider: "deepgram".into(),
+                    api_key: "k".into(),
+                    voice_id: Some("aura-2-thalia-en".into()),
+                    ..Default::default()
+                },
+                features: Default::default(),
+                extras: ProviderExtras(extras),
+            }
+        };
+
+        assert!(DeepgramTTS::from_standard(&mk("post")).is_ok());
+
+        let err = match DeepgramTTS::from_standard(&mk("DELETE")) {
+            Ok(_) => panic!("unsupported callback_method should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("expected POST or PUT"),
+            "unexpected error: {err}"
+        );
+
+        let err = match DeepgramTTS::from_standard(&mk("   ")) {
+            Ok(_) => panic!("blank callback_method should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("empty method"),
+            "unexpected error: {err}"
         );
     }
 
@@ -515,7 +722,10 @@ mod tests {
 
         // callback / callback_method must NOT change the hash (delivery-only).
         let mut cb = serde_json::Map::new();
-        cb.insert("callback".into(), serde_json::json!("https://example.com/cb"));
+        cb.insert(
+            "callback".into(),
+            serde_json::json!("https://example.com/cb"),
+        );
         cb.insert("callback_method".into(), serde_json::json!("POST"));
         let with_callback = mk(TtsFeatures::default(), cb);
         assert_eq!(

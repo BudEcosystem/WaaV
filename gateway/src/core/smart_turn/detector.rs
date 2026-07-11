@@ -31,6 +31,7 @@ use super::mel_extractor::WHISPER_N_MELS;
 /// See: https://huggingface.co/pipecat-ai/smart-turn-v3
 const SMART_TURN_MODEL_URL: &str =
     "https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/main/smart-turn-v3.2-cpu.onnx";
+const SMART_TURN_MODEL_URL_SCHEMES: &[&str] = &["http", "https"];
 
 /// Number of mel frames expected by the model (8 seconds at 10ms = 800 frames).
 pub const SMART_TURN_MAX_FRAMES: usize = 800;
@@ -218,6 +219,10 @@ impl SmartTurnDetectorConfig {
 
     /// Validates the configuration.
     pub fn validate(&self) -> Result<(), String> {
+        if self.model_path.is_none() {
+            smart_turn_model_download_url(self.model_url.as_deref())?;
+        }
+
         if self.threshold < 0.0 || self.threshold > 1.0 {
             return Err(format!(
                 "Threshold must be between 0.0 and 1.0, got {}",
@@ -242,6 +247,16 @@ impl SmartTurnDetectorConfig {
 
         Ok(())
     }
+}
+
+fn smart_turn_model_download_url(custom_url: Option<&str>) -> Result<&str, String> {
+    let url = custom_url.unwrap_or(SMART_TURN_MODEL_URL).trim();
+    if url.is_empty() {
+        return Err("Smart Turn model_url rejected (SSRF protection): empty URL".to_string());
+    }
+    crate::core::net::validate_url_for_ssrf(url, SMART_TURN_MODEL_URL_SCHEMES)
+        .map(|_| url)
+        .map_err(|msg| format!("Smart Turn model_url rejected (SSRF protection): {msg}"))
 }
 
 /// Result of Smart Turn detection.
@@ -425,7 +440,8 @@ impl SmartTurnDetector {
         }
 
         // Attempt to download
-        let model_url = config.model_url.as_deref().unwrap_or(SMART_TURN_MODEL_URL);
+        let model_url = smart_turn_model_download_url(config.model_url.as_deref())
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         let cache_dir: PathBuf = dirs::cache_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -461,7 +477,8 @@ impl SmartTurnDetector {
             }
 
             let download_future = async {
-                let client = reqwest::Client::new();
+                let client = crate::core::net::ssrf_protected_client(SMART_TURN_MODEL_URL_SCHEMES)
+                    .context("Failed to create SSRF-protected download client")?;
                 let response = client
                     .get(model_url)
                     .timeout(std::time::Duration::from_secs(download_timeout_secs))
@@ -1068,6 +1085,38 @@ mod tests {
     fn test_config_validation_valid() {
         let config = SmartTurnDetectorConfig::default();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_unsafe_model_url() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let config = SmartTurnDetectorConfig {
+            model_url: Some(" https://model.example.com/smart-turn.onnx ".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            smart_turn_model_download_url(config.model_url.as_deref()).unwrap(),
+            "https://model.example.com/smart-turn.onnx"
+        );
+
+        let config = SmartTurnDetectorConfig {
+            model_url: Some("http://127.0.0.1:9000/model.onnx".to_string()),
+            ..Default::default()
+        };
+        let err = config
+            .validate()
+            .expect_err("loopback model_url must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        let config = SmartTurnDetectorConfig {
+            model_url: Some("file:///tmp/model.onnx".to_string()),
+            ..Default::default()
+        };
+        let err = config
+            .validate()
+            .expect_err("non-HTTP model_url must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
     }
 
     #[test]

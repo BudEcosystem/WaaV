@@ -26,6 +26,16 @@ use serde::{Deserialize, Serialize};
 use crate::core::stt::aws_transcribe::AwsRegion;
 use crate::core::tts::base::TTSConfig;
 
+fn validate_aws_polly_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Polly Engine
 // =============================================================================
@@ -641,7 +651,12 @@ impl AwsPollyTTSConfig {
         // `TtsFeatures` field for this Polly-specific knob, so it flows through the `extras`
         // passthrough as a string array; only the four valid AWS names are kept so a typo cannot
         // reach the wire as an SDK `Unknown` variant.
-        if let Some(marks) = std.extras.0.get("speech_mark_types").and_then(|v| v.as_array()) {
+        if let Some(marks) = std
+            .extras
+            .0
+            .get("speech_mark_types")
+            .and_then(|v| v.as_array())
+        {
             cfg.speech_mark_types = marks
                 .iter()
                 .filter_map(|v| v.as_str())
@@ -654,13 +669,28 @@ impl AwsPollyTTSConfig {
         // AWS credentials flow through the standardized path via the `extras` passthrough; without
         // this the standard path could never authenticate (the explicit-credential branch in
         // `init_client` was unreachable from `from_standard`).
-        if let Some(k) = std.extras.0.get("aws_access_key_id").and_then(|v| v.as_str()) {
+        if let Some(k) = std
+            .extras
+            .0
+            .get("aws_access_key_id")
+            .and_then(|v| v.as_str())
+        {
             cfg.aws_access_key_id = Some(k.to_string());
         }
-        if let Some(k) = std.extras.0.get("aws_secret_access_key").and_then(|v| v.as_str()) {
+        if let Some(k) = std
+            .extras
+            .0
+            .get("aws_secret_access_key")
+            .and_then(|v| v.as_str())
+        {
             cfg.aws_secret_access_key = Some(k.to_string());
         }
-        if let Some(k) = std.extras.0.get("aws_session_token").and_then(|v| v.as_str()) {
+        if let Some(k) = std
+            .extras
+            .0
+            .get("aws_session_token")
+            .and_then(|v| v.as_str())
+        {
             cfg.aws_session_token = Some(k.to_string());
         }
         cfg
@@ -692,6 +722,10 @@ impl AwsPollyTTSConfig {
         // Validate lexicon count (max 5)
         if self.lexicon_names.len() > 5 {
             return Err("Maximum 5 lexicons can be applied per request".to_string());
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_aws_polly_tts_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -839,6 +873,42 @@ mod tests {
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("lexicons"));
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = AwsPollyTTSConfig::default();
+
+        config.endpoint_override = Some("https://polly-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://polly-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected for REST Polly");
+        assert!(err.contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "aws-polly".into(),
+            sample_rate: Some(16000),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        let cfg = AwsPollyTTSConfig::from_standard(&std);
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! using HTTP streaming for real-time audio synthesis.
 
 use async_trait::async_trait;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -13,6 +13,10 @@ use super::config::{AcapelaAccountInfo, AcapelaTtsConfig, AcapelaVoice};
 use super::messages::{AcapelaApiError, LoginRequest, LoginResponse};
 use crate::core::tts::base::{BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult};
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
+
+fn acapela_tts_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES).build()
+}
 
 // =============================================================================
 // Token Cache
@@ -67,13 +71,12 @@ impl AcapelaRequestBuilder {
         // Build pronunciation replacer from base config. SSML input is forwarded verbatim — the
         // word-boundary regex substitution would corrupt the markup — so the replacer is disabled
         // when `ssml_input` is set (pronunciation control belongs inside the SSML in that case).
-        let pronunciation_replacer = if !base_config.pronunciations.is_empty()
-            && !acapela_config.ssml_input
-        {
-            Some(PronunciationReplacer::new(&base_config.pronunciations))
-        } else {
-            None
-        };
+        let pronunciation_replacer =
+            if !base_config.pronunciations.is_empty() && !acapela_config.ssml_input {
+                Some(PronunciationReplacer::new(&base_config.pronunciations))
+            } else {
+                None
+            };
 
         Self {
             config: acapela_config,
@@ -99,15 +102,8 @@ impl TTSRequestBuilder for AcapelaRequestBuilder {
         // Build query parameters
         let params = self.config.build_query_params(text);
 
-        // Build headers
-        let mut headers = HeaderMap::new();
-
         // Acapela uses "Token <token>" format for authorization
         let auth_value = format!("Token {}", self.token);
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&auth_value).unwrap_or_else(|_| HeaderValue::from_static("")),
-        );
 
         debug!(
             "Acapela TTS request: voice={}, format={}, sample_rate={}, url={}",
@@ -123,7 +119,7 @@ impl TTSRequestBuilder for AcapelaRequestBuilder {
                 self.command_url(),
                 self.config.endpoint_override.as_deref(),
             ))
-            .headers(headers)
+            .header(AUTHORIZATION, auth_value)
             .query(&params)
     }
 
@@ -381,10 +377,10 @@ impl AcapelaTts {
     /// [`AcapelaTtsConfig::from_standard`] (speed/volume/sample_rate/word_timestamps + the
     /// `bitrate`/`dictionaries`/`application` extras) so advanced features reach the live request
     /// builder through the standardized dispatch instead of being dropped at the flat boundary.
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let acapela_config = AcapelaTtsConfig::from_standard(std)?;
+        let auth_client = acapela_tts_http_client()
+            .map_err(|e| TTSError::NetworkError(format!("Failed to build HTTP client: {e}")))?;
 
         info!(
             "Creating Acapela Cloud TTS provider (standardized): voice={}, format={}, sample_rate={}",
@@ -392,11 +388,11 @@ impl AcapelaTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             acapela_config,
             base_config: std.base.clone(),
             token_cache: Arc::new(RwLock::new(None)),
-            auth_client: reqwest::Client::new(),
+            auth_client,
         })
     }
 
@@ -415,6 +411,8 @@ impl BaseTTS for AcapelaTts {
     {
         // Parse Acapela-specific configuration from base config
         let acapela_config = AcapelaTtsConfig::from_base(&config)?;
+        let auth_client = acapela_tts_http_client()
+            .map_err(|e| TTSError::NetworkError(format!("Failed to build HTTP client: {e}")))?;
 
         info!(
             "Creating Acapela Cloud TTS provider: voice={}, format={}, sample_rate={}",
@@ -422,11 +420,11 @@ impl BaseTTS for AcapelaTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             acapela_config,
             base_config: config,
             token_cache: Arc::new(RwLock::new(None)),
-            auth_client: reqwest::Client::new(),
+            auth_client,
         })
     }
 
@@ -562,6 +560,7 @@ impl BaseTTS for AcapelaTts {
 mod tests {
     use super::*;
     use crate::core::tts::acapela::AcapelaAudioFormat;
+    use std::io::ErrorKind;
 
     // W1 keystone: a StandardTTSConfig advanced feature Acapela supports (speed/volume/
     // sample_rate/word_timestamps) reaches the provider's `acapela_config` through the provider
@@ -627,7 +626,10 @@ mod tests {
             extras: Default::default(),
         };
         let tts = AcapelaTts::from_standard(&std).unwrap();
-        assert!(tts.acapela_config().ssml_input, "ssml feature must set ssml_input");
+        assert!(
+            tts.acapela_config().ssml_input,
+            "ssml feature must set ssml_input"
+        );
 
         // The request builder must NOT mangle SSML — the replacer is suppressed.
         let builder = AcapelaRequestBuilder::new(
@@ -647,6 +649,73 @@ mod tests {
             params_map.get("text"),
             Some(&SSML.to_string()),
             "SSML markup must reach the `text` query parameter verbatim"
+        );
+    }
+
+    #[test]
+    fn invalid_acapela_token_header_value_is_request_build_error() {
+        let config = TTSConfig {
+            api_key: "user@example.com:password".into(),
+            voice_id: Some("alice".into()),
+            ..Default::default()
+        };
+        let acapela_config = AcapelaTtsConfig::from_base(&config).unwrap();
+        let builder = AcapelaRequestBuilder::new(acapela_config, config, "bad\ntoken".into());
+        let err = builder
+            .build_http_request(&reqwest::Client::new(), "hello")
+            .build()
+            .expect_err("malformed Acapela token must not become an empty Authorization header");
+
+        assert!(err.is_builder(), "unexpected reqwest error: {err}");
+    }
+
+    #[tokio::test]
+    async fn acapela_tts_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!("Skipping acapela_tts_redirect_policy_rejects_private_hop: {err}");
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = acapela_tts_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
         );
     }
 

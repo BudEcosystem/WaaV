@@ -59,7 +59,8 @@ pub fn sniff_container(bytes: &[u8]) -> Option<SniffedContainer> {
         && (bytes[1] & 0x06) != 0x00 // layer: reserved
         && (bytes[2] & 0xF0) != 0xF0 // bitrate: invalid
         && (bytes[2] & 0xF0) != 0x00 // bitrate: "free" — legal but unused by real encoders; PCM noise hits it
-        && (bytes[2] & 0x0C) != 0x0C // sample rate: reserved
+        && (bytes[2] & 0x0C) != 0x0C
+    // sample rate: reserved
     {
         return Some(SniffedContainer::Mp3);
     }
@@ -76,7 +77,10 @@ pub fn sniff_container(bytes: &[u8]) -> Option<SniffedContainer> {
 
 /// True when the declared format is a raw-PCM family the chunker would slice.
 pub fn is_pcm_family(declared: &str) -> bool {
-    matches!(declared, "linear16" | "pcm" | "pcm16" | "mulaw" | "ulaw" | "alaw")
+    matches!(
+        declared,
+        "linear16" | "pcm" | "pcm16" | "mulaw" | "ulaw" | "alaw"
+    )
 }
 
 /// True ONLY for 16-bit linear PCM — the formats whose bytes ARE i16 LE
@@ -112,9 +116,18 @@ mod tests {
 
     #[test]
     fn sniffs_mp3_id3_and_framesync() {
-        assert_eq!(sniff_container(b"ID3\x04\x00rest"), Some(SniffedContainer::Mp3));
-        assert_eq!(sniff_container(&[0xFF, 0xFB, 0x90, 0x00]), Some(SniffedContainer::Mp3));
-        assert_eq!(sniff_container(&[0xFF, 0xF3, 0x18, 0xC4]), Some(SniffedContainer::Mp3));
+        assert_eq!(
+            sniff_container(b"ID3\x04\x00rest"),
+            Some(SniffedContainer::Mp3)
+        );
+        assert_eq!(
+            sniff_container(&[0xFF, 0xFB, 0x90, 0x00]),
+            Some(SniffedContainer::Mp3)
+        );
+        assert_eq!(
+            sniff_container(&[0xFF, 0xF3, 0x18, 0xC4]),
+            Some(SniffedContainer::Mp3)
+        );
     }
 
     /// Adversarial-review regression: PCM whose first samples are -1 (all
@@ -132,8 +145,14 @@ mod tests {
 
     #[test]
     fn sniffs_ogg_and_flac() {
-        assert_eq!(sniff_container(b"OggS\x00\x02more"), Some(SniffedContainer::Ogg));
-        assert_eq!(sniff_container(b"fLaC\x00\x00\x00\x22"), Some(SniffedContainer::Flac));
+        assert_eq!(
+            sniff_container(b"OggS\x00\x02more"),
+            Some(SniffedContainer::Ogg)
+        );
+        assert_eq!(
+            sniff_container(b"fLaC\x00\x00\x00\x22"),
+            Some(SniffedContainer::Flac)
+        );
     }
 
     #[test]

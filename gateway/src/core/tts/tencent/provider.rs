@@ -21,6 +21,14 @@ use tracing::{debug, error, info, warn};
 
 type HmacSha256 = Hmac<Sha256>;
 
+fn tencent_tts_http_client() -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(std::time::Duration::from_secs(30))
+        .pool_max_idle_per_host(4)
+        .pool_idle_timeout(std::time::Duration::from_secs(60))
+        .build()
+}
+
 // =============================================================================
 // Provider Implementation
 // =============================================================================
@@ -46,11 +54,7 @@ impl TencentTts {
         let tencent_config = TencentTtsConfig::from_base(config)?;
         tencent_config.validate()?;
 
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .pool_max_idle_per_host(4)
-            .pool_idle_timeout(std::time::Duration::from_secs(60))
-            .build()
+        let client = tencent_tts_http_client()
             .map_err(|e| TTSError::NetworkError(format!("Failed to create HTTP client: {}", e)))?;
 
         Ok(Self {
@@ -67,9 +71,7 @@ impl TencentTts {
     /// `emotion`→`emotion_category`, plus the `project_id`/`use_intl_endpoint`/`emotion_intensity`/
     /// `primary_language`/`region` extras), then constructs the provider via [`Self::with_config`]
     /// so the mapped settings are honored end-to-end through the dispatch path.
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let tencent_config = TencentTtsConfig::from_standard(std)?;
         Self::with_config(tencent_config)
     }
@@ -78,11 +80,7 @@ impl TencentTts {
     pub fn with_config(config: TencentTtsConfig) -> TTSResult<Self> {
         config.validate()?;
 
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .pool_max_idle_per_host(4)
-            .pool_idle_timeout(std::time::Duration::from_secs(60))
-            .build()
+        let client = tencent_tts_http_client()
             .map_err(|e| TTSError::NetworkError(format!("Failed to create HTTP client: {}", e)))?;
 
         Ok(Self {
@@ -93,59 +91,60 @@ impl TencentTts {
         })
     }
 
-    /// Get current date in YYYY-MM-DD format.
-    fn get_current_date() -> String {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+    /// Convert a Unix timestamp to the UTC date string Tencent's TC3 credential scope expects.
+    fn date_from_unix_seconds(unix_secs: u64) -> TTSResult<String> {
+        let days_since_epoch = i128::from(unix_secs / 86_400);
+        let z = days_since_epoch + 719_468;
+        let era = z / 146_097;
+        let day_of_era = z - era * 146_097;
+        let year_of_era =
+            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let month_prime = (5 * day_of_year + 2) / 153;
+        let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+        let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+        let year = year_of_era + era * 400 + if month <= 2 { 1 } else { 0 };
 
-        // Calculate date from Unix timestamp (UTC)
-        let days_since_epoch = now / 86400;
-        let mut remaining_days = days_since_epoch as i32;
-        let mut y = 1970i32;
+        let year = i32::try_from(year).map_err(|_| {
+            TTSError::InternalError(format!(
+                "Tencent signing timestamp {unix_secs} is outside supported TC3 date range"
+            ))
+        })?;
+        let month = u32::try_from(month).map_err(|_| {
+            TTSError::InternalError(format!(
+                "Tencent signing timestamp {unix_secs} produced invalid month {month}"
+            ))
+        })?;
+        let day = u32::try_from(day).map_err(|_| {
+            TTSError::InternalError(format!(
+                "Tencent signing timestamp {unix_secs} produced invalid day {day}"
+            ))
+        })?;
 
-        loop {
-            let days_in_year = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
-                366
-            } else {
-                365
-            };
-
-            if remaining_days < days_in_year {
-                break;
-            }
-            remaining_days -= days_in_year;
-            y += 1;
-        }
-
-        let is_leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-        let days_in_months: [i32; 12] = if is_leap {
-            [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-        } else {
-            [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-        };
-
-        let mut m = 0usize;
-        while m < 12 && remaining_days >= days_in_months[m] {
-            remaining_days -= days_in_months[m];
-            m += 1;
-        }
-
-        format!("{:04}-{:02}-{:02}", y, m + 1, remaining_days + 1)
+        Ok(format!("{:04}-{:02}-{:02}", year, month, day))
     }
 
     /// Get current Unix timestamp.
-    fn get_current_timestamp() -> i64 {
-        SystemTime::now()
+    fn get_current_timestamp() -> TTSResult<i64> {
+        let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64
+            .map_err(|e| TTSError::InternalError(format!("System time error: {}", e)))?
+            .as_secs();
+        i64::try_from(secs).map_err(|_| {
+            TTSError::InternalError(format!(
+                "Tencent signing timestamp {secs} does not fit signed TC3 header"
+            ))
+        })
     }
 
     /// Generate TC3-HMAC-SHA256 signature.
     fn sign_request(&self, payload: &str, timestamp: i64) -> TTSResult<(String, String, String)> {
-        let date = Self::get_current_date();
+        let timestamp_secs = u64::try_from(timestamp).map_err(|_| {
+            TTSError::InternalError(format!(
+                "Tencent signing timestamp must be non-negative, got {timestamp}"
+            ))
+        })?;
+        let date = Self::date_from_unix_seconds(timestamp_secs)?;
         let service = "tts";
         let host = if self.config.use_intl_endpoint {
             "tts.intl.tencentcloudapi.com"
@@ -268,7 +267,7 @@ impl TencentTts {
         let payload_str = serde_json::to_string(&payload)
             .map_err(|e| TTSError::InternalError(format!("Failed to serialize payload: {}", e)))?;
 
-        let timestamp = Self::get_current_timestamp();
+        let timestamp = Self::get_current_timestamp()?;
         let (authorization, timestamp_str, host) = self.sign_request(&payload_str, timestamp)?;
 
         let endpoint = self.config.get_endpoint_url();
@@ -348,11 +347,10 @@ impl TencentTts {
         let mut current_chunk = String::new();
 
         for sentence in text.split_inclusive(&['.', '!', '?', '。', '！', '？'][..]) {
-            if current_chunk.len() + sentence.len() > MAX_TEXT_LENGTH
-                && !current_chunk.is_empty() {
-                    chunks.push(current_chunk.trim().to_string());
-                    current_chunk = String::new();
-                }
+            if current_chunk.len() + sentence.len() > MAX_TEXT_LENGTH && !current_chunk.is_empty() {
+                chunks.push(current_chunk.trim().to_string());
+                current_chunk = String::new();
+            }
             current_chunk.push_str(sentence);
         }
 
@@ -560,6 +558,22 @@ mod tests {
     }
 
     #[test]
+    fn from_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "tencent".into(),
+            api_key: "secret_id|secret_key".into(),
+            ..Default::default()
+        })
+        .with_endpoint_override("http://127.0.0.1:9000");
+
+        match TencentTts::from_standard(&std) {
+            Ok(_) => panic!("Tencent provider construction must reject unsafe endpoint_override"),
+            Err(err) => assert!(err.to_string().contains("SSRF protection")),
+        }
+    }
+
+    #[test]
     fn test_provider_creation_invalid_key() {
         let config = TTSConfig {
             api_key: "no_pipe".to_string(),
@@ -578,6 +592,50 @@ mod tests {
 
         let result = TencentTts::with_config(config);
         assert!(result.is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tencent_tts_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let tts = TencentTts::with_config(TencentTtsConfig::new("id", "key"))
+            .expect("construct Tencent TTS");
+        let err = tts
+            .client
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected Tencent TTS redirect error: {error_chain}"
+        );
     }
 
     // =========================================================================
@@ -659,6 +717,19 @@ mod tests {
     }
 
     #[test]
+    fn date_from_unix_seconds_uses_utc_calendar() {
+        assert_eq!(TencentTts::date_from_unix_seconds(0).unwrap(), "1970-01-01");
+        assert_eq!(
+            TencentTts::date_from_unix_seconds(1_582_934_400).unwrap(),
+            "2020-02-29"
+        );
+        assert_eq!(
+            TencentTts::date_from_unix_seconds(1_783_555_200).unwrap(),
+            "2026-07-09"
+        );
+    }
+
+    #[test]
     fn test_sign_request() {
         let config = create_test_config();
         let tts = TencentTts::new(config).unwrap();
@@ -670,6 +741,18 @@ mod tests {
         assert!(auth.starts_with("TC3-HMAC-SHA256"));
         assert_eq!(timestamp, "1234567890");
         assert!(host.contains("tencentcloudapi.com"));
+    }
+
+    #[test]
+    fn sign_request_rejects_negative_timestamp_without_panic() {
+        let config = create_test_config();
+        let tts = TencentTts::new(config).unwrap();
+
+        let err = tts.sign_request(r#"{"Text":"hello"}"#, -1).unwrap_err();
+        assert!(matches!(
+            err,
+            TTSError::InternalError(message) if message.contains("must be non-negative")
+        ));
     }
 
     // =========================================================================

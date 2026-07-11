@@ -302,6 +302,17 @@ pub struct AzureTTS {
 }
 
 impl AzureTTS {
+    fn from_parts_unchecked(config: TTSConfig, azure_config: AzureTTSConfig) -> Self {
+        let request_builder = AzureRequestBuilder::new(config.clone(), azure_config.clone());
+        let config_hash = compute_azure_tts_config_hash(&config, &azure_config);
+
+        Self {
+            provider: TTSProvider::new(),
+            request_builder,
+            config_hash,
+        }
+    }
+
     /// Creates a new Azure TTS provider instance.
     ///
     /// # Arguments
@@ -357,17 +368,7 @@ impl AzureTTS {
         // Create Azure-specific config with the specified region
         let azure_config = AzureTTSConfig::with_region(config.clone(), region);
 
-        // Create the request builder
-        let request_builder = AzureRequestBuilder::new(config.clone(), azure_config.clone());
-
-        // Compute config hash for caching
-        let config_hash = compute_azure_tts_config_hash(&config, &azure_config);
-
-        Ok(Self {
-            provider: TTSProvider::new()?,
-            request_builder,
-            config_hash,
-        })
+        Ok(Self::from_parts_unchecked(config, azure_config))
     }
 
     /// Build the provider from the standardized config (W1 keystone), mirroring
@@ -377,19 +378,12 @@ impl AzureTTS {
     /// `mstts:express-as` SSML — through the standardized dispatch instead of being dropped at the
     /// flat boundary. (Speed/pitch/volume/emotion are Azure SSML-time controls without struct
     /// fields, so they stay at default here, matching the config-level mapping.)
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let config = std.base.clone();
-        let azure_config = AzureTTSConfig::from_standard(std);
-        let request_builder = AzureRequestBuilder::new(config.clone(), azure_config.clone());
-        let config_hash = compute_azure_tts_config_hash(&config, &azure_config);
+        let azure_config = AzureTTSConfig::from_standard(std)?;
+        azure_config.validate()?;
 
-        Ok(Self {
-            provider: TTSProvider::new()?,
-            request_builder,
-            config_hash,
-        })
+        Ok(Self::from_parts_unchecked(config, azure_config))
     }
 
     /// Sets the request manager for this instance.
@@ -408,7 +402,10 @@ impl AzureTTS {
 
 impl Default for AzureTTS {
     fn default() -> Self {
-        Self::new(TTSConfig::default()).expect("Failed to create default AzureTTS")
+        let config = TTSConfig::default();
+        let azure_config = AzureTTSConfig::from_base(config.clone());
+
+        Self::from_parts_unchecked(config, azure_config)
     }
 }
 
@@ -849,9 +846,7 @@ mod tests {
         assert_eq!(tts.azure_config().emotion.as_deref(), Some("sad"));
 
         let client = reqwest::Client::new();
-        let request_builder = tts
-            .request_builder
-            .build_http_request(&client, "Oh no");
+        let request_builder = tts.request_builder.build_http_request(&client, "Oh no");
         let request = request_builder.build().unwrap();
         let body = request.body().unwrap().as_bytes().unwrap();
         let body_str = std::str::from_utf8(body).unwrap();
@@ -876,7 +871,10 @@ mod tests {
             extras: ProviderExtras(extras),
         };
         let tts = AzureTTS::from_standard(&std).unwrap();
-        assert_eq!(tts.azure_config().deployment_id.as_deref(), Some("dep-abc-123"));
+        assert_eq!(
+            tts.azure_config().deployment_id.as_deref(),
+            Some("dep-abc-123")
+        );
 
         let client = reqwest::Client::new();
         let request = tts
@@ -915,7 +913,12 @@ mod tests {
         let auth = request.headers().get("authorization").unwrap();
         assert_eq!(auth.to_str().unwrap(), "Bearer eyJ.token.val");
         // Subscription-key header must NOT be present when bearer auth is used.
-        assert!(request.headers().get(AZURE_SUBSCRIPTION_KEY_HEADER).is_none());
+        assert!(
+            request
+                .headers()
+                .get(AZURE_SUBSCRIPTION_KEY_HEADER)
+                .is_none()
+        );
     }
 
     // Negative: without auth_token, the subscription key header is used (default credential path).
@@ -964,8 +967,14 @@ mod tests {
             .unwrap();
         let body = request.body().unwrap().as_bytes().unwrap();
         let body_str = std::str::from_utf8(body).unwrap();
-        assert!(body_str.contains("pitch=\"-3%\""), "pitch not on wire: {body_str}");
-        assert!(body_str.contains("volume=\"80\""), "volume not on wire: {body_str}");
+        assert!(
+            body_str.contains("pitch=\"-3%\""),
+            "pitch not on wire: {body_str}"
+        );
+        assert!(
+            body_str.contains("volume=\"80\""),
+            "volume not on wire: {body_str}"
+        );
         assert!(
             body_str.contains("<emphasis level=\"strong\">"),
             "emphasis not on wire: {body_str}"
@@ -981,7 +990,10 @@ mod tests {
 
         let mut pitch_cfg = base.clone();
         pitch_cfg.ssml_options.pitch = Some("+4%".into());
-        assert_ne!(base_hash, compute_azure_tts_config_hash(&config, &pitch_cfg));
+        assert_ne!(
+            base_hash,
+            compute_azure_tts_config_hash(&config, &pitch_cfg)
+        );
 
         let mut role_cfg = base.clone();
         role_cfg.ssml_options.role = Some("Boy".into());
@@ -1136,6 +1148,54 @@ mod tests {
     }
 
     #[test]
+    fn from_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(create_test_config())
+            .with_endpoint_override("http://127.0.0.1:9000");
+
+        match AzureTTS::from_standard(&std) {
+            Ok(_) => panic!("Azure provider construction must reject unsafe endpoint_override"),
+            Err(err) => assert!(err.to_string().contains("SSRF protection")),
+        }
+    }
+
+    #[test]
+    fn from_standard_rejects_ssrf_ssml_provider_urls() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+
+        let mut lexicon_extras = serde_json::Map::new();
+        lexicon_extras.insert(
+            "lexicon_uri".into(),
+            serde_json::json!("http://127.0.0.1:9000/lex.xml"),
+        );
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(lexicon_extras),
+        };
+        match AzureTTS::from_standard(&std) {
+            Ok(_) => panic!("Azure provider construction must reject unsafe lexicon_uri"),
+            Err(err) => assert!(err.to_string().contains("SSRF protection")),
+        }
+
+        let mut bg_extras = serde_json::Map::new();
+        bg_extras.insert(
+            "background_audio_src".into(),
+            serde_json::json!("file:///tmp/bg.wav"),
+        );
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(bg_extras),
+        };
+        match AzureTTS::from_standard(&std) {
+            Ok(_) => panic!("Azure provider construction must reject unsafe background_audio_src"),
+            Err(err) => assert!(err.to_string().contains("URL scheme")),
+        }
+    }
+
+    #[test]
     fn test_azure_tts_with_region() {
         let config = create_test_config();
         let tts = AzureTTS::with_region(config, AzureRegion::WestEurope).unwrap();
@@ -1148,11 +1208,12 @@ mod tests {
     }
 
     #[test]
-    fn test_azure_tts_default() {
+    fn azure_tts_default_does_not_depend_on_result_unwrap() {
         let tts = AzureTTS::default();
 
         assert!(!tts.is_ready());
         assert_eq!(tts.azure_config().region, AzureRegion::EastUS);
+        assert_eq!(tts.azure_config().base.api_key, "");
     }
 
     #[test]

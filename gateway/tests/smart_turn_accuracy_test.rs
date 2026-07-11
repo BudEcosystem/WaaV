@@ -322,8 +322,16 @@ async fn real_dataset_accuracy() -> Result<()> {
 
     assert!(n >= 20, "need a meaningful sample count, got {n}");
     let acc = (tp + tn) as f64 / n as f64;
-    let precision = if tp + fp > 0 { tp as f64 / (tp + fp) as f64 } else { 0.0 };
-    let recall = if tp + fn_ > 0 { tp as f64 / (tp + fn_) as f64 } else { 0.0 };
+    let precision = if tp + fp > 0 {
+        tp as f64 / (tp + fp) as f64
+    } else {
+        0.0
+    };
+    let recall = if tp + fn_ > 0 {
+        tp as f64 / (tp + fn_) as f64
+    } else {
+        0.0
+    };
     let f1 = if precision + recall > 0.0 {
         2.0 * precision * recall / (precision + recall)
     } else {
@@ -337,7 +345,10 @@ async fn real_dataset_accuracy() -> Result<()> {
     );
 
     // Sanity gate: the model must do substantially better than chance on the official test set.
-    assert!(acc > 0.65, "accuracy {acc:.3} below 0.65 — pipeline likely broken");
+    assert!(
+        acc > 0.65,
+        "accuracy {acc:.3} below 0.65 — pipeline likely broken"
+    );
     Ok(())
 }
 

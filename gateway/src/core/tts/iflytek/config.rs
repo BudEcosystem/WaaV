@@ -20,6 +20,18 @@
 use crate::core::stt::iflytek::IFlytekAuth;
 use crate::core::tts::base::{TTSConfig, TTSError};
 
+fn validate_iflytek_tts_endpoint(source: &str, endpoint: &str) -> Result<(), TTSError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_WS_URL_SCHEMES)
+        .map_err(|msg| {
+            TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}"))
+        })
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -397,6 +409,7 @@ impl IFlytekTtsConfig {
         }
 
         cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate()?;
 
         Ok(cfg)
     }
@@ -433,6 +446,10 @@ impl IFlytekTtsConfig {
                 "Invalid pitch: {}. Must be 0-100.",
                 self.pitch
             )));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_iflytek_tts_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -501,6 +518,34 @@ mod tests {
         assert_eq!(cfg.volume, 80);
         assert_eq!(cfg.sample_rate, 8000);
         assert!(cfg.background_sound); // from extras passthrough
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = IFlytekTtsConfig::from_base(create_test_config()).unwrap();
+
+        config.endpoint_override = Some("https://iflytek-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("wss://iflytek-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(create_test_config())
+            .with_endpoint_override("file:///tmp/socket");
+        assert!(IFlytekTtsConfig::from_standard(&std).is_err());
     }
 
     // Voice tests

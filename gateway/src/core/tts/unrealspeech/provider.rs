@@ -4,7 +4,7 @@
 //! using HTTP streaming for real-time audio synthesis.
 
 use async_trait::async_trait;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use tracing::{debug, info};
 
 use super::config::{UnrealSpeechStreamRequest, UnrealSpeechTtsConfig};
@@ -64,16 +64,8 @@ impl TTSRequestBuilder for UnrealSpeechRequestBuilder {
         // Build request body
         let request_body = UnrealSpeechStreamRequest::from_config(&self.config, text);
 
-        // Build headers
-        let mut headers = HeaderMap::new();
-
-        // Unreal Speech uses Bearer token authentication
+        // Unreal Speech uses Bearer token authentication.
         let auth_value = format!("Bearer {}", self.config.api_key);
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&auth_value).unwrap_or_else(|_| HeaderValue::from_static("")),
-        );
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         debug!(
             "Unreal Speech TTS request: voice={}, bitrate={}, speed={}, pitch={}, codec={}, url={}",
@@ -91,7 +83,8 @@ impl TTSRequestBuilder for UnrealSpeechRequestBuilder {
                 self.streaming_url(),
                 self.config.endpoint_override.as_deref(),
             ))
-            .headers(headers)
+            .header(AUTHORIZATION, auth_value)
+            .header(CONTENT_TYPE, "application/json")
             .json(&request_body)
     }
 
@@ -161,9 +154,7 @@ impl UnrealSpeechTts {
     /// generic provider's connect layer.
     ///
     /// [`UnrealSpeechTtsConfig::from_standard`]: super::config::UnrealSpeechTtsConfig::from_standard
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let unrealspeech_config = UnrealSpeechTtsConfig::from_standard(std)?;
 
         info!(
@@ -175,7 +166,7 @@ impl UnrealSpeechTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             unrealspeech_config,
             base_config: std.base.clone(),
         })
@@ -211,7 +202,7 @@ impl BaseTTS for UnrealSpeechTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             unrealspeech_config,
             base_config: config,
         })
@@ -318,6 +309,44 @@ mod tests {
             UnrealSpeechBitrate::Bitrate320k
         );
         assert_eq!(tts.unrealspeech_config().voice, UnrealSpeechVoice::Dan);
+    }
+
+    #[test]
+    fn invalid_unrealspeech_api_key_header_value_is_request_build_error() {
+        let config = TTSConfig {
+            api_key: "bad\nkey".to_string(),
+            voice_id: Some("Dan".to_string()),
+            ..Default::default()
+        };
+        let unrealspeech_config = UnrealSpeechTtsConfig::from_base(&config).unwrap();
+        let builder = UnrealSpeechRequestBuilder::new(unrealspeech_config, config);
+        let err = builder
+            .build_http_request(&reqwest::Client::new(), "hello")
+            .build()
+            .expect_err(
+                "malformed Unreal Speech API key must not become an empty Authorization header",
+            );
+
+        assert!(err.is_builder(), "unexpected reqwest error: {err}");
+    }
+
+    #[test]
+    fn from_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "unrealspeech".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("Dan".into()),
+            ..Default::default()
+        })
+        .with_endpoint_override("http://127.0.0.1:9000");
+
+        match UnrealSpeechTts::from_standard(&std) {
+            Ok(_) => {
+                panic!("UnrealSpeech provider construction must reject unsafe endpoint_override")
+            }
+            Err(err) => assert!(err.to_string().contains("SSRF protection")),
+        }
     }
 
     #[test]

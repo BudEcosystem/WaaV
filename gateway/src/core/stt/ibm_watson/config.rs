@@ -7,6 +7,22 @@ use crate::core::stt::base::STTConfig;
 use serde::{Deserialize, Serialize};
 use url::form_urlencoded;
 
+fn validate_ibm_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    let validation_url;
+    let endpoint = if endpoint.contains("://") {
+        endpoint
+    } else {
+        validation_url = format!("http://{endpoint}");
+        validation_url.as_str()
+    };
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -239,7 +255,6 @@ impl IbmModel {
         }
     }
 }
-
 
 impl std::fmt::Display for IbmModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -486,7 +501,9 @@ impl IbmWatsonSTTConfig {
     /// Build from the standardized config (W1 keystone — 5th provider). IBM Watson has a rich
     /// boolean surface, so this maps 6 features at once. Also demonstrates the `provider_extras`
     /// passthrough: IBM's `instance_id` (not a standard field) is read from extras.
-    pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, String> {
         let f = &std.features;
         let instance_id = std
             .extras
@@ -532,7 +549,10 @@ impl IbmWatsonSTTConfig {
         if let Some(v) = e.get("keywords_threshold").and_then(|v| v.as_f64()) {
             cfg.keywords_threshold = Some(v as f32);
         }
-        if let Some(v) = e.get("word_alternatives_threshold").and_then(|v| v.as_f64()) {
+        if let Some(v) = e
+            .get("word_alternatives_threshold")
+            .and_then(|v| v.as_f64())
+        {
             cfg.word_alternatives_threshold = Some(v as f32);
         }
         if let Some(v) = e.get("customization_weight").and_then(|v| v.as_f64()) {
@@ -550,14 +570,18 @@ impl IbmWatsonSTTConfig {
         if let Some(v) = e.get("processing_metrics").and_then(|v| v.as_bool()) {
             cfg.processing_metrics = v;
         }
-        if let Some(v) = e.get("processing_metrics_interval").and_then(|v| v.as_f64()) {
+        if let Some(v) = e
+            .get("processing_metrics_interval")
+            .and_then(|v| v.as_f64())
+        {
             cfg.processing_metrics_interval = Some(v as f32);
         }
         if let Some(v) = e.get("smart_formatting_version").and_then(|v| v.as_u64()) {
             cfg.smart_formatting_version = Some(v as u32);
         }
         cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
-        cfg
+        cfg.validate_endpoint_override()?;
+        Ok(cfg)
     }
 
     /// Create IBM Watson STT configuration from base STT config.
@@ -642,6 +666,13 @@ impl IbmWatsonSTTConfig {
             speech_begin_event: false,
             endpoint_override: None,
         }
+    }
+
+    pub fn validate_endpoint_override(&self) -> Result<(), String> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_ibm_stt_endpoint("endpoint_override", endpoint)?;
+        }
+        Ok(())
     }
 
     /// Build the IAM token URL, honoring `endpoint_override` (mock host + `/identity/token`). The
@@ -792,7 +823,7 @@ mod tests {
     // W1 keystone (5th provider): maps 6 features + demonstrates provider_extras (instance_id).
     #[test]
     fn from_standard_maps_features_and_extras() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let mut extras = serde_json::Map::new();
         extras.insert("instance_id".into(), serde_json::json!("inst-123"));
         let std = StandardSTTConfig {
@@ -811,7 +842,7 @@ mod tests {
             extras: ProviderExtras(extras),
             translation: None,
         };
-        let cfg = IbmWatsonSTTConfig::from_standard(&std);
+        let cfg = IbmWatsonSTTConfig::from_standard(&std).unwrap();
         assert!(cfg.speaker_labels);
         assert!(cfg.word_timestamps);
         assert!(cfg.smart_formatting);
@@ -826,18 +857,24 @@ mod tests {
     // live client emits (verified above: client.rs uses both).
     #[test]
     fn keyword_nbest_metrics_features_reach_start_message_and_url() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
 
         let mut extras = serde_json::Map::new();
         extras.insert("instance_id".into(), serde_json::json!("inst-9"));
         extras.insert("keywords_threshold".into(), serde_json::json!(0.5));
         extras.insert("word_alternatives_threshold".into(), serde_json::json!(0.4));
         extras.insert("customization_weight".into(), serde_json::json!(0.3));
-        extras.insert("base_model_version".into(), serde_json::json!("en-US_NarrowbandModel.v2021"));
+        extras.insert(
+            "base_model_version".into(),
+            serde_json::json!("en-US_NarrowbandModel.v2021"),
+        );
         extras.insert("grammar_name".into(), serde_json::json!("digits"));
         extras.insert("audio_metrics".into(), serde_json::json!(true));
         extras.insert("processing_metrics".into(), serde_json::json!(true));
-        extras.insert("processing_metrics_interval".into(), serde_json::json!(0.25));
+        extras.insert(
+            "processing_metrics_interval".into(),
+            serde_json::json!(0.25),
+        );
         extras.insert("smart_formatting_version".into(), serde_json::json!(2));
 
         let std = StandardSTTConfig {
@@ -856,14 +893,13 @@ mod tests {
             translation: None,
         };
 
-        let cfg = IbmWatsonSTTConfig::from_standard(&std);
+        let cfg = IbmWatsonSTTConfig::from_standard(&std).unwrap();
         let msg = cfg.build_start_message();
         let url = cfg.build_websocket_url("tok");
 
         // f32 round-trip precision: compare numeric knobs as f64 within tolerance.
-        let approx = |v: &serde_json::Value, want: f64| {
-            (v.as_f64().expect("number") - want).abs() < 1e-4
-        };
+        let approx =
+            |v: &serde_json::Value, want: f64| (v.as_f64().expect("number") - want).abs() < 1e-4;
 
         // --- START message body (per-utterance recognition knobs) ---
         assert_eq!(msg["keywords"], serde_json::json!(["WaaV", "Watson"]));
@@ -905,7 +941,53 @@ mod tests {
         ] {
             assert!(msg.get(k).is_none(), "{k} must be absent by default");
         }
-        assert!(!cfg.build_websocket_url("tok").contains("base_model_version"));
+        assert!(
+            !cfg.build_websocket_url("tok")
+                .contains("base_model_version")
+        );
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = IbmWatsonSTTConfig::from_base(
+            STTConfig {
+                api_key: "k".to_string(),
+                ..Default::default()
+            },
+            "inst".to_string(),
+        );
+        config.endpoint_override = Some("https://gateway.example.com".to_string());
+        assert!(config.validate_endpoint_override().is_ok());
+
+        config.endpoint_override = Some("gateway.example.com:8443".to_string());
+        assert!(config.validate_endpoint_override().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:8080".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://gateway.example.com".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(err.contains("URL scheme"));
+
+        let std = crate::core::stt::standard::StandardSTTConfig::from_base(STTConfig {
+            provider: "ibm-watson".to_string(),
+            api_key: "k".to_string(),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(IbmWatsonSTTConfig::from_standard(&std).is_err());
     }
 
     #[test]
@@ -995,7 +1077,10 @@ mod tests {
             ..Default::default()
         };
         let config = IbmWatsonSTTConfig::from_base(base, "iid".to_string());
-        assert_eq!(config.model, IbmModel::Custom("en-US_Telephony".to_string()));
+        assert_eq!(
+            config.model,
+            IbmModel::Custom("en-US_Telephony".to_string())
+        );
         assert_eq!(config.model.as_str(), "en-US_Telephony");
     }
 

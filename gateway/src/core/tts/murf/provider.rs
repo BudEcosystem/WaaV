@@ -4,13 +4,19 @@
 //! using HTTP streaming for real-time audio synthesis.
 
 use async_trait::async_trait;
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::CONTENT_TYPE;
 use tracing::{debug, info};
 
 use super::MURF_VOICES_URL;
 use super::config::{MurfStreamRequest, MurfTtsConfig, MurfVoice};
 use crate::core::tts::base::{BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult};
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
+
+fn murf_tts_http_client() -> TTSResult<reqwest::Client> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .build()
+        .map_err(|e| TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}")))
+}
 
 // =============================================================================
 // Request Builder
@@ -63,17 +69,6 @@ impl TTSRequestBuilder for MurfRequestBuilder {
         // Build request body
         let request_body = MurfStreamRequest::from_config(&self.config, text);
 
-        // Build headers
-        let mut headers = HeaderMap::new();
-
-        // Murf uses 'api-key' header (NOT Authorization: Bearer)
-        headers.insert(
-            "api-key",
-            HeaderValue::from_str(&self.config.api_key)
-                .unwrap_or_else(|_| HeaderValue::from_static("")),
-        );
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-
         debug!(
             "Murf TTS request: voice={}, model={}, format={}, sample_rate={}, url={}",
             request_body.voice_id,
@@ -86,7 +81,9 @@ impl TTSRequestBuilder for MurfRequestBuilder {
         // Build and return the request
         client
             .post(self.streaming_url())
-            .headers(headers)
+            // Murf uses 'api-key' header (NOT Authorization: Bearer).
+            .header("api-key", self.config.api_key.clone())
+            .header(CONTENT_TYPE, "application/json")
             .json(&request_body)
     }
 
@@ -151,12 +148,10 @@ impl MurfTts {
     /// `emotion`→`style`, `language`→`multi_native_locale`, `sample_rate`, and the non-standard
     /// `region` extra) so the mapped Murf settings are honored end-to-end through the dispatch
     /// path. The matching flat base config is kept for the generic provider's connect/cache layer.
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let murf_config = MurfTtsConfig::from_standard(std)?;
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             murf_config,
             base_config: std.base.clone(),
         })
@@ -170,7 +165,7 @@ impl MurfTts {
     /// # Returns
     /// * `TTSResult<Vec<MurfVoice>>` - List of available voices
     pub async fn list_voices(api_key: &str) -> TTSResult<Vec<MurfVoice>> {
-        let client = reqwest::Client::new();
+        let client = murf_tts_http_client()?;
 
         let response = client
             .get(MURF_VOICES_URL)
@@ -222,7 +217,7 @@ impl BaseTTS for MurfTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             murf_config,
             base_config: config,
         })
@@ -291,6 +286,7 @@ impl BaseTTS for MurfTts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
 
     // W1 keystone: the struct-level `from_standard` (the dispatch entry point, mirroring
     // `DeepgramTTS::from_standard`) must carry the standardized advanced features onto the live
@@ -334,6 +330,93 @@ mod tests {
         assert_eq!(cfg.model, MurfModel::Gen2); // base carried through
         // The flat base config is kept for the generic provider's connect/cache layer.
         assert_eq!(tts.base_config.api_key, "test-key");
+    }
+
+    #[test]
+    fn invalid_murf_api_key_header_value_is_request_build_error() {
+        let config = TTSConfig {
+            api_key: "bad\nkey".into(),
+            voice_id: Some("en-US-natalie".into()),
+            ..Default::default()
+        };
+        let murf_config = MurfTtsConfig::from_base(&config).unwrap();
+        let builder = MurfRequestBuilder::new(murf_config, config);
+        let err = builder
+            .build_http_request(&reqwest::Client::new(), "hello")
+            .build()
+            .expect_err("malformed Murf api-key must not become an empty auth header");
+
+        assert!(err.is_builder(), "unexpected reqwest error: {err}");
+    }
+
+    #[test]
+    fn from_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "murf".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("en-US-natalie".into()),
+            ..Default::default()
+        })
+        .with_endpoint_override("http://127.0.0.1:9000");
+
+        match MurfTts::from_standard(&std) {
+            Ok(_) => panic!("unsafe endpoint override should be rejected"),
+            Err(err) => assert!(
+                err.to_string().contains("SSRF protection"),
+                "unexpected error: {err}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn murf_tts_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!("Skipping murf_tts_redirect_policy_rejects_private_hop: {err}");
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = murf_tts_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
     }
 
     // WIRE-LEVEL (recurring bug class: asserting the config struct, not the request body): the

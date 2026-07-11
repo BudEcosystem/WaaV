@@ -57,6 +57,12 @@ pub struct AppState {
 
 impl AppState {
     pub async fn new(config: ServerConfig) -> Arc<Self> {
+        Self::try_new(config)
+            .await
+            .unwrap_or_else(|e| panic!("invalid app state config: {e}"))
+    }
+
+    pub async fn try_new(config: ServerConfig) -> Result<Arc<Self>, String> {
         // Ensure a process-level rustls CryptoProvider is installed before any provider opens a
         // TLS/WSS connection (e.g. a realtime STT socket). The gateway binary installs this in
         // main(); doing it here too — idempotently — makes embedding AppState (tests, SDKs, custom
@@ -64,7 +70,7 @@ impl AppState {
         // returns Err if one is already installed, which we intentionally ignore.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let core_state = CoreState::new(&config).await;
+        let core_state = CoreState::try_new(&config).await?;
 
         // Initialize LiveKit room handler if API keys are available
         let livekit_room_handler = if let (Some(api_key), Some(api_secret)) =
@@ -231,7 +237,8 @@ impl AppState {
                     config.livekit_url.clone(),
                     api_key.clone(),
                     api_secret.clone(),
-                );
+                )
+                .map_err(|e| format!("Failed to initialize LiveKit SIP handler: {e}"))?;
 
                 // Build deterministic trunk and dispatch names based on naming_prefix and room_prefix
                 // This allows operators to predict resource names in the LiveKit UI
@@ -301,7 +308,7 @@ impl AppState {
             None
         };
 
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             config,
             core_state,
             livekit_room_handler,
@@ -313,7 +320,7 @@ impl AppState {
             connections_per_ip: Arc::new(DashMap::new()),
             shutdown: CancellationToken::new(),
             batch_jobs: Arc::new(DashMap::new()),
-        })
+        }))
     }
 
     /// Get a TTS request manager for a specific provider
@@ -449,6 +456,17 @@ pub enum ConnectionLimitError {
 mod tests {
     use super::*;
     use crate::config::SipConfig;
+    use serial_test::serial;
+
+    fn cleanup_core_runtime_env() {
+        unsafe {
+            std::env::remove_var("WAAV_EAGER_WARMUP");
+            std::env::remove_var("WAAV_MAX_CONCURRENT_RECONNECTS");
+            std::env::remove_var("WAAV_DEBUG_PROFILE");
+            std::env::remove_var("WAAV_DEBUG_PROFILE_SAMPLE_N");
+            std::env::remove_var("WAAV_DEBUG_PROFILE_TOKEN");
+        }
+    }
 
     #[test]
     fn test_sip_handler_not_created_without_config() {
@@ -721,7 +739,10 @@ mod tests {
     /// shutdown token, and cancelling it must be observed by every clone of the
     /// state (sessions hold clones of `Arc<AppState>` / its token).
     #[tokio::test]
+    #[serial]
     async fn test_shutdown_token_shared_across_state_clones() {
+        cleanup_core_runtime_env();
+
         let state = AppState::new(minimal_test_config()).await;
         assert!(
             !state.shutdown.is_cancelled(),
@@ -736,5 +757,25 @@ mod tests {
             clone.shutdown.is_cancelled(),
             "cancellation must propagate to all AppState clones"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn app_state_try_new_rejects_malformed_core_runtime_env_without_panic() {
+        cleanup_core_runtime_env();
+        unsafe {
+            std::env::set_var("WAAV_EAGER_WARMUP", "sometimes");
+        }
+
+        let err = match AppState::try_new(minimal_test_config()).await {
+            Ok(_) => panic!("malformed runtime env must fail AppState::try_new"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("WAAV_EAGER_WARMUP"),
+            "error should name bad env var: {err}"
+        );
+
+        cleanup_core_runtime_env();
     }
 }

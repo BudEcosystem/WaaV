@@ -16,6 +16,15 @@
 use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 
+fn validate_huawei_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -118,8 +127,7 @@ impl HuaweiCloudRegion {
 // =============================================================================
 
 /// Huawei Cloud TTS voice identifiers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum HuaweiTtsVoice {
     // Standard Voices (普通发音人)
     /// 小琪 - Female, Standard
@@ -155,7 +163,6 @@ pub enum HuaweiTtsVoice {
     /// Custom voice by property string
     Custom(String),
 }
-
 
 impl HuaweiTtsVoice {
     /// Get the property string for API requests.
@@ -490,6 +497,11 @@ impl HuaweiCloudTtsConfig {
             ));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_huawei_tts_endpoint("endpoint_override", endpoint)
+                .map_err(TTSError::InvalidConfiguration)?;
+        }
+
         Ok(())
     }
 
@@ -615,6 +627,7 @@ impl HuaweiCloudTtsConfig {
         // Endpoint override (W-T0 mock harness): redirects IAM token + synth POSTs to a mock/proxy.
         cfg.endpoint_override = std.endpoint_override().map(String::from);
 
+        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -807,11 +820,13 @@ impl HuaweiTtsResponse {
 
     /// Get error message if present.
     pub fn get_error(&self) -> Option<String> {
-        self.error_code.as_ref().map(|code| format!(
+        self.error_code.as_ref().map(|code| {
+            format!(
                 "{}: {}",
                 code,
                 self.error_msg.as_deref().unwrap_or("Unknown error")
-            ))
+            )
+        })
     }
 
     /// Get audio data if present (base64-decoded).
@@ -961,6 +976,7 @@ mod tests {
             base: TTSConfig {
                 provider: "huawei-cloud".into(),
                 api_key: "user|pass|domain|project123".into(),
+                sample_rate: Some(16000),
                 ..Default::default()
             },
             features: TtsFeatures {
@@ -989,9 +1005,13 @@ mod tests {
             base: TTSConfig {
                 provider: "huawei-cloud".into(),
                 api_key: "user|pass|domain|project123".into(),
+                sample_rate: Some(16000),
                 ..Default::default()
             },
-            features: TtsFeatures { word_timestamps: Some(true), ..Default::default() },
+            features: TtsFeatures {
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
             extras: Default::default(),
         };
         let cfg = HuaweiCloudTtsConfig::from_standard(&std).unwrap();
@@ -1007,15 +1027,22 @@ mod tests {
             base: TTSConfig {
                 provider: "huawei-cloud".into(),
                 api_key: "user|pass|domain|project123".into(),
+                sample_rate: Some(16000),
                 ..Default::default()
             },
-            features: TtsFeatures { word_timestamps: Some(true), ..Default::default() },
+            features: TtsFeatures {
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
             extras: Default::default(),
         };
         let cfg = HuaweiCloudTtsConfig::from_standard(&std).unwrap();
         let json = HuaweiTtsRequest::new("hello", &cfg).to_json().unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["config"]["subtitle"], 1, "subtitle must be on the REST wire: {json}");
+        assert_eq!(
+            v["config"]["subtitle"], 1,
+            "subtitle must be on the REST wire: {json}"
+        );
     }
 
     // WIRE-LEVEL: `subtitle` reaches the SERIALIZED RTTS START command config.
@@ -1027,16 +1054,25 @@ mod tests {
             base: TTSConfig {
                 provider: "huawei-cloud".into(),
                 api_key: "user|pass|domain|project123".into(),
+                sample_rate: Some(16000),
                 ..Default::default()
             },
-            features: TtsFeatures { word_timestamps: Some(true), ..Default::default() },
+            features: TtsFeatures {
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
             extras: Default::default(),
         };
         let cfg = HuaweiCloudTtsConfig::from_standard(&std).unwrap();
-        let json = HuaweiRttsStartCommand::new("hello", &cfg).to_json().unwrap();
+        let json = HuaweiRttsStartCommand::new("hello", &cfg)
+            .to_json()
+            .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["command"], "START");
-        assert_eq!(v["config"]["subtitle"], 1, "subtitle must be on the RTTS START wire: {json}");
+        assert_eq!(
+            v["config"]["subtitle"], 1,
+            "subtitle must be on the RTTS START wire: {json}"
+        );
     }
 
     // When word_timestamps is unset/false, `subtitle` is OMITTED from both wire shapes (no spurious
@@ -1052,10 +1088,17 @@ mod tests {
         assert!(!cfg.subtitle);
         let rest: serde_json::Value =
             serde_json::from_str(&HuaweiTtsRequest::new("hi", &cfg).to_json().unwrap()).unwrap();
-        assert!(rest["config"].get("subtitle").is_none(), "subtitle must be absent on REST when off");
+        assert!(
+            rest["config"].get("subtitle").is_none(),
+            "subtitle must be absent on REST when off"
+        );
         let rtts: serde_json::Value =
-            serde_json::from_str(&HuaweiRttsStartCommand::new("hi", &cfg).to_json().unwrap()).unwrap();
-        assert!(rtts["config"].get("subtitle").is_none(), "subtitle must be absent on RTTS when off");
+            serde_json::from_str(&HuaweiRttsStartCommand::new("hi", &cfg).to_json().unwrap())
+                .unwrap();
+        assert!(
+            rtts["config"].get("subtitle").is_none(),
+            "subtitle must be absent on RTTS when off"
+        );
     }
 
     #[test]
@@ -1174,6 +1217,46 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = HuaweiCloudTtsConfig {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            domain_name: "domain".to_string(),
+            project_id: "project123".to_string(),
+            endpoint_override: Some("https://gateway.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:8080".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        config.endpoint_override = Some("wss://gateway.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "huawei-cloud".to_string(),
+            api_key: "user|pass|domain|project123".to_string(),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(HuaweiCloudTtsConfig::from_standard(&std).is_err());
     }
 
     #[test]

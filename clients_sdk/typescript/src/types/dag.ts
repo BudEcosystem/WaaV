@@ -100,6 +100,61 @@ export interface DAGValidationResult {
 }
 
 // =============================================================================
+// DAG REST Surface (gateway handlers/dag.rs)
+// =============================================================================
+
+/**
+ * One template entry from `GET /dag/templates` (gateway `TemplateInfo`,
+ * handlers/dag.rs). Field names are already wire-identical.
+ */
+export interface DAGTemplateInfo {
+  /** Template registry name (e.g. `"voice-assistant"`). */
+  name: string;
+  /** Template version string. */
+  version: string;
+  /** Human-readable description (the template's display name); may be null. */
+  description?: string | null;
+}
+
+/** Response of `GET /dag/templates` (gateway `ListTemplatesResponse`). */
+export interface DAGTemplateListResponse {
+  /** Registered templates. */
+  templates: DAGTemplateInfo[];
+  /** Number of templates. */
+  count: number;
+}
+
+/**
+ * Response of `GET /dag/templates/{name}` — `{ name, template }` where
+ * `template` is the gateway-side `DAGDefinition` serialization (snake_case:
+ * `entry_node`, `exit_nodes`, `api_key_routes`, …), which is a superset of the
+ * client-side {@link DAGDefinition} shape, so it is kept as an open record.
+ */
+export interface DAGTemplateDetail {
+  /** The requested template name. */
+  name: string;
+  /** The gateway DAG definition (wire shape, snake_case keys). */
+  template: Record<string, unknown>;
+}
+
+/**
+ * Response of `POST /dag/validate` (gateway `ValidateDAGResponse`,
+ * handlers/dag.rs): `{ valid, errors, warnings, node_count, edge_count }`.
+ */
+export interface DAGValidateResponse {
+  /** Whether the definition compiled cleanly. */
+  valid: boolean;
+  /** Compile/parse errors (empty when valid). */
+  errors: string[];
+  /** Non-fatal warnings. */
+  warnings: string[];
+  /** Number of nodes parsed (wire: `node_count`). */
+  nodeCount: number;
+  /** Number of edges parsed (wire: `edge_count`). */
+  edgeCount: number;
+}
+
+// =============================================================================
 // DAG Validation
 // =============================================================================
 

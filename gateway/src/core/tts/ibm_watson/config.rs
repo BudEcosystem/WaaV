@@ -20,6 +20,15 @@ use crate::core::stt::ibm_watson::IbmRegion;
 use crate::core::tts::base::TTSConfig;
 use serde::{Deserialize, Serialize};
 
+fn validate_ibm_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -36,6 +45,12 @@ pub const MAX_TEXT_LENGTH: usize = 5120;
 
 /// Default sample rate for PCM audio (22050 Hz).
 pub const DEFAULT_SAMPLE_RATE: u32 = 22050;
+
+/// Lowest IBM TTS sample rate accepted by this gateway.
+pub const MIN_SAMPLE_RATE: u32 = 8000;
+
+/// Highest IBM TTS sample rate accepted by this gateway.
+pub const MAX_SAMPLE_RATE: u32 = 192_000;
 
 // =============================================================================
 // Voice Configuration
@@ -368,7 +383,6 @@ impl IbmVoice {
     }
 }
 
-
 impl std::fmt::Display for IbmVoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
@@ -653,7 +667,9 @@ impl IbmWatsonTTSConfig {
     /// back to the `IBM_WATSON_INSTANCE_ID` env var (precedence: extras > env). Features
     /// without an IBM field (stability, similarity_boost, style, use_speaker_boost, emotion,
     /// instructions, ssml, language, word_timestamps, streaming, seed, volume) are skipped.
-    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, String> {
         let f = &std.features;
         let instance_id = std
             .extras
@@ -697,7 +713,9 @@ impl IbmWatsonTTSConfig {
             cfg.base.sample_rate = Some(rate);
         }
         cfg.endpoint_override = std.endpoint_override().map(String::from);
-        cfg
+        cfg.validate_sample_rate()?;
+        cfg.validate_endpoint_override()?;
+        Ok(cfg)
     }
 
     /// Create a new configuration with the given voice.
@@ -720,29 +738,57 @@ impl IbmWatsonTTSConfig {
             return Err("API key is required".to_string());
         }
 
+        self.validate_sample_rate()?;
+
         // Validate rate percentage if set
         if let Some(rate) = self.rate_percentage
-            && !(-100..=100).contains(&rate) {
-                return Err(format!(
-                    "Rate percentage must be between -100 and 100, got {}",
-                    rate
-                ));
-            }
+            && !(-100..=100).contains(&rate)
+        {
+            return Err(format!(
+                "Rate percentage must be between -100 and 100, got {}",
+                rate
+            ));
+        }
 
         // Validate pitch percentage if set
         if let Some(pitch) = self.pitch_percentage
-            && !(-100..=100).contains(&pitch) {
-                return Err(format!(
-                    "Pitch percentage must be between -100 and 100, got {}",
-                    pitch
-                ));
-            }
+            && !(-100..=100).contains(&pitch)
+        {
+            return Err(format!(
+                "Pitch percentage must be between -100 and 100, got {}",
+                pitch
+            ));
+        }
 
         // Validate customization count (max 2)
         if self.customization_ids.len() > 2 {
             return Err("Maximum 2 customization IDs allowed per request".to_string());
         }
 
+        self.validate_endpoint_override()?;
+
+        Ok(())
+    }
+
+    pub fn validate_sample_rate(&self) -> Result<(), String> {
+        let Some(sample_rate) = self.base.sample_rate else {
+            return Ok(());
+        };
+
+        if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate) {
+            return Err(format!(
+                "Sample rate must be between {} and {} Hz, got {}",
+                MIN_SAMPLE_RATE, MAX_SAMPLE_RATE, sample_rate
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_endpoint_override(&self) -> Result<(), String> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_ibm_tts_endpoint("endpoint_override", endpoint)?;
+        }
         Ok(())
     }
 
@@ -833,7 +879,7 @@ mod tests {
             },
             extras: crate::core::stt::standard::ProviderExtras(extras),
         };
-        let cfg = IbmWatsonTTSConfig::from_standard(&std);
+        let cfg = IbmWatsonTTSConfig::from_standard(&std).unwrap();
         assert_eq!(cfg.rate_percentage, Some(50)); // 1.5x -> +50%
         assert_eq!(cfg.pitch_percentage, Some(25));
         assert_eq!(cfg.base.sample_rate, Some(16000));
@@ -860,7 +906,7 @@ mod tests {
             features: TtsFeatures::default(),
             extras: Default::default(),
         };
-        let cfg = IbmWatsonTTSConfig::from_standard(&std_no_extras);
+        let cfg = IbmWatsonTTSConfig::from_standard(&std_no_extras).unwrap();
         assert_eq!(cfg.instance_id, "inst-from-env"); // env fallback
 
         // Extras present -> extras win over the env var.
@@ -870,7 +916,7 @@ mod tests {
             extras: crate::core::stt::standard::ProviderExtras(extras),
             ..std_no_extras
         };
-        let cfg = IbmWatsonTTSConfig::from_standard(&std_extras);
+        let cfg = IbmWatsonTTSConfig::from_standard(&std_extras).unwrap();
         assert_eq!(cfg.instance_id, "inst-extras"); // extras > env
 
         // SAFETY: Test-only, no concurrent access to this env var.
@@ -900,9 +946,50 @@ mod tests {
             },
             extras: Default::default(),
         };
-        let cfg = IbmWatsonTTSConfig::from_standard(&std);
+        let cfg = IbmWatsonTTSConfig::from_standard(&std).unwrap();
         assert_eq!(cfg.rate_percentage, Some(-15)); // native knob, not speed-derived
         assert_eq!(cfg.pitch_percentage, Some(40)); // native knob, not pitch-derived
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = IbmWatsonTTSConfig {
+            instance_id: "inst".to_string(),
+            base: TTSConfig {
+                api_key: "k".to_string(),
+                ..Default::default()
+            },
+            endpoint_override: Some("https://gateway.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:8080".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://gateway.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(err.contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "ibm-watson".to_string(),
+            api_key: "k".to_string(),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(IbmWatsonTTSConfig::from_standard(&std).is_err());
     }
 
     #[test]
@@ -1044,6 +1131,31 @@ mod tests {
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("API key"));
+    }
+
+    #[test]
+    fn test_config_validation_rejects_invalid_sample_rate() {
+        let mut config = IbmWatsonTTSConfig::default();
+        config.instance_id = "test-instance".to_string();
+        config.base.api_key = "test-api-key".to_string();
+
+        config.base.sample_rate = Some(99);
+        let err = config
+            .validate()
+            .expect_err("sub-100 Hz sample rates can create zero-byte chunks");
+        assert!(err.contains("Sample rate"), "{err}");
+
+        config.base.sample_rate = Some(0);
+        let err = config
+            .validate_sample_rate()
+            .expect_err("zero sample rate must be rejected");
+        assert!(err.contains("Sample rate"), "{err}");
+
+        config.base.sample_rate = Some(u32::MAX);
+        let err = config
+            .validate_sample_rate()
+            .expect_err("pathological sample rate must be rejected");
+        assert!(err.contains("Sample rate"), "{err}");
     }
 
     #[test]

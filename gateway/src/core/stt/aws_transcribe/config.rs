@@ -28,6 +28,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::stt::base::STTConfig;
 
+fn validate_aws_transcribe_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // AWS Regions
 // =============================================================================
@@ -631,9 +640,11 @@ impl AwsTranscribeSTTConfig {
         // `language_options` (x-amzn-transcribe-language-options): comma-separated string OR JSON
         // array of language codes. Accept either form so callers can pass a list or a string.
         cfg.language_options = match ex.get("language_options") {
-            Some(serde_json::Value::String(s)) => {
-                s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
-            }
+            Some(serde_json::Value::String(s)) => s
+                .split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect(),
             Some(serde_json::Value::Array(a)) => a
                 .iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
@@ -756,6 +767,10 @@ impl AwsTranscribeSTTConfig {
             );
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_aws_transcribe_endpoint("endpoint_override", endpoint)?;
+        }
+
         Ok(())
     }
 
@@ -795,7 +810,7 @@ mod tests {
     // off by the flat factory per BRUTAL_REVIEW.md.
     #[test]
     fn from_standard_unlocks_aws_diarization_and_redaction() {
-        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "aws-transcribe".into(),
@@ -899,6 +914,49 @@ mod tests {
     fn test_config_validation_valid() {
         let config = AwsTranscribeSTTConfig::default();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = AwsTranscribeSTTConfig {
+            endpoint_override: Some("https://transcribe-proxy.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("ws://transcribe-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected for AWS SDK HTTP endpoint");
+        assert!(err.contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]

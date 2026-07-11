@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 use super::config::SpeechmaticsSTTConfig;
@@ -20,6 +21,7 @@ use super::messages::{
     SpeakerDiarizationConfig, StartRecognitionMessage, TranscriptFilteringConfig,
     TranscriptionConfig,
 };
+use crate::core::resilience::connect::{WS_CONNECT_TIMEOUT, with_timeout};
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
@@ -58,8 +60,8 @@ struct SpeechmaticsTransport {
     ws_stream: WsReadStream,
     /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
     audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
-    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
-    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    /// Shared shutdown token (fires once; an intentional close must not reconnect).
+    shutdown_token: CancellationToken,
     /// The featured `StartRecognition` JSON, re-sent verbatim on every restore.
     start_recognition_json: String,
     /// Set true once `RecognitionStarted` arrives (drives `is_ready`); cleared per (re)connect.
@@ -75,6 +77,16 @@ struct SpeechmaticsTransport {
     /// caller requested (`"es-ES"`). Empty when no translation was configured; a
     /// missing key falls back to the raw provider code.
     translation_lang_map: Arc<std::collections::HashMap<String, String>>,
+}
+
+impl SpeechmaticsTransport {
+    async fn send_end_of_stream(ws_sink: &mut WsSink, seq_no: u64) {
+        let end_msg = EndOfStreamMessage::new(seq_no);
+        if let Ok(json) = serde_json::to_string(&end_msg) {
+            let _ = ws_sink.send(Message::Text(json.into())).await;
+        }
+        let _ = ws_sink.close().await;
+    }
 }
 
 #[async_trait]
@@ -102,8 +114,15 @@ impl WsTransport for SpeechmaticsTransport {
 
     async fn run(&mut self) -> ReconnectOutcome {
         let mut audio_rx = self.audio_rx.lock().await;
-        let mut shutdown_rx = self.shutdown_rx.lock().await;
+        let shutdown_token = self.shutdown_token.clone();
         loop {
+            if shutdown_token.is_cancelled() {
+                info!("Speechmatics: Received shutdown signal");
+                Self::send_end_of_stream(&mut self.ws_sink, self.seq_no.load(Ordering::SeqCst))
+                    .await;
+                return ReconnectOutcome::Completed;
+            }
+
             tokio::select! {
                 // Handle outgoing audio data (raw binary frames).
                 Some(audio_data) = audio_rx.recv() => {
@@ -171,13 +190,9 @@ impl WsTransport for SpeechmaticsTransport {
                 }
 
                 // Handle shutdown signal (intentional close — must NOT reconnect).
-                _ = &mut *shutdown_rx => {
+                _ = shutdown_token.cancelled() => {
                     info!("Speechmatics: Received shutdown signal");
-                    let end_msg = EndOfStreamMessage::new(self.seq_no.load(Ordering::SeqCst));
-                    if let Ok(json) = serde_json::to_string(&end_msg) {
-                        let _ = self.ws_sink.send(Message::Text(json.into())).await;
-                    }
-                    let _ = self.ws_sink.close().await;
+                    Self::send_end_of_stream(&mut self.ws_sink, self.seq_no.load(Ordering::SeqCst)).await;
                     return ReconnectOutcome::Completed;
                 }
             }
@@ -261,7 +276,8 @@ impl SpeechmaticsTransport {
             }
             "AddTranslation" | "AddPartialTranslation" => {
                 if let Ok(msg) = serde_json::from_str::<AddTranslationMessage>(text)
-                    && let Some(result) = translation_to_stt_result(&msg, &self.translation_lang_map)
+                    && let Some(result) =
+                        translation_to_stt_result(&msg, &self.translation_lang_map)
                     && let Some(callback) = self.result_callback.read().await.as_ref()
                 {
                     callback(result).await;
@@ -286,7 +302,9 @@ impl SpeechmaticsTransport {
                 }
                 // A provider error frame is typically fatal (bad config) — don't hammer it with
                 // reconnects.
-                return Some(ReconnectOutcome::Fatal(StreamError::new("provider error frame")));
+                return Some(ReconnectOutcome::Fatal(StreamError::new(
+                    "provider error frame",
+                )));
             }
             _ => {}
         }
@@ -302,14 +320,14 @@ pub struct SpeechmaticsSTT {
     base_config: Option<STTConfig>,
     /// Audio sender (bounded channel for backpressure); the supervised transport drains it.
     ws_sender: Option<mpsc::Sender<Bytes>>,
-    /// Shutdown signal sender.
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Shutdown signal token.
+    shutdown_token: Option<CancellationToken>,
     /// Connection task handle (the supervisor's outer reconnect loop).
     connection_handle: Option<tokio::task::JoinHandle<()>>,
     /// Connection state
     is_connected: Arc<AtomicBool>,
     /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
-    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// `connect()`, set in `disconnect()` before cancelling `shutdown_token`, so a client close racing a
     /// server-side close can never trigger a spurious reconnect.
     intentional_disconnect: Arc<AtomicBool>,
     /// Session started flag
@@ -350,7 +368,7 @@ impl SpeechmaticsSTT {
             config: speechmatics_config,
             base_config: Some(std.base.clone()),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             connection_handle: None,
             is_connected: Arc::new(AtomicBool::new(false)),
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
@@ -374,7 +392,13 @@ impl SpeechmaticsSTT {
         // Honor an `endpoint_override` for the in-repo mock/proxy: swap the dialed scheme://host
         // while keeping the `/v2` path (a path-less URL fails the WS handshake). Otherwise dial the
         // region endpoint from `ws_url()`.
-        match self.config.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
+        match self
+            .config
+            .endpoint_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+        {
             Some(o) => format!("{}/v2", o.trim_end_matches('/')),
             None => self.config.ws_url().to_string(),
         }
@@ -431,8 +455,7 @@ impl SpeechmaticsSTT {
 
         // End-of-utterance silence trigger (turn detection).
         if let Some(secs) = self.config.end_of_utterance_silence_trigger {
-            transcription_config =
-                transcription_config.with_end_of_utterance_silence_trigger(secs);
+            transcription_config = transcription_config.with_end_of_utterance_silence_trigger(secs);
         }
 
         // Transcript filtering: disfluency removal + find-and-replace.
@@ -498,7 +521,7 @@ impl BaseSTT for SpeechmaticsSTT {
             config: speechmatics_config,
             base_config: Some(config),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             connection_handle: None,
             is_connected: Arc::new(AtomicBool::new(false)),
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
@@ -542,16 +565,15 @@ impl BaseSTT for SpeechmaticsSTT {
 
         // Create channels for communication (bounded for backpressure on audio).
         let (ws_tx, ws_rx) = mpsc::channel::<Bytes>(32);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_token = CancellationToken::new();
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         self.ws_sender = Some(ws_tx);
-        self.shutdown_tx = Some(shutdown_tx);
+        self.shutdown_token = Some(shutdown_token.clone());
         self.seq_no.store(0, Ordering::SeqCst);
 
         // Shared state the supervised transport re-uses across reconnect attempts.
         let audio_rx = Arc::new(Mutex::new(ws_rx));
-        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
         let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
 
         let result_callback = Arc::clone(&self.result_callback);
@@ -589,7 +611,7 @@ impl BaseSTT for SpeechmaticsSTT {
                     let api_key = api_key.clone();
                     let start_recognition_json = start_recognition_json.clone();
                     let audio_rx = Arc::clone(&audio_rx);
-                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let shutdown_token = shutdown_token.clone();
                     let connected_tx = Arc::clone(&connected_tx);
                     let result_callback = Arc::clone(&result_callback);
                     let error_callback = Arc::clone(&error_callback);
@@ -597,45 +619,52 @@ impl BaseSTT for SpeechmaticsSTT {
                     let seq_no = Arc::clone(&seq_no);
                     let translation_lang_map = Arc::clone(&translation_lang_map);
                     async move {
-                        // Derive the Host header from the ACTUAL dial URL — hardcoding the EU host
-                        // broke every US-region session (dialing us.rt.speechmatics.com while
-                        // sending `Host: eu.rt.speechmatics.com` is a Host/SNI mismatch the server
-                        // rejects). tokio-tungstenite only auto-derives Host for a URL string, not a
-                        // hand-built Request, so we must set it ourselves to match the region.
-                        let ws_host = ws_url
-                            .split("://")
-                            .nth(1)
-                            .and_then(|rest| rest.split(['/', '?']).next())
-                            .unwrap_or("eu.rt.speechmatics.com");
-                        let request = http::Request::builder()
-                            .uri(&ws_url)
-                            .header("Authorization", format!("Bearer {}", api_key))
-                            .header("Sec-WebSocket-Protocol", "json")
-                            .header("Host", ws_host)
-                            .header("Connection", "Upgrade")
-                            .header("Upgrade", "websocket")
-                            .header("Sec-WebSocket-Version", "13")
-                            .header(
-                                "Sec-WebSocket-Key",
-                                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
-                            )
-                            .body(())
-                            .map_err(|e| {
-                                StreamError::new(format!("Failed to build request: {e}"))
-                            })?;
+                        // Build the upgrade request via `into_client_request` (repo convention):
+                        // it derives the 5 mandatory WS handshake headers (`Host`, `Connection`,
+                        // `Upgrade`, `Sec-WebSocket-Version`, `Sec-WebSocket-Key`) from the dial
+                        // URL. Deriving Host from the ACTUAL dial URL is load-bearing — a
+                        // hardcoded EU host broke every US-region session (dialing
+                        // us.rt.speechmatics.com while sending `Host: eu.rt.speechmatics.com` is
+                        // a Host/SNI mismatch the server rejects). Only Speechmatics' auth +
+                        // subprotocol headers ride on top.
+                        let map_req_err = |e: &dyn std::fmt::Display| {
+                            StreamError::new(format!("Failed to build request: {e}"))
+                        };
+                        let mut request = ws_url
+                            .as_str()
+                            .into_client_request()
+                            .map_err(|e| map_req_err(&e))?;
+                        let headers = request.headers_mut();
+                        headers.insert(
+                            "Authorization",
+                            format!("Bearer {}", api_key)
+                                .parse()
+                                .map_err(|e| map_req_err(&e))?,
+                        );
+                        headers.insert(
+                            "Sec-WebSocket-Protocol",
+                            "json".parse().map_err(|e| map_req_err(&e))?,
+                        );
 
-                        let (ws_stream, _) = tokio_tungstenite::connect_async(request)
-                            .await
-                            .map_err(|e| {
-                                StreamError::new(format!("WebSocket connect failed: {e}"))
-                            })?;
+                        let (ws_stream, _) = with_timeout(
+                            WS_CONNECT_TIMEOUT,
+                            tokio_tungstenite::connect_async(request),
+                        )
+                        .await
+                        .map_err(|_| {
+                            StreamError::new(format!(
+                                "connect to Speechmatics timed out after {}s",
+                                WS_CONNECT_TIMEOUT.as_secs()
+                            ))
+                        })?
+                        .map_err(|e| StreamError::new(format!("WebSocket connect failed: {e}")))?;
                         info!("Speechmatics connected");
                         let (ws_sink, ws_stream) = ws_stream.split();
                         Ok(SpeechmaticsTransport {
                             ws_sink,
                             ws_stream,
                             audio_rx,
-                            shutdown_rx,
+                            shutdown_token,
                             start_recognition_json,
                             is_session_started,
                             seq_no,
@@ -674,17 +703,22 @@ impl BaseSTT for SpeechmaticsSTT {
         // Record the intent BEFORE the connected-guard so the supervisor sees it even if the
         // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
         self.intentional_disconnect.store(true, Ordering::SeqCst);
-        if !self.is_connected.load(Ordering::SeqCst) {
+        if !self.is_connected.load(Ordering::SeqCst) && self.connection_handle.is_none() {
             return Ok(());
         }
 
         // Signal the supervised transport to send EndOfStream + close intentionally (no reconnect).
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
 
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "speechmatics-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         self.ws_sender = None;
@@ -760,8 +794,9 @@ impl BaseSTT for SpeechmaticsSTT {
 
 impl Drop for SpeechmaticsSTT {
     fn drop(&mut self) {
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
         if let Some(handle) = self.connection_handle.take() {
             handle.abort();
@@ -894,7 +929,7 @@ mod tests {
     // config — not just the config-level `from_standard`. The flat `new` path leaves them off.
     #[test]
     fn test_new_standard_unlocks_advanced_features() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "speechmatics".into(),
@@ -926,6 +961,51 @@ mod tests {
     }
 
     #[test]
+    fn test_new_standard_rejects_ssrf_endpoint_override() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mk = |endpoint: &str| {
+            StandardSTTConfig {
+                base: STTConfig {
+                    provider: "speechmatics".into(),
+                    api_key: "test-api-key".into(),
+                    language: "en".into(),
+                    sample_rate: 16000,
+                    encoding: "pcm_s16le".into(),
+                    ..Default::default()
+                },
+                features: SttFeatures::default(),
+                extras: ProviderExtras::default(),
+                translation: None,
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(SpeechmaticsSTT::new_standard(&mk("wss://speechmatics-proxy.example.com")).is_ok());
+        assert!(SpeechmaticsSTT::new_standard(&mk("ws://127.0.0.1:9000")).is_err());
+        assert!(SpeechmaticsSTT::new_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(
+            SpeechmaticsSTT::new_standard(&mk("https://speechmatics-proxy.example.com")).is_err()
+        );
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
+    }
+
+    #[test]
     fn test_build_start_recognition() {
         let config = STTConfig {
             api_key: "test-api-key".to_string(),
@@ -950,14 +1030,11 @@ mod tests {
     // Guards the recurring "set on the struct but never emitted to the wire" gap class.
     #[test]
     fn standardized_features_reach_start_recognition_json() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let mut extras = serde_json::Map::new();
         extras.insert("speaker_sensitivity".into(), serde_json::json!(0.7));
         extras.insert("prefer_current_speaker".into(), serde_json::json!(true));
-        extras.insert(
-            "permitted_marks".into(),
-            serde_json::json!([".", ",", "?"]),
-        );
+        extras.insert("permitted_marks".into(), serde_json::json!([".", ",", "?"]));
         extras.insert("punctuation_sensitivity".into(), serde_json::json!(0.4));
         extras.insert(
             "replacements".into(),
@@ -1049,7 +1126,10 @@ mod tests {
             json.contains("\"output_locale\":\"en-US\""),
             "output_locale missing: {json}"
         );
-        assert!(json.contains("\"domain\":\"finance\""), "domain missing: {json}");
+        assert!(
+            json.contains("\"domain\":\"finance\""),
+            "domain missing: {json}"
+        );
         assert!(
             json.contains("\"max_delay_mode\":\"flexible\""),
             "max_delay_mode missing: {json}"
@@ -1116,6 +1196,20 @@ mod tests {
 
         assert!(url.starts_with("wss://"));
         assert!(url.contains("speechmatics.com"));
+    }
+
+    #[test]
+    fn test_build_ws_url_trims_endpoint_override() {
+        let mut stt = SpeechmaticsSTT::new(STTConfig {
+            api_key: "test-api-key".to_string(),
+            language: "en".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        stt.config.endpoint_override = Some(" wss://speechmatics-proxy.example.com/ ".to_string());
+
+        let url = stt.build_ws_url();
+        assert_eq!(url, "wss://speechmatics-proxy.example.com/v2");
     }
 
     #[tokio::test]

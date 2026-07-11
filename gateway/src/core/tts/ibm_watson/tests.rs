@@ -646,7 +646,10 @@ mod provider_tests {
         )
         .unwrap();
         let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
-        assert_eq!(pairs.get("rate_percentage").map(String::as_str), Some("-30"));
+        assert_eq!(
+            pairs.get("rate_percentage").map(String::as_str),
+            Some("-30")
+        );
     }
 
     #[test]
@@ -661,7 +664,10 @@ mod provider_tests {
         )
         .unwrap();
         let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
-        assert_eq!(pairs.get("pitch_percentage").map(String::as_str), Some("15"));
+        assert_eq!(
+            pairs.get("pitch_percentage").map(String::as_str),
+            Some("15")
+        );
     }
 
     #[test]
@@ -678,7 +684,10 @@ mod provider_tests {
         .unwrap();
         let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
         assert_eq!(pairs.get("rate_percentage").map(String::as_str), Some("50"));
-        assert_eq!(pairs.get("pitch_percentage").map(String::as_str), Some("-20"));
+        assert_eq!(
+            pairs.get("pitch_percentage").map(String::as_str),
+            Some("-20")
+        );
 
         // Body is plain text, not double-wrapped in SSML.
         let tts = IbmWatsonTTS::new_from_ibm_config(config).unwrap();

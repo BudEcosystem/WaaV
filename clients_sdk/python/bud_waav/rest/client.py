@@ -369,26 +369,28 @@ class RestClient:
         """
         Generate a LiveKit access token.
 
+        The gateway ``TokenRequest`` (handlers/livekit/token.rs) requires exactly
+        ``{room_name, participant_name, participant_identity}`` — the previous
+        ``identity``/``name`` field names were silently ignored and the call 422'd.
+        ``ttl``/``metadata`` are not part of the gateway contract and are not sent.
+
         Args:
             room_name: Room name to join
-            identity: Participant identity
-            name: Participant display name
-            ttl: Token TTL in seconds
-            metadata: Participant metadata
+            identity: Participant identity (sent as ``participant_identity``)
+            name: Participant display name (sent as ``participant_name``;
+                defaults to the identity when omitted — the field is required
+                by the gateway)
+            ttl: Deprecated/ignored — the gateway sets the token TTL server-side
+            metadata: Deprecated/ignored — not part of the gateway contract
 
         Returns:
             Token response with JWT and room info
         """
         payload: dict[str, Any] = {
             "room_name": room_name,
-            "identity": identity,
+            "participant_identity": identity,
+            "participant_name": name or identity,
         }
-        if name:
-            payload["name"] = name
-        if ttl:
-            payload["ttl"] = ttl
-        if metadata:
-            payload["metadata"] = metadata
 
         result: dict[str, Any] = await self.post("/livekit/token", json=payload)
         return result
@@ -432,18 +434,23 @@ class RestClient:
         webhook_url: str,
     ) -> dict[str, Any]:
         """
-        Create a SIP hook.
+        Create (or replace) a SIP hook.
+
+        The gateway ``SipHooksRequest`` (handlers/sip/hooks.rs) is an ENVELOPE:
+        ``{"hooks": [{"host": ..., "url": ...}]}``. Because ``hooks`` is
+        ``#[serde(default)]``, the previous flat ``{host, webhook_url}`` body
+        deserialized to an EMPTY hook list — a silent no-op (or destructive
+        replace-with-nothing). Hooks with a matching host are replaced.
 
         Args:
-            host: SIP host
-            webhook_url: Webhook URL for incoming calls
+            host: SIP host pattern (case-insensitive)
+            webhook_url: HTTPS URL to forward webhook events to (wire field: ``url``)
 
         Returns:
-            Created hook info
+            The updated hook list.
         """
-        payload: dict[str, str] = {
-            "host": host,
-            "webhook_url": webhook_url,
+        payload: dict[str, Any] = {
+            "hooks": [{"host": host, "url": webhook_url}],
         }
         result: dict[str, Any] = await self.post("/sip/hooks", json=payload)
         return result
@@ -658,15 +665,19 @@ class RestClient:
         Delete a cloned voice.
 
         .. warning::
-            Gateway does not currently expose a DELETE /voices/{voice_id}
-            endpoint. This method will return a 404 until gateway support
-            is added. Use the provider's API directly in the meantime.
+            The gateway serves no ``DELETE /voices/{voice_id}`` route — this
+            raises a typed 501 ``APIError`` immediately (fail-fast, instead of
+            a confusing network 404). Use the provider's API directly.
 
         Args:
             voice_id: The voice ID to delete.
             provider: The voice cloning provider.
         """
-        await self.delete(f"/voices/{voice_id}", params={"provider": provider})
+        raise APIError(
+            f"delete_cloned_voice({voice_id!r}) is not supported: the gateway serves no "
+            "DELETE /voices/{id} route. Use the provider's API directly.",
+            status_code=501,
+        )
 
     async def get_cloned_voice(
         self,
@@ -677,9 +688,10 @@ class RestClient:
         Get information about a cloned voice.
 
         .. warning::
-            Gateway does not currently expose a GET /voices/{voice_id}
-            endpoint. This method will return a 404 until gateway support
-            is added. Use the provider's API directly in the meantime.
+            The gateway serves no ``GET /voices/{voice_id}`` route — this raises
+            a typed 501 ``APIError`` immediately (fail-fast, instead of a
+            confusing network 404). Use ``list_cloned_voices()`` and filter, or
+            the provider's API directly.
 
         Args:
             voice_id: The voice ID.
@@ -688,10 +700,11 @@ class RestClient:
         Returns:
             Voice information.
         """
-        result: dict[str, Any] = await self.get(
-            f"/voices/{voice_id}", params={"provider": provider}
+        raise APIError(
+            f"get_cloned_voice({voice_id!r}) is not supported: the gateway serves no "
+            "GET /voices/{id} route. Use list_cloned_voices() and filter client-side.",
+            status_code=501,
         )
-        return result
 
     # =========================================================================
     # Recording Methods
@@ -700,23 +713,23 @@ class RestClient:
     async def get_recording(
         self,
         stream_id: str,
-    ) -> dict[str, Any]:
+    ) -> bytes:
         """
         Get recording metadata by stream ID.
 
-        .. warning::
-            Gateway does not currently expose a metadata-only recording
-            endpoint. This method will return a 404 until gateway support
-            is added. Use ``download_recording()`` to retrieve the audio.
+        .. note::
+            The gateway serves recordings at ``GET /recording/{stream_id}``
+            (singular) as audio bytes; there is no metadata-only endpoint.
+            This method is a deprecated alias of ``download_recording()`` —
+            the previous ``/recordings/{id}`` (plural) path always 404'd.
 
         Args:
             stream_id: The stream/session ID.
 
         Returns:
-            Recording information including status, duration, format.
+            Audio data as bytes (OGG format) — same as ``download_recording()``.
         """
-        result: dict[str, Any] = await self.get(f"/recordings/{stream_id}")
-        return result
+        return await self.download_recording(stream_id)
 
     async def download_recording(
         self,
@@ -750,9 +763,10 @@ class RestClient:
         List recordings with optional filters.
 
         .. warning::
-            Gateway does not currently expose a GET /recordings list
-            endpoint. This method will return a 404 until gateway support
-            is added.
+            The gateway serves no ``GET /recordings`` list route — this raises
+            a typed 501 ``APIError`` immediately (fail-fast, instead of a
+            confusing network 404). Recordings are addressed by stream id via
+            ``download_recording()``.
 
         Args:
             limit: Maximum number of recordings to return.
@@ -764,19 +778,11 @@ class RestClient:
         Returns:
             Dictionary with recordings list and pagination info.
         """
-        params: dict[str, Any] = {
-            "limit": limit,
-            "offset": offset,
-        }
-        if status:
-            params["status"] = status
-        if from_date:
-            params["from_date"] = from_date
-        if to_date:
-            params["to_date"] = to_date
-
-        result: dict[str, Any] = await self.get("/recordings", params=params)
-        return result
+        raise APIError(
+            "list_recordings() is not supported: the gateway serves no GET /recordings "
+            "route. Recordings are addressed by stream id via download_recording().",
+            status_code=501,
+        )
 
     async def delete_recording(
         self,
@@ -786,14 +792,18 @@ class RestClient:
         Delete a recording.
 
         .. warning::
-            Gateway does not currently expose a DELETE /recordings/{stream_id}
-            endpoint. This method will return a 404 until gateway support
-            is added.
+            The gateway serves no ``DELETE /recordings/{stream_id}`` route —
+            this raises a typed 501 ``APIError`` immediately (fail-fast,
+            instead of a confusing network 404).
 
         Args:
             stream_id: The stream/session ID.
         """
-        await self.delete(f"/recordings/{stream_id}")
+        raise APIError(
+            f"delete_recording({stream_id!r}) is not supported: the gateway serves no "
+            "DELETE /recordings/{id} route.",
+            status_code=501,
+        )
 
     # =========================================================================
     # DAG Template Methods
@@ -925,21 +935,35 @@ class RestClient:
 
     async def sip_transfer(
         self,
-        stream_id: str,
+        room_name: str,
+        participant_identity: str,
         transfer_to: str,
     ) -> dict[str, Any]:
         """
-        Transfer an active SIP call to another number.
+        Transfer an active SIP call (SIP REFER) to another number.
+
+        The gateway endpoint is ``POST /sip/transfer`` with a JSON body of
+        ``{room_name, participant_identity, transfer_to}`` — the gateway
+        ``SIPTransferRequest`` (handlers/sip/transfer.rs) requires ALL THREE
+        fields (the previous ``stream_id`` payload was never a gateway field
+        and 422'd on every call). The room name is normalized with the auth
+        prefix server-side for tenant isolation.
 
         Args:
-            stream_id: Active stream/session ID.
-            transfer_to: Phone number or SIP URI to transfer to.
+            room_name: LiveKit room name where the SIP participant is connected.
+            participant_identity: Identity of the SIP participant to transfer
+                (obtainable by listing the room's participants).
+            transfer_to: Destination — international (``+1234567890``),
+                national (``07123456789``), or internal extension (``1234``).
 
         Returns:
-            Transfer result.
+            Transfer result: ``{status, room_name, participant_identity,
+            transfer_to}`` where ``status`` is ``"completed"`` or
+            ``"initiated"`` (confirmation timed out but likely succeeded).
         """
         payload: dict[str, Any] = {
-            "stream_id": stream_id,
+            "room_name": room_name,
+            "participant_identity": participant_identity,
             "transfer_to": transfer_to,
         }
         result: dict[str, Any] = await self.post("/sip/transfer", json=payload)
@@ -949,19 +973,74 @@ class RestClient:
     # Metrics Method
     # =========================================================================
 
-    async def get_metrics(self) -> dict[str, Any]:
+    async def get_metrics(self) -> str:
         """
         Get server performance metrics.
 
-        .. warning::
-            Gateway does not currently expose a GET /metrics endpoint.
-            This method will return a 404 until gateway support is added.
-            Use the SDK's local ``SessionMetrics`` for client-side metrics.
+        The gateway serves ``GET /metrics`` as a public **Prometheus text
+        exposition** (``text/plain``) — turn counters, frame latencies,
+        provider health, etc. The previous docstring claimed the endpoint
+        did not exist and the annotation claimed ``dict``; both were stale.
 
         Returns:
-            Server metrics including STT/TTS latency, connection counts, etc.
+            The Prometheus text exposition as a string (parse with a
+            Prometheus client library, or scrape directly).
         """
-        result: dict[str, Any] = await self.get("/metrics")
+        result: str = await self.get("/metrics")
+        return result
+
+    # =========================================================================
+    # Capability Discovery
+    # =========================================================================
+
+    async def fetch_language_capabilities(
+        self,
+        provider: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Fetch the LIVE unified-language support matrix from the gateway.
+
+        Calls ``GET /capabilities/languages`` (gateway
+        ``LanguageCapabilitiesResponse``, handlers/capabilities.rs) — the
+        authoritative, always-current counterpart to the SDK's static
+        :func:`bud_waav.types.language_capabilities` table::
+
+            {
+                "canonical_languages": [
+                    {"bcp47": "en-US", "lang_subtag": "en",
+                     "iso639_1": "en", "region": "US"},
+                    ...
+                ],
+                "providers": [
+                    {"provider": "deepgram", "notation": "bcp47",
+                     "supports_auto": true,
+                     "example_cmn_cn": "zh-CN", "example_en_us": "en-US"},
+                    ...
+                ],
+                "canonical_count": N,
+            }
+
+        The endpoint takes NO query parameters — when ``provider`` is given
+        the ``providers`` rows are filtered CLIENT-side (an unknown provider
+        yields an empty ``providers`` list; the canonical language list is
+        always returned in full).
+
+        Args:
+            provider: Optional provider id to filter the ``providers`` rows to.
+
+        Returns:
+            The capability matrix dict shown above.
+        """
+        result: dict[str, Any] = await self.get("/capabilities/languages")
+        if provider is not None and isinstance(result.get("providers"), list):
+            result = {
+                **result,
+                "providers": [
+                    row
+                    for row in result["providers"]
+                    if isinstance(row, dict) and row.get("provider") == provider
+                ],
+            }
         return result
 
     # =========================================================================

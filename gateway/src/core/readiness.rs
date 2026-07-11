@@ -79,47 +79,74 @@ fn enabled_provider_targets(config: &ServerConfig) -> BTreeMap<String, Option<(S
 
     add(
         "deepgram",
-        config.deepgram_api_key.as_deref().is_some_and(|k| !k.is_empty()),
+        config
+            .deepgram_api_key
+            .as_deref()
+            .is_some_and(|k| !k.is_empty()),
         "api.deepgram.com",
     );
     add(
         "elevenlabs",
-        config.elevenlabs_api_key.as_deref().is_some_and(|k| !k.is_empty()),
+        config
+            .elevenlabs_api_key
+            .as_deref()
+            .is_some_and(|k| !k.is_empty()),
         "api.elevenlabs.io",
     );
     add(
         "openai",
-        config.openai_api_key.as_deref().is_some_and(|k| !k.is_empty()),
+        config
+            .openai_api_key
+            .as_deref()
+            .is_some_and(|k| !k.is_empty()),
         "api.openai.com",
     );
     add(
         "cartesia",
-        config.cartesia_api_key.as_deref().is_some_and(|k| !k.is_empty()),
+        config
+            .cartesia_api_key
+            .as_deref()
+            .is_some_and(|k| !k.is_empty()),
         "api.cartesia.ai",
     );
     add(
         "assemblyai",
-        config.assemblyai_api_key.as_deref().is_some_and(|k| !k.is_empty()),
+        config
+            .assemblyai_api_key
+            .as_deref()
+            .is_some_and(|k| !k.is_empty()),
         "api.assemblyai.com",
     );
     add(
         "hume",
-        config.hume_api_key.as_deref().is_some_and(|k| !k.is_empty()),
+        config
+            .hume_api_key
+            .as_deref()
+            .is_some_and(|k| !k.is_empty()),
         "api.hume.ai",
     );
     add(
         "lmnt",
-        config.lmnt_api_key.as_deref().is_some_and(|k| !k.is_empty()),
+        config
+            .lmnt_api_key
+            .as_deref()
+            .is_some_and(|k| !k.is_empty()),
         "api.lmnt.com",
     );
     add(
         "groq",
-        config.groq_api_key.as_deref().is_some_and(|k| !k.is_empty()),
+        config
+            .groq_api_key
+            .as_deref()
+            .is_some_and(|k| !k.is_empty()),
         "api.groq.com",
     );
     add(
         "playht",
-        config.playht_api_key.as_deref().is_some_and(|k| !k.is_empty()),
+        config
+            .playht_api_key
+            .as_deref()
+            .is_some_and(|k| !k.is_empty()),
         "api.play.ht",
     );
     add(

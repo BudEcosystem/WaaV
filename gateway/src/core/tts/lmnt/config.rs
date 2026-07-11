@@ -12,6 +12,15 @@ use super::{
     DEFAULT_TOP_P, MAX_SPEED, MAX_TOP_P, MIN_SPEED, MIN_TEMPERATURE, MIN_TOP_P,
 };
 
+fn validate_lmnt_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Audio Format
 // =============================================================================
@@ -471,6 +480,10 @@ impl LmntTtsConfig {
             ));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_lmnt_tts_endpoint("endpoint_override", endpoint)?;
+        }
+
         Ok(())
     }
 
@@ -543,6 +556,46 @@ mod tests {
         assert!((cfg.top_p - 0.9).abs() < 0.001); // stability → top_p
         assert!(cfg.debug); // from provider extras passthrough
         assert_eq!(cfg.voice_id(), "lily"); // base carried through
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = LmntTtsConfig::from_base(TTSConfig {
+            api_key: "test-api-key".to_string(),
+            voice_id: Some("lily".to_string()),
+            ..Default::default()
+        });
+
+        config.endpoint_override = Some("https://lmnt-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://lmnt-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected for REST LMNT");
+        assert!(err.contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            api_key: "test-api-key".to_string(),
+            voice_id: Some("lily".to_string()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        let cfg = LmntTtsConfig::from_standard(&std);
+        assert!(cfg.validate().is_err());
     }
 
     // =========================================================================

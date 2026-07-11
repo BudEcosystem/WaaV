@@ -424,9 +424,10 @@ impl BhashiniErrorResponse {
     /// Get the error message.
     pub fn error_message(&self) -> String {
         if let Some(ref err) = self.error
-            && let Some(ref msg) = err.message {
-                return msg.clone();
-            }
+            && let Some(ref msg) = err.message
+        {
+            return msg.clone();
+        }
         if let Some(ref msg) = self.message {
             return msg.clone();
         }
@@ -448,32 +449,24 @@ pub mod wav {
         num_channels: u16,
         data_size: u32,
     ) -> Vec<u8> {
-        let byte_rate = sample_rate * num_channels as u32 * bits_per_sample as u32 / 8;
-        let block_align = num_channels * bits_per_sample / 8;
-        let chunk_size = 36 + data_size;
+        try_create_wav_header(sample_rate, bits_per_sample, num_channels, data_size)
+            .expect("Invalid WAV parameters")
+    }
 
-        let mut header = Vec::with_capacity(44);
-
-        // RIFF header
-        header.extend_from_slice(b"RIFF");
-        header.extend_from_slice(&chunk_size.to_le_bytes());
-        header.extend_from_slice(b"WAVE");
-
-        // fmt subchunk
-        header.extend_from_slice(b"fmt ");
-        header.extend_from_slice(&16u32.to_le_bytes()); // Subchunk1Size (16 for PCM)
-        header.extend_from_slice(&1u16.to_le_bytes()); // AudioFormat (1 = PCM)
-        header.extend_from_slice(&num_channels.to_le_bytes());
-        header.extend_from_slice(&sample_rate.to_le_bytes());
-        header.extend_from_slice(&byte_rate.to_le_bytes());
-        header.extend_from_slice(&block_align.to_le_bytes());
-        header.extend_from_slice(&bits_per_sample.to_le_bytes());
-
-        // data subchunk
-        header.extend_from_slice(b"data");
-        header.extend_from_slice(&data_size.to_le_bytes());
-
-        header
+    /// Fallible WAV header builder for production callsites.
+    pub(crate) fn try_create_wav_header(
+        sample_rate: u32,
+        bits_per_sample: u16,
+        num_channels: u16,
+        data_size: u32,
+    ) -> Result<Vec<u8>, crate::core::stt::wav::WavBuildError> {
+        crate::core::stt::wav::create_pcm_wav_header(
+            sample_rate,
+            bits_per_sample,
+            num_channels,
+            data_size,
+        )
+        .map(|header| header.to_vec())
     }
 
     /// Encode raw PCM audio data as WAV file.
@@ -483,15 +476,18 @@ pub mod wav {
         bits_per_sample: u16,
         num_channels: u16,
     ) -> Vec<u8> {
-        let header = create_wav_header(
-            sample_rate,
-            bits_per_sample,
-            num_channels,
-            pcm_data.len() as u32,
-        );
-        let mut wav = header;
-        wav.extend_from_slice(pcm_data);
-        wav
+        try_encode_wav(pcm_data, sample_rate, bits_per_sample, num_channels)
+            .expect("Invalid WAV parameters")
+    }
+
+    /// Fallible WAV encoder for production callsites.
+    pub(crate) fn try_encode_wav(
+        pcm_data: &[u8],
+        sample_rate: u32,
+        bits_per_sample: u16,
+        num_channels: u16,
+    ) -> Result<Vec<u8>, crate::core::stt::wav::WavBuildError> {
+        crate::core::stt::wav::encode_pcm_wav(pcm_data, sample_rate, bits_per_sample, num_channels)
     }
 }
 
@@ -555,10 +551,12 @@ mod tests {
     // Empty post-processor list is treated as absence (omitted from the wire body).
     #[test]
     fn empty_post_processors_are_omitted() {
-        let request =
-            PipelineConfigRequest::new_asr_with("hi", "p", None, Some(Vec::new()));
+        let request = PipelineConfigRequest::new_asr_with("hi", "p", None, Some(Vec::new()));
         let json = serde_json::to_string(&request).unwrap();
-        assert!(!json.contains("postProcessors"), "empty list must be omitted: {json}");
+        assert!(
+            !json.contains("postProcessors"),
+            "empty list must be omitted: {json}"
+        );
     }
 
     #[test]

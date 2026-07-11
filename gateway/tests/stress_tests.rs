@@ -10,15 +10,19 @@
 //! Run: cargo test --test stress_tests -- --nocapture
 //! Run with release: cargo test --test stress_tests --release -- --nocapture
 
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+
 use futures::future::join_all;
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -36,9 +40,38 @@ mod common {
     use axum::{Router, middleware};
     use std::sync::Arc;
 
-    pub fn get_available_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
+    pub struct TestServer {
+        handle: JoinHandle<()>,
+        panicked: Arc<AtomicBool>,
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            if !self.handle.is_finished() {
+                self.handle.abort();
+            }
+            if self.panicked.load(Ordering::SeqCst) {
+                if std::thread::panicking() {
+                    eprintln!("stress test server panicked");
+                } else {
+                    panic!("stress test server panicked");
+                }
+            }
+        }
+    }
+
+    fn spawn_test_server<F>(future: F) -> TestServer
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let panicked = Arc::new(AtomicBool::new(false));
+        let panicked_in_task = Arc::clone(&panicked);
+        let handle = tokio::spawn(async move {
+            if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+                panicked_in_task.store(true, Ordering::SeqCst);
+            }
+        });
+        TestServer { handle, panicked }
     }
 
     fn create_minimal_config(port: u16) -> ServerConfig {
@@ -134,22 +167,25 @@ mod common {
             .with_state(state)
     }
 
-    pub async fn start_test_server(port: u16) -> SocketAddr {
-        let config = create_minimal_config(port);
+    pub async fn start_test_server() -> (SocketAddr, TestServer) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind stress test server");
+        let actual_addr = listener.local_addr().expect("Failed to get address");
+
+        let config = create_minimal_config(actual_addr.port());
         let app_state = AppState::new(config).await;
         let app = create_combined_router(app_state);
 
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let listener = TcpListener::bind(addr).await.expect("Failed to bind");
-        let actual_addr = listener.local_addr().expect("Failed to get address");
-
-        tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service()).await.ok();
+        let server = spawn_test_server(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .expect("stress test server failed");
         });
 
         // Wait for server to be ready
         tokio::time::sleep(Duration::from_millis(100)).await;
-        actual_addr
+        (actual_addr, server)
     }
 
     /// Create a text message with proper conversion for tungstenite 0.28
@@ -170,8 +206,7 @@ mod common {
 /// Test maximum concurrent HTTP connections
 #[tokio::test]
 async fn test_max_concurrent_http_connections() {
-    let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server().await;
     let base_url = format!("http://{}", addr);
 
     let num_connections = 200;
@@ -203,7 +238,9 @@ async fn test_max_concurrent_http_connections() {
         }));
     }
 
-    join_all(handles).await;
+    for result in join_all(handles).await {
+        result.expect("HTTP stress worker should not panic");
+    }
 
     let success_count = successful.load(Ordering::Relaxed);
     let fail_count = failed.load(Ordering::Relaxed);
@@ -225,8 +262,7 @@ async fn test_max_concurrent_http_connections() {
 /// Test maximum concurrent WebSocket connections
 #[tokio::test]
 async fn test_max_concurrent_websocket_connections() {
-    let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server().await;
     let ws_url = format!("ws://{}/ws", addr);
 
     let num_connections = 100;
@@ -255,7 +291,9 @@ async fn test_max_concurrent_websocket_connections() {
         }));
     }
 
-    join_all(handles).await;
+    for result in join_all(handles).await {
+        result.expect("WebSocket stress worker should not panic");
+    }
 
     let connect_count = connected.load(Ordering::Relaxed);
     let fail_count = failed.load(Ordering::Relaxed);
@@ -277,8 +315,7 @@ async fn test_max_concurrent_websocket_connections() {
 /// Test rapid connect/disconnect cycles
 #[tokio::test]
 async fn test_rapid_connect_disconnect() {
-    let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server().await;
     let ws_url = format!("ws://{}/ws", addr);
 
     let cycles = 50;
@@ -319,8 +356,7 @@ async fn test_rapid_connect_disconnect() {
 /// Test large JSON payload handling
 #[tokio::test]
 async fn test_large_json_payload() {
-    let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server().await;
     let base_url = format!("http://{}", addr);
 
     let client = reqwest::Client::builder()
@@ -341,84 +377,126 @@ async fn test_large_json_payload() {
         .post(format!("{}/speak", base_url))
         .json(&payload)
         .send()
-        .await;
+        .await
+        .expect("Large JSON payload should receive a clean HTTP response");
 
-    // Should handle large payload gracefully (either process or reject cleanly)
-    match response {
-        Ok(resp) => {
-            println!(
-                "Large JSON payload response: {} {}",
-                resp.status(),
-                resp.status().canonical_reason().unwrap_or("")
-            );
-            // Should not be a 5xx error
-            assert!(
-                resp.status().as_u16() < 500,
-                "Server returned 5xx for large payload"
-            );
-        }
-        Err(e) => {
-            // Timeout or connection reset is acceptable for very large payloads
-            println!("Large JSON payload error (acceptable): {}", e);
-        }
-    }
+    println!(
+        "Large JSON payload response: {} {}",
+        response.status(),
+        response.status().canonical_reason().unwrap_or("")
+    );
+    assert!(
+        response.status().as_u16() < 500,
+        "Server returned 5xx for large payload"
+    );
+
+    let health = client
+        .get(format!("{}/", base_url))
+        .send()
+        .await
+        .expect("Server should remain reachable after large JSON payload");
+    assert!(
+        health.status().is_success(),
+        "Server health check failed after large JSON payload: {}",
+        health.status()
+    );
 }
 
 /// Test large binary WebSocket message
 #[tokio::test]
 async fn test_large_binary_websocket_message() {
-    let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server().await;
     let ws_url = format!("ws://{}/ws", addr);
 
-    match timeout(Duration::from_secs(10), connect_async(&ws_url)).await {
-        Ok(Ok((ws, _))) => {
-            let (mut write, mut read) = ws.split();
+    let (ws, _) = timeout(Duration::from_secs(10), connect_async(&ws_url))
+        .await
+        .expect("WebSocket connection timed out")
+        .expect("WebSocket connection failed");
+    let (mut write, mut read) = ws.split();
 
-            // Send config first
-            let config = json!({
-                "type": "config",
-                "stt_config": { "provider": "deepgram" },
-                "tts_config": { "provider": "elevenlabs" }
-            });
-            write
-                .send(common::text_message(&config.to_string()))
-                .await
-                .expect("Failed to send config");
+    let config = json!({
+        "type": "config",
+        "audio": false
+    });
+    write
+        .send(common::text_message(&config.to_string()))
+        .await
+        .expect("Failed to send config");
 
-            // Wait for ready
-            let mut ready_received = false;
-            for _ in 0..10 {
-                if let Ok(Some(Ok(msg))) = timeout(Duration::from_millis(500), read.next()).await
-                    && let Message::Text(text) = msg {
-                        let text_str: &str = &text;
-                        if text_str.contains("ready") {
-                            ready_received = true;
-                            break;
-                        }
-                    }
-            }
-
-            if ready_received {
-                // Try to send large binary message (10MB)
-                let large_audio = vec![0u8; 10 * 1024 * 1024];
-
-                match write.send(common::binary_message(large_audio)).await {
-                    Ok(_) => {
-                        println!("Large binary message sent successfully");
-                    }
-                    Err(e) => {
-                        println!("Large binary message rejected (acceptable): {}", e);
-                    }
-                }
-            }
+    let ready = timeout(Duration::from_secs(5), read.next())
+        .await
+        .expect("Timed out waiting for ready response")
+        .expect("WebSocket closed before ready")
+        .expect("Failed to read ready response");
+    match ready {
+        Message::Text(text) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&text).expect("ready response should be JSON");
+            assert_eq!(
+                parsed["type"].as_str(),
+                Some("ready"),
+                "Expected ready before large binary stress, got: {parsed}"
+            );
         }
-        Ok(Err(e)) => {
-            println!("WebSocket connection error: {}", e);
+        other => panic!("Expected ready text response, got {other:?}"),
+    }
+
+    let large_audio =
+        vec![0u8; waav_gateway::handlers::ws::audio_handler::MAX_AUDIO_FRAME_SIZE + 1];
+    write
+        .send(common::binary_message(large_audio))
+        .await
+        .expect("Failed to send oversized binary message");
+
+    let oversized_response = timeout(Duration::from_secs(5), read.next())
+        .await
+        .expect("Timed out waiting for oversized-frame response")
+        .expect("WebSocket closed after oversized frame")
+        .expect("Failed to read oversized-frame response");
+    match oversized_response {
+        Message::Text(text) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&text).expect("oversized-frame response should be JSON");
+            assert_eq!(
+                parsed["type"].as_str(),
+                Some("error"),
+                "Expected error for oversized audio frame, got: {parsed}"
+            );
+            let message = parsed["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("Audio frame too large"),
+                "Expected oversized-audio error, got: {message}"
+            );
         }
-        Err(_) => {
-            println!("WebSocket connection timeout");
+        other => panic!("Expected oversized-frame error text response, got {other:?}"),
+    }
+
+    write
+        .send(common::binary_message(vec![0u8; 1600]))
+        .await
+        .expect("Connection should still accept a later small binary frame");
+
+    let follow_up = timeout(Duration::from_secs(5), read.next())
+        .await
+        .expect("Timed out waiting for follow-up binary response")
+        .expect("WebSocket closed after oversized-frame recovery check")
+        .expect("Failed to read follow-up binary response");
+    match follow_up {
+        Message::Text(text) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&text).expect("follow-up response should be JSON");
+            assert_eq!(
+                parsed["type"].as_str(),
+                Some("error"),
+                "Expected disabled-audio error after recovery send, got: {parsed}"
+            );
+            let message = parsed["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("Audio processing is disabled"),
+                "Expected disabled-audio error after recovery send, got: {message}"
+            );
         }
+        other => panic!("Expected follow-up error text response, got {other:?}"),
     }
 }
 
@@ -429,8 +507,7 @@ async fn test_large_binary_websocket_message() {
 /// Test sustained high throughput HTTP requests
 #[tokio::test]
 async fn test_sustained_http_throughput() {
-    let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server().await;
     let base_url = format!("http://{}", addr);
 
     let client = reqwest::Client::builder()
@@ -471,7 +548,9 @@ async fn test_sustained_http_throughput() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    join_all(handles).await;
+    for result in join_all(handles).await {
+        result.expect("sustained HTTP stress worker should not panic");
+    }
 
     let elapsed = start.elapsed();
     let requests = request_count.load(Ordering::Relaxed);
@@ -498,74 +577,86 @@ async fn test_sustained_http_throughput() {
 /// Test WebSocket message throughput
 #[tokio::test]
 async fn test_websocket_message_throughput() {
-    let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server().await;
     let ws_url = format!("ws://{}/ws", addr);
 
-    match timeout(Duration::from_secs(10), connect_async(&ws_url)).await {
-        Ok(Ok((ws, _))) => {
-            let (mut write, mut read) = ws.split();
+    let (ws, _) = timeout(Duration::from_secs(10), connect_async(&ws_url))
+        .await
+        .expect("WebSocket connection timed out")
+        .expect("WebSocket connection failed");
+    let (mut write, mut read) = ws.split();
 
-            // Send config
-            let config = json!({
-                "type": "config",
-                "stt_config": { "provider": "deepgram" },
-                "tts_config": { "provider": "elevenlabs" }
-            });
-            write
-                .send(common::text_message(&config.to_string()))
-                .await
-                .expect("Failed to send config");
+    let config = json!({
+        "type": "config",
+        "audio": false
+    });
+    write
+        .send(common::text_message(&config.to_string()))
+        .await
+        .expect("Failed to send config");
 
-            // Wait for ready
-            let mut ready_received = false;
-            for _ in 0..10 {
-                if let Ok(Some(Ok(msg))) = timeout(Duration::from_millis(500), read.next()).await
-                    && let Message::Text(text) = msg {
-                        let text_str: &str = &text;
-                        if text_str.contains("ready") {
-                            ready_received = true;
-                            break;
-                        }
-                    }
-            }
+    let ready = timeout(Duration::from_secs(5), read.next())
+        .await
+        .expect("Timed out waiting for ready response")
+        .expect("WebSocket closed before ready")
+        .expect("Failed to read ready response");
+    match ready {
+        Message::Text(text) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&text).expect("ready response should be JSON");
+            assert_eq!(
+                parsed["type"].as_str(),
+                Some("ready"),
+                "Expected ready before throughput stress, got: {parsed}"
+            );
+        }
+        other => panic!("Expected ready text response, got {other:?}"),
+    }
 
-            if ready_received {
-                let duration = Duration::from_secs(5);
-                let start = Instant::now();
-                let mut messages_sent = 0;
+    let message_count = 200;
+    let start = Instant::now();
+    for _ in 0..message_count {
+        let audio_chunk = vec![0u8; 3200]; // 100ms at 16kHz
+        write
+            .send(common::binary_message(audio_chunk))
+            .await
+            .expect("Failed to send WebSocket binary throughput frame");
+    }
 
-                // Send audio chunks as fast as possible
-                while start.elapsed() < duration {
-                    let audio_chunk = vec![0u8; 3200]; // 100ms at 16kHz
-                    if write
-                        .send(common::binary_message(audio_chunk))
-                        .await
-                        .is_ok()
-                    {
-                        messages_sent += 1;
-                    } else {
-                        break;
-                    }
-                }
+    let elapsed = start.elapsed();
+    let mps = message_count as f64 / elapsed.as_secs_f64();
 
-                let elapsed = start.elapsed();
-                let mps = messages_sent as f64 / elapsed.as_secs_f64();
+    println!(
+        "WebSocket throughput: {} messages in {:?} ({:.2} msg/s)",
+        message_count, elapsed, mps
+    );
 
-                println!(
-                    "WebSocket throughput: {} messages in {:?} ({:.2} msg/s)",
-                    messages_sent, elapsed, mps
+    assert!(mps >= 100.0, "Message throughput too low: {:.2} msg/s", mps);
+
+    let mut responses = 0;
+    while responses < message_count {
+        let msg = timeout(Duration::from_secs(5), read.next())
+            .await
+            .expect("Timed out waiting for throughput response")
+            .expect("WebSocket closed during throughput response drain")
+            .expect("Failed to read throughput response");
+        match msg {
+            Message::Text(text) => {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&text).expect("throughput response should be JSON");
+                assert_eq!(
+                    parsed["type"].as_str(),
+                    Some("error"),
+                    "Expected disabled-audio error while draining throughput response, got: {parsed}"
                 );
-
-                // Should be able to send at least 100 messages per second
-                assert!(mps >= 100.0, "Message throughput too low: {:.2} msg/s", mps);
+                let message = parsed["message"].as_str().unwrap_or_default();
+                assert!(
+                    message.contains("Audio processing is disabled"),
+                    "Expected disabled-audio error while draining throughput response, got: {message}"
+                );
+                responses += 1;
             }
-        }
-        Ok(Err(e)) => {
-            panic!("WebSocket connection error: {}", e);
-        }
-        Err(_) => {
-            panic!("WebSocket connection timeout");
+            other => panic!("Expected throughput response text frame, got {other:?}"),
         }
     }
 }
@@ -577,8 +668,7 @@ async fn test_websocket_message_throughput() {
 /// Test memory stability under load
 #[tokio::test]
 async fn test_memory_stability_under_load() {
-    let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server().await;
     let base_url = format!("http://{}", addr);
 
     let client = reqwest::Client::builder()
@@ -633,22 +723,40 @@ async fn test_memory_stability_under_load() {
 /// Test handling of connection exhaustion
 #[tokio::test]
 async fn test_connection_exhaustion_recovery() {
-    let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server().await;
     let base_url = format!("http://{}", addr);
     let ws_url = format!("ws://{}/ws", addr);
 
     // Open many WebSocket connections
     let num_connections = 50;
     let mut connections = Vec::new();
+    let mut failed_connections = 0;
 
     for _ in 0..num_connections {
-        if let Ok(Ok((ws, _))) = timeout(Duration::from_secs(5), connect_async(&ws_url)).await {
-            connections.push(ws);
+        match timeout(Duration::from_secs(5), connect_async(&ws_url)).await {
+            Ok(Ok((ws, _))) => {
+                connections.push(ws);
+            }
+            _ => {
+                failed_connections += 1;
+            }
         }
     }
 
-    println!("Opened {} WebSocket connections", connections.len());
+    println!(
+        "Opened {} / {} WebSocket connections ({} failed)",
+        connections.len(),
+        num_connections,
+        failed_connections
+    );
+
+    assert!(
+        connections.len() >= (num_connections * 80 / 100),
+        "Connection exhaustion test did not hold enough WebSocket connections: opened {} / {}, failed {}",
+        connections.len(),
+        num_connections,
+        failed_connections
+    );
 
     // Server should still respond to HTTP requests
     let client = reqwest::Client::builder()
@@ -685,8 +793,7 @@ async fn test_connection_exhaustion_recovery() {
 /// Test handling of many invalid requests
 #[tokio::test]
 async fn test_invalid_request_flood() {
-    let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server().await;
     let base_url = format!("http://{}", addr);
 
     let client = reqwest::Client::builder()
@@ -698,21 +805,25 @@ async fn test_invalid_request_flood() {
     let mut proper_rejection_count = 0;
 
     // Send many invalid requests
-    for _ in 0..iterations {
+    for i in 0..iterations {
         // Invalid JSON
         let response = client
             .post(format!("{}/speak", base_url))
             .header("Content-Type", "application/json")
             .body("{ invalid json }")
             .send()
-            .await;
+            .await
+            .unwrap_or_else(|e| {
+                panic!("Invalid request {i} should receive a clean HTTP response: {e}")
+            });
 
-        if let Ok(resp) = response {
-            // Should be rejected with 4xx, not 5xx
-            if resp.status().is_client_error() {
-                proper_rejection_count += 1;
-            }
-        }
+        // Should be rejected with 4xx, not 5xx or transport failure.
+        assert!(
+            response.status().is_client_error(),
+            "Invalid request {i} should be rejected with 4xx, got {}",
+            response.status()
+        );
+        proper_rejection_count += 1;
     }
 
     println!(
@@ -720,62 +831,106 @@ async fn test_invalid_request_flood() {
         proper_rejection_count, iterations
     );
 
-    // All invalid requests should be properly rejected
-    assert!(
-        proper_rejection_count >= (iterations * 90 / 100),
-        "Server not properly rejecting invalid requests"
+    assert_eq!(
+        proper_rejection_count, iterations,
+        "Server did not reject every invalid request cleanly"
     );
 
     // Server should still be responsive
-    let response = client.get(format!("{}/", base_url)).send().await;
+    let response = client
+        .get(format!("{}/", base_url))
+        .send()
+        .await
+        .expect("Server should remain reachable after invalid request flood");
     assert!(
-        response.is_ok() && response.unwrap().status().is_success(),
-        "Server unresponsive after invalid request flood"
+        response.status().is_success(),
+        "Server health check failed after invalid request flood: {}",
+        response.status()
     );
 }
 
 /// Test malformed WebSocket messages
 #[tokio::test]
 async fn test_malformed_websocket_messages() {
-    let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server().await;
     let ws_url = format!("ws://{}/ws", addr);
 
     match timeout(Duration::from_secs(10), connect_async(&ws_url)).await {
         Ok(Ok((ws, _))) => {
-            let (mut write, _read) = ws.split();
+            let (mut write, mut read) = ws.split();
 
             // Send various malformed messages
             let malformed_messages = vec![
-                "not json at all",
-                "{ broken json",
-                r#"{"type": "unknown_type"}"#,
-                r#"{"type": "config"}"#, // Missing required fields
-                r#"{"type": "config", "stt_config": null}"#,
+                ("not json at all", "Invalid message format"),
+                ("{ broken json", "Invalid message format"),
+                (r#"{"type": "unknown_type"}"#, "Invalid message format"),
+                (r#"{"type": "config"}"#, "STT configuration is required"),
+                (
+                    r#"{"type": "config", "stt_config": null}"#,
+                    "STT configuration is required",
+                ),
             ];
 
-            let mut still_connected = true;
-            for msg in malformed_messages {
-                match write.send(common::text_message(msg)).await {
-                    Ok(_) => {}
-                    Err(_) => {
-                        still_connected = false;
-                        break;
+            for (msg, expected_error) in malformed_messages {
+                write
+                    .send(common::text_message(msg))
+                    .await
+                    .expect("Malformed message should be accepted for protocol rejection");
+
+                let response = timeout(Duration::from_secs(2), read.next())
+                    .await
+                    .expect("Timed out waiting for malformed-message error")
+                    .expect("WebSocket closed before malformed-message error")
+                    .expect("Failed to read malformed-message error");
+                match response {
+                    Message::Text(text) => {
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&text).expect("error response should be JSON");
+                        assert_eq!(
+                            parsed["type"].as_str(),
+                            Some("error"),
+                            "Expected error for malformed message {msg:?}, got: {parsed}"
+                        );
+                        let message = parsed["message"].as_str().unwrap_or_default();
+                        assert!(
+                            message.contains(expected_error),
+                            "Expected malformed-message error to contain {expected_error:?}, got: {message}"
+                        );
                     }
+                    other => panic!("Expected malformed-message error text frame, got {other:?}"),
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
             }
 
-            println!(
-                "Connection after malformed messages: {}",
-                if still_connected {
-                    "maintained"
-                } else {
-                    "closed"
-                }
-            );
+            println!("Malformed WebSocket messages were rejected with protocol errors");
 
-            // Server may close connection or continue - both are acceptable
+            let config = json!({
+                "type": "config",
+                "audio": false
+            });
+            write
+                .send(common::text_message(&config.to_string()))
+                .await
+                .expect("Connection should accept valid config after malformed messages");
+
+            let ready = timeout(Duration::from_secs(5), read.next())
+                .await
+                .expect("Timed out waiting for ready after malformed messages")
+                .expect("WebSocket closed before ready after malformed messages")
+                .expect("Failed to read ready after malformed messages");
+            match ready {
+                Message::Text(text) => {
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(&text).expect("ready response should be JSON");
+                    assert_eq!(
+                        parsed["type"].as_str(),
+                        Some("ready"),
+                        "Expected ready after malformed-message recovery, got: {parsed}"
+                    );
+                }
+                other => {
+                    panic!("Expected ready text response after malformed messages, got {other:?}")
+                }
+            }
         }
         Ok(Err(e)) => {
             panic!("WebSocket connection error: {}", e);
@@ -800,8 +955,7 @@ async fn test_malformed_websocket_messages() {
 /// Test mixed concurrent operations
 #[tokio::test]
 async fn test_mixed_concurrent_operations() {
-    let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server().await;
     let base_url = format!("http://{}", addr);
     let ws_url = format!("ws://{}/ws", addr);
 
@@ -862,7 +1016,9 @@ async fn test_mixed_concurrent_operations() {
         }));
     }
 
-    join_all(handles).await;
+    for result in join_all(handles).await {
+        result.expect("mixed operation stress worker should not panic");
+    }
 
     let http_count = http_requests.load(Ordering::Relaxed);
     let ws_count = ws_connections.load(Ordering::Relaxed);

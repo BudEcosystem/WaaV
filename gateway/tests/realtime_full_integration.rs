@@ -146,6 +146,7 @@ fn rich_config_for(name: &str) -> RealtimeConfig {
         // in the override-honoring cases below to prove it wins over the host).
         realtime_endpoint_override: None,
         reconnection: None,
+        trace: None,
     };
 
     match name {
@@ -408,13 +409,21 @@ fn session_config_to_realtime_config_carries_every_feature_field() {
 
     // Now assert EVERY feature field survived the conversion.
     assert_eq!(realtime_config.model, "gpt-realtime", "model dropped");
-    assert_eq!(realtime_config.voice.as_deref(), Some("verse"), "voice dropped");
+    assert_eq!(
+        realtime_config.voice.as_deref(),
+        Some("verse"),
+        "voice dropped"
+    );
     assert_eq!(
         realtime_config.instructions.as_deref(),
         Some("Be brief."),
         "instructions dropped"
     );
-    assert_eq!(realtime_config.temperature, Some(0.42), "temperature dropped");
+    assert_eq!(
+        realtime_config.temperature,
+        Some(0.42),
+        "temperature dropped"
+    );
     assert_eq!(
         realtime_config.max_response_output_tokens,
         Some(2048),
@@ -454,7 +463,11 @@ fn session_config_to_realtime_config_carries_every_feature_field() {
     assert_eq!(it.model, "gpt-4o-transcribe", "transcription_model dropped");
 
     // Turn detection survived with the server-VAD params intact.
-    match realtime_config.turn_detection.as_ref().expect("turn_detection dropped") {
+    match realtime_config
+        .turn_detection
+        .as_ref()
+        .expect("turn_detection dropped")
+    {
         TurnDetectionConfig::ServerVad {
             threshold,
             prefix_padding_ms,
@@ -463,8 +476,16 @@ fn session_config_to_realtime_config_carries_every_feature_field() {
             interrupt_response,
         } => {
             assert_eq!(*threshold, Some(0.6), "vad threshold dropped");
-            assert_eq!(*prefix_padding_ms, Some(250), "vad prefix_padding_ms dropped");
-            assert_eq!(*silence_duration_ms, Some(450), "vad silence_duration_ms dropped");
+            assert_eq!(
+                *prefix_padding_ms,
+                Some(250),
+                "vad prefix_padding_ms dropped"
+            );
+            assert_eq!(
+                *silence_duration_ms,
+                Some(450),
+                "vad silence_duration_ms dropped"
+            );
             // The handler hard-sets these two so server VAD also drives response
             // creation + barge-in interruption.
             assert_eq!(*create_response, Some(true));
@@ -477,9 +498,18 @@ fn session_config_to_realtime_config_carries_every_feature_field() {
     let tools = realtime_config.tools.as_ref().expect("tools dropped");
     assert_eq!(tools.len(), 1, "tool list dropped/resized");
     assert_eq!(tools[0].tool_type, "function");
-    assert_eq!(tools[0].function.name, "get_weather", "tool fn name dropped");
-    assert!(tools[0].function.description.is_some(), "tool description dropped");
-    assert!(tools[0].function.parameters.is_some(), "tool parameters dropped");
+    assert_eq!(
+        tools[0].function.name, "get_weather",
+        "tool fn name dropped"
+    );
+    assert!(
+        tools[0].function.description.is_some(),
+        "tool description dropped"
+    );
+    assert!(
+        tools[0].function.parameters.is_some(),
+        "tool parameters dropped"
+    );
 
     // FINALLY: the plumbed config must itself construct a real provider through
     // the registry (the rich-config surface is accepted end-to-end).

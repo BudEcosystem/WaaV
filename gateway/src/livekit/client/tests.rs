@@ -28,6 +28,54 @@ async fn test_livekit_client_creation() {
     assert!(!client.has_local_track_publication().await);
 }
 
+#[test]
+fn test_livekit_audio_buffer_capacity_is_checked_and_capped() {
+    assert_eq!(
+        LiveKitClient::audio_buffer_capacity(24_000, 1),
+        MIN_AUDIO_BUFFER_POOL_CAPACITY
+    );
+    assert_eq!(
+        LiveKitClient::audio_buffer_capacity(u32::MAX, u16::MAX),
+        MAX_AUDIO_BUFFER_POOL_CAPACITY
+    );
+}
+
+#[test]
+fn test_livekit_audio_config_validation_rejects_pathological_sample_rate() {
+    let mut config = create_test_config();
+    config.sample_rate = u32::MAX;
+
+    let err = LiveKitClient::validate_audio_config(&config).unwrap_err();
+    match err {
+        AppError::InternalServerError(msg) => {
+            assert!(msg.contains("sample_rate"));
+            assert!(msg.contains("192000"));
+        }
+        other => panic!("expected InternalServerError, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_livekit_audio_config_validation_rejects_zero_channels() {
+    let mut config = create_test_config();
+    config.channels = 0;
+
+    let err = LiveKitClient::validate_audio_config(&config).unwrap_err();
+    match err {
+        AppError::InternalServerError(msg) => {
+            assert!(msg.contains("channels"));
+            assert!(msg.contains("1..=8"));
+        }
+        other => panic!("expected InternalServerError, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_livekit_samples_per_10ms_validates_rate() {
+    assert_eq!(LiveKitClient::samples_per_10ms(24_000).unwrap(), 240);
+    assert!(LiveKitClient::samples_per_10ms(0).is_err());
+}
+
 #[tokio::test]
 async fn test_livekit_client_clear_audio_not_connected() {
     let config = create_test_config();
@@ -196,6 +244,74 @@ async fn test_livekit_client_disconnect_cleanup() {
     assert!(!client.has_local_track_publication().await);
     assert!(!client.has_room().await);
     assert!(!client.has_room_events());
+}
+
+#[tokio::test]
+async fn reconnect_event_handler_is_owned_and_disconnected() {
+    struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    let config = create_test_config();
+    let mut client = LiveKitClient::new(config);
+    let old_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let old_dropped_clone = old_dropped.clone();
+    let (old_started_tx, old_started_rx) = tokio::sync::oneshot::channel();
+    let old = tokio::spawn(async move {
+        let _guard = DropFlag(old_dropped_clone);
+        let _ = old_started_tx.send(());
+        std::future::pending::<()>().await;
+    });
+    old_started_rx
+        .await
+        .expect("old event handler should start");
+    client
+        .event_handler_handle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .replace(old);
+
+    let (_room_events_tx, room_events_rx) = tokio::sync::mpsc::unbounded_channel();
+    LiveKitClient::restart_event_handler(
+        room_events_rx,
+        &client.audio_callback,
+        &client.data_callback,
+        &client.participant_disconnect_callback,
+        &client.active_streams,
+        &client.event_handler_handle,
+        &client.is_connected,
+        &client.config,
+    )
+    .await;
+
+    assert!(
+        old_dropped.load(std::sync::atomic::Ordering::Acquire),
+        "reconnect must abort and observe the replaced room-event handler"
+    );
+    assert!(
+        client
+            .event_handler_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some(),
+        "reconnect must store the replacement room-event handler for teardown"
+    );
+
+    client
+        .disconnect()
+        .await
+        .expect("disconnect should clean up");
+    assert!(
+        client
+            .event_handler_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none(),
+        "disconnect must take and abort the current room-event handler"
+    );
 }
 
 #[tokio::test]

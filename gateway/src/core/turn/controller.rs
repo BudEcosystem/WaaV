@@ -188,7 +188,10 @@ impl TurnController {
                     let id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
                     self.current_turn_id.store(id, Ordering::Release);
                     self.reset_strategies();
-                    out.push(TurnEvent::Started { turn_id: id, interrupt });
+                    out.push(TurnEvent::Started {
+                        turn_id: id,
+                        interrupt,
+                    });
                 } else if interrupt && ctx.bot_speaking {
                     // Turn already active but the bot is STILL audible
                     // (e.g. an in-flight speak resolved after the first
@@ -201,7 +204,10 @@ impl TurnController {
         // 4) Stop strategies (short-circuit). Re-read turn_active — the start
         //    phase above may have just opened the turn on this same signal
         //    (e.g. a first-ever speech_final with no prior interim).
-        let ctx = TurnCtx { turn_active: self.turn_active.load(Ordering::Acquire), ..ctx };
+        let ctx = TurnCtx {
+            turn_active: self.turn_active.load(Ordering::Acquire),
+            ..ctx
+        };
         let stop_verdict = {
             let mut stop = self.stop.lock();
             let mut verdict = StopVerdict::Ignore;
@@ -281,7 +287,10 @@ mod tests {
     }
 
     fn interim(text: &str) -> ControllerSignal {
-        ControllerSignal::SttInterim { text: text.into(), confidence: 0.9 }
+        ControllerSignal::SttInterim {
+            text: text.into(),
+            confidence: 0.9,
+        }
     }
     fn final_sig(text: &str, speech_final: bool) -> ControllerSignal {
         ControllerSignal::SttFinal {
@@ -295,7 +304,13 @@ mod tests {
     fn no_double_start() {
         let c = legacy_controller();
         let e1 = c.feed(&interim("hello"));
-        assert!(matches!(e1.as_slice(), [TurnEvent::Started { interrupt: true, .. }]));
+        assert!(matches!(
+            e1.as_slice(),
+            [TurnEvent::Started {
+                interrupt: true,
+                ..
+            }]
+        ));
         // More speech while the turn is open: no second Started.
         assert!(c.feed(&interim("hello there")).is_empty());
         assert!(c.feed(&final_sig("hello there", false)).is_empty());
@@ -317,9 +332,18 @@ mod tests {
         .with_bot_speaking_probe(move || probe.load(Ordering::Relaxed));
 
         let e1 = c.feed(&interim("stop"));
-        assert!(matches!(e1.as_slice(), [TurnEvent::Started { interrupt: true, .. }]));
+        assert!(matches!(
+            e1.as_slice(),
+            [TurnEvent::Started {
+                interrupt: true,
+                ..
+            }]
+        ));
         // Bot still audible mid-turn → mop-up, NOT a second Started.
-        assert_eq!(c.feed(&interim("stop talking")), vec![TurnEvent::BargeInMopUp]);
+        assert_eq!(
+            c.feed(&interim("stop talking")),
+            vec![TurnEvent::BargeInMopUp]
+        );
         // Bot went silent → continued speech is just aggregation, no events.
         audible.store(false, Ordering::Relaxed);
         assert!(c.feed(&interim("stop talking please")).is_empty());
@@ -336,7 +360,10 @@ mod tests {
         // for the NEW turn id, never a re-stop of the old one.
         let e2 = c.feed(&final_sig("hi", true));
         match e2.as_slice() {
-            [TurnEvent::Started { turn_id: s, .. }, TurnEvent::Stopped { turn_id: t, .. }] => {
+            [
+                TurnEvent::Started { turn_id: s, .. },
+                TurnEvent::Stopped { turn_id: t, .. },
+            ] => {
                 assert_eq!(s, t);
             }
             other => panic!("unexpected events: {other:?}"),
@@ -374,8 +401,14 @@ mod tests {
         let e = c.feed(&final_sig("quick question", true));
         match e.as_slice() {
             [
-                TurnEvent::Started { turn_id: a, interrupt: true },
-                TurnEvent::Stopped { turn_id: b, transcript },
+                TurnEvent::Started {
+                    turn_id: a,
+                    interrupt: true,
+                },
+                TurnEvent::Stopped {
+                    turn_id: b,
+                    transcript,
+                },
             ] => {
                 assert_eq!(a, b);
                 assert_eq!(transcript, "quick question");
@@ -415,7 +448,10 @@ mod tests {
         }
         let counter = std::sync::Arc::new(AtomicU64::new(0));
         let c = TurnController::new(
-            vec![Box::new(AnySpeechStart), Box::new(CountingStart(counter.clone()))],
+            vec![
+                Box::new(AnySpeechStart),
+                Box::new(CountingStart(counter.clone())),
+            ],
             vec![Box::new(LegacySpeechFinalStop)],
             vec![],
         );
@@ -456,7 +492,8 @@ mod tests {
         struct CaptureCtx(std::sync::Arc<AtomicU64>);
         impl UserTurnStopStrategy for CaptureCtx {
             fn on_signal(&mut self, _: &ControllerSignal, ctx: &TurnCtx) -> StopVerdict {
-                self.0.store(ctx.stt_ttfs_p99_ms.unwrap_or(0), Ordering::Relaxed);
+                self.0
+                    .store(ctx.stt_ttfs_p99_ms.unwrap_or(0), Ordering::Relaxed);
                 StopVerdict::Ignore
             }
         }

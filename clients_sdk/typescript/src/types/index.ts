@@ -44,6 +44,9 @@ export type {
   CanonicalLanguage,
   LanguageNotation,
   LanguageCapabilities,
+  CanonicalLanguageInfo,
+  ProviderLanguageSupport,
+  LanguageCapabilitiesResponse,
 } from './canonical-languages.js';
 
 // Message types
@@ -105,6 +108,8 @@ export type {
   TrackInfo,
   RoomListResponse,
   LiveKitConnectOptions,
+  RemoveParticipantResponse,
+  MuteParticipantResponse,
 } from './livekit.js';
 
 // SIP types
@@ -114,6 +119,7 @@ export type {
   SIPHookCreateRequest,
   SIPHookCreateResponse,
   SIPTransferRequest,
+  SIPTransferResponse,
   SIPTransferResult,
   SIPCallInfo,
   SIPWebhookEvent,
@@ -194,6 +200,10 @@ export type {
   DAGDefinition,
   DAGConfig,
   DAGValidationResult,
+  DAGTemplateInfo,
+  DAGTemplateListResponse,
+  DAGTemplateDetail,
+  DAGValidateResponse,
 } from './dag.js';
 export {
   DAG_NODE_TYPES,

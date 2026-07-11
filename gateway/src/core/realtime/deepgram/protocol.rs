@@ -19,7 +19,7 @@
 //! / agent settings + server messages).
 
 use bytes::Bytes;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::core::realtime::base::{
     FunctionCallRequest, RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult,
@@ -278,7 +278,9 @@ impl RealtimeProtocol for DeepgramProtocol {
                     funcs
                         .iter()
                         .filter(|f| {
-                            f.get("client_side").and_then(Value::as_bool).unwrap_or(true)
+                            f.get("client_side")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(true)
                         })
                         .map(|f| {
                             S2sEvent::FunctionCall(FunctionCallRequest {
@@ -364,10 +366,11 @@ impl RealtimeProtocol for DeepgramProtocol {
 
     fn serialize(&self, msg: &Self::Wire) -> RealtimeResult<OutFrame> {
         match msg {
-            DeepgramClientMsg::Json(v) => Ok(OutFrame::Text(
-                serde_json::to_string(v)
-                    .map_err(|e| RealtimeError::SerializationError(e.to_string()))?,
-            )),
+            DeepgramClientMsg::Json(v) => {
+                Ok(OutFrame::Text(serde_json::to_string(v).map_err(|e| {
+                    RealtimeError::SerializationError(e.to_string())
+                })?))
+            }
             // THE binary path: audio frames serialize to a raw binary frame.
             DeepgramClientMsg::Audio(b) => Ok(OutFrame::Binary(b.clone())),
         }
@@ -425,10 +428,7 @@ mod tests {
             .map(|(_, v)| v.as_str())
             .unwrap();
         assert_eq!(auth, "Token dgkey", "Deepgram uses Token, not Bearer");
-        assert!(
-            !auth.starts_with("Bearer"),
-            "must NOT be a Bearer header"
-        );
+        assert!(!auth.starts_with("Bearer"), "must NOT be a Bearer header");
     }
 
     /// SERVER-CONFIG `realtime_endpoint_override` WINS over the Voice Agent host
@@ -440,11 +440,16 @@ mod tests {
             realtime_endpoint_override: Some("ws://127.0.0.1:9005/dg".into()),
             ..base_cfg()
         };
-        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap() else {
+        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap()
+        else {
             panic!("expected WebSocket")
         };
         assert_eq!(url, "ws://127.0.0.1:9005/dg");
-        assert!(headers.iter().any(|(k, v)| k == "Authorization" && v == "Token dgkey"));
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "Authorization" && v == "Token dgkey")
+        );
     }
 
     /// build_session_config serializes to the LIVE-CAPTURED Settings shape:
@@ -554,12 +559,14 @@ mod tests {
         let p = proto(&base_cfg());
         let user = r#"{"type":"ConversationText","role":"user","content":"hello there"}"#;
         match p.map_server_event(Inbound::Text(user)).as_slice() {
-            [S2sEvent::Transcript {
-                role,
-                text,
-                is_final,
-                item_id,
-            }] => {
+            [
+                S2sEvent::Transcript {
+                    role,
+                    text,
+                    is_final,
+                    item_id,
+                },
+            ] => {
                 assert_eq!(*role, TranscriptRole::User);
                 assert_eq!(text, "hello there");
                 assert!(*is_final);
@@ -569,12 +576,14 @@ mod tests {
         }
         let asst = r#"{"type":"ConversationText","role":"assistant","content":"hi!"}"#;
         match p.map_server_event(Inbound::Text(asst)).as_slice() {
-            [S2sEvent::Transcript {
-                role,
-                text,
-                is_final,
-                ..
-            }] => {
+            [
+                S2sEvent::Transcript {
+                    role,
+                    text,
+                    is_final,
+                    ..
+                },
+            ] => {
                 assert_eq!(*role, TranscriptRole::Assistant);
                 assert_eq!(text, "hi!");
                 assert!(*is_final);
@@ -603,11 +612,13 @@ mod tests {
         let p = proto(&base_cfg());
         let pcm: &[u8] = &[1, 2, 3, 4, 250, 251];
         match p.map_server_event(Inbound::Binary(pcm)).as_slice() {
-            [S2sEvent::Audio {
-                data,
-                item_id,
-                response_id,
-            }] => {
+            [
+                S2sEvent::Audio {
+                    data,
+                    item_id,
+                    response_id,
+                },
+            ] => {
                 assert_eq!(data.as_ref(), pcm);
                 assert!(item_id.is_none());
                 assert!(response_id.is_none());
@@ -638,10 +649,13 @@ mod tests {
             .map_server_event(Inbound::Text(r#"{"type":"UserStartedSpeaking"}"#))
             .as_slice()
         {
-            [S2sEvent::Speech(SpeechEvent::Started {
-                audio_start_ms,
-                item_id,
-            }), S2sEvent::InterruptedByServer] => {
+            [
+                S2sEvent::Speech(SpeechEvent::Started {
+                    audio_start_ms,
+                    item_id,
+                }),
+                S2sEvent::InterruptedByServer,
+            ] => {
                 assert_eq!(*audio_start_ms, 0);
                 assert!(item_id.is_none());
             }

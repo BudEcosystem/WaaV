@@ -115,22 +115,12 @@ impl ModelManager {
 
         // Prepare arrays as owned Array2 for ort 2.0
         let input_array = input_ids.to_owned();
-        let mask_array = if let Some(mask) = attention_mask {
-            mask.to_owned()
-        } else {
-            // Reuse cached attention mask if dimensions match, otherwise create new
-            let needs_new_mask = self
-                .cached_attention_mask
-                .as_ref()
-                .is_none_or(|cached| cached.dim() != (batch_size, sequence_length));
-
-            if needs_new_mask {
-                self.cached_attention_mask =
-                    Some(Array2::<i64>::ones((batch_size, sequence_length)));
-            }
-
-            self.cached_attention_mask.as_ref().unwrap().clone()
-        };
+        let mask_array = Self::attention_mask_array(
+            &mut self.cached_attention_mask,
+            batch_size,
+            sequence_length,
+            attention_mask,
+        );
 
         // Build input values with names - ort 2.0 uses Vec<(&str, Value)>
         // Validate input_names has at least one element
@@ -339,7 +329,61 @@ impl ModelManager {
         exp_end / (exp_end + exp_continue)
     }
 
+    fn attention_mask_array(
+        cached_attention_mask: &mut Option<Array2<i64>>,
+        batch_size: usize,
+        sequence_length: usize,
+        attention_mask: Option<ArrayView2<'_, i64>>,
+    ) -> Array2<i64> {
+        if let Some(mask) = attention_mask {
+            return mask.to_owned();
+        }
+
+        let cached = cached_attention_mask
+            .get_or_insert_with(|| Array2::<i64>::ones((batch_size, sequence_length)));
+        if cached.dim() != (batch_size, sequence_length) {
+            *cached = Array2::<i64>::ones((batch_size, sequence_length));
+        }
+        cached.clone()
+    }
+
     pub fn config(&self) -> &TurnDetectorConfig {
         &self.config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn attention_mask_array_reuses_and_resizes_cache_without_unwrap() {
+        let mut cache = None;
+
+        let first = ModelManager::attention_mask_array(&mut cache, 2, 3, None);
+        assert_eq!(first.dim(), (2, 3));
+        assert!(first.iter().all(|v| *v == 1));
+        assert_eq!(cache.as_ref().map(|mask| mask.dim()), Some((2, 3)));
+
+        let second = ModelManager::attention_mask_array(&mut cache, 2, 3, None);
+        assert_eq!(second.dim(), (2, 3));
+        assert_eq!(cache.as_ref().map(|mask| mask.dim()), Some((2, 3)));
+
+        let resized = ModelManager::attention_mask_array(&mut cache, 1, 4, None);
+        assert_eq!(resized.dim(), (1, 4));
+        assert!(resized.iter().all(|v| *v == 1));
+        assert_eq!(cache.as_ref().map(|mask| mask.dim()), Some((1, 4)));
+    }
+
+    #[test]
+    fn attention_mask_array_prefers_explicit_mask_without_mutating_cache() {
+        let mut cache = Some(Array2::<i64>::ones((2, 2)));
+        let explicit = array![[1_i64, 0, 1]];
+
+        let got = ModelManager::attention_mask_array(&mut cache, 1, 3, Some(explicit.view()));
+
+        assert_eq!(got, explicit);
+        assert_eq!(cache.as_ref().map(|mask| mask.dim()), Some((2, 2)));
     }
 }

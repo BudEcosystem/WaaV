@@ -254,7 +254,10 @@ impl BaseRealtime for OpenAIRealtime {
         self.0.replay_user_audio_preroll().await
     }
 
-    async fn replay_conversation(&mut self, items: &[ReplayConversationItem]) -> RealtimeResult<()> {
+    async fn replay_conversation(
+        &mut self,
+        items: &[ReplayConversationItem],
+    ) -> RealtimeResult<()> {
         self.0.replay_conversation(items).await
     }
 }
@@ -341,12 +344,22 @@ mod tests {
             "voice nests under audio.output"
         );
         assert_eq!(
-            audio.input.as_ref().unwrap().format.as_ref().unwrap().format_type,
+            audio
+                .input
+                .as_ref()
+                .unwrap()
+                .format
+                .as_ref()
+                .unwrap()
+                .format_type,
             "audio/pcm",
             "PCM16 ⇒ {{type: audio/pcm, rate: 24000}}"
         );
         let json = serde_json::to_value(&sc).unwrap();
-        assert!(json.get("temperature").is_none(), "GA: no session temperature");
+        assert!(
+            json.get("temperature").is_none(),
+            "GA: no session temperature"
+        );
         assert!(json.get("reasoning").is_none(), "GA: no session reasoning");
     }
 
@@ -358,7 +371,10 @@ mod tests {
         assert_eq!(OpenAIRealtimeAudioFormat::G711Ulaw.bytes_per_ms(), 8);
         assert_eq!(OpenAIRealtimeAudioFormat::G711Alaw.bytes_per_ms(), 8);
         // 200ms of g711 = 1600 bytes (not 1600/48 ≈ 33ms).
-        assert_eq!(1600 / OpenAIRealtimeAudioFormat::G711Ulaw.bytes_per_ms(), 200);
+        assert_eq!(
+            1600 / OpenAIRealtimeAudioFormat::G711Ulaw.bytes_per_ms(),
+            200
+        );
     }
 
     #[tokio::test]

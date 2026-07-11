@@ -36,7 +36,7 @@ mod env;
 mod merge;
 pub mod pricing;
 mod sip;
-mod utils;
+pub(crate) mod utils;
 mod validation;
 mod yaml;
 
@@ -531,7 +531,13 @@ impl ServerConfig {
     ///
     /// Returns true if both AUTH_SERVICE_URL and AUTH_SIGNING_KEY_PATH are set
     pub fn has_jwt_auth(&self) -> bool {
-        self.auth_service_url.is_some() && self.auth_signing_key_path.is_some()
+        self.auth_service_url
+            .as_ref()
+            .is_some_and(|u| !u.trim().is_empty())
+            && self
+                .auth_signing_key_path
+                .as_ref()
+                .is_some_and(|p| !p.as_os_str().is_empty())
     }
 
     /// Check if API secret authentication is configured
@@ -1342,6 +1348,12 @@ mod tests {
         };
 
         assert!(!config_without_jwt.has_jwt_auth());
+
+        let mut config_with_blank_jwt_url = config_without_jwt;
+        config_with_blank_jwt_url.auth_service_url = Some("   ".to_string());
+        config_with_blank_jwt_url.auth_signing_key_path = Some(PathBuf::from("test_key.pem"));
+
+        assert!(!config_with_blank_jwt_url.has_jwt_auth());
     }
 
     #[test]

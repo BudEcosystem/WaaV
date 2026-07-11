@@ -27,6 +27,15 @@
 use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 
+fn validate_zalo_http_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -288,7 +297,9 @@ impl ZaloTtsConfig {
     /// Zalo also has no field for pitch, volume, stability, similarity_boost, style,
     /// use_speaker_boost, emotion, instructions, SSML, language, word_timestamps, streaming, seed or
     /// sample_rate, so those features are skipped too.
-    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Result<Self, TTSError> {
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
         let f = &std.features;
         let mut cfg = Self::from_base(std.base.clone())?;
 
@@ -319,6 +330,8 @@ impl ZaloTtsConfig {
 
         cfg.endpoint_override = std.endpoint_override().map(String::from);
 
+        cfg.validate().map_err(TTSError::InvalidConfiguration)?;
+
         Ok(cfg)
     }
 
@@ -333,6 +346,10 @@ impl ZaloTtsConfig {
                 "Speed must be between {} and {}, got {}",
                 MIN_SPEED, MAX_SPEED, self.speed
             ));
+        }
+
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_zalo_http_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -422,8 +439,8 @@ mod tests {
             },
             features: TtsFeatures {
                 speed: Some(1.1),
-                pitch: Some(2.0),  // capability gap: Zalo has no pitch field, must be ignored
-                ssml: Some(true),  // capability gap: Zalo has no SSML field, must be ignored
+                pitch: Some(2.0), // capability gap: Zalo has no pitch field, must be ignored
+                ssml: Some(true), // capability gap: Zalo has no SSML field, must be ignored
                 ..Default::default()
             },
             extras: ProviderExtras(extras),
@@ -640,6 +657,24 @@ mod tests {
         config.api_key = "test_key".to_string();
 
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = ZaloTtsConfig {
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://zalo-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
     }
 
     #[test]

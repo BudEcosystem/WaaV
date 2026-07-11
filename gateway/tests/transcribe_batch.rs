@@ -106,7 +106,9 @@ async fn post_batch(app: axum::Router, body: Value) -> (StatusCode, Value) {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
     (status, v)
 }
@@ -153,6 +155,30 @@ async fn missing_credential_is_clear_400() {
 }
 
 #[tokio::test]
+async fn inline_audio_json_above_axum_default_limit_reaches_batch_handler() {
+    let body = json!({
+        "audio_base64": "A".repeat((2 * 1024 * 1024) + 1),
+        "content_type": "audio/wav",
+        "provider": "openai", "api_key": "", "language": "en-US",
+        "sample_rate": 16000, "channels": 1, "punctuation": true,
+        "encoding": "linear16", "model": "whisper-1"
+    });
+
+    let (status, v) = post_batch(app().await, body).await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "large but valid batch JSON should reach handler, not body-limit rejection: {v}"
+    );
+    let msg = v["error"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("API key") || msg.contains("not configured"),
+        "expected credential resolution after JSON extraction, got: {v}"
+    );
+}
+
+#[tokio::test]
 async fn unknown_job_is_404() {
     let req = Request::builder()
         .method("GET")
@@ -166,8 +192,9 @@ async fn unknown_job_is_404() {
 #[tokio::test]
 async fn valid_submission_dispatches_and_stores_error_job_when_endpoint_unreachable() {
     // A complete OpenAI batch with a (fake) client key + an endpoint_override pointing at a
-    // non-routable host. This PROVES the dispatcher resolved the key, built the multipart request,
-    // and fired it — the provider call fails (no real endpoint), yielding a uniform error job.
+    // syntactically public but unresolvable host. This PROVES the dispatcher resolved the key,
+    // built the multipart request, and fired it — the provider call fails (no real endpoint),
+    // yielding a uniform error job.
     // A real transcription round-trip needs a vendor key (out of scope here).
     let body = json!({
         "audio_base64": "AAAAAAAAAAA=",
@@ -176,7 +203,7 @@ async fn valid_submission_dispatches_and_stores_error_job_when_endpoint_unreacha
         "sample_rate": 16000, "channels": 1, "punctuation": true,
         "encoding": "linear16", "model": "whisper-1",
         "batch": { "detect_language": true },
-        "extras": { "endpoint_override": "http://127.0.0.1:1" }
+        "extras": { "endpoint_override": "https://unresolvable-host.invalid" }
     });
     let the_app = app().await;
     let (status, v) = post_batch(the_app.clone(), body).await;
@@ -193,7 +220,9 @@ async fn valid_submission_dispatches_and_stores_error_job_when_endpoint_unreacha
         .unwrap();
     let resp = the_app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let got: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(got["job_id"], job_id);
     assert_eq!(got["status"], "error");

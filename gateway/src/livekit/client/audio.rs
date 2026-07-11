@@ -17,9 +17,11 @@ use tracing::{debug, error, info, warn};
 
 use super::{LiveKitClient, LiveKitConfig, LiveKitOperation, operation_worker::OperationContext};
 use crate::AppError;
+use crate::core::observability::abort_and_await_task;
 
 impl LiveKitClient {
     pub(super) async fn setup_audio_publishing(&mut self) -> Result<(), AppError> {
+        Self::validate_audio_config(&self.config)?;
         info!(
             "Setting up audio publishing: {}Hz, {} channels",
             self.config.sample_rate, self.config.channels
@@ -31,7 +33,7 @@ impl LiveKitClient {
             auto_gain_control: false,
         };
 
-        let samples_per_frame = (self.config.sample_rate * 10) / 1000;
+        let samples_per_frame = Self::samples_per_10ms(self.config.sample_rate)?;
 
         let audio_source = Arc::new(NativeAudioSource::new(
             audio_source_options,
@@ -133,7 +135,7 @@ impl LiveKitClient {
                     .await
                     .insert("__egress_publisher".to_string(), handle)
                 {
-                    old.abort();
+                    let _ = abort_and_await_task("livekit.egress_publisher.replace", old).await;
                 }
 
                 info!("Audio source, track, and publication are now set");
@@ -297,10 +299,7 @@ impl LiveKitClient {
                         Err(e) => {
                             // Immediate queue on failure - NO RETRIES, NO SLEEP
                             // This is critical for real-time audio latency guarantees
-                            debug!(
-                                "Capture frame failed, immediately queueing: {:?}",
-                                e
-                            );
+                            debug!("Capture frame failed, immediately queueing: {:?}", e);
 
                             // Apply bounded queue with backpressure - drop oldest if queue is too large
                             let mut queue = audio_queue.lock().await;
@@ -502,7 +501,7 @@ impl LiveKitClient {
                     auto_gain_control: false,
                 };
 
-                let samples_per_frame = (ctx.config.sample_rate * 10) / 1000;
+                let samples_per_frame = Self::samples_per_10ms(ctx.config.sample_rate)?;
                 let new_audio_source = Arc::new(NativeAudioSource::new(
                     audio_source_options,
                     ctx.config.sample_rate,
@@ -580,7 +579,8 @@ impl LiveKitClient {
                             .await
                             .insert("__egress_publisher".to_string(), handle)
                         {
-                            old.abort();
+                            let _ = abort_and_await_task("livekit.egress_publisher.reconnect", old)
+                                .await;
                         }
 
                         info!("Successfully reconnected and re-published audio track");

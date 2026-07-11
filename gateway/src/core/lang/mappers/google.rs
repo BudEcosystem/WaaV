@@ -51,9 +51,8 @@ impl LanguageMapper for GoogleTtsLanguageMapper {
     fn map(&self, lang: CanonicalLanguage, _model: &str) -> MappedLanguage {
         match lang {
             // TTS has no detection; default to en-US + warning.
-            CanonicalLanguage::Auto => MappedLanguage::native("en-US").warn(
-                "Google TTS has no language detection; defaulting to en-US",
-            ),
+            CanonicalLanguage::Auto => MappedLanguage::native("en-US")
+                .warn("Google TTS has no language detection; defaulting to en-US"),
             // cmn-CN/yue-HK keep their canonical BCP-47 form (no script subtag) — i.e. the default.
             other => MappedLanguage::native(other.as_bcp47()),
         }

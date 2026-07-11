@@ -23,6 +23,15 @@
 use crate::core::stt::base::{STTConfig, STTError};
 use serde::{Deserialize, Serialize};
 
+fn validate_viettel_http_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -140,6 +149,7 @@ impl ViettelSttConfig {
     ) -> Result<Self, STTError> {
         let mut cfg = Self::from_base(&std.base)?;
         cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        cfg.validate().map_err(STTError::ConfigurationError)?;
         Ok(cfg)
     }
 
@@ -155,6 +165,10 @@ impl ViettelSttConfig {
 
         if self.channels == 0 {
             return Err("Channels must be greater than 0".to_string());
+        }
+
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_viettel_http_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -226,7 +240,7 @@ mod tests {
     // (api_key/sample_rate/channels) through unchanged.
     #[test]
     fn from_standard_passes_base_through() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "viettel_ai".into(),
@@ -289,6 +303,45 @@ mod tests {
         config.api_key = "test_token".to_string();
 
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = ViettelSttConfig {
+            api_key: "test_token".to_string(),
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://viettel-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the shared test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]

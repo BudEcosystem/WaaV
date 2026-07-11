@@ -2,15 +2,19 @@
 
 use crate::core::stt::{STTConfig, STTResult};
 use crate::core::tts::TTSConfig;
+use crate::core::voice_manager::manager::WAAV_UNINTERRUPTIBLE_PLAYBACK_ENV;
 use crate::core::voice_manager::state::SpeechFinalState;
 use crate::core::voice_manager::stt_result::STTResultProcessor;
-use crate::core::voice_manager::{VoiceManager, VoiceManagerConfig};
+use crate::core::voice_manager::{
+    VoiceManager, VoiceManagerConfig, VoiceManagerError, VoiceManagerResult,
+};
 use parking_lot::RwLock as SyncRwLock;
+use serial_test::serial;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 
-fn ag6_voice_manager() -> VoiceManager {
+fn ag6_voice_manager_result() -> VoiceManagerResult<VoiceManager> {
     let stt_config = STTConfig {
         provider: "deepgram".to_string(),
         api_key: "test_key".to_string(),
@@ -21,7 +25,31 @@ fn ag6_voice_manager() -> VoiceManager {
         api_key: "test_key".to_string(),
         ..Default::default()
     };
-    VoiceManager::new(VoiceManagerConfig::new(stt_config, tts_config), None).unwrap()
+    VoiceManager::new(VoiceManagerConfig::new(stt_config, tts_config), None)
+}
+
+fn ag6_voice_manager() -> VoiceManager {
+    ag6_voice_manager_result().unwrap()
+}
+
+struct UninterruptiblePlaybackEnvGuard(Option<String>);
+
+impl Drop for UninterruptiblePlaybackEnvGuard {
+    fn drop(&mut self) {
+        match self.0.as_deref() {
+            Some(value) => unsafe { std::env::set_var(WAAV_UNINTERRUPTIBLE_PLAYBACK_ENV, value) },
+            None => unsafe { std::env::remove_var(WAAV_UNINTERRUPTIBLE_PLAYBACK_ENV) },
+        }
+    }
+}
+
+fn set_uninterruptible_playback_env(value: Option<&str>) -> UninterruptiblePlaybackEnvGuard {
+    let previous = std::env::var(WAAV_UNINTERRUPTIBLE_PLAYBACK_ENV).ok();
+    match value {
+        Some(value) => unsafe { std::env::set_var(WAAV_UNINTERRUPTIBLE_PLAYBACK_ENV, value) },
+        None => unsafe { std::env::remove_var(WAAV_UNINTERRUPTIBLE_PLAYBACK_ENV) },
+    }
+    UninterruptiblePlaybackEnvGuard(previous)
 }
 
 fn ag6_audio(tag: u8) -> crate::core::tts::AudioData {
@@ -37,7 +65,9 @@ fn ag6_audio(tag: u8) -> crate::core::tts::AudioData {
 /// begins delivering it (so the test knows it is in flight), then blocks on a
 /// semaphore until the test releases it, recording delivered chunk ids.
 fn ag6_gated_sink() -> (
-    impl Fn(crate::core::tts::AudioData) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    impl Fn(
+        crate::core::tts::AudioData,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
     + Send
     + Sync
     + 'static,
@@ -65,7 +95,10 @@ fn ag6_gated_sink() -> (
 }
 
 #[tokio::test]
+#[serial]
 async fn ag6_pump_engaged_only_when_enabled() {
+    let _guard = set_uninterruptible_playback_env(None);
+
     // Disabled (default): no pump — the validated immediate-delivery path.
     let vm = ag6_voice_manager();
     vm.on_tts_audio(|_a| Box::pin(async {})).await.unwrap();
@@ -79,6 +112,50 @@ async fn ag6_pump_engaged_only_when_enabled() {
 }
 
 #[tokio::test]
+#[serial]
+async fn ag6_env_true_engages_pump() {
+    let _guard = set_uninterruptible_playback_env(Some("yes"));
+
+    let vm = ag6_voice_manager();
+    vm.on_tts_audio(|_a| Box::pin(async {})).await.unwrap();
+
+    assert!(vm.test_has_playback_pump(), "env true ⇒ pump engaged");
+}
+
+#[tokio::test]
+#[serial]
+async fn ag6_env_false_keeps_pump_off() {
+    let _guard = set_uninterruptible_playback_env(Some("0"));
+
+    let vm = ag6_voice_manager();
+    vm.on_tts_audio(|_a| Box::pin(async {})).await.unwrap();
+
+    assert!(!vm.test_has_playback_pump(), "env false ⇒ no pump");
+}
+
+#[test]
+#[serial]
+fn ag6_env_malformed_rejects_voice_manager_initialization() {
+    let _guard = set_uninterruptible_playback_env(Some("tru"));
+
+    let err = match ag6_voice_manager_result() {
+        Ok(_) => panic!("malformed env should reject VoiceManager initialization"),
+        Err(err) => err,
+    };
+
+    match err {
+        VoiceManagerError::InitializationError(message) => {
+            assert!(
+                message.contains(WAAV_UNINTERRUPTIBLE_PLAYBACK_ENV),
+                "error should name env var: {message}"
+            );
+        }
+        other => panic!("expected InitializationError, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[serial]
 async fn ag6_queued_uninterruptible_survives_barge_in() {
     // Mixed queue: int1, uninterruptible(2), int2. A barge-in keeps 2 and drops
     // the interruptible audio queued behind it. No synthesis-deadline override
@@ -104,11 +181,18 @@ async fn ag6_queued_uninterruptible_survives_barge_in() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     let got = delivered.lock().unwrap().clone();
-    assert!(got.contains(&2), "the uninterruptible chunk survived: {got:?}");
-    assert!(!got.contains(&3), "the trailing interruptible chunk was dropped: {got:?}");
+    assert!(
+        got.contains(&2),
+        "the uninterruptible chunk survived: {got:?}"
+    );
+    assert!(
+        !got.contains(&3),
+        "the trailing interruptible chunk was dropped: {got:?}"
+    );
 }
 
 #[tokio::test]
+#[serial]
 async fn ag6_in_flight_uninterruptible_survives_barge_in() {
     // The review-#2 case: the disclaimer's only chunk is already POPPED (in
     // flight, playing in the transport) when the barge-in arrives. The protection
@@ -280,7 +364,7 @@ async fn test_speech_final_timing_control() {
                 last_forced_text: String::with_capacity(1024),
                 segment_start_ms: AtomicUsize::new(0),
                 hard_timeout_deadline_ms: AtomicUsize::new(0),
-            fire_generation: AtomicUsize::new(0),
+                fire_generation: AtomicUsize::new(0),
             };
         }
 
@@ -333,7 +417,7 @@ async fn test_speech_final_timing_control() {
                 last_forced_text: String::with_capacity(1024),
                 segment_start_ms: AtomicUsize::new(0),
                 hard_timeout_deadline_ms: AtomicUsize::new(0),
-            fire_generation: AtomicUsize::new(0),
+                fire_generation: AtomicUsize::new(0),
             };
         }
 
@@ -386,7 +470,7 @@ async fn test_speech_final_timing_control() {
                 last_forced_text: String::with_capacity(1024),
                 segment_start_ms: AtomicUsize::new(0),
                 hard_timeout_deadline_ms: AtomicUsize::new(0),
-            fire_generation: AtomicUsize::new(0),
+                fire_generation: AtomicUsize::new(0),
             };
         }
 
@@ -460,7 +544,7 @@ async fn test_speech_final_timing_control() {
                 last_forced_text: String::with_capacity(1024),
                 segment_start_ms: AtomicUsize::new(0),
                 hard_timeout_deadline_ms: AtomicUsize::new(0),
-            fire_generation: AtomicUsize::new(0),
+                fire_generation: AtomicUsize::new(0),
             };
         }
 
@@ -729,7 +813,7 @@ async fn test_hard_timeout_fallback_without_turn_detector() {
         last_forced_text: String::new(),
         segment_start_ms: AtomicUsize::new(0),
         hard_timeout_deadline_ms: AtomicUsize::new(0),
-            fire_generation: AtomicUsize::new(0),
+        fire_generation: AtomicUsize::new(0),
     }));
 
     // Send is_final result without speech_final (simulating Deepgram behavior)
@@ -828,7 +912,7 @@ async fn test_hard_timeout_with_turn_detector_failure() {
         last_forced_text: String::new(),
         segment_start_ms: AtomicUsize::new(0),
         hard_timeout_deadline_ms: AtomicUsize::new(0),
-            fire_generation: AtomicUsize::new(0),
+        fire_generation: AtomicUsize::new(0),
     }));
 
     // Send is_final result
@@ -886,7 +970,7 @@ async fn test_cancellation_cleanup_on_real_speech_final() {
         last_forced_text: String::new(),
         segment_start_ms: AtomicUsize::new(0),
         hard_timeout_deadline_ms: AtomicUsize::new(0),
-            fire_generation: AtomicUsize::new(0),
+        fire_generation: AtomicUsize::new(0),
     }));
 
     // Send is_final to start both timers
@@ -982,7 +1066,7 @@ async fn test_continuous_speech_hard_timeout_not_restarted() {
         last_forced_text: String::new(),
         segment_start_ms: AtomicUsize::new(0),
         hard_timeout_deadline_ms: AtomicUsize::new(0),
-            fire_generation: AtomicUsize::new(0),
+        fire_generation: AtomicUsize::new(0),
     }));
 
     // Send first is_final at t=0
@@ -1078,7 +1162,7 @@ async fn test_hard_timeout_observability() {
         last_forced_text: String::new(),
         segment_start_ms: AtomicUsize::new(0),
         hard_timeout_deadline_ms: AtomicUsize::new(0),
-            fire_generation: AtomicUsize::new(0),
+        fire_generation: AtomicUsize::new(0),
     }));
 
     // Send is_final result

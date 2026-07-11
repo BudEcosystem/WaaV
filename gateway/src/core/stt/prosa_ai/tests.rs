@@ -46,7 +46,7 @@ fn test_config_validation_empty_key() {
 // provider-struct `new_standard` method to the provider-specific config.
 #[test]
 fn test_prosa_new_standard_unlocks_advanced_features() {
-    use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+    use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
     let std = StandardSTTConfig {
         base: STTConfig {
             provider: "prosa-ai".into(),
@@ -217,8 +217,6 @@ fn test_model_display() {
 
 #[test]
 fn test_model_from_str_trait() {
-    
-
     let model: ProsaSttModel = "general".parse().unwrap();
     assert_eq!(model, ProsaSttModel::General);
 

@@ -5,6 +5,15 @@
 use crate::core::stt::base::{STTConfig, STTError};
 use std::str::FromStr;
 
+fn validate_yandex_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Audio Format
 // =============================================================================
@@ -62,8 +71,7 @@ impl FromStr for YandexSTTAudioFormat {
 // =============================================================================
 
 /// Supported languages for Yandex STT
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum YandexSTTLanguage {
     /// Russian (default)
     #[default]
@@ -97,7 +105,6 @@ pub enum YandexSTTLanguage {
     /// Auto-detect language
     Auto,
 }
-
 
 impl YandexSTTLanguage {
     /// Get the language code for the API
@@ -344,7 +351,17 @@ impl YandexSTTConfig {
         if let Some(n) = f.numerals {
             cfg.raw_results = !n;
         }
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Validate provider-specific URL surfaces.
+    pub fn validate(&self) -> Result<(), STTError> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_yandex_stt_endpoint("endpoint_override", endpoint)
+                .map_err(STTError::ConfigurationError)?;
+        }
+        Ok(())
     }
 
     /// Get the Authorization header value
@@ -411,7 +428,7 @@ mod tests {
     // custom vocabulary hints) onto its own config fields.
     #[test]
     fn from_standard_maps_features() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "yandex".into(),
@@ -437,7 +454,7 @@ mod tests {
     // serialized URL (this is the same `.query(&build_query_params())` path the STT client uses).
     #[test]
     fn numerals_reaches_request_url_as_raw_results() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
 
         // `numerals: Some(false)` = numbers as WORDS = rawResults=true.
         let std = StandardSTTConfig {
@@ -495,6 +512,31 @@ mod tests {
             !req2.url().as_str().contains("rawResults"),
             "rawResults must be absent for figures (default)"
         );
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        let mk = |endpoint: &str| {
+            StandardSTTConfig {
+                base: STTConfig {
+                    provider: "yandex".into(),
+                    api_key: "test-key".into(),
+                    ..Default::default()
+                },
+                features: SttFeatures::default(),
+                extras: ProviderExtras::default(),
+                translation: None,
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(YandexSTTConfig::from_standard(&mk("https://stt-proxy.example.com")).is_ok());
+        assert!(YandexSTTConfig::from_standard(&mk("http://127.0.0.1:9000")).is_err());
+        assert!(YandexSTTConfig::from_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(YandexSTTConfig::from_standard(&mk("wss://stt-proxy.example.com")).is_err());
     }
 
     #[test]

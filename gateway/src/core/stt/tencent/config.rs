@@ -17,6 +17,17 @@
 use crate::core::stt::base::{STTConfig, STTError};
 use serde::{Deserialize, Serialize};
 
+fn validate_tencent_stt_endpoint(source: &str, endpoint: &str) -> Result<(), STTError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, &["ws", "wss"]).map_err(|e| {
+        STTError::ConfigurationError(format!("{source} rejected (SSRF protection): {e}"))
+    })
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -696,30 +707,33 @@ impl TencentSttConfig {
 
         // Validate VAD silence time
         if let Some(vad_time) = self.vad_silence_time
-            && (!(VAD_SILENCE_TIME_MIN..=VAD_SILENCE_TIME_MAX).contains(&vad_time)) {
-                return Err(STTError::ConfigurationError(format!(
-                    "VAD silence time must be between {} and {} ms",
-                    VAD_SILENCE_TIME_MIN, VAD_SILENCE_TIME_MAX
-                )));
-            }
+            && (!(VAD_SILENCE_TIME_MIN..=VAD_SILENCE_TIME_MAX).contains(&vad_time))
+        {
+            return Err(STTError::ConfigurationError(format!(
+                "VAD silence time must be between {} and {} ms",
+                VAD_SILENCE_TIME_MIN, VAD_SILENCE_TIME_MAX
+            )));
+        }
 
         // Validate max speak time
         if let Some(max_speak) = self.max_speak_time
-            && (!(MAX_SPEAK_TIME_MIN..=MAX_SPEAK_TIME_MAX).contains(&max_speak)) {
-                return Err(STTError::ConfigurationError(format!(
-                    "Max speak time must be between {} and {} ms",
-                    MAX_SPEAK_TIME_MIN, MAX_SPEAK_TIME_MAX
-                )));
-            }
+            && (!(MAX_SPEAK_TIME_MIN..=MAX_SPEAK_TIME_MAX).contains(&max_speak))
+        {
+            return Err(STTError::ConfigurationError(format!(
+                "Max speak time must be between {} and {} ms",
+                MAX_SPEAK_TIME_MIN, MAX_SPEAK_TIME_MAX
+            )));
+        }
 
         // Validate hotword list size
         if let Some(ref list) = self.hotword_list
-            && list.len() > MAX_HOTWORD_LIST_SIZE {
-                return Err(STTError::ConfigurationError(format!(
-                    "Hotword list must not exceed {} terms",
-                    MAX_HOTWORD_LIST_SIZE
-                )));
-            }
+            && list.len() > MAX_HOTWORD_LIST_SIZE
+        {
+            return Err(STTError::ConfigurationError(format!(
+                "Hotword list must not exceed {} terms",
+                MAX_HOTWORD_LIST_SIZE
+            )));
+        }
 
         // Validate reinforce_hotword is only used with compatible models
         if self.reinforce_hotword {
@@ -729,6 +743,10 @@ impl TencentSttConfig {
                     "reinforce_hotword is only supported for 8k_zh and 16k_zh models".to_string(),
                 ));
             }
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_tencent_stt_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -874,7 +892,7 @@ mod tests {
     // key terms) onto its own config fields.
     #[test]
     fn from_standard_maps_features() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "tencent".into(),
@@ -1210,6 +1228,52 @@ mod tests {
     fn test_config_validation_valid() {
         let config = TencentSttConfig::new("secret_id", "secret_key", "app_id");
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = TencentSttConfig {
+            endpoint_override: Some("wss://tencent-proxy.example.com".to_string()),
+            ..TencentSttConfig::new("secret_id", "secret_key", "app_id")
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://tencent-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-WebSocket endpoint_override must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("https://tencent-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("HTTP endpoint_override must be rejected for Tencent WebSocket dial");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]

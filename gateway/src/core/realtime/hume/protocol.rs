@@ -297,9 +297,11 @@ impl RealtimeProtocol for HumeProtocol {
 
             // websocket_error ⇒ Error(WebSocketError) with the reason (or "Unknown
             // error"), matching the bespoke client.
-            EVIServerMessage::WebSocketError(err) => vec![S2sEvent::Error(
-                RealtimeError::WebSocketError(err.reason.unwrap_or_else(|| "Unknown error".to_string())),
-            )],
+            EVIServerMessage::WebSocketError(err) => {
+                vec![S2sEvent::Error(RealtimeError::WebSocketError(
+                    err.reason.unwrap_or_else(|| "Unknown error".to_string()),
+                ))]
+            }
 
             // Unknown (forward-compat) ⇒ trace-logged + ignored.
             EVIServerMessage::Unknown => vec![S2sEvent::Ignore],
@@ -436,12 +438,22 @@ mod tests {
             realtime_endpoint_override: Some("ws://127.0.0.1:9009/hume".into()),
             ..base_cfg()
         };
-        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap() else {
+        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap()
+        else {
             panic!("expected WebSocket")
         };
-        assert!(url.starts_with("ws://127.0.0.1:9009/hume?"), "override base kept: {url}");
-        assert!(url.contains("api_key=hume-key"), "EVI auth query appended: {url}");
-        assert!(url.contains("evi_version=3"), "EVI version query appended: {url}");
+        assert!(
+            url.starts_with("ws://127.0.0.1:9009/hume?"),
+            "override base kept: {url}"
+        );
+        assert!(
+            url.contains("api_key=hume-key"),
+            "EVI auth query appended: {url}"
+        );
+        assert!(
+            url.contains("evi_version=3"),
+            "EVI version query appended: {url}"
+        );
         assert!(headers.is_empty());
     }
 
@@ -550,11 +562,13 @@ mod tests {
         let p = proto(&base_cfg());
         let pcm: &[u8] = &[1, 2, 3, 4, 250, 251];
         match p.map_server_event(Inbound::Binary(pcm)).as_slice() {
-            [S2sEvent::Audio {
-                data,
-                item_id,
-                response_id,
-            }] => {
+            [
+                S2sEvent::Audio {
+                    data,
+                    item_id,
+                    response_id,
+                },
+            ] => {
                 assert_eq!(data.as_ref(), pcm);
                 assert!(item_id.is_none());
                 assert!(response_id.is_none());
@@ -571,11 +585,13 @@ mod tests {
         let encoded = BASE64.encode(&pcm);
         let raw = format!(r#"{{"type":"audio_output","id":"a1","data":"{encoded}"}}"#);
         match p.map_server_event(Inbound::Text(&raw)).as_slice() {
-            [S2sEvent::Audio {
-                data,
-                item_id,
-                response_id,
-            }] => {
+            [
+                S2sEvent::Audio {
+                    data,
+                    item_id,
+                    response_id,
+                },
+            ] => {
                 assert_eq!(data.as_ref(), pcm.as_slice());
                 assert_eq!(item_id.as_deref(), Some("a1"));
                 assert!(response_id.is_none());
@@ -604,12 +620,14 @@ mod tests {
         let p = proto(&base_cfg());
         let interim = r#"{"type":"user_message","id":"u1","message":{"role":"user","content":"hi"},"interim":true}"#;
         match p.map_server_event(Inbound::Text(interim)).as_slice() {
-            [S2sEvent::Transcript {
-                role,
-                text,
-                is_final,
-                item_id,
-            }] => {
+            [
+                S2sEvent::Transcript {
+                    role,
+                    text,
+                    is_final,
+                    item_id,
+                },
+            ] => {
                 assert_eq!(*role, TranscriptRole::User);
                 assert_eq!(text, "hi");
                 assert!(!*is_final, "interim:true ⇒ not final");
@@ -617,7 +635,8 @@ mod tests {
             }
             other => panic!("expected user Transcript, got {other:?}"),
         }
-        let final_msg = r#"{"type":"user_message","id":"u2","message":{"role":"user","content":"done"}}"#;
+        let final_msg =
+            r#"{"type":"user_message","id":"u2","message":{"role":"user","content":"done"}}"#;
         match p.map_server_event(Inbound::Text(final_msg)).as_slice() {
             [S2sEvent::Transcript { is_final, .. }] => {
                 assert!(*is_final, "absent interim ⇒ final");
@@ -632,12 +651,14 @@ mod tests {
         let p = proto(&base_cfg());
         let raw = r#"{"type":"assistant_message","id":"m2","message":{"role":"assistant","content":"hello!"}}"#;
         match p.map_server_event(Inbound::Text(raw)).as_slice() {
-            [S2sEvent::Transcript {
-                role,
-                text,
-                is_final,
-                item_id,
-            }] => {
+            [
+                S2sEvent::Transcript {
+                    role,
+                    text,
+                    is_final,
+                    item_id,
+                },
+            ] => {
                 assert_eq!(*role, TranscriptRole::Assistant);
                 assert_eq!(text, "hello!");
                 assert!(*is_final);
@@ -654,10 +675,12 @@ mod tests {
         let p = proto(&base_cfg());
         let raw = r#"{"type":"user_interruption","time":123}"#;
         match p.map_server_event(Inbound::Text(raw)).as_slice() {
-            [S2sEvent::Speech(SpeechEvent::Started {
-                audio_start_ms,
-                item_id,
-            })] => {
+            [
+                S2sEvent::Speech(SpeechEvent::Started {
+                    audio_start_ms,
+                    item_id,
+                }),
+            ] => {
                 assert_eq!(*audio_start_ms, 123);
                 assert!(item_id.is_none());
             }

@@ -338,7 +338,9 @@ impl ObserverRegistry {
     pub fn notify_smart_turn(&self, inference_us: u64, is_complete: bool, ts_ns: u64) {
         let observers = self.observers.read();
         for entry in observers.iter() {
-            entry.observer.on_smart_turn(inference_us, is_complete, ts_ns);
+            entry
+                .observer
+                .on_smart_turn(inference_us, is_complete, ts_ns);
         }
     }
 
@@ -955,7 +957,8 @@ mod tests {
         }
         fn on_smart_turn(&self, inference_us: u64, is_complete: bool, _ts_ns: u64) {
             self.smart_turn.fetch_add(1, Ordering::Relaxed);
-            self.last_inference_us.store(inference_us, Ordering::Relaxed);
+            self.last_inference_us
+                .store(inference_us, Ordering::Relaxed);
             if is_complete {
                 self.smart_turn_complete.fetch_add(1, Ordering::Relaxed);
             }

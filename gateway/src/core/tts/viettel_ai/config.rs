@@ -24,6 +24,15 @@
 use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 
+fn validate_viettel_http_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -337,12 +346,7 @@ impl ViettelTtsConfig {
         }
 
         // Provider-specific passthrough.
-        if let Some(without_filter) = std
-            .extras
-            .0
-            .get("without_filter")
-            .and_then(|v| v.as_bool())
-        {
+        if let Some(without_filter) = std.extras.0.get("without_filter").and_then(|v| v.as_bool()) {
             cfg.without_filter = without_filter;
         }
         if let Some(opt) = std
@@ -355,6 +359,8 @@ impl ViettelTtsConfig {
         }
 
         cfg.endpoint_override = std.endpoint_override().map(String::from);
+
+        cfg.validate().map_err(TTSError::InvalidConfiguration)?;
 
         Ok(cfg)
     }
@@ -370,6 +376,10 @@ impl ViettelTtsConfig {
                 "Speed must be between {} and {}, got {}",
                 MIN_SPEED, MAX_SPEED, self.speed
             ));
+        }
+
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_viettel_http_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -487,8 +497,8 @@ mod tests {
             },
             features: TtsFeatures {
                 speed: Some(1.5),
-                pitch: Some(70.0),  // capability gap: Viettel has no pitch, must be ignored
-                ssml: Some(true),   // capability gap: Viettel has no SSML, must be ignored
+                pitch: Some(70.0), // capability gap: Viettel has no pitch, must be ignored
+                ssml: Some(true),  // capability gap: Viettel has no SSML, must be ignored
                 ..Default::default()
             },
             extras: ProviderExtras(extras),
@@ -630,6 +640,45 @@ mod tests {
         config.api_key = "test_token".to_string();
 
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = ViettelTtsConfig {
+            api_key: "test_token".to_string(),
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://viettel-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the shared test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]

@@ -41,6 +41,11 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use crate::config::utils::parse_bool;
+
+pub(crate) const HTTP_URL_SCHEMES: &[&str] = &["http", "https"];
+pub(crate) const HTTP_WS_URL_SCHEMES: &[&str] = &["http", "https", "ws", "wss"];
+
 /// Hostnames rejected outright (case-insensitive), before any IP parsing or
 /// DNS resolution. Union of the lists the three former copies carried, plus
 /// `metadata.azure.com`.
@@ -68,17 +73,33 @@ const BLOCKED_HOSTNAMES: &[&str] = &[
 /// mock servers can target `127.0.0.1` without weakening production SSRF
 /// protection. Never set in production.
 pub(crate) fn loopback_endpoints_allowed() -> bool {
-    loopback_flag_enabled(
-        std::env::var("WAAV_ALLOW_LOOPBACK_ENDPOINTS")
-            .ok()
-            .as_deref(),
-    )
+    match std::env::var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") {
+        Ok(value) => match loopback_flag_enabled(Some(&value)) {
+            Ok(enabled) => enabled,
+            Err(e) => {
+                tracing::error!(error = %e, "invalid loopback endpoint escape-hatch environment configuration");
+                false
+            }
+        },
+        Err(std::env::VarError::NotPresent) => false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::error!(
+                "WAAV_ALLOW_LOOPBACK_ENDPOINTS must be valid UTF-8; keeping SSRF protection enabled"
+            );
+            false
+        }
+    }
 }
 
 /// Pure parser for the escape-hatch flag value (unit-testable without touching
 /// process-global env state; see the note on [`tests`]).
-fn loopback_flag_enabled(value: Option<&str>) -> bool {
-    matches!(value, Some("1") | Some("true") | Some("TRUE"))
+fn loopback_flag_enabled(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        Some(value) => parse_bool(value).ok_or_else(|| {
+            "WAAV_ALLOW_LOOPBACK_ENDPOINTS must be one of true/false/1/0/yes/no".to_string()
+        }),
+        None => Ok(false),
+    }
 }
 
 /// Validate a URL for SSRF (Server-Side Request Forgery) protection.
@@ -88,6 +109,44 @@ fn loopback_flag_enabled(value: Option<&str>) -> bool {
 /// the URL was rejected. See the module docs for the full rule set.
 pub fn validate_url_for_ssrf(url: &str, allowed_schemes: &[&str]) -> Result<(), String> {
     validate_url_for_ssrf_inner(url, allowed_schemes, loopback_endpoints_allowed())
+}
+
+/// Build a reqwest redirect policy that validates every redirect target before
+/// following it. Use this for requests whose original URL passed
+/// [`validate_url_for_ssrf`]; reqwest follows redirects by default, and an
+/// attacker-controlled public URL can otherwise redirect to a private target.
+pub(crate) fn ssrf_protected_redirect_policy(
+    allowed_schemes: &'static [&'static str],
+) -> reqwest::redirect::Policy {
+    const MAX_REDIRECTS: usize = 10;
+
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() > MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+
+        let next = attempt.url().as_str();
+        match validate_url_for_ssrf(next, allowed_schemes) {
+            Ok(()) => attempt.follow(),
+            Err(msg) => attempt.error(format!("redirect URL rejected (SSRF protection): {msg}")),
+        }
+    })
+}
+
+/// Build a reqwest client builder whose redirects are constrained by
+/// [`ssrf_protected_redirect_policy`].
+pub(crate) fn ssrf_protected_client_builder(
+    allowed_schemes: &'static [&'static str],
+) -> reqwest::ClientBuilder {
+    reqwest::Client::builder().redirect(ssrf_protected_redirect_policy(allowed_schemes))
+}
+
+/// Build a reqwest client whose redirects are constrained by
+/// [`ssrf_protected_redirect_policy`].
+pub(crate) fn ssrf_protected_client(
+    allowed_schemes: &'static [&'static str],
+) -> Result<reqwest::Client, reqwest::Error> {
+    ssrf_protected_client_builder(allowed_schemes).build()
 }
 
 /// Rule engine behind [`validate_url_for_ssrf`], with the loopback escape
@@ -123,10 +182,7 @@ fn validate_url_for_ssrf_inner(
     // Blocked hostnames (case-insensitive).
     let host_lower = host.to_lowercase();
     if BLOCKED_HOSTNAMES.contains(&host_lower.as_str()) {
-        return Err(format!(
-            "URL host '{}' is blocked (SSRF protection)",
-            host
-        ));
+        return Err(format!("URL host '{}' is blocked (SSRF protection)", host));
     }
 
     // Plain IP literal (the `url` crate normalizes IPv4 forms for http/ws
@@ -311,6 +367,20 @@ pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
+/// Serializes every test that SETS or DEPENDS ON `WAAV_ALLOW_LOOPBACK_ENDPOINTS`.
+/// Env vars are process-global: module-local locks cannot prevent a parallel test in
+/// another module from observing a temporarily-set allow-loopback window (the rotating
+/// SSRF-test flake). Setters take the lock for their whole set→assert→restore span;
+/// rejection-assertion tests take it for their assertion so they never overlap a window.
+/// Keys the SAME mutex as [`test_env_lock`] so both entry points exclude each other.
+/// `unwrap_or_else(PoisonError::into_inner)` — a poisoned lock must not cascade.
+#[cfg(test)]
+pub(crate) fn ssrf_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    test_env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,17 +501,17 @@ mod tests {
     fn private_ipv6_literals_rejected() {
         let _guard = env_guard();
         for host in [
-            "[::1]",                // loopback (also hostname-blocked)
-            "[fe80::1]",            // link-local
-            "[febf::1]",            // link-local upper edge
-            "[fc00::1]",            // unique-local
-            "[fdff::1]",            // unique-local upper edge
-            "[2001:db8::1]",        // documentation
-            "[::ffff:127.0.0.1]",   // IPv4-mapped loopback
-            "[::ffff:10.0.0.1]",    // IPv4-mapped RFC1918
-            "[::ffff:a9fe:a9fe]",   // IPv4-mapped 169.254.169.254
-            "[ff02::1]",            // multicast all-nodes (audit gap)
-            "[ff05::2]",            // multicast site-local scope
+            "[::1]",              // loopback (also hostname-blocked)
+            "[fe80::1]",          // link-local
+            "[febf::1]",          // link-local upper edge
+            "[fc00::1]",          // unique-local
+            "[fdff::1]",          // unique-local upper edge
+            "[2001:db8::1]",      // documentation
+            "[::ffff:127.0.0.1]", // IPv4-mapped loopback
+            "[::ffff:10.0.0.1]",  // IPv4-mapped RFC1918
+            "[::ffff:a9fe:a9fe]", // IPv4-mapped 169.254.169.254
+            "[ff02::1]",          // multicast all-nodes (audit gap)
+            "[ff05::2]",          // multicast site-local scope
         ] {
             let url = format!("http://{host}/x");
             assert!(
@@ -512,12 +582,69 @@ mod tests {
     /// The env-flag parser itself (pure; no env mutation needed).
     #[test]
     fn loopback_flag_parsing() {
-        for on in [Some("1"), Some("true"), Some("TRUE")] {
-            assert!(loopback_flag_enabled(on), "{on:?} must enable the gate");
+        for on in [Some("1"), Some("true"), Some("TRUE"), Some("yes")] {
+            assert!(
+                loopback_flag_enabled(on).expect("truthy value parses"),
+                "{on:?} must enable the gate"
+            );
         }
-        for off in [None, Some("0"), Some("false"), Some(""), Some("yes")] {
-            assert!(!loopback_flag_enabled(off), "{off:?} must keep the gate off");
+        for off in [None, Some("0"), Some("false"), Some("FALSE"), Some("no")] {
+            assert!(
+                !loopback_flag_enabled(off).expect("false value parses"),
+                "{off:?} must keep the gate off"
+            );
         }
+        for malformed in [Some(""), Some("maybe"), Some("on")] {
+            let err =
+                loopback_flag_enabled(malformed).expect_err("malformed bool must fail closed");
+            assert!(
+                err.contains("WAAV_ALLOW_LOOPBACK_ENDPOINTS"),
+                "error should name bad env var: {err}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ssrf_redirect_policy_rejects_private_redirect_hop() {
+        let _guard = env_guard();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let client = ssrf_protected_client(HTTP_SCHEMES).expect("client");
+        let err = client
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
     }
 
     #[test]

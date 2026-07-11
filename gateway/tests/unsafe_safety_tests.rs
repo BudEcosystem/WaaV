@@ -142,9 +142,7 @@ fn test_audio_conversion_fixed_pattern_is_endian_safe() {
 /// identical results for the same logical samples (no path-dependent skew).
 #[test]
 fn test_audio_conversion_aligned_matches_unaligned() {
-    let pattern: Vec<u8> = vec![
-        0x10, 0x20, 0x30, 0x40, 0x00, 0x80, 0xFF, 0x7F, 0xAB, 0xCD,
-    ];
+    let pattern: Vec<u8> = vec![0x10, 0x20, 0x30, 0x40, 0x00, 0x80, 0xFF, 0x7F, 0xAB, 0xCD];
 
     // Aligned slice (offset 0 of a fresh Vec).
     let aligned = convert_bytes_to_i16_safe(&pattern);
@@ -243,11 +241,8 @@ impl<T: Copy + Default> TestAlignedBuffer<T> {
             };
         }
 
-        let layout = Layout::from_size_align(
-            capacity * std::mem::size_of::<T>(),
-            CACHE_LINE_SIZE,
-        )
-        .expect("Invalid layout");
+        let layout = Layout::from_size_align(capacity * std::mem::size_of::<T>(), CACHE_LINE_SIZE)
+            .expect("Invalid layout");
 
         // SAFETY: Layout is valid and non-zero
         let ptr = unsafe {
@@ -287,7 +282,12 @@ impl<T: Copy + Default> TestAlignedBuffer<T> {
         match self.ptr {
             Some(ptr) => {
                 // Debug assertions for safety
-                debug_assert!(self.len <= self.capacity, "len {} > capacity {}", self.len, self.capacity);
+                debug_assert!(
+                    self.len <= self.capacity,
+                    "len {} > capacity {}",
+                    self.len,
+                    self.capacity
+                );
                 // (No null check: `ptr` is a NonNull, so `as_ptr()` is never null by construction.)
 
                 // SAFETY: ptr is valid, len <= capacity (checked in debug)
@@ -301,19 +301,25 @@ impl<T: Copy + Default> TestAlignedBuffer<T> {
         assert!(new_len <= self.capacity, "Cannot resize beyond capacity");
 
         if let Some(ptr) = self.ptr
-            && new_len > self.len {
-                // Debug assertions for bounds checking
-                debug_assert!(new_len <= self.capacity, "new_len {} > capacity {}", new_len, self.capacity);
+            && new_len > self.len
+        {
+            // Debug assertions for bounds checking
+            debug_assert!(
+                new_len <= self.capacity,
+                "new_len {} > capacity {}",
+                new_len,
+                self.capacity
+            );
 
-                // SAFETY: bounds checked above
-                unsafe {
-                    let start = ptr.as_ptr().add(self.len);
-                    for i in 0..(new_len - self.len) {
-                        debug_assert!(self.len + i < self.capacity, "Write beyond capacity");
-                        std::ptr::write(start.add(i), value);
-                    }
+            // SAFETY: bounds checked above
+            unsafe {
+                let start = ptr.as_ptr().add(self.len);
+                for i in 0..(new_len - self.len) {
+                    debug_assert!(self.len + i < self.capacity, "Write beyond capacity");
+                    std::ptr::write(start.add(i), value);
                 }
             }
+        }
 
         self.len = new_len;
     }
@@ -340,18 +346,17 @@ impl<T: Copy + Default> TestAlignedBuffer<T> {
 impl<T: Copy + Default> Drop for TestAlignedBuffer<T> {
     fn drop(&mut self) {
         if let Some(ptr) = self.ptr
-            && self.capacity > 0 {
-                let layout = Layout::from_size_align(
-                    self.capacity * std::mem::size_of::<T>(),
-                    CACHE_LINE_SIZE,
-                )
-                .expect("Invalid layout");
+            && self.capacity > 0
+        {
+            let layout =
+                Layout::from_size_align(self.capacity * std::mem::size_of::<T>(), CACHE_LINE_SIZE)
+                    .expect("Invalid layout");
 
-                // SAFETY: ptr was allocated with this layout
-                unsafe {
-                    dealloc(ptr.as_ptr() as *mut u8, layout);
-                }
+            // SAFETY: ptr was allocated with this layout
+            unsafe {
+                dealloc(ptr.as_ptr() as *mut u8, layout);
             }
+        }
     }
 }
 

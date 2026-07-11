@@ -374,7 +374,7 @@ mod client_tests {
     // survives through `new_standard` into the provider config.
     #[test]
     fn test_new_standard_unlocks_word_timestamps() {
-        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 api_key: "test_key".to_string(),
@@ -541,7 +541,13 @@ mod client_tests {
         let msg =
             Message::Text(r#"{"type":"Begin","id":"session-xyz","expires_at":1704067200}"#.into());
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
+        let result = AssemblyAISTT::handle_websocket_message(
+            msg,
+            &tx,
+            &session_id,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .await;
 
         assert!(result.is_ok());
         assert!(result.unwrap()); // Should continue
@@ -557,7 +563,13 @@ mod client_tests {
             r#"{"type":"Turn","turn_order":0,"transcript":"Test transcript","end_of_turn":true,"words":[{"start":0,"end":1000,"confidence":0.95,"text":"Test"},{"start":1000,"end":2000,"confidence":0.92,"text":"transcript"}]}"#.into(),
         );
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
+        let result = AssemblyAISTT::handle_websocket_message(
+            msg,
+            &tx,
+            &session_id,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .await;
 
         assert!(result.is_ok());
         assert!(result.unwrap()); // Should continue
@@ -579,7 +591,13 @@ mod client_tests {
             r#"{"type":"Termination","audio_duration_ms":5000,"terminated_normally":true}"#.into(),
         );
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
+        let result = AssemblyAISTT::handle_websocket_message(
+            msg,
+            &tx,
+            &session_id,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .await;
 
         assert!(result.is_ok());
         assert!(!result.unwrap()); // Should NOT continue
@@ -594,7 +612,13 @@ mod client_tests {
             r#"{"type":"Error","error_code":"invalid_api_key","error":"Invalid API key"}"#.into(),
         );
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
+        let result = AssemblyAISTT::handle_websocket_message(
+            msg,
+            &tx,
+            &session_id,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .await;
 
         assert!(result.is_err());
         match result {
@@ -615,7 +639,13 @@ mod client_tests {
                 .into(),
         );
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
+        let result = AssemblyAISTT::handle_websocket_message(
+            msg,
+            &tx,
+            &session_id,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .await;
 
         assert!(result.is_err());
         match result {
@@ -636,7 +666,13 @@ mod client_tests {
                 .into(),
         );
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
+        let result = AssemblyAISTT::handle_websocket_message(
+            msg,
+            &tx,
+            &session_id,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .await;
 
         assert!(result.is_err());
         match result {
@@ -654,7 +690,13 @@ mod client_tests {
 
         let msg = Message::Close(None);
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
+        let result = AssemblyAISTT::handle_websocket_message(
+            msg,
+            &tx,
+            &session_id,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .await;
 
         assert!(result.is_ok());
         assert!(!result.unwrap()); // Should NOT continue
@@ -667,7 +709,13 @@ mod client_tests {
 
         let msg = Message::Ping(vec![].into());
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
+        let result = AssemblyAISTT::handle_websocket_message(
+            msg,
+            &tx,
+            &session_id,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .await;
 
         assert!(result.is_ok());
         assert!(result.unwrap()); // Should continue
@@ -680,7 +728,13 @@ mod client_tests {
 
         let msg = Message::Pong(vec![].into());
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
+        let result = AssemblyAISTT::handle_websocket_message(
+            msg,
+            &tx,
+            &session_id,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .await;
 
         assert!(result.is_ok());
         assert!(result.unwrap()); // Should continue
@@ -693,7 +747,13 @@ mod client_tests {
 
         let msg = Message::Text(r#"{"type":"FutureType","data":"value"}"#.into());
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
+        let result = AssemblyAISTT::handle_websocket_message(
+            msg,
+            &tx,
+            &session_id,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .await;
 
         assert!(result.is_ok());
         assert!(result.unwrap()); // Should continue (forward compatibility)
@@ -706,7 +766,13 @@ mod client_tests {
 
         let msg = Message::Text("not valid json".into());
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
+        let result = AssemblyAISTT::handle_websocket_message(
+            msg,
+            &tx,
+            &session_id,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .await;
 
         // Should not error, just log warning and continue
         assert!(result.is_ok());

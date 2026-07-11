@@ -102,10 +102,7 @@ impl VoiceManagerConfig {
     /// (cache hashing, etc.) keep working, while `standard_stt`/`standard_tts` carry the advanced
     /// `features`/`extras` that [`VoiceManager::new`](crate::core::voice_manager::VoiceManager::new)
     /// threads into `create_stt_standard`/`create_tts_standard`.
-    pub fn from_standard(
-        standard_stt: StandardSTTConfig,
-        standard_tts: StandardTTSConfig,
-    ) -> Self {
+    pub fn from_standard(standard_stt: StandardSTTConfig, standard_tts: StandardTTSConfig) -> Self {
         Self {
             stt_config: standard_stt.base.clone(),
             tts_config: standard_tts.base.clone(),

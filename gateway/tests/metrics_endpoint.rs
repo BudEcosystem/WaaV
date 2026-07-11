@@ -10,13 +10,20 @@
 //! `waav_provider_ttfb_ms` histogram is present (i.e. the request's time-to-first-byte was
 //! recorded and exported).
 
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use axum::{
     Router,
     body::Body,
     http::{Request, StatusCode},
     routing::get,
 };
+use futures::FutureExt;
 use http_body_util::BodyExt;
+use tokio::task::JoinHandle;
 use tower::util::ServiceExt;
 
 use waav_gateway::{
@@ -25,6 +32,40 @@ use waav_gateway::{
     routes,
     state::AppState,
 };
+
+struct TestServer {
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        if self.panicked.load(Ordering::SeqCst) {
+            if std::thread::panicking() {
+                eprintln!("metrics endpoint mock server panicked");
+            } else {
+                panic!("metrics endpoint mock server panicked");
+            }
+        }
+    }
+}
+
+fn spawn_test_server<F>(future: F) -> TestServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let panicked = Arc::new(AtomicBool::new(false));
+    let panicked_in_task = Arc::clone(&panicked);
+    let handle = tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked_in_task.store(true, Ordering::SeqCst);
+        }
+    });
+    TestServer { handle, panicked }
+}
 
 /// 8000 samples of s16le PCM "audio" the mock returns as the synthesized speech.
 fn fake_pcm() -> Vec<u8> {
@@ -117,7 +158,7 @@ async fn metrics_exposes_provider_ttfb() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let mock = Router::new().route("/v1/audio/speech", post(speak));
-    tokio::spawn(async move {
+    let _server = spawn_test_server(async move {
         axum::serve(listener, mock).await.unwrap();
     });
 
@@ -171,12 +212,7 @@ async fn metrics_exposes_provider_ttfb() {
     let metrics_resp = app.oneshot(metrics_req).await.unwrap();
     assert_eq!(metrics_resp.status(), StatusCode::OK);
 
-    let bytes = metrics_resp
-        .into_body()
-        .collect()
-        .await
-        .unwrap()
-        .to_bytes();
+    let bytes = metrics_resp.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8(bytes.to_vec()).unwrap();
 
     assert!(

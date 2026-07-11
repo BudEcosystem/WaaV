@@ -6,18 +6,24 @@
 //! task body is wrapped in `catch_unwind` (see `src/handlers/ws/handler.rs`), so a
 //! panic is contained to the one offending session.
 //!
-//! `fuzzed_first_message_does_not_abort` proves this end to end: a first
-//! connection sends a frame that panics inside the session body; under abort this
-//! would kill the test process. Under unwind + catch the process survives and the
-//! server still serves a subsequent healthy connection.
+//! `fuzzed_first_message_does_not_abort` proves this end to end in debug/test
+//! builds: a first connection sends a frame that trips the debug-only panic seam
+//! inside the session body; under abort this would kill the test process. Under
+//! unwind + catch the process survives and the server still serves a subsequent
+//! healthy connection.
 
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use serde_json::json;
+use std::future::Future;
 use std::io::ErrorKind;
+use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::middleware;
 use serial_test::serial;
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use waav_gateway::{
@@ -27,6 +33,42 @@ use waav_gateway::{
     routes,
     state::AppState,
 };
+
+struct TestServer {
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        if self.panicked.load(Ordering::SeqCst) {
+            let msg = "panic_isolation server panicked";
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+}
+
+fn spawn_test_server<F>(future: F) -> TestServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let panicked = Arc::new(AtomicBool::new(false));
+    let panicked_in_task = Arc::clone(&panicked);
+    let handle = tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked_in_task.store(true, Ordering::SeqCst);
+            eprintln!("panic_isolation server panicked");
+        }
+    });
+    TestServer { handle, panicked }
+}
 
 fn test_config() -> ServerConfig {
     ServerConfig {
@@ -102,8 +144,8 @@ fn test_config() -> ServerConfig {
 #[tokio::test]
 #[serial]
 async fn fuzzed_first_message_does_not_abort() {
-    // Arm the panic-injection seam: any text frame starting with this token
-    // panics inside `process_message` (the per-session task body).
+    // Arm the debug-only panic-injection seam: any text frame starting with
+    // this token panics inside `process_message` (the per-session task body).
     const PANIC_TOKEN: &str = "__WAAV_PANIC__";
     // SAFETY: single-threaded test setup before the server task is spawned;
     // guarded by #[serial] so no other test reads/writes this env concurrently.
@@ -133,7 +175,7 @@ async fn fuzzed_first_message_does_not_abort() {
     };
     let addr = listener.local_addr().unwrap();
 
-    let server = tokio::spawn(async move {
+    let _server = spawn_test_server(async move {
         axum::serve(listener, app).await.unwrap();
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -221,6 +263,4 @@ async fn fuzzed_first_message_does_not_abort() {
         }
         other => panic!("expected a text protocol response, got: {other:?}"),
     }
-
-    server.abort();
 }

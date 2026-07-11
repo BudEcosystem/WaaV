@@ -35,9 +35,7 @@ pub struct LanguageCapabilitiesResponse {
 }
 
 /// `GET /capabilities/languages` — the unified-language discovery surface.
-pub async fn list_language_capabilities(
-    State(_state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn list_language_capabilities(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
     let canonical_languages: Vec<CanonicalLanguageInfo> = CanonicalLanguage::all()
         .iter()
         .map(|c| CanonicalLanguageInfo {

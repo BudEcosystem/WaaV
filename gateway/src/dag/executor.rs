@@ -214,7 +214,11 @@ impl DAGExecutor {
         for &n in &nodes {
             let node = Arc::clone(&dag.graph[n].node);
             let node_id = dag.graph[n].id.clone();
-            let rx = in_rx.remove(&n).expect("input rx");
+            let rx = in_rx.remove(&n).ok_or_else(|| {
+                DAGError::InternalError(format!(
+                    "streaming executor missing input receiver for node '{node_id}'"
+                ))
+            })?;
             let (out_tx, mut out_rx) = mpsc::channel::<DAGData>(CHAN_BUF);
 
             // The node task: stream this node's outputs onto `out_tx`. Own context per node; the
@@ -231,13 +235,11 @@ impl DAGExecutor {
 
             // The forwarder task: route this node's stream to its downstream inputs (per-chunk
             // condition eval for routers; broadcast for splits) or to the client sink if terminal.
-            let downstream: Vec<(mpsc::Sender<DAGData>, super::edges::CompiledEdge)> =
-                dag.outgoing_edges(n)
-                    .into_iter()
-                    .filter_map(|(tgt, edge)| {
-                        in_tx.get(&tgt).cloned().map(|tx| (tx, edge.clone()))
-                    })
-                    .collect();
+            let downstream: Vec<(mpsc::Sender<DAGData>, super::edges::CompiledEdge)> = dag
+                .outgoing_edges(n)
+                .into_iter()
+                .filter_map(|(tgt, edge)| in_tx.get(&tgt).cloned().map(|tx| (tx, edge.clone())))
+                .collect();
             let evaluator = Arc::clone(&dag.evaluator);
             let fwd_ctx = ctx.clone_for_branch();
             let sink = ctx.output_tx.clone();
@@ -276,7 +278,9 @@ impl DAGExecutor {
                     let chunk_json = chunk.to_json();
                     for (tx, edge) in &downstream {
                         let pass = match &edge.condition {
-                            Some(c) => evaluator.evaluate(c, &chunk_json, &fwd_ctx).unwrap_or(false),
+                            Some(c) => evaluator
+                                .evaluate(c, &chunk_json, &fwd_ctx)
+                                .unwrap_or(false),
                             None => true,
                         };
                         if pass {
@@ -494,31 +498,27 @@ impl DAGExecutor {
 
             // Handle router node output - prune unreachable downstream paths
             if compiled_node.node.node_type() == "router"
-                && let Some(router_target) = ctx.metadata.get("router_target").cloned() {
-                    // Find the target node index
-                    if let Some(target_idx) = dag.get_node_index(&router_target) {
-                        // Prune all outgoing paths except the target
-                        self.prune_non_target_paths(
-                            dag,
-                            node_idx,
-                            target_idx,
-                            &mut reachable_nodes,
-                        );
-                        debug!(
-                            router_id = %compiled_node.id,
-                            target = %router_target,
-                            "Router path pruning applied"
-                        );
-                    } else {
-                        warn!(
-                            router_id = %compiled_node.id,
-                            target = %router_target,
-                            "Router target node not found, continuing without pruning"
-                        );
-                    }
-                    // Clear the router_target after processing
-                    ctx.metadata.remove("router_target");
+                && let Some(router_target) = ctx.metadata.get("router_target").cloned()
+            {
+                // Find the target node index
+                if let Some(target_idx) = dag.get_node_index(&router_target) {
+                    // Prune all outgoing paths except the target
+                    self.prune_non_target_paths(dag, node_idx, target_idx, &mut reachable_nodes);
+                    debug!(
+                        router_id = %compiled_node.id,
+                        target = %router_target,
+                        "Router path pruning applied"
+                    );
+                } else {
+                    warn!(
+                        router_id = %compiled_node.id,
+                        target = %router_target,
+                        "Router target node not found, continuing without pruning"
+                    );
                 }
+                // Clear the router_target after processing
+                ctx.metadata.remove("router_target");
+            }
 
             // Store output for downstream nodes
             node_outputs.insert(node_idx, output);
@@ -698,9 +698,10 @@ impl DAGExecutor {
         let mut inputs: Vec<DAGData> = Vec::new();
         for src_idx in source_indices {
             if let Some(data) = node_outputs.get(&src_idx)
-                && !matches!(data, DAGData::Empty) {
-                    inputs.push(data.clone());
-                }
+                && !matches!(data, DAGData::Empty)
+            {
+                inputs.push(data.clone());
+            }
         }
 
         match inputs.len() {
@@ -1792,7 +1793,10 @@ mod tests {
 
         match result {
             Err(DAGError::NodeExecutionError { node_id, .. }) => {
-                assert_eq!(node_id, "mid", "error must come from the failing middle node");
+                assert_eq!(
+                    node_id, "mid",
+                    "error must come from the failing middle node"
+                );
             }
             other => panic!("expected mid-node execution error, got {:?}", other),
         }

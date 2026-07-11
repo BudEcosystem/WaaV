@@ -9,30 +9,239 @@
 //! chaos); this adds a clean happy-path proof for Rev AI (a 3rd-party vendor we have no key for) and
 //! is the template for extending credential-free e2e coverage provider-by-provider.
 
-use std::sync::Arc;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
-use futures::{SinkExt, StreamExt};
+use bytes::Bytes;
+use futures::{FutureExt, SinkExt, StreamExt};
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use waav_gateway::core::stt::standard::{StandardSTTConfig, create_stt_standard};
-use waav_gateway::core::stt::{STTConfig, STTResult};
+use waav_gateway::core::stt::{BaseSTT, STTConfig, STTError, STTResult};
 
 fn ensure_crypto() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+fn allow_loopback_endpoint_mocks() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: this integration-test binary only drives local mock endpoint overrides.
+        unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
+    });
+}
+
+struct MockServer {
+    label: &'static str,
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+    children: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl Drop for MockServer {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        if let Ok(mut children) = self.children.lock() {
+            for child in children.drain(..) {
+                if !child.is_finished() {
+                    child.abort();
+                }
+            }
+        }
+        if self.panicked.load(Ordering::SeqCst) {
+            let msg = format!("mock_endpoint_e2e server '{}' panicked", self.label);
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+}
+
+struct MockEndpoint {
+    port: u16,
+    _server: MockServer,
+}
+
+impl MockEndpoint {
+    fn new(port: u16, server: MockServer) -> Self {
+        Self {
+            port,
+            _server: server,
+        }
+    }
+}
+
+impl std::fmt::Display for MockEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.port.fmt(f)
+    }
+}
+
+fn spawn_mock_server<F>(label: &'static str, future: F) -> MockServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let panicked = Arc::new(AtomicBool::new(false));
+    let children = Arc::new(Mutex::new(Vec::new()));
+    spawn_mock_server_with_state(label, panicked, children, future)
+}
+
+fn spawn_mock_server_with_state<F>(
+    label: &'static str,
+    panicked: Arc<AtomicBool>,
+    children: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    future: F,
+) -> MockServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    allow_loopback_endpoint_mocks();
+    let handle = spawn_mock_task(label, Arc::clone(&panicked), future);
+    MockServer {
+        label,
+        handle,
+        panicked,
+        children,
+    }
+}
+
+fn spawn_mock_task<F>(label: &'static str, panicked: Arc<AtomicBool>, future: F) -> JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked.store(true, Ordering::SeqCst);
+            eprintln!("mock_endpoint_e2e task '{label}' panicked");
+        }
+    })
+}
+
+fn spawn_mock_child<F>(
+    label: &'static str,
+    panicked: &Arc<AtomicBool>,
+    children: &Arc<Mutex<Vec<JoinHandle<()>>>>,
+    future: F,
+) where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let handle = spawn_mock_task(label, Arc::clone(panicked), future);
+    children
+        .lock()
+        .expect("mock endpoint child task list poisoned")
+        .push(handle);
+}
+
+async fn send_mock_audio_chunks(
+    stt: &mut dyn BaseSTT,
+    label: &str,
+    chunk_bytes: usize,
+    chunks: usize,
+    pause: Option<Duration>,
+) {
+    for chunk_idx in 0..chunks {
+        stt.send_audio(Bytes::from(vec![0u8; chunk_bytes]))
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "{label} send_audio chunk {chunk_idx}/{chunks} failed before mock transcript assertion: {err}"
+                )
+            });
+        if let Some(pause) = pause {
+            tokio::time::sleep(pause).await;
+        }
+    }
+}
+
+struct FailingSendStt;
+
+#[async_trait::async_trait]
+impl BaseSTT for FailingSendStt {
+    fn new(_config: STTConfig) -> Result<Self, STTError> {
+        Ok(Self)
+    }
+
+    async fn connect(&mut self) -> Result<(), STTError> {
+        Ok(())
+    }
+
+    async fn disconnect(&mut self) -> Result<(), STTError> {
+        Ok(())
+    }
+
+    fn is_ready(&self) -> bool {
+        true
+    }
+
+    async fn send_audio(&mut self, _audio_data: Bytes) -> Result<(), STTError> {
+        Err(STTError::ProviderError("injected send failure".into()))
+    }
+
+    async fn on_result(
+        &mut self,
+        _callback: waav_gateway::core::stt::STTResultCallback,
+    ) -> Result<(), STTError> {
+        Ok(())
+    }
+
+    async fn on_error(
+        &mut self,
+        _callback: waav_gateway::core::stt::STTErrorCallback,
+    ) -> Result<(), STTError> {
+        Ok(())
+    }
+
+    fn get_config(&self) -> Option<&STTConfig> {
+        None
+    }
+
+    async fn update_config(&mut self, _config: STTConfig) -> Result<(), STTError> {
+        Ok(())
+    }
+
+    fn get_provider_info(&self) -> &'static str {
+        "failing-send-stt"
+    }
+}
+
+#[tokio::test]
+async fn mock_endpoint_driver_reports_send_audio_failures_immediately() {
+    let mut stt = FailingSendStt;
+    let result = AssertUnwindSafe(send_mock_audio_chunks(
+        &mut stt,
+        "failing provider",
+        640,
+        1,
+        None,
+    ))
+    .catch_unwind()
+    .await;
+
+    assert!(
+        result.is_err(),
+        "the mock endpoint driver must not discard send_audio failures"
+    );
 }
 
 /// Spawn a local mock Rev AI WS server: accept the upgrade, emit one `final` transcript message that
 /// decodes to `transcript_value`, then drain inbound audio so the client keeps streaming. Returns
 /// the bound port. The mock speaks Rev AI's real wire shape
 /// (`{"type":"final","elements":[{"type":"text","value":..}]}`).
-async fn spawn_revai_mock(transcript_value: &'static str) -> u16 {
+async fn spawn_revai_mock(transcript_value: &'static str) -> MockEndpoint {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    let server = spawn_mock_server("revai_mock", async move {
         if let Ok((stream, _)) = listener.accept().await
             && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
         {
@@ -57,7 +266,7 @@ async fn spawn_revai_mock(transcript_value: &'static str) -> u16 {
             }
         }
     });
-    port
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
@@ -98,12 +307,16 @@ async fn revai_full_integration_via_mock_endpoint() {
     // Full loop: connect to the mock (real handshake), stream a little audio, let the provider parse
     // the mock's `final` message and fire the callback.
     stt.connect().await.expect("connect to mock endpoint");
-    for _ in 0..5 {
-        let _ = stt.send_audio(bytes::Bytes::from(vec![0u8; 640])).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    send_mock_audio_chunks(
+        stt.as_mut(),
+        "Rev AI",
+        640,
+        5,
+        Some(Duration::from_millis(20)),
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(400)).await;
-    stt.disconnect().await.ok();
+    stt.disconnect().await.expect("disconnect Rev AI STT");
 
     let got = best.lock().await.clone();
     println!("Rev AI mock e2e surfaced transcript: {got:?}");
@@ -115,10 +328,10 @@ async fn revai_full_integration_via_mock_endpoint() {
 
 /// Spawn a local mock Reverie WS server: after the first audio frame, emit a Reverie transcript
 /// message (`{"id":..,"text":..,"final":true}`) — its real wire shape — then drain audio.
-async fn spawn_reverie_mock(transcript_value: &'static str) -> u16 {
+async fn spawn_reverie_mock(transcript_value: &'static str) -> MockEndpoint {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    let server = spawn_mock_server("reverie_mock", async move {
         if let Ok((stream, _)) = listener.accept().await
             && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
         {
@@ -135,7 +348,7 @@ async fn spawn_reverie_mock(transcript_value: &'static str) -> u16 {
             }
         }
     });
-    port
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
@@ -174,12 +387,16 @@ async fn reverie_full_integration_via_mock_endpoint() {
     .unwrap();
 
     stt.connect().await.expect("connect to mock endpoint");
-    for _ in 0..5 {
-        let _ = stt.send_audio(bytes::Bytes::from(vec![0u8; 640])).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    send_mock_audio_chunks(
+        stt.as_mut(),
+        "Reverie",
+        640,
+        5,
+        Some(Duration::from_millis(20)),
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(400)).await;
-    stt.disconnect().await.ok();
+    stt.disconnect().await.expect("disconnect Reverie STT");
 
     let got = best.lock().await.clone();
     println!("Reverie mock e2e surfaced transcript: {got:?}");
@@ -192,10 +409,10 @@ async fn reverie_full_integration_via_mock_endpoint() {
 /// Spawn a local mock Tencent ASR WS server: after the first audio frame, emit a Tencent ASR
 /// response (`{"code":0,...,"result":{"slice_type":2,...,"voice_text_str":..},"final":1}`) — its real
 /// wire shape — then drain audio.
-async fn spawn_tencent_mock(transcript_value: &'static str) -> u16 {
+async fn spawn_tencent_mock(transcript_value: &'static str) -> MockEndpoint {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    let server = spawn_mock_server("tencent_mock", async move {
         if let Ok((stream, _)) = listener.accept().await
             && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
         {
@@ -212,7 +429,7 @@ async fn spawn_tencent_mock(transcript_value: &'static str) -> u16 {
             }
         }
     });
-    port
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
@@ -251,12 +468,16 @@ async fn tencent_full_integration_via_mock_endpoint() {
     .unwrap();
 
     stt.connect().await.expect("connect to mock endpoint");
-    for _ in 0..5 {
-        let _ = stt.send_audio(bytes::Bytes::from(vec![0u8; 640])).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    send_mock_audio_chunks(
+        stt.as_mut(),
+        "Tencent",
+        640,
+        5,
+        Some(Duration::from_millis(20)),
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(400)).await;
-    stt.disconnect().await.ok();
+    stt.disconnect().await.expect("disconnect Tencent STT");
 
     let got = best.lock().await.clone();
     println!("Tencent mock e2e surfaced transcript: {got:?}");
@@ -283,21 +504,27 @@ async fn drive_and_capture(stt: &mut dyn waav_gateway::core::stt::BaseSTT) -> St
     .await
     .unwrap();
     stt.connect().await.expect("connect to mock endpoint");
-    for _ in 0..6 {
-        let _ = stt.send_audio(bytes::Bytes::from(vec![0u8; 1280])).await;
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    send_mock_audio_chunks(
+        stt,
+        "streaming STT mock provider",
+        1280,
+        6,
+        Some(Duration::from_millis(25)),
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    stt.disconnect().await.ok();
+    stt.disconnect()
+        .await
+        .expect("disconnect streaming STT mock provider");
     best.lock().await.clone()
 }
 
 /// iFlytek mock: client streams audio as JSON `Message::Text` (base64 inside), so we trigger on the
 /// first Text frame and reply with iFlytek's real response shape (ws[].cw[].w, status==2 final).
-async fn spawn_iflytek_mock(transcript_value: &'static str) -> u16 {
+async fn spawn_iflytek_mock(transcript_value: &'static str) -> MockEndpoint {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    let server = spawn_mock_server("iflytek_mock", async move {
         if let Ok((stream, _)) = listener.accept().await
             && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
         {
@@ -314,7 +541,7 @@ async fn spawn_iflytek_mock(transcript_value: &'static str) -> u16 {
             }
         }
     });
-    port
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
@@ -341,10 +568,10 @@ async fn iflytek_full_integration_via_mock_endpoint() {
 }
 
 /// Prosa mock: streams audio as `Message::Binary`; replies with the `{"type":"result",...}` shape.
-async fn spawn_prosa_mock(transcript_value: &'static str) -> u16 {
+async fn spawn_prosa_mock(transcript_value: &'static str) -> MockEndpoint {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    let server = spawn_mock_server("prosa_mock", async move {
         if let Ok((stream, _)) = listener.accept().await
             && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
         {
@@ -361,7 +588,7 @@ async fn spawn_prosa_mock(transcript_value: &'static str) -> u16 {
             }
         }
     });
-    port
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
@@ -389,10 +616,10 @@ async fn prosa_full_integration_via_mock_endpoint() {
 
 /// Speechmatics mock: the client requests the `json` WS subprotocol, so we MUST echo it via
 /// `accept_hdr_async` (a plain accept fails the handshake). Replies with an `AddTranscript` message.
-async fn spawn_speechmatics_mock(transcript_value: &'static str) -> u16 {
+async fn spawn_speechmatics_mock(transcript_value: &'static str) -> MockEndpoint {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    let server = spawn_mock_server("speechmatics_mock", async move {
         if let Ok((stream, _)) = listener.accept().await {
             let cb = |_req: &Request, mut response: Response| {
                 response
@@ -415,7 +642,7 @@ async fn spawn_speechmatics_mock(transcript_value: &'static str) -> u16 {
             }
         }
     });
-    port
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
@@ -434,7 +661,8 @@ async fn speechmatics_full_integration_via_mock_endpoint() {
         model: String::new(),
     })
     .with_endpoint_override(&endpoint);
-    let mut stt = create_stt_standard("speechmatics", std).expect("build speechmatics via keystone");
+    let mut stt =
+        create_stt_standard("speechmatics", std).expect("build speechmatics via keystone");
     let got = drive_and_capture(stt.as_mut()).await;
     println!("Speechmatics mock e2e surfaced transcript: {got:?}");
     assert_eq!(got, "hello world", "Speechmatics full integration broken");
@@ -443,10 +671,10 @@ async fn speechmatics_full_integration_via_mock_endpoint() {
 /// AmiVoice mock: connect() blocks on the session-start ack, so the mock sends a bare `s`
 /// (SessionStartOk) IMMEDIATELY on connect (not gated on audio, or connect deadlocks); then on the
 /// first audio frame it emits a final result `A <json>` (AmiVoice's real `A `+JSON wire shape).
-async fn spawn_amivoice_mock(transcript_value: &'static str) -> u16 {
+async fn spawn_amivoice_mock(transcript_value: &'static str) -> MockEndpoint {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    let server = spawn_mock_server("amivoice_mock", async move {
         if let Ok((stream, _)) = listener.accept().await
             && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
         {
@@ -464,7 +692,7 @@ async fn spawn_amivoice_mock(transcript_value: &'static str) -> u16 {
             }
         }
     });
-    port
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
@@ -493,10 +721,10 @@ async fn amivoice_full_integration_via_mock_endpoint() {
 /// Azure mock: USP protocol. connect() self-unblocks on its own handshake+config-send (no server
 /// ack needed), no WS subprotocol. Audio is USP Binary frames; reply on the first Binary with a USP
 /// `Path:speech.phrase` Text frame (CRLF header block + JSON) whose DisplayText surfaces the text.
-async fn spawn_azure_mock(transcript_value: &'static str) -> u16 {
+async fn spawn_azure_mock(transcript_value: &'static str) -> MockEndpoint {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    let server = spawn_mock_server("azure_mock", async move {
         if let Ok((stream, _)) = listener.accept().await
             && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
         {
@@ -513,7 +741,7 @@ async fn spawn_azure_mock(transcript_value: &'static str) -> u16 {
             }
         }
     });
-    port
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
@@ -540,10 +768,10 @@ async fn azure_full_integration_via_mock_endpoint() {
 
 /// Alibaba DashScope (Paraformer) mock: plain accept (no subprotocol); audio is Binary; connect()
 /// does NOT block on a server ack. Reply with a `result-generated` event (sentence_end=true=final).
-async fn spawn_dashscope_mock(transcript_value: &'static str) -> u16 {
+async fn spawn_dashscope_mock(transcript_value: &'static str) -> MockEndpoint {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    let server = spawn_mock_server("dashscope_mock", async move {
         if let Ok((stream, _)) = listener.accept().await
             && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
         {
@@ -560,7 +788,7 @@ async fn spawn_dashscope_mock(transcript_value: &'static str) -> u16 {
             }
         }
     });
-    port
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
@@ -588,10 +816,10 @@ async fn dashscope_full_integration_via_mock_endpoint() {
 
 /// Baidu mock: realtime WS (OAuth is dead code on this path). Audio is Binary; connect() doesn't
 /// block on a server ack. Reply with a `FIN_TEXT` final result.
-async fn spawn_baidu_mock(transcript_value: &'static str) -> u16 {
+async fn spawn_baidu_mock(transcript_value: &'static str) -> MockEndpoint {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    let server = spawn_mock_server("baidu_mock", async move {
         if let Ok((stream, _)) = listener.accept().await
             && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
         {
@@ -608,7 +836,7 @@ async fn spawn_baidu_mock(transcript_value: &'static str) -> u16 {
             }
         }
     });
-    port
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
@@ -637,7 +865,7 @@ async fn baidu_full_integration_via_mock_endpoint() {
 /// NAVER CLOVA is a REST/batch provider (not WS): it buffers audio and POSTs it on disconnect().
 /// So the mock is an axum HTTP server returning `{"text":...}`, and the e2e triggers the POST via
 /// disconnect(), not a streamed frame.
-async fn spawn_naver_mock(transcript_value: &'static str) -> u16 {
+async fn spawn_naver_mock(transcript_value: &'static str) -> MockEndpoint {
     use axum::{Router, http::header, routing::post};
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -649,10 +877,10 @@ async fn spawn_naver_mock(transcript_value: &'static str) -> u16 {
             async move { ([(header::CONTENT_TYPE, "application/json")], body) }
         }),
     );
-    tokio::spawn(async move {
+    let server = spawn_mock_server("naver_mock", async move {
         axum::serve(listener, app).await.unwrap();
     });
-    port
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
@@ -688,11 +916,9 @@ async fn naver_clova_full_integration_via_mock_endpoint() {
     .unwrap();
 
     stt.connect().await.expect("connect (local, no I/O)");
-    for _ in 0..5 {
-        let _ = stt.send_audio(bytes::Bytes::from(vec![0u8; 640])).await;
-    }
+    send_mock_audio_chunks(stt.as_mut(), "NAVER CLOVA", 640, 5, None).await;
     // REST: the batch POST + on_result callback fire on disconnect().
-    stt.disconnect().await.ok();
+    stt.disconnect().await.expect("disconnect NAVER CLOVA STT");
 
     let got = best.lock().await.clone();
     println!("NAVER CLOVA mock e2e surfaced transcript: {got:?}");
@@ -716,15 +942,15 @@ async fn drive_rest_and_capture(stt: &mut dyn waav_gateway::core::stt::BaseSTT) 
     .await
     .unwrap();
     stt.connect().await.expect("connect (local, no I/O)");
-    for _ in 0..6 {
-        let _ = stt.send_audio(bytes::Bytes::from(vec![0u8; 1280])).await;
-    }
-    stt.disconnect().await.ok();
+    send_mock_audio_chunks(stt, "REST STT mock provider", 1280, 6, None).await;
+    stt.disconnect()
+        .await
+        .expect("disconnect REST STT mock provider");
     best.lock().await.clone()
 }
 
 /// Generic axum HTTP mock: serve `body` on `path` (one POST route). Returns the bound port.
-async fn spawn_http_mock(path: &'static str, body: String) -> u16 {
+async fn spawn_http_mock(path: &'static str, body: String) -> MockEndpoint {
     use axum::{Router, http::header, routing::post};
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -735,10 +961,10 @@ async fn spawn_http_mock(path: &'static str, body: String) -> u16 {
             async move { ([(header::CONTENT_TYPE, "application/json")], body) }
         }),
     );
-    tokio::spawn(async move {
+    let server = spawn_mock_server("http_mock", async move {
         axum::serve(listener, app).await.unwrap();
     });
-    port
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
@@ -877,9 +1103,7 @@ async fn yandex_full_integration_via_mock_endpoint() {
     .unwrap();
 
     stt.connect().await.expect("connect");
-    for _ in 0..6 {
-        let _ = stt.send_audio(bytes::Bytes::from(vec![0u8; 1280])).await;
-    }
+    send_mock_audio_chunks(stt.as_mut(), "Yandex", 1280, 6, None).await;
     // Yandex POSTs from a background task (~500ms cadence once the buffer ≥ 1600 bytes), NOT on
     // disconnect() — so poll for the callback before tearing the session down.
     let mut got = String::new();
@@ -890,7 +1114,7 @@ async fn yandex_full_integration_via_mock_endpoint() {
             break;
         }
     }
-    stt.disconnect().await.ok();
+    stt.disconnect().await.expect("disconnect Yandex STT");
     println!("Yandex mock e2e surfaced transcript: {got:?}");
     assert_eq!(got, "hello world", "Yandex full integration broken");
 }
@@ -898,7 +1122,7 @@ async fn yandex_full_integration_via_mock_endpoint() {
 /// Sberdevices SaluteSpeech mock: TWO routes on one host — the OAuth token endpoint (hit on
 /// connect()) and the speech:recognize endpoint (hit by a background task). One axum router with two
 /// `.route(...)` entries serves both (the single endpoint_override rewrites both Sber hosts to here).
-async fn spawn_sber_mock(transcript_value: &'static str) -> u16 {
+async fn spawn_sber_mock(transcript_value: &'static str) -> MockEndpoint {
     use axum::{Router, http::header, routing::post};
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -920,10 +1144,10 @@ async fn spawn_sber_mock(transcript_value: &'static str) -> u16 {
                 async move { ([(header::CONTENT_TYPE, "application/json")], body) }
             }),
         );
-    tokio::spawn(async move {
+    let server = spawn_mock_server("sber_mock", async move {
         axum::serve(listener, app).await.unwrap();
     });
-    port
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
@@ -958,9 +1182,7 @@ async fn sberdevices_full_integration_via_mock_endpoint() {
     .unwrap();
 
     stt.connect().await.expect("connect (hits the OAuth route)");
-    for _ in 0..6 {
-        let _ = stt.send_audio(bytes::Bytes::from(vec![0u8; 1280])).await;
-    }
+    send_mock_audio_chunks(stt.as_mut(), "Sberdevices", 1280, 6, None).await;
     // Sber's recognize POST fires from a background task (~500ms cadence once buffer ≥ 3200 bytes),
     // not on disconnect() — poll for the callback before tearing the session down.
     let mut got = String::new();
@@ -971,7 +1193,7 @@ async fn sberdevices_full_integration_via_mock_endpoint() {
             break;
         }
     }
-    stt.disconnect().await.ok();
+    stt.disconnect().await.expect("disconnect Sberdevices STT");
     println!("Sberdevices mock e2e surfaced transcript: {got:?}");
     assert_eq!(got, "hello world", "Sberdevices full integration broken");
 }
@@ -998,7 +1220,7 @@ async fn ibm_ws_handler(mut socket: axum::extract::ws::WebSocket, results: Strin
 /// IBM Watson mock: connect() does an IAM HTTP token POST THEN a WS dial — so ONE axum server serves
 /// BOTH (POST /identity/token + a WS upgrade on the recognize path). The single endpoint_override
 /// rewrites both hosts to here; the config re-applies http:// for IAM and ws:// for the WS dial.
-async fn spawn_ibm_mock(transcript_value: &'static str) -> u16 {
+async fn spawn_ibm_mock(transcript_value: &'static str) -> MockEndpoint {
     use axum::extract::ws::WebSocketUpgrade;
     use axum::{
         Router,
@@ -1027,18 +1249,18 @@ async fn spawn_ibm_mock(transcript_value: &'static str) -> u16 {
                 async move { ws.on_upgrade(move |socket| ibm_ws_handler(socket, results)) }
             }),
         );
-    tokio::spawn(async move {
+    let server = spawn_mock_server("ibm_mock", async move {
         axum::serve(listener, app).await.unwrap();
     });
-    port
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
 async fn ibm_watson_full_integration_via_mock_endpoint() {
     ensure_crypto();
     let port = spawn_ibm_mock("hello world").await;
-    // IBM reads instance_id from extras; the override (authority only) drives both the IAM POST and
-    // the WS dial against this one mock.
+    // IBM reads instance_id from extras; the override drives both the IAM POST and the WS dial
+    // against this one mock. The provider strips the URL scheme internally for its WS authority.
     let mut std = StandardSTTConfig::from_base(STTConfig {
         provider: "ibm_watson".into(),
         api_key: "test-key".into(),
@@ -1049,7 +1271,7 @@ async fn ibm_watson_full_integration_via_mock_endpoint() {
         encoding: "linear16".into(),
         model: String::new(),
     })
-    .with_endpoint_override(format!("127.0.0.1:{port}"));
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
     std.extras
         .0
         .insert("instance_id".into(), serde_json::json!("inst-test"));
@@ -1067,10 +1289,14 @@ async fn ibm_watson_full_integration_via_mock_endpoint() {
 /// Parametric STT WS mock: optionally send `ack` first (handshake the client blocks on), then emit
 /// `transcript` once the first inbound frame of the matching kind arrives (`trigger_text` → the
 /// provider sends audio as JSON Text; otherwise Binary). Drains the rest so the client keeps streaming.
-async fn spawn_stt_ws_mock(ack: Option<&'static str>, transcript: String, trigger_text: bool) -> u16 {
+async fn spawn_stt_ws_mock(
+    ack: Option<&'static str>,
+    transcript: String,
+    trigger_text: bool,
+) -> MockEndpoint {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    let server = spawn_mock_server("stt_ws_mock", async move {
         if let Ok((stream, _)) = listener.accept().await
             && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
         {
@@ -1092,7 +1318,7 @@ async fn spawn_stt_ws_mock(ack: Option<&'static str>, transcript: String, trigge
             }
         }
     });
-    port
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
@@ -1101,7 +1327,8 @@ async fn assemblyai_full_integration_via_mock_endpoint() {
     // AssemblyAI v3: connect() blocks on a `Begin` ack, then a `Turn` with end_of_turn=true is final.
     let port = spawn_stt_ws_mock(
         Some(r#"{"type":"Begin","id":"s","expires_at":1704067200}"#),
-        r#"{"type":"Turn","turn_order":0,"transcript":"hello world","end_of_turn":true}"#.to_string(),
+        r#"{"type":"Turn","turn_order":0,"transcript":"hello world","end_of_turn":true}"#
+            .to_string(),
         false,
     )
     .await;
@@ -1258,7 +1485,7 @@ async fn gladia_ws_handler(mut socket: axum::extract::ws::WebSocket, transcript:
 
 /// Gladia mock: connect() does a session-init POST (`/v2/live`) that returns a WS `url`, then dials
 /// it. ONE axum server serves both (POST returns a `ws://this-port/ws` url + a WS upgrade on `/ws`).
-async fn spawn_gladia_mock(transcript_value: &'static str) -> u16 {
+async fn spawn_gladia_mock(transcript_value: &'static str) -> MockEndpoint {
     use axum::extract::ws::WebSocketUpgrade;
     use axum::{
         Router,
@@ -1270,8 +1497,9 @@ async fn spawn_gladia_mock(transcript_value: &'static str) -> u16 {
     let transcript = format!(
         r#"{{"type":"transcript","session_id":"s","created_at":"2026-06-04T00:00:00.000Z","data":{{"id":"00-1","is_final":true,"utterance":{{"text":"{transcript_value}","language":"en","start":0.0,"end":1.5,"confidence":0.95,"channel":0}}}}}}"#
     );
-    let init_body =
-        format!(r#"{{"id":"sess","created_at":"2026-06-04T00:00:00.000Z","url":"ws://127.0.0.1:{port}/ws"}}"#);
+    let init_body = format!(
+        r#"{{"id":"sess","created_at":"2026-06-04T00:00:00.000Z","url":"ws://127.0.0.1:{port}/ws"}}"#
+    );
     let app = Router::new()
         .route(
             "/v2/live",
@@ -1287,10 +1515,10 @@ async fn spawn_gladia_mock(transcript_value: &'static str) -> u16 {
                 async move { ws.on_upgrade(move |s| gladia_ws_handler(s, t)) }
             }),
         );
-    tokio::spawn(async move {
+    let server = spawn_mock_server("gladia_mock", async move {
         axum::serve(listener, app).await.unwrap();
     });
-    port
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
@@ -1333,7 +1561,7 @@ async fn nectec_full_integration_via_mock_endpoint() {
             r#"{"content":"hello world"}"#,
         )
     }));
-    tokio::spawn(async move {
+    let _server = spawn_mock_server("nectec_mock", async move {
         axum::serve(listener, app).await.unwrap();
     });
     let std = StandardSTTConfig::from_base(STTConfig {
@@ -1381,7 +1609,7 @@ async fn bhashini_full_integration_via_mock_endpoint() {
                 )
             }),
         );
-    tokio::spawn(async move {
+    let _server = spawn_mock_server("bhashini_mock", async move {
         axum::serve(listener, app).await.unwrap();
     });
     let std = StandardSTTConfig::from_base(STTConfig {
@@ -1410,7 +1638,9 @@ async fn huawei_ws_handler(mut socket: axum::extract::ws::WebSocket, transcript:
         match msg {
             Aws::Text(_) => {
                 let _ = socket
-                    .send(Aws::Text(r#"{"resp_type":"STARTED","error_code":0}"#.into()))
+                    .send(Aws::Text(
+                        r#"{"resp_type":"STARTED","error_code":0}"#.into(),
+                    ))
                     .await;
             }
             Aws::Binary(_) => {
@@ -1423,7 +1653,7 @@ async fn huawei_ws_handler(mut socket: axum::extract::ws::WebSocket, transcript:
 
 /// Huawei STT mock: connect() does an IAM token POST (token in the `X-Subject-Token` RESPONSE HEADER)
 /// THEN a WS dial. ONE axum server serves both (POST /v3/auth/tokens + a WS upgrade on the rasr path).
-async fn spawn_huawei_stt_mock(project_id: &str, transcript_value: &'static str) -> u16 {
+async fn spawn_huawei_stt_mock(project_id: &str, transcript_value: &'static str) -> MockEndpoint {
     use axum::extract::ws::WebSocketUpgrade;
     use axum::http::HeaderName;
     use axum::{
@@ -1440,7 +1670,10 @@ async fn spawn_huawei_stt_mock(project_id: &str, transcript_value: &'static str)
         .route(
             "/v3/auth/tokens",
             post(|| async {
-                ([(HeaderName::from_static("x-subject-token"), "mock-token")], "{}")
+                (
+                    [(HeaderName::from_static("x-subject-token"), "mock-token")],
+                    "{}",
+                )
             }),
         )
         .route(
@@ -1450,10 +1683,10 @@ async fn spawn_huawei_stt_mock(project_id: &str, transcript_value: &'static str)
                 async move { ws.on_upgrade(move |s| huawei_ws_handler(s, t)) }
             }),
         );
-    tokio::spawn(async move {
+    let server = spawn_mock_server("huawei_stt_mock", async move {
         axum::serve(listener, app).await.unwrap();
     });
-    port
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
@@ -1514,7 +1747,7 @@ fn encode_tinkoff_stt_response(transcript: &str) -> Vec<u8> {
 
 /// Spawn a plaintext tonic bidi-streaming gRPC mock for Tinkoff STT `StreamingRecognize`: it ignores
 /// the inbound audio stream and emits a single pre-encoded `StreamingRecognizeResponse`.
-async fn spawn_tinkoff_stt_grpc_mock(response: Vec<u8>) -> u16 {
+async fn spawn_tinkoff_stt_grpc_mock(response: Vec<u8>) -> MockEndpoint {
     use bytes::{Buf, BufMut, Bytes};
     use futures::Stream;
     use std::pin::Pin;
@@ -1564,6 +1797,8 @@ async fn spawn_tinkoff_stt_grpc_mock(response: Vec<u8>) -> u16 {
     #[derive(Clone)]
     struct Mock {
         resp: Arc<Vec<u8>>,
+        panicked: Arc<AtomicBool>,
+        children: Arc<Mutex<Vec<JoinHandle<()>>>>,
     }
     impl tonic::server::NamedService for Mock {
         const NAME: &'static str = "tinkoff.cloud.stt.v1.SpeechToText";
@@ -1582,30 +1817,52 @@ async fn spawn_tinkoff_stt_grpc_mock(response: Vec<u8>) -> u16 {
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             if req.uri().path().ends_with("/StreamingRecognize") {
                 let resp = self.resp.clone();
+                let panicked = Arc::clone(&self.panicked);
+                let children = Arc::clone(&self.children);
                 Box::pin(async move {
-                    struct Svc(Arc<Vec<u8>>);
+                    struct Svc {
+                        resp: Arc<Vec<u8>>,
+                        panicked: Arc<AtomicBool>,
+                        children: Arc<Mutex<Vec<JoinHandle<()>>>>,
+                    }
                     impl StreamingService<Bytes> for Svc {
                         type Response = Vec<u8>;
                         type ResponseStream =
                             Pin<Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send>>;
                         type Future = BoxFuture<Response<Self::ResponseStream>, Status>;
                         fn call(&mut self, req: Request<Streaming<Bytes>>) -> Self::Future {
-                            let chunk = (*self.0).clone();
+                            let chunk = (*self.resp).clone();
+                            let panicked = Arc::clone(&self.panicked);
+                            let children = Arc::clone(&self.children);
                             Box::pin(async move {
                                 // Drain inbound audio in the background so HTTP/2 flow control on the
                                 // client's send side never stalls before it reads our response.
                                 let mut inbound = req.into_inner();
-                                tokio::spawn(async move {
-                                    use futures::StreamExt;
-                                    while inbound.next().await.is_some() {}
-                                });
+                                spawn_mock_child(
+                                    "tinkoff_stt_grpc_inbound_drain",
+                                    &panicked,
+                                    &children,
+                                    async move {
+                                        use futures::StreamExt;
+                                        while inbound.next().await.is_some() {}
+                                    },
+                                );
                                 let s = futures::stream::iter(vec![Ok(chunk)]);
                                 Ok(Response::new(Box::pin(s) as Self::ResponseStream))
                             })
                         }
                     }
                     let mut grpc = tonic::server::Grpc::new(ByteCodec);
-                    Ok(grpc.streaming(Svc(resp), req).await)
+                    Ok(grpc
+                        .streaming(
+                            Svc {
+                                resp,
+                                panicked,
+                                children,
+                            },
+                            req,
+                        )
+                        .await)
                 })
             } else {
                 Box::pin(async move {
@@ -1626,16 +1883,22 @@ async fn spawn_tinkoff_stt_grpc_mock(response: Vec<u8>) -> u16 {
         let res = l.accept().await.map(|(s, _)| s);
         Some((res, l))
     });
+    let panicked = Arc::new(AtomicBool::new(false));
+    let children = Arc::new(Mutex::new(Vec::new()));
     let svc = Mock {
         resp: Arc::new(response),
+        panicked: Arc::clone(&panicked),
+        children: Arc::clone(&children),
     };
-    tokio::spawn(async move {
-        let _ = tonic::transport::Server::builder()
-            .add_service(svc)
-            .serve_with_incoming(incoming)
-            .await;
-    });
-    port
+    let server =
+        spawn_mock_server_with_state("tinkoff_stt_grpc_mock", panicked, children, async move {
+            tonic::transport::Server::builder()
+                .add_service(svc)
+                .serve_with_incoming(incoming)
+                .await
+                .expect("tinkoff STT mock gRPC server");
+        });
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
@@ -1686,7 +1949,7 @@ fn encode_gnani_response(transcript: &str) -> Vec<u8> {
 }
 
 /// Plaintext tonic bidi-streaming gRPC mock for Gnani `/Listener/DoSpeechToText`.
-async fn spawn_gnani_stt_grpc_mock(response: Vec<u8>) -> u16 {
+async fn spawn_gnani_stt_grpc_mock(response: Vec<u8>) -> MockEndpoint {
     use bytes::{Buf, BufMut, Bytes};
     use futures::Stream;
     use std::pin::Pin;
@@ -1736,6 +1999,8 @@ async fn spawn_gnani_stt_grpc_mock(response: Vec<u8>) -> u16 {
     #[derive(Clone)]
     struct Mock {
         resp: Arc<Vec<u8>>,
+        panicked: Arc<AtomicBool>,
+        children: Arc<Mutex<Vec<JoinHandle<()>>>>,
     }
     impl tonic::server::NamedService for Mock {
         const NAME: &'static str = "Listener";
@@ -1754,28 +2019,50 @@ async fn spawn_gnani_stt_grpc_mock(response: Vec<u8>) -> u16 {
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             if req.uri().path().ends_with("/DoSpeechToText") {
                 let resp = self.resp.clone();
+                let panicked = Arc::clone(&self.panicked);
+                let children = Arc::clone(&self.children);
                 Box::pin(async move {
-                    struct Svc(Arc<Vec<u8>>);
+                    struct Svc {
+                        resp: Arc<Vec<u8>>,
+                        panicked: Arc<AtomicBool>,
+                        children: Arc<Mutex<Vec<JoinHandle<()>>>>,
+                    }
                     impl StreamingService<Bytes> for Svc {
                         type Response = Vec<u8>;
                         type ResponseStream =
                             Pin<Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send>>;
                         type Future = BoxFuture<Response<Self::ResponseStream>, Status>;
                         fn call(&mut self, req: Request<Streaming<Bytes>>) -> Self::Future {
-                            let chunk = (*self.0).clone();
+                            let chunk = (*self.resp).clone();
+                            let panicked = Arc::clone(&self.panicked);
+                            let children = Arc::clone(&self.children);
                             Box::pin(async move {
                                 let mut inbound = req.into_inner();
-                                tokio::spawn(async move {
-                                    use futures::StreamExt;
-                                    while inbound.next().await.is_some() {}
-                                });
+                                spawn_mock_child(
+                                    "gnani_stt_grpc_inbound_drain",
+                                    &panicked,
+                                    &children,
+                                    async move {
+                                        use futures::StreamExt;
+                                        while inbound.next().await.is_some() {}
+                                    },
+                                );
                                 let s = futures::stream::iter(vec![Ok(chunk)]);
                                 Ok(Response::new(Box::pin(s) as Self::ResponseStream))
                             })
                         }
                     }
                     let mut grpc = tonic::server::Grpc::new(ByteCodec);
-                    Ok(grpc.streaming(Svc(resp), req).await)
+                    Ok(grpc
+                        .streaming(
+                            Svc {
+                                resp,
+                                panicked,
+                                children,
+                            },
+                            req,
+                        )
+                        .await)
                 })
             } else {
                 Box::pin(async move {
@@ -1796,16 +2083,22 @@ async fn spawn_gnani_stt_grpc_mock(response: Vec<u8>) -> u16 {
         let res = l.accept().await.map(|(s, _)| s);
         Some((res, l))
     });
+    let panicked = Arc::new(AtomicBool::new(false));
+    let children = Arc::new(Mutex::new(Vec::new()));
     let svc = Mock {
         resp: Arc::new(response),
+        panicked: Arc::clone(&panicked),
+        children: Arc::clone(&children),
     };
-    tokio::spawn(async move {
-        let _ = tonic::transport::Server::builder()
-            .add_service(svc)
-            .serve_with_incoming(incoming)
-            .await;
-    });
-    port
+    let server =
+        spawn_mock_server_with_state("gnani_stt_grpc_mock", panicked, children, async move {
+            tonic::transport::Server::builder()
+                .add_service(svc)
+                .serve_with_incoming(incoming)
+                .await
+                .expect("gnani STT mock gRPC server");
+        });
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
@@ -1866,7 +2159,7 @@ fn encode_google_stt_response(transcript: &str) -> Vec<u8> {
 }
 
 /// Plaintext tonic bidi-streaming gRPC mock for Google STT `/google.cloud.speech.v2.Speech/StreamingRecognize`.
-async fn spawn_google_stt_grpc_mock(response: Vec<u8>) -> u16 {
+async fn spawn_google_stt_grpc_mock(response: Vec<u8>) -> MockEndpoint {
     use bytes::{Buf, BufMut, Bytes};
     use futures::Stream;
     use std::pin::Pin;
@@ -1916,6 +2209,8 @@ async fn spawn_google_stt_grpc_mock(response: Vec<u8>) -> u16 {
     #[derive(Clone)]
     struct Mock {
         resp: Arc<Vec<u8>>,
+        panicked: Arc<AtomicBool>,
+        children: Arc<Mutex<Vec<JoinHandle<()>>>>,
     }
     impl tonic::server::NamedService for Mock {
         const NAME: &'static str = "google.cloud.speech.v2.Speech";
@@ -1934,28 +2229,50 @@ async fn spawn_google_stt_grpc_mock(response: Vec<u8>) -> u16 {
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             if req.uri().path().ends_with("/StreamingRecognize") {
                 let resp = self.resp.clone();
+                let panicked = Arc::clone(&self.panicked);
+                let children = Arc::clone(&self.children);
                 Box::pin(async move {
-                    struct Svc(Arc<Vec<u8>>);
+                    struct Svc {
+                        resp: Arc<Vec<u8>>,
+                        panicked: Arc<AtomicBool>,
+                        children: Arc<Mutex<Vec<JoinHandle<()>>>>,
+                    }
                     impl StreamingService<Bytes> for Svc {
                         type Response = Vec<u8>;
                         type ResponseStream =
                             Pin<Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send>>;
                         type Future = BoxFuture<Response<Self::ResponseStream>, Status>;
                         fn call(&mut self, req: Request<Streaming<Bytes>>) -> Self::Future {
-                            let chunk = (*self.0).clone();
+                            let chunk = (*self.resp).clone();
+                            let panicked = Arc::clone(&self.panicked);
+                            let children = Arc::clone(&self.children);
                             Box::pin(async move {
                                 let mut inbound = req.into_inner();
-                                tokio::spawn(async move {
-                                    use futures::StreamExt;
-                                    while inbound.next().await.is_some() {}
-                                });
+                                spawn_mock_child(
+                                    "google_stt_grpc_inbound_drain",
+                                    &panicked,
+                                    &children,
+                                    async move {
+                                        use futures::StreamExt;
+                                        while inbound.next().await.is_some() {}
+                                    },
+                                );
                                 let s = futures::stream::iter(vec![Ok(chunk)]);
                                 Ok(Response::new(Box::pin(s) as Self::ResponseStream))
                             })
                         }
                     }
                     let mut grpc = tonic::server::Grpc::new(ByteCodec);
-                    Ok(grpc.streaming(Svc(resp), req).await)
+                    Ok(grpc
+                        .streaming(
+                            Svc {
+                                resp,
+                                panicked,
+                                children,
+                            },
+                            req,
+                        )
+                        .await)
                 })
             } else {
                 Box::pin(async move {
@@ -1976,16 +2293,22 @@ async fn spawn_google_stt_grpc_mock(response: Vec<u8>) -> u16 {
         let res = l.accept().await.map(|(s, _)| s);
         Some((res, l))
     });
+    let panicked = Arc::new(AtomicBool::new(false));
+    let children = Arc::new(Mutex::new(Vec::new()));
     let svc = Mock {
         resp: Arc::new(response),
+        panicked: Arc::clone(&panicked),
+        children: Arc::clone(&children),
     };
-    tokio::spawn(async move {
-        let _ = tonic::transport::Server::builder()
-            .add_service(svc)
-            .serve_with_incoming(incoming)
-            .await;
-    });
-    port
+    let server =
+        spawn_mock_server_with_state("google_stt_grpc_mock", panicked, children, async move {
+            tonic::transport::Server::builder()
+                .add_service(svc)
+                .serve_with_incoming(incoming)
+                .await
+                .expect("google STT mock gRPC server");
+        });
+    MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
@@ -2050,9 +2373,18 @@ async fn aws_transcribe_full_integration_via_mock_endpoint() {
         br#"{"Transcript":{"Results":[{"Alternatives":[{"Transcript":"hello world"}],"IsPartial":false}]}}"#
             .to_vec();
     let msg = Message::new(payload)
-        .add_header(Header::new(":message-type", HeaderValue::String("event".into())))
-        .add_header(Header::new(":event-type", HeaderValue::String("TranscriptEvent".into())))
-        .add_header(Header::new(":content-type", HeaderValue::String("application/json".into())));
+        .add_header(Header::new(
+            ":message-type",
+            HeaderValue::String("event".into()),
+        ))
+        .add_header(Header::new(
+            ":event-type",
+            HeaderValue::String("TranscriptEvent".into()),
+        ))
+        .add_header(Header::new(
+            ":content-type",
+            HeaderValue::String("application/json".into()),
+        ));
     let mut frame = Vec::new();
     write_message_to(&msg, &mut frame).expect("encode event-stream frame");
 

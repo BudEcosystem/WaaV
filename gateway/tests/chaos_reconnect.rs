@@ -14,14 +14,18 @@
 //!   and that no finals are lost (union of pre+post == full set).
 
 use std::collections::HashSet;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
@@ -33,6 +37,101 @@ use waav_gateway::core::websocket::reconnectable_stream::{
     ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
     SupervisorExit, WsTransport,
 };
+
+struct MockServer {
+    label: &'static str,
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+    children: Arc<StdMutex<Vec<JoinHandle<()>>>>,
+}
+
+impl Drop for MockServer {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        if let Ok(mut children) = self.children.lock() {
+            for child in children.drain(..) {
+                if !child.is_finished() {
+                    child.abort();
+                }
+            }
+        }
+        if self.panicked.load(Ordering::SeqCst) {
+            let msg = format!("chaos reconnect mock '{}' panicked", self.label);
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+}
+
+struct MockEndpoint {
+    port: u16,
+    _server: MockServer,
+}
+
+impl MockEndpoint {
+    fn new(port: u16, server: MockServer) -> Self {
+        Self {
+            port,
+            _server: server,
+        }
+    }
+}
+
+impl std::fmt::Display for MockEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.port.fmt(f)
+    }
+}
+
+fn spawn_mock_server_with_state<F>(
+    label: &'static str,
+    panicked: Arc<AtomicBool>,
+    children: Arc<StdMutex<Vec<JoinHandle<()>>>>,
+    future: F,
+) -> MockServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let handle = spawn_mock_task(label, Arc::clone(&panicked), future);
+    MockServer {
+        label,
+        handle,
+        panicked,
+        children,
+    }
+}
+
+fn spawn_mock_task<F>(label: &'static str, panicked: Arc<AtomicBool>, future: F) -> JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked.store(true, Ordering::SeqCst);
+            eprintln!("chaos reconnect mock task '{label}' panicked");
+        }
+    })
+}
+
+fn spawn_mock_child<F>(
+    label: &'static str,
+    panicked: &Arc<AtomicBool>,
+    children: &Arc<StdMutex<Vec<JoinHandle<()>>>>,
+    future: F,
+) where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let handle = spawn_mock_task(label, Arc::clone(panicked), future);
+    children
+        .lock()
+        .expect("chaos reconnect child task list poisoned")
+        .push(handle);
+}
 
 // =============================================================================
 // Part A — generic supervisor with an in-memory mock transport
@@ -153,92 +252,108 @@ struct MockObservations {
 async fn spawn_dropping_deepgram_mock(
     split: usize,
     total: usize,
-) -> (u16, Arc<Mutex<MockObservations>>) {
+) -> (MockEndpoint, Arc<Mutex<MockObservations>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let obs = Arc::new(Mutex::new(MockObservations::default()));
     let obs_ret = Arc::clone(&obs);
     let conn_count = Arc::new(AtomicUsize::new(0));
+    let panicked = Arc::new(AtomicBool::new(false));
+    let children = Arc::new(StdMutex::new(Vec::new()));
+    let panicked_for_task = Arc::clone(&panicked);
+    let children_for_task = Arc::clone(&children);
 
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(v) => v,
-                Err(_) => break,
-            };
-            let obs = Arc::clone(&obs);
-            let conn_count = Arc::clone(&conn_count);
-            tokio::spawn(async move {
-                // Capture the request URI (path + query) during the WS handshake.
-                let captured_uri = Arc::new(std::sync::Mutex::new(String::new()));
-                let cap = Arc::clone(&captured_uri);
-                let callback = move |req: &Request, resp: Response| {
-                    *cap.lock().unwrap() = req.uri().to_string();
-                    Ok(resp)
+    let server = spawn_mock_server_with_state(
+        "deepgram_reconnect_mock",
+        panicked,
+        children,
+        async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => break,
                 };
-                let ws = match accept_hdr_async(stream, callback).await {
-                    Ok(ws) => ws,
-                    Err(_) => return,
-                };
-                let uri = captured_uri.lock().unwrap().clone();
-                let which = conn_count.fetch_add(1, Ordering::AcqRel);
-                obs.lock().await.connect_uris.push(uri);
+                let obs = Arc::clone(&obs);
+                let conn_count = Arc::clone(&conn_count);
+                let panicked = Arc::clone(&panicked_for_task);
+                let children = Arc::clone(&children_for_task);
+                spawn_mock_child(
+                    "deepgram_reconnect_connection",
+                    &panicked,
+                    &children,
+                    async move {
+                        // Capture the request URI (path + query) during the WS handshake.
+                        let captured_uri = Arc::new(std::sync::Mutex::new(String::new()));
+                        let cap = Arc::clone(&captured_uri);
+                        let callback = move |req: &Request, resp: Response| {
+                            *cap.lock().unwrap() = req.uri().to_string();
+                            Ok(resp)
+                        };
+                        let ws = match accept_hdr_async(stream, callback).await {
+                            Ok(ws) => ws,
+                            Err(_) => return,
+                        };
+                        let uri = captured_uri.lock().unwrap().clone();
+                        let which = conn_count.fetch_add(1, Ordering::AcqRel);
+                        obs.lock().await.connect_uris.push(uri);
 
-                let (mut write, mut read) = ws.split();
+                        let (mut write, mut read) = ws.split();
 
-                // Send Deepgram-style Metadata first.
-                let _ = write
-                    .send(Message::Text(
-                        r#"{"type":"Metadata","request_id":"mock"}"#.into(),
-                    ))
-                    .await;
+                        // Send Deepgram-style Metadata first.
+                        let _ = write
+                            .send(Message::Text(
+                                r#"{"type":"Metadata","request_id":"mock"}"#.into(),
+                            ))
+                            .await;
 
-                // Drive a transcript pump that emits finals on a timer regardless of audio,
-                // and reads (to consume audio / detect close).
-                let (lo, hi, drop_after) = if which == 0 {
-                    (0, split, true)
-                } else {
-                    (split, total, false)
-                };
+                        // Drive a transcript pump that emits finals on a timer regardless of audio,
+                        // and reads (to consume audio / detect close).
+                        let (lo, hi, drop_after) = if which == 0 {
+                            (0, split, true)
+                        } else {
+                            (split, total, false)
+                        };
 
-                let mut idx = lo;
-                let mut ticker = tokio::time::interval(Duration::from_millis(15));
-                loop {
-                    tokio::select! {
-                        _ = ticker.tick() => {
-                            if idx < hi {
-                                let transcript = format!(
-                                    r#"{{"type":"Results","is_final":true,"speech_final":false,"channel":{{"alternatives":[{{"transcript":"final {idx}","confidence":0.99}}]}}}}"#
-                                );
-                                if write.send(Message::Text(transcript.into())).await.is_err() {
-                                    return;
+                        let mut idx = lo;
+                        let mut ticker = tokio::time::interval(Duration::from_millis(15));
+                        loop {
+                            tokio::select! {
+                                _ = ticker.tick() => {
+                                    if idx < hi {
+                                        let transcript = format!(
+                                            r#"{{"type":"Results","is_final":true,"speech_final":false,"channel":{{"alternatives":[{{"transcript":"final {idx}","confidence":0.99}}]}}}}"#
+                                        );
+                                        if write.send(Message::Text(transcript.into())).await.is_err() {
+                                            return;
+                                        }
+                                        idx += 1;
+                                    } else if drop_after {
+                                        // First connection: we've emitted our half — drop the socket
+                                        // abruptly (no close frame) to simulate a mid-stream kill.
+                                        return;
+                                    }
+                                    // Second connection: keep the socket open and idle after emitting.
                                 }
-                                idx += 1;
-                            } else if drop_after {
-                                // First connection: we've emitted our half — drop the socket
-                                // abruptly (no close frame) to simulate a mid-stream kill.
-                                return;
-                            }
-                            // Second connection: keep the socket open and idle after emitting.
-                        }
-                        msg = read.next() => {
-                            match msg {
-                                Some(Ok(Message::Close(_))) | None => return,
-                                Some(Ok(Message::Text(t))) => {
-                                    // CloseStream is the client's graceful shutdown.
-                                    if t.contains("CloseStream") { return; }
+                                msg = read.next() => {
+                                    match msg {
+                                        Some(Ok(Message::Close(_))) | None => return,
+                                        Some(Ok(Message::Text(t))) => {
+                                            // CloseStream is the client's graceful shutdown.
+                                            if t.contains("CloseStream") { return; }
+                                        }
+                                        Some(Ok(_)) => {} // audio / ping etc.
+                                        Some(Err(_)) => return,
+                                    }
                                 }
-                                Some(Ok(_)) => {} // audio / ping etc.
-                                Some(Err(_)) => return,
                             }
                         }
-                    }
-                }
-            });
-        }
-    });
+                    },
+                );
+            }
+        },
+    );
 
-    (port, obs_ret)
+    (MockEndpoint::new(port, server), obs_ret)
 }
 
 #[tokio::test]
@@ -362,81 +477,97 @@ async fn deepgram_recovers_after_midstream_kill() {
 async fn spawn_dropping_cartesia_mock(
     split: usize,
     total: usize,
-) -> (u16, Arc<Mutex<MockObservations>>) {
+) -> (MockEndpoint, Arc<Mutex<MockObservations>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let obs = Arc::new(Mutex::new(MockObservations::default()));
     let obs_ret = Arc::clone(&obs);
     let conn_count = Arc::new(AtomicUsize::new(0));
+    let panicked = Arc::new(AtomicBool::new(false));
+    let children = Arc::new(StdMutex::new(Vec::new()));
+    let panicked_for_task = Arc::clone(&panicked);
+    let children_for_task = Arc::clone(&children);
 
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(v) => v,
-                Err(_) => break,
-            };
-            let obs = Arc::clone(&obs);
-            let conn_count = Arc::clone(&conn_count);
-            tokio::spawn(async move {
-                let captured_uri = Arc::new(std::sync::Mutex::new(String::new()));
-                let cap = Arc::clone(&captured_uri);
-                let callback = move |req: &Request, resp: Response| {
-                    *cap.lock().unwrap() = req.uri().to_string();
-                    Ok(resp)
+    let server = spawn_mock_server_with_state(
+        "cartesia_reconnect_mock",
+        panicked,
+        children,
+        async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => break,
                 };
-                let ws = match accept_hdr_async(stream, callback).await {
-                    Ok(ws) => ws,
-                    Err(_) => return,
-                };
-                let uri = captured_uri.lock().unwrap().clone();
-                let which = conn_count.fetch_add(1, Ordering::AcqRel);
-                obs.lock().await.connect_uris.push(uri);
+                let obs = Arc::clone(&obs);
+                let conn_count = Arc::clone(&conn_count);
+                let panicked = Arc::clone(&panicked_for_task);
+                let children = Arc::clone(&children_for_task);
+                spawn_mock_child(
+                    "cartesia_reconnect_connection",
+                    &panicked,
+                    &children,
+                    async move {
+                        let captured_uri = Arc::new(std::sync::Mutex::new(String::new()));
+                        let cap = Arc::clone(&captured_uri);
+                        let callback = move |req: &Request, resp: Response| {
+                            *cap.lock().unwrap() = req.uri().to_string();
+                            Ok(resp)
+                        };
+                        let ws = match accept_hdr_async(stream, callback).await {
+                            Ok(ws) => ws,
+                            Err(_) => return,
+                        };
+                        let uri = captured_uri.lock().unwrap().clone();
+                        let which = conn_count.fetch_add(1, Ordering::AcqRel);
+                        obs.lock().await.connect_uris.push(uri);
 
-                let (mut write, mut read) = ws.split();
+                        let (mut write, mut read) = ws.split();
 
-                let (lo, hi, drop_after) = if which == 0 {
-                    (0, split, true)
-                } else {
-                    (split, total, false)
-                };
+                        let (lo, hi, drop_after) = if which == 0 {
+                            (0, split, true)
+                        } else {
+                            (split, total, false)
+                        };
 
-                let mut idx = lo;
-                let mut ticker = tokio::time::interval(Duration::from_millis(15));
-                loop {
-                    tokio::select! {
-                        _ = ticker.tick() => {
-                            if idx < hi {
-                                let transcript = format!(
-                                    r#"{{"type":"transcript","text":"final {idx}","is_final":true}}"#
-                                );
-                                if write.send(Message::Text(transcript.into())).await.is_err() {
-                                    return;
+                        let mut idx = lo;
+                        let mut ticker = tokio::time::interval(Duration::from_millis(15));
+                        loop {
+                            tokio::select! {
+                                _ = ticker.tick() => {
+                                    if idx < hi {
+                                        let transcript = format!(
+                                            r#"{{"type":"transcript","text":"final {idx}","is_final":true}}"#
+                                        );
+                                        if write.send(Message::Text(transcript.into())).await.is_err() {
+                                            return;
+                                        }
+                                        idx += 1;
+                                    } else if drop_after {
+                                        // First connection: emitted our half — drop abruptly (no close
+                                        // frame) to simulate a mid-stream kill.
+                                        return;
+                                    }
                                 }
-                                idx += 1;
-                            } else if drop_after {
-                                // First connection: emitted our half — drop abruptly (no close
-                                // frame) to simulate a mid-stream kill.
-                                return;
+                                msg = read.next() => {
+                                    match msg {
+                                        Some(Ok(Message::Close(_))) | None => return,
+                                        Some(Ok(Message::Text(t))) => {
+                                            // Cartesia's graceful shutdown is the JSON string "done".
+                                            if t.contains("done") { return; }
+                                        }
+                                        Some(Ok(_)) => {} // raw binary audio / ping etc.
+                                        Some(Err(_)) => return,
+                                    }
+                                }
                             }
                         }
-                        msg = read.next() => {
-                            match msg {
-                                Some(Ok(Message::Close(_))) | None => return,
-                                Some(Ok(Message::Text(t))) => {
-                                    // Cartesia's graceful shutdown is the JSON string "done".
-                                    if t.contains("done") { return; }
-                                }
-                                Some(Ok(_)) => {} // raw binary audio / ping etc.
-                                Some(Err(_)) => return,
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
+                    },
+                );
+            }
+        },
+    );
 
-    (port, obs_ret)
+    (MockEndpoint::new(port, server), obs_ret)
 }
 
 /// Drives the REAL `CartesiaSTT` provider (a newly-migrated W-D1 provider) through the mock that
@@ -556,89 +687,106 @@ async fn cartesia_recovers_after_midstream_kill() {
 async fn spawn_dropping_assemblyai_mock(
     split: usize,
     total: usize,
-) -> (u16, Arc<Mutex<MockObservations>>) {
+) -> (MockEndpoint, Arc<Mutex<MockObservations>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let obs = Arc::new(Mutex::new(MockObservations::default()));
     let obs_ret = Arc::clone(&obs);
     let conn_count = Arc::new(AtomicUsize::new(0));
+    let panicked = Arc::new(AtomicBool::new(false));
+    let children = Arc::new(StdMutex::new(Vec::new()));
+    let panicked_for_task = Arc::clone(&panicked);
+    let children_for_task = Arc::clone(&children);
 
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(v) => v,
-                Err(_) => break,
-            };
-            let obs = Arc::clone(&obs);
-            let conn_count = Arc::clone(&conn_count);
-            tokio::spawn(async move {
-                let captured_uri = Arc::new(std::sync::Mutex::new(String::new()));
-                let cap = Arc::clone(&captured_uri);
-                let callback = move |req: &Request, resp: Response| {
-                    *cap.lock().unwrap() = req.uri().to_string();
-                    Ok(resp)
+    let server = spawn_mock_server_with_state(
+        "assemblyai_reconnect_mock",
+        panicked,
+        children,
+        async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => break,
                 };
-                let ws = match accept_hdr_async(stream, callback).await {
-                    Ok(ws) => ws,
-                    Err(_) => return,
-                };
-                let uri = captured_uri.lock().unwrap().clone();
-                let which = conn_count.fetch_add(1, Ordering::AcqRel);
-                obs.lock().await.connect_uris.push(uri);
+                let obs = Arc::clone(&obs);
+                let conn_count = Arc::clone(&conn_count);
+                let panicked = Arc::clone(&panicked_for_task);
+                let children = Arc::clone(&children_for_task);
+                spawn_mock_child(
+                    "assemblyai_reconnect_connection",
+                    &panicked,
+                    &children,
+                    async move {
+                        let captured_uri = Arc::new(std::sync::Mutex::new(String::new()));
+                        let cap = Arc::clone(&captured_uri);
+                        let callback = move |req: &Request, resp: Response| {
+                            *cap.lock().unwrap() = req.uri().to_string();
+                            Ok(resp)
+                        };
+                        let ws = match accept_hdr_async(stream, callback).await {
+                            Ok(ws) => ws,
+                            Err(_) => return,
+                        };
+                        let uri = captured_uri.lock().unwrap().clone();
+                        let which = conn_count.fetch_add(1, Ordering::AcqRel);
+                        obs.lock().await.connect_uris.push(uri);
 
-                let (mut write, mut read) = ws.split();
+                        let (mut write, mut read) = ws.split();
 
-                // Every AssemblyAI session opens with a Begin frame; the restored session needs
-                // one too (it re-arms the client's readiness after the reconnect).
-                let begin =
-                    format!(r#"{{"type":"Begin","id":"sess-{which}","expires_at":1704067200}}"#);
-                if write.send(Message::Text(begin.into())).await.is_err() {
-                    return;
-                }
+                        // Every AssemblyAI session opens with a Begin frame; the restored session needs
+                        // one too (it re-arms the client's readiness after the reconnect).
+                        let begin = format!(
+                            r#"{{"type":"Begin","id":"sess-{which}","expires_at":1704067200}}"#
+                        );
+                        if write.send(Message::Text(begin.into())).await.is_err() {
+                            return;
+                        }
 
-                let (lo, hi, drop_after) = if which == 0 {
-                    (0, split, true)
-                } else {
-                    (split, total, false)
-                };
+                        let (lo, hi, drop_after) = if which == 0 {
+                            (0, split, true)
+                        } else {
+                            (split, total, false)
+                        };
 
-                let mut idx = lo;
-                let mut ticker = tokio::time::interval(Duration::from_millis(15));
-                loop {
-                    tokio::select! {
-                        _ = ticker.tick() => {
-                            if idx < hi {
-                                let turn = format!(
-                                    r#"{{"type":"Turn","turn_order":{idx},"transcript":"final {idx}","end_of_turn":true,"words":[]}}"#
-                                );
-                                if write.send(Message::Text(turn.into())).await.is_err() {
-                                    return;
+                        let mut idx = lo;
+                        let mut ticker = tokio::time::interval(Duration::from_millis(15));
+                        loop {
+                            tokio::select! {
+                                _ = ticker.tick() => {
+                                    if idx < hi {
+                                        let turn = format!(
+                                            r#"{{"type":"Turn","turn_order":{idx},"transcript":"final {idx}","end_of_turn":true,"words":[]}}"#
+                                        );
+                                        if write.send(Message::Text(turn.into())).await.is_err() {
+                                            return;
+                                        }
+                                        idx += 1;
+                                    } else if drop_after {
+                                        // First connection: emitted our half — drop abruptly (no close
+                                        // frame) to simulate a mid-stream kill.
+                                        return;
+                                    }
                                 }
-                                idx += 1;
-                            } else if drop_after {
-                                // First connection: emitted our half — drop abruptly (no close
-                                // frame) to simulate a mid-stream kill.
-                                return;
+                                msg = read.next() => {
+                                    match msg {
+                                        Some(Ok(Message::Close(_))) | None => return,
+                                        Some(Ok(Message::Text(t))) => {
+                                            // AssemblyAI's graceful shutdown is `{"type":"Terminate"}`.
+                                            if t.contains("Terminate") { return; }
+                                        }
+                                        Some(Ok(_)) => {} // raw binary audio / ping etc.
+                                        Some(Err(_)) => return,
+                                    }
+                                }
                             }
                         }
-                        msg = read.next() => {
-                            match msg {
-                                Some(Ok(Message::Close(_))) | None => return,
-                                Some(Ok(Message::Text(t))) => {
-                                    // AssemblyAI's graceful shutdown is `{"type":"Terminate"}`.
-                                    if t.contains("Terminate") { return; }
-                                }
-                                Some(Ok(_)) => {} // raw binary audio / ping etc.
-                                Some(Err(_)) => return,
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
+                    },
+                );
+            }
+        },
+    );
 
-    (port, obs_ret)
+    (MockEndpoint::new(port, server), obs_ret)
 }
 
 /// Drives the REAL `AssemblyAISTT` provider (migrated off its hand-rolled reconnect loop onto the
@@ -782,12 +930,16 @@ struct ReplayObservations {
 ///   drop the socket abruptly (0xA2 and 0xA3 are now the un-finalized tail).
 /// - conn 1: capture everything; on receiving a 0xA4 chunk → send a FINAL so
 ///   the test can observe completion.
-async fn spawn_replay_mock(proto: ReplayProto) -> (u16, Arc<Mutex<ReplayObservations>>) {
+async fn spawn_replay_mock(proto: ReplayProto) -> (MockEndpoint, Arc<Mutex<ReplayObservations>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let obs = Arc::new(Mutex::new(ReplayObservations::default()));
     let obs_ret = Arc::clone(&obs);
     let conn_count = Arc::new(AtomicUsize::new(0));
+    let panicked = Arc::new(AtomicBool::new(false));
+    let children = Arc::new(StdMutex::new(Vec::new()));
+    let panicked_for_task = Arc::clone(&panicked);
+    let children_for_task = Arc::clone(&children);
 
     fn final_frame(proto: ReplayProto, idx: usize) -> String {
         match proto {
@@ -800,76 +952,86 @@ async fn spawn_replay_mock(proto: ReplayProto) -> (u16, Arc<Mutex<ReplayObservat
         }
     }
 
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(v) => v,
-                Err(_) => break,
-            };
-            let obs = Arc::clone(&obs);
-            let conn_count = Arc::clone(&conn_count);
-            tokio::spawn(async move {
-                let ws = match accept_hdr_async(stream, |_req: &Request, resp: Response| Ok(resp))
-                    .await
-                {
-                    Ok(ws) => ws,
-                    Err(_) => return,
+    let server =
+        spawn_mock_server_with_state("replay_reconnect_mock", panicked, children, async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => break,
                 };
-                let which = conn_count.fetch_add(1, Ordering::AcqRel);
-                obs.lock().await.audio_per_conn.push(Vec::new());
+                let obs = Arc::clone(&obs);
+                let conn_count = Arc::clone(&conn_count);
+                let panicked = Arc::clone(&panicked_for_task);
+                let children = Arc::clone(&children_for_task);
+                spawn_mock_child(
+                    "replay_reconnect_connection",
+                    &panicked,
+                    &children,
+                    async move {
+                        let ws = match accept_hdr_async(stream, |_req: &Request, resp: Response| {
+                            Ok(resp)
+                        })
+                        .await
+                        {
+                            Ok(ws) => ws,
+                            Err(_) => return,
+                        };
+                        let which = conn_count.fetch_add(1, Ordering::AcqRel);
+                        obs.lock().await.audio_per_conn.push(Vec::new());
 
-                let (mut write, mut read) = ws.split();
+                        let (mut write, mut read) = ws.split();
 
-                if matches!(proto, ReplayProto::AssemblyAi) {
-                    let begin = format!(
-                        r#"{{"type":"Begin","id":"sess-{which}","expires_at":1704067200}}"#
-                    );
-                    if write.send(Message::Text(begin.into())).await.is_err() {
-                        return;
-                    }
-                }
-
-                while let Some(msg) = read.next().await {
-                    match msg {
-                        Ok(Message::Binary(b)) => {
-                            let tag = b.first().copied().unwrap_or(0);
-                            obs.lock().await.audio_per_conn[which].push(b.to_vec());
-                            match (which, tag) {
-                                // Ack everything so far: the client clears its ring.
-                                (0, 0xA1)
-                                    if write
-                                        .send(Message::Text(final_frame(proto, 0).into()))
-                                        .await
-                                        .is_err() =>
-                                {
-                                    return;
-                                }
-                                (0, 0xA3) => {
-                                    // Mid-stream kill with 0xA2+0xA3 un-finalized.
-                                    return;
-                                }
-                                (_, 0xA4) => {
-                                    let _ = write
-                                        .send(Message::Text(final_frame(proto, 1).into()))
-                                        .await;
-                                }
-                                _ => {}
-                            }
-                        }
-                        Ok(Message::Close(_)) | Err(_) => return,
-                        Ok(Message::Text(t)) => {
-                            if t.contains("CloseStream") || t.contains("Terminate") {
+                        if matches!(proto, ReplayProto::AssemblyAi) {
+                            let begin = format!(
+                                r#"{{"type":"Begin","id":"sess-{which}","expires_at":1704067200}}"#
+                            );
+                            if write.send(Message::Text(begin.into())).await.is_err() {
                                 return;
                             }
                         }
-                        Ok(_) => {}
-                    }
-                }
-            });
-        }
-    });
 
-    (port, obs_ret)
+                        while let Some(msg) = read.next().await {
+                            match msg {
+                                Ok(Message::Binary(b)) => {
+                                    let tag = b.first().copied().unwrap_or(0);
+                                    obs.lock().await.audio_per_conn[which].push(b.to_vec());
+                                    match (which, tag) {
+                                        // Ack everything so far: the client clears its ring.
+                                        (0, 0xA1)
+                                            if write
+                                                .send(Message::Text(final_frame(proto, 0).into()))
+                                                .await
+                                                .is_err() =>
+                                        {
+                                            return;
+                                        }
+                                        (0, 0xA3) => {
+                                            // Mid-stream kill with 0xA2+0xA3 un-finalized.
+                                            return;
+                                        }
+                                        (_, 0xA4) => {
+                                            let _ = write
+                                                .send(Message::Text(final_frame(proto, 1).into()))
+                                                .await;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                Ok(Message::Close(_)) | Err(_) => return,
+                                Ok(Message::Text(t)) => {
+                                    if t.contains("CloseStream") || t.contains("Terminate") {
+                                        return;
+                                    }
+                                }
+                                Ok(_) => {}
+                            }
+                        }
+                    },
+                );
+            }
+        });
+
+    (MockEndpoint::new(port, server), obs_ret)
 }
 
 fn tagged(tag: u8) -> bytes::Bytes {
@@ -887,7 +1049,11 @@ async fn assert_replays_unfinalized_tail(provider_name: &str, proto: ReplayProto
         base: STTConfig {
             provider: provider_name.into(),
             api_key: "test-key".into(),
-            model: if matches!(proto, ReplayProto::Deepgram) { "nova-3".into() } else { String::new() },
+            model: if matches!(proto, ReplayProto::Deepgram) {
+                "nova-3".into()
+            } else {
+                String::new()
+            },
             language: "en".into(),
             sample_rate: 16000,
             channels: 1,
@@ -926,7 +1092,10 @@ async fn assert_replays_unfinalized_tail(provider_name: &str, proto: ReplayProto
     provider.send_audio(tagged(0xA1)).await.expect("send A1");
     let deadline = Instant::now() + Duration::from_secs(5);
     while finals.load(Ordering::SeqCst) < 1 {
-        assert!(Instant::now() < deadline, "never received the first final ack");
+        assert!(
+            Instant::now() < deadline,
+            "never received the first final ack"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
@@ -976,7 +1145,11 @@ async fn assert_replays_unfinalized_tail(provider_name: &str, proto: ReplayProto
         "only the onset-window survivor may precede the replayed tail: {:?}",
         conn2.iter().map(|f| f[0]).collect::<Vec<_>>()
     );
-    assert_eq!(conn2[a2].len(), 320, "replayed chunk must be byte-identical");
+    assert_eq!(
+        conn2[a2].len(),
+        320,
+        "replayed chunk must be byte-identical"
+    );
     assert_eq!(
         conn2[a2 + 1][0],
         0xA3,

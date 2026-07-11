@@ -138,9 +138,7 @@ impl NoiseReduction {
     /// Build from a config string; `None`/empty/`"off"`/`"none"` ⇒ no reduction.
     pub fn from_opt(s: Option<&str>) -> Option<Self> {
         match s.map(|v| v.to_ascii_lowercase()) {
-            Some(v) if v == "near_field" || v == "far_field" => {
-                Some(Self { reduction_type: v })
-            }
+            Some(v) if v == "near_field" || v == "far_field" => Some(Self { reduction_type: v }),
             _ => None,
         }
     }
@@ -910,7 +908,10 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("session.update"));
-        assert!(json.contains("\"type\":\"realtime\""), "GA session.type required");
+        assert!(
+            json.contains("\"type\":\"realtime\""),
+            "GA session.type required"
+        );
         assert!(json.contains("output_modalities"), "GA renamed modalities");
         assert!(json.contains("alloy"), "voice nests under audio.output");
         // GA gpt-realtime carries no session-level temperature/reasoning.
@@ -926,11 +927,15 @@ mod tests {
         assert_eq!(RealtimeReasoning::from_effort(ReasoningEffort::Off), None);
         assert_eq!(
             RealtimeReasoning::from_effort(ReasoningEffort::Low),
-            Some(RealtimeReasoning { effort: "low".to_string() })
+            Some(RealtimeReasoning {
+                effort: "low".to_string()
+            })
         );
         assert_eq!(
             RealtimeReasoning::from_effort(ReasoningEffort::High),
-            Some(RealtimeReasoning { effort: "high".to_string() })
+            Some(RealtimeReasoning {
+                effort: "high".to_string()
+            })
         );
         // But the GA session.update wire NEVER carries reasoning or temperature
         // (gpt-realtime 400s on either) — the migration dropped both fields.

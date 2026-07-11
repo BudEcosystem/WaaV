@@ -169,9 +169,9 @@ impl CartesiaEmotionMapper {
         match style {
             DeliveryStyle::Rushed | DeliveryStyle::SportsCommentaryExcited => Some(1.3),
             DeliveryStyle::Measured | DeliveryStyle::DocumentaryNarration => Some(0.8),
-            DeliveryStyle::NarrationRelaxed | DeliveryStyle::Gentle | DeliveryStyle::PoetryReading => {
-                Some(0.9)
-            }
+            DeliveryStyle::NarrationRelaxed
+            | DeliveryStyle::Gentle
+            | DeliveryStyle::PoetryReading => Some(0.9),
             _ => None,
         }
     }

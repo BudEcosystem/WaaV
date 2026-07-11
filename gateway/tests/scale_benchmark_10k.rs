@@ -831,7 +831,7 @@ async fn run_stage(
     let mut handles = Vec::with_capacity(vus as usize);
     let request_counter = Arc::new(AtomicU64::new(0));
 
-    for _worker_id in 0..vus {
+    for worker_id in 0..vus {
         let client = client.clone();
         let stats = stats.clone();
         let semaphore = semaphore.clone();
@@ -864,7 +864,7 @@ async fn run_stage(
             }
         });
 
-        handles.push(handle);
+        handles.push((worker_id, handle));
     }
 
     // Run for specified duration
@@ -872,8 +872,10 @@ async fn run_stage(
     running.store(false, Ordering::Relaxed);
 
     // Wait for all workers to complete
-    for handle in handles {
-        let _ = handle.await;
+    for (worker_id, handle) in handles {
+        handle.await.unwrap_or_else(|err| {
+            panic!("scale benchmark worker {worker_id}/{vus} failed to join: {err}")
+        });
     }
 
     let stage_duration = stage_start.elapsed();

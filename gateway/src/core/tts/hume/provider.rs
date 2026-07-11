@@ -416,6 +416,17 @@ pub struct HumeTTS {
 }
 
 impl HumeTTS {
+    fn from_parts_unchecked(config: TTSConfig, hume_config: HumeTTSConfig) -> Self {
+        let request_builder = HumeRequestBuilder::new(config.clone(), hume_config.clone());
+        let config_hash = compute_hume_tts_config_hash(&config, &hume_config);
+
+        Self {
+            provider: TTSProvider::new(),
+            request_builder,
+            config_hash,
+        }
+    }
+
     /// Creates a new Hume TTS provider instance.
     ///
     /// # Arguments
@@ -442,7 +453,7 @@ impl HumeTTS {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             request_builder,
             config_hash,
         })
@@ -475,6 +486,7 @@ impl HumeTTS {
     /// let tts = HumeTTS::with_config(config)?;
     /// ```
     pub fn with_config(hume_config: HumeTTSConfig) -> TTSResult<Self> {
+        hume_config.validate_endpoint_override()?;
         let config = hume_config.base.clone();
         let request_builder = HumeRequestBuilder::new(config.clone(), hume_config.clone());
         let config_hash = compute_hume_tts_config_hash(&config, &hume_config);
@@ -486,7 +498,7 @@ impl HumeTTS {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             request_builder,
             config_hash,
         })
@@ -496,9 +508,7 @@ impl HumeTTS {
     /// Delegates feature mapping to [`HumeTTSConfig::from_standard`] (instructions/emotion ->
     /// `description`, speed, sample_rate, plus the `generation_id`/`num_generations` extras
     /// passthrough) so Hume's natural-language emotion control reaches the provider config.
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         Self::with_config(HumeTTSConfig::from_standard(std))
     }
 
@@ -589,7 +599,10 @@ impl HumeTTS {
 
 impl Default for HumeTTS {
     fn default() -> Self {
-        Self::new(TTSConfig::default()).expect("Default HumeTTS should have valid configuration")
+        let config = TTSConfig::default();
+        let hume_config = HumeTTSConfig::from_base(config.clone());
+
+        Self::from_parts_unchecked(config, hume_config)
     }
 }
 
@@ -758,6 +771,23 @@ mod tests {
         assert_eq!(tts.hume_config().speed, Some(1.3));
     }
 
+    #[test]
+    fn from_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "hume".into(),
+            api_key: "k".into(),
+            voice_id: Some("Kora".to_string()),
+            ..Default::default()
+        })
+        .with_endpoint_override("http://127.0.0.1:9000");
+
+        match HumeTTS::from_standard(&std) {
+            Ok(_) => panic!("Hume provider construction must reject unsafe endpoint_override"),
+            Err(err) => assert!(err.to_string().contains("SSRF protection")),
+        }
+    }
+
     // WIRE-LEVEL: the stream_file features must reach the actual POST body at the correct JSON
     // locations (voice.provider is per-utterance inside the voice object; the rest are top-level).
     // We build the real HTTP request and parse its body — not just inspect the config struct.
@@ -821,10 +851,7 @@ mod tests {
         let builder = HumeRequestBuilder::new(config, hume_config);
 
         let client = reqwest::Client::new();
-        let request = builder
-            .build_http_request(&client, "Hi")
-            .build()
-            .unwrap();
+        let request = builder.build_http_request(&client, "Hi").build().unwrap();
         let body = request.body().unwrap().as_bytes().unwrap();
         let v: serde_json::Value = serde_json::from_slice(body).unwrap();
 
@@ -853,10 +880,19 @@ mod tests {
         let mut with_strip = base.clone();
         with_strip.strip_headers = Some(true);
 
-        assert_ne!(base_hash, compute_hume_tts_config_hash(&config, &with_provider));
+        assert_ne!(
+            base_hash,
+            compute_hume_tts_config_hash(&config, &with_provider)
+        );
         assert_ne!(base_hash, compute_hume_tts_config_hash(&config, &with_temp));
-        assert_ne!(base_hash, compute_hume_tts_config_hash(&config, &with_split));
-        assert_ne!(base_hash, compute_hume_tts_config_hash(&config, &with_strip));
+        assert_ne!(
+            base_hash,
+            compute_hume_tts_config_hash(&config, &with_split)
+        );
+        assert_ne!(
+            base_hash,
+            compute_hume_tts_config_hash(&config, &with_strip)
+        );
     }
 
     // include_timestamp_types is metadata-only: it must NOT fragment the audio cache.
@@ -1104,9 +1140,10 @@ mod tests {
     }
 
     #[test]
-    fn test_hume_tts_default() {
+    fn hume_tts_default_does_not_depend_on_result_unwrap() {
         let tts = HumeTTS::default();
         assert!(!tts.is_ready());
+        assert_eq!(tts.hume_config().base.api_key, "");
         // Default TTSConfig has voice_id "aura-asteria-en" which is parsed as custom voice
         // The voice_name will be whatever the base config provides
         assert!(!tts.hume_config().voice_name().is_empty());

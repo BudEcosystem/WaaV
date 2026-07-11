@@ -9,6 +9,45 @@
 use super::super::base::STTConfig;
 use serde::{Deserialize, Serialize};
 
+const OPENAI_BASE_URL_ENV: &str = "OPENAI_BASE_URL";
+const OPENAI_API_BASE_URL: &str = "https://api.openai.com";
+
+fn openai_audio_url_from_base(
+    source: &str,
+    base: &str,
+    path: &str,
+) -> Result<Option<String>, String> {
+    let base = base.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Ok(None);
+    }
+    crate::core::net::validate_url_for_ssrf(base, &["http", "https"])
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))?;
+    Ok(Some(format!("{base}{path}")))
+}
+
+fn resolve_openai_audio_url(endpoint_override: Option<&str>, path: &str) -> Result<String, String> {
+    if let Some(override_url) = endpoint_override
+        && let Some(url) = openai_audio_url_from_base("endpoint_override", override_url, path)?
+    {
+        return Ok(url);
+    }
+
+    match std::env::var(OPENAI_BASE_URL_ENV) {
+        Ok(base) => {
+            if let Some(url) = openai_audio_url_from_base(OPENAI_BASE_URL_ENV, &base, path)? {
+                return Ok(url);
+            }
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!("{OPENAI_BASE_URL_ENV} must be valid UTF-8"));
+        }
+    }
+
+    Ok(format!("{OPENAI_API_BASE_URL}{path}"))
+}
+
 // =============================================================================
 // OpenAI STT Models
 // =============================================================================
@@ -379,12 +418,13 @@ impl DiarizationConfig {
         // Validate chunking strategy threshold
         if let Some(ref strategy) = self.chunking_strategy
             && let Some(threshold) = strategy.threshold
-                && !(0.0..=1.0).contains(&threshold) {
-                    return Err(format!(
-                        "Chunking threshold must be between 0.0 and 1.0, got {}",
-                        threshold
-                    ));
-                }
+            && !(0.0..=1.0).contains(&threshold)
+        {
+            return Err(format!(
+                "Chunking threshold must be between 0.0 and 1.0, got {}",
+                threshold
+            ));
+        }
 
         // Validate speaker references have both name and audio
         for (i, speaker) in self.speaker_references.iter().enumerate() {
@@ -519,6 +559,7 @@ pub struct OpenAISTTConfig {
     /// Base endpoint override (scheme://host) from the standardized `endpoint_override` — points the
     /// transcription POST at a mock/proxy host (credential-free e2e), taking precedence over the
     /// `OPENAI_BASE_URL` env var. `None` falls back to the env var, then the production host.
+    /// Non-empty override values must pass the canonical SSRF gate before the client can dial them.
     pub endpoint_override: Option<String>,
 
     /// P5 translation (Class B): when `true`, POST to `/v1/audio/translations` (English-only)
@@ -660,9 +701,10 @@ impl OpenAISTTConfig {
             };
         }
         if let Some(k) = &f.keyterms
-            && !k.is_empty() {
-                cfg.prompt = Some(k.join(", "));
-            }
+            && !k.is_empty()
+        {
+            cfg.prompt = Some(k.join(", "));
+        }
         // interim_results → stream (typed).
         if let Some(s) = f.interim_results {
             cfg.stream = s;
@@ -686,17 +728,24 @@ impl OpenAISTTConfig {
                 .filter_map(|v| v.as_str())
                 .enumerate()
                 .map(|(i, audio)| {
-                    let name = names.get(i).cloned().unwrap_or_else(|| format!("speaker_{i}"));
+                    let name = names
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("speaker_{i}"));
                     SpeakerReference::new(name, audio.to_string())
                 })
                 .collect();
         }
         if let Some(cs) = e.get("chunking_strategy") {
             cfg.diarization.chunking_strategy =
-                serde_json::from_value::<ChunkingStrategy>(cs.clone()).ok().or_else(|| {
-                    // A bare `"auto"`/`"server_vad"` string selects the default server-VAD strategy.
-                    cs.as_str().filter(|s| !s.is_empty()).map(|_| ChunkingStrategy::default())
-                });
+                serde_json::from_value::<ChunkingStrategy>(cs.clone())
+                    .ok()
+                    .or_else(|| {
+                        // A bare `"auto"`/`"server_vad"` string selects the default server-VAD strategy.
+                        cs.as_str()
+                            .filter(|s| !s.is_empty())
+                            .map(|_| ChunkingStrategy::default())
+                    });
         }
         // The word-timestamp branch above may have set VerboseJson; coerce back to
         // Json for gpt-4o-transcribe / -mini (they reject verbose_json).
@@ -715,7 +764,10 @@ impl OpenAISTTConfig {
     pub fn transcription_text_fields(&self) -> Vec<(String, String)> {
         let mut fields: Vec<(String, String)> = Vec::new();
         fields.push(("model".into(), self.model.as_str().to_string()));
-        fields.push(("response_format".into(), self.response_format.as_str().to_string()));
+        fields.push((
+            "response_format".into(),
+            self.response_format.as_str().to_string(),
+        ));
 
         if !self.base.language.is_empty() {
             fields.push(("language".into(), self.base.language.clone()));
@@ -775,27 +827,30 @@ impl OpenAISTTConfig {
     /// also works against OpenAI-compatible endpoints (Azure OpenAI, Groq, vLLM, a local
     /// transcription server, or a proxy) — and enables credential-free contract/e2e testing.
     #[inline]
-    pub fn api_url(&self) -> String {
+    pub fn try_api_url(&self) -> Result<String, String> {
         // P5 translation (Class B): the English-only fast path POSTs to `/audio/translations`.
         let path = if self.translate_to_english {
             "/v1/audio/translations"
         } else {
             "/v1/audio/transcriptions"
         };
-        // The standardized `endpoint_override` (mock harness) takes precedence over the env var.
-        if let Some(ov) = self.endpoint_override.as_deref() {
-            let ov = ov.trim().trim_end_matches('/');
-            if !ov.is_empty() {
-                return format!("{ov}{path}");
-            }
-        }
-        if let Ok(base) = std::env::var("OPENAI_BASE_URL") {
-            let base = base.trim().trim_end_matches('/');
-            if !base.is_empty() {
-                return format!("{base}{path}");
-            }
-        }
-        format!("https://api.openai.com{path}")
+        resolve_openai_audio_url(self.endpoint_override.as_deref(), path)
+    }
+
+    /// Get the API endpoint URL, falling back to the production host if an invalid process env
+    /// override appears after construction. Runtime send paths use [`Self::try_api_url`] so invalid
+    /// explicit config still fails closed with a typed configuration error.
+    #[inline]
+    pub fn api_url(&self) -> String {
+        self.try_api_url().unwrap_or_else(|e| {
+            tracing::error!(error = %e, "invalid OpenAI STT endpoint override; using production endpoint for display-only URL");
+            let path = if self.translate_to_english {
+                "/v1/audio/translations"
+            } else {
+                "/v1/audio/transcriptions"
+            };
+            format!("{OPENAI_API_BASE_URL}{path}")
+        })
     }
 
     /// Validate the configuration.
@@ -823,14 +878,15 @@ impl OpenAISTTConfig {
         // Validate diarization configuration
         self.diarization.validate()?;
 
+        self.try_api_url()?;
+
         // Validate that diarized_json format is only used with compatible models
-        if self.response_format == ResponseFormat::DiarizedJson
-            && !self.supports_diarization() {
-                return Err(format!(
-                    "Diarized JSON format requires gpt-4o-transcribe or gpt-4o-mini-transcribe model, got {}",
-                    self.model
-                ));
-            }
+        if self.response_format == ResponseFormat::DiarizedJson && !self.supports_diarization() {
+            return Err(format!(
+                "Diarized JSON format requires gpt-4o-transcribe or gpt-4o-mini-transcribe model, got {}",
+                self.model
+            ));
+        }
 
         Ok(())
     }
@@ -886,7 +942,7 @@ mod tests {
 
     #[test]
     fn advanced_features_reach_multipart_form_fields() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
 
         let mut extras = serde_json::Map::new();
         extras.insert("logprobs".into(), serde_json::json!(true));
@@ -941,8 +997,14 @@ mod tests {
             .expect("chunking_strategy not in form");
         assert!(cs.contains("server_vad"), "chunking_strategy wrong: {cs}");
         // known_speaker_names[] (extras)
-        assert!(has("known_speaker_names[]", "Alice"), "name Alice missing: {fields:?}");
-        assert!(has("known_speaker_names[]", "Bob"), "name Bob missing: {fields:?}");
+        assert!(
+            has("known_speaker_names[]", "Alice"),
+            "name Alice missing: {fields:?}"
+        );
+        assert!(
+            has("known_speaker_names[]", "Bob"),
+            "name Bob missing: {fields:?}"
+        );
         // known_speaker_references[] (extras) — paired positionally with names
         assert!(
             has("known_speaker_references[]", "data:audio/wav;base64,AAA="),
@@ -986,7 +1048,7 @@ mod tests {
     // surface (diarization + word timestamps) — previously unreachable via the flat factory.
     #[test]
     fn from_standard_maps_features() {
-        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "openai".into(),

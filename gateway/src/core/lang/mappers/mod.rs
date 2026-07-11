@@ -35,9 +35,7 @@ pub use sarvam::SarvamLanguageMapper;
 pub use speechmatics::SpeechmaticsLanguageMapper;
 pub use tencent::TencentLanguageMapper;
 
-use super::mapper::{
-    LanguageMapper, MappedLanguage, NotationKind, ProviderLanguageSupport,
-};
+use super::mapper::{LanguageMapper, MappedLanguage, NotationKind, ProviderLanguageSupport};
 use super::notation::NotationMap;
 use super::types::CanonicalLanguage;
 
@@ -266,9 +264,11 @@ pub fn get_language_mapper(provider: &str) -> Box<dyn LanguageMapper> {
         }
 
         // ===== SPECIAL (no language param) =====
-        "hume" | "hume-ai" | "hume_ai" => Box::new(
-            DefaultLanguageMapper::new("hume", NotationKind::None, "Hume"),
-        ),
+        "hume" | "hume-ai" | "hume_ai" => Box::new(DefaultLanguageMapper::new(
+            "hume",
+            NotationKind::None,
+            "Hume",
+        )),
 
         // ===== GENERIC FALLBACK: safe BCP-47 pass-through =====
         other => {
@@ -295,7 +295,9 @@ pub(crate) const INDIAN_LANGS: &[CanonicalLanguage] = {
 /// AssemblyAI universal-streaming supported languages (en/es/fr/de/it/pt).
 pub(crate) const ASSEMBLYAI_LANGS: &[CanonicalLanguage] = {
     use CanonicalLanguage::*;
-    &[EnUs, EnGb, EnIn, EnAu, EsEs, EsMx, FrFr, DeDe, ItIt, PtBr, PtPt]
+    &[
+        EnUs, EnGb, EnIn, EnAu, EsEs, EsMx, FrFr, DeDe, ItIt, PtBr, PtPt,
+    ]
 };
 
 #[cfg(test)]

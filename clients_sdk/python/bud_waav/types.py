@@ -224,10 +224,12 @@ _LANGUAGE_NOTATION: dict[str, tuple[str, bool]] = {
 
 
 def language_capabilities(provider: str) -> dict[str, Any]:
-    """Canonical language capability summary for ``provider`` (P2).
+    """Canonical language capability summary for ``provider`` (P2) — STATIC, offline.
 
-    The SDK's documented stand-in for the gateway ``GET /capabilities/languages``
-    endpoint (not shipped this phase): it tells a developer (a) that the FULL
+    The connection-free mirror of the gateway's live ``GET /capabilities/languages``
+    endpoint (for the authoritative, always-current server-side matrix use
+    ``RestClient.fetch_language_capabilities()`` /
+    ``BudClient.fetch_language_capabilities()``): it tells a developer (a) that the FULL
     canonical value space (:data:`CANONICAL_LANGUAGES`) is accepted for every
     provider — the gateway maps it — and (b) how the provider spells languages
     natively (``notation``) + whether it ``auto_detect``s. It intentionally does

@@ -9,6 +9,7 @@ use serde_json::json;
 pub mod error_codes {
     pub const MISSING_AUTH_HEADER: &str = "missing_auth_header";
     pub const INVALID_AUTH_HEADER: &str = "invalid_auth_header";
+    pub const INVALID_REQUEST_BODY: &str = "invalid_request_body";
     pub const AUTH_SERVICE_UNAVAILABLE: &str = "auth_service_unavailable";
     pub const AUTH_SERVICE_ERROR: &str = "auth_service_error";
     pub const UNAUTHORIZED: &str = "unauthorized";
@@ -26,6 +27,10 @@ pub enum AuthError {
     /// Authorization header format is invalid (not "Bearer {token}")
     #[error("Invalid Authorization header format")]
     InvalidAuthHeader,
+
+    /// Request body could not be parsed for auth validation
+    #[error("Invalid request body: {0}")]
+    InvalidRequestBody(String),
 
     /// Auth service is unavailable or unreachable
     #[error("Auth service unavailable: {0}")]
@@ -62,6 +67,7 @@ impl AuthError {
         match self {
             AuthError::MissingAuthHeader => error_codes::MISSING_AUTH_HEADER,
             AuthError::InvalidAuthHeader => error_codes::INVALID_AUTH_HEADER,
+            AuthError::InvalidRequestBody(_) => error_codes::INVALID_REQUEST_BODY,
             AuthError::AuthServiceUnavailable(_) => error_codes::AUTH_SERVICE_UNAVAILABLE,
             AuthError::AuthServiceError(_, _) => error_codes::AUTH_SERVICE_ERROR,
             AuthError::Unauthorized(_) => error_codes::UNAUTHORIZED,
@@ -76,6 +82,7 @@ impl AuthError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             AuthError::MissingAuthHeader | AuthError::InvalidAuthHeader => StatusCode::UNAUTHORIZED,
+            AuthError::InvalidRequestBody(_) => StatusCode::BAD_REQUEST,
             AuthError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             AuthError::AuthServiceUnavailable(_) | AuthError::HttpError(_) => {
                 StatusCode::SERVICE_UNAVAILABLE
@@ -101,6 +108,9 @@ impl AuthError {
             // Debug level for expected auth failures (missing/invalid headers)
             AuthError::MissingAuthHeader | AuthError::InvalidAuthHeader => {
                 tracing::debug!("{}", self);
+            }
+            AuthError::InvalidRequestBody(msg) => {
+                tracing::warn!("Invalid request body for auth validation: {}", msg);
             }
             // Warn level for auth service issues and unauthorized requests
             AuthError::Unauthorized(msg) => {
@@ -166,6 +176,10 @@ mod tests {
             error_codes::INVALID_AUTH_HEADER
         );
         assert_eq!(
+            AuthError::InvalidRequestBody("bad json".to_string()).error_code(),
+            error_codes::INVALID_REQUEST_BODY
+        );
+        assert_eq!(
             AuthError::Unauthorized("test".to_string()).error_code(),
             error_codes::UNAUTHORIZED
         );
@@ -180,6 +194,10 @@ mod tests {
         assert_eq!(
             AuthError::InvalidAuthHeader.status_code(),
             StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AuthError::InvalidRequestBody("bad json".to_string()).status_code(),
+            StatusCode::BAD_REQUEST
         );
         assert_eq!(
             AuthError::Unauthorized("test".to_string()).status_code(),
@@ -233,6 +251,10 @@ mod tests {
         assert_eq!(
             AuthError::InvalidAuthHeader.to_string(),
             "Invalid Authorization header format"
+        );
+        assert_eq!(
+            AuthError::InvalidRequestBody("bad json".to_string()).to_string(),
+            "Invalid request body: bad json"
         );
         assert_eq!(
             AuthError::Unauthorized("invalid token".to_string()).to_string(),

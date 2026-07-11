@@ -416,6 +416,7 @@ pub enum OutgoingMessage {
 
 /// Message routing for optimized throughput
 /// Using enum for zero-cost abstraction
+#[derive(Debug)]
 pub enum MessageRoute {
     Outgoing(OutgoingMessage),
     Binary(Bytes),
@@ -789,7 +790,10 @@ mod tests {
         };
         let json = serde_json::to_string(&with_opus).expect("serialize");
         assert!(json.contains(r#""audio_in_codec":"opus""#), "got {json}");
-        assert!(json.contains(r#""audio_out_codec":"linear16""#), "got {json}");
+        assert!(
+            json.contains(r#""audio_out_codec":"linear16""#),
+            "got {json}"
+        );
 
         // Default session (no codec requested) omits both fields entirely.
         let default = OutgoingMessage::Ready {
@@ -1083,7 +1087,10 @@ mod tests {
             MessageClass::DroppableAudio,
         )
         .await;
-        match rx.try_recv().expect("frame delivered when channel has capacity") {
+        match rx
+            .try_recv()
+            .expect("frame delivered when channel has capacity")
+        {
             MessageRoute::Binary(b) => assert_eq!(b.as_ref(), b"audio"),
             _ => panic!("expected binary frame"),
         }

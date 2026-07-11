@@ -106,7 +106,12 @@ pub fn validate_auth_required(
         return Ok(());
     }
 
-    let has_jwt_auth = auth_service_url.is_some() && auth_signing_key_path.is_some();
+    let has_jwt_auth = auth_service_url
+        .as_ref()
+        .is_some_and(|u| !u.trim().is_empty())
+        && auth_signing_key_path
+            .as_ref()
+            .is_some_and(|p| !p.as_os_str().is_empty());
     let has_api_secret = !auth_api_secrets.is_empty();
 
     if !has_jwt_auth && !has_api_secret {
@@ -453,6 +458,28 @@ mod tests {
     fn test_validate_auth_required_without_auth_methods() {
         let auth_service_url: Option<String> = None;
         let auth_signing_key_path: Option<PathBuf> = None;
+        let auth_api_secrets: Vec<AuthApiSecret> = Vec::new();
+
+        let result = validate_auth_required(
+            true,
+            &auth_service_url,
+            &auth_signing_key_path,
+            &auth_api_secrets,
+        );
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("AUTH_REQUIRED=true")
+        );
+    }
+
+    #[test]
+    fn test_validate_auth_required_blank_jwt_url_is_unset() {
+        let auth_service_url = Some("   ".to_string());
+        let auth_signing_key_path = Some(PathBuf::from("key.pem"));
         let auth_api_secrets: Vec<AuthApiSecret> = Vec::new();
 
         let result = validate_auth_required(

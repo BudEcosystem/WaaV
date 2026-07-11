@@ -9,8 +9,32 @@
 //! and should be used from there.
 
 use crate::core::providers::azure::AzureRegion;
-use crate::core::tts::base::TTSConfig;
+use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
+
+fn validate_azure_tts_endpoint(source: &str, endpoint: &str) -> Result<(), TTSError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}")),
+    )
+}
+
+fn validate_azure_provider_url(source: &str, url: &str) -> Result<(), TTSError> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(TTSError::InvalidConfiguration(format!(
+            "{source} rejected (SSRF protection): empty URL"
+        )));
+    }
+
+    crate::core::net::validate_url_for_ssrf(url, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}")),
+    )
+}
 
 /// HTTP header name for Azure TTS output format.
 pub const AZURE_OUTPUT_FORMAT_HEADER: &str = "X-Microsoft-OutputFormat";
@@ -548,10 +572,7 @@ pub fn build_ssml_with_options(
     // own attribute values.
     let escaped_text = escape_xml(text);
     let mut inner = if let Some(alias) = opts.sub_alias.as_deref().filter(|s| !s.is_empty()) {
-        format!(
-            "<sub alias=\"{}\">{escaped_text}</sub>",
-            escape_attr(alias)
-        )
+        format!("<sub alias=\"{}\">{escaped_text}</sub>", escape_attr(alias))
     } else if let (Some(alphabet), Some(ph)) = (
         opts.phoneme_alphabet.as_deref().filter(|s| !s.is_empty()),
         opts.phoneme_ph.as_deref().filter(|s| !s.is_empty()),
@@ -707,7 +728,9 @@ pub fn build_ssml_with_options(
         .unwrap_or_default();
 
     // ---- namespace: required for any mstts:* element (express-as OR an opts mstts element) -
-    let mstts_ns = if (emotion.is_some_and(|s| !s.is_empty()) || opts.style_degree.is_some() || opts.role.is_some())
+    let mstts_ns = if (emotion.is_some_and(|s| !s.is_empty())
+        || opts.style_degree.is_some()
+        || opts.role.is_some())
         || opts.needs_mstts_namespace()
     {
         format!(" xmlns:mstts='{AZURE_MSTTS_NAMESPACE}'")
@@ -831,6 +854,30 @@ impl Default for AzureTTSConfig {
 }
 
 impl AzureTTSConfig {
+    pub(crate) fn validate(&self) -> Result<(), TTSError> {
+        self.validate_endpoint_override()?;
+        self.validate_provider_fetched_urls()?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_endpoint_override(&self) -> Result<(), TTSError> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_azure_tts_endpoint("endpoint_override", endpoint)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_provider_fetched_urls(&self) -> Result<(), TTSError> {
+        let options = &self.ssml_options;
+        if let Some(url) = options.lexicon_uri.as_deref() {
+            validate_azure_provider_url("lexicon_uri", url)?;
+        }
+        if let Some(url) = options.background_audio_src.as_deref() {
+            validate_azure_provider_url("background_audio_src", url)?;
+        }
+        Ok(())
+    }
+
     /// Creates an `AzureTTSConfig` from a base `TTSConfig` with default Azure settings.
     ///
     /// Maps the base configuration's audio format and sample rate to the
@@ -901,16 +948,23 @@ impl AzureTTSConfig {
     /// recorded `<audio src>`) are intentionally NOT auto-emitted here — callers that need them
     /// pass full SSML with `use_ssml=false`-style raw bodies. See the per-field note in
     /// `from_standard` for the citation.
-    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
         let f = &std.features;
         let extras = &std.extras.0;
         let mut cfg = Self::from_base(std.base.clone());
-        if let Some(region) = extras
-            .get("region")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse().ok())
-        {
-            cfg.region = region;
+        if let Some(region_value) = extras.get("region") {
+            let region = region_value.as_str().ok_or_else(|| {
+                TTSError::InvalidConfiguration(
+                    "Azure TTS provider_extras.region must be a string".to_string(),
+                )
+            })?;
+            cfg.region = region.parse().map_err(|err| {
+                TTSError::InvalidConfiguration(format!(
+                    "Azure TTS provider_extras.region rejected: {err}"
+                ))
+            })?;
         }
         if let Some(s) = f.ssml {
             cfg.use_ssml = s;
@@ -995,7 +1049,7 @@ impl AzureTTSConfig {
         // Endpoint override redirecting the synthesis POST to a mock/proxy (W-T0).
         cfg.endpoint_override = std.endpoint_override().map(String::from);
 
-        cfg
+        Ok(cfg)
     }
 
     /// Creates an `AzureTTSConfig` with a specific region.
@@ -1208,10 +1262,118 @@ mod tests {
             },
             extras: crate::core::stt::standard::ProviderExtras(extras),
         };
-        let cfg = AzureTTSConfig::from_standard(&std);
+        let cfg = AzureTTSConfig::from_standard(&std).unwrap();
         assert!(!cfg.use_ssml); // mapped from features.ssml
         assert_eq!(cfg.region, AzureRegion::WestEurope); // from provider_extras passthrough
         assert_eq!(cfg.base.api_key, "k"); // base carried through
+    }
+
+    #[test]
+    fn from_standard_rejects_malformed_region_extra() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("region".into(), serde_json::json!("west/europe"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "azure".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+
+        let err = AzureTTSConfig::from_standard(&std)
+            .expect_err("malformed Azure region extra must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Azure TTS provider_extras.region rejected"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = AzureTTSConfig::from_base(TTSConfig {
+            provider: "azure".into(),
+            api_key: "k".into(),
+            voice_id: Some("en-US-JennyNeural".to_string()),
+            ..Default::default()
+        });
+
+        config.endpoint_override = Some("https://azure-proxy.example.com".to_string());
+        assert!(config.validate_endpoint_override().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://azure-proxy.example.com".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("WebSocket endpoint_override must be rejected for REST Azure");
+        assert!(err.to_string().contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "azure".into(),
+            api_key: "k".into(),
+            voice_id: Some("en-US-JennyNeural".to_string()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        let cfg = AzureTTSConfig::from_standard(&std).unwrap();
+        assert!(cfg.validate_endpoint_override().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_ssml_provider_urls() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = AzureTTSConfig::from_base(TTSConfig {
+            provider: "azure".into(),
+            api_key: "k".into(),
+            voice_id: Some("en-US-JennyNeural".to_string()),
+            ..Default::default()
+        });
+
+        config.ssml_options.lexicon_uri = Some("https://example.com/lex.xml".to_string());
+        config.ssml_options.background_audio_src = Some("https://example.com/bg.wav".to_string());
+        assert!(config.validate_provider_fetched_urls().is_ok());
+
+        config.ssml_options.lexicon_uri = Some("http://127.0.0.1:9000/lex.xml".to_string());
+        let err = config
+            .validate_provider_fetched_urls()
+            .expect_err("loopback lexicon_uri must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.ssml_options.lexicon_uri = Some("file:///tmp/lex.xml".to_string());
+        let err = config
+            .validate_provider_fetched_urls()
+            .expect_err("non-HTTP lexicon_uri must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        config.ssml_options.lexicon_uri = Some("https://example.com/lex.xml".to_string());
+        config.ssml_options.background_audio_src = Some("   ".to_string());
+        let err = config
+            .validate_provider_fetched_urls()
+            .expect_err("blank background_audio_src must be rejected");
+        assert!(err.to_string().contains("empty URL"));
+
+        config.ssml_options.background_audio_src =
+            Some("http://169.254.169.254/latest/meta-data".to_string());
+        let err = config
+            .validate_provider_fetched_urls()
+            .expect_err("metadata background_audio_src must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
     }
 
     // =========================================================================
@@ -1543,7 +1705,13 @@ mod tests {
 
     #[test]
     fn test_build_ssml_with_slow_rate() {
-        let ssml = build_ssml("Slow speech", "en-US-JennyNeural", "en-US", Some(0.75), None);
+        let ssml = build_ssml(
+            "Slow speech",
+            "en-US-JennyNeural",
+            "en-US",
+            Some(0.75),
+            None,
+        );
 
         assert!(ssml.contains("<prosody rate=\"75%\">"));
         assert!(ssml.contains("Slow speech"));
@@ -1552,7 +1720,13 @@ mod tests {
     #[test]
     fn test_build_ssml_with_normal_rate() {
         // Rate of exactly 1.0 should not add prosody
-        let ssml = build_ssml("Normal speech", "en-US-JennyNeural", "en-US", Some(1.0), None);
+        let ssml = build_ssml(
+            "Normal speech",
+            "en-US-JennyNeural",
+            "en-US",
+            Some(1.0),
+            None,
+        );
 
         assert!(!ssml.contains("<prosody"));
         assert!(ssml.contains("Normal speech"));
@@ -1588,13 +1762,7 @@ mod tests {
 
     #[test]
     fn test_build_ssml_with_emotion_express_as() {
-        let ssml = build_ssml(
-            "Yay!",
-            "en-US-JennyNeural",
-            "en-US",
-            None,
-            Some("cheerful"),
-        );
+        let ssml = build_ssml("Yay!", "en-US-JennyNeural", "en-US", None, Some("cheerful"));
 
         // Wire assertion: the express-as style attribute appears in the serialized SSML body.
         assert!(
@@ -1637,13 +1805,7 @@ mod tests {
     #[test]
     fn test_build_ssml_emotion_escapes_style_attr() {
         // A hostile style value must not break SSML well-formedness.
-        let ssml = build_ssml(
-            "text",
-            "en-US-JennyNeural",
-            "en-US",
-            None,
-            Some("a\"b"),
-        );
+        let ssml = build_ssml("text", "en-US-JennyNeural", "en-US", None, Some("a\"b"));
         assert!(!ssml.contains("style=\"a\"b\""));
         assert!(ssml.contains("&quot;"));
     }
@@ -1694,7 +1856,7 @@ mod tests {
             },
             extras: crate::core::stt::standard::ProviderExtras(serde_json::Map::new()),
         };
-        let cfg = AzureTTSConfig::from_standard(&std);
+        let cfg = AzureTTSConfig::from_standard(&std).unwrap();
         assert_eq!(cfg.emotion.as_deref(), Some("cheerful"));
         let ssml = cfg.build_ssml_for_text("Hello");
         assert!(
@@ -1714,7 +1876,10 @@ mod tests {
     // =========================================================================
 
     fn opts_std(
-        build: impl FnOnce(&mut crate::core::tts::standard::TtsFeatures, &mut serde_json::Map<String, serde_json::Value>),
+        build: impl FnOnce(
+            &mut crate::core::tts::standard::TtsFeatures,
+            &mut serde_json::Map<String, serde_json::Value>,
+        ),
     ) -> AzureTTSConfig {
         use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
         let mut features = TtsFeatures::default();
@@ -1730,7 +1895,7 @@ mod tests {
             features,
             extras: crate::core::stt::standard::ProviderExtras(extras),
         };
-        AzureTTSConfig::from_standard(&std)
+        AzureTTSConfig::from_standard(&std).unwrap()
     }
 
     #[test]
@@ -1740,8 +1905,14 @@ mod tests {
             f.volume = Some(75.0);
         });
         let ssml = cfg.build_ssml_for_text("Hi");
-        assert!(ssml.contains("pitch=\"+4%\""), "pitch not in prosody: {ssml}");
-        assert!(ssml.contains("volume=\"75\""), "volume not in prosody: {ssml}");
+        assert!(
+            ssml.contains("pitch=\"+4%\""),
+            "pitch not in prosody: {ssml}"
+        );
+        assert!(
+            ssml.contains("volume=\"75\""),
+            "volume not in prosody: {ssml}"
+        );
         assert!(ssml.contains("<prosody"));
     }
 
@@ -1750,17 +1921,26 @@ mod tests {
         let cfg = opts_std(|f, _| f.language = Some("fr-FR".into()));
         assert_eq!(cfg.language_code(), "fr-FR");
         let ssml = cfg.build_ssml_for_text("Bonjour");
-        assert!(ssml.contains("xml:lang='fr-FR'"), "lang override missing: {ssml}");
+        assert!(
+            ssml.contains("xml:lang='fr-FR'"),
+            "lang override missing: {ssml}"
+        );
     }
 
     #[test]
     fn from_standard_extras_prosody_contour_range() {
         let cfg = opts_std(|_, e| {
-            e.insert("contour".into(), serde_json::json!("(0%,+20Hz) (100%,-10Hz)"));
+            e.insert(
+                "contour".into(),
+                serde_json::json!("(0%,+20Hz) (100%,-10Hz)"),
+            );
             e.insert("range".into(), serde_json::json!("+20%"));
         });
         let ssml = cfg.build_ssml_for_text("Hi");
-        assert!(ssml.contains("contour=\"(0%,+20Hz) (100%,-10Hz)\""), "{ssml}");
+        assert!(
+            ssml.contains("contour=\"(0%,+20Hz) (100%,-10Hz)\""),
+            "{ssml}"
+        );
         assert!(ssml.contains("range=\"+20%\""), "{ssml}");
     }
 
@@ -1819,13 +1999,19 @@ mod tests {
             e.insert("phoneme_ph".into(), serde_json::json!("təˈmeɪtoʊ"));
         });
         let ssml = cfg.build_ssml_for_text("tomato");
-        assert!(ssml.contains("<phoneme alphabet=\"ipa\" ph=\"təˈmeɪtoʊ\">"), "{ssml}");
+        assert!(
+            ssml.contains("<phoneme alphabet=\"ipa\" ph=\"təˈmeɪtoʊ\">"),
+            "{ssml}"
+        );
     }
 
     #[test]
     fn from_standard_extras_sub_alias() {
         let cfg = opts_std(|_, e| {
-            e.insert("sub_alias".into(), serde_json::json!("World Wide Web Consortium"));
+            e.insert(
+                "sub_alias".into(),
+                serde_json::json!("World Wide Web Consortium"),
+            );
         });
         let ssml = cfg.build_ssml_for_text("W3C");
         assert!(
@@ -1837,14 +2023,23 @@ mod tests {
     #[test]
     fn from_standard_extras_lexicon_and_audioduration_and_silence() {
         let cfg = opts_std(|_, e| {
-            e.insert("lexicon_uri".into(), serde_json::json!("https://x.example/lex.xml"));
+            e.insert(
+                "lexicon_uri".into(),
+                serde_json::json!("https://x.example/lex.xml"),
+            );
             e.insert("audio_duration".into(), serde_json::json!("20s"));
             e.insert("silence_type".into(), serde_json::json!("Sentenceboundary"));
             e.insert("silence_value".into(), serde_json::json!("200ms"));
         });
         let ssml = cfg.build_ssml_for_text("Hi");
-        assert!(ssml.contains("<lexicon uri=\"https://x.example/lex.xml\"/>"), "{ssml}");
-        assert!(ssml.contains("<mstts:audioduration value=\"20s\"/>"), "{ssml}");
+        assert!(
+            ssml.contains("<lexicon uri=\"https://x.example/lex.xml\"/>"),
+            "{ssml}"
+        );
+        assert!(
+            ssml.contains("<mstts:audioduration value=\"20s\"/>"),
+            "{ssml}"
+        );
         assert!(
             ssml.contains("<mstts:silence type=\"Sentenceboundary\" value=\"200ms\"/>"),
             "{ssml}"
@@ -1867,7 +2062,10 @@ mod tests {
     #[test]
     fn from_standard_extras_ttsembedding_speaker_profile() {
         let cfg = opts_std(|_, e| {
-            e.insert("speaker_profile_id".into(), serde_json::json!("profile-123"));
+            e.insert(
+                "speaker_profile_id".into(),
+                serde_json::json!("profile-123"),
+            );
         });
         let ssml = cfg.build_ssml_for_text("Hi");
         assert!(
@@ -1880,7 +2078,10 @@ mod tests {
     #[test]
     fn from_standard_extras_background_audio() {
         let cfg = opts_std(|_, e| {
-            e.insert("background_audio_src".into(), serde_json::json!("https://x.example/bg.wav"));
+            e.insert(
+                "background_audio_src".into(),
+                serde_json::json!("https://x.example/bg.wav"),
+            );
             e.insert("background_audio_volume".into(), serde_json::json!("0.7"));
             e.insert("background_audio_fadein".into(), serde_json::json!("3000"));
             e.insert("background_audio_fadeout".into(), serde_json::json!("4000"));

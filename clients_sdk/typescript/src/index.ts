@@ -64,6 +64,9 @@ export type {
   CanonicalLanguage,
   LanguageNotation,
   LanguageCapabilities,
+  CanonicalLanguageInfo,
+  ProviderLanguageSupport,
+  LanguageCapabilitiesResponse,
 } from './types/canonical-languages.js';
 
 // Conversation / agent-loop config (the flagship LLM + reasoning surface).
@@ -119,6 +122,8 @@ export type {
   TrackInfo,
   RoomListResponse,
   LiveKitConnectOptions,
+  RemoveParticipantResponse,
+  MuteParticipantResponse,
 } from './types/livekit.js';
 
 export type {
@@ -127,6 +132,7 @@ export type {
   SIPHookCreateRequest,
   SIPHookCreateResponse,
   SIPTransferRequest,
+  SIPTransferResponse,
   SIPTransferResult,
 } from './types/sip.js';
 
@@ -185,6 +191,10 @@ export type {
   DAGDefinition,
   DAGConfig,
   DAGValidationResult,
+  DAGTemplateInfo,
+  DAGTemplateListResponse,
+  DAGTemplateDetail,
+  DAGValidateResponse,
 } from './types/dag.js';
 export {
   DAG_NODE_TYPES,

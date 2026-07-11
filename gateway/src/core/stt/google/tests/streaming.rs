@@ -910,10 +910,14 @@ fn test_keepalive_constants() {
     assert_eq!(KEEPALIVE_SILENCE_DURATION_MS, 20);
 }
 
+fn silence(sample_rate: u32, channels: u32, duration_ms: u64) -> Bytes {
+    generate_silence_audio(sample_rate, channels, duration_ms).expect("valid silence geometry")
+}
+
 #[test]
 fn test_generate_silence_audio_16khz_mono() {
     // 16kHz, mono, 20ms = 16000 * 0.020 * 1 * 2 = 640 bytes
-    let silence = generate_silence_audio(16000, 1, 20);
+    let silence = silence(16000, 1, 20);
     assert_eq!(silence.len(), 640);
 
     // Verify all bytes are zero (silence for LINEAR16)
@@ -923,29 +927,50 @@ fn test_generate_silence_audio_16khz_mono() {
 #[test]
 fn test_generate_silence_audio_8khz_mono() {
     // 8kHz, mono, 20ms = 8000 * 0.020 * 1 * 2 = 320 bytes
-    let silence = generate_silence_audio(8000, 1, 20);
+    let silence = silence(8000, 1, 20);
     assert_eq!(silence.len(), 320);
 }
 
 #[test]
 fn test_generate_silence_audio_16khz_stereo() {
     // 16kHz, stereo, 20ms = 16000 * 0.020 * 2 * 2 = 1280 bytes
-    let silence = generate_silence_audio(16000, 2, 20);
+    let silence = silence(16000, 2, 20);
     assert_eq!(silence.len(), 1280);
 }
 
 #[test]
 fn test_generate_silence_audio_48khz_mono() {
     // 48kHz, mono, 20ms = 48000 * 0.020 * 1 * 2 = 1920 bytes
-    let silence = generate_silence_audio(48000, 1, 20);
+    let silence = silence(48000, 1, 20);
     assert_eq!(silence.len(), 1920);
 }
 
 #[test]
 fn test_generate_silence_audio_longer_duration() {
     // 16kHz, mono, 100ms = 16000 * 0.100 * 1 * 2 = 3200 bytes
-    let silence = generate_silence_audio(16000, 1, 100);
+    let silence = silence(16000, 1, 100);
     assert_eq!(silence.len(), 3200);
+}
+
+#[test]
+fn test_generate_silence_audio_rejects_invalid_geometry_without_allocating() {
+    let zero_rate =
+        generate_silence_audio(0, 1, 20).expect_err("zero sample rate must be rejected");
+    assert!(
+        zero_rate.to_string().contains("sample_rate"),
+        "got {zero_rate}"
+    );
+
+    let zero_channels =
+        generate_silence_audio(16_000, 0, 20).expect_err("zero channels must be rejected");
+    assert!(
+        zero_channels.to_string().contains("channels"),
+        "got {zero_channels}"
+    );
+
+    let huge = generate_silence_audio(u32::MAX, u32::MAX, u64::MAX)
+        .expect_err("overflowing geometry must be rejected");
+    assert!(huge.to_string().contains("overflow"), "got {huge}");
 }
 
 #[test]
@@ -978,7 +1003,7 @@ fn test_keepalive_tracker_touch_resets_timer() {
 #[test]
 fn test_keepalive_tracker_generate_keepalive() {
     let tracker = KeepaliveTracker::new(16000, 1);
-    let silence = tracker.generate_keepalive();
+    let silence = tracker.generate_keepalive().unwrap();
 
     // Should generate silence for the configured sample rate and duration
     // 16kHz, mono, 20ms = 640 bytes
@@ -989,7 +1014,7 @@ fn test_keepalive_tracker_generate_keepalive() {
 #[test]
 fn test_keepalive_tracker_generate_keepalive_stereo() {
     let tracker = KeepaliveTracker::new(16000, 2);
-    let silence = tracker.generate_keepalive();
+    let silence = tracker.generate_keepalive().unwrap();
 
     // 16kHz, stereo, 20ms = 1280 bytes
     assert_eq!(silence.len(), 1280);
@@ -1133,7 +1158,10 @@ fn test_wire_spoken_punctuation_and_emojis_and_word_confidence() {
         ..Default::default()
     };
     let features = rec_config_of(&config).features.unwrap();
-    assert!(features.enable_spoken_punctuation, "spoken_punctuation on wire");
+    assert!(
+        features.enable_spoken_punctuation,
+        "spoken_punctuation on wire"
+    );
     assert!(features.enable_spoken_emojis, "spoken_emojis on wire");
     assert!(features.enable_word_confidence, "word_confidence on wire");
 }
@@ -1141,13 +1169,11 @@ fn test_wire_spoken_punctuation_and_emojis_and_word_confidence() {
 #[test]
 fn test_wire_transcript_normalization_reaches_recognition_config() {
     let config = GoogleSTTConfig {
-        transcript_normalization: vec![
-            crate::core::stt::google::config::TranscriptNormEntry {
-                search: "cat".into(),
-                replace: "dog".into(),
-                case_sensitive: true,
-            },
-        ],
+        transcript_normalization: vec![crate::core::stt::google::config::TranscriptNormEntry {
+            search: "cat".into(),
+            replace: "dog".into(),
+            case_sensitive: true,
+        }],
         project_id: "p".into(),
         ..Default::default()
     };
@@ -1176,7 +1202,10 @@ fn test_wire_features_default_off_when_unset() {
     assert!(!features.enable_spoken_punctuation);
     assert!(!features.enable_spoken_emojis);
     assert_eq!(features.max_alternatives, 0);
-    assert_eq!(features.multi_channel_mode, MultiChannelMode::Unspecified as i32);
+    assert_eq!(
+        features.multi_channel_mode,
+        MultiChannelMode::Unspecified as i32
+    );
     assert!(features.diarization_config.is_none());
     assert!(rec.adaptation.is_none());
     assert!(rec.transcript_normalization.is_none());
@@ -1185,7 +1214,7 @@ fn test_wire_features_default_off_when_unset() {
 // from_standard mapping: typed SttFeatures + ProviderExtras -> GoogleSTTConfig -> wire.
 #[test]
 fn test_from_standard_maps_advanced_features_to_wire() {
-    use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+    use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
     let mut extras = serde_json::Map::new();
     extras.insert("project_id".into(), serde_json::json!("proj-xyz"));
     extras.insert("enable_spoken_punctuation".into(), serde_json::json!(true));

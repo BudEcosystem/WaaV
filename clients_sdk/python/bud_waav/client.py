@@ -570,7 +570,7 @@ class BudClient:
 
     @staticmethod
     def capabilities(provider: str) -> dict[str, Any]:
-        """Canonical language capabilities for ``provider`` (P2 standardization).
+        """Canonical language capabilities for ``provider`` — STATIC, offline lookup.
 
         Returns ``{provider, notation, auto_detect, canonical_languages}`` — how
         the provider spells languages natively + whether it auto-detects, plus
@@ -579,11 +579,32 @@ class BudClient:
         notation server-side). This replaces the SDK's old stale per-provider
         language whitelists; pass any canonical token and the gateway handles it.
 
-        This is a local lookup (the documented stand-in for the gateway
-        ``GET /capabilities/languages`` endpoint, not shipped this phase), so it
-        is synchronous and needs no connection.
+        This is a local table lookup — synchronous, connection-free, and useful
+        offline. For the authoritative, always-current server-side matrix use
+        :meth:`fetch_language_capabilities`, which calls the gateway's live
+        ``GET /capabilities/languages`` endpoint.
         """
         return language_capabilities(provider)
+
+    async def fetch_language_capabilities(
+        self,
+        provider: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Fetch the LIVE unified-language support matrix from the gateway.
+
+        Calls ``GET /capabilities/languages`` and returns
+        ``{canonical_languages, providers, canonical_count}`` — the
+        authoritative counterpart to the static :meth:`capabilities` table.
+        The endpoint takes no query parameters; when ``provider`` is given the
+        ``providers`` rows are filtered client-side.
+
+        Args:
+            provider: Optional provider id to filter the ``providers`` rows to.
+
+        Returns:
+            The live capability matrix dict.
+        """
+        return await self._rest_client.fetch_language_capabilities(provider=provider)
 
     async def list_voices(
         self,
@@ -731,12 +752,16 @@ class BudClient:
             room_name, identity, track_sid=track_sid, muted=muted,
         )
 
-    async def get_metrics(self) -> dict[str, Any]:
+    async def get_metrics(self) -> str:
         """
         Get server performance metrics.
 
+        The gateway serves ``GET /metrics`` as a Prometheus **text
+        exposition** (``text/plain``); the previous ``dict`` annotation was
+        stale.
+
         Returns:
-            Server metrics
+            The Prometheus text exposition as a string.
         """
         return await self._rest_client.get_metrics()
 

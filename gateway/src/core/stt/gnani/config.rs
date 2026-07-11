@@ -7,6 +7,15 @@ use crate::core::stt::base::STTConfig;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+fn validate_gnani_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 /// Gnani STT provider-specific configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GnaniSTTConfig {
@@ -135,6 +144,9 @@ impl GnaniSTTConfig {
             cfg.filename = Some(fname.to_string());
         }
         cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        if let Some(endpoint) = &cfg.endpoint_override {
+            validate_gnani_stt_endpoint("endpoint_override", endpoint)?;
+        }
         Ok(cfg)
     }
 
@@ -193,6 +205,10 @@ impl GnaniSTTConfig {
             );
         }
 
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_gnani_stt_endpoint("endpoint_override", endpoint)?;
+        }
+
         // The TLS CA certificate is only needed for the production endpoint; a plaintext
         // `endpoint_override` (mock/proxy) skips TLS entirely, so don't require a cert there.
         if self.endpoint_override.is_none()
@@ -206,12 +222,13 @@ impl GnaniSTTConfig {
 
         // Validate certificate path exists if provided
         if let Some(ref path) = self.certificate_path
-            && !path.exists() {
-                return Err(format!(
-                    "Gnani certificate file not found: {}",
-                    path.display()
-                ));
-            }
+            && !path.exists()
+        {
+            return Err(format!(
+                "Gnani certificate file not found: {}",
+                path.display()
+            ));
+        }
 
         // Validate language is supported
         GnaniLanguage::from_str(&self.base.language)?;
@@ -270,8 +287,7 @@ impl GnaniAudioFormat {
 }
 
 /// Supported languages for Gnani STT (14 languages)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum GnaniLanguage {
     /// Kannada (kn-IN)
     #[serde(rename = "kn-IN")]
@@ -317,7 +333,6 @@ pub enum GnaniLanguage {
     #[serde(rename = "en-SG")]
     EnglishSG,
 }
-
 
 impl GnaniLanguage {
     /// Get the language code string for API requests
@@ -415,7 +430,7 @@ mod tests {
     // unreachable through the flat factory.
     #[test]
     fn from_standard_maps_features() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "gnani".into(),
@@ -438,6 +453,31 @@ mod tests {
         let cfg = GnaniSTTConfig::from_standard(&std).unwrap();
         assert!(!cfg.interim_results);
         assert_eq!(cfg.access_key, "ak-123");
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = GnaniSTTConfig {
+            token: "test-token".to_string(),
+            access_key: "test-access-key".to_string(),
+            endpoint_override: Some("https://gnani-proxy.example.com".to_string()),
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("grpc://gnani-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
     }
 
     #[test]

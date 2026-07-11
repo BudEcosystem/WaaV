@@ -25,7 +25,7 @@ use reqwest::Client;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Zalo AI TTS client.
 ///
@@ -37,13 +37,32 @@ pub struct ZaloTts {
     /// Provider configuration.
     config: ZaloTtsConfig,
     /// HTTP client for REST API calls.
-    http_client: Client,
+    http_client: Option<Client>,
     /// Whether the client is ready to receive requests.
     is_ready: AtomicBool,
     /// Audio callback for streaming audio to caller.
     audio_callback: Arc<RwLock<Option<Arc<dyn AudioCallback>>>>,
     /// Current connection state.
     connection_state: Arc<RwLock<ConnectionState>>,
+}
+
+fn zalo_tts_http_client(timeout_secs: u64) -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+}
+
+fn default_zalo_tts_http_client() -> Option<Client> {
+    match zalo_tts_http_client(super::config::DEFAULT_REQUEST_TIMEOUT) {
+        Ok(client) => Some(client),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to create default Zalo TTS HTTP client; default instance is inert until rebuilt with a valid config"
+            );
+            None
+        }
+    }
 }
 
 impl ZaloTts {
@@ -63,8 +82,13 @@ impl ZaloTts {
         );
 
         // Step 1: Request audio URL
-        let response = self
-            .http_client
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            TTSError::InvalidConfiguration(
+                "Zalo TTS default HTTP client is unavailable; construct with ZaloTts::new or from_standard".to_string(),
+            )
+        })?;
+
+        let response = http_client
             .post(crate::core::tts::standard::override_rest_endpoint(
                 ZALO_TTS_ENDPOINT,
                 self.config.endpoint_override.as_deref(),
@@ -141,12 +165,23 @@ impl ZaloTts {
         let audio_url = api_response
             .audio_url()
             .ok_or_else(|| TTSError::ProviderError("No audio URL in response".to_string()))?;
+        let audio_url =
+            crate::core::tts::standard::validate_provider_audio_url("Zalo TTS", audio_url)?;
 
         debug!("Zalo TTS: Downloading audio from {}", audio_url);
 
         // Step 2: Download audio from URL
-        let audio_response = self
-            .http_client
+        let audio_client = crate::core::net::ssrf_protected_client_builder(
+            crate::core::tts::standard::PROVIDER_AUDIO_URL_SCHEMES,
+        )
+        .timeout(std::time::Duration::from_secs(
+            self.config.request_timeout_secs,
+        ))
+        .build()
+        .map_err(|e| {
+            TTSError::NetworkError(format!("Failed to create SSRF-protected audio client: {e}"))
+        })?;
+        let audio_response = audio_client
             .get(audio_url)
             .send()
             .await
@@ -174,18 +209,13 @@ impl ZaloTts {
     /// standardized features via [`ZaloTtsConfig::from_standard`] (which honors `speed` and the
     /// `request_timeout_secs` extra) before constructing the timeout-bounded HTTP client. Features
     /// Zalo cannot express stay at provider defaults (capability gaps).
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let zalo_config = ZaloTtsConfig::from_standard(std)?;
 
         let timeout_secs = zalo_config.request_timeout_secs;
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| {
-                TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
-            })?;
+        let http_client = zalo_tts_http_client(timeout_secs).map_err(|e| {
+            TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         info!(
             "Zalo TTS: Initialized (standardized) with voice='{}', speed={}",
@@ -195,7 +225,7 @@ impl ZaloTts {
 
         Ok(Self {
             config: zalo_config,
-            http_client,
+            http_client: Some(http_client),
             is_ready: AtomicBool::new(false),
             audio_callback: Arc::new(RwLock::new(None)),
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
@@ -222,7 +252,7 @@ impl Default for ZaloTts {
     fn default() -> Self {
         Self {
             config: ZaloTtsConfig::default(),
-            http_client: Client::new(),
+            http_client: default_zalo_tts_http_client(),
             is_ready: AtomicBool::new(false),
             audio_callback: Arc::new(RwLock::new(None)),
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
@@ -236,12 +266,9 @@ impl BaseTTS for ZaloTts {
         let zalo_config = ZaloTtsConfig::from_base(config)?;
 
         let timeout_secs = zalo_config.request_timeout_secs;
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| {
-                TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
-            })?;
+        let http_client = zalo_tts_http_client(timeout_secs).map_err(|e| {
+            TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         info!(
             "Zalo TTS: Initialized with voice='{}', speed={}",
@@ -251,7 +278,7 @@ impl BaseTTS for ZaloTts {
 
         Ok(Self {
             config: zalo_config,
-            http_client,
+            http_client: Some(http_client),
             is_ready: AtomicBool::new(false),
             audio_callback: Arc::new(RwLock::new(None)),
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
@@ -479,6 +506,53 @@ mod tests {
         assert!(!tts.is_ready());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn zalo_tts_redirect_policy_rejects_private_hop() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let tts = ZaloTts::new(make_test_config()).expect("construct Zalo TTS");
+        let err = tts
+            .http_client
+            .as_ref()
+            .expect("strict constructor builds an HTTP client")
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(err) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&err.to_string());
+            source = err.source();
+        }
+        assert!(error_chain.contains("SSRF protection"), "{error_chain}");
+    }
+
     // W1 keystone (TTS): the struct-level `from_standard` builds a real `ZaloTts` through the
     // standardized path, carrying the `speed` feature (Zalo's only prosody knob) AND the
     // `output_audio_format` extra onto the provider config the request builder reads. The wire
@@ -548,6 +622,24 @@ mod tests {
     fn test_default_state() {
         let tts = ZaloTts::default();
         assert!(!tts.is_ready());
+    }
+
+    #[tokio::test]
+    async fn default_without_http_client_returns_typed_error_without_panic() {
+        let mut tts = ZaloTts::default();
+        tts.http_client = None;
+
+        let err = tts
+            .synthesize("Xin chao")
+            .await
+            .expect_err("inert default client must fail with a typed error");
+
+        match err {
+            TTSError::InvalidConfiguration(msg) => {
+                assert!(msg.contains("default HTTP client"), "{msg}");
+            }
+            other => panic!("expected InvalidConfiguration, got {other:?}"),
+        }
     }
 
     #[test]

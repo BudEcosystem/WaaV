@@ -8,6 +8,17 @@ use std::str::FromStr;
 
 use crate::core::stt::base::{STTConfig, STTError};
 
+fn validate_speechmatics_stt_endpoint(source: &str, endpoint: &str) -> Result<(), STTError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, &["ws", "wss"]).map_err(|e| {
+        STTError::ConfigurationError(format!("{source} rejected (SSRF protection): {e}"))
+    })
+}
+
 // =============================================================================
 // Region
 // =============================================================================
@@ -609,16 +620,14 @@ impl SpeechmaticsSTTConfig {
     /// Create configuration from base STTConfig
     pub fn from_base(config: &STTConfig) -> Result<Self, STTError> {
         // API key is required
-        let api_key = if !config.api_key.is_empty() {
-            config.api_key.clone()
-        } else {
-            std::env::var("SPEECHMATICS_API_KEY").map_err(|_| {
+        let api_key = crate::core::credentials::explicit_api_key(&config.api_key)
+            .or_else(|| crate::core::credentials::env_api_key("SPEECHMATICS_API_KEY"))
+            .ok_or_else(|| {
                 STTError::ConfigurationError(
                     "Speechmatics API key required. Set api_key or SPEECHMATICS_API_KEY env var"
                         .to_string(),
                 )
-            })?
-        };
+            })?;
 
         // Parse language
         let language = config
@@ -798,20 +807,26 @@ impl SpeechmaticsSTTConfig {
         }
 
         if let Some(sensitivity) = self.punctuation_sensitivity
-            && !(0.0..=1.0).contains(&sensitivity) {
-                return Err(STTError::ConfigurationError(format!(
-                    "Punctuation sensitivity must be between 0.0 and 1.0, got {}",
-                    sensitivity
-                )));
-            }
+            && !(0.0..=1.0).contains(&sensitivity)
+        {
+            return Err(STTError::ConfigurationError(format!(
+                "Punctuation sensitivity must be between 0.0 and 1.0, got {}",
+                sensitivity
+            )));
+        }
 
         if let Some(max_speakers) = self.max_speakers
-            && (!(1..=20).contains(&max_speakers)) {
-                return Err(STTError::ConfigurationError(format!(
-                    "Max speakers must be between 1 and 20, got {}",
-                    max_speakers
-                )));
-            }
+            && (!(1..=20).contains(&max_speakers))
+        {
+            return Err(STTError::ConfigurationError(format!(
+                "Max speakers must be between 1 and 20, got {}",
+                max_speakers
+            )));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_speechmatics_stt_endpoint("endpoint_override", endpoint)?;
+        }
 
         Ok(())
     }
@@ -871,7 +886,7 @@ mod tests {
     // (diarization, entities, vocabulary, partials) — previously unreachable via the flat factory.
     #[test]
     fn from_standard_unlocks_speechmatics_features() {
-        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "speechmatics".into(),
@@ -1075,6 +1090,52 @@ mod tests {
     fn test_config_validate_valid() {
         let config = SpeechmaticsSTTConfig::new("test-api-key");
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = SpeechmaticsSTTConfig {
+            endpoint_override: Some("wss://speechmatics-proxy.example.com".to_string()),
+            ..SpeechmaticsSTTConfig::new("test-api-key")
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://speechmatics-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-WebSocket endpoint_override must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("https://speechmatics-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("HTTP endpoint_override must be rejected for Speechmatics WebSocket dial");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]

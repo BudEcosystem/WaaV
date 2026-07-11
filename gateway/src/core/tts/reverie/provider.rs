@@ -209,7 +209,11 @@ fn compute_reverie_tts_config_hash(
     // SSML input mode changes how the SAME text is synthesized (markup vs literal), so it must be
     // part of the cache key to avoid serving a literal-text render for an SSML request (or vice
     // versa) — the prior review's audio cache-collision bug class.
-    s.push_str(if reverie_config.ssml_input { "ssml|" } else { "text|" });
+    s.push_str(if reverie_config.ssml_input {
+        "ssml|"
+    } else {
+        "text|"
+    });
 
     // Speaking rate from base config
     if let Some(rate) = config.speaking_rate {
@@ -302,7 +306,7 @@ impl ReverieTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             request_builder,
             config_hash,
         })
@@ -315,9 +319,7 @@ impl ReverieTts {
     /// language + the `format` extra), then constructs the provider via [`Self::with_config`].
     /// Capability gaps (volume, stability, emotion, instructions, ssml, seed, …) have no Reverie
     /// field and stay at their defaults — never fabricated.
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let reverie_config =
             ReverieTtsConfig::from_standard(std).map_err(TTSError::InvalidConfiguration)?;
         Self::with_config(reverie_config)
@@ -342,7 +344,7 @@ impl ReverieTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             request_builder,
             config_hash,
         })
@@ -606,7 +608,9 @@ mod tests {
         assert!(tts.reverie_config().ssml_input);
 
         // (2) … AND the built request body carries the input under `ssml`, with NO `text` array.
-        let body = tts.request_builder.build_request_body("<speak>नमस्ते</speak>");
+        let body = tts
+            .request_builder
+            .build_request_body("<speak>नमस्ते</speak>");
         assert_eq!(body["ssml"], "<speak>नमस्ते</speak>");
         assert!(
             body.get("text").is_none(),

@@ -5,11 +5,9 @@ pub mod aws_transcribe;
 pub mod azure;
 pub mod baidu;
 mod base;
-pub mod bhashini;
-/// Standardized capability-rich STT config (W1 keystone, additive).
-pub mod standard;
 /// Batched / async STT (P5): canonical envelope + per-provider prerecorded request builders.
 pub mod batch;
+pub mod bhashini;
 pub mod cartesia;
 pub mod deepgram;
 pub mod elevenlabs;
@@ -33,9 +31,12 @@ pub mod reverie;
 pub mod sarvam;
 pub mod sberdevices;
 pub mod speechmatics;
+/// Standardized capability-rich STT config (W1 keystone, additive).
+pub mod standard;
 pub mod tencent;
 pub mod tinkoff;
 pub mod viettel_ai;
+pub(crate) mod wav;
 pub mod yandex;
 
 // Re-export public types and traits
@@ -1421,10 +1422,10 @@ mod factory_tests {
 ///         punctuation: true,
 ///         encoding: "linear16".to_string(),
 ///     };
-///     
+///
 ///     // Create provider using factory function
 ///     let mut stt_provider = create_stt_provider("deepgram", config).unwrap();
-///     
+///
 ///     // Register a callback for results
 ///     let callback = Arc::new(|result: STTResult| {
 ///         Box::pin(async move {
@@ -1432,13 +1433,13 @@ mod factory_tests {
 ///             println!("Final: {}, Confidence: {:.2}", result.is_final, result.confidence);
 ///         }) as Pin<Box<dyn Future<Output = ()> + Send>>
 ///     });
-///     
+///
 ///     stt_provider.on_result(callback).await.unwrap();
-///     
+///
 ///     // Send audio data
 ///     let audio_data = vec![0u8; 1024]; // Your audio bytes here
 ///     stt_provider.send_audio(audio_data.into()).await.unwrap();
-///     
+///
 ///     // Disconnect when done
 ///     stt_provider.disconnect().await.unwrap();
 /// }

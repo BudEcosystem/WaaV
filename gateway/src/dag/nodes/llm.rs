@@ -565,12 +565,18 @@ mod tests {
 
         // Each finished sentence emits separately (per-sentence TTS chunks).
         let mut agg = SentenceAggregator::default();
-        assert_eq!(agg.push_str("One. Two! Three? tail"), vec!["One.", "Two!", "Three?"]);
+        assert_eq!(
+            agg.push_str("One. Two! Three? tail"),
+            vec!["One.", "Two!", "Three?"]
+        );
         assert_eq!(agg.flush().as_deref(), Some("tail"));
 
         // The lookahead guards: decimals/abbreviations never split mid-token.
         let mut agg = SentenceAggregator::default();
-        assert_eq!(agg.push_str("Pi is 3.14. Mr. Tau wins. End"), vec!["Pi is 3.14.", "Mr. Tau wins."]);
+        assert_eq!(
+            agg.push_str("Pi is 3.14. Mr. Tau wins. End"),
+            vec!["Pi is 3.14.", "Mr. Tau wins."]
+        );
     }
 
     #[test]

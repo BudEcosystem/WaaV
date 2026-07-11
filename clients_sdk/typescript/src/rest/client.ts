@@ -8,9 +8,33 @@ import { buildKeepAliveInit, type KeepAliveInit, type KeepAliveAgentOptions } fr
 import { cloneVoice, cloneVoiceAndWait, getClonedVoiceStatus } from './voice.js';
 import type { VoiceCloneRequest, VoiceCloneResponse } from '../types/voice.js';
 import type { Voice, VoiceListResponse, TTSSynthesisResult } from '../types/tts.js';
-import type { LiveKitTokenRequest, LiveKitTokenResponse, RoomInfo, RoomListResponse } from '../types/livekit.js';
-import type { SIPHook, SIPHookListResponse, SIPHookCreateRequest, SIPHookCreateResponse } from '../types/sip.js';
+import type {
+  LiveKitTokenRequest,
+  LiveKitTokenResponse,
+  RoomInfo,
+  RoomListResponse,
+  RemoveParticipantResponse,
+  MuteParticipantResponse,
+} from '../types/livekit.js';
+import type {
+  SIPHook,
+  SIPHookListResponse,
+  SIPHookCreateRequest,
+  SIPHookCreateResponse,
+  SIPTransferRequest,
+  SIPTransferResponse,
+} from '../types/sip.js';
 import type { STTConfig, TranslationConfig } from '../types/config.js';
+import type {
+  DAGDefinition,
+  DAGTemplateListResponse,
+  DAGTemplateDetail,
+  DAGValidateResponse,
+} from '../types/dag.js';
+import type {
+  LanguageCapabilitiesResponse,
+  ProviderLanguageSupport,
+} from '../types/canonical-languages.js';
 
 /**
  * Batch-only STT knobs that the streaming path drops but ARE batch-capable on
@@ -99,6 +123,11 @@ export interface RestClientOptions {
    * pre-configured `fetch`). No-op in the browser, where `fetch` already pools.
    */
   keepAlive?: boolean | KeepAliveAgentOptions;
+  /**
+   * Backoff retries on a transient 429/503 before giving up (default: 3 —
+   * matches the Python SDK's `max_retries`). 0 disables retrying.
+   */
+  retries?: number;
 }
 
 /**
@@ -118,11 +147,14 @@ export class RestClient {
    */
   private keepAliveInit: KeepAliveInit;
 
+  private readonly maxRetries: number;
+
   constructor(options: RestClientOptions) {
     // Remove trailing slash from base URL
     this.baseUrl = options.baseUrl.replace(/\/+$/, '');
     this.apiKey = options.apiKey;
     this.timeout = options.timeout ?? 30000;
+    this.maxRetries = Math.max(0, options.retries ?? 3);
     this.fetchFn = options.fetch ?? globalThis.fetch;
     this.customHeaders = options.headers ?? {};
     // D7: install the keep-alive agent under Node (no-op in the browser). Pass
@@ -135,9 +167,45 @@ export class RestClient {
   }
 
   /**
-   * Make an authenticated request
+   * Make an authenticated request, auto-retrying transient saturation.
+   *
+   * 429 (per-IP rate limit) and 503 (global capacity) are back-off-and-retry
+   * signals, not fatal errors. Mirrors the Python SDK's policy exactly
+   * (max 3 retries; Retry-After honored, else exponential base capped at 15s,
+   * ±20% jitter) — the two SDKs previously diverged: Python rode out a blip
+   * while TypeScript threw on the first 429.
    */
   private async request<T>(
+    method: string,
+    path: string,
+    options?: {
+      body?: unknown;
+      headers?: Record<string, string>;
+      timeout?: number;
+    }
+  ): Promise<T> {
+    const maxRetries = this.maxRetries;
+    let attempt = 0;
+    for (;;) {
+      try {
+        return await this.requestOnce<T>(method, path, options);
+      } catch (err) {
+        if (!(err instanceof RateLimitError) || attempt >= maxRetries) {
+          throw err;
+        }
+        const baseMs = err.retryAfterMs ?? Math.min(2 ** attempt, 15) * 1000;
+        const jitter = baseMs * 0.2 * (Math.random() * 2 - 1);
+        this.metrics.increment('rest.retries');
+        await new Promise((r) => setTimeout(r, Math.max(0, baseMs + jitter)));
+        attempt += 1;
+      }
+    }
+  }
+
+  /**
+   * One authenticated request attempt (no retry) — the raw wire call.
+   */
+  private async requestOnce<T>(
     method: string,
     path: string,
     options?: {
@@ -323,13 +391,23 @@ export class RestClient {
       format?: string;
     }
   ): Promise<TTSSynthesisResult> {
+    // Gateway SpeakRequest (handlers/speak.rs) is `{ text, tts_config: TTSWebSocketConfig }` —
+    // tts_config is required and NOT flattened. The previous flat body was missing it, so every
+    // one-shot synthesize 422'd. Mirror the Python SDK's nested shape.
+    const ttsConfig: Record<string, unknown> = {
+      provider: options?.provider ?? 'deepgram',
+      model: options?.model ?? 'aura-asteria-en',
+      sample_rate: options?.sampleRate ?? 24000,
+    };
+    if (options?.voice !== undefined) {
+      ttsConfig.voice_id = options.voice;
+    }
+    if (options?.format !== undefined) {
+      ttsConfig.audio_format = options.format;
+    }
     const body = {
       text,
-      provider: options?.provider,
-      voice_id: options?.voice,
-      model: options?.model,
-      sample_rate: options?.sampleRate,
-      audio_format: options?.format,
+      tts_config: ttsConfig,
     };
 
     const startTime = Date.now();
@@ -398,6 +476,72 @@ export class RestClient {
     return response.rooms;
   }
 
+  /**
+   * Remove (forcibly disconnect) a participant from a LiveKit room.
+   *
+   * Gateway route: `DELETE /livekit/participant` with a JSON body
+   * `{ room_name, participant_identity }` (gateway `RemoveParticipantRequest`,
+   * handlers/livekit/participants.rs — both fields required). The room name is
+   * normalized with the auth prefix server-side for tenant isolation.
+   *
+   * @param roomName Room name (un-prefixed; the gateway normalizes it).
+   * @param identity Identity of the participant to remove.
+   */
+  async removeLiveKitParticipant(roomName: string, identity: string): Promise<RemoveParticipantResponse> {
+    const wire = await this.request<{
+      status: string;
+      room_name: string;
+      participant_identity: string;
+    }>('DELETE', '/livekit/participant', {
+      body: { room_name: roomName, participant_identity: identity },
+    });
+    return {
+      status: wire.status,
+      roomName: wire.room_name,
+      participantIdentity: wire.participant_identity,
+    };
+  }
+
+  /**
+   * Mute or unmute a participant's published track in a LiveKit room.
+   *
+   * Gateway route: `POST /livekit/participant/mute` with a JSON body
+   * `{ room_name, participant_identity, track_sid, muted }` (gateway
+   * `MuteParticipantRequest`, handlers/livekit/participants.rs — all four
+   * fields required).
+   *
+   * @param roomName Room name (un-prefixed; the gateway normalizes it).
+   * @param identity Identity of the participant whose track to mute.
+   * @param trackSid Session ID of the track to mute/unmute (e.g. `TR_abc123`).
+   * @param muted `true` to mute (default), `false` to unmute.
+   */
+  async muteLiveKitParticipant(
+    roomName: string,
+    identity: string,
+    trackSid: string,
+    muted = true
+  ): Promise<MuteParticipantResponse> {
+    const wire = await this.request<{
+      room_name: string;
+      participant_identity: string;
+      track_sid: string;
+      muted: boolean;
+    }>('POST', '/livekit/participant/mute', {
+      body: {
+        room_name: roomName,
+        participant_identity: identity,
+        track_sid: trackSid,
+        muted,
+      },
+    });
+    return {
+      roomName: wire.room_name,
+      participantIdentity: wire.participant_identity,
+      trackSid: wire.track_sid,
+      muted: wire.muted,
+    };
+  }
+
   // ============================================================================
   // SIP
   // ============================================================================
@@ -411,17 +555,60 @@ export class RestClient {
   }
 
   /**
-   * Create or update a SIP webhook hook
+   * Create or update a SIP webhook hook.
+   *
+   * The gateway `SipHooksRequest` (handlers/sip/hooks.rs) is an envelope:
+   * `{ hooks: [{ host, url }] }` — `hooks` is serde-defaulted, so a flat body
+   * silently deserialized to an EMPTY list (a no-op). Wrap the entry.
    */
   async createSIPHook(request: SIPHookCreateRequest): Promise<SIPHookCreateResponse> {
-    return this.request<SIPHookCreateResponse>('POST', '/sip/hooks', { body: request });
+    return this.request<SIPHookCreateResponse>('POST', '/sip/hooks', {
+      body: { hooks: [request] },
+    });
   }
 
   /**
-   * Delete a SIP webhook hook
+   * Delete a SIP webhook hook.
+   *
+   * The gateway route is `DELETE /sip/hooks` with a JSON body `{ hosts: [...] }`
+   * (there is no `/sip/hooks/{host}` route — the previous path-param form 404'd).
    */
   async deleteSIPHook(host: string): Promise<void> {
-    await this.request<void>('DELETE', `/sip/hooks/${encodeURIComponent(host)}`);
+    await this.request<void>('DELETE', '/sip/hooks', { body: { hosts: [host] } });
+  }
+
+  /**
+   * Transfer an active SIP call (SIP REFER) to another number.
+   *
+   * Gateway route: `POST /sip/transfer` with a JSON body
+   * `{ room_name, participant_identity, transfer_to }` (gateway
+   * `SIPTransferRequest`, handlers/sip/transfer.rs — ALL THREE required;
+   * there is no `stream_id` field on this endpoint). The participant must be
+   * a SIP participant in the room; `transferTo` accepts international
+   * (`+1234567890`), national (`07123456789`), or extension (`1234`) formats.
+   *
+   * @returns Transfer status — `"completed"`, or `"initiated"` when the
+   * confirmation timed out but the transfer likely succeeded.
+   */
+  async sipTransfer(request: SIPTransferRequest): Promise<SIPTransferResponse> {
+    const wire = await this.request<{
+      status: string;
+      room_name: string;
+      participant_identity: string;
+      transfer_to: string;
+    }>('POST', '/sip/transfer', {
+      body: {
+        room_name: request.roomName,
+        participant_identity: request.participantIdentity,
+        transfer_to: request.transferTo,
+      },
+    });
+    return {
+      status: wire.status,
+      roomName: wire.room_name,
+      participantIdentity: wire.participant_identity,
+      transferTo: wire.transfer_to,
+    };
   }
 
   // ============================================================================
@@ -521,6 +708,135 @@ export class RestClient {
   /** Poll a batch job (`GET /transcribe/batch/{job_id}`). */
   async getBatchJob(jobId: string): Promise<BatchJob> {
     return this.request<BatchJob>('GET', `/transcribe/batch/${encodeURIComponent(jobId)}`);
+  }
+
+  // ============================================================================
+  // DAG Templates (gateway handlers/dag.rs)
+  // ============================================================================
+
+  /**
+   * List the registered DAG templates (`GET /dag/templates`).
+   *
+   * Gateway `ListTemplatesResponse`: `{ templates: [{ name, version,
+   * description }], count }` — wire field names are returned verbatim.
+   * Returns 501 when the gateway was built without `--features dag-routing`.
+   */
+  async listDAGTemplates(): Promise<DAGTemplateListResponse> {
+    return this.request<DAGTemplateListResponse>('GET', '/dag/templates');
+  }
+
+  /**
+   * Get one DAG template by name (`GET /dag/templates/{name}`).
+   *
+   * Gateway response: `{ name, template }` where `template` is the
+   * gateway-side `DAGDefinition` (snake_case: `entry_node`, `exit_nodes`, …).
+   * 404s when the template does not exist.
+   */
+  async getDAGTemplate(name: string): Promise<DAGTemplateDetail> {
+    return this.request<DAGTemplateDetail>('GET', `/dag/templates/${encodeURIComponent(name)}`);
+  }
+
+  /**
+   * Validate a DAG definition server-side (`POST /dag/validate`).
+   *
+   * The body is `{ dag: <definition> }` (gateway `ValidateDAGRequest`) and the
+   * definition is passed through VERBATIM — the gateway parses it as its own
+   * `DAGDefinition`, which additionally requires `entry_node` (string) and
+   * `exit_nodes` (string[]) beyond the client-side {@link DAGDefinition}
+   * shape; missing fields come back as `valid: false` with parse errors
+   * rather than throwing.
+   */
+  async validateDAG(definition: DAGDefinition | Record<string, unknown>): Promise<DAGValidateResponse> {
+    const wire = await this.request<{
+      valid: boolean;
+      errors: string[];
+      warnings: string[];
+      node_count: number;
+      edge_count: number;
+    }>('POST', '/dag/validate', { body: { dag: definition } });
+    return {
+      valid: wire.valid,
+      errors: wire.errors,
+      warnings: wire.warnings,
+      nodeCount: wire.node_count,
+      edgeCount: wire.edge_count,
+    };
+  }
+
+  // ============================================================================
+  // Metrics
+  // ============================================================================
+
+  /**
+   * Fetch the gateway's Prometheus metrics (`GET /metrics`).
+   *
+   * The gateway serves this as a Prometheus **text exposition**
+   * (`text/plain`) — turn counters, frame latencies, provider health, etc.
+   *
+   * @returns The raw exposition text (parse with a Prometheus client library,
+   * or scrape directly).
+   */
+  async getMetrics(): Promise<string> {
+    return this.request<string>('GET', '/metrics');
+  }
+
+  // ============================================================================
+  // Capability Discovery (gateway handlers/capabilities.rs)
+  // ============================================================================
+
+  /**
+   * Fetch the live unified-language support matrix
+   * (`GET /capabilities/languages`) — the authoritative, always-current
+   * counterpart to the SDK's static `languageCapabilities()` table.
+   *
+   * Gateway `LanguageCapabilitiesResponse`: `{ canonical_languages: [{ bcp47,
+   * lang_subtag, iso639_1, region }], providers: [{ provider, notation,
+   * supports_auto, example_cmn_cn, example_en_us }], canonical_count }`.
+   *
+   * The endpoint takes NO query parameters — when `provider` is given the
+   * `providers` rows are filtered CLIENT-side (an unknown provider yields an
+   * empty `providers` array; the canonical language list is always returned
+   * in full).
+   */
+  async getLanguageCapabilities(provider?: string): Promise<LanguageCapabilitiesResponse> {
+    const wire = await this.request<{
+      canonical_languages: Array<{
+        bcp47: string;
+        lang_subtag: string;
+        iso639_1: string;
+        region: string;
+      }>;
+      providers: Array<{
+        provider: string;
+        notation: ProviderLanguageSupport['notation'];
+        supports_auto: boolean;
+        example_cmn_cn: string | null;
+        example_en_us: string | null;
+      }>;
+      canonical_count: number;
+    }>('GET', '/capabilities/languages');
+
+    let providers: ProviderLanguageSupport[] = wire.providers.map((p) => ({
+      provider: p.provider,
+      notation: p.notation,
+      supportsAuto: p.supports_auto,
+      exampleCmnCn: p.example_cmn_cn ?? null,
+      exampleEnUs: p.example_en_us ?? null,
+    }));
+    if (provider !== undefined) {
+      providers = providers.filter((p) => p.provider === provider);
+    }
+
+    return {
+      canonicalLanguages: wire.canonical_languages.map((c) => ({
+        bcp47: c.bcp47,
+        langSubtag: c.lang_subtag,
+        iso6391: c.iso639_1,
+        region: c.region,
+      })),
+      providers,
+      canonicalCount: wire.canonical_count,
+    };
   }
 }
 

@@ -37,11 +37,13 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
 use tokio::time::{Instant, interval, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::form_urlencoded;
 
 use super::config::IbmWatsonSTTConfig;
 use super::messages::{IbmWatsonMessage, StopMessage};
+use crate::core::resilience::connect::with_timeout;
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
@@ -60,6 +62,15 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 /// Per-message idle timeout for WebSocket message reception.
 /// Resets after each successful message. Catches stuck/dead connections.
 const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn ibm_stt_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(4)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()
+}
 
 /// The concrete WebSocket stream type IBM Watson dials.
 type IbmWatsonWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -81,8 +92,8 @@ struct IbmWatsonTransport {
     ws_stream: SplitStream<IbmWatsonWs>,
     /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
     audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
-    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
-    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    /// Shared shutdown token (an intentional close must not reconnect).
+    shutdown_token: CancellationToken,
     result_tx: mpsc::Sender<STTResult>,
     error_tx: mpsc::Sender<STTError>,
     /// Fires once after the featured session is (re)established (we saw `listening`), unblocking
@@ -96,6 +107,19 @@ struct IbmWatsonTransport {
     interim_results_enabled: bool,
     /// Wall clock of the last audio chunk, for the keep-alive silence frames.
     last_audio_time: Instant,
+}
+
+impl IbmWatsonTransport {
+    async fn shutdown_gracefully(
+        ws_sink: &mut SplitSink<IbmWatsonWs, Message>,
+    ) -> ReconnectOutcome {
+        let stop_message = StopMessage::new();
+        if let Ok(stop_json) = serde_json::to_string(&stop_message) {
+            let _ = ws_sink.send(Message::Text(stop_json.into())).await;
+        }
+        let _ = ws_sink.send(Message::Close(None)).await;
+        ReconnectOutcome::Completed
+    }
 }
 
 #[async_trait::async_trait]
@@ -142,8 +166,12 @@ impl WsTransport for IbmWatsonTransport {
     }
 
     async fn run(&mut self) -> ReconnectOutcome {
+        let shutdown_token = self.shutdown_token.clone();
+        if shutdown_token.is_cancelled() {
+            info!("Received shutdown signal for IBM Watson STT");
+            return Self::shutdown_gracefully(&mut self.ws_sink).await;
+        }
         let mut audio_rx = self.audio_rx.lock().await;
-        let mut shutdown_rx = self.shutdown_rx.lock().await;
         let mut keepalive_timer = interval(Duration::from_secs(5));
         loop {
             tokio::select! {
@@ -235,15 +263,9 @@ impl WsTransport for IbmWatsonTransport {
                 }
 
                 // Handle shutdown signal (intentional close — must NOT reconnect)
-                _ = &mut *shutdown_rx => {
+                _ = shutdown_token.cancelled() => {
                     info!("Received shutdown signal for IBM Watson STT");
-                    // Send stop message to gracefully end recognition
-                    let stop_message = StopMessage::new();
-                    if let Ok(stop_json) = serde_json::to_string(&stop_message) {
-                        let _ = self.ws_sink.send(Message::Text(stop_json.into())).await;
-                    }
-                    let _ = self.ws_sink.send(Message::Close(None)).await;
-                    return ReconnectOutcome::Completed;
+                    return Self::shutdown_gracefully(&mut self.ws_sink).await;
                 }
             }
         }
@@ -298,16 +320,9 @@ struct IamTokenResponse {
 
 /// Fetch IAM access token from IBM Cloud using API key.
 async fn fetch_iam_token(api_key: &str, iam_url: &str) -> Result<IamToken, STTError> {
-    // Create client with explicit timeouts to prevent indefinite hangs
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .connect_timeout(Duration::from_secs(10))
-        .pool_max_idle_per_host(4) // Limit connection pool size
-        .pool_idle_timeout(Duration::from_secs(90)) // Close idle connections after 90s
-        .build()
-        .map_err(|e| {
-            STTError::AuthenticationFailed(format!("Failed to create HTTP client: {e}"))
-        })?;
+    let client = ibm_stt_http_client().map_err(|e| {
+        STTError::AuthenticationFailed(format!("Failed to create HTTP client: {e}"))
+    })?;
 
     // URL-encode the API key
     let encoded_api_key: String = form_urlencoded::byte_serialize(api_key.as_bytes()).collect();
@@ -440,8 +455,8 @@ pub struct IbmWatsonSTT {
     /// Uses bounded channel (32 items) for backpressure.
     ws_sender: Option<mpsc::Sender<Bytes>>,
 
-    /// Shutdown signal sender.
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Shutdown token shared with supervised transports.
+    shutdown_token: Option<CancellationToken>,
 
     /// Result channel sender.
     result_tx: Option<mpsc::Sender<STTResult>>,
@@ -471,8 +486,8 @@ pub struct IbmWatsonSTT {
     connected: Arc<AtomicBool>,
 
     /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
-    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
-    /// server-side close can never trigger a spurious reconnect.
+    /// `connect()`, set in `disconnect()` before cancelling the shutdown token, so a client close
+    /// racing a server-side close can never trigger a spurious reconnect.
     intentional_disconnect: Arc<AtomicBool>,
 
     /// Shared, process-global resilience handles (W-D2): the single reconnect governor + this
@@ -490,7 +505,7 @@ impl Default for IbmWatsonSTT {
             state: ConnectionState::Disconnected,
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             result_tx: None,
             error_tx: None,
             connection_handle: None,
@@ -520,12 +535,15 @@ impl IbmWatsonSTT {
                 "IBM Watson API key is required".to_string(),
             ));
         }
+        let ibm_config =
+            IbmWatsonSTTConfig::from_standard(std).map_err(STTError::ConfigurationError)?;
+
         Ok(Self {
-            config: Some(IbmWatsonSTTConfig::from_standard(std)),
+            config: Some(ibm_config),
             state: ConnectionState::Disconnected,
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             result_tx: None,
             error_tx: None,
             connection_handle: None,
@@ -571,9 +589,10 @@ impl IbmWatsonSTT {
         {
             let token_guard = self.iam_token.read().await;
             if let Some(token) = token_guard.as_ref()
-                && !token.is_expired() {
-                    return Ok(token.access_token.clone());
-                }
+                && !token.is_expired()
+            {
+                return Ok(token.access_token.clone());
+            }
         }
 
         // Need to fetch a new token
@@ -615,9 +634,10 @@ impl IbmWatsonSTT {
 
                                 if let Some(stt_result) = result.to_stt_result()
                                     && !stt_result.transcript.is_empty()
-                                        && result_tx.try_send(stt_result).is_err() {
-                                            warn!("Failed to send result - channel closed");
-                                        }
+                                    && result_tx.try_send(stt_result).is_err()
+                                {
+                                    warn!("Failed to send result - channel closed");
+                                }
                             }
                         }
 
@@ -698,6 +718,9 @@ impl IbmWatsonSTT {
                 "IBM Watson instance_id is required. Set it using set_instance_id()".to_string(),
             ));
         }
+        config
+            .validate_endpoint_override()
+            .map_err(STTError::ConfigurationError)?;
 
         // Get access token
         let access_token = self.get_access_token().await?;
@@ -707,7 +730,7 @@ impl IbmWatsonSTT {
 
         // Create channels for communication
         let (ws_tx, ws_rx) = mpsc::channel::<Bytes>(32);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_token = CancellationToken::new();
         // Bounded channels for backpressure - 256 should handle bursts while preventing memory exhaustion
         let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
         let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
@@ -715,7 +738,7 @@ impl IbmWatsonSTT {
 
         // Store channels
         self.ws_sender = Some(ws_tx);
-        self.shutdown_tx = Some(shutdown_tx);
+        self.shutdown_token = Some(shutdown_token.clone());
         self.result_tx = Some(result_tx.clone());
         self.error_tx = Some(error_tx.clone());
 
@@ -725,10 +748,9 @@ impl IbmWatsonSTT {
         let connected_flag = self.connected.clone();
 
         // Shared state the supervised transport re-uses across reconnect attempts: a single-
-        // consumer audio receiver + shutdown oneshot (locked per `run`) and the one-shot connected
-        // signal that fires after the featured session (start + listening) is restored.
+        // consumer audio receiver, shutdown token, and the one-shot connected signal that fires
+        // after the featured session (start + listening) is restored.
         let audio_rx = Arc::new(Mutex::new(ws_rx));
-        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
         let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
 
         // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor (the
@@ -743,10 +765,9 @@ impl IbmWatsonSTT {
                 r.breaker,
                 (*r.governor).clone(),
             ),
-            None => ReconnectableStream::new(ReconnectableStreamConfig::new(
-                "ibm_watson",
-                reconnection,
-            )),
+            None => {
+                ReconnectableStream::new(ReconnectableStreamConfig::new("ibm_watson", reconnection))
+            }
         }
         .with_disconnect_flag(disconnect_flag);
 
@@ -760,7 +781,7 @@ impl IbmWatsonSTT {
                     let ws_url = ws_url.clone();
                     let start_message = start_message.clone();
                     let audio_rx = Arc::clone(&audio_rx);
-                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let shutdown_token = shutdown_token.clone();
                     let connected_tx = Arc::clone(&connected_tx);
                     let connected_flag = connected_flag.clone();
                     let result_tx = result_tx.clone();
@@ -769,8 +790,12 @@ impl IbmWatsonSTT {
                         // Connect to IBM Watson with timeout. Classify auth failures as Fatal-ish
                         // dial errors via the error message (the supervisor records the dial failure
                         // and backs off; a persistent 401 exhausts rather than loops forever).
+                        // Deadline-bounded dial via the shared resilience helper. IBM keeps its
+                        // historical 30s bound (looser than the canonical 15s
+                        // `core::resilience::connect::WS_CONNECT_TIMEOUT`).
                         let connect_result =
-                            match timeout(Duration::from_secs(30), connect_async(&ws_url)).await {
+                            match with_timeout(Duration::from_secs(30), connect_async(&ws_url)).await
+                            {
                                 Ok(result) => result,
                                 Err(_) => {
                                     return Err(StreamError::new(
@@ -810,7 +835,7 @@ impl IbmWatsonSTT {
                             ws_sink,
                             ws_stream,
                             audio_rx,
-                            shutdown_rx,
+                            shutdown_token,
                             result_tx,
                             error_tx,
                             connected_tx,
@@ -891,18 +916,16 @@ impl IbmWatsonSTT {
     /// The shared circuit breaker this session feeds into the generic supervisor, if the
     /// process-global resilience handles have been injected (W-D1/W-D2). Two `IbmWatsonSTT` built
     /// from the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
-    pub fn resilience_breaker(
-        &self,
-    ) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
         self.resilience.as_ref().map(|r| &r.breaker)
     }
 }
 
 impl Drop for IbmWatsonSTT {
     fn drop(&mut self) {
-        // Send shutdown signal if still connected
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
     }
 }
@@ -930,7 +953,7 @@ impl BaseSTT for IbmWatsonSTT {
             state: ConnectionState::Disconnected,
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             result_tx: None,
             error_tx: None,
             connection_handle: None,
@@ -961,30 +984,40 @@ impl BaseSTT for IbmWatsonSTT {
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
-        // Record the intent BEFORE firing shutdown_tx so the supervisor sees it even if the
-        // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
+        // Record the intent BEFORE cancelling the shutdown token so the supervisor sees it even if
+        // the transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
         self.intentional_disconnect.store(true, Ordering::SeqCst);
 
-        // Send shutdown signal
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
 
         // Wait for connection task to finish with timeout
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "ibm-watson-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         // Clean up result forwarding task
         if let Some(handle) = self.result_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task(
+                "ibm-watson-stt-result-forwarder",
+                handle,
+            )
+            .await;
         }
 
         // Clean up error forwarding task
         if let Some(handle) = self.error_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task(
+                "ibm-watson-stt-error-forwarder",
+                handle,
+            )
+            .await;
         }
 
         // Clear all channels
@@ -1235,6 +1268,57 @@ impl IbmWatsonSTT {
 #[cfg(test)]
 mod wd1_disconnect_tests {
     use super::*;
+    use std::io::ErrorKind;
+
+    #[tokio::test]
+    async fn ibm_watson_stt_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!("Skipping ibm_watson_stt_redirect_policy_rejects_private_hop: {err}");
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = ibm_stt_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
+    }
 
     // W-D1: disconnect() must record intent on the supervisor-shared flag so a client close racing
     // a server-side close can never trigger a spurious reconnect (the supervisor's loop-top guard

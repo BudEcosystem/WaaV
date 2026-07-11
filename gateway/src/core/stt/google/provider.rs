@@ -6,6 +6,7 @@ use bytes::Bytes;
 use google_api_proto::google::cloud::speech::v2::StreamingRecognizeRequest;
 use google_api_proto::google::cloud::speech::v2::speech_client::SpeechClient;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 use crate::core::providers::google::{
@@ -24,12 +25,22 @@ use crate::core::websocket::reconnectable_stream::{
 use super::config::GoogleSTTConfig;
 use super::streaming::{
     KEEPALIVE_INTERVAL_SECS, KeepaliveTracker, build_audio_request, build_config_request,
-    chunk_audio, handle_grpc_error, handle_streaming_response,
+    chunk_audio, handle_grpc_error, handle_streaming_response, validate_keepalive_audio_geometry,
 };
 
 /// Per-message idle timeout for the gRPC response stream — resets after each successful message.
 /// Catches stuck/dead connections while allowing active streams to continue.
 const GRPC_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub(super) fn google_speech_grpc_endpoint(config: &GoogleSTTConfig) -> String {
+    config
+        .endpoint_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| GOOGLE_SPEECH_ENDPOINT.to_string())
+}
 
 /// A [`WsTransport`] (the trait is transport-agnostic despite the `Ws` name) that adapts Google
 /// STT's gRPC **bidirectional** streaming to the generic [`ReconnectableStream`] supervisor (W-D1
@@ -59,8 +70,8 @@ struct GoogleTransport {
     channels: u32,
     /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
     audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
-    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
-    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    /// Shared shutdown token (fires once; an intentional close must not reconnect).
+    shutdown_token: CancellationToken,
     result_tx: mpsc::Sender<STTResult>,
     error_tx: mpsc::Sender<STTError>,
     /// Fires once on the first successful stream open, unblocking `start_connection`.
@@ -86,12 +97,18 @@ impl WsTransport for GoogleTransport {
         // `'static`, which `streaming_recognize` requires. The guards are released when the stream
         // is dropped at the end of this attempt, so the next reconnect re-locks the same receivers.
         let mut audio_rx = Arc::clone(&self.audio_rx).lock_owned().await;
-        let mut shutdown_rx = Arc::clone(&self.shutdown_rx).lock_owned().await;
         let initial_config = self.initial_config.clone();
         let recognizer_for_stream = self.recognizer_path.clone();
         let sample_rate = self.sample_rate;
         let channels = self.channels;
+        let shutdown_token = self.shutdown_token.clone();
         let shutdown_seen = Arc::clone(&self.shutdown_seen);
+        if let Err(e) = validate_keepalive_audio_geometry(sample_rate, channels) {
+            error!("Invalid Google STT keepalive audio geometry: {}", e);
+            let _ = self.error_tx.try_send(e);
+            return ReconnectOutcome::Fatal(StreamError::new("invalid keepalive audio geometry"));
+        }
+        let error_tx = self.error_tx.clone();
 
         // Build the request stream for THIS attempt. It re-yields the featured config first, then
         // forwards audio + keep-alive. The owned guards are moved into the generator so it is
@@ -105,6 +122,12 @@ impl WsTransport for GoogleTransport {
             let mut keepalive_tracker = KeepaliveTracker::new(sample_rate, channels);
 
             loop {
+                if shutdown_token.is_cancelled() {
+                    info!("Shutdown signal received, ending Google request stream");
+                    shutdown_seen.store(true, std::sync::atomic::Ordering::Release);
+                    break;
+                }
+
                 tokio::select! {
                     biased;
 
@@ -125,13 +148,21 @@ impl WsTransport for GoogleTransport {
 
                     _ = keepalive_timer.tick() => {
                         if keepalive_tracker.needs_keepalive() {
-                            let silence = keepalive_tracker.generate_keepalive();
+                            let silence = match keepalive_tracker.generate_keepalive() {
+                                Ok(silence) => silence,
+                                Err(e) => {
+                                    error!("Failed to generate Google STT keepalive audio: {}", e);
+                                    let _ = error_tx.try_send(e);
+                                    shutdown_seen.store(true, std::sync::atomic::Ordering::Release);
+                                    break;
+                                }
+                            };
                             yield build_audio_request(silence, recognizer_for_stream.clone());
                             keepalive_tracker.touch();
                         }
                     }
 
-                    _ = &mut *shutdown_rx => {
+                    _ = shutdown_token.cancelled() => {
                         info!("Shutdown signal received, ending Google request stream");
                         shutdown_seen.store(true, std::sync::atomic::Ordering::Release);
                         break;
@@ -144,7 +175,10 @@ impl WsTransport for GoogleTransport {
             Ok(r) => r,
             Err(e) => {
                 let stt_error = handle_grpc_error(e.clone());
-                error!("Failed to start Google streaming recognition: {}", stt_error);
+                error!(
+                    "Failed to start Google streaming recognition: {}",
+                    stt_error
+                );
                 let _ = self.error_tx.try_send(stt_error);
                 // Connection-level gRPC errors (Unavailable, etc.) are reconnectable; auth/config
                 // are fatal. Reuse the status-code classification.
@@ -155,7 +189,10 @@ impl WsTransport for GoogleTransport {
         let mut response_stream = response.into_inner();
         loop {
             // If a shutdown was requested while draining, stop cleanly.
-            if self.shutdown_seen.load(std::sync::atomic::Ordering::Acquire) {
+            if self
+                .shutdown_seen
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
                 return ReconnectOutcome::Completed;
             }
             match tokio::time::timeout(GRPC_MESSAGE_TIMEOUT, response_stream.message()).await {
@@ -163,12 +200,17 @@ impl WsTransport for GoogleTransport {
                     if let Err(e) = handle_streaming_response(msg, &self.result_tx) {
                         error!("Error handling Google streaming response: {}", e);
                         let _ = self.error_tx.try_send(e);
-                        return ReconnectOutcome::Fatal(StreamError::new("provider response error"));
+                        return ReconnectOutcome::Fatal(StreamError::new(
+                            "provider response error",
+                        ));
                     }
                 }
                 Ok(Ok(None)) => {
                     info!("Google Speech-to-Text stream ended");
-                    if self.shutdown_seen.load(std::sync::atomic::Ordering::Acquire) {
+                    if self
+                        .shutdown_seen
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
                         return ReconnectOutcome::Completed;
                     }
                     return ReconnectOutcome::Reconnectable(StreamError::new("stream ended"));
@@ -286,13 +328,13 @@ pub struct GoogleSTT {
     pub(super) config: Option<GoogleSTTConfig>,
     pub(super) state: ConnectionState,
     /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
-    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// `connect()`, set in `disconnect()` before cancelling `shutdown_token`, so a client close racing a
     /// server-side close can never trigger a spurious reconnect.
     pub(super) intentional_disconnect: Arc<AtomicBool>,
     pub(super) state_notify: Arc<Notify>,
     /// Audio sender uses Bytes for zero-copy transfer
     pub(super) audio_sender: Option<mpsc::Sender<Bytes>>,
-    pub(super) shutdown_tx: Option<oneshot::Sender<()>>,
+    pub(super) shutdown_token: Option<CancellationToken>,
     pub(super) result_tx: Option<mpsc::Sender<STTResult>>,
     /// Channel for propagating streaming errors to the client
     pub(super) error_tx: Option<mpsc::Sender<STTError>>,
@@ -320,7 +362,7 @@ impl Default for GoogleSTT {
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             audio_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             result_tx: None,
             error_tx: None,
             connection_handle: None,
@@ -357,6 +399,9 @@ impl GoogleSTT {
             ));
         }
         let google_config = GoogleSTTConfig::from_standard(std);
+        google_config
+            .validate_endpoint_override()
+            .map_err(STTError::ConfigurationError)?;
         let auth_client = STTGoogleAuthClient::from_api_key(&std.base.api_key)?;
         Ok(Self {
             config: Some(google_config),
@@ -364,7 +409,7 @@ impl GoogleSTT {
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             audio_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             result_tx: None,
             error_tx: None,
             connection_handle: None,
@@ -403,7 +448,7 @@ impl GoogleSTT {
 
         // Use smaller buffer for lower latency - Bytes enables zero-copy
         let (audio_tx, audio_rx) = mpsc::channel::<Bytes>(AUDIO_CHANNEL_BUFFER_SIZE);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_token = CancellationToken::new();
         // Bounded channels for backpressure - 256 should handle bursts while preventing memory exhaustion
         let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
         let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
@@ -411,7 +456,7 @@ impl GoogleSTT {
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         self.audio_sender = Some(audio_tx);
-        self.shutdown_tx = Some(shutdown_tx);
+        self.shutdown_token = Some(shutdown_token.clone());
         self.result_tx = Some(result_tx.clone());
         self.error_tx = Some(error_tx.clone());
 
@@ -423,10 +468,7 @@ impl GoogleSTT {
         // localhost tonic mock) replaces the production Speech endpoint, and a `static_access_token`
         // (a pre-minted bearer) bypasses the network OAuth fetch — together letting a mock e2e test
         // point this gRPC channel at a PLAINTEXT mock with no Google network round-trip.
-        let grpc_endpoint = config
-            .endpoint_override
-            .clone()
-            .unwrap_or_else(|| GOOGLE_SPEECH_ENDPOINT.to_string());
+        let grpc_endpoint = google_speech_grpc_endpoint(&config);
         let static_token = config.static_access_token.clone();
 
         // Get sample rate and channels for keep-alive audio generation
@@ -434,10 +476,9 @@ impl GoogleSTT {
         let channels = config.base.channels as u32;
 
         // Shared state the supervised transport re-uses across reconnect attempts: a single-
-        // consumer audio receiver + shutdown oneshot (locked per `run`), the one-shot connected
+        // consumer audio receiver + shutdown token, the one-shot connected
         // signal, and a flag that records whether a clean shutdown was requested mid-stream.
         let audio_rx = Arc::new(Mutex::new(audio_rx));
-        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
         let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
         let shutdown_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -473,7 +514,7 @@ impl GoogleSTT {
                     let grpc_endpoint = grpc_endpoint.clone();
                     let static_token = static_token.clone();
                     let audio_rx = Arc::clone(&audio_rx);
-                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let shutdown_token = shutdown_token.clone();
                     let connected_tx = Arc::clone(&connected_tx);
                     let shutdown_seen = Arc::clone(&shutdown_seen);
                     let result_tx = result_tx.clone();
@@ -482,7 +523,9 @@ impl GoogleSTT {
                         let authenticated_channel =
                             create_authenticated_channel(&grpc_endpoint, auth_client.clone())
                                 .await
-                                .map_err(|e| StreamError::new(google_error_to_stt(e).to_string()))?;
+                                .map_err(|e| {
+                                    StreamError::new(google_error_to_stt(e).to_string())
+                                })?;
 
                         // A pre-minted static token authenticates with NO network OAuth fetch (mock
                         // e2e); otherwise fetch a fresh bearer so a long-lived reconnect re-auths.
@@ -491,7 +534,9 @@ impl GoogleSTT {
                             None => authenticated_channel
                                 .get_authorization_header()
                                 .await
-                                .map_err(|e| StreamError::new(google_error_to_stt(e).to_string()))?,
+                                .map_err(|e| {
+                                    StreamError::new(google_error_to_stt(e).to_string())
+                                })?,
                         };
 
                         let auth_metadata_value: tonic::metadata::MetadataValue<_> =
@@ -526,7 +571,7 @@ impl GoogleSTT {
                             sample_rate,
                             channels,
                             audio_rx,
-                            shutdown_rx,
+                            shutdown_token,
                             result_tx,
                             error_tx,
                             connected_tx,
@@ -657,7 +702,7 @@ impl BaseSTT for GoogleSTT {
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             audio_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             result_tx: None,
             error_tx: None,
             connection_handle: None,
@@ -674,6 +719,9 @@ impl BaseSTT for GoogleSTT {
         let config = self.config.as_ref().ok_or_else(|| {
             STTError::ConfigurationError("No configuration available".to_string())
         })?;
+        config
+            .validate_endpoint_override()
+            .map_err(STTError::ConfigurationError)?;
 
         self.start_connection(config.clone()).await
     }
@@ -683,22 +731,27 @@ impl BaseSTT for GoogleSTT {
         // run() just reported a reconnectable drop (the disconnect-vs-close race).
         self.intentional_disconnect.store(true, Ordering::SeqCst);
 
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
 
         if let Some(handle) = self.connection_handle.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "google-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         if let Some(handle) = self.result_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task("google-stt-result-forwarder", handle)
+                .await;
         }
 
         if let Some(handle) = self.error_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task("google-stt-error-forwarder", handle)
+                .await;
         }
 
         self.audio_sender = None;
@@ -820,17 +873,16 @@ impl GoogleSTT {
     /// The shared circuit breaker this session feeds into the generic supervisor, if the
     /// process-global resilience handles have been injected (W-D1/W-D2). Two `GoogleSTT` built from
     /// the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
-    pub fn resilience_breaker(
-        &self,
-    ) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
         self.resilience.as_ref().map(|r| &r.breaker)
     }
 }
 
 impl Drop for GoogleSTT {
     fn drop(&mut self) {
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
     }
 }

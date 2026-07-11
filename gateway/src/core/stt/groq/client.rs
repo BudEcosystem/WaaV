@@ -76,6 +76,29 @@ const USER_AGENT: &str = concat!("WaaV-Gateway/", env!("CARGO_PKG_VERSION"));
 /// Using 0.5 (neutral) instead of 0.9 to avoid overconfidence.
 pub const DEFAULT_UNKNOWN_CONFIDENCE: f32 = super::messages::DEFAULT_UNKNOWN_CONFIDENCE as f32;
 
+fn groq_stt_http_client() -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
+        .pool_max_idle_per_host(4)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .user_agent(USER_AGENT)
+        .build()
+}
+
+fn default_groq_stt_http_client() -> Option<Client> {
+    match groq_stt_http_client() {
+        Ok(client) => Some(client),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to create default Groq STT HTTP client; default instance is inert until rebuilt with a valid config"
+            );
+            None
+        }
+    }
+}
+
 // =============================================================================
 // Type Aliases
 // =============================================================================
@@ -234,7 +257,7 @@ pub struct GroqSTT {
     pub(crate) config: Option<GroqSTTConfig>,
 
     /// HTTP client for API requests (reused for connection pooling).
-    http_client: Client,
+    http_client: Option<Client>,
 
     /// Audio buffer for accumulating PCM data.
     /// Uses Vec for efficient appending with pre-allocated capacity.
@@ -303,16 +326,9 @@ impl GroqSTT {
         config.validate().map_err(STTError::ConfigurationError)?;
 
         // Create HTTP client with sensible defaults
-        let http_client = Client::builder()
-            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
-            .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
-            .pool_max_idle_per_host(4) // Connection pooling
-            .pool_idle_timeout(Duration::from_secs(90)) // Close idle connections after 90s
-            .user_agent(USER_AGENT)
-            .build()
-            .map_err(|e| {
-                STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
-            })?;
+        let http_client = groq_stt_http_client().map_err(|e| {
+            STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         // Pre-allocate audio buffer with expected capacity
         // Typical audio: 16kHz, 16-bit mono = 32KB/sec
@@ -321,7 +337,7 @@ impl GroqSTT {
 
         Ok(Self {
             config: Some(config),
-            http_client,
+            http_client: Some(http_client),
             audio_buffer: Vec::with_capacity(initial_capacity),
             connected: AtomicBool::new(false),
             result_callback: Arc::new(Mutex::new(None)),
@@ -630,6 +646,12 @@ impl GroqSTT {
         wav_data: Vec<u8>,
         config: &GroqSTTConfig,
     ) -> Result<TranscriptionResult, STTError> {
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            STTError::ConfigurationError(
+                "Groq STT default HTTP client is unavailable; construct with GroqSTT::new, new_standard, or with_config".to_string(),
+            )
+        })?;
+
         // Build multipart form. The non-file text fields come from the single wire source of
         // truth on the config (`build_form_text_fields`), so what a test asserts is exactly what
         // is serialized here. The audio source is either an uploaded `file` part (default) or a
@@ -649,8 +671,7 @@ impl GroqSTT {
         }
 
         // Send request to Groq API
-        let response = self
-            .http_client
+        let response = http_client
             .post(config.api_url())
             .header("Authorization", format!("Bearer {}", config.base.api_key))
             .multipart(form)
@@ -927,18 +948,9 @@ impl GroqSTT {
 impl Default for GroqSTT {
     fn default() -> Self {
         // Create HTTP client with sensible defaults matching with_config()
-        let http_client = Client::builder()
-            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
-            .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
-            .pool_max_idle_per_host(4)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .user_agent(USER_AGENT)
-            .build()
-            .unwrap_or_else(|_| Client::new());
-
         Self {
             config: None,
-            http_client,
+            http_client: default_groq_stt_http_client(),
             audio_buffer: Vec::with_capacity(32 * 1024 * 30),
             connected: AtomicBool::new(false),
             result_callback: Arc::new(Mutex::new(None)),
@@ -1340,6 +1352,84 @@ mod tests {
             GroqResponseFormat::VerboseJson
         );
         assert_eq!(stored_config.temperature, Some(0.2));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn groq_stt_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let config = GroqSTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let stt = GroqSTT::with_config(config).expect("construct Groq STT");
+        let err = stt
+            .http_client
+            .as_ref()
+            .expect("strict constructor builds an HTTP client")
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected Groq STT redirect error: {error_chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_without_http_client_returns_typed_error_without_panic() {
+        let mut stt = GroqSTT::default();
+        stt.http_client = None;
+        let config = GroqSTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = stt
+            .send_request(vec![0u8; 44], &config)
+            .await
+            .expect_err("inert default client must fail with a typed error");
+
+        match err {
+            STTError::ConfigurationError(msg) => {
+                assert!(msg.contains("default HTTP client"), "{msg}");
+            }
+            other => panic!("expected ConfigurationError, got {other:?}"),
+        }
     }
 
     #[test]

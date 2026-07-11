@@ -24,6 +24,15 @@ use crate::core::tts::base::TTSConfig;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+fn validate_nectec_http_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -197,6 +206,7 @@ impl NectecTtsConfig {
             cfg.audiovisual = audiovisual as i32;
         }
         cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -204,6 +214,10 @@ impl NectecTtsConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.api_key.is_empty() {
             return Err("NECTEC API key is required".to_string());
+        }
+
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_nectec_http_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -382,8 +396,8 @@ mod tests {
                 ..Default::default()
             },
             features: TtsFeatures {
-                speed: Some(1.5),  // capability gap: NECTEC has no speed field, must be ignored
-                ssml: Some(true),  // capability gap: NECTEC has no SSML, must be ignored
+                speed: Some(1.5), // capability gap: NECTEC has no speed field, must be ignored
+                ssml: Some(true), // capability gap: NECTEC has no SSML, must be ignored
                 ..Default::default()
             },
             extras: ProviderExtras(extras),
@@ -461,6 +475,30 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = NectecTtsConfig {
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://nectec-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
     }
 
     #[test]

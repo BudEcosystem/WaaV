@@ -9,13 +9,17 @@
 //!
 //! Run: cargo test --test chaos_tests -- --nocapture
 
-use futures::{SinkExt, StreamExt};
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+
+use futures::{FutureExt, SinkExt, StreamExt};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use wiremock::matchers::any;
@@ -34,6 +38,40 @@ mod common {
     use super::*;
     use axum::{Router, middleware};
     use std::sync::Arc;
+
+    pub struct TestServer {
+        handle: JoinHandle<()>,
+        panicked: Arc<AtomicBool>,
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            if !self.handle.is_finished() {
+                self.handle.abort();
+            }
+            if self.panicked.load(Ordering::SeqCst) {
+                if std::thread::panicking() {
+                    eprintln!("chaos test server panicked");
+                } else {
+                    panic!("chaos test server panicked");
+                }
+            }
+        }
+    }
+
+    fn spawn_test_server<F>(future: F) -> TestServer
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let panicked = Arc::new(AtomicBool::new(false));
+        let panicked_in_task = Arc::clone(&panicked);
+        let handle = tokio::spawn(async move {
+            if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+                panicked_in_task.store(true, Ordering::SeqCst);
+            }
+        });
+        TestServer { handle, panicked }
+    }
 
     pub fn get_available_port() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -133,7 +171,7 @@ mod common {
             .with_state(state)
     }
 
-    pub async fn start_test_server(port: u16) -> SocketAddr {
+    pub async fn start_test_server(port: u16) -> (SocketAddr, TestServer) {
         let config = create_minimal_config(port);
         let app_state = AppState::new(config).await;
         let app = create_combined_router(app_state);
@@ -142,12 +180,14 @@ mod common {
         let listener = TcpListener::bind(addr).await.expect("Failed to bind");
         let actual_addr = listener.local_addr().expect("Failed to get address");
 
-        tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service()).await.ok();
+        let server = spawn_test_server(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .expect("chaos test server failed");
         });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
-        actual_addr
+        (actual_addr, server)
     }
 
     /// Create a text message with proper conversion for tungstenite 0.28
@@ -180,7 +220,7 @@ async fn test_provider_503_handling() {
         .await;
 
     let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server(port).await;
     let base_url = format!("http://{}", addr);
 
     let client = reqwest::Client::builder()
@@ -217,7 +257,7 @@ async fn test_provider_timeout_handling() {
         .await;
 
     let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server(port).await;
     let base_url = format!("http://{}", addr);
 
     let client = reqwest::Client::builder()
@@ -268,7 +308,7 @@ async fn test_provider_invalid_response_handling() {
         .await;
 
     let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server(port).await;
     let base_url = format!("http://{}", addr);
 
     let client = reqwest::Client::builder()
@@ -292,7 +332,7 @@ async fn test_provider_invalid_response_handling() {
 #[tokio::test]
 async fn test_client_sudden_disconnect() {
     let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server(port).await;
     let ws_url = format!("ws://{}/ws", addr);
 
     // Connect and immediately disconnect multiple times
@@ -330,7 +370,7 @@ async fn test_client_sudden_disconnect() {
 #[tokio::test]
 async fn test_connection_flood_and_close() {
     let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server(port).await;
     let ws_url = format!("ws://{}/ws", addr);
 
     let mut handles = Vec::new();
@@ -347,7 +387,9 @@ async fn test_connection_flood_and_close() {
         }));
     }
 
-    futures::future::join_all(handles).await;
+    for result in futures::future::join_all(handles).await {
+        result.expect("connection flood task should not panic");
+    }
 
     // Wait for cleanup
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -370,7 +412,7 @@ async fn test_connection_flood_and_close() {
 #[tokio::test]
 async fn test_half_open_connections() {
     let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server(port).await;
     let ws_url = format!("ws://{}/ws", addr);
 
     // Create connections that never complete handshake
@@ -425,7 +467,7 @@ async fn test_half_open_connections() {
 #[tokio::test]
 async fn test_rapid_message_interleaving() {
     let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server(port).await;
     let ws_url = format!("ws://{}/ws", addr);
 
     match timeout(Duration::from_secs(10), connect_async(&ws_url)).await {
@@ -443,13 +485,19 @@ async fn test_rapid_message_interleaving() {
             ];
 
             for msg in messages {
-                let _ = write.send(common::text_message(&msg.to_string())).await;
+                write
+                    .send(common::text_message(&msg.to_string()))
+                    .await
+                    .expect("rapid interleaving text frame should be sent");
                 // No delay between messages
             }
 
             // Also send binary messages interspersed
             for _ in 0..10 {
-                let _ = write.send(common::binary_message(vec![0u8; 100])).await;
+                write
+                    .send(common::binary_message(vec![0u8; 100]))
+                    .await
+                    .expect("rapid interleaving binary frame should be sent");
             }
 
             println!("Sent all interleaved messages");
@@ -482,7 +530,7 @@ async fn test_rapid_message_interleaving() {
 #[tokio::test]
 async fn test_out_of_order_messages() {
     let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server(port).await;
     let ws_url = format!("ws://{}/ws", addr);
 
     match timeout(Duration::from_secs(10), connect_async(&ws_url)).await {
@@ -490,14 +538,18 @@ async fn test_out_of_order_messages() {
             let (mut write, _) = ws.split();
 
             // Send audio before config (out of order)
-            let _ = write.send(common::binary_message(vec![0u8; 1600])).await;
+            write
+                .send(common::binary_message(vec![0u8; 1600]))
+                .await
+                .expect("out-of-order pre-config audio frame should be sent");
 
             // Send speak before ready
-            let _ = write
+            write
                 .send(common::text_message(
                     &json!({"type": "speak", "text": "Hello"}).to_string(),
                 ))
-                .await;
+                .await
+                .expect("out-of-order pre-config speak frame should be sent");
 
             // Now send config
             let config = json!({
@@ -505,10 +557,16 @@ async fn test_out_of_order_messages() {
                 "stt_config": {"provider": "deepgram"},
                 "tts_config": {"provider": "elevenlabs"}
             });
-            let _ = write.send(common::text_message(&config.to_string())).await;
+            write
+                .send(common::text_message(&config.to_string()))
+                .await
+                .expect("out-of-order config frame should be sent");
 
             // Send more audio
-            let _ = write.send(common::binary_message(vec![0u8; 1600])).await;
+            write
+                .send(common::binary_message(vec![0u8; 1600]))
+                .await
+                .expect("out-of-order post-config audio frame should be sent");
 
             println!("Sent out-of-order messages");
         }
@@ -544,7 +602,7 @@ async fn test_out_of_order_messages() {
 #[tokio::test]
 async fn test_multiple_config_changes() {
     let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server(port).await;
     let ws_url = format!("ws://{}/ws", addr);
 
     match timeout(Duration::from_secs(10), connect_async(&ws_url)).await {
@@ -619,7 +677,7 @@ async fn test_multiple_config_changes() {
 #[tokio::test]
 async fn test_server_recovery_after_errors() {
     let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server(port).await;
     let base_url = format!("http://{}", addr);
 
     let client = reqwest::Client::builder()
@@ -678,7 +736,7 @@ async fn test_server_recovery_after_errors() {
 #[tokio::test]
 async fn test_concurrent_chaos_operations() {
     let port = common::get_available_port();
-    let addr = common::start_test_server(port).await;
+    let (addr, _server) = common::start_test_server(port).await;
     let base_url = format!("http://{}", addr);
     let ws_url = format!("ws://{}/ws", addr);
 
@@ -738,7 +796,7 @@ async fn test_concurrent_chaos_operations() {
             while !stop.load(Ordering::Relaxed) {
                 match timeout(Duration::from_secs(2), connect_async(&ws_url)).await {
                     Ok(Ok((mut ws, _))) => {
-                        successful.fetch_add(1, Ordering::Relaxed);
+                        let mut operation_ok = true;
                         // Send random messages
                         for _ in 0..3 {
                             let msg = if counter.is_multiple_of(2) {
@@ -747,9 +805,20 @@ async fn test_concurrent_chaos_operations() {
                                 common::binary_message(vec![0u8; 100])
                             };
                             counter += 1;
-                            let _ = ws.send(msg).await;
+                            if ws.send(msg).await.is_err() {
+                                operation_ok = false;
+                                break;
+                            }
                         }
-                        let _ = ws.close(None).await;
+                        if operation_ok && ws.close(None).await.is_err() {
+                            operation_ok = false;
+                        }
+
+                        if operation_ok {
+                            successful.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     _ => {
                         failed.fetch_add(1, Ordering::Relaxed);
@@ -765,6 +834,12 @@ async fn test_concurrent_chaos_operations() {
 
     // Wait for workers to stop
     tokio::time::sleep(Duration::from_millis(500)).await;
+    for handle in handles {
+        timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("chaos worker should stop after stop flag")
+            .expect("chaos worker should not panic");
+    }
 
     let success_count = successful_ops.load(Ordering::Relaxed);
     let fail_count = failed_ops.load(Ordering::Relaxed);

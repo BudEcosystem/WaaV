@@ -701,7 +701,7 @@ fn test_custom_model() {
 // `new_standard` into the provider-specific config — previously dropped by the flat factory.
 #[test]
 fn new_standard_unlocks_advanced_features_and_instance_id() {
-    use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+    use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
     let mut extras = serde_json::Map::new();
     extras.insert("instance_id".into(), serde_json::json!("inst-123"));
     let std = StandardSTTConfig {

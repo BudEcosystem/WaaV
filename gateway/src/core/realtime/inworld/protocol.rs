@@ -5,14 +5,16 @@
 //! [`OpenAiProtocol`] and DELEGATES every wire method to it verbatim —
 //! overriding ONLY `provider_id` + `connect_spec` (the Inworld host + auth).
 
-use base64::prelude::{Engine as _, BASE64_STANDARD};
+use base64::prelude::{BASE64_STANDARD, Engine as _};
 
 use super::super::openai::protocol::OpenAiProtocol;
 use crate::core::realtime::base::{
     RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult, ReplayConversationItem,
 };
 use crate::core::realtime::openai::ClientEvent;
-use crate::core::realtime::scaffold::{ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol, S2sEvent};
+use crate::core::realtime::scaffold::{
+    ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol, S2sEvent,
+};
 
 /// Inworld realtime session-WebSocket base URL (NO query). Inworld's documented
 /// realtime endpoint is `…/api/v1/realtime/session?key=<session-id>&protocol=realtime`
@@ -251,11 +253,16 @@ mod tests {
             realtime_endpoint_override: Some("ws://127.0.0.1:9004/inworld".into()),
             ..base_cfg() // no `endpoint` / session id
         };
-        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap() else {
+        let ConnectSpec::WebSocket { url, headers } = proto(&cfg).connect_spec(&cfg).unwrap()
+        else {
             panic!("expected WebSocket")
         };
         assert_eq!(url, "ws://127.0.0.1:9004/inworld");
-        assert!(headers.iter().any(|(k, v)| k == "Authorization" && v == "Basic aW5rZXk="));
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "Authorization" && v == "Basic aW5rZXk=")
+        );
     }
 
     /// Inworld bootstraps with session.created (like OpenAI) — delegated mapping.

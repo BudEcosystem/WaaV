@@ -130,7 +130,6 @@ pub mod prelude {
 #[cfg(test)]
 #[cfg(feature = "dag-routing")]
 mod tests {
-    
 
     #[test]
     fn test_module_structure() {

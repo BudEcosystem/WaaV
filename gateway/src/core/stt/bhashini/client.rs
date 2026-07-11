@@ -63,6 +63,7 @@ const BASE_RETRY_DELAY_MS: u64 = 500;
 
 /// User-Agent header value for API requests.
 const USER_AGENT: &str = concat!("WaaV-Gateway/", env!("CARGO_PKG_VERSION"));
+const BHASHINI_CALLBACK_URL_SCHEMES: &[&str] = &["http", "https"];
 
 // =============================================================================
 // Cached Pipeline Config
@@ -135,6 +136,14 @@ pub struct BhashiniStt {
     error_callback: Arc<Mutex<Option<STTErrorCallback>>>,
 }
 
+fn bhashini_stt_http_client() -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
+        .user_agent(USER_AGENT)
+        .build()
+}
+
 impl BhashiniStt {
     /// Create a new Bhashini STT client (internal, for use by BaseSTT::new).
     fn create_internal(config: STTConfig) -> Result<Self, STTError> {
@@ -150,14 +159,9 @@ impl BhashiniStt {
         base_config: STTConfig,
         bhashini_config: BhashiniSttConfig,
     ) -> Result<Self, STTError> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
-            .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
-            .user_agent(USER_AGENT)
-            .build()
-            .map_err(|e| {
-                STTError::ConnectionFailed(format!("Failed to create HTTP client: {}", e))
-            })?;
+        let client = bhashini_stt_http_client().map_err(|e| {
+            STTError::ConnectionFailed(format!("Failed to create HTTP client: {}", e))
+        })?;
 
         Ok(Self {
             base_config,
@@ -251,6 +255,7 @@ impl BhashiniStt {
             .ok_or_else(|| {
                 STTError::ProviderError("No callback URL in pipeline config response".to_string())
             })?;
+        let callback_url = validate_compute_callback_url(&callback_url)?;
 
         // Extract inference API key
         let (auth_header_name, auth_header_value) = config_response
@@ -313,7 +318,8 @@ impl BhashiniStt {
         );
 
         // Encode audio as WAV and then base64
-        let wav_data = wav::encode_wav(&audio_data, self.config.sample_rate, 16, 1);
+        let wav_data = wav::try_encode_wav(&audio_data, self.config.sample_rate, 16, 1)
+            .map_err(|e| STTError::AudioProcessingError(format!("Invalid WAV parameters: {e}")))?;
         let audio_base64 = BASE64.encode(&wav_data);
 
         // Create compute request
@@ -383,8 +389,17 @@ impl BhashiniStt {
         pipeline_config: &CachedPipelineConfig,
         request: &PipelineComputeRequest,
     ) -> Result<PipelineComputeResponse, STTError> {
-        let response = self
-            .client
+        let callback_client =
+            crate::core::net::ssrf_protected_client_builder(BHASHINI_CALLBACK_URL_SCHEMES)
+                .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+                .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
+                .build()
+                .map_err(|e| {
+                    STTError::NetworkError(format!(
+                        "Failed to create SSRF-protected callback client: {e}"
+                    ))
+                })?;
+        let response = callback_client
             .post(&pipeline_config.callback_url)
             .header(
                 &pipeline_config.auth_header_name,
@@ -548,6 +563,23 @@ impl BaseSTT for BhashiniStt {
     }
 }
 
+fn validate_compute_callback_url(url: &str) -> Result<String, STTError> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(STTError::ProviderError(
+            "Bhashini callback URL rejected (SSRF protection): empty URL".to_string(),
+        ));
+    }
+
+    crate::core::net::validate_url_for_ssrf(url, BHASHINI_CALLBACK_URL_SCHEMES)
+        .map(|_| url.to_string())
+        .map_err(|msg| {
+            STTError::ProviderError(format!(
+                "Bhashini callback URL rejected (SSRF protection): {msg}"
+            ))
+        })
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -566,17 +598,79 @@ mod tests {
     }
 
     #[test]
+    fn compute_callback_url_is_ssrf_checked() {
+        let _env = crate::core::net::ssrf_env_lock();
+        assert_eq!(
+            validate_compute_callback_url(" https://compute.example.com/asr ").unwrap(),
+            "https://compute.example.com/asr"
+        );
+
+        let err = validate_compute_callback_url("file:///tmp/compute")
+            .expect_err("non-HTTP callback URL must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        let err =
+            validate_compute_callback_url("   ").expect_err("empty callback URL must be rejected");
+        assert!(err.to_string().contains("empty URL"), "{err}");
+    }
+
+    #[test]
     fn test_bhashini_stt_creation() {
         let config = create_test_config();
         let result = BhashiniStt::new(config);
         assert!(result.is_ok());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn bhashini_stt_redirect_policy_rejects_private_hop() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let stt = BhashiniStt::new(create_test_config()).expect("construct Bhashini STT");
+        let err = stt
+            .client
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(err) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&err.to_string());
+            source = err.source();
+        }
+        assert!(error_chain.contains("SSRF protection"), "{error_chain}");
+    }
+
     // W1 keystone: Bhashini maps zero advanced features (batch ULCA provider), so new_standard is a
     // pure passthrough — the base credentials parsed from api_key carry through to the stored config.
     #[test]
     fn new_standard_passthrough_carries_base() {
-        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "bhashini".into(),

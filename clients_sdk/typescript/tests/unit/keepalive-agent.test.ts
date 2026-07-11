@@ -121,7 +121,9 @@ describe('D7 RestClient attaches the keep-alive agent to every request', () => {
     const fetchFn = vi.fn(async () =>
       new Response('Server at capacity', { status: 503, headers: { 'retry-after': '4' } }),
     ) as unknown as typeof fetch;
-    const client = new RestClient({ baseUrl: 'http://gw', fetch: fetchFn });
+    // retries: 0 — this test asserts the ERROR SHAPE of a single attempt; the retry loop
+    // itself is covered by rest-retry.test.ts.
+    const client = new RestClient({ baseUrl: 'http://gw', fetch: fetchFn, retries: 0 });
     await expect(client.health()).rejects.toMatchObject({ statusCode: 503 });
   });
 });

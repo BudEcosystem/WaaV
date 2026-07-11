@@ -4,13 +4,17 @@
 //! using HTTP POST requests for speech synthesis.
 
 use async_trait::async_trait;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use tracing::{debug, info};
 
 use super::config::YandexTtsConfig;
 use super::messages::{YandexApiError, YandexStatusCode, YandexSynthesisResponse};
 use crate::core::tts::base::{BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult};
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
+
+fn yandex_tts_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES).build()
+}
 
 // =============================================================================
 // Request Builder
@@ -52,20 +56,6 @@ impl YandexRequestBuilder {
 
 impl TTSRequestBuilder for YandexRequestBuilder {
     fn build_http_request(&self, client: &reqwest::Client, text: &str) -> reqwest::RequestBuilder {
-        // Build headers
-        let mut headers = HeaderMap::new();
-
-        // Authorization header
-        if let Ok(auth) = HeaderValue::from_str(&self.yandex_config.auth_header_value()) {
-            headers.insert(AUTHORIZATION, auth);
-        }
-
-        // Content-Type for form data
-        headers.insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("application/x-www-form-urlencoded"),
-        );
-
         // Build form parameters
         let form_params = self.yandex_config.build_form_params(text);
 
@@ -83,7 +73,8 @@ impl TTSRequestBuilder for YandexRequestBuilder {
                 super::YANDEX_TTS_SYNTHESIZE_URL,
                 self.yandex_config.endpoint_override.as_deref(),
             ))
-            .headers(headers)
+            .header(AUTHORIZATION, self.yandex_config.auth_header_value())
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .form(&form_params)
     }
 
@@ -124,7 +115,7 @@ impl YandexTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             yandex_config,
             base_config: config,
         })
@@ -135,9 +126,7 @@ impl YandexTts {
     /// language, output sample rate, and the folder_id / is_iam_token extras) and keeps the
     /// standardized base config as `base_config`. Features without a Yandex field stay at provider
     /// defaults (capability gaps).
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let yandex_config = YandexTtsConfig::from_standard(std)?;
 
         info!(
@@ -146,7 +135,7 @@ impl YandexTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             yandex_config,
             base_config: std.base.clone(),
         })
@@ -163,7 +152,9 @@ impl YandexTts {
     /// Useful for testing or when direct control over the request/response is needed.
     #[allow(dead_code)]
     async fn synthesize_http(&self, text: &str) -> TTSResult<YandexSynthesisResponse> {
-        let client = reqwest::Client::new();
+        let client = yandex_tts_http_client().map_err(|e| {
+            TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
+        })?;
         let request_builder = self.create_request_builder();
 
         let response = request_builder
@@ -307,6 +298,7 @@ impl BaseTTS for YandexTts {
 mod tests {
     use super::*;
     use crate::core::tts::yandex::YandexAudioFormat;
+    use std::io::ErrorKind;
 
     #[test]
     fn test_yandex_tts_creation() {
@@ -378,6 +370,56 @@ mod tests {
         assert_eq!(tts.yandex_config.api_key, "AQVN1234567890");
         assert_eq!(tts.yandex_config.voice.as_str(), "john");
         assert_eq!(tts.yandex_config.audio_format, YandexAudioFormat::Mp3);
+    }
+
+    #[tokio::test]
+    async fn yandex_tts_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!("Skipping yandex_tts_redirect_policy_rejects_private_hop: {err}");
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = yandex_tts_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
     }
 
     #[tokio::test]
@@ -456,6 +498,24 @@ mod tests {
         let builder = YandexRequestBuilder::new(yandex_config, config);
 
         assert!(builder.get_pronunciation_replacer().is_some());
+    }
+
+    #[test]
+    fn invalid_yandex_tts_api_key_header_value_is_request_build_error() {
+        let config = TTSConfig {
+            api_key: "bad\nkey".to_string(),
+            voice_id: Some("alena".to_string()),
+            ..Default::default()
+        };
+
+        let yandex_config = YandexTtsConfig::from_base(&config).unwrap();
+        let builder = YandexRequestBuilder::new(yandex_config, config);
+        let err = builder
+            .build_http_request(&reqwest::Client::new(), "hello")
+            .build()
+            .expect_err("malformed Yandex TTS API key must not omit the Authorization header");
+
+        assert!(err.is_builder(), "unexpected reqwest error: {err}");
     }
 
     #[test]

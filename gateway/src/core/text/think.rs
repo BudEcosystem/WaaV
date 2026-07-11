@@ -119,7 +119,9 @@ mod tests {
     #[test]
     fn strips_whole_block() {
         assert_eq!(
-            strip_think("<think>okay 15% of 60 is 9, let me check… yes</think>\n\nIt's nine dollars."),
+            strip_think(
+                "<think>okay 15% of 60 is 9, let me check… yes</think>\n\nIt's nine dollars."
+            ),
             "It's nine dollars."
         );
         // No think block → unchanged.
@@ -132,7 +134,16 @@ mod tests {
     fn streaming_filter_handles_split_tags() {
         // Tags split arbitrarily across deltas must still be filtered, and only
         // the post-</think> answer emitted.
-        let deltas = ["<thi", "nk>okay ", "the tip is ", "nine</thi", "nk>", " It is ", "nine ", "dollars."];
+        let deltas = [
+            "<thi",
+            "nk>okay ",
+            "the tip is ",
+            "nine</thi",
+            "nk>",
+            " It is ",
+            "nine ",
+            "dollars.",
+        ];
         let mut s = ThinkStripper::default();
         let mut spoken = String::new();
         for d in deltas {

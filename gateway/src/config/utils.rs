@@ -13,7 +13,10 @@ pub(crate) fn is_placeholder_credential(value: &str) -> bool {
     let lower = v.to_ascii_lowercase();
     lower.starts_with("your-")
         || lower.starts_with("your_")
-        || matches!(lower.as_str(), "changeme" | "change-me" | "change_me" | "placeholder" | "todo")
+        || matches!(
+            lower.as_str(),
+            "changeme" | "change-me" | "change_me" | "placeholder" | "todo"
+        )
         || (lower.len() >= 3 && lower.bytes().all(|b| b == b'x'))
 }
 

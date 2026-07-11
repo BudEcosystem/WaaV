@@ -33,17 +33,17 @@
 //! - Docs: <https://docs.ultravox.ai/>
 
 use bytes::Bytes;
-use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
+use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::core::realtime::base::{
     FunctionCallRequest, RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult,
     TranscriptRole,
 };
 use crate::core::realtime::scaffold::{
-    ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol,
-    RealtimeTransportFactory, RestHandshakeWsTransportFactory, S2sEvent,
+    ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol, RealtimeTransportFactory,
+    RestHandshakeWsTransportFactory, S2sEvent,
 };
 
 /// Ultravox REST "create call" endpoint. A `POST` here (with `X-API-Key`) mints a
@@ -256,10 +256,7 @@ impl RealtimeProtocol for UltravoxProtocol {
                     .or_else(|| value.get("delta").and_then(Value::as_str))
                     .unwrap_or("")
                     .to_string();
-                let is_final = value
-                    .get("final")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                let is_final = value.get("final").and_then(Value::as_bool).unwrap_or(false);
                 vec![S2sEvent::Transcript {
                     role,
                     text,
@@ -360,10 +357,11 @@ impl RealtimeProtocol for UltravoxProtocol {
 
     fn serialize(&self, msg: &Self::Wire) -> RealtimeResult<OutFrame> {
         match msg {
-            UltravoxClientMsg::Json(v) => Ok(OutFrame::Text(
-                serde_json::to_string(v)
-                    .map_err(|e| RealtimeError::SerializationError(e.to_string()))?,
-            )),
+            UltravoxClientMsg::Json(v) => {
+                Ok(OutFrame::Text(serde_json::to_string(v).map_err(|e| {
+                    RealtimeError::SerializationError(e.to_string())
+                })?))
+            }
             // THE binary path: audio frames serialize to a raw binary frame.
             UltravoxClientMsg::Audio(b) => Ok(OutFrame::Binary(b.clone())),
         }
@@ -468,7 +466,10 @@ mod tests {
             panic!("override must yield a PLAIN WebSocket (no REST handshake), got {spec:?}");
         };
         assert_eq!(url, "ws://127.0.0.1:9008/join");
-        assert!(headers.is_empty(), "join url is pre-authed: no extra headers");
+        assert!(
+            headers.is_empty(),
+            "join url is pre-authed: no extra headers"
+        );
     }
 
     /// create_call_body skips optional fields when absent (no instructions ⇒ no
@@ -482,7 +483,10 @@ mod tests {
         let p = proto(&cfg);
         let v = p.create_call_body(&cfg);
         assert_eq!(v["model"], "fixie-ai/ultravox");
-        assert!(v.get("systemPrompt").is_none(), "no instructions ⇒ no systemPrompt");
+        assert!(
+            v.get("systemPrompt").is_none(),
+            "no instructions ⇒ no systemPrompt"
+        );
         assert!(v.get("voice").is_none(), "no voice ⇒ no voice key");
         assert_eq!(v["medium"]["serverWebSocket"]["inputSampleRate"], 16000);
     }
@@ -492,7 +496,10 @@ mod tests {
     fn build_session_config_is_empty() {
         let p = proto(&base_cfg());
         assert!(p.build_session_config(&base_cfg(), None).is_empty());
-        assert!(p.build_session_config(&base_cfg(), Some("resume")).is_empty());
+        assert!(
+            p.build_session_config(&base_cfg(), Some("resume"))
+                .is_empty()
+        );
     }
 
     /// caps: server-VAD turn frames, 48 B/ms @ 24 kHz output, NO truncate, NO
@@ -530,11 +537,13 @@ mod tests {
         let p = proto(&base_cfg());
         let pcm: &[u8] = &[1, 2, 3, 4, 250, 251];
         match p.map_server_event(Inbound::Binary(pcm)).as_slice() {
-            [S2sEvent::Audio {
-                data,
-                item_id,
-                response_id,
-            }] => {
+            [
+                S2sEvent::Audio {
+                    data,
+                    item_id,
+                    response_id,
+                },
+            ] => {
                 assert_eq!(data.as_ref(), pcm);
                 assert!(item_id.is_none());
                 assert!(response_id.is_none());
@@ -549,12 +558,14 @@ mod tests {
         let p = proto(&base_cfg());
         let agent = r#"{"type":"transcript","role":"agent","text":"hi there","final":true}"#;
         match p.map_server_event(Inbound::Text(agent)).as_slice() {
-            [S2sEvent::Transcript {
-                role,
-                text,
-                is_final,
-                item_id,
-            }] => {
+            [
+                S2sEvent::Transcript {
+                    role,
+                    text,
+                    is_final,
+                    item_id,
+                },
+            ] => {
                 assert_eq!(*role, TranscriptRole::Assistant);
                 assert_eq!(text, "hi there");
                 assert!(*is_final);
@@ -564,7 +575,14 @@ mod tests {
         }
         let user = r#"{"type":"transcript","role":"user","text":"hello","final":true}"#;
         match p.map_server_event(Inbound::Text(user)).as_slice() {
-            [S2sEvent::Transcript { role, text, is_final, .. }] => {
+            [
+                S2sEvent::Transcript {
+                    role,
+                    text,
+                    is_final,
+                    ..
+                },
+            ] => {
                 assert_eq!(*role, TranscriptRole::User);
                 assert_eq!(text, "hello");
                 assert!(*is_final);
@@ -580,7 +598,14 @@ mod tests {
         let p = proto(&base_cfg());
         let raw = r#"{"type":"transcript","role":"agent","delta":"wor","final":false}"#;
         match p.map_server_event(Inbound::Text(raw)).as_slice() {
-            [S2sEvent::Transcript { role, text, is_final, .. }] => {
+            [
+                S2sEvent::Transcript {
+                    role,
+                    text,
+                    is_final,
+                    ..
+                },
+            ] => {
                 assert_eq!(*role, TranscriptRole::Assistant);
                 assert_eq!(text, "wor");
                 assert!(!*is_final);

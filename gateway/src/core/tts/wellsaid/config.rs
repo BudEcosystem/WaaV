@@ -9,6 +9,15 @@ use crate::core::tts::{TTSConfig, TTSError, TTSResult};
 
 use super::{DEFAULT_SPEAKER_ID, MAX_TEXT_LENGTH};
 
+fn validate_wellsaid_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Model Selection
 // =============================================================================
@@ -252,16 +261,14 @@ impl WellSaidTtsConfig {
     /// The voice_id field is parsed as speaker_id (numeric).
     pub fn from_base(config: &TTSConfig) -> TTSResult<Self> {
         // Get API key from config or environment
-        let api_key = if !config.api_key.is_empty() {
-            config.api_key.clone()
-        } else {
-            std::env::var("WELLSAID_API_KEY").map_err(|_| {
+        let api_key = crate::core::credentials::explicit_api_key(&config.api_key)
+            .or_else(|| crate::core::credentials::env_api_key("WELLSAID_API_KEY"))
+            .ok_or_else(|| {
                 TTSError::InvalidConfiguration(
                     "WELLSAID_API_KEY environment variable not set and no api_key provided"
                         .to_string(),
                 )
-            })?
-        };
+            })?;
 
         // Parse speaker_id from voice_id (numeric string)
         let speaker_id = config
@@ -338,6 +345,7 @@ impl WellSaidTtsConfig {
         }
 
         cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate()?;
 
         Ok(cfg)
     }
@@ -354,6 +362,11 @@ impl WellSaidTtsConfig {
             return Err(TTSError::InvalidConfiguration(
                 "Speaker ID must be greater than 0".to_string(),
             ));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_wellsaid_tts_endpoint("endpoint_override", endpoint)
+                .map_err(TTSError::InvalidConfiguration)?;
         }
 
         Ok(())
@@ -419,7 +432,7 @@ mod tests {
             features: TtsFeatures {
                 sample_rate: Some(44100),
                 ssml: Some(true),
-                speed: Some(1.5),  // capability gap: AI Director markup, not config state
+                speed: Some(1.5), // capability gap: AI Director markup, not config state
                 pitch: Some(70.0), // capability gap
                 ..Default::default()
             },
@@ -459,18 +472,57 @@ mod tests {
             extras: ProviderExtras(extras),
         })
         .unwrap();
-        let body =
-            serde_json::to_value(WellSaidStreamRequest::from_config(&cfg, "hi")).unwrap();
+        let body = serde_json::to_value(WellSaidStreamRequest::from_config(&cfg, "hi")).unwrap();
         assert_eq!(body["audio_configs"]["sample_rate"], 44100);
         assert_eq!(body["audio_configs"]["file_format"], "wav");
         assert_eq!(body["library_ids"][0], "lib-abc");
 
         // Default config: audio_configs and library_ids must be omitted from the body entirely.
-        let default_body =
-            serde_json::to_value(WellSaidStreamRequest::from_config(&WellSaidTtsConfig::new("k"), "hi"))
-                .unwrap();
+        let default_body = serde_json::to_value(WellSaidStreamRequest::from_config(
+            &WellSaidTtsConfig::new("k"),
+            "hi",
+        ))
+        .unwrap();
         assert!(default_body.get("audio_configs").is_none());
         assert!(default_body.get("library_ids").is_none());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = WellSaidTtsConfig {
+            api_key: "test-key".to_string(),
+            endpoint_override: Some("https://wellsaid-proxy.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://wellsaid-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "wellsaid".to_string(),
+            api_key: "test-key".to_string(),
+            voice_id: Some("26".to_string()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(WellSaidTtsConfig::from_standard(&std).is_err());
     }
 
     #[test]

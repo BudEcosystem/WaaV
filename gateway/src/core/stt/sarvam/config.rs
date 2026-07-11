@@ -6,6 +6,15 @@
 use crate::core::stt::base::STTConfig;
 use url::form_urlencoded;
 
+fn validate_sarvam_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_WS_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 /// Sarvam.ai STT streaming WebSocket endpoint.
 ///
 /// NOTE: `/speech-to-text-translate` (no `/ws`) is the BATCH REST (POST) endpoint and returns HTTP
@@ -206,7 +215,10 @@ impl SarvamSTTConfig {
         {
             cfg.start_speech_volume_threshold = Some(v);
         }
-        if let Some(v) = e.get("interrupt_min_speech_frames").and_then(|v| v.as_u64()) {
+        if let Some(v) = e
+            .get("interrupt_min_speech_frames")
+            .and_then(|v| v.as_u64())
+        {
             cfg.interrupt_min_speech_frames = Some(v as u32);
         }
         if let Some(v) = e.get("pre_speech_pad_frames").and_then(|v| v.as_u64()) {
@@ -222,10 +234,9 @@ impl SarvamSTTConfig {
     /// Build the WebSocket URL with query parameters
     pub fn build_websocket_url(&self) -> String {
         let mut url = String::with_capacity(256);
-        // NOTE: model/language_code/input_audio_codec are constrained identifiers (e.g.
-        // "saarika:v2.5", "en-IN", "pcm_s16le") — they never contain spaces or query delimiters, and
-        // the `:` in model ids is valid in a query and must stay literal, so they are NOT
-        // percent-encoded here (unlike genuinely free-text values such as Deepgram keyterms).
+        let encode =
+            |s: &str| -> String { form_urlencoded::byte_serialize(s.as_bytes()).collect() };
+
         // Honor a base-URL override (scheme+host) for tests/regional dials, keeping the
         // `/speech-to-text/ws` path and the query below unchanged. Empty override => production base.
         match self.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
@@ -236,13 +247,13 @@ impl SarvamSTTConfig {
             None => url.push_str(SARVAM_STT_WS_URL),
         }
         url.push_str("?model=");
-        url.push_str(&self.model);
+        url.push_str(&encode(&self.model));
         url.push_str("&language-code=");
-        url.push_str(&self.language_code);
+        url.push_str(&encode(&self.language_code));
         url.push_str("&sample_rate=");
         url.push_str(&self.sample_rate.to_string());
         url.push_str("&input_audio_codec=");
-        url.push_str(&self.input_audio_codec);
+        url.push_str(&encode(&self.input_audio_codec));
 
         if self.vad_signals {
             url.push_str("&vad_signals=true");
@@ -257,10 +268,7 @@ impl SarvamSTTConfig {
         }
 
         // Provider-extras passthrough params. `mode`/`prompt` are free text (the `prompt` biasing
-        // string may contain spaces and delimiters) and so ARE percent-encoded here, unlike the
-        // constrained identifiers above.
-        let encode =
-            |s: &str| -> String { form_urlencoded::byte_serialize(s.as_bytes()).collect() };
+        // string may contain spaces and delimiters) and so are percent-encoded here too.
         if let Some(ref mode) = self.mode {
             url.push_str("&mode=");
             url.push_str(&encode(mode));
@@ -330,6 +338,10 @@ impl SarvamSTTConfig {
             ));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_sarvam_stt_endpoint("endpoint_override", endpoint)?;
+        }
+
         Ok(())
     }
 }
@@ -342,7 +354,7 @@ mod tests {
     // signals (speech_start/speech_end), and the base (provider/api_key) carries through.
     #[test]
     fn from_standard_maps_vad_events() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "sarvam".into(),
@@ -376,7 +388,10 @@ mod tests {
         extras.insert("first_turn_min_speech_frames".into(), serde_json::json!(5));
         extras.insert("negative_frames_count".into(), serde_json::json!(8));
         extras.insert("negative_frames_window".into(), serde_json::json!(16));
-        extras.insert("start_speech_volume_threshold".into(), serde_json::json!(0.2));
+        extras.insert(
+            "start_speech_volume_threshold".into(),
+            serde_json::json!(0.2),
+        );
         extras.insert("interrupt_min_speech_frames".into(), serde_json::json!(4));
         extras.insert("pre_speech_pad_frames".into(), serde_json::json!(2));
         extras.insert("num_initial_ignored_frames".into(), serde_json::json!(10));
@@ -415,7 +430,10 @@ mod tests {
             "pre_speech_pad_frames=2",
             "num_initial_ignored_frames=10",
         ] {
-            assert!(url.contains(needle), "VAD param `{needle}` missing from URL: {url}");
+            assert!(
+                url.contains(needle),
+                "VAD param `{needle}` missing from URL: {url}"
+            );
         }
     }
 
@@ -477,11 +495,35 @@ mod tests {
         let url = config.build_websocket_url();
 
         assert!(url.starts_with(SARVAM_STT_WS_URL));
-        assert!(url.contains("model=saarika:v2.5"));
+        assert!(url.contains("model=saarika%3Av2.5"));
         assert!(url.contains("language-code=hi-IN"));
         assert!(url.contains("sample_rate=16000"));
         assert!(url.contains("input_audio_codec=pcm_s16le"));
         assert!(url.contains("vad_signals=true"));
+    }
+
+    #[test]
+    fn test_build_websocket_url_encodes_model_value() {
+        let config = SarvamSTTConfig {
+            model: "saarika:v2.5&sample_rate=8000".to_string(),
+            ..Default::default()
+        };
+        let url = config.build_websocket_url();
+        let parsed = url::Url::parse(&url).unwrap();
+        let pairs: Vec<_> = parsed.query_pairs().collect();
+        assert!(pairs.contains(&("model".into(), "saarika:v2.5&sample_rate=8000".into())));
+        assert_eq!(
+            pairs
+                .iter()
+                .filter(|(key, value)| key == "sample_rate" && value == "16000")
+                .count(),
+            1,
+            "url: {url}"
+        );
+        assert!(
+            !url.contains("model=saarika:v2.5&sample_rate=8000"),
+            "model must be encoded as one query value: {url}"
+        );
     }
 
     #[test]
@@ -517,6 +559,43 @@ mod tests {
         config.input_audio_codec = "mp3".to_string();
         assert!(config.validate().is_err());
         assert!(config.validate().unwrap_err().contains("audio codec"));
+    }
+
+    #[test]
+    fn test_validate_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = SarvamSTTConfig {
+            endpoint_override: Some("wss://sarvam-proxy.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP/WS endpoint_override must be rejected");
+        assert!(err.contains("URL scheme"), "{err}");
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]

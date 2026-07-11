@@ -742,7 +742,9 @@ mod tests {
         // Some(0.8) => the caller's value reaches the body.
         let msg = QwenSessionUpdate::new("zh", 16000, "pcm16", 400, "server_vad", Some(0.8));
         let v: Value = serde_json::from_str(&msg.to_json().unwrap()).unwrap();
-        let thr = v["session"]["turn_detection"]["threshold"].as_f64().unwrap();
+        let thr = v["session"]["turn_detection"]["threshold"]
+            .as_f64()
+            .unwrap();
         assert!((thr - 0.8).abs() < 1e-6, "threshold not on wire: {v}");
     }
 
@@ -815,8 +817,17 @@ mod tests {
     // Paraformer format tests
     #[test]
     fn test_paraformer_run_task() {
-        let msg =
-            ParaformerRunTask::new("paraformer-realtime-v2", "pcm", 16000, "zh", true, true, None, None, 800);
+        let msg = ParaformerRunTask::new(
+            "paraformer-realtime-v2",
+            "pcm",
+            16000,
+            "zh",
+            true,
+            true,
+            None,
+            None,
+            800,
+        );
         let json = msg.to_json().unwrap();
 
         assert!(json.contains("run-task"));
@@ -830,8 +841,17 @@ mod tests {
     #[test]
     fn test_paraformer_run_task_multi_threshold_reaches_body() {
         // None => the field is omitted entirely (skip_serializing_if).
-        let off =
-            ParaformerRunTask::new("paraformer-realtime-v2", "pcm", 16000, "zh", true, true, None, None, 800);
+        let off = ParaformerRunTask::new(
+            "paraformer-realtime-v2",
+            "pcm",
+            16000,
+            "zh",
+            true,
+            true,
+            None,
+            None,
+            800,
+        );
         let json_off = off.to_json().unwrap();
         assert!(
             !json_off.contains("multi_threshold_mode_enabled"),

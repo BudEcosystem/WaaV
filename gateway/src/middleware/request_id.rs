@@ -128,10 +128,11 @@ fn is_hex_nonzero(s: &str, len: usize) -> bool {
 
 /// Lower-case hex of a byte slice (no external `hex` dep).
 fn hex_of(bytes: &[u8]) -> String {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-        out.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
+        out.push(HEX_DIGITS[(b >> 4) as usize] as char);
+        out.push(HEX_DIGITS[(b & 0x0f) as usize] as char);
     }
     out
 }
@@ -186,10 +187,7 @@ mod tests {
     fn derives_from_traceparent() {
         let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
         let req = req_with(&[(TRACEPARENT_HEADER, tp)]);
-        assert_eq!(
-            resolve_request_id(&req),
-            "4bf92f3577b34da6a3ce929d0e0e4736"
-        );
+        assert_eq!(resolve_request_id(&req), "4bf92f3577b34da6a3ce929d0e0e4736");
     }
 
     #[test]
@@ -205,7 +203,11 @@ mod tests {
     fn ignores_blank_request_id_and_mints() {
         let req = req_with(&[(REQUEST_ID_HEADER, "   ")]);
         let id = resolve_request_id(&req);
-        assert_eq!(id.len(), 36, "blank inbound id is ignored, fresh uuid minted");
+        assert_eq!(
+            id.len(),
+            36,
+            "blank inbound id is ignored, fresh uuid minted"
+        );
     }
 
     #[test]
@@ -221,8 +223,14 @@ mod tests {
         // A valid inbound 32-hex trace id is reused (one trace spans inbound → gateway → Infer).
         let inbound = "4bf92f3577b34da6a3ce929d0e0e4736";
         let tp = mint_traceparent(Some(inbound));
-        assert!(is_w3c_traceparent(&tp), "minted a well-formed traceparent: {tp}");
-        assert!(tp.starts_with(&format!("00-{inbound}-")), "reused the inbound trace id: {tp}");
+        assert!(
+            is_w3c_traceparent(&tp),
+            "minted a well-formed traceparent: {tp}"
+        );
+        assert!(
+            tp.starts_with(&format!("00-{inbound}-")),
+            "reused the inbound trace id: {tp}"
+        );
         assert!(tp.ends_with("-01"), "sampled flag set");
         // The span id is fresh + non-zero (never the all-zero the engine rejects).
         let span = tp.split('-').nth(2).unwrap();
@@ -231,10 +239,27 @@ mod tests {
     }
 
     #[test]
+    fn hex_of_formats_lowercase_without_fallible_digit_conversion() {
+        assert_eq!(hex_of(&[]), "");
+        assert_eq!(
+            hex_of(&[0x00, 0x01, 0x0f, 0x10, 0xab, 0xff]),
+            "00010f10abff"
+        );
+    }
+
+    #[test]
     fn mint_traceparent_mints_fresh_when_absent_or_invalid() {
-        for inbound in [None, Some("not-hex"), Some("abc-123"), Some(&*"0".repeat(32))] {
+        for inbound in [
+            None,
+            Some("not-hex"),
+            Some("abc-123"),
+            Some(&*"0".repeat(32)),
+        ] {
             let tp = mint_traceparent(inbound);
-            assert!(is_w3c_traceparent(&tp), "fresh minted traceparent is valid: {tp} (from {inbound:?})");
+            assert!(
+                is_w3c_traceparent(&tp),
+                "fresh minted traceparent is valid: {tp} (from {inbound:?})"
+            );
         }
         // Two fresh mints differ (a real 128-bit id, not a constant).
         assert_ne!(mint_traceparent(None), mint_traceparent(None));
@@ -242,14 +267,16 @@ mod tests {
 
     #[test]
     fn is_w3c_traceparent_rejects_malformed() {
-        assert!(is_w3c_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"));
+        assert!(is_w3c_traceparent(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        ));
         for bad in [
             "",
-            "00-4bf9",                                                  // too few fields
-            "00-4bf92f3577b34da6a3ce929d0e0e47-00f067aa0ba902b7-01",    // trace too short
-            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",  // all-zero trace
-            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",  // all-zero span
-            "00-zzf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",  // non-hex
+            "00-4bf9",                                                 // too few fields
+            "00-4bf92f3577b34da6a3ce929d0e0e47-00f067aa0ba902b7-01",   // trace too short
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01", // all-zero trace
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01", // all-zero span
+            "00-zzf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", // non-hex
         ] {
             assert!(!is_w3c_traceparent(bad), "must reject `{bad}`");
         }

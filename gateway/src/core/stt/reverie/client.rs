@@ -10,11 +10,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::time::timeout;
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message,
-};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
+use crate::core::resilience::connect::{WS_CONNECT_TIMEOUT, with_timeout};
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTConnectionState, STTError, STTErrorCallback, STTResult,
     STTResultCallback, STTStats,
@@ -60,8 +60,8 @@ struct ReverieTransport {
     ws_stream: SplitStream<ReverieWs>,
     /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
     audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
-    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
-    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    /// Shared shutdown token (fires once; an intentional close must not reconnect).
+    shutdown_token: CancellationToken,
     /// Fires once on the first successful connect, unblocking `connect`.
     connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     on_result: Arc<RwLock<Option<STTResultCallback>>>,
@@ -70,6 +70,18 @@ struct ReverieTransport {
     stats: Arc<RwLock<STTStats>>,
     /// Whether Reverie is in continuous mode (a final result does NOT end the session).
     continuous: bool,
+}
+
+impl ReverieTransport {
+    async fn send_eof_and_close(ws_sink: &mut SplitSink<ReverieWs, Message>) {
+        if let Err(e) = ws_sink
+            .send(Message::Binary(EOF_MARKER.to_vec().into()))
+            .await
+        {
+            warn!("Failed to send EOF marker: {}", e);
+        }
+        let _ = ws_sink.close().await;
+    }
 }
 
 #[async_trait::async_trait]
@@ -85,8 +97,14 @@ impl WsTransport for ReverieTransport {
 
     async fn run(&mut self) -> ReconnectOutcome {
         let mut audio_rx = self.audio_rx.lock().await;
-        let mut shutdown_rx = self.shutdown_rx.lock().await;
+        let shutdown_token = self.shutdown_token.clone();
         loop {
+            if shutdown_token.is_cancelled() {
+                info!("Received shutdown signal for Reverie STT");
+                Self::send_eof_and_close(&mut self.ws_sink).await;
+                return ReconnectOutcome::Completed;
+            }
+
             tokio::select! {
                 // Handle outgoing audio data (raw binary, as Reverie expects)
                 Some(audio_data) = audio_rx.recv() => {
@@ -192,17 +210,9 @@ impl WsTransport for ReverieTransport {
                 }
 
                 // Handle shutdown signal (intentional close — must NOT reconnect)
-                _ = &mut *shutdown_rx => {
+                _ = shutdown_token.cancelled() => {
                     info!("Received shutdown signal for Reverie STT");
-                    // Send EOF marker to signal end of stream, then close.
-                    if let Err(e) = self
-                        .ws_sink
-                        .send(Message::Binary(EOF_MARKER.to_vec().into()))
-                        .await
-                    {
-                        warn!("Failed to send EOF marker: {}", e);
-                    }
-                    let _ = self.ws_sink.close().await;
+                    Self::send_eof_and_close(&mut self.ws_sink).await;
                     return ReconnectOutcome::Completed;
                 }
             }
@@ -224,8 +234,8 @@ pub struct ReverieSTT {
     state: Arc<RwLock<STTConnectionState>>,
     /// WebSocket sender for audio data (bounded channel for backpressure)
     ws_sender: Option<mpsc::Sender<Bytes>>,
-    /// Shutdown signal sender
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Shutdown signal token
+    shutdown_token: Option<CancellationToken>,
     /// Connection task handle (the reconnect supervisor)
     connection_handle: Option<tokio::task::JoinHandle<()>>,
     /// Session ID from server
@@ -237,7 +247,7 @@ pub struct ReverieSTT {
     /// Ready flag
     is_ready: Arc<AtomicBool>,
     /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
-    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// `connect()`, set in `disconnect()` before cancelling `shutdown_token`, so a client close racing a
     /// server-side close can never trigger a spurious reconnect.
     intentional_disconnect: Arc<AtomicBool>,
     /// Statistics
@@ -263,7 +273,7 @@ impl ReverieSTT {
             base_config: None,
             state: Arc::new(RwLock::new(STTConnectionState::Disconnected)),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             connection_handle: None,
             session_id: Arc::new(RwLock::new(None)),
             on_result: Arc::new(RwLock::new(None)),
@@ -297,9 +307,7 @@ impl ReverieSTT {
     /// The shared circuit breaker this session feeds into the generic supervisor, if the
     /// process-global resilience handles have been injected (W-D1/W-D2). Two `ReverieSTT` built
     /// from the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
-    pub fn resilience_breaker(
-        &self,
-    ) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
         self.resilience.as_ref().map(|r| &r.breaker)
     }
 }
@@ -325,7 +333,7 @@ impl BaseSTT for ReverieSTT {
             base_config: Some(config),
             state: Arc::new(RwLock::new(STTConnectionState::Disconnected)),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             connection_handle: None,
             session_id: Arc::new(RwLock::new(None)),
             on_result: Arc::new(RwLock::new(None)),
@@ -363,17 +371,16 @@ impl BaseSTT for ReverieSTT {
 
         // Channels for communication (bounded for backpressure on audio).
         let (ws_tx, ws_rx) = mpsc::channel::<Bytes>(32);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_token = CancellationToken::new();
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         self.ws_sender = Some(ws_tx);
-        self.shutdown_tx = Some(shutdown_tx);
+        self.shutdown_token = Some(shutdown_token.clone());
 
         // Shared state the supervised transport re-uses across reconnect attempts: a single-
-        // consumer audio receiver + shutdown oneshot (locked per `run`) and the one-shot connected
+        // consumer audio receiver + shutdown token and the one-shot connected
         // signal that fires on the first successful connect.
         let audio_rx = Arc::new(Mutex::new(ws_rx));
-        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
         let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
 
         let on_result = self.on_result.clone();
@@ -410,16 +417,25 @@ impl BaseSTT for ReverieSTT {
                 .run(|| {
                     let url = url.clone();
                     let audio_rx = Arc::clone(&audio_rx);
-                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let shutdown_token = shutdown_token.clone();
                     let connected_tx = Arc::clone(&connected_tx);
                     let on_result = on_result.clone();
                     let on_error = on_error.clone();
                     let session_id = session_id.clone();
                     let stats = stats.clone();
                     async move {
-                        let (ws_stream, response) = connect_async(&url).await.map_err(|e| {
-                            StreamError::new(format!("Failed to connect to Reverie: {e}"))
-                        })?;
+                        let (ws_stream, response) =
+                            with_timeout(WS_CONNECT_TIMEOUT, connect_async(&url))
+                                .await
+                                .map_err(|_| {
+                                    StreamError::new(format!(
+                                        "connect to Reverie timed out after {}s",
+                                        WS_CONNECT_TIMEOUT.as_secs()
+                                    ))
+                                })?
+                                .map_err(|e| {
+                                    StreamError::new(format!("Failed to connect to Reverie: {e}"))
+                                })?;
                         debug!(
                             "Reverie WebSocket connected, response status: {:?}",
                             response.status()
@@ -429,7 +445,7 @@ impl BaseSTT for ReverieSTT {
                             ws_sink,
                             ws_stream,
                             audio_rx,
-                            shutdown_rx,
+                            shutdown_token,
                             connected_tx,
                             on_result,
                             on_error,
@@ -472,20 +488,25 @@ impl BaseSTT for ReverieSTT {
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
-        // Record the intent BEFORE firing shutdown_tx so the supervisor sees it even if the
+        // Record the intent BEFORE cancelling the shutdown token so the supervisor sees it even if the
         // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
         self.intentional_disconnect.store(true, Ordering::SeqCst);
         info!("Disconnecting from Reverie STT...");
 
         // Send shutdown signal (the supervised run loop sends the EOF marker and closes the
         // socket; an intentional close must NOT reconnect).
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
 
         // Wait for the supervisor task to finish with a timeout.
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "reverie-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         // Clear state
@@ -516,7 +537,8 @@ impl BaseSTT for ReverieSTT {
             .map_err(|e| STTError::NetworkError(e.to_string()))?;
 
         // Update stats
-        self.bytes_sent.fetch_add(data_len as u64, Ordering::Relaxed);
+        self.bytes_sent
+            .fetch_add(data_len as u64, Ordering::Relaxed);
         {
             let mut stats = self.stats.write().await;
             stats.total_audio_bytes += data_len as u64;
@@ -574,9 +596,10 @@ impl BaseSTT for ReverieSTT {
 
 impl Drop for ReverieSTT {
     fn drop(&mut self) {
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
         // Send shutdown signal if still connected.
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
         // Abort the supervisor task.
         if let Some(handle) = self.connection_handle.take() {
@@ -643,7 +666,7 @@ mod tests {
     // language) survives through the provider-struct method to the provider-specific config.
     #[test]
     fn test_reverie_new_standard_carries_base() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: create_test_base_config(),
             features: SttFeatures {
@@ -671,6 +694,48 @@ mod tests {
             ..Default::default()
         });
         assert!(ReverieSTT::new_standard(&bad).is_err());
+    }
+
+    #[test]
+    fn test_new_standard_rejects_ssrf_endpoint_override() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mk = |endpoint: &str| {
+            StandardSTTConfig {
+                base: STTConfig {
+                    provider: "reverie".into(),
+                    api_key: "test-api-key".into(),
+                    language: "hi".into(),
+                    model: "test-app-id".into(),
+                    ..Default::default()
+                },
+                features: SttFeatures::default(),
+                extras: ProviderExtras::default(),
+                translation: None,
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(ReverieSTT::new_standard(&mk("wss://reverie-proxy.example.com")).is_ok());
+        assert!(ReverieSTT::new_standard(&mk("ws://127.0.0.1:9000")).is_err());
+        assert!(ReverieSTT::new_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(ReverieSTT::new_standard(&mk("https://reverie-proxy.example.com")).is_err());
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]
@@ -843,5 +908,16 @@ mod tests {
         assert!(url.contains("src_lang=hi"));
         assert!(url.contains("timeout=60"));
         assert!(url.contains("continuous=1"));
+    }
+
+    #[test]
+    fn test_reverie_websocket_url_trims_endpoint_override() {
+        let config = ReverieSTTConfig {
+            endpoint_override: Some(" wss://reverie-proxy.example.com/ ".to_string()),
+            ..ReverieSTTConfig::new("test-key", "test-app")
+        };
+
+        let url = config.build_websocket_url();
+        assert!(url.starts_with("wss://reverie-proxy.example.com/stream?"));
     }
 }

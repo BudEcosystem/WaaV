@@ -30,7 +30,9 @@ use crate::core::realtime::base::{
     RealtimeErrorCallback, RealtimeResponseOverride, RealtimeResult, ReconnectionCallback,
     ReplayConversationItem, ResponseDoneCallback, SpeechEventCallback, TranscriptCallback,
 };
-use crate::core::realtime::openai::{OpenAIRealtimeAudioFormat, OpenAIRealtimeModel, OpenAIRealtimeVoice};
+use crate::core::realtime::openai::{
+    OpenAIRealtimeAudioFormat, OpenAIRealtimeModel, OpenAIRealtimeVoice,
+};
 use crate::core::realtime::scaffold::RealtimeSession;
 
 /// Yandex Realtime client — a newtype over the generic [`RealtimeSession`] driver
@@ -205,7 +207,10 @@ impl BaseRealtime for YandexRealtime {
         self.0.replay_user_audio_preroll().await
     }
 
-    async fn replay_conversation(&mut self, items: &[ReplayConversationItem]) -> RealtimeResult<()> {
+    async fn replay_conversation(
+        &mut self,
+        items: &[ReplayConversationItem],
+    ) -> RealtimeResult<()> {
         self.0.replay_conversation(items).await
     }
 }

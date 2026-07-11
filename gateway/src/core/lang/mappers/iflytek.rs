@@ -61,7 +61,11 @@ mod tests {
         assert_eq!(m.map(CanonicalLanguage::EnUs, "").native, "en_us");
         let zh = m.map(CanonicalLanguage::CmnCn, "");
         assert_eq!(zh.native, "zh_cn");
-        assert!(zh.companions.iter().any(|(k, v)| *k == "accent" && v == "mandarin"));
+        assert!(
+            zh.companions
+                .iter()
+                .any(|(k, v)| *k == "accent" && v == "mandarin")
+        );
     }
 
     #[test]

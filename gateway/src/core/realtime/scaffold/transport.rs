@@ -12,12 +12,16 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use std::str::FromStr;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
-use tokio_tungstenite::tungstenite::Message;
 
 use super::super::base::{RealtimeError, RealtimeResult};
 use super::event::{ConnectSpec, OutFrame};
+use crate::core::resilience::connect::{WS_CONNECT_TIMEOUT, with_timeout};
+
+const REST_HANDSHAKE_CREATE_URL_SCHEMES: &[&str] = &["http", "https"];
+const REST_HANDSHAKE_JOIN_URL_SCHEMES: &[&str] = &["ws", "wss"];
 
 /// A live bidirectional realtime transport. The driver owns the state machine +
 /// `S2sEvent` dispatch; the transport owns only the framing.
@@ -48,9 +52,8 @@ pub trait RealtimeTransportFactory: Send + Sync {
 // WebSocket transport (serves JSON-text AND binary-frame providers)
 // =============================================================================
 
-type WsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// A tokio-tungstenite WebSocket transport. Handles BOTH text-JSON providers
 /// (OpenAI/Azure/Gemini/Grok/Inworld) and binary-frame providers
@@ -119,9 +122,20 @@ async fn connect_ws(
             .map_err(|e| RealtimeError::ConnectionFailed(format!("bad header value: {e}")))?;
         hdrs.insert(name, val);
     }
-    let (ws, _resp) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|e| RealtimeError::ConnectionFailed(e.to_string()))?;
+    // Host only (never the full URL: query strings can carry auth tokens).
+    let host = request.uri().host().unwrap_or("<unknown host>").to_string();
+    let (ws, _resp) = with_timeout(
+        WS_CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    .map_err(|_| {
+        RealtimeError::ConnectionFailed(format!(
+            "ws connect to {host} timed out after {}s",
+            WS_CONNECT_TIMEOUT.as_secs()
+        ))
+    })?
+    .map_err(|e| RealtimeError::ConnectionFailed(e.to_string()))?;
     let (sink, stream) = ws.split();
     Ok(Box::new(WsTextTransport { sink, stream }))
 }
@@ -186,17 +200,33 @@ const UDS_HEADER_LEN: usize = 5;
 /// mirrors the 100 MB sanity bound the in-tree UDS endpoint applies.
 const UDS_MAX_FRAME_LEN: usize = 100 * 1024 * 1024;
 
+fn checked_uds_frame_body_len(len: usize) -> RealtimeResult<u32> {
+    if len > UDS_MAX_FRAME_LEN {
+        return Err(RealtimeError::ProviderError(format!(
+            "UDS frame length {len} exceeds the {UDS_MAX_FRAME_LEN}-byte bound"
+        )));
+    }
+    u32::try_from(len).map_err(|_| {
+        RealtimeError::ProviderError(format!(
+            "UDS frame length {len} exceeds the u32 wire prefix"
+        ))
+    })
+}
+
 /// PURE encoder (unit-testable, no socket): append the kind+length-prefixed wire
 /// bytes for one [`OutFrame`] to `out`. Text frames carry the UTF-8 bytes; Binary
 /// frames carry the raw audio bytes byte-exact.
-fn encode_uds_frame(frame: &OutFrame, out: &mut Vec<u8>) {
+fn encode_uds_frame(frame: &OutFrame, out: &mut Vec<u8>) -> RealtimeResult<()> {
     let (kind, body): (u8, &[u8]) = match frame {
         OutFrame::Text(s) => (UDS_KIND_TEXT, s.as_bytes()),
         OutFrame::Binary(b) => (UDS_KIND_BINARY, b.as_ref()),
     };
+    let body_len = checked_uds_frame_body_len(body.len())?;
+    out.reserve(UDS_HEADER_LEN + body.len());
     out.push(kind);
-    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(&body_len.to_be_bytes());
     out.extend_from_slice(body);
+    Ok(())
 }
 
 /// PURE decoder (unit-testable, no socket): try to decode ONE [`OutFrame`] from
@@ -255,7 +285,7 @@ impl RealtimeTransport for UdsTransport {
     async fn send(&mut self, frame: OutFrame) -> RealtimeResult<()> {
         use tokio::io::AsyncWriteExt;
         let mut out = Vec::with_capacity(UDS_HEADER_LEN);
-        encode_uds_frame(&frame, &mut out);
+        encode_uds_frame(&frame, &mut out)?;
         self.stream
             .write_all(&out)
             .await
@@ -331,6 +361,36 @@ fn extract_join_url(response: &serde_json::Value, pointer: &str) -> RealtimeResu
         })
 }
 
+fn validate_rest_handshake_create_url(url: &str) -> RealtimeResult<()> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(RealtimeError::ConnectionFailed(
+            "REST-handshake create URL rejected (SSRF protection): empty URL".to_string(),
+        ));
+    }
+    crate::core::net::validate_url_for_ssrf(url, REST_HANDSHAKE_CREATE_URL_SCHEMES).map_err(|msg| {
+        RealtimeError::ConnectionFailed(format!(
+            "REST-handshake create URL rejected (SSRF protection): {msg}"
+        ))
+    })
+}
+
+fn validate_rest_handshake_join_url(url: &str) -> RealtimeResult<String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(RealtimeError::ConnectionFailed(
+            "REST-handshake join URL rejected (SSRF protection): empty URL".to_string(),
+        ));
+    }
+    crate::core::net::validate_url_for_ssrf(url, REST_HANDSHAKE_JOIN_URL_SCHEMES)
+        .map(|_| url.to_string())
+        .map_err(|msg| {
+            RealtimeError::ConnectionFailed(format!(
+                "REST-handshake join URL rejected (SSRF protection): {msg}"
+            ))
+        })
+}
+
 /// Factory for the ULTRAVOX pattern: a REST "create call" `POST` mints a
 /// single-use `joinUrl`, then a plain WebSocket connects that pre-authed url.
 ///
@@ -355,8 +415,17 @@ impl RealtimeTransportFactory for RestHandshakeWsTransportFactory {
                 body,
                 join_url_pointer,
             } => {
-                // 1. POST the create-call. Reuse the shared reqwest client.
-                let mut req = reqwest::Client::new()
+                validate_rest_handshake_create_url(&create_url)?;
+
+                // 1. POST the create-call, validating every redirect target.
+                let create_client =
+                    crate::core::net::ssrf_protected_client(REST_HANDSHAKE_CREATE_URL_SCHEMES)
+                        .map_err(|e| {
+                            RealtimeError::ConnectionFailed(format!(
+                                "create-call client failed: {e}"
+                            ))
+                        })?;
+                let mut req = create_client
                     .post(&create_url)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .body(body);
@@ -387,6 +456,7 @@ impl RealtimeTransportFactory for RestHandshakeWsTransportFactory {
                     ))
                 })?;
                 let join_url = extract_join_url(&json, &join_url_pointer)?;
+                let join_url = validate_rest_handshake_join_url(&join_url)?;
 
                 // 4. Connect the pre-authed join url (NO extra headers).
                 connect_ws(join_url, Vec::new()).await
@@ -516,9 +586,7 @@ impl RealtimeTransport for BedrockBidiTransport {
             .send(wrap_input_payload(json))
             .await
             .map_err(|_| {
-                RealtimeError::ConnectionFailed(
-                    "Bedrock bidi input stream closed".to_string(),
-                )
+                RealtimeError::ConnectionFailed("Bedrock bidi input stream closed".to_string())
             })
     }
 
@@ -598,7 +666,8 @@ impl RealtimeTransportFactory for BedrockBidiTransportFactory {
             // of union events; the sender is the transport's `send()` surface. (Same
             // channel-fed `async_stream` Transcribe attaches as its audio input — here
             // it is the outbound-frame path.)
-            let (input_tx, mut input_rx) = mpsc::channel::<BidiInputEvent>(BEDROCK_INPUT_CHANNEL_DEPTH);
+            let (input_tx, mut input_rx) =
+                mpsc::channel::<BidiInputEvent>(BEDROCK_INPUT_CHANNEL_DEPTH);
             let input_stream = async_stream::stream! {
                 while let Some(event) = input_rx.recv().await {
                     yield Ok::<BidiInputEvent, BidiInputError>(event);
@@ -685,6 +754,23 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn rest_handshake_urls_are_ssrf_checked() {
+        let _env = crate::core::net::ssrf_env_lock();
+        assert!(validate_rest_handshake_create_url("https://api.ultravox.ai/api/calls").is_ok());
+        let err = validate_rest_handshake_create_url("file:///tmp/create")
+            .expect_err("non-HTTP create URL must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        assert_eq!(
+            validate_rest_handshake_join_url(" wss://join.example.com/call/abc ").unwrap(),
+            "wss://join.example.com/call/abc"
+        );
+        let err = validate_rest_handshake_join_url("https://join.example.com/call/abc")
+            .expect_err("non-WebSocket join URL must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+    }
+
     /// The plain `WsTransportFactory` explicitly rejects `RestThenWebSocket`
     /// (callers must use `RestHandshakeWsTransportFactory`).
     #[tokio::test]
@@ -751,7 +837,13 @@ mod tests {
         let json = r#"{"event":{"contentStart":{"type":"AUDIO"}}}"#.to_string();
         // Wrap → pull the bytes the input Chunk holds.
         let in_event = wrap_input_payload(json.clone());
-        let in_bytes = in_event.as_chunk().unwrap().bytes().unwrap().as_ref().to_vec();
+        let in_bytes = in_event
+            .as_chunk()
+            .unwrap()
+            .bytes()
+            .unwrap()
+            .as_ref()
+            .to_vec();
         // Re-frame those exact bytes as an OUTPUT chunk and unwrap.
         let out_event = BidiOutputEvent::Chunk(
             BidirectionalOutputPayloadPart::builder()
@@ -797,7 +889,7 @@ mod tests {
         // Text control frame.
         let txt = OutFrame::Text(r#"{"type":"session.config","task":"s2s"}"#.to_string());
         let mut buf = Vec::new();
-        encode_uds_frame(&txt, &mut buf);
+        encode_uds_frame(&txt, &mut buf).expect("text frame length is in range");
         let (decoded, consumed) = decode_uds_frame(&buf)
             .expect("a full frame is present")
             .expect("and decodes Ok");
@@ -811,7 +903,7 @@ mod tests {
         let audio = bytes::Bytes::from(vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0x40]);
         let bin = OutFrame::Binary(audio.clone());
         let mut buf2 = Vec::new();
-        encode_uds_frame(&bin, &mut buf2);
+        encode_uds_frame(&bin, &mut buf2).expect("binary frame length is in range");
         let (decoded2, _) = decode_uds_frame(&buf2)
             .expect("a full binary frame is present")
             .expect("and decodes Ok");
@@ -822,10 +914,35 @@ mod tests {
 
         // A partial buffer (fewer than the prefix or fewer than `len` body bytes)
         // ⇒ None (wait for more), NOT a panic or a torn frame.
-        assert!(decode_uds_frame(&buf[..2]).is_none(), "partial prefix ⇒ wait");
+        assert!(
+            decode_uds_frame(&buf[..2]).is_none(),
+            "partial prefix ⇒ wait"
+        );
         assert!(
             decode_uds_frame(&buf[..buf.len() - 1]).is_none(),
             "partial body ⇒ wait"
+        );
+    }
+
+    #[test]
+    fn uds_frame_codec_rejects_oversize_lengths() {
+        let too_large = UDS_MAX_FRAME_LEN + 1;
+        let err = checked_uds_frame_body_len(too_large)
+            .expect_err("outbound UDS frames over the transport cap must fail");
+        assert!(
+            err.to_string().contains("exceeds the"),
+            "unexpected outbound error: {err}"
+        );
+
+        let mut header = Vec::with_capacity(UDS_HEADER_LEN);
+        header.push(UDS_KIND_BINARY);
+        header.extend_from_slice(&(too_large as u32).to_be_bytes());
+        let err = decode_uds_frame(&header)
+            .expect("oversize length is rejected before waiting for a body")
+            .expect_err("oversize inbound UDS frame must fail");
+        assert!(
+            err.to_string().contains("exceeds the"),
+            "unexpected inbound error: {err}"
         );
     }
 

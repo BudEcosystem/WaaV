@@ -102,9 +102,7 @@ impl WsTtsProtocol for DeepgramAuraProtocol {
                     .to_string(),
             ),
             // Frames carrying an error payload without a recognized type.
-            None if value.get("error").is_some() => {
-                WsTtsEvent::Error(value["error"].to_string())
-            }
+            None if value.get("error").is_some() => WsTtsEvent::Error(value["error"].to_string()),
             _ => WsTtsEvent::Ignored,
         }
     }
@@ -221,9 +219,7 @@ impl DeepgramAuraTTS {
     /// Mapped features: `sample_rate` (output rate). The `endpoint_override` extra is
     /// honored for the mock harness but must pass the DAG SSRF rules at connect.
     /// Other features have no Aura WS parameter and stay capability gaps.
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let mut base = std.base.clone();
         if let Some(sr) = std.features.sample_rate {
             base.sample_rate = Some(sr);
@@ -270,7 +266,9 @@ impl BaseTTS for DeepgramAuraTTS {
             tracing::info!("Deepgram Aura TTS not ready, attempting to connect...");
             self.client.connect().await?;
         }
-        self.client.speak_with_context(text, flush, context_id).await
+        self.client
+            .speak_with_context(text, flush, context_id)
+            .await
     }
 
     async fn clear(&mut self) -> TTSResult<()> {
@@ -397,7 +395,10 @@ mod tests {
             p.classify_text_frame(r#"{"type":"Flushed","sequence_id":3}"#),
             WsTtsEvent::Flushed
         );
-        assert_eq!(p.classify_text_frame(r#"{"type":"Cleared"}"#), WsTtsEvent::Cleared);
+        assert_eq!(
+            p.classify_text_frame(r#"{"type":"Cleared"}"#),
+            WsTtsEvent::Cleared
+        );
         assert_eq!(
             p.classify_text_frame(r#"{"type":"Metadata","request_id":"r"}"#),
             WsTtsEvent::Metadata
@@ -423,8 +424,7 @@ mod tests {
             sample_rate: 24000,
             audio_format: "linear16".into(),
         };
-        let speak: serde_json::Value =
-            serde_json::from_str(&p.speak_frame("Hello world")).unwrap();
+        let speak: serde_json::Value = serde_json::from_str(&p.speak_frame("Hello world")).unwrap();
         assert_eq!(speak["type"], "Speak");
         assert_eq!(speak["text"], "Hello world");
         assert_eq!(p.flush_frame().unwrap(), r#"{"type":"Flush"}"#);

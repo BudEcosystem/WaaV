@@ -24,7 +24,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// While held, [`ReconnectGovernor::in_flight`] counts this attempt. The wrapper exists
 /// so the in-flight gauge stays exact even on panics/early returns (RAII).
 pub struct ReconnectPermit {
-    _permit: OwnedSemaphorePermit,
+    _permit: Option<OwnedSemaphorePermit>,
     in_flight: Arc<AtomicU64>,
 }
 
@@ -91,11 +91,18 @@ impl ReconnectGovernor {
         if self.semaphore.available_permits() == 0 {
             self.total_throttled.fetch_add(1, Ordering::Relaxed);
         }
-        // The semaphore is never closed, so acquire cannot fail.
-        let permit = Arc::clone(&self.semaphore)
-            .acquire_owned()
-            .await
-            .expect("reconnect governor semaphore must not be closed");
+        // The semaphore is private and should never be closed. If that invariant
+        // is broken by future refactoring, keep the reconnect task from
+        // unwinding; the log makes the cap loss visible.
+        let permit = match Arc::clone(&self.semaphore).acquire_owned().await {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                tracing::error!(
+                    "reconnect governor semaphore was closed; reconnect proceeds without a cap permit"
+                );
+                None
+            }
+        };
         self.in_flight.fetch_add(1, Ordering::AcqRel);
         ReconnectPermit {
             _permit: permit,
@@ -109,7 +116,7 @@ impl ReconnectGovernor {
             Ok(permit) => {
                 self.in_flight.fetch_add(1, Ordering::AcqRel);
                 Some(ReconnectPermit {
-                    _permit: permit,
+                    _permit: Some(permit),
                     in_flight: Arc::clone(&self.in_flight),
                 })
             }
@@ -221,10 +228,11 @@ mod tests {
     async fn acquire_timeout_gives_up_when_saturated() {
         let gov = ReconnectGovernor::new(1);
         let _held = gov.acquire().await;
-        let denied = gov
-            .acquire_timeout(Duration::from_millis(20))
-            .await;
-        assert!(denied.is_none(), "should time out while the only slot is held");
+        let denied = gov.acquire_timeout(Duration::from_millis(20)).await;
+        assert!(
+            denied.is_none(),
+            "should time out while the only slot is held"
+        );
     }
 
     #[tokio::test]

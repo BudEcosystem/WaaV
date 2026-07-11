@@ -8,13 +8,43 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::{Notify, RwLock};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::config::{MAX_TEXT_LENGTH, SberTtsConfig, TOKEN_REFRESH_THRESHOLD_SECS};
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
 };
+
+fn sber_tts_http_client(
+    connection_timeout_secs: u64,
+    request_timeout_secs: u64,
+) -> Result<reqwest::Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .connect_timeout(Duration::from_secs(connection_timeout_secs))
+        .timeout(Duration::from_secs(request_timeout_secs))
+        .build()
+}
+
+fn default_sber_tts_http_client() -> Option<reqwest::Client> {
+    match sber_tts_http_client(30, 60) {
+        Ok(client) => Some(client),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to create default SberDevices TTS HTTP client; default instance is inert until rebuilt with a valid config"
+            );
+            None
+        }
+    }
+}
+
+fn sber_tts_http_client_unavailable_error() -> TTSError {
+    TTSError::InvalidConfiguration(
+        "SberDevices TTS default HTTP client is unavailable; construct with SberDevicesTts::new or from_standard"
+            .to_string(),
+    )
+}
 
 // =============================================================================
 // OAuth Token Manager
@@ -73,7 +103,7 @@ pub struct SberDevicesTts {
     config: Option<SberTtsConfig>,
     state: ConnectionState,
     state_notify: Arc<Notify>,
-    client: reqwest::Client,
+    client: Option<reqwest::Client>,
     token_manager: Arc<RwLock<TokenManager>>,
     audio_callback: Arc<RwLock<Option<Arc<dyn AudioCallback>>>>,
     connected: AtomicBool,
@@ -85,7 +115,7 @@ impl Default for SberDevicesTts {
             config: None,
             state: ConnectionState::Disconnected,
             state_notify: Arc::new(Notify::new()),
-            client: reqwest::Client::new(),
+            client: default_sber_tts_http_client(),
             token_manager: Arc::new(RwLock::new(TokenManager::new())),
             audio_callback: Arc::new(RwLock::new(None)),
             connected: AtomicBool::new(false),
@@ -101,23 +131,21 @@ impl SberDevicesTts {
     /// then constructs the provider mirroring [`BaseTTS::new`] (HTTP client built from the
     /// resolved timeouts). SberDevices SaluteSpeech exposes no prosody knobs, so speed/pitch/
     /// emotion/instructions/ssml/seed/… are capability gaps and stay at their defaults.
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let sber_config =
             SberTtsConfig::from_standard(std).map_err(TTSError::InvalidConfiguration)?;
 
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(sber_config.connection_timeout_secs))
-            .timeout(Duration::from_secs(sber_config.request_timeout_secs))
-            .build()
-            .map_err(|e| TTSError::InternalError(format!("Failed to create HTTP client: {}", e)))?;
+        let client = sber_tts_http_client(
+            sber_config.connection_timeout_secs,
+            sber_config.request_timeout_secs,
+        )
+        .map_err(|e| TTSError::InternalError(format!("Failed to create HTTP client: {}", e)))?;
 
         Ok(Self {
             config: Some(sber_config),
             state: ConnectionState::Disconnected,
             state_notify: Arc::new(Notify::new()),
-            client,
+            client: Some(client),
             token_manager: Arc::new(RwLock::new(TokenManager::new())),
             audio_callback: Arc::new(RwLock::new(None)),
             connected: AtomicBool::new(false),
@@ -134,18 +162,23 @@ impl SberDevicesTts {
         {
             let token_guard = self.token_manager.read().await;
             if token_guard.is_token_valid()
-                && let Some(token) = token_guard.get_token() {
-                    return Ok(token.to_string());
-                }
+                && let Some(token) = token_guard.get_token()
+            {
+                return Ok(token.to_string());
+            }
         }
 
         // Need to refresh token
         debug!("Obtaining new OAuth token for SberDevices TTS");
 
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(sber_tts_http_client_unavailable_error)?;
+
         let rq_uid = Uuid::new_v4().to_string();
 
-        let response = self
-            .client
+        let response = client
             .post(config.oauth_url())
             .header("Authorization", config.oauth_auth_header())
             .header("RqUID", &rq_uid)
@@ -222,6 +255,10 @@ impl SberDevicesTts {
 
         // Get OAuth token
         let token = self.obtain_token().await?;
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(sber_tts_http_client_unavailable_error)?;
 
         // Build synthesis URL
         let url = config.synthesis_url();
@@ -234,7 +271,7 @@ impl SberDevicesTts {
             "Synthesizing text with SberDevices TTS"
         );
 
-        let response = Self::build_synthesis_request(&self.client, config, &url, &token, text)
+        let response = Self::build_synthesis_request(client, config, &url, &token, text)
             .send()
             .await
             .map_err(|e| TTSError::NetworkError(format!("Synthesis request failed: {}", e)))?;
@@ -288,17 +325,17 @@ impl BaseTTS for SberDevicesTts {
             SberTtsConfig::from_base(config).map_err(TTSError::InvalidConfiguration)?;
 
         // Build HTTP client with timeouts
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(sber_config.connection_timeout_secs))
-            .timeout(Duration::from_secs(sber_config.request_timeout_secs))
-            .build()
-            .map_err(|e| TTSError::InternalError(format!("Failed to create HTTP client: {}", e)))?;
+        let client = sber_tts_http_client(
+            sber_config.connection_timeout_secs,
+            sber_config.request_timeout_secs,
+        )
+        .map_err(|e| TTSError::InternalError(format!("Failed to create HTTP client: {}", e)))?;
 
         Ok(Self {
             config: Some(sber_config),
             state: ConnectionState::Disconnected,
             state_notify: Arc::new(Notify::new()),
-            client,
+            client: Some(client),
             token_manager: Arc::new(RwLock::new(TokenManager::new())),
             audio_callback: Arc::new(RwLock::new(None)),
             connected: AtomicBool::new(false),
@@ -490,6 +527,7 @@ impl BaseTTS for SberDevicesTts {
 mod tests {
     use super::*;
     use std::future::Future;
+    use std::io::ErrorKind;
     use std::pin::Pin;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
@@ -546,11 +584,23 @@ mod tests {
         // (2) … AND the built synth request carries Content-Type: application/ssml on the real
         // text:synthesize URL.
         let url = config.synthesis_url();
-        let request =
-            SberDevicesTts::build_synthesis_request(&tts.client, config, &url, "tok", "<speak/>")
-                .build()
-                .unwrap();
-        assert!(request.url().as_str().starts_with(super::super::SBER_TTS_SYNTHESIZE_URL));
+        let request = SberDevicesTts::build_synthesis_request(
+            tts.client
+                .as_ref()
+                .expect("strict constructor builds an HTTP client"),
+            config,
+            &url,
+            "tok",
+            "<speak/>",
+        )
+        .build()
+        .unwrap();
+        assert!(
+            request
+                .url()
+                .as_str()
+                .starts_with(super::super::SBER_TTS_SYNTHESIZE_URL)
+        );
         assert_eq!(
             request
                 .headers()
@@ -570,10 +620,17 @@ mod tests {
         let config = tts.config.as_ref().unwrap();
         assert!(!config.ssml_input);
         let url = config.synthesis_url();
-        let request =
-            SberDevicesTts::build_synthesis_request(&tts.client, config, &url, "tok", "hi")
-                .build()
-                .unwrap();
+        let request = SberDevicesTts::build_synthesis_request(
+            tts.client
+                .as_ref()
+                .expect("strict constructor builds an HTTP client"),
+            config,
+            &url,
+            "tok",
+            "hi",
+        )
+        .build()
+        .unwrap();
         assert_eq!(
             request
                 .headers()
@@ -608,6 +665,58 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn sberdevices_tts_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!(
+                        "Skipping sberdevices_tts_redirect_policy_rejects_private_hop: {err}"
+                    );
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = sber_tts_http_client(1, 1)
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
+    }
+
     #[test]
     fn test_sberdevices_tts_new() {
         let config = create_test_config();
@@ -636,6 +745,25 @@ mod tests {
         let tts = SberDevicesTts::default();
         assert!(!tts.is_ready());
         assert!(tts.config.is_none());
+    }
+
+    #[tokio::test]
+    async fn default_without_http_client_returns_typed_error_without_panic() {
+        let mut tts = SberDevicesTts::default();
+        tts.config = Some(SberTtsConfig::from_base(create_test_config()).unwrap());
+        tts.client = None;
+
+        let err = tts
+            .synthesize("Privet")
+            .await
+            .expect_err("inert default client must fail with a typed error");
+
+        match err {
+            TTSError::InvalidConfiguration(msg) => {
+                assert!(msg.contains("default HTTP client"), "{msg}");
+            }
+            other => panic!("expected InvalidConfiguration, got {other:?}"),
+        }
     }
 
     #[test]

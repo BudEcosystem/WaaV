@@ -15,6 +15,7 @@
 //! (W-D1) and are designed to be shared via [`crate::core::state::CoreState`].
 
 pub mod circuit_breaker;
+pub mod connect;
 pub mod infer_reject;
 pub mod reconnect_governor;
 pub mod registry;
@@ -22,6 +23,7 @@ pub mod registry;
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerSnapshot, CircuitState,
 };
+pub use connect::{FACTORY_CONNECT_TIMEOUT, WS_CONNECT_TIMEOUT};
 pub use infer_reject::{
     BreakerVerdict, InferRejectReason, record_infer_connection_closed, record_infer_outcome,
 };

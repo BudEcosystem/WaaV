@@ -23,13 +23,13 @@
 //!             // Process the audio data here
 //!         })
 //!     }
-//!     
+//!
 //!     fn on_error(&self, error: TTSError) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
 //!         Box::pin(async move {
 //!             eprintln!("TTS Error: {}", error);
 //!         })
 //!     }
-//!     
+//!
 //!     fn on_complete(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
 //!         Box::pin(async move {
 //!             println!("TTS synthesis complete");
@@ -47,26 +47,26 @@
 //!         sample_rate: Some(22050),
 //!         ..Default::default()
 //!     };
-//!     
+//!
 //!     // Create your TTS provider (e.g., DeepgramTTS, ElevenLabsTTS, etc.)
 //!     let mut tts_provider = create_tts_provider("deepgram", config)?;
-//!     
+//!
 //!     // Connect to the provider
 //!     tts_provider.connect().await?;
-//!     
+//!
 //!     // Register audio callback
 //!     let callback = Arc::new(MyAudioCallback);
 //!     tts_provider.on_audio(callback)?;
-//!     
+//!
 //!     // Synthesize text
 //!     tts_provider.speak("Hello, world! This is a test of the TTS system.").await?;
-//!     
+//!
 //!     // Flush to ensure immediate processing
 //!     tts_provider.flush().await?;
-//!     
+//!
 //!     // Clean up
 //!     tts_provider.disconnect().await?;
-//!     
+//!
 //!     Ok(())
 //! }
 //!
@@ -81,6 +81,16 @@ use std::sync::Arc;
 
 use crate::core::emotion::EmotionConfig;
 use crate::utils::req_manager::ReqManager;
+
+fn duration_ms_from_bytes_saturating(
+    data_len: usize,
+    numerator_ms: u128,
+    denominator: u128,
+) -> usize {
+    debug_assert!(denominator > 0, "duration denominator must be non-zero");
+    let duration_ms = (data_len as u128).saturating_mul(numerator_ms) / denominator;
+    duration_ms.min(usize::MAX as u128) as usize
+}
 
 /// Audio data structure for TTS output
 #[derive(Debug, Clone)]
@@ -123,13 +133,13 @@ impl AudioData {
             24_000
         };
         if crate::core::tts::sniff::is_linear_pcm16(&self.format) {
-            return (self.data.len() as f32 / (rate as f32 * 2.0) * 1000.0) as usize;
+            return duration_ms_from_bytes_saturating(self.data.len(), 1000, u128::from(rate) * 2);
         }
         if crate::core::tts::sniff::is_g711(&self.format) {
-            return (self.data.len() as f32 / rate as f32 * 1000.0) as usize;
+            return duration_ms_from_bytes_saturating(self.data.len(), 1000, u128::from(rate));
         }
         const ASSUMED_COMPRESSED_BPS: usize = 128_000;
-        self.data.len() * 8 * 1000 / ASSUMED_COMPRESSED_BPS
+        duration_ms_from_bytes_saturating(self.data.len(), 8_000, ASSUMED_COMPRESSED_BPS as u128)
     }
 }
 
@@ -399,10 +409,7 @@ pub trait BaseTTS: Send + Sync {
     /// (D-G7). `context_id = None` ⇒ everything. Default delegates to
     /// [`Self::clear`]; context-aware WebSocket providers override to cancel
     /// the specific server-side context.
-    async fn on_audio_context_interrupted(
-        &mut self,
-        _context_id: Option<&str>,
-    ) -> TTSResult<()> {
+    async fn on_audio_context_interrupted(&mut self, _context_id: Option<&str>) -> TTSResult<()> {
         self.clear().await
     }
 
@@ -726,5 +733,26 @@ mod tests {
         assert_eq!(a.playback_ms(8_000), 1000);
         let b = chunk(8_000, 8_000, "alaw", None);
         assert_eq!(b.playback_ms(8_000), 1000);
+    }
+
+    #[test]
+    fn playback_ms_integer_math_saturates_without_overflow() {
+        assert_eq!(
+            duration_ms_from_bytes_saturating(usize::MAX, 8_000, 1),
+            usize::MAX,
+            "compressed-duration fallback must saturate instead of overflowing usize math"
+        );
+        assert_eq!(
+            duration_ms_from_bytes_saturating(usize::MAX, 1_000, 1),
+            usize::MAX,
+            "PCM-duration fallback must saturate instead of overflowing usize math"
+        );
+
+        let odd_pcm = chunk(3, 1_000, "pcm", None);
+        assert_eq!(
+            odd_pcm.playback_ms(0),
+            1,
+            "integer PCM math keeps the same floor semantics for partial trailing samples"
+        );
     }
 }

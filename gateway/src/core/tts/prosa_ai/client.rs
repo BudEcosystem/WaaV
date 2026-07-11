@@ -26,7 +26,7 @@ use reqwest::Client;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Prosa.ai TTS client.
 ///
@@ -38,7 +38,7 @@ pub struct ProsaTts {
     /// Provider configuration.
     config: ProsaTtsConfig,
     /// HTTP client for REST API calls.
-    http_client: Client,
+    http_client: Option<Client>,
     /// Whether the client is ready to receive requests.
     is_ready: AtomicBool,
     /// Audio callback for streaming audio to caller.
@@ -47,17 +47,33 @@ pub struct ProsaTts {
     connection_state: Arc<RwLock<ConnectionState>>,
 }
 
+fn prosa_tts_http_client(timeout_secs: u64) -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+}
+
+fn default_prosa_tts_http_client() -> Option<Client> {
+    match prosa_tts_http_client(super::config::DEFAULT_REQUEST_TIMEOUT) {
+        Ok(client) => Some(client),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to create default Prosa TTS HTTP client; default instance is inert until rebuilt with a valid config"
+            );
+            None
+        }
+    }
+}
+
 impl ProsaTts {
     /// Construct the client from an already-built Prosa config (shared by `new` and
     /// `from_standard`).
     fn from_prosa_config(prosa_config: ProsaTtsConfig) -> TTSResult<Self> {
         let timeout_secs = prosa_config.request_timeout_secs;
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| {
-                TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
-            })?;
+        let http_client = prosa_tts_http_client(timeout_secs).map_err(|e| {
+            TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         info!(
             "Prosa TTS: Initialized with voice='{}', format={}",
@@ -67,7 +83,7 @@ impl ProsaTts {
 
         Ok(Self {
             config: prosa_config,
-            http_client,
+            http_client: Some(http_client),
             is_ready: AtomicBool::new(false),
             audio_callback: Arc::new(RwLock::new(None)),
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
@@ -82,9 +98,7 @@ impl ProsaTts {
     /// through the `extras` passthrough), then builds the client. Voice-tone features (volume,
     /// stability, similarity_boost, style, use_speaker_boost, emotion, instructions, SSML,
     /// language, word_timestamps, streaming, seed, sample_rate) have no Prosa field and are skipped.
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let prosa_config = ProsaTtsConfig::from_standard(std)?;
         Self::from_prosa_config(prosa_config)
     }
@@ -123,8 +137,13 @@ impl ProsaTts {
         };
 
         // Send request
-        let response = self
-            .http_client
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            TTSError::InvalidConfiguration(
+                "Prosa TTS default HTTP client is unavailable; construct with ProsaTts::new or from_standard".to_string(),
+            )
+        })?;
+
+        let response = http_client
             .post(crate::core::tts::standard::override_rest_endpoint(
                 PROSA_TTS_BASE_URL,
                 self.config.endpoint_override.as_deref(),
@@ -201,6 +220,11 @@ impl ProsaTts {
         let url = format!("{}/{}", base, job_id);
         let max_attempts = 60;
         let poll_interval = std::time::Duration::from_secs(1);
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            TTSError::InvalidConfiguration(
+                "Prosa TTS default HTTP client is unavailable; construct with ProsaTts::new or from_standard".to_string(),
+            )
+        })?;
 
         for attempt in 0..max_attempts {
             debug!(
@@ -209,8 +233,7 @@ impl ProsaTts {
                 attempt + 1
             );
 
-            let response = self
-                .http_client
+            let response = http_client
                 .get(&url)
                 .header("x-api-key", &self.config.api_key)
                 .send()
@@ -256,10 +279,20 @@ impl ProsaTts {
 
     /// Download audio from URL.
     async fn download_audio(&self, url: &str) -> TTSResult<Vec<u8>> {
+        let url = crate::core::tts::standard::validate_provider_audio_url("Prosa TTS", url)?;
         debug!("Prosa TTS: Downloading audio from URL");
 
-        let response = self
-            .http_client
+        let audio_client = crate::core::net::ssrf_protected_client_builder(
+            crate::core::tts::standard::PROVIDER_AUDIO_URL_SCHEMES,
+        )
+        .timeout(std::time::Duration::from_secs(
+            self.config.request_timeout_secs,
+        ))
+        .build()
+        .map_err(|e| {
+            TTSError::NetworkError(format!("Failed to create SSRF-protected audio client: {e}"))
+        })?;
+        let response = audio_client
             .get(url)
             .send()
             .await
@@ -285,18 +318,19 @@ impl ProsaTts {
     fn parse_error_response(&self, status: u16, body: &str) -> TTSError {
         // Try to parse as JSON error
         if let Ok(response) = serde_json::from_str::<ProsaTtsResponse>(body)
-            && let Some(err) = response.error {
-                return match err.code.as_str() {
-                    "auth_invalid_api_key" | "auth_unauthorized" => {
-                        TTSError::AuthenticationFailed(err.message)
-                    }
-                    "forbidden" => TTSError::AuthenticationFailed("Access forbidden".to_string()),
-                    "quota_insufficient" | "quota_empty" => {
-                        TTSError::ProviderError(format!("Quota exceeded: {}", err.message))
-                    }
-                    _ => TTSError::ProviderError(err.message),
-                };
-            }
+            && let Some(err) = response.error
+        {
+            return match err.code.as_str() {
+                "auth_invalid_api_key" | "auth_unauthorized" => {
+                    TTSError::AuthenticationFailed(err.message)
+                }
+                "forbidden" => TTSError::AuthenticationFailed("Access forbidden".to_string()),
+                "quota_insufficient" | "quota_empty" => {
+                    TTSError::ProviderError(format!("Quota exceeded: {}", err.message))
+                }
+                _ => TTSError::ProviderError(err.message),
+            };
+        }
 
         // Fallback to status code based error
         match status {
@@ -344,7 +378,7 @@ impl Default for ProsaTts {
     fn default() -> Self {
         Self {
             config: ProsaTtsConfig::default(),
-            http_client: Client::new(),
+            http_client: default_prosa_tts_http_client(),
             is_ready: AtomicBool::new(false),
             audio_callback: Arc::new(RwLock::new(None)),
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
@@ -563,6 +597,53 @@ mod tests {
         assert!(!tts.is_ready());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn prosa_tts_redirect_policy_rejects_private_hop() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let tts = ProsaTts::new(make_test_config()).expect("construct Prosa TTS");
+        let err = tts
+            .http_client
+            .as_ref()
+            .expect("strict constructor builds an HTTP client")
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(err) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&err.to_string());
+            source = err.source();
+        }
+        assert!(error_chain.contains("SSRF protection"), "{error_chain}");
+    }
+
     #[test]
     fn test_new_empty_api_key() {
         let config = TTSConfig {
@@ -588,6 +669,24 @@ mod tests {
     fn test_default_state() {
         let tts = ProsaTts::default();
         assert!(!tts.is_ready());
+    }
+
+    #[tokio::test]
+    async fn default_without_http_client_returns_typed_error_without_panic() {
+        let mut tts = ProsaTts::default();
+        tts.http_client = None;
+
+        let err = tts
+            .synthesize("hello")
+            .await
+            .expect_err("inert default client must fail with a typed error");
+
+        match err {
+            TTSError::InvalidConfiguration(msg) => {
+                assert!(msg.contains("default HTTP client"), "{msg}");
+            }
+            other => panic!("expected InvalidConfiguration, got {other:?}"),
+        }
     }
 
     #[test]

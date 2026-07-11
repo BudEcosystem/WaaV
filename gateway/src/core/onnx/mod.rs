@@ -19,12 +19,14 @@
 //! - `auto` — probe a platform-sensible order (Linux: cuda → xnnpack; macOS:
 //!   coreml; Windows: directml → cuda) via `ExecutionProvider::is_available()`
 //!   and register the first EP that accepts; otherwise CPU.
-//! - unknown value — `warn!`, emit `waav_degraded_total{component="ort_ep",
-//!   reason="unknown_value"}` (RC5: no silent degradation), and use CPU.
+//! - unknown value — fail session creation with an `ort::Error`. This is a
+//!   malformed deploy, not an accelerator availability problem, so it must be
+//!   visible instead of silently changing policy.
 //!
-//! **CPU is always the final fallback.** This function never fails session
-//! creation because an accelerator is missing — accelerator problems degrade
-//! to CPU with a `warn!` and a metric, never an `Err`.
+//! **CPU is always the final fallback for missing accelerators.** This function
+//! never fails session creation because an accelerator is unavailable —
+//! accelerator problems degrade to CPU with a `warn!` and a metric. Malformed
+//! operator configuration returns an `Err`.
 //!
 //! The active EP is published on the `waav_ort_ep{ep}` gauge (1 for the EP in
 //! use, 0 for the rest; bounded label set).
@@ -47,7 +49,7 @@ use ort::execution_providers::{
     TensorRTExecutionProvider, XNNPACKExecutionProvider,
 };
 use ort::session::builder::SessionBuilder;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::core::metrics::bridge::record_degraded;
 
@@ -116,6 +118,24 @@ fn parse_request(raw: &str) -> Option<EpRequest> {
         "directml" => Some(EpRequest::Explicit(EpKind::DirectMl)),
         "xnnpack" => Some(EpRequest::Explicit(EpKind::Xnnpack)),
         _ => None,
+    }
+}
+
+fn invalid_ep_error(value: &str) -> ort::Error {
+    ort::Error::new(format!(
+        "{WAAV_ORT_EP_ENV} must be one of auto|cpu|cuda|tensorrt|coreml|directml|xnnpack; got {value:?}"
+    ))
+}
+
+fn request_from_env() -> ort::Result<EpRequest> {
+    match std::env::var(WAAV_ORT_EP_ENV) {
+        Ok(raw) => parse_request(&raw).ok_or_else(|| invalid_ep_error(&raw)),
+        Err(std::env::VarError::NotPresent) => Ok(EpRequest::Auto),
+        Err(std::env::VarError::NotUnicode(value)) => {
+            let message =
+                format!("{WAAV_ORT_EP_ENV} must be valid UTF-8; got non-unicode value {value:?}");
+            Err(ort::Error::new(message))
+        }
     }
 }
 
@@ -200,24 +220,16 @@ fn try_register(kind: EpKind, builder: &mut SessionBuilder, explicit: bool) -> b
 ///
 /// Reads [`WAAV_ORT_EP_ENV`] (default `auto`) and registers at most one
 /// hardware execution provider on the builder; see the module docs for the
-/// full contract. This function **always returns `Ok`** — CPU is the
-/// guaranteed fallback and accelerator problems never fail session creation.
+/// full contract. CPU is the guaranteed fallback for unavailable accelerator
+/// providers; malformed explicit `WAAV_ORT_EP` values fail before builder
+/// mutation.
 /// The `ort::Result` return keeps call sites uniform (`?`-chained between the
-/// other builder options) and leaves room for future must-fail modes.
+/// other builder options).
 pub fn apply_execution_providers(mut builder: SessionBuilder) -> ort::Result<SessionBuilder> {
-    let raw = std::env::var(WAAV_ORT_EP_ENV).unwrap_or_default();
-    let request = match parse_request(&raw) {
-        Some(request) => request,
-        None => {
-            warn!(
-                value = %raw,
-                "unknown WAAV_ORT_EP value (expected auto|cpu|cuda|tensorrt|coreml|directml|xnnpack); using CPU"
-            );
-            record_degraded("ort_ep", "unknown_value");
-            publish_ep_gauge("cpu");
-            return Ok(builder);
-        }
-    };
+    let request = request_from_env().map_err(|e| {
+        error!(error = %e, "invalid ONNX execution-provider environment configuration");
+        e
+    })?;
 
     match request {
         EpRequest::Cpu => {
@@ -309,6 +321,21 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn request_from_env_rejects_unknown_value() {
+        set_ep("warp-drive");
+        let result = request_from_env();
+        clear_ep();
+        let err = result.expect_err("unknown WAAV_ORT_EP must fail strict env parsing");
+        let msg = err.to_string();
+        assert!(msg.contains(WAAV_ORT_EP_ENV), "error names env var: {msg}");
+        assert!(
+            msg.contains("warp-drive"),
+            "error includes malformed value: {msg}"
+        );
+    }
+
+    #[test]
     fn auto_probe_order_is_nonempty_on_supported_platforms() {
         assert!(
             !auto_probe_order().is_empty(),
@@ -327,13 +354,13 @@ mod tests {
 
     #[test]
     #[serial]
-    fn unknown_value_warns_and_falls_back_to_cpu() {
+    fn unknown_value_fails_before_cpu_fallback() {
         set_ep("warp-drive");
         let result = apply_execution_providers(builder());
         clear_ep();
         assert!(
-            result.is_ok(),
-            "unknown WAAV_ORT_EP values must degrade to CPU, not fail"
+            result.is_err(),
+            "unknown WAAV_ORT_EP values must fail instead of silently using CPU"
         );
     }
 

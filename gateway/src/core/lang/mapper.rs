@@ -202,7 +202,10 @@ mod tests {
 
         let w = MappedLanguage::native("hi-IN").warn("non-Indian language fell back to hi-IN");
         assert!(w.has_warnings());
-        assert_eq!(w.format_warnings().unwrap(), "non-Indian language fell back to hi-IN");
+        assert_eq!(
+            w.format_warnings().unwrap(),
+            "non-Indian language fell back to hi-IN"
+        );
 
         let o = MappedLanguage::omitted();
         assert!(o.omit);

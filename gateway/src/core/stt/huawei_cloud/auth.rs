@@ -21,6 +21,28 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Buffer time before token expiration to trigger refresh (1 hour).
 const TOKEN_REFRESH_BUFFER_SECS: u64 = 3600;
 
+fn huawei_iam_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(HTTP_TIMEOUT)
+        .build()
+}
+
+fn huawei_iam_default_http_client() -> Option<reqwest::Client> {
+    match huawei_iam_http_client() {
+        Ok(client) => Some(client),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build SSRF-protected Huawei IAM HTTP client");
+            None
+        }
+    }
+}
+
+fn huawei_iam_http_client_unavailable_error() -> STTError {
+    STTError::ConfigurationError(
+        "Huawei IAM HTTP client unavailable: failed to initialize reqwest client".to_string(),
+    )
+}
+
 // =============================================================================
 // IAM Token Request
 // =============================================================================
@@ -140,7 +162,7 @@ pub struct HuaweiTokenManager {
     expires_at: RwLock<Option<u64>>,
 
     /// HTTP client for token requests.
-    client: reqwest::Client,
+    client: Option<reqwest::Client>,
 }
 
 impl HuaweiTokenManager {
@@ -149,10 +171,16 @@ impl HuaweiTokenManager {
         Self {
             token: RwLock::new(None),
             expires_at: RwLock::new(None),
-            client: reqwest::Client::builder()
-                .timeout(HTTP_TIMEOUT)
-                .build()
-                .unwrap_or_default(),
+            client: huawei_iam_default_http_client(),
+        }
+    }
+
+    /// Create a token manager with a caller-provided protected HTTP client.
+    pub fn with_client(client: reqwest::Client) -> Self {
+        Self {
+            token: RwLock::new(None),
+            expires_at: RwLock::new(None),
+            client: Some(client),
         }
     }
 
@@ -245,8 +273,12 @@ impl HuaweiTokenManager {
 
         debug!("Fetching new Huawei Cloud IAM token from {}", url);
 
-        let response = self
+        let client = self
             .client
+            .as_ref()
+            .ok_or_else(huawei_iam_http_client_unavailable_error)?;
+
+        let response = client
             .post(&url)
             .header("Content-Type", "application/json")
             .body(request_json)
@@ -416,6 +448,7 @@ fn is_leap_year(year: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
 
     #[test]
     fn test_iam_token_request_serialization() {
@@ -441,6 +474,84 @@ mod tests {
         // Should start with no valid token
         let is_valid = rt.block_on(manager.is_token_valid());
         assert!(!is_valid);
+    }
+
+    #[tokio::test]
+    async fn token_manager_without_http_client_returns_typed_error_without_panic() {
+        let manager = HuaweiTokenManager {
+            token: RwLock::new(None),
+            expires_at: RwLock::new(None),
+            client: None,
+        };
+
+        let err = manager
+            .fetch_token(
+                "testuser",
+                "testpass",
+                "testdomain",
+                HuaweiCloudRegion::CnNorth4,
+                None,
+            )
+            .await
+            .expect_err("missing HTTP client should return a typed error");
+
+        match err {
+            STTError::ConfigurationError(msg) => assert!(
+                msg.contains("Huawei IAM HTTP client unavailable"),
+                "unexpected error: {msg}"
+            ),
+            other => panic!("expected ConfigurationError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn huawei_iam_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!("Skipping huawei_iam_redirect_policy_rejects_private_hop: {err}");
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = huawei_iam_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
     }
 
     #[tokio::test]

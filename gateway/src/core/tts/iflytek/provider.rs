@@ -52,7 +52,6 @@ use crate::core::tts::base::{
 const PROVIDER_INFO: &str = "iFlytek TTS WebSocket v2.0 (科大讯飞)";
 
 /// WebSocket connection timeout.
-const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// WebSocket message timeout.
 const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -149,9 +148,7 @@ impl IFlytekTts {
     /// Delegates feature mapping to [`IFlytekTtsConfig::from_standard`] (speed/pitch/volume as
     /// iFlytek 0-100 levels, sample_rate, plus the `background_sound` extras passthrough) so
     /// advanced prosody reaches the provider config the WebSocket request reads.
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let iflytek_config = IFlytekTtsConfig::from_standard(std)?;
         Self::create_from_iflytek_config(std.base.clone(), iflytek_config)
     }
@@ -279,7 +276,14 @@ impl IFlytekTts {
         // Start connection task
         let connection_handle = tokio::spawn(async move {
             // Connect to WebSocket
-            let ws_stream = match timeout(WS_CONNECT_TIMEOUT, connect_async(&ws_url)).await {
+            // 10s dial bound (provider-historical; tighter than the canonical 15s),
+            // via the shared resilience::connect helper.
+            let ws_stream = match crate::core::resilience::connect::with_timeout(
+                Duration::from_secs(10),
+                connect_async(&ws_url),
+            )
+            .await
+            {
                 Ok(Ok((stream, _))) => stream,
                 Ok(Err(e)) => {
                     error!("iFlytek TTS WebSocket connection failed: {}", e);
@@ -408,7 +412,7 @@ impl IFlytekTts {
         self.audio_forward_handle = Some(audio_forward_handle);
 
         // Wait for connection to be established
-        match timeout(WS_CONNECT_TIMEOUT, connected_rx).await {
+        match timeout(Duration::from_secs(10), connected_rx).await {
             Ok(Ok(())) => {
                 self.connected.store(true, Ordering::SeqCst);
                 info!("iFlytek TTS connected successfully");
@@ -476,13 +480,18 @@ impl BaseTTS for IFlytekTts {
 
         // Wait for connection task to finish
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "iflytek-tts-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         // Clean up forwarding task
         if let Some(handle) = self.audio_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task("iflytek-tts-audio-forwarder", handle)
+                .await;
         }
 
         // Clear state
@@ -659,7 +668,10 @@ mod tests {
         let json = request.to_json().unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         // The wire body's business section MUST carry sfl=1 paired with aue=lame.
-        assert_eq!(v["business"]["sfl"], 1, "sfl must reach the WS request body");
+        assert_eq!(
+            v["business"]["sfl"], 1,
+            "sfl must reach the WS request body"
+        );
         assert_eq!(v["business"]["aue"], "lame");
     }
 
@@ -926,7 +938,6 @@ mod tests {
     // Constants tests
     #[test]
     fn test_constants() {
-        assert_eq!(WS_CONNECT_TIMEOUT, Duration::from_secs(10));
         assert_eq!(WS_MESSAGE_TIMEOUT, Duration::from_secs(60));
         assert_eq!(TEXT_CHANNEL_BUFFER, 32);
         assert_eq!(AUDIO_CHANNEL_BUFFER, 128);

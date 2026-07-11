@@ -7,6 +7,15 @@ use std::fmt;
 
 use crate::core::tts::base::{TTSConfig, TTSError, TTSResult};
 
+fn validate_acapela_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Audio Format Types
 // =============================================================================
@@ -400,11 +409,9 @@ impl AcapelaTtsConfig {
     /// Create configuration from base TTSConfig
     pub fn from_base(config: &TTSConfig) -> TTSResult<Self> {
         // Get credentials from config or environment
-        let api_key = if !config.api_key.is_empty() {
-            config.api_key.clone()
-        } else {
-            std::env::var("ACAPELA_API_KEY").unwrap_or_default()
-        };
+        let api_key = crate::core::credentials::explicit_api_key(&config.api_key)
+            .or_else(|| crate::core::credentials::env_api_key("ACAPELA_API_KEY"))
+            .unwrap_or_default();
 
         if api_key.is_empty() {
             return Err(TTSError::InvalidConfiguration(
@@ -480,8 +487,7 @@ impl AcapelaTtsConfig {
 
         if let Some(speed) = f.speed {
             // Standardized speed is a 1.0-is-normal multiplier; Acapela uses 100-is-normal.
-            cfg.speed =
-                ((speed * 100.0).round() as u32).clamp(super::MIN_SPEED, super::MAX_SPEED);
+            cfg.speed = ((speed * 100.0).round() as u32).clamp(super::MIN_SPEED, super::MAX_SPEED);
         }
         if let Some(volume) = f.volume {
             cfg.volume = (volume.round() as u32).clamp(super::MIN_VOLUME, super::MAX_VOLUME);
@@ -508,6 +514,7 @@ impl AcapelaTtsConfig {
         }
 
         cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate()?;
 
         Ok(cfg)
     }
@@ -578,6 +585,11 @@ impl AcapelaTtsConfig {
                 super::MAX_SHAPING,
                 self.shaping
             )));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_acapela_tts_endpoint("endpoint_override", endpoint)
+                .map_err(TTSError::InvalidConfiguration)?;
         }
 
         Ok(())
@@ -814,6 +826,43 @@ mod tests {
         assert_eq!(cfg.bitrate, Some(128)); // extras passthrough
         assert_eq!(cfg.dictionaries, Some("custom.dic".to_string()));
         assert_eq!(cfg.application, Some("my-app".to_string()));
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = AcapelaTtsConfig {
+            credentials: AcapelaCredentials::new("user@example.com", "password123"),
+            endpoint_override: Some("https://acapela-proxy.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://acapela-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "acapela".to_string(),
+            api_key: "user@example.com:password123".to_string(),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(AcapelaTtsConfig::from_standard(&std).is_err());
     }
 
     #[test]

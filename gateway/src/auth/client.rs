@@ -7,6 +7,15 @@ use reqwest::{Client, StatusCode};
 use std::collections::HashMap;
 use std::time::Duration;
 
+fn auth_http_client(timeout: Duration) -> AuthResult<Client> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(timeout)
+        .pool_max_idle_per_host(10)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()
+        .map_err(|e| AuthError::ConfigError(format!("Failed to create HTTP client: {e}")))
+}
+
 /// HTTP client for communicating with the external authentication service
 #[derive(Clone)]
 pub struct AuthClient {
@@ -55,12 +64,7 @@ impl AuthClient {
 
         let timeout = Duration::from_secs(config.auth_timeout_seconds);
 
-        let client = Client::builder()
-            .timeout(timeout)
-            .pool_max_idle_per_host(10) // Connection pooling
-            .pool_idle_timeout(Duration::from_secs(90)) // Close idle connections after 90s
-            .build()
-            .map_err(|e| AuthError::ConfigError(format!("Failed to create HTTP client: {e}")))?;
+        let client = auth_http_client(timeout)?;
 
         Ok(Self {
             client,
@@ -197,6 +201,7 @@ impl AuthClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
     use std::path::PathBuf;
     use tempfile::TempDir;
     use wiremock::{
@@ -246,6 +251,58 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
         file.flush().unwrap();
 
         (temp_dir, key_path)
+    }
+
+    #[tokio::test]
+    async fn auth_http_client_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!(
+                        "Skipping auth_http_client_redirect_policy_rejects_private_hop: {err}"
+                    );
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = auth_http_client(Duration::from_secs(5))
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
     }
 
     #[tokio::test]

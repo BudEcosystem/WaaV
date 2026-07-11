@@ -12,6 +12,16 @@ use super::{
     STT_STREAM_APPNAME,
 };
 
+fn validate_reverie_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, &["ws", "wss"])
+        .map_err(|e| format!("{source} rejected (SSRF protection): {e}"))
+}
+
 // =============================================================================
 // Language Enum
 // =============================================================================
@@ -455,7 +465,12 @@ impl ReverieSTTConfig {
 
         // Base endpoint: honor an `endpoint_override` (scheme://host[:port]) for the in-repo
         // mock/proxy; the Reverie stream path is re-appended (a path-less URL fails the WS handshake).
-        let base = match self.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
+        let base = match self
+            .endpoint_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+        {
             Some(o) => format!("{}/stream", o.trim_end_matches('/')),
             None => REVERIE_STREAM_URL.to_string(),
         };
@@ -481,6 +496,9 @@ impl ReverieSTTConfig {
                 "Punctuation not supported for language: {}",
                 self.language
             ));
+        }
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_reverie_stt_endpoint("endpoint_override", endpoint)?;
         }
         Ok(())
     }
@@ -582,7 +600,7 @@ mod tests {
     // (api_key + app_id parsed from the model field) carries through unchanged.
     #[test]
     fn from_standard_passthrough_carries_base() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "reverie".into(),
@@ -692,6 +710,52 @@ mod tests {
 
         let config = ReverieSTTConfig::new("key", "app");
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = ReverieSTTConfig {
+            endpoint_override: Some("wss://reverie-proxy.example.com".to_string()),
+            ..ReverieSTTConfig::new("key", "app")
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://reverie-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-WebSocket endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("https://reverie-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("HTTP endpoint_override must be rejected for Reverie WebSocket dial");
+        assert!(err.contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]

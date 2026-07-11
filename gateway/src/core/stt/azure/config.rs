@@ -9,9 +9,19 @@
 //! and re-exported here for backwards compatibility.
 
 use super::super::base::STTConfig;
+use url::form_urlencoded;
 
 // Re-export AzureRegion from the shared providers module for backwards compatibility
 pub use crate::core::providers::azure::AzureRegion;
+
+fn encode_query_value(value: &str) -> String {
+    form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+fn validate_azure_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    crate::core::net::validate_url_for_ssrf(endpoint, &["ws", "wss"])
+        .map_err(|e| format!("{source} rejected (SSRF protection): {e}"))
+}
 
 // =============================================================================
 // Output Format
@@ -255,20 +265,23 @@ impl AzureSTTConfig {
         // Honor an `endpoint_override` (in-repo mock/proxy → local `ws://` server) for credential-free
         // e2e: swap only the dialed scheme://host; the `/speech/recognition/.../v1?...` path+query
         // (and USP auth) are kept verbatim.
-        let base_url = match self.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
+        let base_url = match self
+            .endpoint_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+        {
             Some(o) => o.trim_end_matches('/').to_string(),
             None => self.region.stt_websocket_base_url().to_string(),
         };
 
-        // NOTE: language (a locale like "en-US"), endpoint_id (a GUID) and auto-detect locales are
-        // constrained identifiers with no spaces/query-delimiters, so they are not percent-encoded
-        // (unlike genuinely free-text values such as Deepgram keyterms).
+        let language = encode_query_value(&self.base.language);
 
         // Start with the base path and required parameters
         let mut url = format!(
             "{}/speech/recognition/conversation/cognitiveservices/v1?language={}&format={}&profanity={}",
             base_url,
-            self.base.language,
+            language,
             self.output_format.as_str(),
             self.profanity.as_str()
         );
@@ -276,7 +289,7 @@ impl AzureSTTConfig {
         // Add endpoint ID for Custom Speech models
         if let Some(ref endpoint_id) = self.endpoint_id {
             url.push_str("&cid=");
-            url.push_str(endpoint_id);
+            url.push_str(&encode_query_value(endpoint_id));
         }
 
         // Add auto-detect languages if specified and non-empty
@@ -285,10 +298,33 @@ impl AzureSTTConfig {
         {
             // Azure expects comma-separated language codes for the 'languages' parameter
             url.push_str("&languages=");
-            url.push_str(&languages.join(","));
+            let encoded_languages = languages
+                .iter()
+                .map(|language| encode_query_value(language))
+                .collect::<Vec<_>>()
+                .join(",");
+            url.push_str(&encoded_languages);
         }
 
         url
+    }
+
+    /// Validate provider-specific configuration before a WebSocket dial.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.base.api_key.is_empty() {
+            return Err("Azure subscription key is required".to_string());
+        }
+
+        if let Some(endpoint) = self
+            .endpoint_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|endpoint| !endpoint.is_empty())
+        {
+            validate_azure_stt_endpoint("endpoint_override", endpoint)?;
+        }
+
+        Ok(())
     }
 
     /// The USP `speech.context` segmentation `mode` key for the active `phraseDetection.mode`.
@@ -297,7 +333,11 @@ impl AzureSTTConfig {
     /// disfluencies are requested. (Research-provided path; matches the Speech SDK
     /// `SpeechContext-phraseDetection.<mode>.segmentation.segmentationSilenceTimeoutMs` mapping.)
     fn phrase_detection_mode_key(&self) -> &'static str {
-        if self.dictation_mode { "dictation" } else { "conversation" }
+        if self.dictation_mode {
+            "dictation"
+        } else {
+            "conversation"
+        }
     }
 
     /// True when any advanced `speech.context` feature is set and a context message must be sent.
@@ -363,13 +403,19 @@ impl AzureSTTConfig {
         }
 
         if !phrase_detection.is_empty() {
-            ctx.insert("phraseDetection".into(), serde_json::Value::Object(phrase_detection));
+            ctx.insert(
+                "phraseDetection".into(),
+                serde_json::Value::Object(phrase_detection),
+            );
         }
 
         // --- languageId (continuous automatic language detection) ---------------------------
         if self.language_id_continuous {
             let mut language_id = serde_json::Map::new();
-            language_id.insert("mode".into(), serde_json::Value::String("DetectContinuous".into()));
+            language_id.insert(
+                "mode".into(),
+                serde_json::Value::String("DetectContinuous".into()),
+            );
             if let Some(langs) = &self.auto_detect_languages
                 && !langs.is_empty()
             {
@@ -381,7 +427,10 @@ impl AzureSTTConfig {
         // --- phraseOutput (N-best / detailed options) ---------------------------------------
         if self.nbest_count.is_some() || !self.phrase_output_options.is_empty() {
             let mut phrase_output = serde_json::Map::new();
-            phrase_output.insert("format".into(), serde_json::Value::String("Detailed".into()));
+            phrase_output.insert(
+                "format".into(),
+                serde_json::Value::String("Detailed".into()),
+            );
 
             let mut detailed = serde_json::Map::new();
             // Word-level confidence / detailed options (e.g. "WordTimings"). Default to
@@ -396,7 +445,10 @@ impl AzureSTTConfig {
                 detailed.insert("maxNBest".into(), serde_json::json!(n));
             }
             phrase_output.insert("detailed".into(), serde_json::Value::Object(detailed));
-            ctx.insert("phraseOutput".into(), serde_json::Value::Object(phrase_output));
+            ctx.insert(
+                "phraseOutput".into(),
+                serde_json::Value::Object(phrase_output),
+            );
         }
 
         // --- dgi (dynamic grammar / phrase list / keyterm boosting) -------------------------
@@ -480,9 +532,11 @@ impl AzureSTTConfig {
                 .iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect(),
-            Some(serde_json::Value::String(s)) => {
-                s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
-            }
+            Some(serde_json::Value::String(s)) => s
+                .split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect(),
             _ => Vec::new(),
         };
 
@@ -522,7 +576,7 @@ mod tests {
     // word-level timing) onto its own config fields.
     #[test]
     fn from_standard_maps_features() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "azure".into(),
@@ -645,6 +699,78 @@ mod tests {
     }
 
     #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = AzureSTTConfig {
+            base: STTConfig {
+                api_key: "subscription-key".to_string(),
+                ..Default::default()
+            },
+            endpoint_override: Some("wss://azure-proxy.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://azure-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-WebSocket endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("https://azure-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("HTTP endpoint_override must be rejected for Azure WebSocket dial");
+        assert!(err.contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
+    }
+
+    #[test]
+    fn test_azure_stt_config_build_url_trims_endpoint_override() {
+        let config = AzureSTTConfig {
+            base: STTConfig {
+                language: "en-US".to_string(),
+                ..Default::default()
+            },
+            endpoint_override: Some(" wss://azure-proxy.example.com/ ".to_string()),
+            ..Default::default()
+        };
+
+        let url = config.build_websocket_url();
+
+        assert!(
+            url.starts_with(
+                "wss://azure-proxy.example.com/speech/recognition/conversation/cognitiveservices/v1"
+            ),
+            "endpoint_override slash should be normalized: {url}"
+        );
+        assert!(url.contains("language=en-US"));
+    }
+
+    #[test]
     fn test_azure_stt_config_from_base() {
         let base = STTConfig {
             api_key: "test-key".to_string(),
@@ -729,6 +855,83 @@ mod tests {
         assert!(url.contains("languages=en-GB,en-US"));
     }
 
+    #[test]
+    fn test_azure_stt_websocket_url_encodes_open_query_values() {
+        let config = AzureSTTConfig {
+            base: STTConfig {
+                language: "en-US&format=simple".to_string(),
+                ..Default::default()
+            },
+            endpoint_id: Some("custom&profanity=raw".to_string()),
+            auto_detect_languages: Some(vec!["en-US".to_string(), "es-ES&cid=evil".to_string()]),
+            ..Default::default()
+        };
+
+        let url = config.build_websocket_url();
+        assert!(url.contains("language=en-US%26format%3Dsimple"));
+        assert!(url.contains("cid=custom%26profanity%3Draw"));
+        assert!(url.contains("languages=en-US,es-ES%26cid%3Devil"));
+
+        let parsed = url::Url::parse(&url).expect("Azure STT websocket URL should parse");
+        let query_pairs = parsed.query_pairs().into_owned().collect::<Vec<_>>();
+
+        assert_eq!(
+            query_pairs
+                .iter()
+                .filter(|(key, _)| key == "language")
+                .count(),
+            1
+        );
+        assert!(
+            query_pairs
+                .iter()
+                .any(|(key, value)| key == "language" && value == "en-US&format=simple")
+        );
+        assert!(
+            query_pairs
+                .iter()
+                .any(|(key, value)| key == "format" && value == "detailed")
+        );
+        assert!(
+            !query_pairs
+                .iter()
+                .any(|(key, value)| key == "format" && value == "simple")
+        );
+
+        assert_eq!(
+            query_pairs.iter().filter(|(key, _)| key == "cid").count(),
+            1
+        );
+        assert!(
+            query_pairs
+                .iter()
+                .any(|(key, value)| key == "cid" && value == "custom&profanity=raw")
+        );
+        assert!(
+            query_pairs
+                .iter()
+                .any(|(key, value)| key == "profanity" && value == "masked")
+        );
+        assert!(
+            !query_pairs
+                .iter()
+                .any(|(key, value)| key == "profanity" && value == "raw")
+        );
+
+        assert_eq!(
+            query_pairs
+                .iter()
+                .filter(|(key, _)| key == "languages")
+                .count(),
+            1
+        );
+        assert!(
+            query_pairs
+                .iter()
+                .any(|(key, value)| key == "languages" && value == "en-US,es-ES&cid=evil")
+        );
+    }
+
     // =========================================================================
     // WIRE-LEVEL tests for the advanced `speech.context` features. These assert
     // the api_param reaches the SERIALIZED `speech.context` JSON body (the exact
@@ -737,9 +940,12 @@ mod tests {
     // through `from_standard` → `build_speech_context_body`.
     // =========================================================================
 
-    use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+    use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
 
-    fn ctx_json(features: SttFeatures, extras: serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    fn ctx_json(
+        features: SttFeatures,
+        extras: serde_json::Map<String, serde_json::Value>,
+    ) -> serde_json::Value {
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "azure".into(),
@@ -762,7 +968,11 @@ mod tests {
     #[test]
     fn no_advanced_features_means_no_speech_context() {
         let cfg = AzureSTTConfig::from_standard(&StandardSTTConfig {
-            base: STTConfig { provider: "azure".into(), api_key: "k".into(), ..Default::default() },
+            base: STTConfig {
+                provider: "azure".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
             features: SttFeatures::default(),
             extras: ProviderExtras::default(),
             translation: None,
@@ -774,7 +984,13 @@ mod tests {
     /// diarization (typed) → phraseDetection.speakerDiarization.mode.
     #[test]
     fn diarization_reaches_speech_context() {
-        let v = ctx_json(SttFeatures { diarization: Some(true), ..Default::default() }, Default::default());
+        let v = ctx_json(
+            SttFeatures {
+                diarization: Some(true),
+                ..Default::default()
+            },
+            Default::default(),
+        );
         assert_eq!(
             v["phraseDetection"]["speakerDiarization"]["mode"], "Identity",
             "speakerDiarization.mode must reach the speech.context body: {v}"
@@ -785,36 +1001,75 @@ mod tests {
     /// with segmentation.mode = "Custom".
     #[test]
     fn segmentation_timeout_reaches_speech_context() {
-        let v = ctx_json(SttFeatures { endpointing_ms: Some(720), ..Default::default() }, Default::default());
+        let v = ctx_json(
+            SttFeatures {
+                endpointing_ms: Some(720),
+                ..Default::default()
+            },
+            Default::default(),
+        );
         let seg = &v["phraseDetection"]["conversation"]["segmentation"];
-        assert_eq!(seg["segmentationSilenceTimeoutMs"], 720, "timeout must reach the body: {v}");
-        assert_eq!(seg["mode"], "Custom", "segmentation mode must be Custom to honor the timeout: {v}");
+        assert_eq!(
+            seg["segmentationSilenceTimeoutMs"], 720,
+            "timeout must reach the body: {v}"
+        );
+        assert_eq!(
+            seg["mode"], "Custom",
+            "segmentation mode must be Custom to honor the timeout: {v}"
+        );
     }
 
     /// language_detection (typed) → languageId.mode = "DetectContinuous".
     #[test]
     fn language_id_continuous_reaches_speech_context() {
-        let v = ctx_json(SttFeatures { language_detection: Some(true), ..Default::default() }, Default::default());
-        assert_eq!(v["languageId"]["mode"], "DetectContinuous", "languageId.mode must reach the body: {v}");
+        let v = ctx_json(
+            SttFeatures {
+                language_detection: Some(true),
+                ..Default::default()
+            },
+            Default::default(),
+        );
+        assert_eq!(
+            v["languageId"]["mode"], "DetectContinuous",
+            "languageId.mode must reach the body: {v}"
+        );
     }
 
     /// alternatives (typed) → phraseOutput.format=Detailed + phraseOutput.detailed.maxNBest.
     #[test]
     fn nbest_reaches_speech_context_detailed_output() {
-        let v = ctx_json(SttFeatures { alternatives: Some(5), ..Default::default() }, Default::default());
-        assert_eq!(v["phraseOutput"]["format"], "Detailed", "phraseOutput.format must be Detailed: {v}");
-        assert_eq!(v["phraseOutput"]["detailed"]["maxNBest"], 5, "maxNBest must reach the body: {v}");
+        let v = ctx_json(
+            SttFeatures {
+                alternatives: Some(5),
+                ..Default::default()
+            },
+            Default::default(),
+        );
+        assert_eq!(
+            v["phraseOutput"]["format"], "Detailed",
+            "phraseOutput.format must be Detailed: {v}"
+        );
+        assert_eq!(
+            v["phraseOutput"]["detailed"]["maxNBest"], 5,
+            "maxNBest must reach the body: {v}"
+        );
     }
 
     /// keyterms (typed) → dgi.Groups[].Items (dynamic-grammar phrase list / keyterm boosting).
     #[test]
     fn keyterms_reach_speech_context_dgi() {
         let v = ctx_json(
-            SttFeatures { keyterms: Some(vec!["WaaV".into(), "Cognitive Services".into()]), ..Default::default() },
+            SttFeatures {
+                keyterms: Some(vec!["WaaV".into(), "Cognitive Services".into()]),
+                ..Default::default()
+            },
             Default::default(),
         );
         let items = &v["dgi"]["Groups"][0]["Items"];
-        assert_eq!(items[0], "WaaV", "phrase-list item must reach dgi.Groups[].Items: {v}");
+        assert_eq!(
+            items[0], "WaaV",
+            "phrase-list item must reach dgi.Groups[].Items: {v}"
+        );
         assert_eq!(items[1], "Cognitive Services");
     }
 
@@ -823,10 +1078,17 @@ mod tests {
     #[test]
     fn dictation_mode_reaches_speech_context() {
         let v = ctx_json(
-            SttFeatures { filler_words: Some(true), endpointing_ms: Some(500), ..Default::default() },
+            SttFeatures {
+                filler_words: Some(true),
+                endpointing_ms: Some(500),
+                ..Default::default()
+            },
             Default::default(),
         );
-        assert_eq!(v["phraseDetection"]["mode"], "Dictation", "phraseDetection.mode must be Dictation: {v}");
+        assert_eq!(
+            v["phraseDetection"]["mode"], "Dictation",
+            "phraseDetection.mode must be Dictation: {v}"
+        );
         // Segmentation nests under the dictation mode key when dictation is active.
         assert_eq!(
             v["phraseDetection"]["dictation"]["segmentation"]["segmentationSilenceTimeoutMs"], 500,
@@ -837,7 +1099,13 @@ mod tests {
     /// sentiment (typed) → phraseDetection.sentimentAnalysis.enabled = true.
     #[test]
     fn sentiment_reaches_speech_context() {
-        let v = ctx_json(SttFeatures { sentiment: Some(true), ..Default::default() }, Default::default());
+        let v = ctx_json(
+            SttFeatures {
+                sentiment: Some(true),
+                ..Default::default()
+            },
+            Default::default(),
+        );
         assert_eq!(
             v["phraseDetection"]["sentimentAnalysis"]["enabled"], true,
             "sentimentAnalysis.enabled must reach the body: {v}"
@@ -848,10 +1116,16 @@ mod tests {
     #[test]
     fn phrase_output_options_reach_speech_context() {
         let mut ex = serde_json::Map::new();
-        ex.insert("phrase_output_options".into(), serde_json::json!(["WordTimings", "SNR", "Pronunciation"]));
+        ex.insert(
+            "phrase_output_options".into(),
+            serde_json::json!(["WordTimings", "SNR", "Pronunciation"]),
+        );
         let v = ctx_json(SttFeatures::default(), ex);
         let opts = &v["phraseOutput"]["detailed"]["options"];
-        assert_eq!(opts[0], "WordTimings", "detailed options must reach the body: {v}");
+        assert_eq!(
+            opts[0], "WordTimings",
+            "detailed options must reach the body: {v}"
+        );
         assert_eq!(opts[1], "SNR");
         assert_eq!(opts[2], "Pronunciation");
     }
@@ -860,7 +1134,10 @@ mod tests {
     #[test]
     fn from_standard_all_speech_context_features_reach_the_wire() {
         let mut ex = serde_json::Map::new();
-        ex.insert("phrase_output_options".into(), serde_json::json!(["WordTimings"]));
+        ex.insert(
+            "phrase_output_options".into(),
+            serde_json::json!(["WordTimings"]),
+        );
         let v = ctx_json(
             SttFeatures {
                 diarization: Some(true),
@@ -876,9 +1153,13 @@ mod tests {
         );
         // Dictation is on, so segmentation nests under "dictation".
         assert_eq!(v["phraseDetection"]["mode"], "Dictation");
-        assert_eq!(v["phraseDetection"]["speakerDiarization"]["mode"], "Identity");
         assert_eq!(
-            v["phraseDetection"]["dictation"]["segmentation"]["segmentationSilenceTimeoutMs"], 640
+            v["phraseDetection"]["speakerDiarization"]["mode"],
+            "Identity"
+        );
+        assert_eq!(
+            v["phraseDetection"]["dictation"]["segmentation"]["segmentationSilenceTimeoutMs"],
+            640
         );
         assert_eq!(v["phraseDetection"]["sentimentAnalysis"]["enabled"], true);
         assert_eq!(v["languageId"]["mode"], "DetectContinuous");

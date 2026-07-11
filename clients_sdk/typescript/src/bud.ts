@@ -26,9 +26,9 @@ import { SLOTracker } from './metrics/slo.js';
 import type { SLOThreshold, SLOStatus } from './types/metrics.js';
 
 /** Default gateway URL when neither config nor env provides one. */
-export const DEFAULT_GATEWAY_URL = 'http://127.0.0.1:3009';
+export const DEFAULT_GATEWAY_URL = 'http://127.0.0.1:3001';
 
-/** Env var the SDK reads for the gateway URL (e.g. ws://127.0.0.1:3009). */
+/** Env var the SDK reads for the gateway URL (e.g. ws://127.0.0.1:3001). */
 export const GATEWAY_URL_ENV = 'WAAV_GATEWAY_URL';
 
 /**
@@ -53,13 +53,13 @@ function normalizeHttpUrl(url: string): string {
  */
 export interface BudClientConfig {
   /**
-   * Base URL for the gateway REST API (e.g., "http://127.0.0.1:3009").
+   * Base URL for the gateway REST API (e.g., "http://127.0.0.1:3001").
    * Optional: defaults to the `WAAV_GATEWAY_URL` env var when set, otherwise
-   * "http://127.0.0.1:3009". An ws/wss URL is also accepted and normalised to
+   * "http://127.0.0.1:3001". An ws/wss URL is also accepted and normalised to
    * http/https for REST.
    */
   baseUrl?: string;
-  /** WebSocket URL (e.g., "ws://127.0.0.1:3009/ws"). Defaults to baseUrl with /ws path */
+  /** WebSocket URL (e.g., "ws://127.0.0.1:3001/ws"). Defaults to baseUrl with /ws path */
   wsUrl?: string;
   /** API key for authentication */
   apiKey?: string;

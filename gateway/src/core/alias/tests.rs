@@ -30,7 +30,10 @@ fn registry_register_resolve_case_insensitive() {
 
     let def = reg.resolve("support-bot").expect("resolves");
     assert_eq!(def.kind, Some(AliasKind::Agent));
-    assert_eq!(def.stt.as_ref().unwrap().provider.as_deref(), Some("deepgram"));
+    assert_eq!(
+        def.stt.as_ref().unwrap().provider.as_deref(),
+        Some("deepgram")
+    );
     assert_eq!(
         def.tts.as_ref().unwrap().voice.as_deref(),
         Some("female-warm-en")
@@ -82,8 +85,14 @@ fn splice_materializes_full_bundle_from_alias_only() {
     // Echo reflects the concrete resolved providers (the ready-ack payload).
     assert_eq!(echo.name, "support-bot");
     assert_eq!(echo.kind, Some(AliasKind::Agent));
-    assert_eq!(echo.stt.as_ref().unwrap().provider.as_deref(), Some("deepgram"));
-    assert_eq!(echo.tts.as_ref().unwrap().provider.as_deref(), Some("elevenlabs"));
+    assert_eq!(
+        echo.stt.as_ref().unwrap().provider.as_deref(),
+        Some("deepgram")
+    );
+    assert_eq!(
+        echo.tts.as_ref().unwrap().provider.as_deref(),
+        Some("elevenlabs")
+    );
     assert_eq!(echo.llm.as_ref().unwrap().model.as_deref(), Some("qwen2.5"));
     // The system prompt is never echoed back (may be sensitive).
     assert!(echo.llm.as_ref().unwrap().system_prompt.is_none());
@@ -143,7 +152,10 @@ fn client_field_overrides_alias_default() {
     assert_eq!(stt.language, "en-US", "empty client field filled by alias");
 
     let tts = tts.unwrap();
-    assert_eq!(tts.provider, "elevenlabs", "empty client provider filled by alias");
+    assert_eq!(
+        tts.provider, "elevenlabs",
+        "empty client provider filled by alias"
+    );
     assert_eq!(
         tts.voice_id.as_deref(),
         Some("client-voice"),
@@ -164,7 +176,14 @@ dag_template: voice-assistant
 "#,
     );
     let (mut stt, mut tts, mut conv, mut dag) = (None, None, None, None);
-    let echo = splice_alias("translate-bot", &def, &mut stt, &mut tts, &mut conv, &mut dag);
+    let echo = splice_alias(
+        "translate-bot",
+        &def,
+        &mut stt,
+        &mut tts,
+        &mut conv,
+        &mut dag,
+    );
 
     let dag = dag.expect("dag config materialized");
     assert_eq!(dag.template.as_deref(), Some("voice-assistant"));
@@ -189,14 +208,47 @@ fn client_inline_dag_overrides_alias_template() {
     let (mut stt, mut tts, mut conv) = (None, None, None);
     splice_alias("x", &def, &mut stt, &mut tts, &mut conv, &mut dag);
     let dag = dag.unwrap();
-    assert!(dag.template.is_none(), "inline definition is not overridden by alias template");
+    assert!(
+        dag.template.is_none(),
+        "inline definition is not overridden by alias template"
+    );
     assert!(dag.definition.is_some());
+}
+
+#[test]
+fn default_alias_conversation_uses_wire_defaults_without_static_expect() {
+    let cfg = default_alias_conversation();
+
+    assert_eq!(cfg.base_url, "");
+    assert_eq!(cfg.model, "");
+    assert!(cfg.streaming);
+    assert_eq!(cfg.max_history, 20);
+    assert!(cfg.allow_interruption);
+    assert!(cfg.strip_markdown);
+}
+
+#[test]
+fn invalid_alias_conversation_wire_defaults_fall_back_without_panic() {
+    let cfg = alias_conversation_from_wire_defaults(serde_json::json!({
+        "base_url": false,
+        "model": false
+    }));
+
+    assert_eq!(cfg.base_url, "");
+    assert_eq!(cfg.model, "");
+    assert!(cfg.streaming);
+    assert_eq!(cfg.max_history, 20);
+    assert!(cfg.allow_interruption);
+    assert!(cfg.strip_markdown);
 }
 
 #[test]
 fn initialize_aliases_populates_global() {
     let mut map = std::collections::HashMap::new();
-    map.insert("news-voice".to_string(), parse_def("kind: tts\ntts: { provider: deepgram, voice: aura-asteria-en }\n"));
+    map.insert(
+        "news-voice".to_string(),
+        parse_def("kind: tts\ntts: { provider: deepgram, voice: aura-asteria-en }\n"),
+    );
     let n = initialize_aliases(&AliasConfig { aliases: map });
     assert!(n >= 1);
     // The global registry now resolves it (may also contain aliases from other tests
@@ -210,11 +262,15 @@ fn initialize_aliases_populates_global() {
 /// load, instead of silently misconfiguring a session.
 #[test]
 fn unknown_field_in_alias_definition_is_rejected() {
-    let res: Result<AliasDefinition, _> = serde_yaml::from_str("kind: agent\nstt: { provder: deepgram }\n");
+    let res: Result<AliasDefinition, _> =
+        serde_yaml::from_str("kind: agent\nstt: { provder: deepgram }\n");
     assert!(res.is_err(), "typo'd sub-field must be rejected");
 
     let res: Result<AliasDefinition, _> = serde_yaml::from_str("kind: agent\nbogus_block: 1\n");
-    assert!(res.is_err(), "unknown top-level alias field must be rejected");
+    assert!(
+        res.is_err(),
+        "unknown top-level alias field must be rejected"
+    );
 }
 
 // ── SSRF / trust boundary ────────────────────────────────────────────────────────────
@@ -262,7 +318,10 @@ fn client_cannot_inject_alias_definition_object() {
     // Crucially: NO alias was set, and there is no way to reach a definition from here.
     match msg {
         crate::handlers::ws::messages::IncomingMessage::Config { alias, .. } => {
-            assert!(alias.is_none(), "client `aliases` map is not a real field — no definition enters");
+            assert!(
+                alias.is_none(),
+                "client `aliases` map is not a real field — no definition enters"
+            );
         }
         _ => panic!("expected Config"),
     }

@@ -1,9 +1,14 @@
 use axum::middleware;
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use serde_json::json;
+use std::future::Future;
 use std::io::ErrorKind;
+use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use waav_gateway::{
@@ -13,6 +18,47 @@ use waav_gateway::{
     routes,
     state::AppState,
 };
+
+struct TestServer {
+    label: &'static str,
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        if self.panicked.load(Ordering::SeqCst) {
+            let msg = format!("ws_tests server '{}' panicked", self.label);
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+}
+
+fn spawn_test_server<F>(label: &'static str, future: F) -> TestServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let panicked = Arc::new(AtomicBool::new(false));
+    let panicked_in_task = Arc::clone(&panicked);
+    let handle = tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked_in_task.store(true, Ordering::SeqCst);
+            eprintln!("ws_tests server '{label}' panicked");
+        }
+    });
+    TestServer {
+        label,
+        handle,
+        panicked,
+    }
+}
 
 #[tokio::test]
 async fn test_websocket_voice_config() {
@@ -75,10 +121,10 @@ async fn test_websocket_voice_config() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
-            ws_processing_timeout_secs: 10,
-            realtime_processing_timeout_secs: 30,
-            sip_max_participants: 3,
-            realtime_endpoint_overrides: Default::default(),
+        ws_processing_timeout_secs: 10,
+        realtime_processing_timeout_secs: 30,
+        sip_max_participants: 3,
+        realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
         aliases: Default::default(),
@@ -110,7 +156,7 @@ async fn test_websocket_voice_config() {
     let addr = listener.local_addr().unwrap();
 
     // Start server in background
-    tokio::spawn(async move {
+    let _server = spawn_test_server("test_websocket_voice_config", async move {
         axum::serve(listener, app).await.unwrap();
     });
 
@@ -281,10 +327,10 @@ async fn test_websocket_invalid_message() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
-            ws_processing_timeout_secs: 10,
-            realtime_processing_timeout_secs: 30,
-            sip_max_participants: 3,
-            realtime_endpoint_overrides: Default::default(),
+        ws_processing_timeout_secs: 10,
+        realtime_processing_timeout_secs: 30,
+        sip_max_participants: 3,
+        realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
         aliases: Default::default(),
@@ -316,7 +362,7 @@ async fn test_websocket_invalid_message() {
     let addr = listener.local_addr().unwrap();
 
     // Start server in background
-    tokio::spawn(async move {
+    let _server = spawn_test_server("test_websocket_invalid_message", async move {
         axum::serve(listener, app).await.unwrap();
     });
 
@@ -419,10 +465,10 @@ async fn test_websocket_sip_transfer_without_livekit_config() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
-            ws_processing_timeout_secs: 10,
-            realtime_processing_timeout_secs: 30,
-            sip_max_participants: 3,
-            realtime_endpoint_overrides: Default::default(),
+        ws_processing_timeout_secs: 10,
+        realtime_processing_timeout_secs: 30,
+        sip_max_participants: 3,
+        realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
         aliases: Default::default(),
@@ -454,9 +500,12 @@ async fn test_websocket_sip_transfer_without_livekit_config() {
     let addr = listener.local_addr().unwrap();
 
     // Start server in background
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let _server = spawn_test_server(
+        "test_websocket_sip_transfer_without_livekit_config",
+        async move {
+            axum::serve(listener, app).await.unwrap();
+        },
+    );
 
     // Give server time to start
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -560,10 +609,10 @@ async fn test_websocket_sip_transfer_invalid_phone_number() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
-            ws_processing_timeout_secs: 10,
-            realtime_processing_timeout_secs: 30,
-            sip_max_participants: 3,
-            realtime_endpoint_overrides: Default::default(),
+        ws_processing_timeout_secs: 10,
+        realtime_processing_timeout_secs: 30,
+        sip_max_participants: 3,
+        realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
         aliases: Default::default(),
@@ -595,9 +644,12 @@ async fn test_websocket_sip_transfer_invalid_phone_number() {
     let addr = listener.local_addr().unwrap();
 
     // Start server in background
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let _server = spawn_test_server(
+        "test_websocket_sip_transfer_invalid_phone_number",
+        async move {
+            axum::serve(listener, app).await.unwrap();
+        },
+    );
 
     // Give server time to start
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -701,10 +753,10 @@ async fn test_websocket_sip_transfer_empty_phone_number() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
-            ws_processing_timeout_secs: 10,
-            realtime_processing_timeout_secs: 30,
-            sip_max_participants: 3,
-            realtime_endpoint_overrides: Default::default(),
+        ws_processing_timeout_secs: 10,
+        realtime_processing_timeout_secs: 30,
+        sip_max_participants: 3,
+        realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
         aliases: Default::default(),
@@ -736,9 +788,12 @@ async fn test_websocket_sip_transfer_empty_phone_number() {
     let addr = listener.local_addr().unwrap();
 
     // Start server in background
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let _server = spawn_test_server(
+        "test_websocket_sip_transfer_empty_phone_number",
+        async move {
+            axum::serve(listener, app).await.unwrap();
+        },
+    );
 
     // Give server time to start
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;

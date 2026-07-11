@@ -66,7 +66,7 @@ fn sarvam_translate_node() -> NodeDefinition {
             assistant_id: None,
             timeout_ms: Some(120_000),
             headers: Default::default(),
-                reasoning_effort: None,
+            reasoning_effort: None,
         },
     )
 }
@@ -108,7 +108,11 @@ async fn synth_english_pcm(text: &str, deepgram_key: &str) -> Vec<u8> {
         .send()
         .await
         .expect("deepgram /v1/speak");
-    assert!(resp.status().is_success(), "deepgram speak: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "deepgram speak: {}",
+        resp.status()
+    );
     resp.bytes().await.unwrap().to_vec()
 }
 
@@ -119,7 +123,9 @@ async fn synth_english_pcm(text: &str, deepgram_key: &str) -> Vec<u8> {
 #[ignore = "Requires SARVAM_API_KEY; real billed Sarvam call"]
 async fn dag_sarvam_translates_en_to_hindi_live() {
     ensure_crypto();
-    let Some(_) = key("SARVAM_API_KEY") else { return };
+    let Some(_) = key("SARVAM_API_KEY") else {
+        return;
+    };
 
     let mut dag = DAGDefinition::new("translate-only", "Sarvam EN->HI");
     dag.add_node(sarvam_translate_node());
@@ -130,7 +136,12 @@ async fn dag_sarvam_translates_en_to_hindi_live() {
     let exec = DAGExecutor::new() /* per-node timeout_ms=120000 on the translate node is now honored (no executor override needed) */;
     let mut ctx = DAGContext::new("xlate-test");
     let out = exec
-        .execute_from(&compiled, "translate", DAGData::Text(ENGLISH.to_string()), &mut ctx)
+        .execute_from(
+            &compiled,
+            "translate",
+            DAGData::Text(ENGLISH.to_string()),
+            &mut ctx,
+        )
         .await
         .expect("translation executes");
 
@@ -153,7 +164,9 @@ async fn dag_sarvam_translates_en_to_hindi_live() {
 #[ignore = "Requires SARVAM_API_KEY + ELEVENLABS_API_KEY; real billed calls"]
 async fn dag_translate_then_elevenlabs_hindi_tts_live() {
     ensure_crypto();
-    let (Some(_), Some(_)) = (key("SARVAM_API_KEY"), key("ELEVENLABS_API_KEY")) else { return };
+    let (Some(_), Some(_)) = (key("SARVAM_API_KEY"), key("ELEVENLABS_API_KEY")) else {
+        return;
+    };
 
     let mut dag = DAGDefinition::new("xlate-tts", "Sarvam EN->HI -> ElevenLabs TTS");
     dag.add_node(sarvam_translate_node());
@@ -166,14 +179,28 @@ async fn dag_translate_then_elevenlabs_hindi_tts_live() {
     let exec = DAGExecutor::new() /* per-node timeout_ms=120000 on the translate node is now honored (no executor override needed) */;
     let mut ctx = DAGContext::new("xlate-tts-test");
     let out = exec
-        .execute_from(&compiled, "translate", DAGData::Text(ENGLISH.to_string()), &mut ctx)
+        .execute_from(
+            &compiled,
+            "translate",
+            DAGData::Text(ENGLISH.to_string()),
+            &mut ctx,
+        )
         .await
         .expect("translate->tts executes");
 
     match out {
         DAGData::TTSAudio(a) => {
-            println!("Hindi TTS audio: {} bytes ({} Hz, {})", a.data.len(), a.sample_rate, a.format);
-            assert!(a.data.len() > 1000, "expected real Hindi audio, got {} B", a.data.len());
+            println!(
+                "Hindi TTS audio: {} bytes ({} Hz, {})",
+                a.data.len(),
+                a.sample_rate,
+                a.format
+            );
+            assert!(
+                a.data.len() > 1000,
+                "expected real Hindi audio, got {} B",
+                a.data.len()
+            );
         }
         other => panic!("expected TTSAudio, got {}", other.type_name()),
     }
@@ -192,7 +219,9 @@ async fn dag_streaming_emits_incremental_audio_live() {
     use waav_gateway::dag::context::DagOutput;
 
     ensure_crypto();
-    let (Some(_), Some(_)) = (key("SARVAM_API_KEY"), key("ELEVENLABS_API_KEY")) else { return };
+    let (Some(_), Some(_)) = (key("SARVAM_API_KEY"), key("ELEVENLABS_API_KEY")) else {
+        return;
+    };
 
     // A multi-sentence translation so the LLM produces several Hindi sentences to stream.
     let paragraph = "Hello there. How are you doing today? The weather is really nice. \
@@ -217,11 +246,14 @@ async fn dag_streaming_emits_incremental_audio_live() {
             assistant_id: None,
             timeout_ms: Some(120_000),
             headers: Default::default(),
-                reasoning_effort: None,
+            reasoning_effort: None,
         },
     );
 
-    let mut dag = DAGDefinition::new("stream-xlate-tts", "streaming Sarvam EN->HI -> ElevenLabs TTS");
+    let mut dag = DAGDefinition::new(
+        "stream-xlate-tts",
+        "streaming Sarvam EN->HI -> ElevenLabs TTS",
+    );
     dag.add_node(translate);
     dag.add_node(elevenlabs_hindi_tts_node());
     dag.add_edge(EdgeDefinition::new("translate", "tts"));
@@ -245,9 +277,14 @@ async fn dag_streaming_emits_incremental_audio_live() {
 
     let exec = DAGExecutor::new() /* per-node timeout_ms=120000 on the translate node is now honored (no executor override needed) */;
     let mut ctx = DAGContext::new("stream-test").with_output_tx(tx);
-    exec.execute_streaming_from(&compiled, "translate", DAGData::Text(paragraph.to_string()), &mut ctx)
-        .await
-        .expect("streaming pipeline executes");
+    exec.execute_streaming_from(
+        &compiled,
+        "translate",
+        DAGData::Text(paragraph.to_string()),
+        &mut ctx,
+    )
+    .await
+    .expect("streaming pipeline executes");
     drop(ctx); // drop the sink so the drain task ends
 
     let chunks = drain.await.unwrap();
@@ -268,7 +305,9 @@ async fn dag_streaming_emits_incremental_audio_live() {
             chunks.last().unwrap().0
         );
     } else {
-        println!("NOTE: provider streamed the content as a single chunk this run (model-dependent)");
+        println!(
+            "NOTE: provider streamed the content as a single chunk this run (model-dependent)"
+        );
     }
 }
 
@@ -284,7 +323,9 @@ async fn dag_streaming_fanout_audio_and_text_live() {
     use waav_gateway::dag::definition::OutputDestination;
 
     ensure_crypto();
-    let (Some(_), Some(_)) = (key("SARVAM_API_KEY"), key("ELEVENLABS_API_KEY")) else { return };
+    let (Some(_), Some(_)) = (key("SARVAM_API_KEY"), key("ELEVENLABS_API_KEY")) else {
+        return;
+    };
 
     let paragraph = "Hello there. How are you today? The weather is very nice.";
 
@@ -305,12 +346,14 @@ async fn dag_streaming_fanout_audio_and_text_live() {
             assistant_id: None,
             timeout_ms: Some(120_000),
             headers: Default::default(),
-                reasoning_effort: None,
+            reasoning_effort: None,
         },
     );
     let text_out = NodeDefinition::new(
         "text_out",
-        NodeType::TextOutput { destination: OutputDestination::WebSocket },
+        NodeType::TextOutput {
+            destination: OutputDestination::WebSocket,
+        },
     );
 
     // translate fans out to BOTH a TTS branch (audio) and a text-output branch (text).
@@ -341,14 +384,22 @@ async fn dag_streaming_fanout_audio_and_text_live() {
 
     let exec = DAGExecutor::new();
     let mut ctx = DAGContext::new("fanout-test").with_output_tx(tx);
-    exec.execute_streaming_from(&compiled, "translate", DAGData::Text(paragraph.to_string()), &mut ctx)
-        .await
-        .expect("fan-out streaming executes");
+    exec.execute_streaming_from(
+        &compiled,
+        "translate",
+        DAGData::Text(paragraph.to_string()),
+        &mut ctx,
+    )
+    .await
+    .expect("fan-out streaming executes");
     drop(ctx);
 
     let (audio_chunks, text_chunks) = drain.await.unwrap();
     let text_joined = text_chunks.join(" ");
-    println!("FAN-OUT: {audio_chunks} audio chunk(s) + {} text chunk(s); text={text_joined:?}", text_chunks.len());
+    println!(
+        "FAN-OUT: {audio_chunks} audio chunk(s) + {} text chunk(s); text={text_joined:?}",
+        text_chunks.len()
+    );
     // The proof of fan-out streaming: BOTH terminals (TTS→audio AND text_output→text) delivered to
     // the client concurrently from the single `translate` source. (We don't assert the script —
     // Sarvam's streaming output is sometimes Devanagari, sometimes romanized Hindi.)
@@ -366,9 +417,11 @@ async fn dag_streaming_fanout_audio_and_text_live() {
 #[ignore = "Requires DEEPGRAM_API_KEY + SARVAM_API_KEY + ELEVENLABS_API_KEY; real billed calls"]
 async fn dag_full_audio_pipeline_en_to_hindi_live() {
     ensure_crypto();
-    let (Some(dg), Some(_), Some(_)) =
-        (key("DEEPGRAM_API_KEY"), key("SARVAM_API_KEY"), key("ELEVENLABS_API_KEY"))
-    else {
+    let (Some(dg), Some(_), Some(_)) = (
+        key("DEEPGRAM_API_KEY"),
+        key("SARVAM_API_KEY"),
+        key("ELEVENLABS_API_KEY"),
+    ) else {
         return;
     };
 
@@ -376,7 +429,10 @@ async fn dag_full_audio_pipeline_en_to_hindi_live() {
     let pcm = synth_english_pcm(ENGLISH, &dg).await;
     assert!(pcm.len() > 8000, "synth audio too short: {} B", pcm.len());
 
-    let mut dag = DAGDefinition::new("en2hi-full", "Deepgram STT -> Sarvam translate -> ElevenLabs TTS");
+    let mut dag = DAGDefinition::new(
+        "en2hi-full",
+        "Deepgram STT -> Sarvam translate -> ElevenLabs TTS",
+    );
     dag.add_node(deepgram_stt_node());
     dag.add_node(sarvam_translate_node());
     dag.add_node(elevenlabs_hindi_tts_node());
@@ -389,7 +445,12 @@ async fn dag_full_audio_pipeline_en_to_hindi_live() {
     let exec = DAGExecutor::new() /* per-node timeout_ms=120000 on the translate node is now honored (no executor override needed) */;
     let mut ctx = DAGContext::new("full-pipeline-test");
     let out = exec
-        .execute_from(&compiled, "stt", DAGData::Audio(bytes::Bytes::from(pcm)), &mut ctx)
+        .execute_from(
+            &compiled,
+            "stt",
+            DAGData::Audio(bytes::Bytes::from(pcm)),
+            &mut ctx,
+        )
         .await
         .expect("full audio->audio pipeline executes");
 
@@ -401,7 +462,11 @@ async fn dag_full_audio_pipeline_en_to_hindi_live() {
                 a.sample_rate,
                 a.format
             );
-            assert!(a.data.len() > 1000, "expected real Hindi audio out, got {} B", a.data.len());
+            assert!(
+                a.data.len() > 1000,
+                "expected real Hindi audio out, got {} B",
+                a.data.len()
+            );
         }
         other => panic!("expected final TTSAudio, got {}", other.type_name()),
     }

@@ -25,7 +25,9 @@ pub(super) struct OperationContext {
     pub(super) is_connected: Arc<Mutex<bool>>,
     pub(super) config: LiveKitConfig,
     pub(super) local_track_publication: Arc<Mutex<Option<LocalTrackPublication>>>,
-    pub(super) active_streams: Arc<Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>>,
+    pub(super) active_streams:
+        Arc<Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>>,
+    pub(super) event_handler_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     pub(super) audio_callback: Option<AudioCallback>,
     pub(super) data_callback: Option<DataCallback>,
     pub(super) participant_disconnect_callback: Option<ParticipantDisconnectCallback>,
@@ -44,6 +46,7 @@ impl LiveKitClient {
             config: self.config.clone(),
             local_track_publication: Arc::clone(&self.local_track_publication),
             active_streams: Arc::clone(&self.active_streams),
+            event_handler_handle: Arc::clone(&self.event_handler_handle),
             audio_callback: self.audio_callback.clone(),
             data_callback: self.data_callback.clone(),
             participant_disconnect_callback: self.participant_disconnect_callback.clone(),
@@ -202,6 +205,7 @@ impl LiveKitClient {
                             &ctx.data_callback,
                             &ctx.participant_disconnect_callback,
                             &ctx.active_streams,
+                            &ctx.event_handler_handle,
                             &ctx.is_connected,
                             &ctx.config,
                         )

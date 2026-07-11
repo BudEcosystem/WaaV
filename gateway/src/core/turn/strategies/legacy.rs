@@ -23,8 +23,7 @@ pub struct AnySpeechStart;
 impl UserTurnStartStrategy for AnySpeechStart {
     fn on_signal(&mut self, sig: &ControllerSignal, _ctx: &TurnCtx) -> StartVerdict {
         match sig {
-            ControllerSignal::SttInterim { text, .. }
-            | ControllerSignal::SttFinal { text, .. }
+            ControllerSignal::SttInterim { text, .. } | ControllerSignal::SttFinal { text, .. }
                 if !text.trim().is_empty() =>
             {
                 StartVerdict::Start { interrupt: true }
@@ -60,11 +59,11 @@ pub struct LegacySpeechFinalStop;
 impl UserTurnStopStrategy for LegacySpeechFinalStop {
     fn on_signal(&mut self, sig: &ControllerSignal, _ctx: &TurnCtx) -> StopVerdict {
         match sig {
-            ControllerSignal::SttFinal { text, is_speech_final: true, .. }
-                if !text.trim().is_empty() =>
-            {
-                StopVerdict::Stopped
-            }
+            ControllerSignal::SttFinal {
+                text,
+                is_speech_final: true,
+                ..
+            } if !text.trim().is_empty() => StopVerdict::Stopped,
             _ => StopVerdict::Ignore,
         }
     }
@@ -75,7 +74,11 @@ mod tests {
     use super::*;
 
     fn ctx() -> TurnCtx {
-        TurnCtx { bot_speaking: false, turn_active: false, stt_ttfs_p99_ms: None }
+        TurnCtx {
+            bot_speaking: false,
+            turn_active: false,
+            stt_ttfs_p99_ms: None,
+        }
     }
 
     #[test]
@@ -84,9 +87,14 @@ mod tests {
         let mut stop = LegacySpeechFinalStop;
 
         // Non-empty interim: barge-in start, no stop.
-        let interim =
-            ControllerSignal::SttInterim { text: "hel".into(), confidence: 0.5 };
-        assert_eq!(start.on_signal(&interim, &ctx()), StartVerdict::Start { interrupt: true });
+        let interim = ControllerSignal::SttInterim {
+            text: "hel".into(),
+            confidence: 0.5,
+        };
+        assert_eq!(
+            start.on_signal(&interim, &ctx()),
+            StartVerdict::Start { interrupt: true }
+        );
         assert_eq!(stop.on_signal(&interim, &ctx()), StopVerdict::Ignore);
 
         // Empty results: neither.

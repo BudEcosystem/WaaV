@@ -12,13 +12,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use waav_gateway::core::resilience::CircuitBreaker;
 use waav_gateway::core::resilience::ReconnectGovernor;
+use waav_gateway::core::websocket::ReconnectionConfig;
 use waav_gateway::core::websocket::reconnectable_stream::{
     ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
     SupervisorExit, WsTransport,
 };
-use waav_gateway::core::websocket::ReconnectionConfig;
-use waav_gateway::core::resilience::CircuitBreaker;
 
 /// A trivial transport that just completes immediately after a short hold, used to create
 /// contention on the governor.
@@ -95,7 +95,11 @@ async fn thousand_reconnects_stay_under_cap() {
         observed_peak > 1,
         "expected genuine contention in a 1000-way storm, saw peak {observed_peak}"
     );
-    assert_eq!(governor.in_flight(), 0, "every permit returned after the storm");
+    assert_eq!(
+        governor.in_flight(),
+        0,
+        "every permit returned after the storm"
+    );
     assert!(
         governor.total_throttled() > 0,
         "with 1000 reconnects and a cap of {CAP}, many must have been throttled"
@@ -120,11 +124,8 @@ async fn supervisors_sharing_governor_stay_under_cap() {
         let peak = Arc::clone(&peak);
         handles.push(tokio::spawn(async move {
             let cfg = ReconnectableStreamConfig::new("storm", no_jitter());
-            let stream = ReconnectableStream::with_breaker_and_governor(
-                cfg,
-                breaker,
-                governor.clone(),
-            );
+            let stream =
+                ReconnectableStream::with_breaker_and_governor(cfg, breaker, governor.clone());
             let g = governor.clone();
             let p = Arc::clone(&peak);
             stream

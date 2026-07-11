@@ -1,17 +1,20 @@
 //! B-G3 structured conversation flows — FlowManager semantics against a
 //! scripted in-process OpenAI-compatible mock.
 
+use futures_util::FutureExt;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::{Json, Router, extract::State, routing::post};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use waav_gateway::core::flow::{
-    ContextStrategy, FlowFunctionSchema, FlowManager, NodeConfig,
-};
+use waav_gateway::core::flow::{ContextStrategy, FlowFunctionSchema, FlowManager, NodeConfig};
 use waav_gateway::core::llm::{
     ChatMessage, FunctionRegistry, LlmClient, LlmClientConfig, ToolDefinition,
 };
@@ -23,6 +26,42 @@ use waav_gateway::core::llm::{
 struct Script {
     responses: Arc<Mutex<Vec<Value>>>, // popped front-first
     requests: Arc<Mutex<Vec<Value>>>,
+}
+
+struct ScriptedMockServer {
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+}
+
+impl Drop for ScriptedMockServer {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        if self.panicked.load(Ordering::SeqCst) {
+            let msg = "flow_manager scripted mock server panicked";
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+}
+
+fn spawn_scripted_mock_server<F>(future: F) -> ScriptedMockServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let panicked = Arc::new(AtomicBool::new(false));
+    let panicked_in_task = Arc::clone(&panicked);
+    let handle = tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked_in_task.store(true, Ordering::SeqCst);
+            eprintln!("flow_manager scripted mock server panicked");
+        }
+    });
+    ScriptedMockServer { handle, panicked }
 }
 
 fn content_resp(text: &str) -> Value {
@@ -37,7 +76,7 @@ fn tool_resp(name: &str, args: &str) -> Value {
             "finish_reason":"tool_calls"}]})
 }
 
-async fn start_scripted_mock(responses: Vec<Value>) -> (String, Script) {
+async fn start_scripted_mock(responses: Vec<Value>) -> (String, Script, ScriptedMockServer) {
     let script = Script {
         responses: Arc::new(Mutex::new(responses)),
         requests: Arc::new(Mutex::new(Vec::new())),
@@ -46,15 +85,23 @@ async fn start_scripted_mock(responses: Vec<Value>) -> (String, Script) {
         s.requests.lock().push(req);
         let resp = {
             let mut r = s.responses.lock();
-            if r.is_empty() { content_resp("(script exhausted)") } else { r.remove(0) }
+            if r.is_empty() {
+                content_resp("(script exhausted)")
+            } else {
+                r.remove(0)
+            }
         };
         Json(resp)
     }
-    let app = Router::new().route("/chat/completions", post(chat)).with_state(script.clone());
+    let app = Router::new()
+        .route("/chat/completions", post(chat))
+        .with_state(script.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (format!("http://127.0.0.1:{}", addr.port()), script)
+    let server = spawn_scripted_mock_server(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://127.0.0.1:{}", addr.port()), script, server)
 }
 
 fn flow(base_url: &str) -> (Arc<LlmClient>, Arc<FunctionRegistry>, FlowManager) {
@@ -69,8 +116,12 @@ fn flow(base_url: &str) -> (Arc<LlmClient>, Arc<FunctionRegistry>, FlowManager) 
         })
         .with_functions(Arc::clone(&registry)),
     );
-    let manager =
-        FlowManager::new(Arc::clone(&llm), Arc::clone(&registry), "flow-session", None);
+    let manager = FlowManager::new(
+        Arc::clone(&llm),
+        Arc::clone(&registry),
+        "flow-session",
+        None,
+    );
     (llm, registry, manager)
 }
 
@@ -107,7 +158,8 @@ fn messages_of(req: &Value) -> Vec<(String, String)> {
 
 #[tokio::test]
 async fn append_strategy_extends_context() {
-    let (url, script) = start_scripted_mock(vec![content_resp("hi"), content_resp("ok")]).await;
+    let (url, script, _server) =
+        start_scripted_mock(vec![content_resp("hi"), content_resp("ok")]).await;
     let (_llm, _reg, mgr2) = flow(&url);
 
     let cancel = CancellationToken::new();
@@ -119,20 +171,28 @@ async fn append_strategy_extends_context() {
         ..Default::default()
     };
     mgr2.initialize(node_a, &cancel).await.unwrap();
-    mgr2.handle_user_turn("my name is Ada", &cancel).await.unwrap();
+    mgr2.handle_user_turn("my name is Ada", &cancel)
+        .await
+        .unwrap();
 
     let reqs = script.requests.lock();
     assert_eq!(reqs.len(), 2);
     let msgs = messages_of(&reqs[1]);
     // APPEND kept everything: system, task, (greeting), user turn.
     assert_eq!(msgs[0].0, "system");
-    assert!(msgs.iter().any(|(_, c)| c.contains("Ask for the caller's name")));
-    assert!(msgs.iter().any(|(r, c)| r == "user" && c.contains("my name is Ada")));
+    assert!(
+        msgs.iter()
+            .any(|(_, c)| c.contains("Ask for the caller's name"))
+    );
+    assert!(
+        msgs.iter()
+            .any(|(r, c)| r == "user" && c.contains("my name is Ada"))
+    );
 }
 
 #[tokio::test]
 async fn reset_strategy_replaces_context_messages() {
-    let (url, script) = start_scripted_mock(vec![
+    let (url, script, _server) = start_scripted_mock(vec![
         content_resp("what's your name?"),
         tool_resp("collect_name", r#"{"name":"Ada"}"#),
         content_resp("noted, Ada. what do you need?"),
@@ -163,24 +223,30 @@ async fn reset_strategy_replaces_context_messages() {
     // Last request = entry inference of the RESET node.
     let msgs = messages_of(reqs.last().unwrap());
     assert!(
-        msgs.iter().any(|(_, c)| c.contains("Ask what the caller needs")),
+        msgs.iter()
+            .any(|(_, c)| c.contains("Ask what the caller needs")),
         "new node's task present: {msgs:?}"
     );
     assert!(
-        !msgs.iter().any(|(_, c)| c.contains("Ask for the caller's name")),
+        !msgs
+            .iter()
+            .any(|(_, c)| c.contains("Ask for the caller's name")),
         "RESET must drop the old node's task messages: {msgs:?}"
     );
     assert!(
         !msgs.iter().any(|(_, c)| c.contains("I'm Ada")),
         "RESET must drop prior turns: {msgs:?}"
     );
-    assert_eq!(msgs[0], ("system".into(), "You are an intake agent.".into()),
-        "persona survives a RESET");
+    assert_eq!(
+        msgs[0],
+        ("system".into(), "You are an intake agent.".into()),
+        "persona survives a RESET"
+    );
 }
 
 #[tokio::test]
 async fn role_message_persists_across_nodes() {
-    let (url, script) = start_scripted_mock(vec![
+    let (url, script, _server) = start_scripted_mock(vec![
         content_resp("hello!"),
         tool_resp("go_next", "{}"),
         content_resp("next question"),
@@ -218,8 +284,8 @@ async fn role_message_persists_across_nodes() {
 
 #[tokio::test]
 async fn edge_function_defers_inference_until_after_transition() {
-    let (url, script) = start_scripted_mock(vec![
-        tool_resp("go_b", "{}"),     // user turn → edge call
+    let (url, script, _server) = start_scripted_mock(vec![
+        tool_resp("go_b", "{}"),      // user turn → edge call
         content_resp("welcome to B"), // ONLY inference after: B's entry
     ])
     .await;
@@ -235,7 +301,11 @@ async fn edge_function_defers_inference_until_after_transition() {
     let node_a = NodeConfig {
         name: Some("a".into()),
         task_messages: vec![ChatMessage::user("[task] A.")],
-        functions: vec![node_fn("go_b", json!({"status":"acknowledged"}), Some(node_b))],
+        functions: vec![node_fn(
+            "go_b",
+            json!({"status":"acknowledged"}),
+            Some(node_b),
+        )],
         respond_immediately: false,
         ..Default::default()
     };
@@ -262,7 +332,10 @@ async fn edge_function_defers_inference_until_after_transition() {
     assert!(
         raw.iter().any(|m| m["role"] == "assistant"
             && m["content"].as_str().unwrap_or_default().contains("go_b")
-            && m["content"].as_str().unwrap_or_default().contains("acknowledged")),
+            && m["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("acknowledged")),
         "edge result must land in context (inlined) BEFORE the transition inference: {raw:?}"
     );
     assert!(
@@ -273,11 +346,8 @@ async fn edge_function_defers_inference_until_after_transition() {
 
 #[tokio::test]
 async fn node_function_runs_llm_immediately() {
-    let (url, script) = start_scripted_mock(vec![
-        tool_resp("lookup", "{}"),
-        content_resp("found it"),
-    ])
-    .await;
+    let (url, script, _server) =
+        start_scripted_mock(vec![tool_resp("lookup", "{}"), content_resp("found it")]).await;
     let (_llm, _reg, mgr) = flow(&url);
     let cancel = CancellationToken::new();
 
@@ -292,7 +362,11 @@ async fn node_function_runs_llm_immediately() {
     let resp = mgr.handle_user_turn("look it up", &cancel).await.unwrap();
 
     assert_eq!(resp.unwrap().content, "found it");
-    assert_eq!(mgr.current_node().as_deref(), Some("a"), "node fn stays put");
+    assert_eq!(
+        mgr.current_node().as_deref(),
+        Some("a"),
+        "node fn stays put"
+    );
     let reqs = script.requests.lock();
     assert_eq!(reqs.len(), 2, "node fn re-infers in place");
     let raw = reqs[1]["messages"].as_array().unwrap();
@@ -301,7 +375,7 @@ async fn node_function_runs_llm_immediately() {
 
 #[tokio::test]
 async fn respond_immediately_false_does_not_infer() {
-    let (url, script) = start_scripted_mock(vec![
+    let (url, script, _server) = start_scripted_mock(vec![
         tool_resp("go_quiet", "{}"),
         // nothing else should be requested
     ])
@@ -326,16 +400,17 @@ async fn respond_immediately_false_does_not_infer() {
 
     assert!(resp.is_none(), "quiet node: nothing to speak");
     assert_eq!(mgr.current_node().as_deref(), Some("quiet"));
-    assert_eq!(script.requests.lock().len(), 1, "no entry inference on a quiet node");
+    assert_eq!(
+        script.requests.lock().len(),
+        1,
+        "no entry inference on a quiet node"
+    );
 }
 
 #[tokio::test]
 async fn global_functions_available_at_every_node_and_tools_swap_atomically() {
-    let (url, _script) = start_scripted_mock(vec![
-        tool_resp("go_b", "{}"),
-        content_resp("in b"),
-    ])
-    .await;
+    let (url, _script, _server) =
+        start_scripted_mock(vec![tool_resp("go_b", "{}"), content_resp("in b")]).await;
     let registry = Arc::new(FunctionRegistry::new());
     let llm = Arc::new(
         LlmClient::new(LlmClientConfig {
@@ -365,7 +440,10 @@ async fn global_functions_available_at_every_node_and_tools_swap_atomically() {
     mgr.initialize(node_a, &cancel).await.unwrap();
 
     let names = |reg: &FunctionRegistry| -> Vec<String> {
-        reg.request_tools().iter().map(|t| t.function.name.clone()).collect()
+        reg.request_tools()
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect()
     };
     let at_a = names(&registry);
     assert!(at_a.contains(&"go_b".to_string()) && at_a.contains(&"help".to_string()));
@@ -437,7 +515,10 @@ async fn live_three_node_intake_flow() {
                 Arc::new(move |p| {
                     let confirm = confirm.clone();
                     Box::pin(async move {
-                        (json!({"recorded": p.arguments["intent"]}), Some(confirm.clone()))
+                        (
+                            json!({"recorded": p.arguments["intent"]}),
+                            Some(confirm.clone()),
+                        )
                     })
                 })
             },
@@ -478,14 +559,22 @@ async fn live_three_node_intake_flow() {
 
     let greeting = mgr.initialize(name_node, &cancel).await.unwrap().unwrap();
     println!("[flow:name] {}", greeting.content);
-    assert!(!greeting.content.trim().is_empty(), "greeting must ask for a name");
+    assert!(
+        !greeting.content.trim().is_empty(),
+        "greeting must ask for a name"
+    );
 
-    let ask_intent = mgr.handle_user_turn("Hi, my name is Ada Lovelace.", &cancel)
+    let ask_intent = mgr
+        .handle_user_turn("Hi, my name is Ada Lovelace.", &cancel)
         .await
         .unwrap()
         .expect("intent node responds immediately");
     println!("[flow:intent] {}", ask_intent.content);
-    assert_eq!(mgr.current_node().as_deref(), Some("intent"), "edge must fire once");
+    assert_eq!(
+        mgr.current_node().as_deref(),
+        Some("intent"),
+        "edge must fire once"
+    );
 
     let confirm_resp = mgr
         .handle_user_turn("I need to reschedule my appointment to Friday.", &cancel)
@@ -495,7 +584,10 @@ async fn live_three_node_intake_flow() {
     println!("[flow:confirm] {}", confirm_resp.content);
     assert_eq!(mgr.current_node().as_deref(), Some("confirm"));
     let lower = confirm_resp.content.to_lowercase();
-    assert!(lower.contains("ada"), "confirmation must reference the caller's name: {lower}");
+    assert!(
+        lower.contains("ada"),
+        "confirmation must reference the caller's name: {lower}"
+    );
     assert!(
         lower.contains("reschedul") || lower.contains("appointment") || lower.contains("friday"),
         "confirmation must reference the intent: {lower}"

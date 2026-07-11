@@ -7,6 +7,7 @@ pub mod alias;
 pub mod audio;
 pub mod cache;
 pub mod conversation;
+pub mod credentials;
 pub mod emotion;
 pub mod flow;
 /// Unified language system (P2): one canonical region-qualified BCP-47 token per request, mapped to
@@ -15,13 +16,18 @@ pub mod flow;
 pub mod lang;
 pub mod llm;
 pub mod metrics;
+pub(crate) mod model_integrity;
 // Canonical SSRF/URL validation shared by the DAG endpoint nodes, the
 // streaming-TTS endpoint override, and the conversation LLM URL check.
 pub mod net;
 pub mod observability;
 // Hardware execution-provider policy (MASTER_PLAN §7 H). Available exactly when
 // `ort` is pulled in, i.e. whenever any of the three ONNX consumers is enabled.
-#[cfg(any(feature = "turn-detect", feature = "smart-turn", feature = "silero-vad"))]
+#[cfg(any(
+    feature = "turn-detect",
+    feature = "smart-turn",
+    feature = "silero-vad"
+))]
 pub mod onnx;
 pub mod pipeline;
 pub mod providers;

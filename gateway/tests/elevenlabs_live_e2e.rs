@@ -8,13 +8,61 @@
 //! These prove the real wire path through WaaV's `ElevenLabsTTS` provider and the full gateway
 //! WebSocket pipeline against the live vendor.
 
+use futures::FutureExt;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use waav_gateway::core::tts::{AudioCallback, AudioData, BaseTTS, ElevenLabsTTS, TTSConfig, TTSError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::task::JoinHandle;
+use waav_gateway::core::tts::{
+    AudioCallback, AudioData, BaseTTS, ElevenLabsTTS, TTSConfig, TTSError,
+};
 
 const RACHEL_VOICE: &str = "21m00Tcm4TlvDq8ikWAM";
 
 fn api_key() -> String {
     std::env::var("ELEVENLABS_API_KEY").expect("ELEVENLABS_API_KEY must be set for live tests")
+}
+
+struct TestServer {
+    label: &'static str,
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        if self.panicked.load(Ordering::SeqCst) {
+            let msg = format!("elevenlabs_live_e2e server '{}' panicked", self.label);
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+}
+
+fn spawn_test_server<F>(label: &'static str, future: F) -> TestServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let panicked = Arc::new(AtomicBool::new(false));
+    let panicked_in_task = Arc::clone(&panicked);
+    let handle = tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked_in_task.store(true, Ordering::SeqCst);
+            eprintln!("elevenlabs_live_e2e server '{label}' panicked");
+        }
+    });
+    TestServer {
+        label,
+        handle,
+        panicked,
+    }
 }
 
 /// Capture callback that forwards received audio byte-counts to a channel.
@@ -38,9 +86,7 @@ impl AudioCallback for CaptureCallback {
             eprintln!("ElevenLabs TTS error: {error:?}");
         })
     }
-    fn on_complete(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    fn on_complete(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {})
     }
 }
@@ -73,7 +119,10 @@ async fn test_waav_elevenlabs_tts_provider_live() {
 
     timeout(
         Duration::from_secs(20),
-        tts.speak("Hello from WaaV. This is a live end to end test of ElevenLabs.", true),
+        tts.speak(
+            "Hello from WaaV. This is a live end to end test of ElevenLabs.",
+            true,
+        ),
     )
     .await
     .expect("speak timed out")
@@ -175,7 +224,8 @@ async fn test_elevenlabs_seed_determinism_live() {
         a == b
     );
     assert_eq!(
-        a, b,
+        a,
+        b,
         "same seed must yield byte-identical audio (A={} B={} bytes)",
         a.len(),
         b.len()
@@ -189,7 +239,8 @@ async fn test_elevenlabs_seed_determinism_live() {
         c != a
     );
     assert_ne!(
-        a, c,
+        a,
+        c,
         "different seeds should produce different audio (both {} bytes — suspiciously identical)",
         a.len()
     );
@@ -307,9 +358,11 @@ async fn test_waav_gateway_ws_elevenlabs_tts_live() {
         .merge(ws_routes)
         .with_state(app_state);
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind gateway");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gateway");
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let _server = spawn_test_server("gateway_ws_elevenlabs_tts_live", async move {
         axum::serve(listener, app).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -353,9 +406,10 @@ async fn test_waav_gateway_ws_elevenlabs_tts_live() {
 
     // Read the config ack (ready or error — log it; TTS can still work).
     if let Ok(Some(Ok(msg))) = timeout(Duration::from_secs(10), read.next()).await
-        && let Message::Text(t) = msg {
-            println!("gateway config ack: {t}");
-        }
+        && let Message::Text(t) = msg
+    {
+        println!("gateway config ack: {t}");
+    }
 
     // Issue a speak command — drives the gateway → ElevenLabs TTS → audio back over the socket.
     let speak_message = json!({
@@ -388,9 +442,11 @@ async fn test_waav_gateway_ws_elevenlabs_tts_live() {
             }
         }
     };
-    let _ = timeout(deadline, collect).await;
+    timeout(deadline, collect)
+        .await
+        .expect("timed out collecting gateway ElevenLabs live audio frames");
 
-    let _ = write.close().await;
+    write.close().await.expect("close gateway WebSocket");
 
     println!("gateway streamed {audio_bytes} bytes of real ElevenLabs TTS audio to the client");
     assert!(

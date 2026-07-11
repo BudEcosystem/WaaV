@@ -8,6 +8,15 @@ use std::fmt;
 
 use crate::core::tts::base::{TTSConfig, TTSError, TTSResult};
 
+fn validate_cereproc_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Audio Format Enum
 // =============================================================================
@@ -402,8 +411,18 @@ impl CereprocTtsConfig {
         }
 
         cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate_endpoint_override()?;
 
         Ok(cfg)
+    }
+
+    /// Validate the provider-level endpoint override, when present.
+    pub fn validate_endpoint_override(&self) -> TTSResult<()> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_cereproc_tts_endpoint("endpoint_override", endpoint)
+                .map_err(TTSError::InvalidConfiguration)?;
+        }
+        Ok(())
     }
 
     /// Build the query parameters for the speak endpoint
@@ -521,6 +540,45 @@ mod tests {
         };
         let cfg = CereprocTtsConfig::from_standard(&std).unwrap();
         assert_eq!(cfg.emotion, Some(CereprocEmotion::Happy));
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = CereprocTtsConfig::from_base(&TTSConfig {
+            api_key: "user@example.com:password123".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        config.endpoint_override = Some("https://cereproc-proxy.example.com".to_string());
+        assert!(config.validate_endpoint_override().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://cereproc-proxy.example.com".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "cereproc".to_string(),
+            api_key: "user@example.com:password123".to_string(),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(CereprocTtsConfig::from_standard(&std).is_err());
     }
 
     #[test]

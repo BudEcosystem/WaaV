@@ -27,6 +27,24 @@
 use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 
+fn validate_fpt_http_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
+fn validate_fpt_callback_url(source: &str, url: &str) -> Result<(), String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(format!("{source} rejected (SSRF protection): empty URL"));
+    }
+    crate::core::net::validate_url_for_ssrf(url, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -339,6 +357,8 @@ impl FptTtsConfig {
 
         cfg.endpoint_override = std.endpoint_override().map(String::from);
 
+        cfg.validate().map_err(TTSError::InvalidConfiguration)?;
+
         Ok(cfg)
     }
 
@@ -353,6 +373,13 @@ impl FptTtsConfig {
                 "Speed must be between {} and {}, got {}",
                 MIN_SPEED, MAX_SPEED, self.speed
             ));
+        }
+
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_fpt_http_endpoint("endpoint_override", endpoint)?;
+        }
+        if let Some(callback_url) = &self.callback_url {
+            validate_fpt_callback_url("callback_url", callback_url)?;
         }
 
         Ok(())
@@ -447,8 +474,8 @@ mod tests {
                 ..Default::default()
             },
             features: TtsFeatures {
-                speed: Some(1.5), // 1.5 -> +3 on FPT's -3..=+3 scale
-                ssml: Some(true), // capability gap: FPT has no SSML, must be ignored
+                speed: Some(1.5),         // 1.5 -> +3 on FPT's -3..=+3 scale
+                ssml: Some(true),         // capability gap: FPT has no SSML, must be ignored
                 sample_rate: Some(48000), // capability gap: FPT rate is fixed, must be ignored
                 ..Default::default()
             },
@@ -641,6 +668,85 @@ mod tests {
         config.api_key = "test_key".to_string();
 
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = FptTtsConfig {
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://fpt-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_callback_url() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = FptTtsConfig {
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+
+        config.callback_url = Some("https://callback.example.com/fpt".to_string());
+        assert!(config.validate().is_ok());
+
+        config.callback_url = Some("   ".to_string());
+        let err = config
+            .validate()
+            .expect_err("empty callback_url must be rejected when configured");
+        assert!(err.contains("empty URL"), "{err}");
+
+        config.callback_url = Some("http://127.0.0.1:9000/fpt".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback callback_url must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.callback_url = Some("file:///tmp/fpt-callback".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP callback_url must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+    }
+
+    #[test]
+    fn from_standard_rejects_ssrf_callback_url_extra() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert(
+            "callback_url".to_string(),
+            serde_json::json!("http://127.0.0.1:9000/fpt"),
+        );
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "fpt-ai".to_string(),
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: ProviderExtras(extras),
+        };
+
+        let err = FptTtsConfig::from_standard(&std)
+            .expect_err("standardized callback_url extra must be validated");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
     }
 
     #[test]

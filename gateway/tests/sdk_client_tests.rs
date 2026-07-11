@@ -152,10 +152,10 @@ fn create_test_config(port: u16) -> ServerConfig {
         rate_limit_burst_size: 100,
         max_websocket_connections: None,
         max_connections_per_ip: 1000,
-            ws_processing_timeout_secs: 10,
-            realtime_processing_timeout_secs: 30,
-            sip_max_participants: 3,
-            realtime_endpoint_overrides: Default::default(),
+        ws_processing_timeout_secs: 10,
+        realtime_processing_timeout_secs: 30,
+        sip_max_participants: 3,
+        realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
         aliases: Default::default(),
@@ -620,11 +620,13 @@ async fn test_sdk_concurrent_clients() {
         .collect();
 
     let mut success_count = 0;
-    for task in tasks {
-        if let Ok(status) = task.await
-            && status == axum::http::StatusCode::OK {
-                success_count += 1;
-            }
+    for (client_id, task) in tasks.into_iter().enumerate() {
+        let status = task
+            .await
+            .unwrap_or_else(|err| panic!("SDK client task {client_id} panicked: {err}"));
+        if status == axum::http::StatusCode::OK {
+            success_count += 1;
+        }
     }
 
     assert_eq!(success_count, 50);

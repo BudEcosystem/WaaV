@@ -35,6 +35,10 @@ use super::{
 /// Trade-off: Uses more memory but provides better latency characteristics
 const CHANNEL_BUFFER_SIZE: usize = 1024;
 
+/// How long voice WebSocket teardown waits for the sender task to drain queued
+/// critical messages and emit a close frame before aborting it.
+const SENDER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Maximum WebSocket frame size (10 MB)
 /// This limits individual frame sizes to prevent memory exhaustion attacks
 const MAX_WS_FRAME_SIZE: usize = 10 * 1024 * 1024;
@@ -135,9 +139,8 @@ async fn handle_voice_socket(
         ip,
     });
 
-    let session = std::panic::AssertUnwindSafe(run_voice_socket_session(
-        socket, app_state, auth, client_ip,
-    ));
+    let session =
+        std::panic::AssertUnwindSafe(run_voice_socket_session(socket, app_state, auth, client_ip));
     if futures::FutureExt::catch_unwind(session).await.is_err() {
         // A panic was caught and contained to this session. The process and all
         // other sessions remain alive. The connection guard above still releases
@@ -301,21 +304,7 @@ async fn run_voice_socket_session(
 
     // Clean up resources - graceful shutdown with timeout fallback
     // Signal shutdown to sender task
-    let _ = shutdown_tx.send(());
-    // Wait for graceful completion with timeout, then abort if needed.
-    // D-G4: on timeout, ABORT the handle rather than letting `timeout` drop it
-    // (a dropped JoinHandle detaches — the sender would leak past the session);
-    // record it as a dangling task.
-    match tokio::time::timeout(Duration::from_millis(500), &mut sender_task).await {
-        Ok(_) => {
-            debug!("Sender task completed gracefully");
-        }
-        Err(_) => {
-            warn!("Sender task did not complete within timeout; aborting (D-G4)");
-            sender_task.abort();
-            crate::core::metrics::bridge::record_session_dangling_task();
-        }
-    }
+    shutdown_voice_sender_task(shutdown_tx, &mut sender_task).await;
 
     // Snapshot state before cleanup so we can drop the read lock before awaiting
     let (voice_manager, livekit_client, recording_egress_id, room_name) = {
@@ -408,13 +397,19 @@ async fn run_voice_socket_session(
     // Clone the Arc so we never hold the connection read lock across the grace.
     {
         let tracker = state.read().await.task_tracker.clone();
-        let dangling = tracker
-            .abort_and_audit(crate::core::observability::DEFAULT_TEARDOWN_GRACE)
+        let audit = tracker
+            .abort_and_audit_details(crate::core::observability::DEFAULT_TEARDOWN_GRACE)
             .await;
-        if dangling > 0 {
+        if audit.dangling > 0 {
             warn!(
-                count = dangling,
+                count = audit.dangling,
                 "session task(s) resisted cancellation at teardown (D-G4)"
+            );
+        }
+        if audit.panicked > 0 {
+            error!(
+                count = audit.panicked,
+                "session task panic(s) observed at teardown (W-E1/D-G4)"
             );
         }
     }
@@ -556,6 +551,41 @@ where
     }
 }
 
+async fn shutdown_voice_sender_task(
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    sender_task: &mut tokio::task::JoinHandle<()>,
+) -> bool {
+    let _ = shutdown_tx.send(());
+    // Wait for graceful completion with timeout, then abort if needed.
+    // D-G4: on timeout, ABORT the handle rather than letting `timeout` drop it
+    // (a dropped JoinHandle detaches — the sender would leak past the session);
+    // record only true timeout leaks as dangling tasks. A completed JoinHandle
+    // can still be a panic, so inspect the join result instead of treating
+    // every completed handle as graceful.
+    match tokio::time::timeout(SENDER_SHUTDOWN_TIMEOUT, &mut *sender_task).await {
+        Ok(Ok(())) => {
+            debug!("Sender task completed gracefully");
+            true
+        }
+        Ok(Err(e)) => {
+            if e.is_panic() {
+                error!("Sender task panicked during shutdown: {}", e);
+                crate::core::metrics::bridge::record_session_task_panic();
+            } else {
+                debug!("Sender task cancelled during shutdown: {}", e);
+            }
+            true
+        }
+        Err(_) => {
+            warn!("Sender task did not complete within timeout; aborting (D-G4)");
+            sender_task.abort();
+            crate::core::metrics::bridge::record_session_dangling_task();
+            let _ = sender_task.await;
+            false
+        }
+    }
+}
+
 /// Process incoming WebSocket message with optimizations
 ///
 /// Routes different message types to appropriate handlers and manages
@@ -585,16 +615,15 @@ async fn process_message(
         Message::Text(text) => {
             debug!("Received text message: {} bytes", text.len());
 
-            // Panic-isolation test seam (W-E1). Inert in production: only fires when
-            // the operator/test explicitly sets `WAAV_TEST_PANIC_ON_TEXT` AND the
-            // incoming text starts with that token. Used by
-            // tests/panic_isolation.rs to prove a panic in one session is contained
-            // by the per-session `catch_unwind` in `handle_voice_socket` and does
-            // not abort the process or other sessions.
+            // Panic-isolation test seam (W-E1). This is debug-only so release
+            // deployments cannot be env-triggered into a session panic.
+            #[cfg(debug_assertions)]
             if let Ok(token) = std::env::var("WAAV_TEST_PANIC_ON_TEXT")
-                && !token.is_empty() && text.starts_with(token.as_str()) {
-                    panic!("WAAV_TEST_PANIC_ON_TEXT injected panic (test seam)");
-                }
+                && !token.is_empty()
+                && text.starts_with(token.as_str())
+            {
+                panic!("WAAV_TEST_PANIC_ON_TEXT injected panic (debug-only test seam)");
+            }
 
             // Pre-deserialization size check to prevent JSON parsing attacks
             if text.len() > MAX_TEXT_MESSAGE_SIZE {
@@ -748,7 +777,10 @@ mod tests {
 
         assert_eq!(exit, SessionLoopExit::Shutdown);
 
-        match rx.try_recv().expect("a final protocol message must be queued") {
+        match rx
+            .try_recv()
+            .expect("a final protocol message must be queued")
+        {
             MessageRoute::Outgoing(OutgoingMessage::Error { message }) => {
                 assert_eq!(message, "server shutting down");
             }
@@ -845,5 +877,49 @@ mod tests {
         .expect("loop must exit when the handler requests close");
 
         assert_eq!(exit, SessionLoopExit::Closed);
+    }
+
+    #[tokio::test]
+    async fn voice_sender_shutdown_observes_panicked_task() {
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut sender_task = tokio::spawn(async move {
+            panic!("voice sender panic regression");
+        });
+
+        assert!(
+            shutdown_voice_sender_task(shutdown_tx, &mut sender_task).await,
+            "a panicked-but-finished sender task must be observed, not classified as dangling"
+        );
+        assert!(
+            sender_task.is_finished(),
+            "panicked sender handle must be joined by shutdown"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn voice_sender_shutdown_aborts_stuck_task() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let observed_shutdown = Arc::new(AtomicBool::new(false));
+        let observed = observed_shutdown.clone();
+        let mut sender_task = tokio::spawn(async move {
+            let _ = shutdown_rx.await;
+            observed.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        });
+
+        assert!(
+            !shutdown_voice_sender_task(shutdown_tx, &mut sender_task).await,
+            "stuck sender task must time out and be aborted"
+        );
+        assert!(
+            observed_shutdown.load(Ordering::SeqCst),
+            "sender task should still receive shutdown before timing out"
+        );
+        assert!(
+            sender_task.is_finished(),
+            "aborted sender handle must be joined by shutdown"
+        );
     }
 }

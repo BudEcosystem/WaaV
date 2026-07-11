@@ -297,9 +297,20 @@ pub fn turn_needs_reasoning_ctx(transcript: &str, prev_was_reasoning: bool) -> b
     // requests need no reasoning — the math cases are caught by calculate/how
     // much/percent/% signals.)
     const SINGLE: &[&str] = &[
-        "calculate", "compute", "calculation", "explain", "compare", "reason",
-        "prove", "analyze", "analyse", "analysis", "analytical", "percent",
-        "percentage", "why",
+        "calculate",
+        "compute",
+        "calculation",
+        "explain",
+        "compare",
+        "reason",
+        "prove",
+        "analyze",
+        "analyse",
+        "analysis",
+        "analytical",
+        "percent",
+        "percentage",
+        "why",
     ];
     const PHRASES: &[&[&str]] = &[
         &["how", "many"],
@@ -362,9 +373,24 @@ fn has_percentage_math(t: &str) -> bool {
 
 fn reasoning_is_negator(tok: &str) -> bool {
     const NEGATORS: &[&str] = &[
-        "no", "not", "never", "without", "cannot", "can't", "won't", "don't",
-        "isn't", "aren't", "wasn't", "doesn't", "didn't", "couldn't",
-        "shouldn't", "wouldn't", "nor", "zero",
+        "no",
+        "not",
+        "never",
+        "without",
+        "cannot",
+        "can't",
+        "won't",
+        "don't",
+        "isn't",
+        "aren't",
+        "wasn't",
+        "doesn't",
+        "didn't",
+        "couldn't",
+        "shouldn't",
+        "wouldn't",
+        "nor",
+        "zero",
     ];
     NEGATORS.contains(&tok)
 }
@@ -406,7 +432,9 @@ fn reasoning_is_short_continuation(tokens: &[&str]) -> bool {
     {
         return false; // user is wrapping up / negating — don't stick
     }
-    const OPENERS: &[&str] = &["and", "also", "then", "next", "again", "now", "plus", "minus"];
+    const OPENERS: &[&str] = &[
+        "and", "also", "then", "next", "again", "now", "plus", "minus",
+    ];
     if tokens.first().is_some_and(|t| OPENERS.contains(t)) {
         return true;
     }
@@ -601,7 +629,10 @@ pub struct ConversationOrchestrator {
 }
 
 /// S1/S2: build the reasoning tier (sharing `base.histories`) when configured.
-fn build_reasoning_tier(base: &Arc<LlmClient>, config: &ConversationConfig) -> Option<Arc<LlmClient>> {
+fn build_reasoning_tier(
+    base: &Arc<LlmClient>,
+    config: &ConversationConfig,
+) -> Option<Arc<LlmClient>> {
     let model = config.reasoning_model.clone()?;
     // The reasoning tier needs room to ACTUALLY think — independent of the fast
     // tier's voice max_tokens cap (256), which on Anthropic suppresses the
@@ -612,15 +643,19 @@ fn build_reasoning_tier(base: &Arc<LlmClient>, config: &ConversationConfig) -> O
         .max_reasoning_tokens
         .or(config.max_tokens)
         .unwrap_or(REASONING_DEFAULT_MAX_TOKENS);
-    Some(Arc::new(base.with_tier_overrides(
-        model,
-        config.reasoning_base_url.clone(),
-        config.reasoning_api_key.clone(),
-        config.reasoning_provider_kind,
-        // The reasoning tier wants to actually reason — let it (no forced Off).
-        config.reasoning_effort.or(Some(crate::core::llm::ReasoningEffort::Low)),
-        Some(reasoning_max_tokens),
-    )))
+    Some(Arc::new(
+        base.with_tier_overrides(
+            model,
+            config.reasoning_base_url.clone(),
+            config.reasoning_api_key.clone(),
+            config.reasoning_provider_kind,
+            // The reasoning tier wants to actually reason — let it (no forced Off).
+            config
+                .reasoning_effort
+                .or(Some(crate::core::llm::ReasoningEffort::Low)),
+            Some(reasoning_max_tokens),
+        ),
+    ))
 }
 
 /// S3 (M6): may an async-tool result be VOLUNTEERED now? Only when the line is
@@ -673,8 +708,7 @@ impl ConversationOrchestrator {
         config: ConversationConfig,
         voice_manager: Arc<VoiceManager>,
     ) -> Result<Self, ConversationOrchestratorError> {
-        validate_llm_url(&config.base_url)
-            .map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
+        validate_llm_url(&config.base_url).map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
         // S1/S2: the reasoning tier's base_url is ALSO client-supplied — validate
         // it for SSRF before it is ever used for a request.
         if let Some(rb) = &config.reasoning_base_url {
@@ -1008,7 +1042,12 @@ impl ConversationOrchestrator {
         let epoch = self.voice_manager.clear_epoch();
         let result = self
             .llm
-            .continue_from_history(&self.session_id, self.config.api_key.as_deref(), &token, None)
+            .continue_from_history(
+                &self.session_id,
+                self.config.api_key.as_deref(),
+                &token,
+                None,
+            )
             .await;
         match result {
             Ok(resp) if !resp.content.trim().is_empty() => {
@@ -1028,7 +1067,9 @@ impl ConversationOrchestrator {
             Err(LlmError::Cancelled) => {
                 debug!(session = %self.session_id, "S3 follow-up cancelled (barge-in)")
             }
-            Err(e) => warn!(session = %self.session_id, error = %e, "S3 follow-up inference failed"),
+            Err(e) => {
+                warn!(session = %self.session_id, error = %e, "S3 follow-up inference failed")
+            }
         }
         self.end_turn(id);
     }
@@ -1307,7 +1348,10 @@ impl ConversationOrchestrator {
                             crate::core::observability::now_monotonic_ns(),
                         );
                     }
-                    match vm.speak_if_epoch(&text, true, allow_interruption, epoch).await {
+                    match vm
+                        .speak_if_epoch(&text, true, allow_interruption, epoch)
+                        .await
+                    {
                         Ok(true) => true,
                         Ok(false) => {
                             // A barge-in cleared TTS since this turn started:
@@ -1451,43 +1495,44 @@ impl ConversationOrchestrator {
         // speaks it).
         let mut ran_tool_loop = false;
         let result = match result {
-            Ok(response)
-                if !response.tool_calls.is_empty()
-                    && llm.functions().is_some_and(|r| !r.is_empty()) =>
-            {
-                // The initial inference COMPLETED (recorded with its
-                // preamble): the streamed accumulator is spent — without
-                // this, a cancel inside the tool loop would commit the
-                // preamble a SECOND time after the tool results (review
-                // wf_6783a4b3: duplicate assistant text).
-                streamed_text.lock().clear();
-                // The pump spoke (at most) round-0 preamble; the loop's
-                // FINAL answer must still reach TTS through the fallback
-                // speak below (review wf_6783a4b3: a true `spoke` here left
-                // the bot permanently silent after "let me check...").
-                ran_tool_loop = true;
-                let registry =
-                    Arc::clone(llm.functions().expect("guarded by condition"));
-                // P2: bound the per-turn re-inference rounds (the dominant spend
-                // multiplier) by the configured cost budget. A call-me-again loop
-                // can no longer run away on a billing gateway.
-                let tool_opts = crate::core::llm::ToolLoopOptions {
-                    max_rounds: self.config.max_llm_calls_per_turn as usize,
-                    // S3: stamp this turn onto any async tool spawned in the loop,
-                    // so its later final is turn-id-gated before being volunteered.
-                    turn_id: id,
-                    ..Default::default()
-                };
-                crate::core::llm::run_tool_loop(
-                    llm,
-                    &registry,
-                    &self.session_id,
-                    response,
-                    self.config.api_key.as_deref(),
-                    &token,
-                    tool_opts,
-                )
-                .await
+            Ok(response) if !response.tool_calls.is_empty() => {
+                match llm.functions().filter(|r| !r.is_empty()) {
+                    Some(registry) => {
+                        // The initial inference COMPLETED (recorded with its
+                        // preamble): the streamed accumulator is spent — without
+                        // this, a cancel inside the tool loop would commit the
+                        // preamble a SECOND time after the tool results (review
+                        // wf_6783a4b3: duplicate assistant text).
+                        streamed_text.lock().clear();
+                        // The pump spoke (at most) round-0 preamble; the loop's
+                        // FINAL answer must still reach TTS through the fallback
+                        // speak below (review wf_6783a4b3: a true `spoke` here left
+                        // the bot permanently silent after "let me check...").
+                        ran_tool_loop = true;
+                        let registry = Arc::clone(registry);
+                        // P2: bound the per-turn re-inference rounds (the dominant spend
+                        // multiplier) by the configured cost budget. A call-me-again loop
+                        // can no longer run away on a billing gateway.
+                        let tool_opts = crate::core::llm::ToolLoopOptions {
+                            max_rounds: self.config.max_llm_calls_per_turn as usize,
+                            // S3: stamp this turn onto any async tool spawned in the loop,
+                            // so its later final is turn-id-gated before being volunteered.
+                            turn_id: id,
+                            ..Default::default()
+                        };
+                        crate::core::llm::run_tool_loop(
+                            llm,
+                            &registry,
+                            &self.session_id,
+                            response,
+                            self.config.api_key.as_deref(),
+                            &token,
+                            tool_opts,
+                        )
+                        .await
+                    }
+                    None => Ok(response),
+                }
             }
             other => other,
         };
@@ -1686,7 +1731,12 @@ impl ConversationOrchestrator {
                     ..Default::default()
                 };
                 if let Err(e) = llm
-                    .maybe_summarize(&session_id, &cfg, api_key.as_deref(), &CancellationToken::new())
+                    .maybe_summarize(
+                        &session_id,
+                        &cfg,
+                        api_key.as_deref(),
+                        &CancellationToken::new(),
+                    )
                     .await
                 {
                     warn!(session = %session_id, error = %e, "context summarization failed");
@@ -1738,8 +1788,8 @@ impl ConversationOrchestrator {
             // common case — the user appended words — is `text` starting
             // with the old transcript; also supersede any strictly longer
             // divergence.
-            let is_extension = text.starts_with(&existing.transcript)
-                || text.len() > existing.transcript.len();
+            let is_extension =
+                text.starts_with(&existing.transcript) || text.len() > existing.transcript.len();
             if !is_extension {
                 return;
             }
@@ -1749,8 +1799,7 @@ impl ConversationOrchestrator {
                    "eager speculation superseded by a fuller prediction");
         }
         let token = CancellationToken::new();
-        let response: Arc<SyncMutex<Option<Result<String, ()>>>> =
-            Arc::new(SyncMutex::new(None));
+        let response: Arc<SyncMutex<Option<Result<String, ()>>>> = Arc::new(SyncMutex::new(None));
         let llm = self.llm.clone();
         let session_id = self.session_id.clone();
         let api_key = self.config.api_key.clone();
@@ -1760,7 +1809,13 @@ impl ConversationOrchestrator {
         debug!(session = %self.session_id, "eager speculative turn started");
         let task = tokio::spawn(async move {
             let result = llm
-                .complete_staged(&session_id, &text_owned, api_key.as_deref(), &task_token, None)
+                .complete_staged(
+                    &session_id,
+                    &text_owned,
+                    api_key.as_deref(),
+                    &task_token,
+                    None,
+                )
                 .await;
             *response_store.lock() = Some(
                 result
@@ -1799,7 +1854,10 @@ impl ConversationOrchestrator {
     pub async fn on_stt_result(&self, result: &STTResult) {
         // D-G3 (review wc71hewlx #3): once a turn classified FATAL, stop —
         // re-running turns against a dead key only burns latency and money.
-        if self.fatal_stopped.load(std::sync::atomic::Ordering::Acquire) {
+        if self
+            .fatal_stopped
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             return;
         }
         // Derive the same events the legacy policy produces and route them
@@ -1809,7 +1867,10 @@ impl ConversationOrchestrator {
         let has_text = !turn_text.trim().is_empty();
         let mut events = Vec::new();
         if has_text {
-            events.push(crate::core::turn::TurnEvent::Started { turn_id: 0, interrupt: true });
+            events.push(crate::core::turn::TurnEvent::Started {
+                turn_id: 0,
+                interrupt: true,
+            });
         }
         if result.is_speech_final && has_text {
             events.push(crate::core::turn::TurnEvent::Stopped {
@@ -1828,12 +1889,20 @@ impl ConversationOrchestrator {
     pub async fn handle_turn_events(&self, events: &[crate::core::turn::TurnEvent]) {
         use crate::core::turn::TurnEvent;
 
-        let finalizing = events.iter().any(|e| matches!(e, TurnEvent::Stopped { .. }));
-        let mut eager = if finalizing { self.eager.lock().take() } else { None };
+        let finalizing = events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::Stopped { .. }));
+        let mut eager = if finalizing {
+            self.eager.lock().take()
+        } else {
+            None
+        };
 
         for event in events {
             match event {
-                TurnEvent::Started { interrupt: true, .. } => {
+                TurnEvent::Started {
+                    interrupt: true, ..
+                } => {
                     self.handle_barge_in().await;
                 }
                 TurnEvent::Started { .. } => {}
@@ -1925,12 +1994,7 @@ impl ConversationOrchestrator {
                         };
                         match self
                             .voice_manager
-                            .speak_if_epoch(
-                                &sentence,
-                                true,
-                                self.config.allow_interruption,
-                                epoch,
-                            )
+                            .speak_if_epoch(&sentence, true, self.config.allow_interruption, epoch)
                             .await
                         {
                             Ok(true) => {}
@@ -2140,7 +2204,10 @@ pub fn classify_llm_error(error: &LlmError) -> StageErrorClass {
 /// staged answer would be on different input — never speak a wrong reply).
 fn eager_transcript_matches(speculation: &str, final_transcript: &str) -> bool {
     fn norm(s: &str) -> String {
-        s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+        s.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
     }
     norm(speculation) == norm(final_transcript)
 }
@@ -2172,7 +2239,12 @@ mod tests {
             assert!(turn_needs_reasoning(t), "{t:?} should escalate");
         }
         // Trivial chit-chat stays on the fast tier.
-        for t in ["hi there", "are you open today", "thanks, bye", "yes please"] {
+        for t in [
+            "hi there",
+            "are you open today",
+            "thanks, bye",
+            "yes please",
+        ] {
             assert!(!turn_needs_reasoning(t), "{t:?} should stay fast");
         }
         // A long ask escalates on length alone.
@@ -2194,8 +2266,14 @@ mod tests {
 
         // A5 — percentage-MATH ("N% of/de") escalates cross-lingually; bare digits
         // (phone/order/date) and '%'-INTENSIFIER/DISCOUNT idioms must NOT escalate.
-        assert!(turn_needs_reasoning("calcule 15% de 2400"), "percentage math escalates");
-        assert!(turn_needs_reasoning("what is 20% of my bill"), "percentage of X escalates");
+        assert!(
+            turn_needs_reasoning("calcule 15% de 2400"),
+            "percentage math escalates"
+        );
+        assert!(
+            turn_needs_reasoning("what is 20% of my bill"),
+            "percentage of X escalates"
+        );
         for t in [
             "call me at 5551234",
             "order number 12345",
@@ -2206,20 +2284,44 @@ mod tests {
             "yeah 1000% i agree",
             "we're 100% done here",
         ] {
-            assert!(!turn_needs_reasoning(t), "{t:?} must stay fast (no calc intent)");
+            assert!(
+                !turn_needs_reasoning(t),
+                "{t:?} must stay fast (no calc intent)"
+            );
         }
 
         // A5 — apostrophe-safe tokenizer: ASCII and CURLY contractions both match.
-        assert!(turn_needs_reasoning("what's the total of these"), "ascii apostrophe");
-        assert!(turn_needs_reasoning("what\u{2019}s the total of these"), "curly apostrophe");
+        assert!(
+            turn_needs_reasoning("what's the total of these"),
+            "ascii apostrophe"
+        );
+        assert!(
+            turn_needs_reasoning("what\u{2019}s the total of these"),
+            "curly apostrophe"
+        );
 
         // A5 — stickiness: a short continuation after a reasoning turn sticks; a
         // closing/standalone follow-up does not; nothing sticks without context.
-        assert!(turn_needs_reasoning_ctx("and the second one?", true), "continuation sticks");
-        assert!(turn_needs_reasoning_ctx("what about next year", true), "continuation sticks");
-        assert!(!turn_needs_reasoning_ctx("and the second one?", false), "no stick without context");
-        assert!(!turn_needs_reasoning_ctx("thanks that's all", true), "closing does not stick");
-        assert!(!turn_needs_reasoning_ctx("no that's wrong", true), "negation does not stick");
+        assert!(
+            turn_needs_reasoning_ctx("and the second one?", true),
+            "continuation sticks"
+        );
+        assert!(
+            turn_needs_reasoning_ctx("what about next year", true),
+            "continuation sticks"
+        );
+        assert!(
+            !turn_needs_reasoning_ctx("and the second one?", false),
+            "no stick without context"
+        );
+        assert!(
+            !turn_needs_reasoning_ctx("thanks that's all", true),
+            "closing does not stick"
+        );
+        assert!(
+            !turn_needs_reasoning_ctx("no that's wrong", true),
+            "negation does not stick"
+        );
     }
 
     #[test]
@@ -2241,7 +2343,12 @@ mod tests {
         ] {
             assert!(is_reasoning_model(m), "{m} is a reasoning model");
         }
-        for m in ["gpt-4o-mini", "llama3.2:1b", "claude-haiku-4-5", "gemini-3-flash"] {
+        for m in [
+            "gpt-4o-mini",
+            "llama3.2:1b",
+            "claude-haiku-4-5",
+            "gemini-3-flash",
+        ] {
             assert!(!is_reasoning_model(m), "{m} is not a reasoning model");
         }
     }
@@ -2278,7 +2385,10 @@ mod tests {
             reasoning_effort: Some(ReasoningEffort::Off),
             ..Default::default()
         };
-        assert_eq!(cfg.to_client_config().reasoning_effort, Some(ReasoningEffort::Off));
+        assert_eq!(
+            cfg.to_client_config().reasoning_effort,
+            Some(ReasoningEffort::Off)
+        );
         assert_eq!(
             cfg.resolved_reasoning_effort(),
             (Some(ReasoningEffort::Off), ReasoningEffort::Off)
@@ -2292,7 +2402,10 @@ mod tests {
             reasoning_effort: Some(ReasoningEffort::Off),
             ..Default::default()
         };
-        assert_eq!(cfg.to_client_config().reasoning_effort, Some(ReasoningEffort::Low));
+        assert_eq!(
+            cfg.to_client_config().reasoning_effort,
+            Some(ReasoningEffort::Low)
+        );
         assert_eq!(
             cfg.resolved_reasoning_effort(),
             (Some(ReasoningEffort::Low), ReasoningEffort::Low)
@@ -2306,14 +2419,20 @@ mod tests {
             reasoning_effort: Some(ReasoningEffort::Off),
             ..Default::default()
         };
-        assert_eq!(cfg.to_client_config().reasoning_effort, Some(ReasoningEffort::Off));
+        assert_eq!(
+            cfg.to_client_config().reasoning_effort,
+            Some(ReasoningEffort::Off)
+        );
         assert_eq!(
             cfg.resolved_reasoning_effort(),
             (Some(ReasoningEffort::Off), ReasoningEffort::Off)
         );
 
         // None → no param, floor still reported.
-        let cfg = ConversationConfig { model: "gpt-4o-mini".into(), ..Default::default() };
+        let cfg = ConversationConfig {
+            model: "gpt-4o-mini".into(),
+            ..Default::default()
+        };
         assert_eq!(cfg.to_client_config().reasoning_effort, None);
     }
 
@@ -2325,14 +2444,20 @@ mod tests {
             "What's the weather today"
         ));
         assert!(eager_transcript_matches("hello   world", "Hello world"));
-        assert!(eager_transcript_matches(" trailing space ", "trailing space"));
+        assert!(eager_transcript_matches(
+            " trailing space ",
+            "trailing space"
+        ));
         // But genuinely different content does NOT confirm (never speak a
         // reply staged on different input).
         assert!(!eager_transcript_matches(
             "what's the weather",
             "what's the weather today"
         ));
-        assert!(!eager_transcript_matches("book a flight", "cancel a flight"));
+        assert!(!eager_transcript_matches(
+            "book a flight",
+            "cancel a flight"
+        ));
     }
 
     #[test]
@@ -2359,7 +2484,10 @@ mod tests {
 
     #[test]
     fn explicit_max_tokens_respected() {
-        let c = ConversationConfig { max_tokens: Some(1024), ..Default::default() };
+        let c = ConversationConfig {
+            max_tokens: Some(1024),
+            ..Default::default()
+        };
         assert_eq!(c.to_client_config().max_tokens, Some(1024));
     }
 
@@ -2402,7 +2530,10 @@ mod tests {
         };
         let p = on.to_client_config().system_prompt.unwrap();
         assert!(p.starts_with("be nice"), "user prompt preserved: {p}");
-        assert!(p.contains("Do not begin your reply with filler"), "guard appended: {p}");
+        assert!(
+            p.contains("Do not begin your reply with filler"),
+            "guard appended: {p}"
+        );
 
         // Masking off → identity (the prompt is untouched).
         let off = ConversationConfig {
@@ -2410,10 +2541,16 @@ mod tests {
             latency_filler: LatencyFiller::Off,
             ..Default::default()
         };
-        assert_eq!(off.to_client_config().system_prompt.as_deref(), Some("be nice"));
+        assert_eq!(
+            off.to_client_config().system_prompt.as_deref(),
+            Some("be nice")
+        );
 
         // No prompt + masking on → just the guard.
-        let bare = ConversationConfig { system_prompt: None, ..Default::default() };
+        let bare = ConversationConfig {
+            system_prompt: None,
+            ..Default::default()
+        };
         assert!(
             bare.to_client_config()
                 .system_prompt
@@ -2498,6 +2635,9 @@ mod stage_error_tests {
                 "{msg} must classify RECOVERABLE"
             );
         }
-        assert_eq!(classify_llm_error(&LlmError::Cancelled), StageErrorClass::Recoverable);
+        assert_eq!(
+            classify_llm_error(&LlmError::Cancelled),
+            StageErrorClass::Recoverable
+        );
     }
 }

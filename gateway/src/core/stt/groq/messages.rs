@@ -312,6 +312,8 @@ pub mod wav {
         ZeroSampleRate,
         /// Channels cannot be zero.
         ZeroChannels,
+        /// WAV header arithmetic overflowed before a valid header could be written.
+        HeaderArithmeticOverflow(&'static str),
         /// PCM data size exceeds maximum WAV file size (4GB limit).
         DataTooLarge,
     }
@@ -321,6 +323,9 @@ pub mod wav {
             match self {
                 Self::ZeroSampleRate => write!(f, "Sample rate cannot be zero"),
                 Self::ZeroChannels => write!(f, "Number of channels cannot be zero"),
+                Self::HeaderArithmeticOverflow(field) => {
+                    write!(f, "WAV header arithmetic overflow for {field}")
+                }
                 Self::DataTooLarge => write!(f, "PCM data exceeds maximum WAV file size (4GB)"),
             }
         }
@@ -375,19 +380,21 @@ pub mod wav {
             return Err(WavError::ZeroChannels);
         }
 
-        // WAV format uses 32-bit values for sizes, so max is ~4GB
-        // Check if data_size + header would overflow u32
-        if pcm_data.len() > (u32::MAX as usize - 36) {
-            return Err(WavError::DataTooLarge);
-        }
-
         let bits_per_sample: u16 = 16;
-        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
-        let block_align = channels * bits_per_sample / 8;
-        let data_size = pcm_data.len() as u32;
-        let file_size = 36 + data_size;
+        let block_align = channels
+            .checked_mul(bits_per_sample)
+            .and_then(|n| n.checked_div(8))
+            .ok_or(WavError::HeaderArithmeticOverflow("block_align"))?;
+        let byte_rate = sample_rate
+            .checked_mul(u32::from(block_align))
+            .ok_or(WavError::HeaderArithmeticOverflow("byte_rate"))?;
+        let data_size = u32::try_from(pcm_data.len()).map_err(|_| WavError::DataTooLarge)?;
+        let file_size = 36u32.checked_add(data_size).ok_or(WavError::DataTooLarge)?;
+        let capacity = HEADER_SIZE
+            .checked_add(pcm_data.len())
+            .ok_or(WavError::DataTooLarge)?;
 
-        let mut wav = Vec::with_capacity(44 + pcm_data.len());
+        let mut wav = Vec::with_capacity(capacity);
 
         // RIFF header
         wav.extend_from_slice(b"RIFF");
@@ -558,6 +565,20 @@ mod tests {
 
         // Check total size
         assert_eq!(wav.len(), wav::HEADER_SIZE + pcm_data.len());
+    }
+
+    #[test]
+    fn try_wav_rejects_header_arithmetic_overflow_without_panicking() {
+        let pcm_data = vec![0u8; 4];
+
+        assert_eq!(
+            wav::try_create_wav(&pcm_data, u32::MAX, 1).unwrap_err(),
+            wav::WavError::HeaderArithmeticOverflow("byte_rate")
+        );
+        assert_eq!(
+            wav::try_create_wav(&pcm_data, 16_000, u16::MAX).unwrap_err(),
+            wav::WavError::HeaderArithmeticOverflow("block_align")
+        );
     }
 
     #[test]

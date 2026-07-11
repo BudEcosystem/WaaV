@@ -184,7 +184,10 @@ impl BaseRealtime for DeepgramRealtime {
         self.0.replay_user_audio_preroll().await
     }
 
-    async fn replay_conversation(&mut self, items: &[ReplayConversationItem]) -> RealtimeResult<()> {
+    async fn replay_conversation(
+        &mut self,
+        items: &[ReplayConversationItem],
+    ) -> RealtimeResult<()> {
         self.0.replay_conversation(items).await
     }
 }
@@ -228,7 +231,13 @@ mod tests {
     #[tokio::test]
     async fn factory_creates_by_name_case_insensitive() {
         use crate::core::realtime::create_realtime_provider;
-        for name in ["deepgram", "DEEPGRAM", "Deepgram", "deepgram-agent", "deepgram_voice_agent"] {
+        for name in [
+            "deepgram",
+            "DEEPGRAM",
+            "Deepgram",
+            "deepgram-agent",
+            "deepgram_voice_agent",
+        ] {
             let provider = create_realtime_provider(name, cfg())
                 .unwrap_or_else(|e| panic!("registry failed for {name}: {e:?}"));
             assert_eq!(

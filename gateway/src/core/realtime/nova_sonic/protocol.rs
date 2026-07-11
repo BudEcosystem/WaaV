@@ -42,7 +42,7 @@
 
 use base64::prelude::*;
 use bytes::Bytes;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Mutex;
 
 use crate::core::realtime::base::{
@@ -437,15 +437,15 @@ impl RealtimeProtocol for NovaSonicProtocol {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let state = self
-                    .current_text
-                    .lock()
-                    .ok()
-                    .and_then(|g| *g)
-                    .unwrap_or(TextContentState {
-                        role: TranscriptRole::Assistant,
-                        is_final: true,
-                    });
+                let state =
+                    self.current_text
+                        .lock()
+                        .ok()
+                        .and_then(|g| *g)
+                        .unwrap_or(TextContentState {
+                            role: TranscriptRole::Assistant,
+                            is_final: true,
+                        });
                 vec![S2sEvent::Transcript {
                     role: state.role,
                     text,
@@ -630,10 +630,9 @@ impl RealtimeProtocol for NovaSonicProtocol {
     fn serialize(&self, msg: &Self::Wire) -> RealtimeResult<OutFrame> {
         // Every Nova Sonic wire message is a JSON event ⇒ a Text frame (the
         // BedrockBidi transport wraps its bytes into a Bedrock input payload part).
-        Ok(OutFrame::Text(
-            serde_json::to_string(msg)
-                .map_err(|e| RealtimeError::SerializationError(e.to_string()))?,
-        ))
+        Ok(OutFrame::Text(serde_json::to_string(msg).map_err(|e| {
+            RealtimeError::SerializationError(e.to_string())
+        })?))
     }
 }
 
@@ -644,9 +643,7 @@ impl RealtimeProtocol for NovaSonicProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::realtime::base::{
-        FunctionDefinition, ReplayConversationItem, ToolDefinition,
-    };
+    use crate::core::realtime::base::{FunctionDefinition, ReplayConversationItem, ToolDefinition};
 
     fn base_cfg() -> RealtimeConfig {
         RealtimeConfig {
@@ -779,7 +776,10 @@ mod tests {
         // SYSTEM block: contentStart(role SYSTEM, type TEXT) + textInput(content).
         assert_eq!(events[2]["event"]["contentStart"]["role"], "SYSTEM");
         assert_eq!(events[2]["event"]["contentStart"]["type"], "TEXT");
-        assert_eq!(events[3]["event"]["textInput"]["content"], "You are helpful.");
+        assert_eq!(
+            events[3]["event"]["textInput"]["content"],
+            "You are helpful."
+        );
 
         // USER AUDIO container opened (type AUDIO, role USER, interactive true),
         // 16 kHz lpcm input.
@@ -802,7 +802,11 @@ mod tests {
             if let Some(inner) = e["event"].as_object().and_then(|o| o.values().next())
                 && let Some(pn) = inner.get("promptName")
             {
-                assert_eq!(pn.as_str().unwrap(), prompt_name, "all events share promptName");
+                assert_eq!(
+                    pn.as_str().unwrap(),
+                    prompt_name,
+                    "all events share promptName"
+                );
             }
         }
         // The USER AUDIO contentStart uses the SAME contentName encode_user_audio reuses.
@@ -827,7 +831,15 @@ mod tests {
         let events = p.build_session_config(&cfg, None);
         let names: Vec<&str> = events
             .iter()
-            .map(|e| e["event"].as_object().unwrap().keys().next().unwrap().as_str())
+            .map(|e| {
+                e["event"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .next()
+                    .unwrap()
+                    .as_str()
+            })
             .collect();
         // No SYSTEM contentStart/textInput/contentEnd — just session/prompt/audio.
         assert_eq!(names, vec!["sessionStart", "promptStart", "contentStart"]);
@@ -856,7 +868,9 @@ mod tests {
         let tools = &events[1]["event"]["promptStart"]["toolConfiguration"]["tools"];
         assert_eq!(tools[0]["toolSpec"]["name"], "get_weather");
         // inputSchema.json is a STRING (stringified schema).
-        let schema = tools[0]["toolSpec"]["inputSchema"]["json"].as_str().unwrap();
+        let schema = tools[0]["toolSpec"]["inputSchema"]["json"]
+            .as_str()
+            .unwrap();
         let parsed: Value = serde_json::from_str(schema).unwrap();
         assert_eq!(parsed["properties"]["city"]["type"], "string");
     }
@@ -872,7 +886,9 @@ mod tests {
         assert_eq!(ai["promptName"].as_str().unwrap(), p.prompt_name);
         assert_eq!(ai["contentName"].as_str().unwrap(), p.audio_content_name);
         assert_eq!(
-            BASE64_STANDARD.decode(ai["content"].as_str().unwrap()).unwrap(),
+            BASE64_STANDARD
+                .decode(ai["content"].as_str().unwrap())
+                .unwrap(),
             pcm,
             "audio is base64-encoded PCM inside the JSON event"
         );
@@ -895,7 +911,14 @@ mod tests {
         ));
         let to = r#"{"event":{"textOutput":{"content":"hello there","contentId":"c1"}}}"#;
         match p.map_server_event(Inbound::Text(to)).as_slice() {
-            [S2sEvent::Transcript { role, text, is_final, item_id }] => {
+            [
+                S2sEvent::Transcript {
+                    role,
+                    text,
+                    is_final,
+                    item_id,
+                },
+            ] => {
                 assert_eq!(*role, TranscriptRole::Assistant);
                 assert_eq!(text, "hello there");
                 assert!(!*is_final, "SPECULATIVE ⇒ non-final");
@@ -917,7 +940,14 @@ mod tests {
         ));
         let to = r#"{"event":{"textOutput":{"content":"what is the weather","contentId":"u1"}}}"#;
         match p.map_server_event(Inbound::Text(to)).as_slice() {
-            [S2sEvent::Transcript { role, text, is_final, .. }] => {
+            [
+                S2sEvent::Transcript {
+                    role,
+                    text,
+                    is_final,
+                    ..
+                },
+            ] => {
                 assert_eq!(*role, TranscriptRole::User);
                 assert_eq!(text, "what is the weather");
                 assert!(*is_final, "FINAL ⇒ final");
@@ -936,7 +966,13 @@ mod tests {
             r#"{{"event":{{"audioOutput":{{"content":"{b64}","contentId":"a1","completionId":"comp1"}}}}}}"#
         );
         match p.map_server_event(Inbound::Text(&raw)).as_slice() {
-            [S2sEvent::Audio { data, item_id, response_id }] => {
+            [
+                S2sEvent::Audio {
+                    data,
+                    item_id,
+                    response_id,
+                },
+            ] => {
                 assert_eq!(data.as_ref(), pcm);
                 assert_eq!(item_id.as_deref(), Some("a1"));
                 assert_eq!(response_id.as_deref(), Some("comp1"));
@@ -1002,7 +1038,10 @@ mod tests {
             "not json",
         ] {
             assert!(
-                matches!(p.map_server_event(Inbound::Text(raw)).as_slice(), [S2sEvent::Ignore]),
+                matches!(
+                    p.map_server_event(Inbound::Text(raw)).as_slice(),
+                    [S2sEvent::Ignore]
+                ),
                 "expected Ignore for {raw}"
             );
         }
@@ -1024,7 +1063,9 @@ mod tests {
         assert_eq!(msgs[0]["event"]["contentStart"]["type"], "TEXT");
         assert_eq!(msgs[1]["event"]["textInput"]["content"], "hello model");
         // One shared contentName across the block.
-        let cn = msgs[0]["event"]["contentStart"]["contentName"].as_str().unwrap();
+        let cn = msgs[0]["event"]["contentStart"]["contentName"]
+            .as_str()
+            .unwrap();
         assert_eq!(msgs[1]["event"]["textInput"]["contentName"], cn);
         assert_eq!(msgs[2]["event"]["contentEnd"]["contentName"], cn);
     }
@@ -1040,7 +1081,10 @@ mod tests {
         assert_eq!(cs["type"], "TOOL");
         assert_eq!(cs["role"], "TOOL");
         assert_eq!(cs["toolResultInputConfiguration"]["toolUseId"], "tu-1");
-        assert_eq!(msgs[1]["event"]["toolResult"]["content"], r#"{"temp":"72F"}"#);
+        assert_eq!(
+            msgs[1]["event"]["toolResult"]["content"],
+            r#"{"temp":"72F"}"#
+        );
     }
 
     /// Turn/response controls are empty (server VAD owns them); defaults (truncate,

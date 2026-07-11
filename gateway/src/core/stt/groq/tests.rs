@@ -955,7 +955,7 @@ mod client_tests {
     // `new_standard` into the provider-specific config — previously dropped by the flat factory.
     #[test]
     fn new_standard_unlocks_word_timestamps() {
-        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "groq".into(),
@@ -973,9 +973,10 @@ mod client_tests {
         let stt = GroqSTT::new_standard(&std).expect("new_standard should succeed");
         let cfg = stt.config.as_ref().expect("config should be set");
         assert_eq!(cfg.response_format, GroqResponseFormat::VerboseJson);
-        assert!(cfg
-            .timestamp_granularities
-            .contains(&super::super::config::TimestampGranularity::Word));
+        assert!(
+            cfg.timestamp_granularities
+                .contains(&super::super::config::TimestampGranularity::Word)
+        );
         assert_eq!(cfg.base.api_key, "gsk_test");
 
         // Empty api_key is rejected through the standardized path too (parity with Deepgram).
@@ -1597,12 +1598,10 @@ mod audio_url_wire_tests {
     #[test]
     fn from_standard_maps_url_from_extras() {
         // RED guard: the extras `url` passthrough must reach the typed config field.
-        let cfg = GroqSTTConfig::from_standard(&std_with_url(
-            "https://cdn.example.com/clip.mp3",
-        ));
+        let cfg = GroqSTTConfig::from_standard(&std_with_url(" https://example.com/clip.mp3 "));
         assert_eq!(
             cfg.audio_url.as_deref(),
-            Some("https://cdn.example.com/clip.mp3")
+            Some("https://example.com/clip.mp3")
         );
     }
 
@@ -1611,9 +1610,7 @@ mod audio_url_wire_tests {
         // WIRE-LEVEL: `build_form_text_fields` is the exact list `send_request` iterates to
         // build the multipart body, so asserting on it asserts what reaches Groq's body —
         // not merely a struct field (the recurring "tested config, not wire" bug class).
-        let cfg = GroqSTTConfig::from_standard(&std_with_url(
-            "https://cdn.example.com/clip.mp3",
-        ));
+        let cfg = GroqSTTConfig::from_standard(&std_with_url("https://cdn.example.com/clip.mp3"));
         let fields = cfg.build_form_text_fields();
         let url = fields
             .iter()
@@ -1649,6 +1646,34 @@ mod audio_url_wire_tests {
         );
     }
 
+    #[test]
+    fn audio_url_validation_rejects_unsafe_targets() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let public = GroqSTTConfig::from_standard(&std_with_url("https://example.com/clip.mp3"));
+        assert!(public.validate().is_ok());
+
+        let data = GroqSTTConfig::from_standard(&std_with_url("data:audio/wav;base64,AAAA"));
+        assert!(data.validate().is_ok());
+
+        let loopback = GroqSTTConfig::from_standard(&std_with_url("http://127.0.0.1:9000/a.wav"));
+        let err = loopback
+            .validate()
+            .expect_err("loopback audio_url must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        let file = GroqSTTConfig::from_standard(&std_with_url("file:///tmp/a.wav"));
+        let err = file
+            .validate()
+            .expect_err("non-HTTP audio_url must be rejected");
+        assert!(err.contains("URL scheme"), "{err}");
+
+        let blank = GroqSTTConfig::from_standard(&std_with_url("   "));
+        let err = blank
+            .validate()
+            .expect_err("blank audio_url must be rejected");
+        assert!(err.contains("empty"), "{err}");
+    }
+
     #[tokio::test]
     async fn url_reaches_multipart_request_body_over_the_wire() {
         // End-to-end wire assert: drive the public path (connect → send_audio → flush) against a
@@ -1659,9 +1684,7 @@ mod audio_url_wire_tests {
             .mock("POST", "/openai/v1/audio/transcriptions")
             .match_body(mockito::Matcher::AllOf(vec![
                 mockito::Matcher::Regex(r#"name="url""#.to_string()),
-                mockito::Matcher::Regex(
-                    regex::escape("https://cdn.example.com/clip.mp3"),
-                ),
+                mockito::Matcher::Regex(regex::escape("https://cdn.example.com/clip.mp3")),
             ]))
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -1669,16 +1692,29 @@ mod audio_url_wire_tests {
             .create_async()
             .await;
 
-        let mut cfg = GroqSTTConfig::from_standard(&std_with_url(
-            "https://cdn.example.com/clip.mp3",
-        ));
+        let mut cfg =
+            GroqSTTConfig::from_standard(&std_with_url("https://cdn.example.com/clip.mp3"));
         cfg.response_format = GroqResponseFormat::Json;
-        cfg.custom_endpoint = Some(format!(
-            "{}/openai/v1/audio/transcriptions",
-            server.url()
-        ));
+        cfg.custom_endpoint = Some(format!("{}/openai/v1/audio/transcriptions", server.url()));
 
-        let mut stt = GroqSTT::with_config(cfg).expect("client");
+        let mut stt = {
+            let _guard = crate::core::net::test_env_lock()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+            unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
+            let stt = GroqSTT::with_config(cfg).expect("client");
+            // SAFETY: restore the process env before releasing the test env lock.
+            unsafe {
+                if let Some(previous) = previous {
+                    std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+                } else {
+                    std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+                }
+            }
+            stt
+        };
         stt.connect().await.expect("connect");
         // Buffer a little audio so the flush gate (non-empty buffer) is satisfied; the body
         // should still carry `url` (not a `file` part) because `audio_url` is set.

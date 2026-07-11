@@ -20,9 +20,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::handshake::client::generate_key;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 // =============================================================================
@@ -47,28 +48,12 @@ pub const MIN_SAMPLE_RATE: u32 = 8000;
 /// Maximum supported sample rate (48kHz for high-quality audio)
 pub const MAX_SAMPLE_RATE: u32 = 48000;
 
+use crate::core::resilience::connect::{WS_CONNECT_TIMEOUT, with_timeout};
 use crate::core::websocket::ReconnectionConfig;
 use crate::core::websocket::reconnectable_stream::{
     ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
     WsTransport,
 };
-
-/// Extract the `host[:port]` authority from a `ws://`/`wss://` base URL, for the `Host`
-/// header when an `endpoint_override` is in effect.
-fn ws_authority(base: &str) -> Option<String> {
-    let rest = base
-        .strip_prefix("wss://")
-        .or_else(|| base.strip_prefix("ws://"))
-        .or_else(|| base.strip_prefix("https://"))
-        .or_else(|| base.strip_prefix("http://"))
-        .unwrap_or(base);
-    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
-    if authority.is_empty() {
-        None
-    } else {
-        Some(authority.to_string())
-    }
-}
 
 use super::config::{
     AssemblyAIEncoding, AssemblyAIRegion, AssemblyAISTTConfig, AssemblyAISpeechModel,
@@ -123,8 +108,8 @@ struct AssemblyAiTransport {
     audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
     /// Shared control-message receiver (ForceEndpoint etc.; locked for the duration of `run`).
     control_rx: Arc<Mutex<mpsc::Receiver<String>>>,
-    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
-    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    /// Shared shutdown token (an intentional close must not reconnect).
+    shutdown_token: CancellationToken,
     result_tx: mpsc::Sender<STTResult>,
     error_tx: mpsc::Sender<STTError>,
     /// Fires once when the first `Begin` arrives, unblocking `start_connection`.
@@ -137,6 +122,22 @@ struct AssemblyAiTransport {
     /// D-G1: shared replay ring — pushed by the send arm, cleared on
     /// end-of-turn, replayed by `restore_session`.
     replay: Arc<crate::core::websocket::AudioReplayBuffer>,
+}
+
+impl AssemblyAiTransport {
+    async fn shutdown_gracefully(
+        ws_sink: &mut SplitSink<AssemblyAiWs, Message>,
+        is_connected: &Arc<AtomicBool>,
+    ) -> ReconnectOutcome {
+        let terminate_msg = TerminateMessage::default();
+        if let Ok(json) = serde_json::to_string(&terminate_msg) {
+            let _ = ws_sink.send(Message::Text(json.into())).await;
+        }
+
+        let _ = ws_sink.send(Message::Close(None)).await;
+        is_connected.store(false, Ordering::Release);
+        ReconnectOutcome::Completed
+    }
 }
 
 #[async_trait::async_trait]
@@ -157,18 +158,24 @@ impl WsTransport for AssemblyAiTransport {
                 "AssemblyAI: replaying un-finalized audio tail after reconnect"
             );
             for chunk in tail {
-                self.ws_sink.send(Message::Binary(chunk)).await.map_err(|e| {
-                    RestoreError::new(format!("audio replay send failed: {e}"))
-                })?;
+                self.ws_sink
+                    .send(Message::Binary(chunk))
+                    .await
+                    .map_err(|e| RestoreError::new(format!("audio replay send failed: {e}")))?;
             }
         }
         Ok(())
     }
 
     async fn run(&mut self) -> ReconnectOutcome {
+        let shutdown_token = self.shutdown_token.clone();
+        let is_connected = Arc::clone(&self.is_connected);
+        if shutdown_token.is_cancelled() {
+            info!("Received shutdown signal for AssemblyAI STT");
+            return Self::shutdown_gracefully(&mut self.ws_sink, &is_connected).await;
+        }
         let mut audio_rx = self.audio_rx.lock().await;
         let mut control_rx = self.control_rx.lock().await;
-        let mut shutdown_rx = self.shutdown_rx.lock().await;
         loop {
             tokio::select! {
                 // Handle outgoing audio data
@@ -272,18 +279,9 @@ impl WsTransport for AssemblyAiTransport {
                 }
 
                 // Handle shutdown signal (intentional close — must NOT reconnect)
-                _ = &mut *shutdown_rx => {
+                _ = shutdown_token.cancelled() => {
                     info!("Received shutdown signal for AssemblyAI STT");
-
-                    // Send terminate message for graceful shutdown
-                    let terminate_msg = TerminateMessage::default();
-                    if let Ok(json) = serde_json::to_string(&terminate_msg) {
-                        let _ = self.ws_sink.send(Message::Text(json.into())).await;
-                    }
-
-                    let _ = self.ws_sink.send(Message::Close(None)).await;
-                    self.is_connected.store(false, Ordering::Release);
-                    return ReconnectOutcome::Completed;
+                    return Self::shutdown_gracefully(&mut self.ws_sink, &is_connected).await;
                 }
             }
         }
@@ -365,8 +363,8 @@ pub struct AssemblyAISTT {
     /// Control message sender for ForceEndpoint, Terminate, etc.
     control_tx: Option<mpsc::Sender<String>>,
 
-    /// Shutdown signal sender
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Shutdown token shared with supervised transports.
+    shutdown_token: Option<CancellationToken>,
 
     /// Result channel sender
     result_tx: Option<mpsc::Sender<STTResult>>,
@@ -402,9 +400,9 @@ pub struct AssemblyAISTT {
     resilience: Option<crate::core::resilience::ResilienceHandles>,
 
     /// Intentional-disconnect flag shared with the [`ReconnectableStream`] supervisor (W-D1).
-    /// Cleared on `start_connection`, set in `disconnect()` before firing `shutdown_tx`. The
-    /// supervisor checks it at its loop top and after a racy `Reconnectable` outcome, so a client
-    /// close racing a server-side close can never trigger a spurious reconnect.
+    /// Cleared on `start_connection`, set in `disconnect()` before cancelling the shutdown token.
+    /// The supervisor checks it at its loop top and after a racy `Reconnectable` outcome, so a
+    /// client close racing a server-side close can never trigger a spurious reconnect.
     intentional_disconnect: Arc<AtomicBool>,
 
     /// D-G1 reconnect audio-replay: the un-finalized audio tail (cleared on
@@ -421,7 +419,7 @@ impl Default for AssemblyAISTT {
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
             control_tx: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             result_tx: None,
             error_tx: None,
             connection_handle: None,
@@ -459,14 +457,12 @@ impl AssemblyAISTT {
         }
         // `AssemblyAISTT` implements `Drop`, so build the default then set the config field
         // (struct-update with `..Default::default()` would move out of a Drop type).
-        let mut stt = Self::default();
-        stt.config = Some(AssemblyAISTTConfig::from_standard(std));
-        Ok(stt)
-    }
+        let assemblyai_config = AssemblyAISTTConfig::from_standard(std);
+        assemblyai_config.validate_endpoint_override()?;
 
-    /// Get the host name from the region for HTTP headers.
-    pub(crate) fn get_host_from_region(region: &AssemblyAIRegion) -> &'static str {
-        region.host()
+        let mut stt = Self::default();
+        stt.config = Some(assemblyai_config);
+        Ok(stt)
     }
 
     /// Handle incoming WebSocket messages from AssemblyAI.
@@ -613,6 +609,8 @@ impl AssemblyAISTT {
 
     /// Start the WebSocket connection to AssemblyAI STT API.
     async fn start_connection(&mut self, config: AssemblyAISTTConfig) -> Result<(), STTError> {
+        config.validate_endpoint_override()?;
+
         // Validate sample rate
         let sample_rate = config.base.sample_rate;
         if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate) {
@@ -627,7 +625,7 @@ impl AssemblyAISTT {
         // Create channels for communication
         let (ws_tx, ws_rx) = mpsc::channel::<Bytes>(32);
         let (control_tx, control_rx) = mpsc::channel::<String>(8);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_token = CancellationToken::new();
         // Bounded channels for backpressure - 256 should handle bursts while preventing memory exhaustion
         let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
         let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
@@ -636,30 +634,22 @@ impl AssemblyAISTT {
         // Store channels
         self.ws_sender = Some(ws_tx);
         self.control_tx = Some(control_tx);
-        self.shutdown_tx = Some(shutdown_tx);
+        self.shutdown_token = Some(shutdown_token.clone());
         self.result_tx = Some(result_tx.clone());
         self.error_tx = Some(error_tx.clone());
 
         // Clone necessary data for the connection task
         let api_key = config.base.api_key.clone();
-        // The Host header must match the endpoint actually dialed: for an override
-        // (mock/proxy) derive it from the override authority; otherwise the regional host.
-        let host: String = match &config.endpoint_override {
-            Some(o) => ws_authority(o)
-                .unwrap_or_else(|| Self::get_host_from_region(&config.region).to_string()),
-            None => Self::get_host_from_region(&config.region).to_string(),
-        };
 
         // Clone shared state for the supervised transport
         let session_id = self.session_id.clone();
         let is_connected = self.is_connected.clone();
 
         // Shared state the supervised transport re-uses across reconnect attempts: single-
-        // consumer audio/control receivers + shutdown oneshot (locked per `run`) and the
-        // one-shot connected signal that fires on the first Begin.
+        // consumer audio/control receivers, shutdown token, and the one-shot connected signal
+        // that fires on the first Begin.
         let audio_rx = Arc::new(Mutex::new(ws_rx));
         let control_rx = Arc::new(Mutex::new(control_rx));
-        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
         let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
 
         // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor
@@ -695,11 +685,10 @@ impl AssemblyAISTT {
             let exit = supervisor
                 .run(|| {
                     let ws_url = ws_url.clone();
-                    let host = host.clone();
                     let api_key = api_key.clone();
                     let audio_rx = Arc::clone(&audio_rx);
                     let control_rx = Arc::clone(&control_rx);
-                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let shutdown_token = shutdown_token.clone();
                     let connected_tx = Arc::clone(&connected_tx);
                     let session_id = Arc::clone(&session_id);
                     let is_connected = Arc::clone(&is_connected);
@@ -707,38 +696,48 @@ impl AssemblyAISTT {
                     let error_tx = error_tx.clone();
                     let replay = Arc::clone(&replay);
                     async move {
-                        // Build WebSocket request with AssemblyAI authentication
+                        // Build the upgrade request via `into_client_request` (repo convention):
+                        // it derives the 5 mandatory WS handshake headers (`Host`, `Connection`,
+                        // `Upgrade`, `Sec-WebSocket-Version`, `Sec-WebSocket-Key`) from the dial
+                        // URL; only AssemblyAI's auth header rides on top.
                         // Note: AssemblyAI uses "Authorization: <API_KEY>" (no Bearer prefix
                         // for WebSocket)
-                        let request = tokio_tungstenite::tungstenite::http::Request::builder()
-                            .method("GET")
-                            .uri(&ws_url)
-                            .header("Host", host)
-                            .header("Upgrade", "websocket")
-                            .header("Connection", "upgrade")
-                            .header("Sec-WebSocket-Key", generate_key())
-                            .header("Sec-WebSocket-Version", "13")
-                            .header("Authorization", &api_key) // AssemblyAI uses raw API key
-                            .body(())
-                            .map_err(|e| {
-                                let stt_error = STTError::ConnectionFailed(format!(
-                                    "Failed to create WebSocket request: {e}"
-                                ));
-                                error!("{}", stt_error);
-                                if error_tx.try_send(stt_error).is_err() {
-                                    error!(
-                                        "AssemblyAI error channel full/closed — fatal connection \
-                                         error NOT delivered to caller (session will appear silent)"
-                                    );
-                                }
-                                StreamError::new(format!("Failed to create WebSocket request: {e}"))
-                            })?;
-
-                        // Connect to AssemblyAI
-                        let (ws_stream, _response) = connect_async(request).await.map_err(|e| {
+                        let map_req_err = |e: &dyn std::fmt::Display| {
                             let stt_error = STTError::ConnectionFailed(format!(
-                                "Failed to connect to AssemblyAI: {e}"
+                                "Failed to create WebSocket request: {e}"
                             ));
+                            error!("{}", stt_error);
+                            if error_tx.try_send(stt_error).is_err() {
+                                error!(
+                                    "AssemblyAI error channel full/closed — fatal connection \
+                                     error NOT delivered to caller (session will appear silent)"
+                                );
+                            }
+                            StreamError::new(format!("Failed to create WebSocket request: {e}"))
+                        };
+                        let mut request = ws_url
+                            .as_str()
+                            .into_client_request()
+                            .map_err(|e| map_req_err(&e))?;
+                        request.headers_mut().insert(
+                            "Authorization",
+                            api_key.parse().map_err(|e| map_req_err(&e))?, // raw API key
+                        );
+
+                        // Connect to AssemblyAI (deadline-bounded dial: a timeout takes
+                        // the exact same error path as a refused/failed connect).
+                        let dial =
+                            match with_timeout(WS_CONNECT_TIMEOUT, connect_async(request)).await {
+                                Ok(res) => {
+                                    res.map_err(|e| format!("Failed to connect to AssemblyAI: {e}"))
+                                }
+                                Err(_) => Err(format!(
+                                    "connect to AssemblyAI timed out after {}s",
+                                    WS_CONNECT_TIMEOUT.as_secs()
+                                )),
+                            };
+                        let (ws_stream, _response) = dial.map_err(|msg| {
+                            let stt_error = STTError::ConnectionFailed(msg.clone());
                             error!("{}", stt_error);
                             if error_tx.try_send(stt_error).is_err() {
                                 error!(
@@ -746,7 +745,7 @@ impl AssemblyAISTT {
                                          NOT delivered to caller (session will appear silent)"
                                 );
                             }
-                            StreamError::new(format!("Failed to connect to AssemblyAI: {e}"))
+                            StreamError::new(msg)
                         })?;
 
                         info!("Connected to AssemblyAI STT WebSocket");
@@ -756,7 +755,7 @@ impl AssemblyAISTT {
                             ws_stream,
                             audio_rx,
                             control_rx,
-                            shutdown_rx,
+                            shutdown_token,
                             result_tx,
                             error_tx,
                             connected_tx,
@@ -830,8 +829,9 @@ impl AssemblyAISTT {
 
 impl Drop for AssemblyAISTT {
     fn drop(&mut self) {
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
     }
 }
@@ -866,7 +866,7 @@ impl BaseSTT for AssemblyAISTT {
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
             control_tx: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             result_tx: None,
             error_tx: None,
             connection_handle: None,
@@ -894,22 +894,33 @@ impl BaseSTT for AssemblyAISTT {
         // W-D1: record the intent BEFORE firing the shutdown signal so the reconnect loop never
         // re-dials on a disconnect that races a server-side close.
         self.intentional_disconnect.store(true, Ordering::SeqCst);
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
 
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "assemblyai-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         if let Some(handle) = self.result_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task(
+                "assemblyai-stt-result-forwarder",
+                handle,
+            )
+            .await;
         }
 
         if let Some(handle) = self.error_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task(
+                "assemblyai-stt-error-forwarder",
+                handle,
+            )
+            .await;
         }
 
         self.ws_sender = None;
@@ -1027,6 +1038,7 @@ impl BaseSTT for AssemblyAISTT {
             domain: existing.as_ref().and_then(|c| c.domain.clone()),
             endpoint_override: existing.as_ref().and_then(|c| c.endpoint_override.clone()),
         };
+        assemblyai_config.validate_endpoint_override()?;
 
         self.config = Some(assemblyai_config);
 
@@ -1242,6 +1254,24 @@ mod tests {
     }
 
     #[test]
+    fn new_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let std = crate::core::stt::standard::StandardSTTConfig::from_base(STTConfig {
+            api_key: "test_key".to_string(),
+            language: "en-US".to_string(),
+            sample_rate: 16000,
+            ..Default::default()
+        })
+        .with_endpoint_override("ws://127.0.0.1:9000");
+
+        let err = match AssemblyAISTT::new_standard(&std) {
+            Err(err) => err,
+            Ok(_) => panic!("loopback endpoint_override must be rejected"),
+        };
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+    }
+
+    #[test]
     fn test_websocket_url_generation() {
         let config = STTConfig {
             api_key: "test_key".to_string(),
@@ -1310,7 +1340,13 @@ mod tests {
             r#"{"type":"Begin","id":"test-session-123","expires_at":1704067200}"#.into(),
         );
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
+        let result = AssemblyAISTT::handle_websocket_message(
+            msg,
+            &tx,
+            &session_id,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .await;
 
         assert!(result.is_ok());
         assert!(result.unwrap()); // Should continue
@@ -1329,7 +1365,13 @@ mod tests {
             r#"{"type":"Turn","turn_order":0,"transcript":"Hello world","end_of_turn":true,"words":[{"start":0,"end":500,"confidence":0.95,"text":"Hello"},{"start":500,"end":1000,"confidence":0.98,"text":"world"}]}"#.into(),
         );
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
+        let result = AssemblyAISTT::handle_websocket_message(
+            msg,
+            &tx,
+            &session_id,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .await;
 
         assert!(result.is_ok());
         assert!(result.unwrap()); // Should continue
@@ -1350,7 +1392,13 @@ mod tests {
             r#"{"type":"Termination","audio_duration_ms":5000,"terminated_normally":true}"#.into(),
         );
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
+        let result = AssemblyAISTT::handle_websocket_message(
+            msg,
+            &tx,
+            &session_id,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .await;
 
         assert!(result.is_ok());
         assert!(!result.unwrap()); // Should NOT continue (termination)
@@ -1366,7 +1414,13 @@ mod tests {
                 .into(),
         );
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
+        let result = AssemblyAISTT::handle_websocket_message(
+            msg,
+            &tx,
+            &session_id,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .await;
 
         assert!(result.is_err());
         if let Err(STTError::AuthenticationFailed(msg)) = result {
@@ -1386,7 +1440,13 @@ mod tests {
                 .into(),
         );
 
-        let result = AssemblyAISTT::handle_websocket_message(msg, &tx, &session_id, &crate::core::websocket::AudioReplayBuffer::default()).await;
+        let result = AssemblyAISTT::handle_websocket_message(
+            msg,
+            &tx,
+            &session_id,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .await;
 
         assert!(result.is_err());
         if let Err(STTError::ProviderError(msg)) = result {

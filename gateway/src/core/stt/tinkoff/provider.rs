@@ -8,13 +8,12 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::config::TinkoffSttConfig;
 use super::grpc::{TinkoffGrpcClient, classify_grpc_outcome, create_tinkoff_channel};
-use super::messages::{
-    RecognitionConfig, StreamingRecognitionConfig, StreamingRecognizeResponse,
-};
+use super::messages::{RecognitionConfig, StreamingRecognitionConfig, StreamingRecognizeResponse};
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
@@ -52,8 +51,8 @@ struct TinkoffTransport {
     /// `run`). Each attempt forwards from it into a fresh per-stream channel, so queued audio
     /// survives a reconnect instead of being lost with the old gRPC stream.
     audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
-    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
-    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    /// Shared shutdown signal (cloneable across reconnect attempts; intentional close must not reconnect).
+    shutdown_token: CancellationToken,
     /// Decoded responses are forwarded here to the callback task.
     result_tx: mpsc::Sender<Result<StreamingRecognizeResponse, STTError>>,
     /// Fires once on the first successful stream open, unblocking `start_connection`.
@@ -76,7 +75,12 @@ impl WsTransport for TinkoffTransport {
         use futures::StreamExt;
 
         let mut audio_rx = self.audio_rx.lock().await;
-        let mut shutdown_rx = self.shutdown_rx.lock().await;
+        let shutdown_token = self.shutdown_token.clone();
+
+        if shutdown_token.is_cancelled() {
+            info!("Shutdown signal already received for Tinkoff STT");
+            return ReconnectOutcome::Completed;
+        }
 
         // Per-attempt inner channel handed to the fresh gRPC stream. We forward the durable audio
         // receiver into it inside the select! below, so a reconnect re-uses the same durable
@@ -94,7 +98,10 @@ impl WsTransport for TinkoffTransport {
             Ok(s) => s,
             Err(status) => {
                 let stt_error = super::grpc::grpc_status_to_stt_error(status.clone());
-                error!("Failed to start Tinkoff streaming recognition: {}", stt_error);
+                error!(
+                    "Failed to start Tinkoff streaming recognition: {}",
+                    stt_error
+                );
                 let _ = self.result_tx.try_send(Err(stt_error));
                 return classify_grpc_outcome(status);
             }
@@ -105,7 +112,7 @@ impl WsTransport for TinkoffTransport {
                 biased;
 
                 // Intentional shutdown — must NOT reconnect.
-                _ = &mut *shutdown_rx => {
+                _ = shutdown_token.cancelled() => {
                     info!("Shutdown signal received for Tinkoff STT");
                     return ReconnectOutcome::Completed;
                 }
@@ -204,12 +211,12 @@ pub struct TinkoffStt {
     pub(super) config: Option<TinkoffSttConfig>,
     pub(super) state: ConnectionState,
     /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
-    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// `connect()`, set in `disconnect()` before cancelling the shutdown token, so a client close racing a
     /// server-side close can never trigger a spurious reconnect.
     pub(super) intentional_disconnect: Arc<AtomicBool>,
     pub(super) state_notify: Arc<Notify>,
     pub(super) audio_sender: Option<mpsc::Sender<Bytes>>,
-    pub(super) shutdown_tx: Option<oneshot::Sender<()>>,
+    pub(super) shutdown_token: Option<CancellationToken>,
     pub(super) connection_handle: Option<tokio::task::JoinHandle<()>>,
     pub(super) result_forward_handle: Option<tokio::task::JoinHandle<()>>,
     pub(super) error_forward_handle: Option<tokio::task::JoinHandle<()>>,
@@ -231,7 +238,7 @@ impl Default for TinkoffStt {
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             audio_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             connection_handle: None,
             result_forward_handle: None,
             error_forward_handle: None,
@@ -263,7 +270,7 @@ impl TinkoffStt {
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             audio_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             connection_handle: None,
             result_forward_handle: None,
             error_forward_handle: None,
@@ -339,19 +346,18 @@ impl TinkoffStt {
 
         // Channels
         let (audio_tx, audio_rx) = mpsc::channel::<Bytes>(AUDIO_CHANNEL_BUFFER_SIZE);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_token = CancellationToken::new();
         let (result_tx, mut result_rx) =
             mpsc::channel::<Result<StreamingRecognizeResponse, STTError>>(100);
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         self.audio_sender = Some(audio_tx);
-        self.shutdown_tx = Some(shutdown_tx);
+        self.shutdown_token = Some(shutdown_token.clone());
 
         let streaming_config = Self::create_streaming_config(&config);
 
         // Shared state the supervised transport re-uses across reconnect attempts.
         let audio_rx = Arc::new(Mutex::new(audio_rx));
-        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
         let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
 
         // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor with
@@ -379,7 +385,7 @@ impl TinkoffStt {
                     let config = config.clone();
                     let streaming_config = streaming_config.clone();
                     let audio_rx = Arc::clone(&audio_rx);
-                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let shutdown_token = shutdown_token.clone();
                     let connected_tx = Arc::clone(&connected_tx);
                     let result_tx = result_tx.clone();
                     async move {
@@ -390,7 +396,7 @@ impl TinkoffStt {
                             grpc_client,
                             streaming_config,
                             audio_rx,
-                            shutdown_rx,
+                            shutdown_token,
                             result_tx,
                             connected_tx,
                         })
@@ -492,7 +498,7 @@ impl BaseSTT for TinkoffStt {
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             audio_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             connection_handle: None,
             result_forward_handle: None,
             error_forward_handle: None,
@@ -515,25 +521,33 @@ impl BaseSTT for TinkoffStt {
         // run() just reported a reconnectable drop (the disconnect-vs-close race).
         self.intentional_disconnect.store(true, Ordering::SeqCst);
 
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
 
         // Drop the outbound audio sender so the transport's recv() also unblocks.
         self.audio_sender = None;
 
         if let Some(handle) = self.connection_handle.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "tinkoff-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         if let Some(handle) = self.result_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task(
+                "tinkoff-stt-result-forwarder",
+                handle,
+            )
+            .await;
         }
 
         if let Some(handle) = self.error_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task("tinkoff-stt-error-forwarder", handle)
+                .await;
         }
 
         self.audio_sender = None;
@@ -625,17 +639,16 @@ impl TinkoffStt {
     /// The shared circuit breaker this session feeds into the generic supervisor, if the
     /// process-global resilience handles have been injected (W-D1/W-D2). Two `TinkoffStt` built from
     /// the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
-    pub fn resilience_breaker(
-        &self,
-    ) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
         self.resilience.as_ref().map(|r| &r.breaker)
     }
 }
 
 impl Drop for TinkoffStt {
     fn drop(&mut self) {
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
     }
 }
@@ -662,7 +675,7 @@ mod tests {
     // provider default by the flat path. RED until `new_standard` maps it.
     #[test]
     fn test_tinkoff_new_standard_unlocks_advanced_features() {
-        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "tinkoff".into(),
@@ -692,6 +705,50 @@ mod tests {
             ..Default::default()
         });
         assert!(TinkoffStt::new_standard(&std).is_err());
+    }
+
+    #[test]
+    fn test_new_standard_rejects_ssrf_endpoint_override() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mk = |endpoint: &str| {
+            StandardSTTConfig {
+                base: STTConfig {
+                    provider: "tinkoff".into(),
+                    api_key: "test-key|test-secret".into(),
+                    language: "ru-RU".into(),
+                    sample_rate: 16000,
+                    encoding: "linear16".into(),
+                    model: "default".into(),
+                    ..Default::default()
+                },
+                features: SttFeatures::default(),
+                extras: ProviderExtras::default(),
+                translation: None,
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(TinkoffStt::new_standard(&mk("https://tinkoff-proxy.example.com")).is_ok());
+        assert!(TinkoffStt::new_standard(&mk("http://127.0.0.1:9000")).is_err());
+        assert!(TinkoffStt::new_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(TinkoffStt::new_standard(&mk("grpc://tinkoff-proxy.example.com")).is_err());
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]
@@ -791,11 +848,17 @@ mod tests {
     #[test]
     fn test_streaming_features_reach_encoded_request_e2e() {
         use super::super::messages::StreamingRecognizeRequest;
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
 
         let mut extras = serde_json::Map::new();
-        extras.insert("interim_results_config.interval".into(), serde_json::json!(0.25));
-        extras.insert("enable_gender_identification".into(), serde_json::json!(true));
+        extras.insert(
+            "interim_results_config.interval".into(),
+            serde_json::json!(0.25),
+        );
+        extras.insert(
+            "enable_gender_identification".into(),
+            serde_json::json!(true),
+        );
         extras.insert("vad_config.silence_max".into(), serde_json::json!(1.5));
         extras.insert("vad_config.silence_min".into(), serde_json::json!(0.3));
 
@@ -826,17 +889,38 @@ mod tests {
         let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
 
         // profanity_filter (field 5) bytes 0x28 0x01 must be present inside the embedded config.
-        assert!(contains(&[0x28, 0x01]), "profanity_filter missing from encoded request");
+        assert!(
+            contains(&[0x28, 0x01]),
+            "profanity_filter missing from encoded request"
+        );
         // speech_contexts phrase text bytes must be present.
-        assert!(contains("Тинькофф".as_bytes()), "speech context phrase missing from encoded request");
+        assert!(
+            contains("Тинькофф".as_bytes()),
+            "speech context phrase missing from encoded request"
+        );
         // enable_denormalization (field 16) bytes 0x80 0x01 0x01.
-        assert!(contains(&[0x80, 0x01, 0x01]), "enable_denormalization missing from encoded request");
+        assert!(
+            contains(&[0x80, 0x01, 0x01]),
+            "enable_denormalization missing from encoded request"
+        );
         // enable_gender_identification (field 18) bytes 0x90 0x01 0x01.
-        assert!(contains(&[0x90, 0x01, 0x01]), "enable_gender_identification missing from encoded request");
+        assert!(
+            contains(&[0x90, 0x01, 0x01]),
+            "enable_gender_identification missing from encoded request"
+        );
         // VAD silence_max (1.5) and silence_min (0.3) float bytes.
-        assert!(contains(&1.5f32.to_le_bytes()), "vad silence_max missing from encoded request");
-        assert!(contains(&0.3f32.to_le_bytes()), "vad silence_min missing from encoded request");
+        assert!(
+            contains(&1.5f32.to_le_bytes()),
+            "vad silence_max missing from encoded request"
+        );
+        assert!(
+            contains(&0.3f32.to_le_bytes()),
+            "vad silence_min missing from encoded request"
+        );
         // interim_results_config.interval (0.25) float bytes.
-        assert!(contains(&0.25f32.to_le_bytes()), "interim interval missing from encoded request");
+        assert!(
+            contains(&0.25f32.to_le_bytes()),
+            "interim interval missing from encoded request"
+        );
     }
 }

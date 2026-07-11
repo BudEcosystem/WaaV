@@ -10,8 +10,10 @@ use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
+use crate::core::resilience::connect::{WS_CONNECT_TIMEOUT, with_timeout};
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTConnectionState, STTError, STTErrorCallback, STTResult,
     STTResultCallback, STTStats,
@@ -39,6 +41,13 @@ type WsReadStream = futures_util::stream::SplitStream<WsStream>;
 /// Per-message idle timeout for WebSocket message reception.
 /// Resets after each successful message. Catches stuck/dead connections.
 const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
+const GLADIA_SESSION_WS_SCHEMES: &[&str] = &["ws", "wss"];
+
+fn gladia_stt_http_client() -> Result<reqwest::Client, STTError> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .build()
+        .map_err(|e| STTError::ConfigurationError(format!("Failed to create HTTP client: {e}")))
+}
 
 // =============================================================================
 // Featured session-init helper (shared by connect closure + unit tests)
@@ -119,12 +128,22 @@ async fn init_session(
         .await
         .map_err(|e| STTError::ConnectionFailed(format!("Failed to parse response: {}", e)))?;
 
+    validate_session_websocket_url(&init_response.url)?;
+
     debug!(
         "Session initialized: id={}, ws_url={}",
         init_response.id, init_response.url
     );
 
     Ok(init_response)
+}
+
+fn validate_session_websocket_url(url: &str) -> Result<(), STTError> {
+    crate::core::net::validate_url_for_ssrf(url, GLADIA_SESSION_WS_SCHEMES).map_err(|msg| {
+        STTError::ConnectionFailed(format!(
+            "Gladia session WebSocket URL rejected (SSRF protection): {msg}"
+        ))
+    })
 }
 
 // =============================================================================
@@ -146,8 +165,8 @@ struct GladiaTransport {
     ws_stream: WsReadStream,
     /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
     audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
-    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
-    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    /// Shared shutdown token (an intentional close must not reconnect).
+    shutdown_token: CancellationToken,
     on_result: Arc<RwLock<Option<STTResultCallback>>>,
     on_error: Arc<RwLock<Option<STTErrorCallback>>>,
     stats: Arc<RwLock<STTStats>>,
@@ -159,6 +178,17 @@ struct GladiaTransport {
     /// BCP-47 string the caller requested (`"es-ES"`). Empty when no translation
     /// was configured; a missing key falls back to the raw provider code.
     translation_lang_map: std::collections::HashMap<String, String>,
+}
+
+impl GladiaTransport {
+    async fn shutdown_gracefully(ws_sink: &mut WsSink) -> ReconnectOutcome {
+        let stop_msg = StopRecordingMessage::new();
+        if let Ok(json) = stop_msg.to_json() {
+            let _ = ws_sink.send(Message::Text(json.into())).await;
+        }
+        let _ = ws_sink.close().await;
+        ReconnectOutcome::Completed
+    }
 }
 
 #[async_trait::async_trait]
@@ -174,8 +204,12 @@ impl WsTransport for GladiaTransport {
     }
 
     async fn run(&mut self) -> ReconnectOutcome {
+        let shutdown_token = self.shutdown_token.clone();
+        if shutdown_token.is_cancelled() {
+            info!("Gladia: Received shutdown signal");
+            return Self::shutdown_gracefully(&mut self.ws_sink).await;
+        }
         let mut audio_rx = self.audio_rx.lock().await;
-        let mut shutdown_rx = self.shutdown_rx.lock().await;
         loop {
             tokio::select! {
                 // Handle outgoing audio data (JSON with base64-encoded chunk, per Gladia docs).
@@ -306,14 +340,9 @@ impl WsTransport for GladiaTransport {
                 }
 
                 // Handle shutdown signal (intentional close — must NOT reconnect).
-                _ = &mut *shutdown_rx => {
+                _ = shutdown_token.cancelled() => {
                     info!("Gladia: Received shutdown signal");
-                    let stop_msg = StopRecordingMessage::new();
-                    if let Ok(json) = stop_msg.to_json() {
-                        let _ = self.ws_sink.send(Message::Text(json.into())).await;
-                    }
-                    let _ = self.ws_sink.close().await;
-                    return ReconnectOutcome::Completed;
+                    return Self::shutdown_gracefully(&mut self.ws_sink).await;
                 }
             }
         }
@@ -334,8 +363,8 @@ pub struct GladiaSTT {
     state: Arc<RwLock<STTConnectionState>>,
     /// Audio sender (bounded channel for backpressure); the supervised transport drains it.
     ws_sender: Option<mpsc::Sender<Bytes>>,
-    /// Shutdown signal sender.
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Shutdown token shared with supervised transports.
+    shutdown_token: Option<CancellationToken>,
     /// Connection task handle (the supervisor's outer reconnect loop).
     connection_handle: Option<tokio::task::JoinHandle<()>>,
     /// Session ID from the most recent initialization.
@@ -347,8 +376,8 @@ pub struct GladiaSTT {
     /// Ready flag
     is_ready: Arc<AtomicBool>,
     /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
-    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
-    /// server-side close can never trigger a spurious reconnect.
+    /// `connect()`, set in `disconnect()` before cancelling the shutdown token, so a client close
+    /// racing a server-side close can never trigger a spurious reconnect.
     intentional_disconnect: Arc<AtomicBool>,
     /// Statistics
     stats: Arc<RwLock<STTStats>>,
@@ -382,13 +411,14 @@ impl GladiaSTT {
     pub fn with_config(config: GladiaSTTConfig) -> Result<Self, STTError> {
         // Validate configuration
         config.validate()?;
+        let http_client = gladia_stt_http_client()?;
 
         Ok(Self {
             gladia_config: config,
             base_config: None,
             state: Arc::new(RwLock::new(STTConnectionState::Disconnected)),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             connection_handle: None,
             session_id: Arc::new(RwLock::new(None)),
             on_result: Arc::new(RwLock::new(None)),
@@ -397,7 +427,7 @@ impl GladiaSTT {
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(RwLock::new(STTStats::default())),
             bytes_sent: Arc::new(AtomicU64::new(0)),
-            http_client: reqwest::Client::new(),
+            http_client,
             resilience: None,
         })
     }
@@ -432,13 +462,14 @@ impl BaseSTT for GladiaSTT {
         }
 
         let gladia_config = GladiaSTTConfig::from_base(&config)?;
+        let http_client = gladia_stt_http_client()?;
 
         Ok(Self {
             gladia_config,
             base_config: Some(config),
             state: Arc::new(RwLock::new(STTConnectionState::Disconnected)),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             connection_handle: None,
             session_id: Arc::new(RwLock::new(None)),
             on_result: Arc::new(RwLock::new(None)),
@@ -447,7 +478,7 @@ impl BaseSTT for GladiaSTT {
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(RwLock::new(STTStats::default())),
             bytes_sent: Arc::new(AtomicU64::new(0)),
-            http_client: reqwest::Client::new(),
+            http_client,
             resilience: None,
         })
     }
@@ -469,15 +500,14 @@ impl BaseSTT for GladiaSTT {
 
         // Create channels for communication (bounded for backpressure on audio).
         let (ws_tx, ws_rx) = mpsc::channel::<Bytes>(32);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_token = CancellationToken::new();
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         self.ws_sender = Some(ws_tx);
-        self.shutdown_tx = Some(shutdown_tx);
+        self.shutdown_token = Some(shutdown_token.clone());
 
         // Shared state the supervised transport re-uses across reconnect attempts.
         let audio_rx = Arc::new(Mutex::new(ws_rx));
-        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
         let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
 
         let on_result = Arc::clone(&self.on_result);
@@ -515,7 +545,7 @@ impl BaseSTT for GladiaSTT {
                     let http_client = http_client.clone();
                     let gladia_config = gladia_config.clone();
                     let audio_rx = Arc::clone(&audio_rx);
-                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let shutdown_token = shutdown_token.clone();
                     let connected_tx = Arc::clone(&connected_tx);
                     let on_result = Arc::clone(&on_result);
                     let on_error = Arc::clone(&on_error);
@@ -531,9 +561,17 @@ impl BaseSTT for GladiaSTT {
 
                         debug!("Connecting to WebSocket: {}", init_response.url);
                         let (ws_stream, _) =
-                            connect_async(&init_response.url).await.map_err(|e| {
-                                StreamError::new(format!("WebSocket connection failed: {e}"))
-                            })?;
+                            with_timeout(WS_CONNECT_TIMEOUT, connect_async(&init_response.url))
+                                .await
+                                .map_err(|_| {
+                                    StreamError::new(format!(
+                                        "connect to Gladia timed out after {}s",
+                                        WS_CONNECT_TIMEOUT.as_secs()
+                                    ))
+                                })?
+                                .map_err(|e| {
+                                    StreamError::new(format!("WebSocket connection failed: {e}"))
+                                })?;
                         info!("Connected to Gladia STT (session: {})", init_response.id);
                         let (ws_sink, ws_stream) = ws_stream.split();
                         // P5: ISO-639-1 -> canonical BCP-47 map, from the index-aligned
@@ -556,7 +594,7 @@ impl BaseSTT for GladiaSTT {
                             ws_sink,
                             ws_stream,
                             audio_rx,
-                            shutdown_rx,
+                            shutdown_token,
                             on_result,
                             on_error,
                             stats,
@@ -605,12 +643,17 @@ impl BaseSTT for GladiaSTT {
 
         // Signal the supervised transport to send StopRecording + close intentionally (no
         // reconnect).
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
 
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "gladia-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         // Clear state
@@ -685,8 +728,9 @@ impl BaseSTT for GladiaSTT {
 
 impl Drop for GladiaSTT {
     fn drop(&mut self) {
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
         if let Some(handle) = self.connection_handle.take() {
             handle.abort();
@@ -718,6 +762,7 @@ pub fn create_gladia_stt(config: STTConfig) -> Result<Box<dyn BaseSTT>, STTError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
 
     fn create_test_gladia_config() -> GladiaSTTConfig {
         GladiaSTTConfig::new("test-api-key")
@@ -733,12 +778,76 @@ mod tests {
         }
     }
 
+    #[test]
+    fn session_websocket_url_is_ssrf_checked() {
+        let _env = crate::core::net::ssrf_env_lock();
+        assert!(validate_session_websocket_url("wss://gladia-proxy.invalid/v2/live").is_ok());
+
+        let err = validate_session_websocket_url("https://api.gladia.io/v2/live")
+            .expect_err("non-WebSocket session URL must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        let err = validate_session_websocket_url("ws://127.0.0.1:9000/v2/live")
+            .expect_err("loopback session URL must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn gladia_stt_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!("Skipping gladia_stt_redirect_policy_rejects_private_hop: {err}");
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = gladia_stt_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
+    }
+
     // W1 keystone: advanced features set on the standardized config must survive through
     // `new_standard` into the nested Gladia provider config (previously dropped by the flat
     // factory).
     #[test]
     fn new_standard_propagates_advanced_features() {
-        use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "gladia".into(),
@@ -753,7 +862,11 @@ mod tests {
             ..StandardSTTConfig::from_base(STTConfig::default())
         };
         let stt = GladiaSTT::new_standard(&std).expect("new_standard should succeed");
-        assert!(stt.gladia_config.realtime_processing.words_accurate_timestamps);
+        assert!(
+            stt.gladia_config
+                .realtime_processing
+                .words_accurate_timestamps
+        );
         assert_eq!(
             stt.gladia_config.realtime_processing.custom_vocabulary,
             vec!["WaaV", "Gladia"]
@@ -810,7 +923,10 @@ mod tests {
             "custom_spelling_dictionary": { "WaaV": ["wave", "wav"], "Gladia": ["gladiya"] }
         }));
         let rp = &body["realtime_processing"];
-        assert_eq!(rp["custom_spelling"], true, "custom_spelling flag missing: {body}");
+        assert_eq!(
+            rp["custom_spelling"], true,
+            "custom_spelling flag missing: {body}"
+        );
         assert_eq!(
             rp["custom_spelling_config"]["spelling_dictionary"]["WaaV"],
             serde_json::json!(["wave", "wav"]),
@@ -830,15 +946,25 @@ mod tests {
         }));
         let cvc = &body["realtime_processing"]["custom_vocabulary_config"];
         // f32 round-trips with widening, so compare numerics with a tolerance.
-        let default_intensity = cvc["default_intensity"].as_f64().expect("default_intensity");
+        let default_intensity = cvc["default_intensity"]
+            .as_f64()
+            .expect("default_intensity");
         assert!(
             (default_intensity - 0.5).abs() < 1e-6,
             "default_intensity missing on wire: {body}"
         );
         assert_eq!(cvc["vocabulary"][0]["value"], "WaaV");
-        let intensity = cvc["vocabulary"][0]["intensity"].as_f64().expect("intensity");
-        assert!((intensity - 0.8).abs() < 1e-6, "intensity missing on wire: {body}");
-        assert_eq!(cvc["vocabulary"][0]["pronunciations"], serde_json::json!(["wave"]));
+        let intensity = cvc["vocabulary"][0]["intensity"]
+            .as_f64()
+            .expect("intensity");
+        assert!(
+            (intensity - 0.8).abs() < 1e-6,
+            "intensity missing on wire: {body}"
+        );
+        assert_eq!(
+            cvc["vocabulary"][0]["pronunciations"],
+            serde_json::json!(["wave"])
+        );
         assert_eq!(cvc["vocabulary"][0]["language"], "en");
     }
 
@@ -870,7 +996,10 @@ mod tests {
             "summarization_config": { "type": "bullet_points" }
         }));
         let pp = &body["post_processing"];
-        assert_eq!(pp["summarization"], true, "summarization flag missing: {body}");
+        assert_eq!(
+            pp["summarization"], true,
+            "summarization flag missing: {body}"
+        );
         assert_eq!(
             pp["summarization_config"]["type"], "bullet_points",
             "summarization type missing on wire: {body}"
@@ -916,10 +1045,13 @@ mod tests {
         assert_eq!(mc["receive_lifecycle_events"], false);
         let rp = &body["realtime_processing"];
         assert_eq!(rp["custom_spelling"], false);
-        assert!(rp.get("custom_spelling_config").is_none() || rp["custom_spelling_config"].is_null());
+        assert!(
+            rp.get("custom_spelling_config").is_none() || rp["custom_spelling_config"].is_null()
+        );
         assert!(rp.get("translation_config").is_none() || rp["translation_config"].is_null());
         assert!(
-            rp.get("custom_vocabulary_config").is_none() || rp["custom_vocabulary_config"].is_null()
+            rp.get("custom_vocabulary_config").is_none()
+                || rp["custom_vocabulary_config"].is_null()
         );
     }
 

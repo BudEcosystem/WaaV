@@ -59,10 +59,11 @@ use super::error::GoogleError;
 /// }
 /// ```
 pub async fn create_grpc_channel(endpoint: &str) -> Result<tonic::transport::Channel, GoogleError> {
-    let mut builder = tonic::transport::Channel::from_shared(endpoint.to_string()).map_err(|e| {
-        error!(error = %e, endpoint = %endpoint, "Invalid endpoint URL");
-        GoogleError::ConfigurationError(format!("Invalid endpoint URL '{endpoint}': {e}"))
-    })?;
+    let mut builder =
+        tonic::transport::Channel::from_shared(endpoint.to_string()).map_err(|e| {
+            error!(error = %e, endpoint = %endpoint, "Invalid endpoint URL");
+            GoogleError::ConfigurationError(format!("Invalid endpoint URL '{endpoint}': {e}"))
+        })?;
 
     // TLS is required for production `https://` endpoints; skip it for plaintext `http://`
     // endpoints (a localhost tonic mock used by e2e tests). Production endpoints are always

@@ -50,7 +50,11 @@ pub trait RealtimeProtocol: Send + Sync + Sized + 'static {
     /// reconnect. `resumption` is `Some` after a reconnect for session/SDK
     /// providers (Gemini). MUST use `skip_serializing_if` on every optional field
     /// — these APIs kill the session on unknown/explicit-null keys.
-    fn build_session_config(&self, cfg: &RealtimeConfig, resumption: Option<&str>) -> Vec<Self::Wire>;
+    fn build_session_config(
+        &self,
+        cfg: &RealtimeConfig,
+        resumption: Option<&str>,
+    ) -> Vec<Self::Wire>;
 
     /// Lower one raw inbound payload to zero-or-more normalized events. Returns a
     /// `Vec` because some providers bundle multiple logical frames per wire

@@ -47,16 +47,23 @@
 //! the audio hot path and the smart-turn metric stays 0 — which this test asserts AGAINST,
 //! so a missing model fails the test loudly rather than passing as a silent downgrade.
 
-#![cfg(all(feature = "dag-routing", feature = "silero-vad", feature = "smart-turn"))]
+#![cfg(all(
+    feature = "dag-routing",
+    feature = "silero-vad",
+    feature = "smart-turn"
+))]
 
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use waav_gateway::{
@@ -76,6 +83,50 @@ use waav_gateway::{
     routes,
     state::AppState,
 };
+
+struct TestServer {
+    label: &'static str,
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        if self.panicked.load(Ordering::SeqCst) {
+            let msg = format!(
+                "dag_realtime_frontend_audio server '{}' panicked",
+                self.label
+            );
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+}
+
+fn spawn_test_server<F>(label: &'static str, future: F) -> TestServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let panicked = Arc::new(AtomicBool::new(false));
+    let panicked_in_task = Arc::clone(&panicked);
+    let handle = tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked_in_task.store(true, Ordering::SeqCst);
+            eprintln!("dag_realtime_frontend_audio server '{label}' panicked");
+        }
+    });
+    TestServer {
+        label,
+        handle,
+        panicked,
+    }
+}
 
 // Process-global connect counter on the mock realtime provider: reachable only through
 // `production` DAG-init inserting the `RealtimeSessionMap`, so a non-zero value proves the
@@ -103,7 +154,11 @@ struct MockStt {
 #[async_trait::async_trait]
 impl BaseSTT for MockStt {
     fn new(_config: STTConfig) -> Result<Self, STTError> {
-        Ok(Self { ready: false, callback: None, turn: AtomicUsize::new(0) })
+        Ok(Self {
+            ready: false,
+            callback: None,
+            turn: AtomicUsize::new(0),
+        })
     }
     async fn connect(&mut self) -> Result<(), STTError> {
         self.ready = true;
@@ -397,7 +452,7 @@ fn test_server_config() -> ServerConfig {
 }
 
 /// Boot the full gateway. Returns (ws_url, http_base) — the HTTP base serves `/metrics`.
-async fn boot_gateway() -> (String, String, Arc<AppState>) {
+async fn boot_gateway() -> (String, String, Arc<AppState>, TestServer) {
     let config = test_server_config();
     let app_state = AppState::new(config).await;
 
@@ -419,7 +474,7 @@ async fn boot_gateway() -> (String, String, Arc<AppState>) {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let server = spawn_test_server("gateway", async move {
         axum::serve(listener, app).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -427,6 +482,7 @@ async fn boot_gateway() -> (String, String, Arc<AppState>) {
         format!("ws://127.0.0.1:{}/ws", addr.port()),
         format!("http://127.0.0.1:{}", addr.port()),
         app_state,
+        server,
     )
 }
 
@@ -448,7 +504,9 @@ fn synth_noisy_speech(total_ms: usize) -> Vec<u8> {
     // Cheap deterministic LCG for reproducible broadband noise (no rand dep).
     let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut next_noise = || {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((rng >> 33) as f64 / (1u64 << 31) as f64) - 1.0 // ~[-1,1] white noise
     };
     let mut pcm = Vec::with_capacity(n * 2);
@@ -566,7 +624,7 @@ async fn real_audio_drives_frontend_into_realtime_dag_node() {
     RT_CONNECTS.store(0, Ordering::SeqCst);
     register_mocks();
 
-    let (ws_url, http_base, app_state) = boot_gateway().await;
+    let (ws_url, http_base, app_state, _server) = boot_gateway().await;
 
     // ── FRONT-END PROOF #1 (turn-detect): the text end-of-turn model loaded into
     //    CoreState. If this is None the build degraded to a timer fallback — assert it
@@ -658,7 +716,10 @@ async fn real_audio_drives_frontend_into_realtime_dag_node() {
             _ => break,
         }
     }
-    assert!(ready, "gateway never sent `ready` for the frontend→realtime DAG session");
+    assert!(
+        ready,
+        "gateway never sent `ready` for the frontend→realtime DAG session"
+    );
 
     // ── Drive TWO turns of REAL (denoised) speech-like audio. Each turn streams the 1.6 s
     //    of frames through the front-end; the per-frame mock STT finalizes, the StreamDriver
@@ -682,7 +743,10 @@ async fn real_audio_drives_frontend_into_realtime_dag_node() {
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_secs(5), read.next()).await {
                 Ok(Some(Ok(Message::Binary(bytes)))) => {
-                    if bytes.windows(RT_AUDIO_MARKER.len()).any(|w| w == RT_AUDIO_MARKER) {
+                    if bytes
+                        .windows(RT_AUDIO_MARKER.len())
+                        .any(|w| w == RT_AUDIO_MARKER)
+                    {
                         got = true;
                         audio_marker_egresses += 1;
                         break;

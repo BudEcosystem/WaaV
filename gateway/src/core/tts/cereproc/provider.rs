@@ -4,16 +4,20 @@
 //! using HTTP requests for audio synthesis with file URL download.
 
 use async_trait::async_trait;
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use super::config::CereprocTtsConfig;
-use super::messages::{AuthResponse, CereprocApiError};
+use super::messages::{AuthResponse, CereprocApiError, SpeakResponse};
 use crate::core::tts::base::{BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult};
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
+
+fn cereproc_tts_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES).build()
+}
 
 // =============================================================================
 // Token Cache
@@ -86,20 +90,6 @@ impl CereprocRequestBuilder {
 
 impl TTSRequestBuilder for CereprocRequestBuilder {
     fn build_http_request(&self, client: &reqwest::Client, text: &str) -> reqwest::RequestBuilder {
-        // Build headers
-        let mut headers = HeaderMap::new();
-
-        // Authorization header with Bearer token
-        if let Ok(auth) = HeaderValue::from_str(&format!("Bearer {}", self.token)) {
-            headers.insert(AUTHORIZATION, auth);
-        }
-
-        // Content-Type for XML/SSML body
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/xml"));
-
-        // Accept JSON response
-        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-
         // Build query parameters
         let query_params: Vec<(String, String)> = self
             .cereproc_config
@@ -124,7 +114,9 @@ impl TTSRequestBuilder for CereprocRequestBuilder {
                 super::CEREVOICE_SPEAK_URL,
                 self.cereproc_config.endpoint_override.as_deref(),
             ))
-            .headers(headers)
+            .header(AUTHORIZATION, format!("Bearer {}", self.token))
+            .header(CONTENT_TYPE, "text/xml")
+            .header(ACCEPT, "application/json")
             .query(&query_params)
             .body(body)
     }
@@ -135,6 +127,35 @@ impl TTSRequestBuilder for CereprocRequestBuilder {
 
     fn get_pronunciation_replacer(&self) -> Option<&PronunciationReplacer> {
         self.pronunciation_replacer.as_ref()
+    }
+
+    fn expects_provider_audio_url_response(&self) -> bool {
+        true
+    }
+
+    fn provider_audio_url_label(&self) -> &'static str {
+        "CereProc TTS"
+    }
+
+    fn parse_provider_audio_url_response(&self, body: &[u8]) -> TTSResult<Option<String>> {
+        let response: SpeakResponse = serde_json::from_slice(body).map_err(|e| {
+            TTSError::ProviderError(format!("Failed to parse CereProc TTS response: {e}"))
+        })?;
+
+        if !response.is_success() {
+            return Err(TTSError::ProviderError(format!(
+                "CereProc synthesis failed: {}",
+                response.status_message()
+            )));
+        }
+
+        if response.file_url.trim().is_empty() {
+            return Err(TTSError::ProviderError(
+                "CereProc synthesis succeeded without fileUrl".to_string(),
+            ));
+        }
+
+        Ok(Some(response.file_url))
     }
 }
 
@@ -163,6 +184,8 @@ impl CereprocTts {
     /// Create a new CereProc TTS provider from TTSConfig
     pub fn create(config: TTSConfig) -> TTSResult<Self> {
         let cereproc_config = CereprocTtsConfig::from_base(&config)?;
+        let auth_client = cereproc_tts_http_client()
+            .map_err(|e| TTSError::NetworkError(format!("Failed to build HTTP client: {e}")))?;
 
         info!(
             "Creating CereProc TTS provider: voice={}, format={}, sample_rate={}",
@@ -170,11 +193,11 @@ impl CereprocTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             cereproc_config,
             base_config: config,
             token_cache: Arc::new(RwLock::new(None)),
-            auth_client: reqwest::Client::new(),
+            auth_client,
         })
     }
 
@@ -186,10 +209,10 @@ impl CereprocTts {
     /// are skipped (capability gaps).
     ///
     /// [`DeepgramTTS::from_standard`]: crate::core::tts::deepgram::DeepgramTTS::from_standard
-    pub fn from_standard(
-        std: &crate::core::tts::standard::StandardTTSConfig,
-    ) -> TTSResult<Self> {
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
         let cereproc_config = CereprocTtsConfig::from_standard(std)?;
+        let auth_client = cereproc_tts_http_client()
+            .map_err(|e| TTSError::NetworkError(format!("Failed to build HTTP client: {e}")))?;
 
         info!(
             "Creating CereProc TTS provider (standardized): voice={}, format={}, sample_rate={}",
@@ -197,11 +220,11 @@ impl CereprocTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             cereproc_config,
             base_config: std.base.clone(),
             token_cache: Arc::new(RwLock::new(None)),
-            auth_client: reqwest::Client::new(),
+            auth_client,
         })
     }
 
@@ -451,6 +474,7 @@ impl BaseTTS for CereprocTts {
 mod tests {
     use super::*;
     use crate::core::tts::cereproc::CereprocAudioFormat;
+    use std::io::ErrorKind;
 
     // The provider STRUCT's `from_standard` (the dispatch entry point) carries CereProc's
     // expressible advanced features — emotion (via its custom <emotion> SSML tags) and the output
@@ -513,13 +537,22 @@ mod tests {
             "tok".into(),
         );
         let client = reqwest::Client::new();
-        let request = builder.build_http_request(&client, "Bonjour").build().unwrap();
+        let request = builder
+            .build_http_request(&client, "Bonjour")
+            .build()
+            .unwrap();
 
         let query = request.url().query().unwrap_or("");
         // The voice is the only language/accent carrier; no lang/accent/streaming query params.
         assert!(query.contains("voice=Stuart"), "voice missing: {query}");
-        assert!(!query.contains("lang"), "language leaked to /speak query: {query}");
-        assert!(!query.contains("accent"), "accent leaked to /speak query: {query}");
+        assert!(
+            !query.contains("lang"),
+            "language leaked to /speak query: {query}"
+        );
+        assert!(
+            !query.contains("accent"),
+            "accent leaked to /speak query: {query}"
+        );
         assert!(
             !query.contains("stream"),
             "streaming leaked to /speak query: {query}"
@@ -527,8 +560,64 @@ mod tests {
 
         let body = request.body().unwrap().as_bytes().unwrap();
         let body_str = std::str::from_utf8(body).unwrap();
-        assert!(!body_str.contains("lang"), "language leaked to body: {body_str}");
-        assert!(!body_str.contains("accent"), "accent leaked to body: {body_str}");
+        assert!(
+            !body_str.contains("lang"),
+            "language leaked to body: {body_str}"
+        );
+        assert!(
+            !body_str.contains("accent"),
+            "accent leaked to body: {body_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cereproc_tts_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!("Skipping cereproc_tts_redirect_policy_rejects_private_hop: {err}");
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = cereproc_tts_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
     }
 
     #[test]
@@ -629,6 +718,71 @@ mod tests {
 
         // Verify get_config works
         assert_eq!(builder.get_config().api_key, config.api_key);
+    }
+
+    #[test]
+    fn invalid_cereproc_token_header_value_is_request_build_error() {
+        let config = TTSConfig {
+            api_key: "user@example.com:password".to_string(),
+            voice_id: Some("Stuart".to_string()),
+            ..Default::default()
+        };
+
+        let cereproc_config = CereprocTtsConfig::from_base(&config).unwrap();
+        let builder = CereprocRequestBuilder::new(cereproc_config, config, "bad\ntoken".into());
+        let err = builder
+            .build_http_request(&reqwest::Client::new(), "hello")
+            .build()
+            .expect_err("malformed CereProc bearer token must not omit Authorization");
+
+        assert!(err.is_builder(), "unexpected reqwest error: {err}");
+    }
+
+    #[test]
+    fn request_builder_extracts_file_url_response() {
+        let config = TTSConfig {
+            api_key: "user@example.com:password".to_string(),
+            voice_id: Some("Stuart".to_string()),
+            ..Default::default()
+        };
+
+        let cereproc_config = CereprocTtsConfig::from_base(&config).unwrap();
+        let builder = CereprocRequestBuilder::new(cereproc_config, config, "test-token".into());
+        let body = br#"{
+            "fileUrl": "https://audio.example.com/cereproc.wav",
+            "charCount": "11",
+            "resultCode": "1",
+            "resultDescription": "Success"
+        }"#;
+
+        assert!(builder.expects_provider_audio_url_response());
+        assert_eq!(
+            builder.parse_provider_audio_url_response(body).unwrap(),
+            Some("https://audio.example.com/cereproc.wav".to_string())
+        );
+    }
+
+    #[test]
+    fn request_builder_rejects_success_response_without_file_url() {
+        let config = TTSConfig {
+            api_key: "user@example.com:password".to_string(),
+            voice_id: Some("Stuart".to_string()),
+            ..Default::default()
+        };
+
+        let cereproc_config = CereprocTtsConfig::from_base(&config).unwrap();
+        let builder = CereprocRequestBuilder::new(cereproc_config, config, "test-token".into());
+        let body = br#"{
+            "fileUrl": "   ",
+            "charCount": "11",
+            "resultCode": "1",
+            "resultDescription": "Success"
+        }"#;
+
+        let err = builder
+            .parse_provider_audio_url_response(body)
+            .expect_err("success response without fileUrl must not be treated as audio");
+        assert!(err.to_string().contains("without fileUrl"), "{err}");
     }
 
     #[test]

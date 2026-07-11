@@ -9,6 +9,15 @@
 use super::super::base::{STTConfig, STTError};
 use url::form_urlencoded;
 
+fn validate_cartesia_ws_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, &["ws", "wss"])
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Audio Encoding
 // =============================================================================
@@ -161,10 +170,15 @@ impl CartesiaSTTConfig {
     ///
     /// `Ok(())` if configuration is valid, otherwise `Err(STTError::ConfigurationError)`.
     pub fn validate(&self) -> Result<(), STTError> {
-        // Check API key
-        if self.base.api_key.is_empty() {
+        let has_access_token = self
+            .access_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty());
+
+        // Check authentication
+        if self.base.api_key.is_empty() && !has_access_token {
             return Err(STTError::ConfigurationError(
-                "Cartesia API key is required".to_string(),
+                "Cartesia API key or access_token is required".to_string(),
             ));
         }
 
@@ -201,6 +215,11 @@ impl CartesiaSTTConfig {
             )));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_cartesia_ws_endpoint("endpoint_override", endpoint)
+                .map_err(STTError::ConfigurationError)?;
+        }
+
         Ok(())
     }
 
@@ -235,7 +254,12 @@ impl CartesiaSTTConfig {
 
         // Base URL: honor an `endpoint_override` (scheme://host[:port]) for the in-repo mock/proxy
         // (the chaos test points this at a local ws:// server); otherwise the production endpoint.
-        match self.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
+        match self
+            .endpoint_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+        {
             Some(o) => {
                 url.push_str(o.trim_end_matches('/'));
                 url.push_str("/stt/websocket");
@@ -246,7 +270,12 @@ impl CartesiaSTTConfig {
         // Authentication: a short-lived `access_token` (extras) takes precedence over the
         // long-lived `api_key` — the recommended pattern for untrusted clients. Exactly one
         // auth param is emitted so the two are never sent together.
-        if let Some(token) = self.access_token.as_deref().filter(|t| !t.is_empty()) {
+        if let Some(token) = self
+            .access_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
             url.push_str("?access_token=");
             url.push_str(&encode(token));
         } else {
@@ -358,7 +387,7 @@ mod tests {
     // (api_key) carries through unchanged.
     #[test]
     fn from_standard_maps_endpointing() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "cartesia".into(),
@@ -381,7 +410,7 @@ mod tests {
     // `model=` query param, not just sit on the config struct.
     #[test]
     fn model_selection_reaches_ws_url() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "cartesia".into(),
@@ -404,7 +433,7 @@ mod tests {
     // query param.
     #[test]
     fn encoding_selection_reaches_ws_url() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "cartesia".into(),
@@ -420,7 +449,10 @@ mod tests {
         let cfg = CartesiaSTTConfig::from_standard(&std);
         assert_eq!(cfg.encoding, CartesiaAudioEncoding::PcmMulaw);
         let url = cfg.build_websocket_url("k");
-        assert!(url.contains("&encoding=pcm_mulaw"), "encoding not on wire: {url}");
+        assert!(
+            url.contains("&encoding=pcm_mulaw"),
+            "encoding not on wire: {url}"
+        );
     }
 
     // The shared default encoding ("linear16") must map back to Cartesia's default so default
@@ -436,14 +468,17 @@ mod tests {
         let cfg = CartesiaSTTConfig::from_standard(&std);
         assert_eq!(cfg.encoding, CartesiaAudioEncoding::PcmS16le);
         let url = cfg.build_websocket_url("k");
-        assert!(url.contains("&encoding=pcm_s16le"), "default encoding wrong: {url}");
+        assert!(
+            url.contains("&encoding=pcm_s16le"),
+            "default encoding wrong: {url}"
+        );
     }
 
     // WIRE-LEVEL: a short-lived `access_token` (extras) must reach the connect URL's
     // `access_token=` query param AND replace `api_key=` (exactly one auth param).
     #[test]
     fn access_token_extra_reaches_ws_url_and_replaces_api_key() {
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let mut extras = serde_json::Map::new();
         extras.insert("access_token".into(), serde_json::json!("ephemeral-xyz"));
         let std = StandardSTTConfig {
@@ -469,5 +504,90 @@ mod tests {
             !url.contains("api_key="),
             "api_key must be replaced by access_token: {url}"
         );
+    }
+
+    #[test]
+    fn access_token_satisfies_validation_without_api_key() {
+        let config = CartesiaSTTConfig {
+            base: STTConfig {
+                api_key: String::new(),
+                language: "en".into(),
+                sample_rate: 16000,
+                ..Default::default()
+            },
+            access_token: Some("ephemeral-xyz".into()),
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_ok());
+        let url = config.build_websocket_url(&config.base.api_key);
+        assert!(url.contains("access_token=ephemeral-xyz"), "{url}");
+        assert!(!url.contains("api_key="), "{url}");
+    }
+
+    #[test]
+    fn endpoint_override_validation_rejects_ssrf_targets() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = CartesiaSTTConfig {
+            base: STTConfig {
+                api_key: "test-key".into(),
+                language: "en".into(),
+                sample_rate: 16000,
+                ..Default::default()
+            },
+            endpoint_override: Some("wss://cartesia-proxy.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-WebSocket endpoint_override must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("https://cartesia-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("HTTP endpoint_override must be rejected for WebSocket dial");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
+    }
+
+    #[test]
+    fn websocket_url_trims_endpoint_override() {
+        let config = CartesiaSTTConfig {
+            base: STTConfig {
+                api_key: "test-key".into(),
+                language: "en".into(),
+                sample_rate: 16000,
+                ..Default::default()
+            },
+            endpoint_override: Some(" wss://cartesia-proxy.example.com/ ".to_string()),
+            ..Default::default()
+        };
+
+        let url = config.build_websocket_url(&config.base.api_key);
+        assert!(url.starts_with("wss://cartesia-proxy.example.com/stt/websocket?"));
     }
 }

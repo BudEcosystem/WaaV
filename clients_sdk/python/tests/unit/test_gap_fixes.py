@@ -809,20 +809,98 @@ class TestRestClientNewEndpoints:
 
     @pytest.mark.asyncio
     async def test_sip_transfer(self, client):
-        """Should transfer a SIP call."""
-        client.post = AsyncMock(return_value={"status": "transferred"})
+        """Should transfer a SIP call with the gateway SIPTransferRequest shape.
+
+        The gateway struct (handlers/sip/transfer.rs) requires exactly
+        {room_name, participant_identity, transfer_to} — the old stream_id
+        payload was never a gateway field and 422'd on every call.
+        """
+        client.post = AsyncMock(return_value={
+            "status": "completed",
+            "room_name": "proj_call-room-123",
+            "participant_identity": "sip_participant_456",
+            "transfer_to": "tel:+1234567890",
+        })
 
         result = await client.sip_transfer(
-            stream_id="stream-123",
+            room_name="call-room-123",
+            participant_identity="sip_participant_456",
             transfer_to="+1234567890",
         )
 
-        assert result["status"] == "transferred"
+        assert result["status"] == "completed"
         client.post.assert_called_once()
         call_args = client.post.call_args
         assert call_args[0][0] == "/sip/transfer"
-        assert call_args[1]["json"]["stream_id"] == "stream-123"
-        assert call_args[1]["json"]["transfer_to"] == "+1234567890"
+        assert call_args[1]["json"] == {
+            "room_name": "call-room-123",
+            "participant_identity": "sip_participant_456",
+            "transfer_to": "+1234567890",
+        }
+
+    @pytest.mark.asyncio
+    async def test_fetch_language_capabilities(self, client):
+        """Should fetch the live language matrix from GET /capabilities/languages."""
+        payload = {
+            "canonical_languages": [
+                {"bcp47": "en-US", "lang_subtag": "en", "iso639_1": "en", "region": "US"},
+                {"bcp47": "cmn-CN", "lang_subtag": "cmn", "iso639_1": "zh", "region": "CN"},
+            ],
+            "providers": [
+                {
+                    "provider": "deepgram",
+                    "notation": "bcp47",
+                    "supports_auto": True,
+                    "example_cmn_cn": "zh-CN",
+                    "example_en_us": "en-US",
+                },
+                {
+                    "provider": "elevenlabs",
+                    "notation": "iso6391",
+                    "supports_auto": True,
+                    "example_cmn_cn": "zh",
+                    "example_en_us": "en",
+                },
+            ],
+            "canonical_count": 2,
+        }
+        client.get = AsyncMock(return_value=payload)
+
+        result = await client.fetch_language_capabilities()
+
+        # The gateway handler takes NO query params — a bare GET.
+        client.get.assert_called_once_with("/capabilities/languages")
+        assert result == payload
+
+    @pytest.mark.asyncio
+    async def test_fetch_language_capabilities_provider_filter(self, client):
+        """Provider filter is applied CLIENT-side (endpoint has no query params)."""
+        payload = {
+            "canonical_languages": [
+                {"bcp47": "en-US", "lang_subtag": "en", "iso639_1": "en", "region": "US"},
+            ],
+            "providers": [
+                {"provider": "deepgram", "notation": "bcp47", "supports_auto": True,
+                 "example_cmn_cn": "zh-CN", "example_en_us": "en-US"},
+                {"provider": "elevenlabs", "notation": "iso6391", "supports_auto": True,
+                 "example_cmn_cn": "zh", "example_en_us": "en"},
+            ],
+            "canonical_count": 1,
+        }
+        client.get = AsyncMock(return_value=payload)
+
+        result = await client.fetch_language_capabilities(provider="elevenlabs")
+
+        client.get.assert_called_once_with("/capabilities/languages")
+        assert [row["provider"] for row in result["providers"]] == ["elevenlabs"]
+        # Canonical value space always returned in full.
+        assert len(result["canonical_languages"]) == 1
+        assert result["canonical_count"] == 1
+
+        # Unknown provider yields an empty providers list, not an error.
+        client.get = AsyncMock(return_value=payload)
+        result = await client.fetch_language_capabilities(provider="nope")
+        assert result["providers"] == []
 
     @pytest.mark.asyncio
     async def test_get_metrics(self, client):

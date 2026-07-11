@@ -41,6 +41,17 @@ use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+fn validate_hume_tts_endpoint(source: &str, endpoint: &str) -> Result<(), TTSError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}")),
+    )
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -268,7 +279,6 @@ impl HumeVoice {
     }
 }
 
-
 // =============================================================================
 // Main Configuration
 // =============================================================================
@@ -362,6 +372,13 @@ pub struct HumeTTSConfig {
 }
 
 impl HumeTTSConfig {
+    pub(crate) fn validate_endpoint_override(&self) -> Result<(), TTSError> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_hume_tts_endpoint("endpoint_override", endpoint)?;
+        }
+        Ok(())
+    }
+
     /// Creates a HumeTTSConfig from a base TTSConfig with default Hume settings.
     pub fn from_base(base: TTSConfig) -> Self {
         let sample_rate = base.sample_rate.unwrap_or(24000);
@@ -442,12 +459,7 @@ impl HumeTTSConfig {
         if let Some(id) = std.extras.0.get("generation_id").and_then(|v| v.as_str()) {
             cfg.generation_id = Some(id.to_string());
         }
-        if let Some(num) = std
-            .extras
-            .0
-            .get("num_generations")
-            .and_then(|v| v.as_u64())
-        {
+        if let Some(num) = std.extras.0.get("num_generations").and_then(|v| v.as_u64()) {
             cfg.num_generations = Some(num as u8);
         }
         // `voice_provider` -> per-utterance `voice.provider` (e.g. HUME_AI / CUSTOM_VOICE).
@@ -459,7 +471,12 @@ impl HumeTTSConfig {
             cfg.temperature = Some(t as f32);
         }
         // `split_utterances` -> top-level `split_utterances`.
-        if let Some(s) = std.extras.0.get("split_utterances").and_then(|v| v.as_bool()) {
+        if let Some(s) = std
+            .extras
+            .0
+            .get("split_utterances")
+            .and_then(|v| v.as_bool())
+        {
             cfg.split_utterances = Some(s);
         }
         // `strip_headers` -> top-level `strip_headers`.
@@ -483,13 +500,14 @@ impl HumeTTSConfig {
 
         // Validate description length
         if let Some(desc) = &self.description
-            && desc.len() > MAX_DESCRIPTION_LENGTH {
-                return Err(TTSError::InvalidConfiguration(format!(
-                    "Acting instructions (description) must be {} characters or less, got {}",
-                    MAX_DESCRIPTION_LENGTH,
-                    desc.len()
-                )));
-            }
+            && desc.len() > MAX_DESCRIPTION_LENGTH
+        {
+            return Err(TTSError::InvalidConfiguration(format!(
+                "Acting instructions (description) must be {} characters or less, got {}",
+                MAX_DESCRIPTION_LENGTH,
+                desc.len()
+            )));
+        }
 
         // Validate speed range
         if let Some(speed) = self.speed {
@@ -516,15 +534,17 @@ impl HumeTTSConfig {
 
         // Validate num_generations
         if let Some(num) = self.num_generations
-            && !(1..=3).contains(&num) {
-                return Err(TTSError::InvalidConfiguration(format!(
-                    "num_generations must be between 1 and 3, got {}",
-                    num
-                )));
-            }
+            && !(1..=3).contains(&num)
+        {
+            return Err(TTSError::InvalidConfiguration(format!(
+                "num_generations must be between 1 and 3, got {}",
+                num
+            )));
+        }
 
         // Validate output format
         self.output_format.validate()?;
+        self.validate_endpoint_override()?;
 
         Ok(())
     }
@@ -638,11 +658,56 @@ mod tests {
             extras: ProviderExtras(extras),
         };
         let cfg = HumeTTSConfig::from_standard(&std);
-        assert_eq!(cfg.description, Some("warm, friendly, inviting".to_string()));
+        assert_eq!(
+            cfg.description,
+            Some("warm, friendly, inviting".to_string())
+        );
         assert_eq!(cfg.speed, Some(1.25));
         assert_eq!(cfg.output_format.sample_rate, 48000);
         assert_eq!(cfg.generation_id, Some("gen-123".to_string())); // extras passthrough
         assert_eq!(cfg.num_generations, Some(2));
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = HumeTTSConfig::from_base(TTSConfig {
+            provider: "hume".into(),
+            api_key: "k".into(),
+            voice_id: Some("Kora".to_string()),
+            ..Default::default()
+        });
+
+        config.endpoint_override = Some("https://hume-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://hume-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected for REST Hume");
+        assert!(err.to_string().contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "hume".into(),
+            api_key: "k".into(),
+            voice_id: Some("Kora".to_string()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        let cfg = HumeTTSConfig::from_standard(&std);
+        assert!(cfg.validate_endpoint_override().is_err());
     }
 
     // Clamp parity: from_standard's instructions -> description mapping must truncate to
@@ -664,7 +729,9 @@ mod tests {
             extras: Default::default(),
         };
         let cfg = HumeTTSConfig::from_standard(&std);
-        let desc = cfg.description.expect("instructions must map to description");
+        let desc = cfg
+            .description
+            .expect("instructions must map to description");
         assert_eq!(desc.len(), MAX_DESCRIPTION_LENGTH); // 150 chars -> clamped to 100
         assert_eq!(desc, "a".repeat(MAX_DESCRIPTION_LENGTH));
     }

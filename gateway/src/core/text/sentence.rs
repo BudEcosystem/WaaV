@@ -81,7 +81,10 @@ pub struct SentenceConfig {
 
 impl Default for SentenceConfig {
     fn default() -> Self {
-        Self { max_hold_chars: 160, disambiguate_latin: true }
+        Self {
+            max_hold_chars: 160,
+            disambiguate_latin: true,
+        }
     }
 }
 
@@ -110,7 +113,12 @@ impl Default for SentenceAggregator {
 
 impl SentenceAggregator {
     pub fn new(cfg: SentenceConfig) -> Self {
-        Self { buf: String::with_capacity(256), pending: None, char_count: 0, cfg }
+        Self {
+            buf: String::with_capacity(256),
+            pending: None,
+            char_count: 0,
+            cfg,
+        }
     }
 
     /// Feed a token delta; returns 0+ completed sentences (space-trimmed).
@@ -187,7 +195,11 @@ impl SentenceAggregator {
         }
         let t = s.trim_matches(' ');
         // Avoid the copy when there was nothing to trim (the common case).
-        if t.len() == s.len() { Some(s) } else { Some(t.to_string()) }
+        if t.len() == s.len() {
+            Some(s)
+        } else {
+            Some(t.to_string())
+        }
     }
 
     /// Discard buffered text (barge-in / interruption).
@@ -232,7 +244,9 @@ impl SentenceAggregator {
             // mark. A whitespace-free buffer (one giant token) hard-cuts —
             // unavoidable.
             let end = match self.buf.rfind(|c: char| c.is_whitespace()) {
-                Some(idx) if idx > 0 => idx + self.buf[idx..].chars().next().map_or(1, char::len_utf8),
+                Some(idx) if idx > 0 => {
+                    idx + self.buf[idx..].chars().next().map_or(1, char::len_utf8)
+                }
                 _ => self.buf.len(),
             };
             self.emit_to(end, out);
@@ -291,7 +305,9 @@ impl SentenceAggregator {
             // "No."/"Fig." are real sentence enders unless followed by a
             // number ("No. 5", "Fig. 3").
             let next_non_ws = self.buf[term_end..].chars().find(|c| !c.is_whitespace());
-            if NUMERIC_ABBREVIATIONS.iter().any(|a| a.eq_ignore_ascii_case(lw))
+            if NUMERIC_ABBREVIATIONS
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(lw))
                 && matches!(next_non_ws, Some(d) if d.is_numeric())
             {
                 return false;
@@ -385,7 +401,10 @@ mod tests {
 
     #[test]
     fn abbreviation_char_streamed() {
-        assert_eq!(feed_chars("Call Mr. Smith now. Bye"), vec!["Call Mr. Smith now."]);
+        assert_eq!(
+            feed_chars("Call Mr. Smith now. Bye"),
+            vec!["Call Mr. Smith now."]
+        );
     }
 
     // --- multilingual unambiguous set: immediate flush, no lookahead ---
@@ -407,7 +426,10 @@ mod tests {
 
     #[test]
     fn newline_immediate() {
-        assert_eq!(feed("Line one\nLine two\n"), vec!["Line one\n", "Line two\n"]);
+        assert_eq!(
+            feed("Line one\nLine two\n"),
+            vec!["Line one\n", "Line two\n"]
+        );
     }
 
     // --- ambiguous Latin terminators with lookahead ---
@@ -434,7 +456,10 @@ mod tests {
     #[test]
     fn semicolon_is_not_a_boundary() {
         // v2 decision: `;` would fragment ordinary clauses — not a terminator.
-        assert_eq!(feed("first part; second part. End"), vec!["first part; second part."]);
+        assert_eq!(
+            feed("first part; second part. End"),
+            vec!["first part; second part."]
+        );
     }
 
     #[test]
@@ -545,14 +570,13 @@ mod tests {
             state = state.wrapping_mul(0x2545F4914F6CDD1D);
             state
         };
-        let alphabet: Vec<char> = "abc XY12.!?…।。\n,;$ नম你…"
-            .chars()
-            .collect();
+        let alphabet: Vec<char> = "abc XY12.!?…।。\n,;$ नম你…".chars().collect();
         for _case in 0..200 {
             // Build a random input and split it into random-sized deltas.
             let len = (rng() % 120) as usize + 1;
-            let input: String =
-                (0..len).map(|_| alphabet[(rng() % alphabet.len() as u64) as usize]).collect();
+            let input: String = (0..len)
+                .map(|_| alphabet[(rng() % alphabet.len() as u64) as usize])
+                .collect();
             let mut agg = SentenceAggregator::default();
             let mut got = String::new();
             let mut idx = 0;
@@ -586,7 +610,10 @@ mod tests {
             feed("Visit docs.python.org. Anything else? Ok"),
             vec!["Visit docs.python.org.", "Anything else?"]
         );
-        assert_eq!(feed_chars("Open main.rs now. Done"), vec!["Open main.rs now."]);
+        assert_eq!(
+            feed_chars("Open main.rs now. Done"),
+            vec!["Open main.rs now."]
+        );
         assert_eq!(feed("Use Node.js here. Ok"), vec!["Use Node.js here."]);
     }
 
@@ -599,7 +626,10 @@ mod tests {
     fn no_as_sentence_end_splits() {
         // "No." is one of the most common voice replies — it must NOT be
         // swallowed by the abbreviation list.
-        assert_eq!(feed("No. The store closes at nine. End"), vec!["No.", "The store closes at nine."]);
+        assert_eq!(
+            feed("No. The store closes at nine. End"),
+            vec!["No.", "The store closes at nine."]
+        );
     }
 
     #[test]
@@ -611,7 +641,10 @@ mod tests {
     #[test]
     fn strict_decimal_adjacency_splits_spaced_digits() {
         // digit-dot-SPACE-digit is two sentences, not a decimal.
-        assert_eq!(feed("It costs 42. 7 are left. End"), vec!["It costs 42.", "7 are left."]);
+        assert_eq!(
+            feed("It costs 42. 7 are left. End"),
+            vec!["It costs 42.", "7 are left."]
+        );
     }
 
     #[test]
@@ -629,7 +662,10 @@ mod tests {
             vec!["1. First item\n", "2. Second item\n"]
         );
         // Mid-sentence numbers still end sentences normally.
-        assert_eq!(feed("The total is 42. Next topic"), vec!["The total is 42."]);
+        assert_eq!(
+            feed("The total is 42. Next topic"),
+            vec!["The total is 42."]
+        );
     }
 
     #[test]
@@ -638,7 +674,10 @@ mod tests {
             feed("He said \"Stop.\" Then left. Bye"),
             vec!["He said \"Stop.\"", "Then left."]
         );
-        assert_eq!(feed("It works (mostly.) Right? Ok"), vec!["It works (mostly.)", "Right?"]);
+        assert_eq!(
+            feed("It works (mostly.) Right? Ok"),
+            vec!["It works (mostly.)", "Right?"]
+        );
     }
 
     #[test]
@@ -658,7 +697,11 @@ mod tests {
         let mut agg = SentenceAggregator::default();
         let out = agg.push_str(&input);
         assert_eq!(out, vec!["x".repeat(156)]);
-        assert_eq!(agg.flush().as_deref(), Some("3.14159"), "number survives the cap intact");
+        assert_eq!(
+            agg.flush().as_deref(),
+            Some("3.14159"),
+            "number survives the cap intact"
+        );
     }
 
     // --- legacy mode (disambiguate_latin = false) ---
@@ -678,7 +721,14 @@ mod tests {
     fn plan_integration_stream() {
         let mut agg = SentenceAggregator::default();
         let mut out = Vec::new();
-        for tok in ["Pi is 3", ".", "14. Mr", ". Tau is bigger", ". ", "नमस्ते। Done"] {
+        for tok in [
+            "Pi is 3",
+            ".",
+            "14. Mr",
+            ". Tau is bigger",
+            ". ",
+            "नमस्ते। Done",
+        ] {
             out.extend(agg.push_str(tok));
         }
         out.extend(agg.flush());

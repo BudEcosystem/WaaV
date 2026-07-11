@@ -656,7 +656,7 @@ mod tests {
     fn vad_and_interim_features_reach_serialized_start_frame() {
         use crate::core::stt::base::STTConfig;
         use crate::core::stt::huawei_cloud::config::HuaweiCloudSttConfig;
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
 
         let mut extras = serde_json::Map::new();
         extras.insert("vad_head".into(), serde_json::json!(1500)); // initial-silence VAD (ms)
@@ -670,8 +670,8 @@ mod tests {
                 ..Default::default()
             },
             features: SttFeatures {
-                interim_results: Some(false),  // typed → interim_results
-                endpointing_ms: Some(900),     // canonical tail-silence → vad_tail (ms)
+                interim_results: Some(false), // typed → interim_results
+                endpointing_ms: Some(900),    // canonical tail-silence → vad_tail (ms)
                 ..Default::default()
             },
             extras: ProviderExtras(extras),
@@ -684,11 +684,20 @@ mod tests {
             .expect("serialize START frame");
 
         // tail-silence VAD endpointing (typed endpointing_ms → vad_tail), in ms.
-        assert!(json.contains("\"vad_tail\":900"), "vad_tail missing: {json}");
+        assert!(
+            json.contains("\"vad_tail\":900"),
+            "vad_tail missing: {json}"
+        );
         // initial-silence VAD head (extras vad_head), in ms.
-        assert!(json.contains("\"vad_head\":1500"), "vad_head missing: {json}");
+        assert!(
+            json.contains("\"vad_head\":1500"),
+            "vad_head missing: {json}"
+        );
         // max utterance/sentence duration (extras max_seconds), in s.
-        assert!(json.contains("\"max_seconds\":42"), "max_seconds missing: {json}");
+        assert!(
+            json.contains("\"max_seconds\":42"),
+            "max_seconds missing: {json}"
+        );
         // interim/partial results toggle (typed) — false → "no" on the wire.
         assert!(
             json.contains("\"interim_results\":\"no\""),

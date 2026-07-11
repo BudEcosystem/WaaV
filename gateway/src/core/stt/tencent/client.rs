@@ -39,11 +39,13 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::config::{TENCENT_ASR_WS_URL, TencentSttConfig};
 use super::messages::TencentAsrResponse;
 use super::signature::TencentSignatureBuilder;
+use crate::core::resilience::connect::with_timeout;
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
@@ -61,9 +63,6 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 /// Provider information string.
 const PROVIDER_INFO: &str = "Tencent Cloud Speech (腾讯云语音)";
-
-/// WebSocket connection timeout.
-const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Per-message idle timeout for WebSocket message reception. Resets after each successful message;
 /// catches stuck/dead connections so a silently-dropped socket reconnects instead of hanging.
@@ -88,8 +87,8 @@ struct TencentTransport {
     ws_stream: SplitStream<TencentWs>,
     /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
     audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
-    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
-    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    /// Shared shutdown token (fires once; an intentional close must not reconnect).
+    shutdown_token: CancellationToken,
     result_tx: mpsc::Sender<STTResult>,
     error_tx: mpsc::Sender<STTError>,
     /// Fires once on the first successful connect, unblocking `connect()`.
@@ -112,8 +111,14 @@ impl WsTransport for TencentTransport {
 
     async fn run(&mut self) -> ReconnectOutcome {
         let mut audio_rx = self.audio_rx.lock().await;
-        let mut shutdown_rx = self.shutdown_rx.lock().await;
+        let shutdown_token = self.shutdown_token.clone();
         loop {
+            if shutdown_token.is_cancelled() {
+                debug!("Tencent shutdown signal received");
+                let _ = self.ws_sink.send(Message::Close(None)).await;
+                return ReconnectOutcome::Completed;
+            }
+
             tokio::select! {
                 // Handle outgoing audio data (raw binary frames)
                 Some(audio) = audio_rx.recv() => {
@@ -167,7 +172,7 @@ impl WsTransport for TencentTransport {
                 }
 
                 // Handle shutdown signal (intentional close — must NOT reconnect)
-                _ = &mut *shutdown_rx => {
+                _ = shutdown_token.cancelled() => {
                     debug!("Tencent shutdown signal received");
                     let _ = self.ws_sink.send(Message::Close(None)).await;
                     return ReconnectOutcome::Completed;
@@ -244,7 +249,7 @@ pub struct TencentStt {
     connected: Arc<AtomicBool>,
 
     /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
-    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// `connect()`, set in `disconnect()` before cancelling `shutdown_token`, so a client close racing a
     /// server-side close can never trigger a spurious reconnect.
     intentional_disconnect: Arc<AtomicBool>,
 
@@ -254,8 +259,8 @@ pub struct TencentStt {
     /// WebSocket sender for audio data.
     ws_sender: Option<mpsc::Sender<Bytes>>,
 
-    /// Shutdown signal sender.
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Shutdown signal token.
+    shutdown_token: Option<CancellationToken>,
 
     /// Connection task handle.
     connection_handle: Option<tokio::task::JoinHandle<()>>,
@@ -317,7 +322,7 @@ impl TencentStt {
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             connection_handle: None,
             result_forward_handle: None,
             error_forward_handle: None,
@@ -394,7 +399,12 @@ impl TencentStt {
             })?;
         // Honor an `endpoint_override` for the in-repo mock/proxy: swap the dialed scheme://host while
         // keeping the signed `/asr/v2/{app_id}?...` path+query (the mock ignores the HMAC signature).
-        if let Some(o) = self.config.endpoint_override.as_deref().filter(|o| !o.is_empty())
+        if let Some(o) = self
+            .config
+            .endpoint_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
             && let Some(idx) = url.find("/asr/v2")
         {
             return Ok(format!("{}{}", o.trim_end_matches('/'), &url[idx..]));
@@ -492,17 +502,16 @@ impl BaseSTT for TencentStt {
         let (audio_tx, audio_rx) = mpsc::channel::<Bytes>(AUDIO_CHANNEL_BUFFER);
         let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(RESULT_CHANNEL_BUFFER);
         let (error_tx, mut error_rx) = mpsc::channel::<STTError>(ERROR_CHANNEL_BUFFER);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_token = CancellationToken::new();
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         self.ws_sender = Some(audio_tx);
-        self.shutdown_tx = Some(shutdown_tx);
+        self.shutdown_token = Some(shutdown_token.clone());
 
         // Shared state the supervised transport re-uses across reconnect attempts: a single-
-        // consumer audio receiver + shutdown oneshot (locked per `run`) and the one-shot connected
+        // consumer audio receiver + shutdown token and the one-shot connected
         // signal that fires on the first successful connect.
         let audio_rx = Arc::new(Mutex::new(audio_rx));
-        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
         let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
         let connected_flag = self.connected.clone();
         let state_notify = self.state_notify.clone();
@@ -529,43 +538,49 @@ impl BaseSTT for TencentStt {
         // `connect` closure dials the *featured* (signed) URL and hands back a transport whose
         // `run()` is the consolidated Tencent event loop.
         let connection_handle = tokio::spawn(async move {
-            let exit = supervisor
-                .run(|| {
-                    let url = url.clone();
-                    let audio_rx = Arc::clone(&audio_rx);
-                    let shutdown_rx = Arc::clone(&shutdown_rx);
-                    let connected_tx = Arc::clone(&connected_tx);
-                    let connected_flag = connected_flag.clone();
-                    let result_tx = result_tx.clone();
-                    let error_tx = error_tx.clone();
-                    async move {
-                        let (ws_stream, _) =
-                            match timeout(WS_CONNECT_TIMEOUT, connect_async(&url)).await {
-                                Ok(Ok(result)) => result,
-                                Ok(Err(e)) => {
-                                    return Err(StreamError::new(format!(
-                                        "WebSocket connection failed: {e}"
-                                    )));
-                                }
-                                Err(_) => {
-                                    return Err(StreamError::new("connection timeout"));
-                                }
-                            };
-                        info!("Connected to Tencent ASR");
-                        let (ws_sink, ws_stream) = ws_stream.split();
-                        Ok(TencentTransport {
-                            ws_sink,
-                            ws_stream,
-                            audio_rx,
-                            shutdown_rx,
-                            result_tx,
-                            error_tx,
-                            connected_tx,
-                            connected_flag,
-                        })
-                    }
-                })
-                .await;
+            let exit =
+                supervisor
+                    .run(|| {
+                        let url = url.clone();
+                        let audio_rx = Arc::clone(&audio_rx);
+                        let shutdown_token = shutdown_token.clone();
+                        let connected_tx = Arc::clone(&connected_tx);
+                        let connected_flag = connected_flag.clone();
+                        let result_tx = result_tx.clone();
+                        let error_tx = error_tx.clone();
+                        async move {
+                            // Deadline-bounded dial via the shared resilience helper. Tencent keeps
+                            // its historical 10s bound (tighter than the canonical 15s
+                            // `core::resilience::connect::WS_CONNECT_TIMEOUT`).
+                            let (ws_stream, _) =
+                                match with_timeout(Duration::from_secs(10), connect_async(&url))
+                                    .await
+                                {
+                                    Ok(Ok(result)) => result,
+                                    Ok(Err(e)) => {
+                                        return Err(StreamError::new(format!(
+                                            "WebSocket connection failed: {e}"
+                                        )));
+                                    }
+                                    Err(_) => {
+                                        return Err(StreamError::new("connection timeout"));
+                                    }
+                                };
+                            info!("Connected to Tencent ASR");
+                            let (ws_sink, ws_stream) = ws_stream.split();
+                            Ok(TencentTransport {
+                                ws_sink,
+                                ws_stream,
+                                audio_rx,
+                                shutdown_token,
+                                result_tx,
+                                error_tx,
+                                connected_tx,
+                                connected_flag,
+                            })
+                        }
+                    })
+                    .await;
             connected_flag.store(false, Ordering::SeqCst);
             state_notify.notify_waiters();
             info!("Tencent STT WebSocket connection closed (supervisor exit: {exit:?})");
@@ -602,7 +617,7 @@ impl BaseSTT for TencentStt {
         // Wait for the first successful connect (the supervisor's restore signals `connected_tx`),
         // matching the other supervised providers — `connect()` returns ready only once the session
         // is live, and the `connected` flag drives `is_ready`.
-        match timeout(WS_CONNECT_TIMEOUT, connected_rx).await {
+        match timeout(Duration::from_secs(10), connected_rx).await {
             Ok(Ok(())) => {
                 self.state_notify.notify_waiters();
                 info!("Tencent STT connected successfully");
@@ -623,7 +638,7 @@ impl BaseSTT for TencentStt {
         // Record the intent BEFORE the connected-guard so the supervisor sees it even if the
         // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
         self.intentional_disconnect.store(true, Ordering::SeqCst);
-        if !self.connected.load(Ordering::SeqCst) {
+        if !self.connected.load(Ordering::SeqCst) && self.connection_handle.is_none() {
             return Ok(());
         }
 
@@ -633,22 +648,32 @@ impl BaseSTT for TencentStt {
         self.ws_sender.take();
 
         // Send shutdown signal
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
 
         // Wait for connection task to complete
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "tencent-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         // Abort forwarding tasks
         if let Some(handle) = self.result_forward_handle.take() {
-            handle.abort();
+            crate::core::observability::abort_and_await_task(
+                "tencent-stt-result-forwarder",
+                handle,
+            )
+            .await;
         }
 
         if let Some(handle) = self.error_forward_handle.take() {
-            handle.abort();
+            crate::core::observability::abort_and_await_task("tencent-stt-error-forwarder", handle)
+                .await;
         }
 
         self.connected.store(false, Ordering::SeqCst);
@@ -739,10 +764,26 @@ impl TencentStt {
     /// The shared circuit breaker this session feeds into the generic supervisor, if the
     /// process-global resilience handles have been injected (W-D1/W-D2). Two `TencentStt` built
     /// from the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
-    pub fn resilience_breaker(
-        &self,
-    ) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
         self.resilience.as_ref().map(|r| &r.breaker)
+    }
+}
+
+impl Drop for TencentStt {
+    fn drop(&mut self) {
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
+        }
+        if let Some(handle) = self.connection_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.result_forward_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.error_forward_handle.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -792,7 +833,7 @@ mod tests {
     #[test]
     fn test_new_standard_unlocks_advanced_features() {
         use super::super::config::{TencentFilterDirtyMode, TencentWordInfo};
-        use crate::core::stt::standard::{ProviderExtras, SttFeatures, StandardSTTConfig};
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "tencent".into(),
@@ -826,6 +867,50 @@ mod tests {
             ..Default::default()
         });
         assert!(TencentStt::new_standard(&bad).is_err());
+    }
+
+    #[test]
+    fn test_new_standard_rejects_ssrf_endpoint_override() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mk = |endpoint: &str| {
+            StandardSTTConfig {
+                base: STTConfig {
+                    provider: "tencent".into(),
+                    api_key: "test_secret_id|test_secret_key|test_app_id".into(),
+                    language: "zh".into(),
+                    sample_rate: 16000,
+                    encoding: "pcm".into(),
+                    model: "16k_zh".into(),
+                    ..Default::default()
+                },
+                features: SttFeatures::default(),
+                extras: ProviderExtras::default(),
+                translation: None,
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(TencentStt::new_standard(&mk("wss://tencent-proxy.example.com")).is_ok());
+        assert!(TencentStt::new_standard(&mk("ws://127.0.0.1:9000")).is_err());
+        assert!(TencentStt::new_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(TencentStt::new_standard(&mk("https://tencent-proxy.example.com")).is_err());
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]

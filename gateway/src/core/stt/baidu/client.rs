@@ -47,13 +47,15 @@ use tokio::time::timeout;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use super::config::{BAIDU_OAUTH_URL, BaiduOAuthResponse, BaiduSttConfig};
+use super::config::{BaiduOAuthResponse, BaiduSttConfig, build_baidu_oauth_url};
 use super::messages::{
     BaiduFinishFrame, BaiduRealtimeResponse, BaiduShortAsrRequest, BaiduShortAsrResponse,
     BaiduStartFrame,
 };
+use crate::core::resilience::connect::with_timeout;
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
@@ -70,15 +72,18 @@ use crate::core::websocket::reconnectable_stream::{
 /// Provider information string.
 const PROVIDER_INFO: &str = "Baidu AI Cloud Speech (百度语音)";
 
-/// WebSocket connection timeout.
-const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Per-message idle timeout for WebSocket message reception. Resets after each successful
 /// message; catches stuck/dead connections so the supervisor can reconnect.
 const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// HTTP request timeout for OAuth and REST API.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn baidu_stt_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(HTTP_TIMEOUT)
+        .build()
+}
 
 /// Channel buffer size for audio frames.
 const AUDIO_CHANNEL_BUFFER: usize = 64;
@@ -134,8 +139,8 @@ struct BaiduTransport {
     ws_stream: SplitStream<BaiduWs>,
     /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
     audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
-    /// Shared shutdown signal (fires once; an intentional close must not reconnect).
-    shutdown_rx: Arc<Mutex<oneshot::Receiver<()>>>,
+    /// Shared shutdown token (fires once; an intentional close must not reconnect).
+    shutdown_token: CancellationToken,
     result_tx: mpsc::Sender<STTResult>,
     error_tx: mpsc::Sender<STTError>,
     /// Fires once after the featured session is (re)established, unblocking `connect`.
@@ -143,6 +148,14 @@ struct BaiduTransport {
     /// The pre-serialized `START` frame JSON, re-sent on every restore so reconnects keep the
     /// featured session (dev_pid model, sample rate, format, credentials).
     start_frame_json: String,
+}
+
+impl BaiduTransport {
+    async fn send_finish(ws_sink: &mut SplitSink<BaiduWs, Message>) {
+        if let Ok(finish_json) = BaiduFinishFrame::new().to_json() {
+            let _ = ws_sink.send(Message::Text(finish_json.into())).await;
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -164,8 +177,14 @@ impl WsTransport for BaiduTransport {
 
     async fn run(&mut self) -> ReconnectOutcome {
         let mut audio_rx = self.audio_rx.lock().await;
-        let mut shutdown_rx = self.shutdown_rx.lock().await;
+        let shutdown_token = self.shutdown_token.clone();
         loop {
+            if shutdown_token.is_cancelled() {
+                debug!("Received shutdown signal for Baidu STT");
+                Self::send_finish(&mut self.ws_sink).await;
+                return ReconnectOutcome::Completed;
+            }
+
             tokio::select! {
                 // Handle outgoing audio data (raw binary frames)
                 Some(audio) = audio_rx.recv() => {
@@ -223,12 +242,9 @@ impl WsTransport for BaiduTransport {
                 }
 
                 // Handle shutdown signal (intentional close — must NOT reconnect)
-                _ = &mut *shutdown_rx => {
+                _ = shutdown_token.cancelled() => {
                     debug!("Received shutdown signal for Baidu STT");
-                    // Send the graceful FINISH frame before closing.
-                    if let Ok(finish_json) = BaiduFinishFrame::new().to_json() {
-                        let _ = self.ws_sink.send(Message::Text(finish_json.into())).await;
-                    }
+                    Self::send_finish(&mut self.ws_sink).await;
                     return ReconnectOutcome::Completed;
                 }
             }
@@ -255,14 +271,11 @@ struct TokenManager {
 
 impl TokenManager {
     /// Create a new token manager.
-    fn new() -> Self {
+    fn new(client: reqwest::Client) -> Self {
         Self {
             access_token: RwLock::new(None),
             expires_at: RwLock::new(None),
-            client: reqwest::Client::builder()
-                .timeout(HTTP_TIMEOUT)
-                .build()
-                .unwrap_or_default(),
+            client,
         }
     }
 
@@ -272,6 +285,10 @@ impl TokenManager {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
+    }
+
+    fn build_token_url(api_key: &str, secret_key: &str) -> String {
+        build_baidu_oauth_url(api_key, secret_key)
     }
 
     /// Check if the token is valid (with 1-hour buffer).
@@ -289,15 +306,13 @@ impl TokenManager {
     async fn get_token(&self, api_key: &str, secret_key: &str) -> Result<String, STTError> {
         // Check if we have a valid cached token
         if self.is_token_valid().await
-            && let Some(token) = self.access_token.read().await.clone() {
-                return Ok(token);
-            }
+            && let Some(token) = self.access_token.read().await.clone()
+        {
+            return Ok(token);
+        }
 
         // Fetch new token
-        let url = format!(
-            "{}?grant_type=client_credentials&client_id={}&client_secret={}",
-            BAIDU_OAUTH_URL, api_key, secret_key
-        );
+        let url = Self::build_token_url(api_key, secret_key);
 
         debug!("Fetching new Baidu OAuth token...");
 
@@ -383,7 +398,7 @@ pub struct BaiduStt {
     connected: Arc<AtomicBool>,
 
     /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
-    /// `connect()`, set in `disconnect()` before firing `shutdown_tx`, so a client close racing a
+    /// `connect()`, set in `disconnect()` before cancelling `shutdown_token`, so a client close racing a
     /// server-side close can never trigger a spurious reconnect.
     intentional_disconnect: Arc<AtomicBool>,
 
@@ -393,8 +408,8 @@ pub struct BaiduStt {
     /// WebSocket sender for audio data.
     ws_sender: Option<mpsc::Sender<Bytes>>,
 
-    /// Shutdown signal sender.
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Shutdown signal token.
+    shutdown_token: Option<CancellationToken>,
 
     /// Connection task handle.
     connection_handle: Option<tokio::task::JoinHandle<()>>,
@@ -452,26 +467,25 @@ impl BaiduStt {
         baidu_config: BaiduSttConfig,
     ) -> Result<Self, STTError> {
         baidu_config.validate()?;
+        let http_client =
+            baidu_stt_http_client().map_err(|e| STTError::ConnectionFailed(e.to_string()))?;
 
         Ok(Self {
             base_config,
             config: baidu_config,
-            token_manager: Arc::new(TokenManager::new()),
+            token_manager: Arc::new(TokenManager::new(http_client.clone())),
             connected: Arc::new(AtomicBool::new(false)),
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             connection_handle: None,
             result_forward_handle: None,
             error_forward_handle: None,
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
             session_id: uuid::Uuid::new_v4().to_string(),
-            http_client: reqwest::Client::builder()
-                .timeout(HTTP_TIMEOUT)
-                .build()
-                .unwrap_or_default(),
+            http_client,
             audio_buffer: Arc::new(Mutex::new(Vec::new())),
             resilience: None,
         })
@@ -487,11 +501,11 @@ impl BaiduStt {
         let (audio_tx, audio_rx) = mpsc::channel::<Bytes>(AUDIO_CHANNEL_BUFFER);
         let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(RESULT_CHANNEL_BUFFER);
         let (error_tx, mut error_rx) = mpsc::channel::<STTError>(ERROR_CHANNEL_BUFFER);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_token = CancellationToken::new();
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         self.ws_sender = Some(audio_tx);
-        self.shutdown_tx = Some(shutdown_tx);
+        self.shutdown_token = Some(shutdown_token.clone());
 
         // Build the featured `START` frame once (re-sent verbatim on every restore by the
         // supervised transport). A reconnect must restore the featured session, not a bare one.
@@ -509,7 +523,6 @@ impl BaiduStt {
 
         // Shared state the supervised transport re-uses across reconnect attempts.
         let audio_rx = Arc::new(Mutex::new(audio_rx));
-        let shutdown_rx = Arc::new(Mutex::new(shutdown_rx));
         let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
 
         // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor with
@@ -543,30 +556,37 @@ impl BaiduStt {
                     let url = url.clone();
                     let start_frame_json = start_frame_json.clone();
                     let audio_rx = Arc::clone(&audio_rx);
-                    let shutdown_rx = Arc::clone(&shutdown_rx);
+                    let shutdown_token = shutdown_token.clone();
                     let connected_tx = Arc::clone(&connected_tx);
                     let result_tx = result_tx.clone();
                     let error_tx = error_tx.clone();
                     async move {
-                        let (ws_stream, _) =
-                            match timeout(WS_CONNECT_TIMEOUT, connect_async(&url)).await {
-                                Ok(Ok(s)) => s,
-                                Ok(Err(e)) => {
-                                    return Err(StreamError::new(format!(
-                                        "WebSocket connection failed: {e}"
-                                    )));
-                                }
-                                Err(_) => {
-                                    return Err(StreamError::new("Connection timeout".to_string()));
-                                }
-                            };
+                        // Deadline-bounded dial via the shared resilience helper. Baidu keeps its
+                        // historical 10s bound (tighter than the canonical 15s
+                        // `core::resilience::connect::WS_CONNECT_TIMEOUT`).
+                        let (ws_stream, _) = match with_timeout(
+                            Duration::from_secs(10),
+                            connect_async(&url),
+                        )
+                        .await
+                        {
+                            Ok(Ok(s)) => s,
+                            Ok(Err(e)) => {
+                                return Err(StreamError::new(format!(
+                                    "WebSocket connection failed: {e}"
+                                )));
+                            }
+                            Err(_) => {
+                                return Err(StreamError::new("Connection timeout".to_string()));
+                            }
+                        };
                         info!("Connected to Baidu real-time ASR");
                         let (ws_sink, ws_stream) = ws_stream.split();
                         Ok(BaiduTransport {
                             ws_sink,
                             ws_stream,
                             audio_rx,
-                            shutdown_rx,
+                            shutdown_token,
                             result_tx,
                             error_tx,
                             connected_tx,
@@ -607,7 +627,7 @@ impl BaiduStt {
         self.error_forward_handle = Some(error_forward_handle);
 
         // Wait for the featured session to be established (first restore) with a timeout.
-        match timeout(WS_CONNECT_TIMEOUT, connected_rx).await {
+        match timeout(Duration::from_secs(10), connected_rx).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => {
                 self.connected.store(false, Ordering::SeqCst);
@@ -653,7 +673,15 @@ impl BaiduStt {
                         transcript
                     );
 
-                    let _ = result_tx.try_send(result);
+                    // A dropped FINAL is a lost turn (the caller hangs waiting for a
+                    // response) — never drop mute under backpressure (the N1/N2 class the
+                    // audit fixed for Deepgram/AssemblyAI; baidu was the straggler).
+                    if result_tx.try_send(result).is_err() {
+                        warn!(
+                            is_final = response.is_final(),
+                            "Baidu transcript dropped - result channel full or closed"
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -785,7 +813,7 @@ impl BaseSTT for BaiduStt {
         // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
         self.intentional_disconnect.store(true, Ordering::SeqCst);
 
-        if !self.connected.load(Ordering::SeqCst) {
+        if !self.connected.load(Ordering::SeqCst) && self.connection_handle.is_none() {
             return Ok(());
         }
 
@@ -795,22 +823,29 @@ impl BaseSTT for BaiduStt {
         self.ws_sender.take();
 
         // Send shutdown signal
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
 
         // Wait for connection task to complete
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "baidu-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         // Abort forwarding tasks
         if let Some(handle) = self.result_forward_handle.take() {
-            handle.abort();
+            crate::core::observability::abort_and_await_task("baidu-stt-result-forwarder", handle)
+                .await;
         }
 
         if let Some(handle) = self.error_forward_handle.take() {
-            handle.abort();
+            crate::core::observability::abort_and_await_task("baidu-stt-error-forwarder", handle)
+                .await;
         }
 
         // Clear audio buffer
@@ -907,6 +942,24 @@ impl BaseSTT for BaiduStt {
     }
 }
 
+impl Drop for BaiduStt {
+    fn drop(&mut self) {
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
+        }
+        if let Some(handle) = self.connection_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.result_forward_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.error_forward_handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -914,6 +967,7 @@ impl BaseSTT for BaiduStt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
 
     fn create_test_config() -> STTConfig {
         STTConfig {
@@ -931,6 +985,56 @@ mod tests {
         let config = create_test_config();
         let result = BaiduStt::new(config);
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn baidu_stt_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!("Skipping baidu_stt_redirect_policy_rejects_private_hop: {err}");
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = baidu_stt_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
     }
 
     // W1 keystone: Baidu's one honorable knob (custom-vocabulary `lm_id` from provider_extras)
@@ -1176,11 +1280,48 @@ mod tests {
 
     #[test]
     fn test_token_manager_creation() {
-        let manager = TokenManager::new();
+        let manager = TokenManager::new(baidu_stt_http_client().unwrap());
         // Should start with no token
         let rt = tokio::runtime::Runtime::new().unwrap();
         let is_valid = rt.block_on(manager.is_token_valid());
         assert!(!is_valid);
+    }
+
+    #[test]
+    fn token_manager_oauth_url_encodes_credentials() {
+        let url =
+            TokenManager::build_token_url("my_api_key&client_secret=evil", "my secret&scope=all");
+        assert!(url.contains("client_id=my_api_key%26client_secret%3Devil"));
+        assert!(url.contains("client_secret=my+secret%26scope%3Dall"));
+
+        let parsed = url::Url::parse(&url).expect("Baidu OAuth URL should parse");
+        let query_pairs = parsed.query_pairs().into_owned().collect::<Vec<_>>();
+
+        assert_eq!(
+            query_pairs
+                .iter()
+                .filter(|(key, _)| key == "client_id")
+                .count(),
+            1
+        );
+        assert!(
+            query_pairs
+                .iter()
+                .any(|(key, value)| key == "client_id" && value == "my_api_key&client_secret=evil")
+        );
+        assert_eq!(
+            query_pairs
+                .iter()
+                .filter(|(key, _)| key == "client_secret")
+                .count(),
+            1
+        );
+        assert!(
+            query_pairs
+                .iter()
+                .any(|(key, value)| key == "client_secret" && value == "my secret&scope=all")
+        );
+        assert!(!query_pairs.iter().any(|(key, _)| key == "scope"));
     }
 
     #[test]

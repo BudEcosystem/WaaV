@@ -2,7 +2,10 @@
 //!
 //! Simulates WebSocket-based providers like Deepgram, Cartesia, LMNT
 
-use super::{ChaosConfig, LatencyProfile, MockStats};
+use super::{
+    ChaosConfig, LatencyProfile, MockServerHandle, MockStats, MockTaskScope,
+    spawn_mock_server_with_scope,
+};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -171,9 +174,10 @@ async fn handle_stt_connection(
             Ok(Message::Text(text)) => {
                 // Handle control messages
                 if let Ok(msg) = serde_json::from_str::<Value>(&text)
-                    && msg.get("type").and_then(|t| t.as_str()) == Some("CloseStream") {
-                        break;
-                    }
+                    && msg.get("type").and_then(|t| t.as_str()) == Some("CloseStream")
+                {
+                    break;
+                }
             }
             Ok(Message::Close(_)) => break,
             Ok(Message::Ping(data)) => {
@@ -388,13 +392,21 @@ pub async fn start_stt_websocket_mock(
     port: u16,
     state: Arc<WebSocketMockState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    start_stt_websocket_mock_with_scope(port, state, MockTaskScope::detached()).await
+}
+
+async fn start_stt_websocket_mock_with_scope(
+    port: u16,
+    state: Arc<WebSocketMockState>,
+    child_scope: MockTaskScope,
+) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     println!("STT WebSocket Mock Server listening on port {}", port);
 
     loop {
         let (stream, _) = listener.accept().await?;
         let state = state.clone();
-        tokio::spawn(async move {
+        child_scope.spawn("stt_websocket_connection", async move {
             if let Err(e) = handle_stt_connection(stream, state).await {
                 eprintln!("STT connection error: {}", e);
             }
@@ -407,13 +419,21 @@ pub async fn start_tts_websocket_mock(
     port: u16,
     state: Arc<WebSocketMockState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    start_tts_websocket_mock_with_scope(port, state, MockTaskScope::detached()).await
+}
+
+async fn start_tts_websocket_mock_with_scope(
+    port: u16,
+    state: Arc<WebSocketMockState>,
+    child_scope: MockTaskScope,
+) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     println!("TTS WebSocket Mock Server listening on port {}", port);
 
     loop {
         let (stream, _) = listener.accept().await?;
         let state = state.clone();
-        tokio::spawn(async move {
+        child_scope.spawn("tts_websocket_connection", async move {
             if let Err(e) = handle_tts_connection(stream, state).await {
                 eprintln!("TTS connection error: {}", e);
             }
@@ -422,25 +442,44 @@ pub async fn start_tts_websocket_mock(
 }
 
 /// Spawn STT WebSocket mock in background
-pub fn spawn_stt_websocket_mock(
-    port: u16,
-    state: Arc<WebSocketMockState>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(e) = start_stt_websocket_mock(port, state).await {
-            eprintln!("STT WebSocket Mock error: {}", e);
+pub fn spawn_stt_websocket_mock(port: u16, state: Arc<WebSocketMockState>) -> MockServerHandle {
+    spawn_mock_server_with_scope("stt_websocket_mock", move |child_scope| async move {
+        if let Err(e) = start_stt_websocket_mock_with_scope(port, state, child_scope).await {
+            panic!("STT WebSocket Mock error: {e}");
         }
     })
 }
 
-/// Spawn TTS WebSocket mock in background
-pub fn spawn_tts_websocket_mock(
-    port: u16,
+/// Spawn the STT WebSocket mock on an OS-assigned ephemeral port.
+pub async fn spawn_stt_websocket_mock_ephemeral(
     state: Arc<WebSocketMockState>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(e) = start_tts_websocket_mock(port, state).await {
-            eprintln!("TTS WebSocket Mock error: {}", e);
+) -> std::io::Result<(u16, MockServerHandle)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let handle = spawn_mock_server_with_scope(
+        "stt_websocket_mock_ephemeral",
+        move |child_scope| async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let state = state.clone();
+                child_scope.spawn("stt_websocket_ephemeral_connection", async move {
+                    if let Err(e) = handle_stt_connection(stream, state).await {
+                        eprintln!("STT connection error: {}", e);
+                    }
+                });
+            }
+        },
+    );
+    Ok((port, handle))
+}
+
+/// Spawn TTS WebSocket mock in background
+pub fn spawn_tts_websocket_mock(port: u16, state: Arc<WebSocketMockState>) -> MockServerHandle {
+    spawn_mock_server_with_scope("tts_websocket_mock", move |child_scope| async move {
+        if let Err(e) = start_tts_websocket_mock_with_scope(port, state, child_scope).await {
+            panic!("TTS WebSocket Mock error: {e}");
         }
     })
 }
@@ -449,21 +488,24 @@ pub fn spawn_tts_websocket_mock(
 /// bound port (avoids fixed-port collisions when tests run in parallel).
 pub async fn spawn_tts_websocket_mock_ephemeral(
     state: Arc<WebSocketMockState>,
-) -> std::io::Result<(u16, tokio::task::JoinHandle<()>)> {
+) -> std::io::Result<(u16, MockServerHandle)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
-    let handle = tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                break;
-            };
-            let state = state.clone();
-            tokio::spawn(async move {
-                if let Err(e) = handle_tts_connection(stream, state).await {
-                    eprintln!("TTS connection error: {}", e);
-                }
-            });
-        }
-    });
+    let handle = spawn_mock_server_with_scope(
+        "tts_websocket_mock_ephemeral",
+        move |child_scope| async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let state = state.clone();
+                child_scope.spawn("tts_websocket_ephemeral_connection", async move {
+                    if let Err(e) = handle_tts_connection(stream, state).await {
+                        eprintln!("TTS connection error: {}", e);
+                    }
+                });
+            }
+        },
+    );
     Ok((port, handle))
 }

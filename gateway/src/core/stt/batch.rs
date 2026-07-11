@@ -30,6 +30,18 @@
 use super::standard::{StandardSTTConfig, TranslationConfig};
 use serde::{Deserialize, Serialize};
 
+const BATCH_BASE_URL_SCHEMES: &[&str] = &["http", "https"];
+const BATCH_AUDIO_SOURCE_URL_SCHEMES: &[&str] = &["http", "https"];
+const BATCH_CALLBACK_URL_SCHEMES: &[&str] = &["http", "https"];
+/// Maximum decoded inline audio accepted by `POST /transcribe/batch`.
+///
+/// This keeps in-process base64 decoding bounded and aligns with the OpenAI
+/// batch transcription upload ceiling documented in this module.
+pub const MAX_BATCH_INLINE_AUDIO_BYTES: usize = 25 * 1024 * 1024;
+/// JSON body budget for base64 inline audio plus envelope overhead.
+pub const BATCH_JSON_BODY_LIMIT_BYTES: usize =
+    ((MAX_BATCH_INLINE_AUDIO_BYTES + 2) / 3) * 4 + (1024 * 1024);
+
 // =============================================================================
 // Envelope
 // =============================================================================
@@ -280,6 +292,8 @@ pub fn build_deepgram_prerecorded(
     api_key: &str,
     base_url: &str,
 ) -> Result<BatchSubmission, String> {
+    validate_batch_base_url("deepgram", base_url)?;
+
     let std = &req.config;
     let f = &std.features;
     let b = &req.batch;
@@ -353,12 +367,14 @@ pub fn build_deepgram_prerecorded(
     // Async callback.
     let is_async = req.callback_url.is_some();
     if let Some(cb) = &req.callback_url {
-        qs.push(("callback".into(), cb.clone()));
+        let callback = validate_batch_callback_url("deepgram", cb)?;
+        qs.push(("callback".into(), callback));
         let method = req
             .callback_method
-            .clone()
-            .unwrap_or_else(|| "POST".into())
-            .to_uppercase();
+            .as_deref()
+            .map(normalize_batch_callback_method)
+            .transpose()?
+            .unwrap_or_else(|| "POST".into());
         qs.push(("callback_method".into(), method));
     }
     // Translation degrade (Deepgram prerecorded translate is EN-target only via batch; treat an
@@ -379,10 +395,13 @@ pub fn build_deepgram_prerecorded(
     let url = parsed.to_string();
 
     let (body, content_type) = match &req.audio {
-        BatchAudioSource::Url { url } => (
-            BatchHttpBody::Json(serde_json::json!({ "url": url })),
-            "application/json".to_string(),
-        ),
+        BatchAudioSource::Url { url } => {
+            let audio_url = validate_batch_audio_source_url("deepgram", url)?;
+            (
+                BatchHttpBody::Json(serde_json::json!({ "url": audio_url })),
+                "application/json".to_string(),
+            )
+        }
         BatchAudioSource::Bytes {
             audio_base64,
             content_type,
@@ -428,12 +447,15 @@ pub fn build_assemblyai_transcript(
     base_url: &str,
     audio_url: &str,
 ) -> Result<BatchSubmission, String> {
+    validate_batch_base_url("assemblyai", base_url)?;
+
     let std = &req.config;
     let f = &std.features;
     let b = &req.batch;
     let mut warnings = Vec::new();
     let mut body = serde_json::Map::new();
-    body.insert("audio_url".into(), serde_json::Value::String(audio_url.into()));
+    let audio_url = validate_batch_audio_source_url("assemblyai", audio_url)?;
+    body.insert("audio_url".into(), serde_json::Value::String(audio_url));
 
     if !std.base.language.is_empty() && std.base.language != "auto" {
         body.insert(
@@ -482,7 +504,11 @@ pub fn build_assemblyai_transcript(
         body.insert(
             "redact_pii_policies".into(),
             serde_json::Value::Array(
-                redact.iter().cloned().map(serde_json::Value::String).collect(),
+                redact
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
             ),
         );
     }
@@ -491,14 +517,15 @@ pub fn build_assemblyai_transcript(
     {
         body.insert(
             "keyterms_prompt".into(),
-            serde_json::Value::Array(
-                kw.iter().cloned().map(serde_json::Value::String).collect(),
-            ),
+            serde_json::Value::Array(kw.iter().cloned().map(serde_json::Value::String).collect()),
         );
     }
     // Webhook (async).
     if let Some(cb) = &req.callback_url {
-        body.insert("webhook_url".into(), serde_json::Value::String(cb.clone()));
+        body.insert(
+            "webhook_url".into(),
+            serde_json::Value::String(validate_batch_callback_url("assemblyai", cb)?),
+        );
     }
     // Translation: AssemblyAI translation is batch-only; the canonical block is honored here (no
     // streaming warning). It rides the Speech-Understanding pipeline.
@@ -534,6 +561,8 @@ pub fn build_openai_transcription(
     api_key: &str,
     base_url: &str,
 ) -> Result<BatchSubmission, String> {
+    validate_batch_base_url("openai", base_url)?;
+
     let std = &req.config;
     let b = &req.batch;
     let mut warnings = Vec::new();
@@ -613,12 +642,7 @@ pub fn build_openai_transcription(
         headers: vec![("Authorization".into(), format!("Bearer {api_key}"))],
         body: BatchHttpBody::Multipart {
             fields,
-            file: Some((
-                "file".into(),
-                "audio.wav".into(),
-                "audio/wav".into(),
-                bytes,
-            )),
+            file: Some(("file".into(), "audio.wav".into(), "audio/wav".into(), bytes)),
         },
     };
     Ok(BatchSubmission {
@@ -636,20 +660,96 @@ pub fn batch_provider_supported(provider: &str) -> bool {
     )
 }
 
+/// Validate the batch provider base URL before the gateway dials it.
+pub fn validate_batch_base_url(provider: &str, base_url: &str) -> Result<(), String> {
+    let base = base_url.trim();
+    if base.is_empty() {
+        return Err(format!("{provider} batch base url invalid: empty"));
+    }
+    crate::core::net::validate_url_for_ssrf(base, BATCH_BASE_URL_SCHEMES)
+        .map_err(|msg| format!("{provider} batch base url rejected (SSRF protection): {msg}"))
+}
+
+fn validate_batch_audio_source_url(provider: &str, audio_url: &str) -> Result<String, String> {
+    let audio_url = audio_url.trim();
+    if audio_url.is_empty() {
+        return Err(format!("{provider} batch audio url invalid: empty"));
+    }
+    crate::core::net::validate_url_for_ssrf(audio_url, BATCH_AUDIO_SOURCE_URL_SCHEMES)
+        .map_err(|msg| format!("{provider} batch audio url rejected (SSRF protection): {msg}"))?;
+    Ok(audio_url.to_string())
+}
+
+fn validate_batch_callback_url(provider: &str, callback_url: &str) -> Result<String, String> {
+    let callback_url = callback_url.trim();
+    if callback_url.is_empty() {
+        return Err(format!("{provider} batch callback url invalid: empty"));
+    }
+    crate::core::net::validate_url_for_ssrf(callback_url, BATCH_CALLBACK_URL_SCHEMES).map_err(
+        |msg| format!("{provider} batch callback url rejected (SSRF protection): {msg}"),
+    )?;
+    Ok(callback_url.to_string())
+}
+
+fn normalize_batch_callback_method(method: &str) -> Result<String, String> {
+    let method = method.trim();
+    if method.is_empty() {
+        return Err("batch callback_method invalid: empty".to_string());
+    }
+    let method = method.to_ascii_uppercase();
+    match method.as_str() {
+        "POST" | "PUT" => Ok(method),
+        _ => Err(format!(
+            "batch callback_method invalid: expected POST or PUT, got {method}"
+        )),
+    }
+}
+
 /// Decode a base64 audio payload, tolerating a `data:...;base64,` prefix.
 fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
+    decode_inline_batch_audio(s)
+}
+
+pub(crate) fn decode_inline_batch_audio(s: &str) -> Result<Vec<u8>, String> {
+    decode_inline_batch_audio_with_limit(s, MAX_BATCH_INLINE_AUDIO_BYTES)
+}
+
+pub(crate) fn decode_inline_batch_audio_with_limit(
+    s: &str,
+    max_decoded_bytes: usize,
+) -> Result<Vec<u8>, String> {
     use base64::Engine;
     let payload = s.rsplit_once("base64,").map(|(_, b)| b).unwrap_or(s);
-    base64::engine::general_purpose::STANDARD
-        .decode(payload.trim())
-        .map_err(|e| format!("invalid base64 audio: {e}"))
+    let payload = payload.trim();
+    let padding = payload
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|&&b| b == b'=')
+        .count()
+        .min(2);
+    let decoded_upper_bound = ((payload.len() + 3) / 4) * 3 - padding;
+    if decoded_upper_bound > max_decoded_bytes {
+        return Err(format!(
+            "inline batch audio exceeds decoded size limit of {max_decoded_bytes} bytes"
+        ));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|e| format!("invalid base64 audio: {e}"))?;
+    if bytes.len() > max_decoded_bytes {
+        return Err(format!(
+            "inline batch audio exceeds decoded size limit of {max_decoded_bytes} bytes"
+        ));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::stt::base::STTConfig;
-    use crate::core::stt::standard::{SttFeatures, StandardSTTConfig};
+    use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
 
     fn req_with(
         provider: &str,
@@ -706,13 +806,27 @@ mod tests {
     }
 
     #[test]
+    fn inline_batch_audio_decode_is_size_bounded_before_allocation() {
+        let ok = decode_inline_batch_audio_with_limit("data:audio/wav;base64,QUJD", 3)
+            .expect("three decoded bytes should fit limit");
+        assert_eq!(ok, b"ABC");
+
+        let err = decode_inline_batch_audio_with_limit("QUJD", 2)
+            .expect_err("decoded payload above limit must be rejected");
+        assert!(
+            err.contains("decoded size limit"),
+            "unexpected limit error: {err}"
+        );
+    }
+
+    #[test]
     fn deepgram_builder_enables_streaming_gap_features_on_the_wire() {
         // THE critical assertion: alternatives + detect_language (streaming gaps) AND the
         // batch-exclusive summarize/topics/intents all reach the prerecorded query string.
         let r = req_with(
             "deepgram",
             BatchAudioSource::Url {
-                url: "https://example.com/a.wav".into(),
+                url: " https://example.com/a.wav ".into(),
             },
             SttFeatures {
                 diarization: Some(true),
@@ -728,18 +842,26 @@ mod tests {
                 utterances: Some(true),
             },
         );
-        let sub =
-            build_deepgram_prerecorded(&r, "test-key", "https://api.deepgram.com").unwrap();
+        let sub = build_deepgram_prerecorded(&r, "test-key", "https://api.deepgram.com").unwrap();
         let url = &sub.request.url;
         assert!(url.contains("/v1/listen?"), "{url}");
-        assert!(url.contains("alternatives=4"), "alternatives gap not enabled: {url}");
-        assert!(url.contains("detect_language=true"), "detect_language gap not enabled: {url}");
+        assert!(
+            url.contains("alternatives=4"),
+            "alternatives gap not enabled: {url}"
+        );
+        assert!(
+            url.contains("detect_language=true"),
+            "detect_language gap not enabled: {url}"
+        );
         assert!(url.contains("summarize=v2"), "{url}");
         assert!(url.contains("topics=true"), "{url}");
         assert!(url.contains("intents=true"), "{url}");
         assert!(url.contains("paragraphs=true"), "{url}");
         assert!(url.contains("utterances=true"), "{url}");
-        assert!(url.contains("diarize=true"), "reused feature missing: {url}");
+        assert!(
+            url.contains("diarize=true"),
+            "reused feature missing: {url}"
+        );
         // URL source → JSON body {"url":…}.
         match &sub.request.body {
             BatchHttpBody::Json(v) => assert_eq!(v["url"], "https://example.com/a.wav"),
@@ -756,6 +878,34 @@ mod tests {
     }
 
     #[test]
+    fn deepgram_builder_rejects_unsafe_audio_source_url() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut r = req_with(
+            "deepgram",
+            BatchAudioSource::Url {
+                url: "http://127.0.0.1:9000/a.wav".into(),
+            },
+            Default::default(),
+            Default::default(),
+        );
+        let err = build_deepgram_prerecorded(&r, "test-key", "https://api.deepgram.com")
+            .expect_err("loopback audio source URL must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        r.audio = BatchAudioSource::Url {
+            url: "file:///tmp/a.wav".into(),
+        };
+        let err = build_deepgram_prerecorded(&r, "test-key", "https://api.deepgram.com")
+            .expect_err("non-HTTP audio source URL must be rejected");
+        assert!(err.contains("URL scheme"), "{err}");
+
+        r.audio = BatchAudioSource::Url { url: "   ".into() };
+        let err = build_deepgram_prerecorded(&r, "test-key", "https://api.deepgram.com")
+            .expect_err("blank audio source URL must be rejected");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
     fn deepgram_builder_callback_makes_it_async() {
         let mut r = req_with(
             "deepgram",
@@ -765,13 +915,61 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        r.callback_url = Some("https://hook.example.com/cb".into());
+        r.callback_url = Some(" https://hook.example.com/cb?x=1&y=two words ".into());
         r.callback_method = Some("put".into());
-        let sub =
-            build_deepgram_prerecorded(&r, "k", "https://api.deepgram.com").unwrap();
+        let sub = build_deepgram_prerecorded(&r, "k", "https://api.deepgram.com").unwrap();
         assert!(sub.is_async);
-        assert!(sub.request.url.contains("callback=https"), "{}", sub.request.url);
-        assert!(sub.request.url.contains("callback_method=PUT"), "{}", sub.request.url);
+        let parsed = url::Url::parse(&sub.request.url).unwrap();
+        let callback = parsed
+            .query_pairs()
+            .find(|(key, _)| key == "callback")
+            .map(|(_, value)| value.into_owned());
+        assert_eq!(
+            callback.as_deref(),
+            Some("https://hook.example.com/cb?x=1&y=two words"),
+            "{}",
+            sub.request.url
+        );
+        assert!(sub.request.url.contains("callback=https%3A%2F%2F"));
+        assert!(
+            sub.request.url.contains("callback_method=PUT"),
+            "{}",
+            sub.request.url
+        );
+    }
+
+    #[test]
+    fn deepgram_builder_rejects_unsafe_callback_url_and_method() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut r = req_with(
+            "deepgram",
+            BatchAudioSource::Url {
+                url: "https://example.com/a.wav".into(),
+            },
+            Default::default(),
+            Default::default(),
+        );
+
+        r.callback_url = Some("http://127.0.0.1:9000/cb".into());
+        let err = build_deepgram_prerecorded(&r, "k", "https://api.deepgram.com")
+            .expect_err("loopback callback URL must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        r.callback_url = Some("file:///tmp/cb".into());
+        let err = build_deepgram_prerecorded(&r, "k", "https://api.deepgram.com")
+            .expect_err("non-HTTP callback URL must be rejected");
+        assert!(err.contains("URL scheme"), "{err}");
+
+        r.callback_url = Some("   ".into());
+        let err = build_deepgram_prerecorded(&r, "k", "https://api.deepgram.com")
+            .expect_err("blank callback URL must be rejected");
+        assert!(err.contains("empty"), "{err}");
+
+        r.callback_url = Some("https://hook.example.com/cb".into());
+        r.callback_method = Some("DELETE".into());
+        let err = build_deepgram_prerecorded(&r, "k", "https://api.deepgram.com")
+            .expect_err("unsupported callback method must be rejected");
+        assert!(err.contains("expected POST or PUT"), "{err}");
     }
 
     #[test]
@@ -841,6 +1039,97 @@ mod tests {
     }
 
     #[test]
+    fn assemblyai_builder_validates_audio_url() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let r = req_with(
+            "assemblyai",
+            BatchAudioSource::Url {
+                url: "https://example.com/a.wav".into(),
+            },
+            Default::default(),
+            Default::default(),
+        );
+
+        let sub = build_assemblyai_transcript(
+            &r,
+            "aai-key",
+            "https://api.assemblyai.com",
+            " https://example.com/upload.wav ",
+        )
+        .unwrap();
+        let body = match &sub.request.body {
+            BatchHttpBody::Json(v) => v,
+            _ => panic!("expected JSON body"),
+        };
+        assert_eq!(body["audio_url"], "https://example.com/upload.wav");
+
+        let err = build_assemblyai_transcript(
+            &r,
+            "aai-key",
+            "https://api.assemblyai.com",
+            "http://127.0.0.1:9000/a.wav",
+        )
+        .expect_err("loopback audio_url must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        let err = build_assemblyai_transcript(
+            &r,
+            "aai-key",
+            "https://api.assemblyai.com",
+            "file:///tmp/a.wav",
+        )
+        .expect_err("non-HTTP audio_url must be rejected");
+        assert!(err.contains("URL scheme"), "{err}");
+    }
+
+    #[test]
+    fn assemblyai_builder_validates_webhook_url() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut r = req_with(
+            "assemblyai",
+            BatchAudioSource::Url {
+                url: "https://example.com/a.wav".into(),
+            },
+            Default::default(),
+            Default::default(),
+        );
+
+        r.callback_url = Some(" https://hook.example.com/cb ".into());
+        let sub = build_assemblyai_transcript(
+            &r,
+            "aai-key",
+            "https://api.assemblyai.com",
+            "https://example.com/a.wav",
+        )
+        .unwrap();
+        let body = match &sub.request.body {
+            BatchHttpBody::Json(v) => v,
+            _ => panic!("expected JSON body"),
+        };
+        assert_eq!(body["webhook_url"], "https://hook.example.com/cb");
+
+        r.callback_url = Some("http://127.0.0.1:9000/cb".into());
+        let err = build_assemblyai_transcript(
+            &r,
+            "aai-key",
+            "https://api.assemblyai.com",
+            "https://example.com/a.wav",
+        )
+        .expect_err("loopback webhook URL must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        r.callback_url = Some("file:///tmp/cb".into());
+        let err = build_assemblyai_transcript(
+            &r,
+            "aai-key",
+            "https://api.assemblyai.com",
+            "https://example.com/a.wav",
+        )
+        .expect_err("non-HTTP webhook URL must be rejected");
+        assert!(err.contains("URL scheme"), "{err}");
+    }
+
+    #[test]
     fn openai_builder_uses_verbose_json_for_detect_language_and_warns_unsupported() {
         let r = req_with(
             "openai",
@@ -858,7 +1147,11 @@ mod tests {
         );
         let sub = build_openai_transcription(&r, "sk", "https://api.openai.com").unwrap();
         assert!(!sub.is_async, "OpenAI is synchronous");
-        assert!(sub.request.url.ends_with("/v1/audio/transcriptions"), "{}", sub.request.url);
+        assert!(
+            sub.request.url.ends_with("/v1/audio/transcriptions"),
+            "{}",
+            sub.request.url
+        );
         match &sub.request.body {
             BatchHttpBody::Multipart { fields, file } => {
                 assert!(
@@ -890,6 +1183,50 @@ mod tests {
     }
 
     #[test]
+    fn batch_builders_reject_ssrf_base_urls() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let deepgram = req_with(
+            "deepgram",
+            BatchAudioSource::Url {
+                url: "https://example.com/a.wav".into(),
+            },
+            Default::default(),
+            Default::default(),
+        );
+        let err = build_deepgram_prerecorded(&deepgram, "k", "http://127.0.0.1:9000").unwrap_err();
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        let assemblyai = req_with(
+            "assemblyai",
+            BatchAudioSource::Url {
+                url: "https://example.com/a.wav".into(),
+            },
+            Default::default(),
+            Default::default(),
+        );
+        let err = build_assemblyai_transcript(
+            &assemblyai,
+            "k",
+            "http://169.254.169.254",
+            "https://example.com/a.wav",
+        )
+        .unwrap_err();
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        let openai = req_with(
+            "openai",
+            BatchAudioSource::Bytes {
+                audio_base64: "AAAA".into(),
+                content_type: None,
+            },
+            Default::default(),
+            Default::default(),
+        );
+        let err = build_openai_transcription(&openai, "sk", "file:///tmp/socket").unwrap_err();
+        assert!(err.contains("not allowed"), "{err}");
+    }
+
+    #[test]
     fn job_status_serializes_lowercase() {
         let j = BatchJob::queued("abc", vec!["w".into()]);
         let v = serde_json::to_value(&j).unwrap();
@@ -899,10 +1236,7 @@ mod tests {
         // result/error omitted when None.
         assert!(v.get("result").is_none());
         let done = BatchJob::completed("abc", serde_json::json!({"transcript":"hi"}), vec![]);
-        assert_eq!(
-            serde_json::to_value(&done).unwrap()["status"],
-            "completed"
-        );
+        assert_eq!(serde_json::to_value(&done).unwrap()["status"], "completed");
     }
 
     #[test]

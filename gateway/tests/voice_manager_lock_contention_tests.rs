@@ -9,8 +9,8 @@
 //! 3. Smart turn processing is optional/skippable when lock is busy
 //! 4. Latency stays within budget (< 10ms for audio forwarding)
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, RwLock};
@@ -101,11 +101,12 @@ async fn receive_audio_non_blocking_pattern(
 
     // AFTER: Try to get write lock, skip smart turn if busy (GOOD)
     if let Ok(smart_turn_guard) = smart_turn.try_write()
-        && let Some(ref processor) = *smart_turn_guard {
-            let samples: Vec<f32> = audio.chunks(2).map(|_| 0.0f32).collect();
-            processor.process_audio(&samples).await;
-            processed_smart_turn = true;
-        }
+        && let Some(ref processor) = *smart_turn_guard
+    {
+        let samples: Vec<f32> = audio.chunks(2).map(|_| 0.0f32).collect();
+        processor.process_audio(&samples).await;
+        processed_smart_turn = true;
+    }
     // If try_write() fails, lock is busy - skip smart turn, audio still goes to STT
 
     // Send to STT (always happens, regardless of smart turn)
@@ -303,8 +304,7 @@ async fn test_individual_latency_meets_requirements() {
 
     for _ in 0..100 {
         let audio_data = vec![0u8; 640];
-        let (latency, _) =
-            receive_audio_non_blocking_pattern(&audio_data, &smart_turn, &stt).await;
+        let (latency, _) = receive_audio_non_blocking_pattern(&audio_data, &smart_turn, &stt).await;
         latencies.push(latency);
     }
 

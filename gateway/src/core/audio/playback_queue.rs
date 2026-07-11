@@ -102,7 +102,8 @@ impl PlaybackQueue {
         let unit = q.pop_front();
         if let Some(u) = &unit {
             if !u.interruptible {
-                self.uninterruptible_in_flight.fetch_add(1, Ordering::Release);
+                self.uninterruptible_in_flight
+                    .fetch_add(1, Ordering::Release);
                 self.uninterruptible_pending.fetch_sub(1, Ordering::Release);
             }
         }
@@ -219,8 +220,15 @@ mod tests {
         assert_eq!(dropped, 2, "both interruptible units dropped");
         assert_eq!(q.len(), 1, "the uninterruptible unit remains");
         assert!(q.has_uninterruptible_pending());
-        assert_eq!(id(&q.pop_front().unwrap()), 2, "the kept unit is the disclaimer");
-        assert!(!q.has_uninterruptible_pending(), "count drops to 0 after it pops");
+        assert_eq!(
+            id(&q.pop_front().unwrap()),
+            2,
+            "the kept unit is the disclaimer"
+        );
+        assert!(
+            !q.has_uninterruptible_pending(),
+            "count drops to 0 after it pops"
+        );
     }
 
     #[test]
@@ -234,7 +242,10 @@ mod tests {
         let dropped = q.clear_all();
         assert_eq!(dropped, 2);
         assert!(q.is_empty());
-        assert!(!q.has_uninterruptible_pending(), "blanket clear resets the count");
+        assert!(
+            !q.has_uninterruptible_pending(),
+            "blanket clear resets the count"
+        );
     }
 
     #[test]
@@ -242,7 +253,10 @@ mod tests {
         let q = PlaybackQueue::new();
         assert!(!q.has_uninterruptible_pending());
         q.enqueue(PlaybackUnit::interruptible(audio(1)));
-        assert!(!q.has_uninterruptible_pending(), "interruptible doesn't set the flag");
+        assert!(
+            !q.has_uninterruptible_pending(),
+            "interruptible doesn't set the flag"
+        );
         q.enqueue(PlaybackUnit::uninterruptible(audio(2)));
         q.enqueue(PlaybackUnit::uninterruptible(audio(3)));
         assert!(q.has_uninterruptible_pending());
@@ -250,7 +264,10 @@ mod tests {
         let _ = q.pop_front(); // drops audio(1) (interruptible)
         assert!(q.has_uninterruptible_pending());
         let _ = q.pop_front(); // drops audio(2) (uninterruptible)
-        assert!(q.has_uninterruptible_pending(), "one uninterruptible still queued");
+        assert!(
+            q.has_uninterruptible_pending(),
+            "one uninterruptible still queued"
+        );
         let _ = q.pop_front(); // drops audio(3) (uninterruptible)
         assert!(!q.has_uninterruptible_pending(), "now none");
     }

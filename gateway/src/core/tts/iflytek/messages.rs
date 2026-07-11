@@ -141,8 +141,8 @@ impl TtsRequest {
     pub fn simple(app_id: &str, voice: &str, text: &str) -> Self {
         Self::new(
             app_id, voice, "raw", 16000, "UTF8", 50, // Normal speed
-            50,   // Normal volume
-            50,   // Normal pitch
+            50, // Normal volume
+            50, // Normal pitch
             false, 0, 0, None, // no streaming MP3 return
             text,
         )
@@ -393,11 +393,17 @@ mod tests {
     #[test]
     fn test_tts_request_business_params() {
         let request = TtsRequest::new(
-            "app_id", "xiaoyan", "lame", 8000, "GBK", 30, // Slow
-            80,   // Loud
-            70,   // High pitch
-            true, 1, // Letter by letter
-            2,    // Read as value
+            "app_id",
+            "xiaoyan",
+            "lame",
+            8000,
+            "GBK",
+            30, // Slow
+            80, // Loud
+            70, // High pitch
+            true,
+            1,       // Letter by letter
+            2,       // Read as value
             Some(1), // streaming MP3 return on
             "Test",
         );

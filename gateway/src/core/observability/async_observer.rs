@@ -37,14 +37,25 @@ enum ObserverEvent {
     SttResult(STTResult, u64),
     TtsChunk(AudioData, Option<u64>),
     TtsComplete(u64),
-    ConnectionStateChange { provider: String, from: ConnectionState, to: ConnectionState },
-    Error { provider: String, error: TTSError },
+    ConnectionStateChange {
+        provider: String,
+        from: ConnectionState,
+        to: ConnectionState,
+    },
+    Error {
+        provider: String,
+        error: TTSError,
+    },
     BotSpeakingStarted(u64),
     BotSpeakingStopped(u64),
     LocalVadSpeechStarted,
     LocalVadSpeechEnded,
     AudioIn(u64),
-    SmartTurn { inference_us: u64, is_complete: bool, ts_ns: u64 },
+    SmartTurn {
+        inference_us: u64,
+        is_complete: bool,
+        ts_ns: u64,
+    },
     FrameSkipped,
     SttPartial(u64),
     LlmRequest(u64),
@@ -70,18 +81,18 @@ impl AsyncObserver {
         Self::with_label(inner, queue, "async-observer")
     }
 
-    pub fn with_label(
-        inner: Arc<dyn VoiceObserver>,
-        queue: usize,
-        label: &'static str,
-    ) -> Self {
+    pub fn with_label(inner: Arc<dyn VoiceObserver>, queue: usize, label: &'static str) -> Self {
         let (tx, mut rx) = mpsc::channel::<ObserverEvent>(queue.max(1));
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 dispatch(&*inner, event);
             }
         });
-        Self { tx, dropped: Arc::new(AtomicU64::new(0)), label }
+        Self {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+            label,
+        }
     }
 
     /// Events dropped because the queue was full (observability/tests).
@@ -121,9 +132,11 @@ fn dispatch(observer: &dyn VoiceObserver, event: ObserverEvent) {
         ObserverEvent::LocalVadSpeechStarted => observer.on_local_vad_speech_started(),
         ObserverEvent::LocalVadSpeechEnded => observer.on_local_vad_speech_ended(),
         ObserverEvent::AudioIn(ts) => observer.on_audio_in(ts),
-        ObserverEvent::SmartTurn { inference_us, is_complete, ts_ns } => {
-            observer.on_smart_turn(inference_us, is_complete, ts_ns)
-        }
+        ObserverEvent::SmartTurn {
+            inference_us,
+            is_complete,
+            ts_ns,
+        } => observer.on_smart_turn(inference_us, is_complete, ts_ns),
         ObserverEvent::FrameSkipped => observer.on_frame_skipped(),
         ObserverEvent::SttPartial(ts) => observer.on_stt_partial(ts),
         ObserverEvent::LlmRequest(ts) => observer.on_llm_request(ts),
@@ -179,7 +192,11 @@ impl VoiceObserver for AsyncObserver {
         self.enqueue(ObserverEvent::AudioIn(ts_ns));
     }
     fn on_smart_turn(&self, inference_us: u64, is_complete: bool, ts_ns: u64) {
-        self.enqueue(ObserverEvent::SmartTurn { inference_us, is_complete, ts_ns });
+        self.enqueue(ObserverEvent::SmartTurn {
+            inference_us,
+            is_complete,
+            ts_ns,
+        });
     }
     fn on_frame_skipped(&self) {
         self.enqueue(ObserverEvent::FrameSkipped);
@@ -227,7 +244,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn async_observer_does_not_block_hot_path() {
         let seen = Arc::new(AtomicUsize::new(0));
-        let slow = Arc::new(SlowObserver { seen: Arc::clone(&seen) });
+        let slow = Arc::new(SlowObserver {
+            seen: Arc::clone(&seen),
+        });
         let wrapped = Arc::new(AsyncObserver::new(slow, 64));
 
         let registry = super::super::ObserverRegistry::new();

@@ -120,14 +120,28 @@ async fn readyz_returns_503_when_provider_unreachable() {
     // /livez stays healthy regardless of upstream provider state.
     let live = app
         .clone()
-        .oneshot(Request::builder().uri("/livez").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/livez")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    assert_eq!(live.status(), StatusCode::OK, "liveness is independent of providers");
+    assert_eq!(
+        live.status(),
+        StatusCode::OK,
+        "liveness is independent of providers"
+    );
 
     // /readyz must return 503 because the enabled deepgram provider is unreachable.
     let ready = app
-        .oneshot(Request::builder().uri("/readyz").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     let status = ready.status();
@@ -162,7 +176,12 @@ async fn readyz_is_200_when_no_providers_enabled() {
     let app = app(state);
 
     let ready = app
-        .oneshot(Request::builder().uri("/readyz").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(ready.status(), StatusCode::OK);

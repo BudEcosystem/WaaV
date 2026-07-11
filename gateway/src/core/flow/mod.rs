@@ -72,7 +72,9 @@ pub type FlowFnResult = (Value, Option<NodeConfig>);
 
 /// Flow function handler.
 pub type FlowFunction = Arc<
-    dyn Fn(crate::core::llm::FunctionCallParams) -> Pin<Box<dyn Future<Output = FlowFnResult> + Send>>
+    dyn Fn(
+            crate::core::llm::FunctionCallParams,
+        ) -> Pin<Box<dyn Future<Output = FlowFnResult> + Send>>
         + Send
         + Sync,
 >;
@@ -86,7 +88,10 @@ pub struct FlowFunctionSchema {
 
 impl FlowFunctionSchema {
     pub fn new(definition: ToolDefinition, handler: FlowFunction) -> Self {
-        Self { definition, handler }
+        Self {
+            definition,
+            handler,
+        }
     }
 }
 
@@ -158,7 +163,10 @@ impl std::fmt::Debug for FlowManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FlowManager")
             .field("session", &self.session_id)
-            .field("node", &self.current.lock().as_ref().and_then(|n| n.name.clone()))
+            .field(
+                "node",
+                &self.current.lock().as_ref().and_then(|n| n.name.clone()),
+            )
             .finish()
     }
 }
@@ -239,7 +247,13 @@ impl FlowManager {
         }
         let response = self
             .llm
-            .complete(&self.session_id, transcript, self.api_key.as_deref(), cancel, None)
+            .complete(
+                &self.session_id,
+                transcript,
+                self.api_key.as_deref(),
+                cancel,
+                None,
+            )
             .await?;
         self.run_flow_loop(response, cancel).await
     }
@@ -274,7 +288,9 @@ impl FlowManager {
                         )
                     })
                     .collect();
-                self.llm.add_tool_results_batch(&self.session_id, results).await;
+                self.llm
+                    .add_tool_results_batch(&self.session_id, results)
+                    .await;
                 response.tool_calls.clear();
                 return Ok(Some(response));
             }
@@ -293,7 +309,9 @@ impl FlowManager {
                 .zip(results)
                 .map(|(call, value)| (call.id.clone(), value.to_string()))
                 .collect();
-            self.llm.add_tool_results_batch(&self.session_id, rendered).await;
+            self.llm
+                .add_tool_results_batch(&self.session_id, rendered)
+                .await;
 
             // TWO-PHASE: results are in context; NOW the transition fires.
             let next = self.pending_transition.lock().take();
@@ -374,8 +392,7 @@ impl FlowManager {
                     .append_context(&self.session_id, node.task_messages.clone())
                     .await;
             }
-            strategy @ (ContextStrategy::Reset
-            | ContextStrategy::ResetWithSummary { .. }) => {
+            strategy @ (ContextStrategy::Reset | ContextStrategy::ResetWithSummary { .. }) => {
                 if matches!(strategy, ContextStrategy::ResetWithSummary { .. }) {
                     warn!(
                         session = %self.session_id,

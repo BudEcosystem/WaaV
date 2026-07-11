@@ -118,9 +118,9 @@ impl OpenAiEmotionMapper {
                 Some("slow and deliberate")
             }
             DeliveryStyle::SportsCommentaryExcited => Some("rapid and animated"),
-            DeliveryStyle::NarrationRelaxed | DeliveryStyle::Gentle | DeliveryStyle::PoetryReading => {
-                Some("unhurried with natural pauses")
-            }
+            DeliveryStyle::NarrationRelaxed
+            | DeliveryStyle::Gentle
+            | DeliveryStyle::PoetryReading => Some("unhurried with natural pauses"),
             _ => None,
         }
     }

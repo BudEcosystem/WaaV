@@ -43,9 +43,6 @@ pub fn generate_silence_bytes(duration_samples: usize) -> Vec<u8> {
 
 /// Generate white noise with specified amplitude (0.0 - 1.0)
 pub fn generate_white_noise(duration_samples: usize, amplitude: f32) -> Vec<i16> {
-    
-    
-
     let mut samples = Vec::with_capacity(duration_samples);
     let max_amplitude = (amplitude * i16::MAX as f32) as i16;
 
