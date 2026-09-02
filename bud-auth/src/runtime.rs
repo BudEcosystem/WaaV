@@ -147,7 +147,15 @@ impl BudPlane {
             self.origin.elapsed().as_millis() as u64 + 1,
             Ordering::Relaxed,
         );
-        hydrate::apply_key_event(self.store.as_ref(), &self.auth, &self.guards, key, event).await?;
+        hydrate::apply_key_event(
+            self.store.as_ref(),
+            &self.auth,
+            &self.guards,
+            &self.decryptor,
+            key,
+            event,
+        )
+        .await?;
         Ok(())
     }
 
@@ -582,6 +590,85 @@ mod voice_plane_tests {
         assert!(
             plane.voice_endpoint("old").is_none(),
             "a deleted endpoint survived and would keep serving with a stale credential"
+        );
+    }
+}
+
+impl BudPlane {
+    /// Map an alias in a caller's own allowlist to the endpoint id it points at.
+    ///
+    /// This is the alias → endpoint indirection *and* the authorization check in one step: a
+    /// caller can only resolve aliases their key lists, so an endpoint id they merely guessed
+    /// never resolves. Returns `None` when the key is unknown or does not carry the alias.
+    pub fn alias_endpoint_id(&self, raw_token: &str, alias: &str) -> Option<String> {
+        let hashed = hash_api_key(raw_token);
+        if let Some(meta) = self.auth.lookup_alias(&hashed, alias)
+            && let Some(id) = meta.endpoint_id
+        {
+            return Some(id);
+        }
+        // A JWT caller's allowlist lives in the identity-keyed cache, not the snapshot.
+        let jwt = self.jwt.as_ref()?;
+        let identity = jwt.cached_identity(&hashed)?;
+        let entry = jwt.cached_authz(&identity.sub)?;
+        entry.aliases.get(alias).and_then(|m| m.endpoint_id.clone())
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+    use crate::store::MemoryStore;
+
+    async fn plane_with_alias() -> (Arc<MemoryStore>, BudPlane) {
+        let store = Arc::new(MemoryStore::new());
+        let hashed = hash_api_key("bud_alias_test");
+        store.set(
+            &format!("api_key:{hashed}"),
+            r#"{"tts-deepgram":{"endpoint_id":"ep-1","project_id":"p1"}}"#,
+        );
+        store.set(
+            "voice_table:ep-1",
+            r#"{"ep-1":{"vendor":"deepgram","endpoints":["text_to_speech"]}}"#,
+        );
+        let plane = BudPlane::new(Arc::clone(&store) as Arc<dyn ControlPlaneStore>, None);
+        plane.boot().await.unwrap();
+        (store, plane)
+    }
+
+    /// The indirection an end-to-end run caught and the unit tests had missed: callers name an
+    /// alias, the voice table is keyed by endpoint id.
+    #[tokio::test]
+    async fn an_alias_resolves_to_its_endpoint_id() {
+        let (_s, plane) = plane_with_alias().await;
+        assert_eq!(
+            plane
+                .alias_endpoint_id("bud_alias_test", "tts-deepgram")
+                .as_deref(),
+            Some("ep-1")
+        );
+    }
+
+    /// The same lookup is the authorization boundary: an endpoint id a caller merely guessed
+    /// is not in their allowlist, so it does not resolve.
+    #[tokio::test]
+    async fn an_alias_the_key_does_not_carry_does_not_resolve() {
+        let (_s, plane) = plane_with_alias().await;
+        assert!(
+            plane
+                .alias_endpoint_id("bud_alias_test", "someone-elses-endpoint")
+                .is_none(),
+            "a caller resolved an alias their key does not list"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_key_resolves_no_alias() {
+        let (_s, plane) = plane_with_alias().await;
+        assert!(
+            plane
+                .alias_endpoint_id("bud_not_a_key", "tts-deepgram")
+                .is_none()
         );
     }
 }

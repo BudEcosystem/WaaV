@@ -45,11 +45,22 @@ impl TTSRequestBuilder for DeepgramRequestBuilder {
             _ => {}
         }
 
-        if let Some(sample_rate) = self.config.sample_rate {
-            params.push(format!("sample_rate={sample_rate}"));
-        } else {
-            // Use 24000 to match defaults elsewhere (e.g., WS path)
-            params.push("sample_rate=24000".to_string());
+        // `sample_rate` applies ONLY to container-less encodings. A compressed format carries
+        // its rate in its own header, and Deepgram rejects the combination outright:
+        //
+        //   400 UNSUPPORTED_AUDIO_FORMAT
+        //   `sample_rate` is not applicable when `encoding=mp3`
+        //
+        // Sending it unconditionally therefore made every compressed-format request fail, on
+        // this route and on /speak alike, regardless of what the caller configured.
+        let takes_sample_rate = matches!(encoding, "linear16" | "pcm" | "mulaw" | "ulaw" | "alaw");
+        if takes_sample_rate {
+            match self.config.sample_rate {
+                Some(sample_rate) => params.push(format!("sample_rate={sample_rate}")),
+                // Match the default used elsewhere (the WS path) rather than letting the vendor
+                // pick, so raw samples arrive at a predictable rate.
+                None => params.push("sample_rate=24000".to_string()),
+            }
         }
 
         if !params.is_empty() {
@@ -275,7 +286,49 @@ mod tests {
 
         assert!(url.contains("model=aura-asteria-en"));
         assert!(url.contains("encoding=mp3"));
-        assert!(url.contains("sample_rate=24000"));
+        // NOT sample_rate. This assertion previously demanded `sample_rate=24000` here, which
+        // pinned a bug: Deepgram answers
+        //   400 UNSUPPORTED_AUDIO_FORMAT: `sample_rate` is not applicable when `encoding=mp3`
+        // so every compressed-format request failed. Verified against the live API.
+        assert!(
+            !url.contains("sample_rate"),
+            "a sample rate alongside a compressed encoding is a 400 from Deepgram: {url}"
+        );
         assert!(url.starts_with(DEEPGRAM_TTS_URL));
+    }
+
+    /// The other half of the same rule: container-less encodings DO take a rate, and without
+    /// one the caller cannot interpret the samples they receive.
+    #[test]
+    fn raw_encodings_still_carry_a_sample_rate() {
+        for encoding in ["linear16", "pcm", "mulaw"] {
+            let config = TTSConfig {
+                provider: "deepgram".to_string(),
+                model: "aura-asteria-en".to_string(),
+                audio_format: Some(encoding.to_string()),
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            };
+            let builder = DeepgramRequestBuilder {
+                config,
+                pronunciation_replacer: None,
+            };
+            let client = reqwest::Client::new();
+            let url = builder
+                .build_http_request(&client, "Test text")
+                .build()
+                .unwrap()
+                .url()
+                .to_string();
+
+            assert!(
+                url.contains("sample_rate="),
+                "{encoding} is container-less and needs a rate: {url}"
+            );
+            assert!(
+                url.contains("container=none"),
+                "{encoding} must not be wrapped in a container: {url}"
+            );
+        }
     }
 }

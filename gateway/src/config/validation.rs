@@ -98,10 +98,18 @@ pub fn validate_auth_required(
 
     let has_jwt_auth = auth_service_url.is_some() && auth_signing_key_path.is_some();
     let has_api_secret = !auth_api_secrets.is_empty();
+    // FRD-018: Bud mode resolves credentials from the control plane, so `WAAV_REDIS_URL` is a
+    // complete auth configuration on its own. Without this arm the validator demands settings
+    // that bud mode never uses, and the process refuses to start with auth correctly configured.
+    let has_bud_mode = std::env::var("WAAV_REDIS_URL")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
 
-    if !has_jwt_auth && !has_api_secret {
+    if !has_jwt_auth && !has_api_secret && !has_bud_mode {
         return Err(
-            "When AUTH_REQUIRED=true, either (AUTH_SERVICE_URL + AUTH_SIGNING_KEY_PATH) or AUTH_API_SECRETS_JSON/AUTH_API_SECRET must be configured".into()
+            "When AUTH_REQUIRED=true, configure one of: WAAV_REDIS_URL (Bud control plane), \
+             (AUTH_SERVICE_URL + AUTH_SIGNING_KEY_PATH), or AUTH_API_SECRETS_JSON/AUTH_API_SECRET"
+                .into(),
         );
     }
 

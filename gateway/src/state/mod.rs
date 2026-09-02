@@ -37,6 +37,47 @@ pub struct AppState {
     pub active_ws_connections: Arc<AtomicUsize>,
     /// Connection count per IP address (for per-IP limit enforcement)
     pub connections_per_ip: Arc<DashMap<IpAddr, AtomicUsize>>,
+    /// Bud control plane (FRD-018). `None` leaves WaaV in standalone mode, where credentials
+    /// come from configuration and voice endpoints are not registrable.
+    pub bud_mode: Option<Arc<crate::auth::bud_mode::BudMode>>,
+}
+
+impl AppState {
+    /// Resolve a Bud voice endpoint by the name the caller used, checking it serves what was
+    /// asked for.
+    ///
+    /// The capability check is not decoration: an endpoint registered for transcription would
+    /// otherwise accept a synthesis request and fail deep inside a vendor call, with an error
+    /// naming neither the endpoint nor the mistake.
+    pub fn resolve_voice_endpoint(
+        &self,
+        name: &str,
+        capability: &str,
+        bearer: Option<&str>,
+    ) -> Option<bud_auth::credentials::VoiceEndpoint> {
+        let plane = self.bud_mode.as_ref()?.plane();
+
+        // A caller names an ALIAS ("tts-deepgram"); the voice table is keyed by ENDPOINT ID
+        // ("ep-e2e"). The mapping lives in the caller's own api_key blob, which is also the
+        // authorization boundary — resolving through it means a caller can only reach endpoints
+        // their key actually lists, rather than any endpoint whose id they can guess.
+        let endpoint_id = bearer
+            .and_then(|token| plane.alias_endpoint_id(token, name))
+            .unwrap_or_else(|| name.to_string());
+
+        let endpoint = plane.voice_endpoint(&endpoint_id)?;
+        if endpoint.serves(capability) {
+            Some(endpoint)
+        } else {
+            tracing::warn!(
+                endpoint = %name,
+                requested = %capability,
+                serves = ?endpoint.endpoints,
+                "voice endpoint does not serve the requested capability"
+            );
+            None
+        }
+    }
 }
 
 impl AppState {
@@ -279,6 +320,9 @@ impl AppState {
         };
 
         Arc::new(Self {
+            // Installed after construction by main(), once the control-plane connection is up:
+            // AppState::new runs before the Redis URL is known.
+            bud_mode: None,
             config,
             core_state,
             livekit_room_handler,

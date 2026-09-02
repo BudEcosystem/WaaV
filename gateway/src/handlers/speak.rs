@@ -378,3 +378,67 @@ pub async fn speak_handler(
     )
         .into_response()
 }
+
+/// Synthesise once and return the whole buffer, with no HTTP shape attached.
+///
+/// Extracted from [`speak_handler`] so the OpenAI-compatible `/v1/audio/speech` route (FRD-018)
+/// drives exactly the same provider path rather than a parallel copy of it — two synthesis
+/// implementations would drift on timeouts, pronunciation handling and connection pooling, and
+/// the drift would only show on one of the two routes.
+///
+/// Returns `(audio, format, sample_rate)`.
+pub async fn synthesize_once(
+    state: &AppState,
+    tts_config: crate::core::tts::TTSConfig,
+    text: &str,
+) -> Result<(Vec<u8>, String, u32), String> {
+    // Pronunciation replacements apply to every synthesis path, not just the native one.
+    let mut processed = text.to_string();
+    for p in &tts_config.pronunciations {
+        processed = processed.replace(&p.word, &p.pronunciation);
+    }
+
+    let mut provider = create_tts_provider(&tts_config.provider, tts_config.clone())
+        .map_err(|e| format!("failed to create TTS provider: {e}"))?;
+
+    // Connection pooling and per-provider metrics come from the shared manager; without this
+    // the OpenAI route would open a fresh connection per request while `/speak` reuses them.
+    if let Some(req_manager) = state.get_tts_req_manager(&tts_config.provider).await {
+        if let Some(p) = provider.get_provider() {
+            p.set_req_manager(req_manager.clone()).await;
+        }
+        provider.set_req_manager(req_manager).await;
+    }
+
+    provider
+        .connect()
+        .await
+        .map_err(|e| format!("failed to connect to TTS provider: {e}"))?;
+
+    let collector = Arc::new(AudioCollector::new());
+    provider
+        .on_audio(collector.clone())
+        .map_err(|e| format!("failed to register audio callback: {e}"))?;
+
+    if let Err(e) = provider.speak(&processed, true).await {
+        let _ = provider.disconnect().await;
+        return Err(format!("synthesis failed: {e}"));
+    }
+
+    if let Err(e) = collector
+        .wait_for_completion(DEFAULT_SPEAK_TIMEOUT_SECS)
+        .await
+    {
+        // Always disconnect on the timeout path: leaking the connection is how a slow vendor
+        // turns into exhausted file descriptors.
+        let _ = provider.disconnect().await;
+        return Err(e.to_string());
+    }
+
+    let _ = provider.disconnect().await;
+
+    collector
+        .get_result()
+        .await
+        .map_err(|e| format!("synthesis error: {e}"))
+}

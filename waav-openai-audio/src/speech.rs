@@ -75,6 +75,17 @@ impl AudioFormat {
         }
     }
 
+    /// Whether a sample rate may be sent alongside this format.
+    ///
+    /// Only container-less PCM takes one. A compressed format carries its rate in its own
+    /// header, and vendors reject the combination outright — Deepgram answers
+    /// `UNSUPPORTED_AUDIO_FORMAT: sample_rate is not applicable when encoding=mp3`. WaaV's
+    /// `TTSConfig` defaults to `Some(24000)`, so this has to be cleared deliberately rather
+    /// than left to the default.
+    pub fn accepts_sample_rate(self) -> bool {
+        matches!(self, Self::Pcm)
+    }
+
     /// The `Content-Type` for a response carrying this format.
     pub fn content_type(self) -> &'static str {
         match self {
@@ -368,6 +379,24 @@ mod tests {
                 err,
                 AudioError::Missing { field },
                 "a caller can only fix a field the error names"
+            );
+        }
+    }
+
+    /// A vendor rejects the combination outright, so this cannot be left to a default.
+    #[test]
+    fn only_pcm_accepts_a_sample_rate() {
+        assert!(AudioFormat::Pcm.accepts_sample_rate());
+        for f in [
+            AudioFormat::Mp3,
+            AudioFormat::Opus,
+            AudioFormat::Aac,
+            AudioFormat::Flac,
+            AudioFormat::Wav,
+        ] {
+            assert!(
+                !f.accepts_sample_rate(),
+                "{f:?} carries its rate in its own header; sending one is a 400 from the vendor"
             );
         }
     }

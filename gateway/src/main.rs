@@ -163,7 +163,34 @@ async fn main() -> anyhow::Result<()> {
     println!("Starting server on {address}");
 
     // Create application state
-    let app_state = AppState::new(config).await;
+    let mut app_state = AppState::new(config).await;
+
+    // FRD-018: bring up the Bud control plane, if configured.
+    //
+    // Boot failure is fatal on purpose. A WaaV that starts with an empty auth snapshot answers
+    // 401 to every valid credential — a total outage from a pod that looks perfectly healthy.
+    // Failing here stalls the rollout instead, which is the outcome an operator can act on.
+    if let Some(bud_cfg) = waav_gateway::auth::bud_mode::BudModeConfig::from_env() {
+        match waav_gateway::auth::bud_mode::BudMode::start(bud_cfg).await {
+            Ok(bud) => {
+                bud.spawn_keyspace_loop();
+                if let Some(state) = std::sync::Arc::get_mut(&mut app_state) {
+                    state.bud_mode = Some(bud);
+                } else {
+                    eprintln!("FATAL: application state was already shared; cannot install the Bud control plane");
+                    std::process::exit(1);
+                }
+                println!("Bud control plane active: identity and voice endpoints resolved locally");
+            }
+            Err(e) => {
+                eprintln!("FATAL: Bud control plane failed to start: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("Bud control plane not configured (WAAV_REDIS_URL unset); running standalone");
+    }
+    let app_state = app_state;
 
     // Create protected API routes with authentication middleware
     let protected_routes = routes::api::create_api_router().layer(middleware::from_fn_with_state(
@@ -201,10 +228,19 @@ async fn main() -> anyhow::Result<()> {
     let webhook_routes = routes::webhooks::create_webhook_router();
 
     // Create public health check route (no auth)
-    let public_routes = Router::new().route(
-        "/",
-        axum::routing::get(waav_gateway::handlers::api::health_check),
-    );
+    let public_routes = Router::new()
+        .route(
+            "/",
+            axum::routing::get(waav_gateway::handlers::api::health_check),
+        )
+        // Liveness says the process is up; readiness says it can actually serve. Before the
+        // first control-plane hydration completes, every valid credential resolves to 401 —
+        // so a pod in that state must stay out of the load balancer.
+        .route(
+            "/ready",
+            axum::routing::get(waav_gateway::handlers::api::readiness_check),
+        )
+        .with_state(app_state.clone());
 
     // Configure rate limiting (disabled when rate >= 100000 for performance testing)
     let governor_layer = if rate_limit_rps < 100000 {

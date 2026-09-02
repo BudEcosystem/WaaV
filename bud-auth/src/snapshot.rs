@@ -134,6 +134,30 @@ impl BudAuth {
         self.snapshot.load().voice.len()
     }
 
+    /// Upsert or remove one voice endpoint, leaving everything else untouched.
+    ///
+    /// Driven by `voice_table:` keyspace events. Without this, a credential rotation or an
+    /// endpoint edit would not take effect until the next reconnect — which may be never.
+    pub fn mutate_voice(&self, endpoint_id: &str, endpoint: Option<Arc<VoiceEndpoint>>) {
+        #[expect(
+            clippy::expect_used,
+            reason = "a poisoned auth writer is unrecoverable"
+        )]
+        let _guard = self.writer.lock().expect("bud auth writer mutex poisoned");
+        let mut next = self.snapshot.load().clone_contents();
+        match endpoint {
+            Some(e) => {
+                next.voice.insert(Arc::from(endpoint_id), e);
+            }
+            None => {
+                next.voice.remove(endpoint_id);
+            }
+        }
+        self.snapshot.store(Arc::new(next));
+        self.generations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Replace the whole voice table as one generation, leaving the api-key map untouched.
     pub fn replace_voice(&self, voice: HashMap<Arc<str>, Arc<VoiceEndpoint>>) {
         #[expect(

@@ -89,9 +89,36 @@ impl BudMode {
             }
         };
 
-        let plane = Arc::new(BudPlane::new(
+        // The decryptor opens RSA-encrypted vendor credentials at hydration. Its absence is a
+        // warning rather than a failure: keyless self-hosted endpoints still work, and an
+        // endpoint whose credential cannot be opened is dropped with a named error rather than
+        // being used with ciphertext as its bearer token.
+        let decryptor = match &cfg.rsa_private_key_path {
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(pem) => match bud_auth::CredentialDecryptor::from_pem(&pem) {
+                    Ok(d) => {
+                        tracing::info!(path = %path, "vendor-credential decryption enabled");
+                        d
+                    }
+                    Err(e) => {
+                        return Err(format!("RSA private key at {path} could not be loaded: {e}"));
+                    }
+                },
+                Err(e) => return Err(format!("RSA private key at {path} could not be read: {e}")),
+            },
+            None => {
+                tracing::warn!(
+                    "WAAV_RSA_PRIVATE_KEY_PATH is unset; encrypted vendor credentials cannot be \
+                     opened and those endpoints will be unusable"
+                );
+                bud_auth::CredentialDecryptor::disabled()
+            }
+        };
+
+        let plane = Arc::new(BudPlane::with_decryptor(
             Arc::clone(&store) as Arc<dyn ControlPlaneStore>,
             jwt,
+            decryptor,
         ));
 
         let stats = plane.boot().await.map_err(|e| {

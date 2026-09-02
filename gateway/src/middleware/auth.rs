@@ -116,6 +116,46 @@ pub async fn auth_middleware(
         }
     };
 
+    // FRD-018 Bud mode, checked FIRST because it is the deployed configuration when present:
+    // credentials resolve from the in-memory control-plane snapshot with no I/O and no call to
+    // budapp. Falling through to the modes below would ask an auth service that is not
+    // configured, and answer 500 to a perfectly valid Bud key.
+    if let Some(bud) = &state.bud_mode {
+        return match bud.authenticate(&token).await {
+            Ok(auth) => {
+                tracing::info!(
+                    method = %request_method,
+                    path = %request_path,
+                    auth_id = ?auth.id,
+                    "bud authentication successful"
+                );
+                request.extensions_mut().insert(auth);
+                Ok(next.run(request).await)
+            }
+            Err(bud_auth::AuthFailure::NotReady) => {
+                // 503, not 401: the credential may be perfectly good; this pod simply has not
+                // finished its first hydration. Answering 401 would teach a client to
+                // re-authenticate against a problem that is not theirs.
+                tracing::warn!(path = %request_path, "auth attempted before first hydration");
+                Err(AuthError::AuthServiceUnavailable(
+                    "control plane still hydrating".to_string(),
+                ))
+            }
+            Err(bud_auth::AuthFailure::Throttled) => {
+                tracing::warn!(path = %request_path, "auth escalation throttled");
+                Err(AuthError::Unauthorized("Too many auth misses".to_string()))
+            }
+            Err(_) => {
+                tracing::warn!(
+                    method = %request_method,
+                    path = %request_path,
+                    "bud authentication failed"
+                );
+                Err(AuthError::Unauthorized("Invalid API key".to_string()))
+            }
+        };
+    }
+
     // Check authentication mode and validate accordingly
     // Priority: API secret mode first (simpler), then JWT mode
     if state.config.has_api_secret_auth() {

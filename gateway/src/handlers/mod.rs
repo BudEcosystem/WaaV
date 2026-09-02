@@ -17,6 +17,7 @@ pub mod livekit;
 pub mod realtime;
 pub mod recording;
 pub mod sip;
+pub mod openai_audio;
 pub mod speak;
 pub mod voices;
 pub mod ws;

@@ -17,6 +17,20 @@ pub fn create_api_router() -> Router<Arc<AppState>> {
         .route("/voices", get(voices::list_voices))
         .route("/voices/clone", post(voices::clone_voice))
         .route("/speak", post(speak::speak_handler))
+        // OpenAI-compatible audio surface (FRD-018). These are what the Bud ingress routes
+        // /v1/audio/* to, so a WaaV voice endpoint is reachable as an ordinary Bud model.
+        .route(
+            "/v1/audio/speech",
+            post(crate::handlers::openai_audio::speech_handler),
+        )
+        .route(
+            "/v1/audio/transcriptions",
+            post(crate::handlers::openai_audio::transcription_not_implemented),
+        )
+        .route(
+            "/v1/audio/translations",
+            post(crate::handlers::openai_audio::transcription_not_implemented),
+        )
         .route("/livekit/token", post(livekit::generate_token))
         .route("/livekit/rooms", get(livekit::list_rooms))
         .route("/livekit/rooms/{room_name}", get(livekit::get_room_details))

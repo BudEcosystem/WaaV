@@ -102,6 +102,53 @@ pub async fn hydrate_all(
     Ok(stats)
 }
 
+/// Apply one `voice_table:` keyspace event.
+///
+/// A blob may declare more than one endpoint, so a `set` replaces every endpoint the blob names
+/// and a `del` removes the one the key is named for.
+async fn apply_voice_event(
+    store: &dyn ControlPlaneStore,
+    auth: &BudAuth,
+    decryptor: &crate::credentials::CredentialDecryptor,
+    key: &str,
+    endpoint_id: &str,
+    event: KeyEvent,
+) -> Result<bool, StoreError> {
+    match event {
+        KeyEvent::Set => {
+            let Some(raw) = store.get(key).await? else {
+                auth.mutate_voice(endpoint_id, None);
+                return Ok(true);
+            };
+            match crate::credentials::parse_voice_blob(&raw, decryptor) {
+                Ok(entries) if entries.is_empty() => {
+                    // Parsed, but every endpoint was dropped — an unopenable credential. Remove
+                    // rather than leave the previous one serving: budapp has changed something
+                    // we cannot honour, and continuing with the old credential is worse.
+                    tracing::warn!(
+                        endpoint_id = %endpoint_id,
+                        "voice endpoint update yielded no usable endpoint; removing it"
+                    );
+                    auth.mutate_voice(endpoint_id, None);
+                }
+                Ok(entries) => {
+                    for (id, endpoint) in entries {
+                        auth.mutate_voice(&id, Some(std::sync::Arc::new(endpoint)));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(key = %key, error = %e, "ignoring unparseable voice_table update");
+                }
+            }
+            Ok(true)
+        }
+        KeyEvent::Del | KeyEvent::Expired => {
+            auth.mutate_voice(endpoint_id, None);
+            Ok(true)
+        }
+    }
+}
+
 /// What a keyspace notification means for the snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyEvent {
@@ -130,9 +177,18 @@ pub async fn apply_key_event(
     store: &dyn ControlPlaneStore,
     auth: &BudAuth,
     guards: &crate::guards::MissGuards,
+    decryptor: &crate::credentials::CredentialDecryptor,
     key: &str,
     event: KeyEvent,
 ) -> Result<bool, StoreError> {
+    // Voice endpoints change on the same keyspace as credentials, and must propagate on the
+    // same events. Handled before the api_key prefix check because the two namespaces are
+    // disjoint and a voice event would otherwise fall through and be ignored — which is how a
+    // credential rotation silently fails to take effect until the next reconnect.
+    if let Some(endpoint_id) = key.strip_prefix(VOICE_TABLE_PREFIX) {
+        return apply_voice_event(store, auth, decryptor, key, endpoint_id, event).await;
+    }
+
     let Some(hashed) = key.strip_prefix(API_KEY_PREFIX) else {
         return Ok(false);
     };
@@ -177,6 +233,7 @@ pub async fn apply_key_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credentials::CredentialDecryptor;
     use crate::guards::MissGuards;
     use crate::store::MemoryStore;
 
@@ -231,9 +288,16 @@ mod tests {
         assert!(auth.resolve("new").is_none());
 
         store.set("api_key:new", &blob("a", "e1"));
-        apply_key_event(&store, &auth, &guards, "api_key:new", KeyEvent::Set)
-            .await
-            .unwrap();
+        apply_key_event(
+            &store,
+            &auth,
+            &guards,
+            &CredentialDecryptor::disabled(),
+            "api_key:new",
+            KeyEvent::Set,
+        )
+        .await
+        .unwrap();
 
         assert!(auth.resolve("new").is_some());
     }
@@ -250,9 +314,16 @@ mod tests {
             assert!(auth.resolve("h1").is_some());
 
             store.remove("api_key:h1");
-            apply_key_event(&store, &auth, &guards, "api_key:h1", ev)
-                .await
-                .unwrap();
+            apply_key_event(
+                &store,
+                &auth,
+                &guards,
+                &CredentialDecryptor::disabled(),
+                "api_key:h1",
+                ev,
+            )
+            .await
+            .unwrap();
 
             assert!(
                 auth.resolve("h1").is_none(),
@@ -331,9 +402,16 @@ mod tests {
         assert!(guards.try_escalate("bud_x", "h1").is_err());
 
         store.set("api_key:h1", &blob("a", "e1"));
-        apply_key_event(&store, &auth, &guards, "api_key:h1", KeyEvent::Set)
-            .await
-            .unwrap();
+        apply_key_event(
+            &store,
+            &auth,
+            &guards,
+            &CredentialDecryptor::disabled(),
+            "api_key:h1",
+            KeyEvent::Set,
+        )
+        .await
+        .unwrap();
 
         assert!(
             guards.try_escalate("bud_x", "h1").is_ok(),
@@ -346,9 +424,16 @@ mod tests {
         let store = MemoryStore::new();
         let auth = BudAuth::new();
         let guards = MissGuards::default();
-        let touched = apply_key_event(&store, &auth, &guards, "model_table:abc", KeyEvent::Set)
-            .await
-            .unwrap();
+        let touched = apply_key_event(
+            &store,
+            &auth,
+            &guards,
+            &CredentialDecryptor::disabled(),
+            "model_table:abc",
+            KeyEvent::Set,
+        )
+        .await
+        .unwrap();
         assert!(!touched);
     }
 
@@ -563,5 +648,144 @@ mod voice_tests {
             stats.skipped, 1,
             "a wholly unusable table must not look empty"
         );
+    }
+}
+
+#[cfg(test)]
+mod voice_event_tests {
+    use super::*;
+    use crate::credentials::CredentialDecryptor;
+    use crate::guards::MissGuards;
+    use crate::store::MemoryStore;
+
+    fn voice(vendor: &str) -> String {
+        format!(r#"{{"ep-1":{{"vendor":"{vendor}","endpoints":["text_to_speech"]}}}}"#)
+    }
+
+    /// The gap an end-to-end run found: without this, a credential rotation or an endpoint edit
+    /// does not take effect until the next reconnect — which may never come.
+    #[tokio::test]
+    async fn a_voice_table_set_event_updates_the_endpoint() {
+        let store = MemoryStore::new();
+        store.set("voice_table:ep-1", &voice("deepgram"));
+        let auth = BudAuth::new();
+        let guards = MissGuards::default();
+        hydrate_voice_table(&store, &auth, &CredentialDecryptor::disabled())
+            .await
+            .unwrap();
+        assert_eq!(auth.voice_endpoint("ep-1").unwrap().vendor, "deepgram");
+
+        store.set("voice_table:ep-1", &voice("elevenlabs"));
+        let touched = apply_key_event(
+            &store,
+            &auth,
+            &guards,
+            &CredentialDecryptor::disabled(),
+            "voice_table:ep-1",
+            KeyEvent::Set,
+        )
+        .await
+        .unwrap();
+
+        assert!(touched, "a voice_table event was ignored");
+        assert_eq!(
+            auth.voice_endpoint("ep-1").unwrap().vendor,
+            "elevenlabs",
+            "the endpoint update did not take effect"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_voice_table_del_event_removes_the_endpoint() {
+        let store = MemoryStore::new();
+        store.set("voice_table:ep-1", &voice("deepgram"));
+        let auth = BudAuth::new();
+        let guards = MissGuards::default();
+        hydrate_voice_table(&store, &auth, &CredentialDecryptor::disabled())
+            .await
+            .unwrap();
+
+        store.remove("voice_table:ep-1");
+        apply_key_event(
+            &store,
+            &auth,
+            &guards,
+            &CredentialDecryptor::disabled(),
+            "voice_table:ep-1",
+            KeyEvent::Del,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            auth.voice_endpoint("ep-1").is_none(),
+            "a deleted endpoint kept serving with a stale credential"
+        );
+    }
+
+    /// An update whose credential cannot be opened must remove the endpoint, not silently leave
+    /// the previous credential in service.
+    #[tokio::test]
+    async fn an_unopenable_update_removes_rather_than_keeps_the_old_endpoint() {
+        let store = MemoryStore::new();
+        store.set("voice_table:ep-1", &voice("deepgram"));
+        let auth = BudAuth::new();
+        let guards = MissGuards::default();
+        hydrate_voice_table(&store, &auth, &CredentialDecryptor::disabled())
+            .await
+            .unwrap();
+        assert!(auth.voice_endpoint("ep-1").is_some());
+
+        store.set(
+            "voice_table:ep-1",
+            r#"{"ep-1":{"vendor":"deepgram","credential":"deadbeef","endpoints":["text_to_speech"]}}"#,
+        );
+        apply_key_event(
+            &store,
+            &auth,
+            &guards,
+            &CredentialDecryptor::disabled(),
+            "voice_table:ep-1",
+            KeyEvent::Set,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            auth.voice_endpoint("ep-1").is_none(),
+            "an endpoint whose new credential cannot be opened kept serving with the old one"
+        );
+    }
+
+    /// A voice event must not disturb the credential map, and vice versa.
+    #[tokio::test]
+    async fn voice_and_api_key_events_do_not_interfere() {
+        let store = MemoryStore::new();
+        store.set("api_key:h1", r#"{"tts":{"endpoint_id":"ep-1"}}"#);
+        store.set("voice_table:ep-1", &voice("deepgram"));
+        let auth = BudAuth::new();
+        let guards = MissGuards::default();
+        hydrate_all(&store, &auth).await.unwrap();
+        hydrate_voice_table(&store, &auth, &CredentialDecryptor::disabled())
+            .await
+            .unwrap();
+
+        store.set("voice_table:ep-1", &voice("cartesia"));
+        apply_key_event(
+            &store,
+            &auth,
+            &guards,
+            &CredentialDecryptor::disabled(),
+            "voice_table:ep-1",
+            KeyEvent::Set,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            auth.resolve("h1").is_some(),
+            "a voice event revoked a credential"
+        );
+        assert_eq!(auth.voice_endpoint("ep-1").unwrap().vendor, "cartesia");
     }
 }

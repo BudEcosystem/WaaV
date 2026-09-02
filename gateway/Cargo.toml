@@ -76,6 +76,9 @@ turn-ensemble = ["smart-turn", "turn-detect", "silero-vad"]
 # security-critical auth plane has a test cycle measured in seconds rather than one that
 # rebuilds the WebRTC stack.
 bud-auth = { path = "../bud-auth" }
+# OpenAI-compatible audio request translation (FRD-018). Separate crate for the same reason
+# as bud-auth: pure mapping logic that tests in milliseconds instead of minutes.
+waav-openai-audio = { path = "../waav-openai-audio" }
 async-trait = "0.1.88"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
