@@ -153,6 +153,20 @@ utoipa = { version = "5.3", optional = true, features = ["axum_extras"] }
 
 # LiveKit
 livekit = "=0.7.24"
+# The libwebrtc chain must be pinned explicitly, not left to resolution.
+#
+# livekit 0.7.24 declares `libwebrtc = "0.3.19"`, but libwebrtc broke compatibility INSIDE its
+# own 0.3.x line (required fields added to KeyProviderOptions; RtcConfiguration became
+# non_exhaustive). Cargo resolves forward as semver permits, and livekit then does not compile.
+#
+# Each pin decides what the one below it downloads, so all three are needed. Getting
+# webrtc-sys-build wrong is the confusing failure: the download succeeds and the C++ headers
+# then reference a `cricket` namespace the newer prebuilt artifact no longer has.
+#
+# These are direct dependencies only so the pin is visible and reviewable; nothing in this
+# crate calls them. See BUILD_NOTES.md.
+libwebrtc = "=0.3.19"
+webrtc-sys = "=0.3.16"
 livekit-api = "=0.4.9"
 livekit-protocol = "=0.5.1"
 # Need prost/pbjson-types for SIP API client, using same versions as livekit to avoid conflicts
