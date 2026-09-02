@@ -72,6 +72,10 @@ silero-vad = [
 turn-ensemble = ["smart-turn", "turn-detect", "silero-vad"]
 
 [dependencies]
+# Bud control-plane identity and credentials (FRD-018). A separate crate so the
+# security-critical auth plane has a test cycle measured in seconds rather than one that
+# rebuilds the WebRTC stack.
+bud-auth = { path = "../bud-auth" }
 async-trait = "0.1.88"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"

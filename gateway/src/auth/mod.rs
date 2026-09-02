@@ -1,4 +1,5 @@
-pub mod bud;
+
+pub mod bud_mode;
 pub mod api_secret;
 pub mod client;
 pub mod context;
