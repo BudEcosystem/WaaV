@@ -85,7 +85,8 @@ impl ControlPlaneStore for MemoryStore {
     }
 
     async fn scan(&self, pattern: &str) -> Result<HashMap<String, String>, StoreError> {
-        self.scans.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.scans
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.is_down() {
             return Err(StoreError::Unavailable("connection down".into()));
         }

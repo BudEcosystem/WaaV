@@ -5,8 +5,8 @@
 //! reconnect — and the readiness signal that stops a pod serving 401s while it waits for its
 //! first sweep.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::authz::{self, AuthzTier};
@@ -116,8 +116,10 @@ impl BudPlane {
         key: &str,
         event: KeyEvent,
     ) -> Result<(), crate::store::StoreError> {
-        self.last_event_ms_plus_one
-            .store(self.origin.elapsed().as_millis() as u64 + 1, Ordering::Relaxed);
+        self.last_event_ms_plus_one.store(
+            self.origin.elapsed().as_millis() as u64 + 1,
+            Ordering::Relaxed,
+        );
         hydrate::apply_key_event(self.store.as_ref(), &self.auth, &self.guards, key, event).await?;
         Ok(())
     }
@@ -246,12 +248,11 @@ impl BudPlane {
         if self.auth.lookup_alias(&hashed, alias).is_some() {
             return true;
         }
-        if let Some(jwt) = &self.jwt {
-            if let Some(identity) = jwt.cached_identity(&hashed) {
-                if let Some(entry) = jwt.cached_authz(&identity.sub) {
-                    return entry.aliases.contains_key(alias);
-                }
-            }
+        if let Some(jwt) = &self.jwt
+            && let Some(identity) = jwt.cached_identity(&hashed)
+            && let Some(entry) = jwt.cached_authz(&identity.sub)
+        {
+            return entry.aliases.contains_key(alias);
         }
         self.published.load().contains_key(alias)
     }
@@ -299,7 +300,10 @@ mod tests {
         for (k, v) in keys {
             store.set(k, v);
         }
-        let plane = Arc::new(BudPlane::new(Arc::clone(&store) as Arc<dyn ControlPlaneStore>, None));
+        let plane = Arc::new(BudPlane::new(
+            Arc::clone(&store) as Arc<dyn ControlPlaneStore>,
+            None,
+        ));
         plane.boot().await.unwrap();
         (store, plane)
     }
@@ -355,7 +359,10 @@ mod tests {
     #[tokio::test]
     async fn an_empty_bearer_is_missing_not_unauthorized() {
         let (_s, plane) = plane_with(&[]).await;
-        assert_eq!(plane.authenticate("   ").await.unwrap_err(), AuthFailure::Missing);
+        assert_eq!(
+            plane.authenticate("   ").await.unwrap_err(),
+            AuthFailure::Missing
+        );
     }
 
     /// TC-AUTH-08 — revocation propagates through the keyspace event, not a TTL.
@@ -450,7 +457,10 @@ mod tests {
     async fn staleness_gauge_tracks_events() {
         let (_s, plane) = plane_with(&[]).await;
         assert!(plane.seconds_since_last_event().is_none());
-        plane.on_key_event("api_key:x", KeyEvent::Del).await.unwrap();
+        plane
+            .on_key_event("api_key:x", KeyEvent::Del)
+            .await
+            .unwrap();
         assert!(plane.seconds_since_last_event().is_some());
     }
 }

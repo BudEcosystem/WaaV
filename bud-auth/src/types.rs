@@ -115,9 +115,10 @@ mod tests {
         assert!(!older.published_only);
         assert!(older.projects.is_empty());
 
-        let newer: UserProjects =
-            serde_json::from_str(r#"{"user_id":"u","published_only":true,"projects":[],"future":1}"#)
-                .unwrap();
+        let newer: UserProjects = serde_json::from_str(
+            r#"{"user_id":"u","published_only":true,"projects":[],"future":1}"#,
+        )
+        .unwrap();
         assert!(newer.published_only);
     }
 

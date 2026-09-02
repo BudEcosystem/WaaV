@@ -29,6 +29,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 
 # Vendor-credential decryption, matching budgateway's encryption.rs.
 rsa = { version = "0.9", features = ["sha2"] }
+pkcs1 = "0.7"
 base64 = "0.22.0"
 
 async-trait = "0.1.88"
@@ -37,3 +38,4 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1.46.0", features = ["full", "test-util"] }
+futures-util = "0.3"

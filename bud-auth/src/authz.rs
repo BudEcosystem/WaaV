@@ -106,7 +106,10 @@ pub async fn resolve(
     // them directly is what removes a per-token fan-out to budapp.
     let mut union = AliasMap::new();
     for project in &blob.projects {
-        match store.get(&format!("{PROJECT_MODELS_PREFIX}{project}")).await {
+        match store
+            .get(&format!("{PROJECT_MODELS_PREFIX}{project}"))
+            .await
+        {
             Ok(Some(raw)) => match crate::hydrate::parse_api_key_blob(&raw) {
                 Ok((aliases, _)) => union.extend(aliases),
                 Err(e) => {
@@ -169,7 +172,10 @@ mod tests {
         let store = MemoryStore::new();
         let r = resolve(&store, "nobody", overlay()).await;
         assert_eq!(r.tier, AuthzTier::Published);
-        assert!(r.tier.is_cacheable(), "an authoritative absence must be cacheable");
+        assert!(
+            r.tier.is_cacheable(),
+            "an authoritative absence must be cacheable"
+        );
     }
 
     #[tokio::test]
@@ -230,7 +236,10 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_blob_shape_falls_back_to_published() {
         let store = MemoryStore::new();
-        store.set("user_projects:u1", r#"{"totally":"different","shape":[1,2]}"#);
+        store.set(
+            "user_projects:u1",
+            r#"{"totally":"different","shape":[1,2]}"#,
+        );
 
         let r = resolve(&store, "u1", overlay()).await;
 
@@ -259,7 +268,10 @@ mod tests {
             "user_projects:u1",
             r#"{"user_id":"u1","published_only":false,"projects":[]}"#,
         );
-        assert_eq!(resolve(&store, "u1", overlay()).await.tier, AuthzTier::Published);
+        assert_eq!(
+            resolve(&store, "u1", overlay()).await.tier,
+            AuthzTier::Published
+        );
     }
 
     /// A partial union is a wrong answer, not a smaller one.

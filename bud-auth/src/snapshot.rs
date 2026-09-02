@@ -89,16 +89,28 @@ impl BudAuth {
     /// explicitly, which keeps that cost visible at the call site rather than paying it on
     /// every request (TC-AUTH-04).
     pub fn resolve(&self, hashed_key: &str) -> Option<Arc<AliasMap>> {
-        self.snapshot.load().api_keys.get(hashed_key).map(Arc::clone)
+        self.snapshot
+            .load()
+            .api_keys
+            .get(hashed_key)
+            .map(Arc::clone)
     }
 
     /// Attribution for a hashed key, if budapp published any.
     pub fn metadata(&self, hashed_key: &str) -> Option<Arc<AuthMetadata>> {
-        self.snapshot.load().metadata.get(hashed_key).map(Arc::clone)
+        self.snapshot
+            .load()
+            .metadata
+            .get(hashed_key)
+            .map(Arc::clone)
     }
 
     /// Look up one alias inside a key's allowlist.
-    pub fn lookup_alias(&self, hashed_key: &str, alias: &str) -> Option<crate::types::AliasMetadata> {
+    pub fn lookup_alias(
+        &self,
+        hashed_key: &str,
+        alias: &str,
+    ) -> Option<crate::types::AliasMetadata> {
         self.snapshot
             .load()
             .api_keys
@@ -129,7 +141,10 @@ impl BudAuth {
 
         // Held across the whole load -> clone -> mutate -> store cycle. Without it, two
         // concurrent writers silently drop one another's deltas.
-        #[expect(clippy::expect_used, reason = "a poisoned auth writer is unrecoverable")]
+        #[expect(
+            clippy::expect_used,
+            reason = "a poisoned auth writer is unrecoverable"
+        )]
         let _guard = self.writer.lock().expect("bud auth writer mutex poisoned");
 
         let mut next = self.snapshot.load().clone_contents();
@@ -165,7 +180,10 @@ impl BudAuth {
         api_keys: HashMap<Arc<str>, Arc<AliasMap>>,
         metadata: HashMap<Arc<str>, Arc<AuthMetadata>>,
     ) {
-        #[expect(clippy::expect_used, reason = "a poisoned auth writer is unrecoverable")]
+        #[expect(
+            clippy::expect_used,
+            reason = "a poisoned auth writer is unrecoverable"
+        )]
         let _guard = self.writer.lock().expect("bud auth writer mutex poisoned");
         self.snapshot
             .store(Arc::new(BudSnapshot { api_keys, metadata }));
@@ -210,7 +228,8 @@ mod tests {
 
         let got = auth.resolve("h1").expect("seeded key must resolve");
         assert_eq!(
-            got.get("tts-deepgram").and_then(|a| a.endpoint_id.as_deref()),
+            got.get("tts-deepgram")
+                .and_then(|a| a.endpoint_id.as_deref()),
             Some("e-1")
         );
         assert_eq!(

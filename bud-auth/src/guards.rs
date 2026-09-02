@@ -15,8 +15,8 @@
 //!    the load bound, for the reason in (2).
 
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -151,8 +151,10 @@ impl CircuitBreaker {
     fn record_failure(&self) {
         let n = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
         if n >= self.threshold {
-            self.open_until_ms
-                .store(self.now_ms() + self.cooldown.as_millis() as u64, Ordering::Relaxed);
+            self.open_until_ms.store(
+                self.now_ms() + self.cooldown.as_millis() as u64,
+                Ordering::Relaxed,
+            );
         }
     }
 }
@@ -185,7 +187,11 @@ impl MissGuards {
     ///
     /// Order matters: the cheapest, most-bounding checks run first, so junk never reaches the
     /// semaphore and a known-absent key never consumes a slot.
-    pub fn try_escalate(&self, raw_key: &str, hashed_key: &str) -> Result<EscalationPermit, Denied> {
+    pub fn try_escalate(
+        &self,
+        raw_key: &str,
+        hashed_key: &str,
+    ) -> Result<EscalationPermit, Denied> {
         if !KeyShape::classify(raw_key).may_escalate() {
             return Err(Denied::Shape);
         }
@@ -325,7 +331,10 @@ mod tests {
         );
 
         drop(held);
-        assert!(g.try_escalate("bud_x", "h-after").is_ok(), "slots not released on drop");
+        assert!(
+            g.try_escalate("bud_x", "h-after").is_ok(),
+            "slots not released on drop"
+        );
     }
 
     /// TC-GUARD-03 / TC-GUARD-04

@@ -61,7 +61,10 @@ mod tests {
     fn is_lowercase_hex_of_fixed_width() {
         let h = hash_api_key("anything");
         assert_eq!(h.len(), 64);
-        assert!(h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            h.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 
     /// The prefix must actually participate; hashing the bare key would still produce a

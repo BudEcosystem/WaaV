@@ -250,9 +250,14 @@ mod tests {
             assert!(auth.resolve("h1").is_some());
 
             store.remove("api_key:h1");
-            apply_key_event(&store, &auth, &guards, "api_key:h1", ev).await.unwrap();
+            apply_key_event(&store, &auth, &guards, "api_key:h1", ev)
+                .await
+                .unwrap();
 
-            assert!(auth.resolve("h1").is_none(), "{ev:?} did not remove the key");
+            assert!(
+                auth.resolve("h1").is_none(),
+                "{ev:?} did not remove the key"
+            );
         }
     }
 
@@ -289,11 +294,7 @@ mod tests {
     fn hydrate_all_has_three_call_sites() {
         // definition + boot + reconnect. Counted across the crate's own source so that deleting
         // the reconnect call is caught here rather than in production.
-        let sources = [
-            include_str!("hydrate.rs"),
-            include_str!("runtime.rs"),
-        ]
-        .join("\n");
+        let sources = [include_str!("hydrate.rs"), include_str!("runtime.rs")].join("\n");
         let call_sites = sources.matches("hydrate_all(").count();
         assert!(
             call_sites >= 3,

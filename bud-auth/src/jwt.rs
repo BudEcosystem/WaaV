@@ -17,8 +17,8 @@
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
 
@@ -85,7 +85,11 @@ impl JwtConfig {
     }
 
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<Self> {
-        let non_empty = |k: &str| get(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let non_empty = |k: &str| {
+            get(k)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
         let u64_or = |k: &str, d: u64| {
             get(k)
                 .and_then(|v| v.trim().parse::<u64>().ok())
@@ -104,8 +108,12 @@ impl JwtConfig {
             return None;
         }
 
-        let jwks_url = non_empty("OIDC_JWKS_URL")
-            .unwrap_or_else(|| format!("{}/protocol/openid-connect/certs", issuer.trim_end_matches('/')));
+        let jwks_url = non_empty("OIDC_JWKS_URL").unwrap_or_else(|| {
+            format!(
+                "{}/protocol/openid-connect/certs",
+                issuer.trim_end_matches('/')
+            )
+        });
 
         Some(Self {
             issuer,
@@ -313,7 +321,10 @@ impl JwtVerifier {
 
     /// Verify a bearer and return the identity it authenticates.
     pub async fn verify(&self, raw: &str) -> Result<VerifiedIdentity, Rejection> {
-        if !matches!(crate::guards::KeyShape::classify(raw), crate::guards::KeyShape::Jwt) {
+        if !matches!(
+            crate::guards::KeyShape::classify(raw),
+            crate::guards::KeyShape::Jwt
+        ) {
             return Err(Rejection::Shape);
         }
         let hashed = hash_api_key(raw);
@@ -356,14 +367,15 @@ impl JwtVerifier {
         validation.required_spec_claims = ["exp", "iss"].iter().map(|s| s.to_string()).collect();
 
         self.verifications.fetch_add(1, Ordering::Relaxed);
-        let decoded = jsonwebtoken::decode::<serde_json::Value>(raw, &key, &validation).map_err(|e| {
-            use jsonwebtoken::errors::ErrorKind;
-            match e.kind() {
-                ErrorKind::ExpiredSignature => Rejection::Expired,
-                ErrorKind::InvalidIssuer => Rejection::WrongIssuer,
-                _ => Rejection::BadSignature,
-            }
-        });
+        let decoded =
+            jsonwebtoken::decode::<serde_json::Value>(raw, &key, &validation).map_err(|e| {
+                use jsonwebtoken::errors::ErrorKind;
+                match e.kind() {
+                    ErrorKind::ExpiredSignature => Rejection::Expired,
+                    ErrorKind::InvalidIssuer => Rejection::WrongIssuer,
+                    _ => Rejection::BadSignature,
+                }
+            });
 
         let decoded = match decoded {
             Ok(d) => d,
@@ -581,7 +593,10 @@ mod tests {
     #[tokio::test]
     async fn verifies_a_well_formed_token() {
         let v = primed(StaticSource::ok()).await;
-        let id = v.verify(&token(valid_claims(600), "test-key-1")).await.unwrap();
+        let id = v
+            .verify(&token(valid_claims(600), "test-key-1"))
+            .await
+            .unwrap();
         assert_eq!(id.sub, "user-abc");
     }
 
@@ -594,7 +609,9 @@ mod tests {
     async fn a_forged_token_carrying_a_known_sub_is_rejected() {
         let v = primed(StaticSource::ok()).await;
 
-        v.verify(&token(valid_claims(600), "test-key-1")).await.unwrap();
+        v.verify(&token(valid_claims(600), "test-key-1"))
+            .await
+            .unwrap();
 
         // Same `sub`, same header, signature replaced.
         let genuine = token(valid_claims(600), "test-key-1");
@@ -613,7 +630,10 @@ mod tests {
     fn verifier_absent_unless_issuer_and_allowlist_are_both_present() {
         let only_issuer =
             JwtConfig::from_lookup(|k| (k == "OIDC_ISSUER").then(|| ISSUER.to_string()));
-        assert!(only_issuer.is_none(), "an issuer alone configured a verifier");
+        assert!(
+            only_issuer.is_none(),
+            "an issuer alone configured a verifier"
+        );
 
         let comma_only = JwtConfig::from_lookup(|k| match k {
             "OIDC_ISSUER" => Some(ISSUER.to_string()),
@@ -641,7 +661,9 @@ mod tests {
         let after_prime = src.calls();
 
         for i in 0..100 {
-            let _ = v.verify(&token(valid_claims(600), &format!("unknown-{i}"))).await;
+            let _ = v
+                .verify(&token(valid_claims(600), &format!("unknown-{i}")))
+                .await;
         }
 
         assert_eq!(
@@ -661,7 +683,11 @@ mod tests {
         for _ in 0..50 {
             let _ = v.verify(&token(valid_claims(600), "test-key-1")).await;
         }
-        assert!(src.calls() <= 2, "failing jwks fetched {} times", src.calls());
+        assert!(
+            src.calls() <= 2,
+            "failing jwks fetched {} times",
+            src.calls()
+        );
     }
 
     /// TC-JWT-04 — invariant 4.
@@ -679,7 +705,11 @@ mod tests {
         let r = v.verify(&token(valid_claims(600), "test-key-1")).await;
         assert_eq!(r.unwrap_err(), Rejection::Overloaded);
         drop(held);
-        assert!(v.verify(&token(valid_claims(600), "test-key-1")).await.is_ok());
+        assert!(
+            v.verify(&token(valid_claims(600), "test-key-1"))
+                .await
+                .is_ok()
+        );
     }
 
     /// TC-JWT-06 — invariant 6, both directions.
@@ -741,7 +771,9 @@ mod tests {
     async fn an_expired_token_is_rejected() {
         let v = primed(StaticSource::ok()).await;
         assert_eq!(
-            v.verify(&token(valid_claims(-3600), "test-key-1")).await.unwrap_err(),
+            v.verify(&token(valid_claims(-3600), "test-key-1"))
+                .await
+                .unwrap_err(),
             Rejection::Expired
         );
     }
