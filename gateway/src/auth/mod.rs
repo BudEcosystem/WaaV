@@ -1,3 +1,4 @@
+pub mod bud;
 pub mod api_secret;
 pub mod client;
 pub mod context;

@@ -1,0 +1,39 @@
+[package]
+name = "bud-auth"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Bud control-plane identity and credential resolution for WaaV: zero request-path I/O, same Redis namespace as budgateway."
+publish = false
+
+[dependencies]
+# Hashing — the cross-service contract with budgateway/budapp.
+sha2 = "0.10"
+hex = "0.4"
+
+# Hot path: lock-free snapshot + sharded maps for the miss/JWT caches.
+arc-swap = "1.7"
+dashmap = "6.1.0"
+
+# Async primitives (semaphores, mutexes) and the Redis client.
+tokio = { version = "1.46.0", features = ["sync", "rt", "time", "macros"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "aio", "connection-manager"] }
+
+# Wire types.
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+
+# JWT verification (same major as budgateway, so semantics match).
+jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Vendor-credential decryption, matching budgateway's encryption.rs.
+rsa = { version = "0.9", features = ["sha2"] }
+base64 = "0.22.0"
+
+async-trait = "0.1.88"
+thiserror = "2.0.12"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.46.0", features = ["full", "test-util"] }
