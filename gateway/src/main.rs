@@ -177,7 +177,9 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(state) = std::sync::Arc::get_mut(&mut app_state) {
                     state.bud_mode = Some(bud);
                 } else {
-                    eprintln!("FATAL: application state was already shared; cannot install the Bud control plane");
+                    eprintln!(
+                        "FATAL: application state was already shared; cannot install the Bud control plane"
+                    );
                     std::process::exit(1);
                 }
                 println!("Bud control plane active: identity and voice endpoints resolved locally");

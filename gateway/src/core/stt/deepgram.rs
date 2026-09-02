@@ -222,9 +222,17 @@ impl DeepgramSTT {
         url.push_str("&channels=");
         url.push_str(&config.base.channels.to_string());
         url.push_str("&punctuate=");
-        url.push_str(if config.base.punctuation { "true" } else { "false" });
+        url.push_str(if config.base.punctuation {
+            "true"
+        } else {
+            "false"
+        });
         url.push_str("&interim_results=");
-        url.push_str(if config.interim_results { "true" } else { "false" });
+        url.push_str(if config.interim_results {
+            "true"
+        } else {
+            "false"
+        });
         url.push_str("&smart_format=");
         url.push_str(if config.smart_format { "true" } else { "false" });
         url.push_str("&encoding=");

@@ -186,11 +186,8 @@ impl<T: Copy + Default> TestAlignedBuffer<T> {
             };
         }
 
-        let layout = Layout::from_size_align(
-            capacity * std::mem::size_of::<T>(),
-            CACHE_LINE_SIZE,
-        )
-        .expect("Invalid layout");
+        let layout = Layout::from_size_align(capacity * std::mem::size_of::<T>(), CACHE_LINE_SIZE)
+            .expect("Invalid layout");
 
         // SAFETY: Layout is valid and non-zero
         let ptr = unsafe {
@@ -230,7 +227,12 @@ impl<T: Copy + Default> TestAlignedBuffer<T> {
         match self.ptr {
             Some(ptr) => {
                 // Debug assertions for safety
-                debug_assert!(self.len <= self.capacity, "len {} > capacity {}", self.len, self.capacity);
+                debug_assert!(
+                    self.len <= self.capacity,
+                    "len {} > capacity {}",
+                    self.len,
+                    self.capacity
+                );
                 debug_assert!(!ptr.as_ptr().is_null(), "null pointer in AlignedBuffer");
 
                 // SAFETY: ptr is valid, len <= capacity (checked in debug)
@@ -246,7 +248,12 @@ impl<T: Copy + Default> TestAlignedBuffer<T> {
         if let Some(ptr) = self.ptr {
             if new_len > self.len {
                 // Debug assertions for bounds checking
-                debug_assert!(new_len <= self.capacity, "new_len {} > capacity {}", new_len, self.capacity);
+                debug_assert!(
+                    new_len <= self.capacity,
+                    "new_len {} > capacity {}",
+                    new_len,
+                    self.capacity
+                );
 
                 // SAFETY: bounds checked above
                 unsafe {

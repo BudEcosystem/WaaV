@@ -95,7 +95,9 @@ impl EVIVersion {
         match version {
             "1" | "2" => Err(EVIConfigError::DeprecatedVersion {
                 version: version.to_string(),
-                message: "Hume EVI v1/v2 were sunset on August 30, 2025. Please migrate to v3 or v4-mini".to_string(),
+                message:
+                    "Hume EVI v1/v2 were sunset on August 30, 2025. Please migrate to v3 or v4-mini"
+                        .to_string(),
                 migration_guide: "https://dev.hume.ai/docs/evi-version".to_string(),
             }),
             "3" => Ok(EVIVersion::V3),
@@ -133,7 +135,9 @@ impl EVIVersion {
             );
             return Err(EVIConfigError::DeprecatedVersion {
                 version: self.as_str().to_string(),
-                message: "Hume EVI v1/v2 were sunset on August 30, 2025. Please migrate to v3 or v4-mini".to_string(),
+                message:
+                    "Hume EVI v1/v2 were sunset on August 30, 2025. Please migrate to v3 or v4-mini"
+                        .to_string(),
                 migration_guide: "https://dev.hume.ai/docs/evi-version".to_string(),
             });
         }
@@ -466,21 +470,30 @@ mod tests {
     fn test_evi_version_from_str_unknown() {
         let result = EVIVersion::from_version_str("5");
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EVIConfigError::UnknownVersion(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            EVIConfigError::UnknownVersion(_)
+        ));
     }
 
     #[test]
     fn test_evi_version_validate_v1_fails() {
         let result = EVIVersion::V1.validate();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EVIConfigError::DeprecatedVersion { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            EVIConfigError::DeprecatedVersion { .. }
+        ));
     }
 
     #[test]
     fn test_evi_version_validate_v2_fails() {
         let result = EVIVersion::V2.validate();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EVIConfigError::DeprecatedVersion { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            EVIConfigError::DeprecatedVersion { .. }
+        ));
     }
 
     #[test]
@@ -580,7 +593,10 @@ mod tests {
         let config = HumeEVIConfig::new("test-key").with_version(EVIVersion::V1);
         let result = config.validate();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EVIConfigError::DeprecatedVersion { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            EVIConfigError::DeprecatedVersion { .. }
+        ));
     }
 
     #[test]
@@ -588,7 +604,10 @@ mod tests {
         let config = HumeEVIConfig::new("test-key").with_version(EVIVersion::V2);
         let result = config.validate();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EVIConfigError::DeprecatedVersion { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            EVIConfigError::DeprecatedVersion { .. }
+        ));
     }
 
     #[test]
@@ -609,7 +628,10 @@ mod tests {
         };
         let result = config.validate();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EVIConfigError::InvalidSampleRate));
+        assert!(matches!(
+            result.unwrap_err(),
+            EVIConfigError::InvalidSampleRate
+        ));
     }
 
     #[test]
@@ -621,7 +643,10 @@ mod tests {
         };
         let result = config.validate();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EVIConfigError::InvalidChannels));
+        assert!(matches!(
+            result.unwrap_err(),
+            EVIConfigError::InvalidChannels
+        ));
     }
 
     #[test]
@@ -691,7 +716,10 @@ mod tests {
         // But validation should fail
         let result = config.validate();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EVIConfigError::DeprecatedVersion { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            EVIConfigError::DeprecatedVersion { .. }
+        ));
     }
 
     #[test]
@@ -716,15 +744,37 @@ mod tests {
         let err = result.unwrap_err();
         let err_string = err.to_string();
 
-        assert!(err_string.contains("hume.ai"), "Error should include migration URL");
-        assert!(err_string.contains("2025"), "Error should include sunset year");
+        assert!(
+            err_string.contains("hume.ai"),
+            "Error should include migration URL"
+        );
+        assert!(
+            err_string.contains("2025"),
+            "Error should include sunset year"
+        );
     }
 
     #[test]
     fn test_error_display() {
-        assert!(EVIConfigError::MissingApiKey.to_string().contains("API key"));
-        assert!(EVIConfigError::InvalidSampleRate.to_string().contains("Sample rate"));
-        assert!(EVIConfigError::InvalidChannels.to_string().contains("Channels"));
-        assert!(EVIConfigError::UnknownVersion("5".into()).to_string().contains("5"));
+        assert!(
+            EVIConfigError::MissingApiKey
+                .to_string()
+                .contains("API key")
+        );
+        assert!(
+            EVIConfigError::InvalidSampleRate
+                .to_string()
+                .contains("Sample rate")
+        );
+        assert!(
+            EVIConfigError::InvalidChannels
+                .to_string()
+                .contains("Channels")
+        );
+        assert!(
+            EVIConfigError::UnknownVersion("5".into())
+                .to_string()
+                .contains("5")
+        );
     }
 }

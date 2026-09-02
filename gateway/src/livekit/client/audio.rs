@@ -288,10 +288,7 @@ impl LiveKitClient {
                         Err(e) => {
                             // Immediate queue on failure - NO RETRIES, NO SLEEP
                             // This is critical for real-time audio latency guarantees
-                            debug!(
-                                "Capture frame failed, immediately queueing: {:?}",
-                                e
-                            );
+                            debug!("Capture frame failed, immediately queueing: {:?}", e);
 
                             // Apply bounded queue with backpressure - drop oldest if queue is too large
                             let mut queue = audio_queue.lock().await;

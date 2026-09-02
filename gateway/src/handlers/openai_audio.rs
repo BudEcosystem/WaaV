@@ -15,14 +15,14 @@
 use axum::{
     body::Bytes,
     extract::State,
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use std::sync::Arc;
 use tracing::{info, warn};
 use waav_openai_audio::{
-    speech::{self, AudioFormat, SpeechRequest},
     AudioError,
+    speech::{self, AudioFormat, SpeechRequest},
 };
 
 use crate::state::AppState;
@@ -133,10 +133,7 @@ pub async fn speech_handler(
         // Cleared for every compressed format. TTSConfig defaults to Some(24000), and a vendor
         // rejects a sample rate alongside a container that carries its own — Deepgram answers
         // `sample_rate is not applicable when encoding=mp3` and the whole request 400s.
-        sample_rate: settings
-            .format
-            .accepts_sample_rate()
-            .then_some(24000),
+        sample_rate: settings.format.accepts_sample_rate().then_some(24000),
         ..Default::default()
     };
 

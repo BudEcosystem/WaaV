@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bud_auth::hydrate::KeyEvent;
-use bud_auth::redis_store::{event_from_channel, keyspace_patterns, RedisStore};
+use bud_auth::redis_store::{RedisStore, event_from_channel, keyspace_patterns};
 use bud_auth::{AuthFailure, BudPlane, ControlPlaneStore, JwtConfig, JwtVerifier, Principal};
 
 use crate::auth::context::Auth;
@@ -32,19 +32,29 @@ pub struct BudModeConfig {
 impl BudModeConfig {
     /// `None` when bud mode is not configured, which leaves the external auth path in place.
     pub fn from_env() -> Option<Self> {
-        let redis_url = std::env::var("WAAV_REDIS_URL")
-            .ok()
-            .filter(|v| !v.trim().is_empty())?;
-        let redis_db = std::env::var("WAAV_REDIS_DB")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// The same logic over an injected lookup.
+    ///
+    /// Tests use this rather than mutating the process environment: `set_var` is global, and a
+    /// parallel test runner will leak it into whatever else is running — which is exactly how
+    /// an unrelated config test started failing.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        let non_empty = |k: &str| {
+            get(k)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+
+        let redis_url = non_empty("WAAV_REDIS_URL")?;
+        let redis_db = non_empty("WAAV_REDIS_DB")
+            .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         Some(Self {
             redis_url,
             redis_db,
-            rsa_private_key_path: std::env::var("WAAV_RSA_PRIVATE_KEY_PATH")
-                .ok()
-                .filter(|v| !v.trim().is_empty()),
+            rsa_private_key_path: non_empty("WAAV_RSA_PRIVATE_KEY_PATH"),
         })
     }
 }
@@ -101,7 +111,9 @@ impl BudMode {
                         d
                     }
                     Err(e) => {
-                        return Err(format!("RSA private key at {path} could not be loaded: {e}"));
+                        return Err(format!(
+                            "RSA private key at {path} could not be loaded: {e}"
+                        ));
                     }
                 },
                 Err(e) => return Err(format!("RSA private key at {path} could not be read: {e}")),
@@ -276,19 +288,40 @@ mod tests {
     fn bud_mode_is_absent_without_a_redis_url() {
         // Absence must leave the external auth path in place rather than half-enabling a
         // control plane with nowhere to read from.
-        temp_env_clear("WAAV_REDIS_URL");
-        assert!(BudModeConfig::from_env().is_none());
+        assert!(BudModeConfig::from_lookup(|_| None).is_none());
     }
 
     #[test]
     fn a_blank_redis_url_counts_as_absent() {
-        // An empty value in a Helm template is the common shape of "not configured".
-        unsafe { std::env::set_var("WAAV_REDIS_URL", "   ") };
-        assert!(BudModeConfig::from_env().is_none());
-        temp_env_clear("WAAV_REDIS_URL");
+        // An empty value is the shape "not configured" takes in a Helm template.
+        assert!(
+            BudModeConfig::from_lookup(|k| (k == "WAAV_REDIS_URL").then(|| "   ".to_string()))
+                .is_none()
+        );
     }
 
-    fn temp_env_clear(k: &str) {
-        unsafe { std::env::remove_var(k) };
+    #[test]
+    fn a_configured_url_yields_a_config() {
+        let cfg = BudModeConfig::from_lookup(|k| match k {
+            "WAAV_REDIS_URL" => Some("redis://localhost:6379/6".to_string()),
+            "WAAV_REDIS_DB" => Some("6".to_string()),
+            _ => None,
+        })
+        .expect("configured");
+        assert_eq!(cfg.redis_db, 6);
+        assert!(cfg.rsa_private_key_path.is_none());
+    }
+
+    #[test]
+    fn the_database_defaults_to_zero_when_unparseable() {
+        // A malformed value must not silently select a different database from the one
+        // budgateway reads — but nor should it stop the process starting.
+        let cfg = BudModeConfig::from_lookup(|k| match k {
+            "WAAV_REDIS_URL" => Some("redis://localhost:6379".to_string()),
+            "WAAV_REDIS_DB" => Some("not-a-number".to_string()),
+            _ => None,
+        })
+        .expect("configured");
+        assert_eq!(cfg.redis_db, 0);
     }
 }

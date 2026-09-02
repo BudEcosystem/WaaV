@@ -194,7 +194,12 @@ impl<T: Copy + Default> AlignedBuffer<T> {
         }
         // Debug assertion for safety invariant
         // Note: self.ptr is NonNull, so null check is unnecessary
-        debug_assert!(self.len <= self.capacity, "len {} > capacity {}", self.len, self.capacity);
+        debug_assert!(
+            self.len <= self.capacity,
+            "len {} > capacity {}",
+            self.len,
+            self.capacity
+        );
 
         // SAFETY: ptr is valid (NonNull guarantees non-null) and len <= capacity
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
@@ -208,7 +213,12 @@ impl<T: Copy + Default> AlignedBuffer<T> {
         }
         // Debug assertion for safety invariant
         // Note: self.ptr is NonNull, so null check is unnecessary
-        debug_assert!(self.len <= self.capacity, "len {} > capacity {}", self.len, self.capacity);
+        debug_assert!(
+            self.len <= self.capacity,
+            "len {} > capacity {}",
+            self.len,
+            self.capacity
+        );
 
         // SAFETY: ptr is valid (NonNull guarantees non-null) and len <= capacity
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
@@ -224,14 +234,24 @@ impl<T: Copy + Default> AlignedBuffer<T> {
         if new_len > self.len {
             // Debug assertion for bounds checking
             // Note: self.ptr is NonNull, so null check is unnecessary
-            debug_assert!(new_len <= self.capacity, "new_len {} > capacity {}", new_len, self.capacity);
+            debug_assert!(
+                new_len <= self.capacity,
+                "new_len {} > capacity {}",
+                new_len,
+                self.capacity
+            );
 
             // Initialize new elements
             // SAFETY: ptr is valid (NonNull guarantees non-null) and new_len <= capacity
             unsafe {
                 let start = self.ptr.as_ptr().add(self.len);
                 for i in 0..(new_len - self.len) {
-                    debug_assert!(self.len + i < self.capacity, "write index {} >= capacity {}", self.len + i, self.capacity);
+                    debug_assert!(
+                        self.len + i < self.capacity,
+                        "write index {} >= capacity {}",
+                        self.len + i,
+                        self.capacity
+                    );
                     std::ptr::write(start.add(i), value);
                 }
             }

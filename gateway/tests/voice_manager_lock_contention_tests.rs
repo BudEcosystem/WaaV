@@ -9,8 +9,8 @@
 //! 3. Smart turn processing is optional/skippable when lock is busy
 //! 4. Latency stays within budget (< 10ms for audio forwarding)
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, RwLock};
@@ -304,8 +304,7 @@ async fn test_individual_latency_meets_requirements() {
 
     for _ in 0..100 {
         let audio_data = vec![0u8; 640];
-        let (latency, _) =
-            receive_audio_non_blocking_pattern(&audio_data, &smart_turn, &stt).await;
+        let (latency, _) = receive_audio_non_blocking_pattern(&audio_data, &smart_turn, &stt).await;
         latencies.push(latency);
     }
 

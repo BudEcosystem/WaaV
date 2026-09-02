@@ -1209,9 +1209,7 @@ impl VoiceManager {
         // Reconnect STT for continued use
         {
             let mut stt = self.stt.write().await;
-            stt.connect()
-                .await
-                .map_err(VoiceManagerError::STTError)?;
+            stt.connect().await.map_err(VoiceManagerError::STTError)?;
         }
 
         tracing::info!("STT stream finalized and reconnected");
