@@ -41,6 +41,13 @@ pub enum AuthFailure {
     Missing,
     /// Presented but not resolvable.
     Unauthorized,
+    /// A JWT-shaped bearer that failed verification.
+    ///
+    /// Separate from `Unauthorized` only so the caller can be told which credential was
+    /// judged. Reporting "invalid API key" to someone holding a Keycloak token sends them to
+    /// rotate a key they are not using, and hides the two things actually worth checking:
+    /// whether the token expired, and whether its client is in the allowlist.
+    JwtRejected,
     /// Refused by a guard rather than by the credential itself.
     Throttled,
     /// The plane has not completed its first hydration.
@@ -229,10 +236,12 @@ impl BudPlane {
                             via: PrincipalKind::Jwt,
                         })
                     }
-                    Err(_) => Err(AuthFailure::Unauthorized),
+                    Err(_) => Err(AuthFailure::JwtRejected),
                 };
             }
-            return Err(AuthFailure::Unauthorized);
+            // JWT-shaped but no verifier configured. Also distinct: the caller's token may be
+            // perfectly good and this deployment simply does not accept tokens.
+            return Err(AuthFailure::JwtRejected);
         }
 
         // 3. Miss escalation — heals gateway/Redis drift. Guarded on all four axes.

@@ -63,3 +63,19 @@ fn an_empty_passphrase_reads_as_absent_rather_than_as_a_passphrase() {
         .expect_err("empty is not a passphrase");
     assert!(err.to_string().contains("WAAV_RSA_PRIVATE_KEY_PASSWORD"));
 }
+
+// --------------------------------------------------------------------------- //
+// A rejected JWT must be distinguishable from a rejected API key.
+// --------------------------------------------------------------------------- //
+
+/// `AuthFailure::JwtRejected` exists so the gateway can say WHICH credential was judged.
+/// Collapsing it back into `Unauthorized` is silent: the caller is told to rotate an API key
+/// they never presented, and the two things worth checking (expiry, client allowlist) are
+/// never mentioned.
+#[test]
+fn a_rejected_jwt_is_its_own_failure_kind() {
+    use bud_auth::AuthFailure;
+    assert_ne!(AuthFailure::JwtRejected, AuthFailure::Unauthorized);
+    assert_ne!(AuthFailure::JwtRejected, AuthFailure::NotReady);
+    assert_ne!(AuthFailure::JwtRejected, AuthFailure::Throttled);
+}

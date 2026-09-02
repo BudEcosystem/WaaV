@@ -145,6 +145,23 @@ pub async fn auth_middleware(
                 tracing::warn!(path = %request_path, "auth escalation throttled");
                 Err(AuthError::Unauthorized("Too many auth misses".to_string()))
             }
+            Err(bud_auth::AuthFailure::JwtRejected) => {
+                // Naming the credential that was judged. "Invalid API key" to someone holding
+                // a Keycloak token sends them to rotate a key they are not using, past the two
+                // things worth checking: whether the token is expired, and whether its client
+                // is in OIDC_ALLOWED_CLIENTS.
+                tracing::warn!(
+                    method = %request_method,
+                    path = %request_path,
+                    "bud authentication failed: JWT rejected"
+                );
+                Err(AuthError::Unauthorized(
+                    "Bearer token was rejected. It is a JWT, so this is not an API-key \
+                     problem: check that it has not expired and that its client is in this \
+                     gateway's allowed-clients list."
+                        .to_string(),
+                ))
+            }
             Err(_) => {
                 tracing::warn!(
                     method = %request_method,
