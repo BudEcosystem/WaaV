@@ -10,7 +10,7 @@
 //! entry disappears from the table with no error logged anywhere and the endpoint simply stops
 //! existing.
 
-use bud_auth::credentials::{parse_voice_blob, CredentialDecryptor};
+use bud_auth::credentials::{CredentialDecryptor, parse_voice_blob};
 
 const CONTRACT: &str = include_str!("fixtures/voice_table_contract.json");
 
@@ -71,10 +71,16 @@ fn the_self_hosted_case_carries_a_deployment_url_and_no_credential() {
 
     assert_eq!(ep.vendor, "self_hosted");
     assert!(
-        ep.api_base.as_deref().unwrap_or_default().starts_with("http://"),
+        ep.api_base
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("http://"),
         "the deployment URL did not survive; the resolver would have nowhere to send audio"
     );
-    assert!(ep.credential.is_none(), "a self-hosted deployment needs no vendor key");
+    assert!(
+        ep.credential.is_none(),
+        "a self-hosted deployment needs no vendor key"
+    );
     assert!(ep.serves("audio_transcription"));
 }
 
@@ -82,7 +88,10 @@ fn the_self_hosted_case_carries_a_deployment_url_and_no_credential() {
 /// depending on a field WaaV treats as optional — or vice versa.
 #[test]
 fn the_minimal_case_needs_only_vendor_and_capabilities() {
-    let entry = cases().get("minimal").cloned().expect("fixture has a minimal case");
+    let entry = cases()
+        .get("minimal")
+        .cloned()
+        .expect("fixture has a minimal case");
     let blob = serde_json::json!({ "ep-min": entry }).to_string();
 
     let map = parse_voice_blob(&blob, &CredentialDecryptor::disabled()).expect("parses");
