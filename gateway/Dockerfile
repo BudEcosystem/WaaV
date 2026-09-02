@@ -4,7 +4,15 @@
 # aws-types 1.5.0). 1.96.0 is also the stable the crates were verified on locally, so the
 # image and a local `cargo build` now agree on the compiler.
 ARG RUST_VERSION=1.96.0
-ARG CARGO_BUILD_FEATURES="--no-default-features --features turn-detect,noise-filter"
+# `turn-detect` and `noise-filter` do not compile against the `ort` version in Cargo.lock
+# (Session::inputs/outputs are private there, and the ort error type is neither Send nor
+# Sync), so the image could not be built with them at all. They are local-ONNX pipeline
+# features -- Smart Turn detection and DeepFilterNet -- and nothing on the FRD-018 audio
+# plane uses them: /v1/audio/speech, the voice_table auth path and the vendor STT/TTS
+# providers are all independent of ONNX. Building without them is therefore the honest
+# default rather than a silent downgrade; restore them here once the ort call sites are
+# updated.
+ARG CARGO_BUILD_FEATURES="--no-default-features"
 ARG ONNX_VERSION=1.23.2
 
 # ==================== Chef Base ====================

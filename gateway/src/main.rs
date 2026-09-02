@@ -246,12 +246,25 @@ async fn main() -> anyhow::Result<()> {
 
     // Configure rate limiting (disabled when rate >= 100000 for performance testing)
     let governor_layer = if rate_limit_rps < 100000 {
+        // `GovernorConfigBuilder::per_second(n)` does NOT mean "n requests per second". It
+        // sets the REPLENISH INTERVAL: `self.period = Duration::from_secs(n)`. So the old
+        // `.per_second(rate_limit_rps)` turned a configured 60 rps into one request every 60
+        // seconds -- roughly 3600x tighter than the number says. With the burst spent, the
+        // Kubernetes readiness probe got 429 and the pod never became ready.
+        //
+        // The interval for N requests per second is 1000/N milliseconds, floored at 1ms
+        // (anything faster than 1000 rps is effectively unlimited here, and a zero interval
+        // is rejected by the builder).
+        let period_ms = waav_gateway::rate_limit_period_ms(rate_limit_rps);
         let governor_config = GovernorConfigBuilder::default()
-            .per_second(rate_limit_rps as u64)
+            .per_millisecond(period_ms)
             .burst_size(rate_limit_burst)
             .key_extractor(SmartIpKeyExtractor)
             .finish()
             .expect("Failed to build rate limiter config");
+        println!(
+            "Rate limiting: {rate_limit_rps} req/s per IP (one token per {period_ms}ms, burst {rate_limit_burst})"
+        );
         Some(GovernorLayer::new(governor_config))
     } else {
         println!("Rate limiting disabled (rate >= 100000/s)");
@@ -328,15 +341,25 @@ async fn main() -> anyhow::Result<()> {
             http::HeaderValue::from_static("DENY"),
         ));
 
-    // Combine all routes: public + webhook + protected + websocket + realtime
-    let app = public_routes
-        .merge(webhook_routes)
+    // Combine all routes: webhook + protected + websocket + realtime, rate-limited; then the
+    // public health routes merged on top, deliberately OUTSIDE the governor.
+    //
+    // `/` and `/ready` are what the kubelet polls, and every probe arrives from the node's
+    // address -- the same bucket as real traffic behind Traefik. Counting probes against that
+    // bucket means a busy pod fails its own liveness check and is restarted for being
+    // popular, which is precisely backwards. They are also the two endpoints that must answer
+    // when the pod is in trouble.
+    let limited_routes = webhook_routes
         .merge(protected_routes)
         .merge(ws_routes)
         .merge(realtime_routes)
+        .with_state(app_state.clone())
+        .layer(tower::util::option_layer(governor_layer));
+
+    let app = public_routes
+        .merge(limited_routes)
         .with_state(app_state)
         .layer(cors_layer)
-        .layer(tower::util::option_layer(governor_layer))
         .layer(security_headers);
 
     // Parse socket address
