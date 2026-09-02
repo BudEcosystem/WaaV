@@ -32,6 +32,39 @@ pub struct SpeakRequest {
     pub tts_config: TTSWebSocketConfig,
 }
 
+/// Decide what a caller-supplied vendor key in a `/speak` body may do.
+///
+/// `Ok(Some(key))` uses the caller's key, `Ok(None)` falls back to server config, and `Err`
+/// carries the message to return to the caller.
+///
+/// `allow_client_keys` is what separates the two deployments. Standalone WaaV is BYOK by
+/// design, and honouring the caller's key is the feature. Under the Bud control plane the same
+/// field is a bypass — the vendor call would carry the caller's own credential, so the request
+/// is attributed to no project, counted against no quota and billed to nobody (FRD-018 §5.3.7).
+///
+/// The bypass is refused rather than ignored: a key that is silently dropped looks like it
+/// worked until the vendor answers 401, naming neither WaaV nor the field that caused it.
+fn vet_speak_api_key(
+    client_key: Option<&String>,
+    allow_client_keys: bool,
+) -> Result<Option<String>, String> {
+    // An empty string is how several clients serialize "unset". It cannot bypass anything, so
+    // it falls back instead of failing the request.
+    match client_key.filter(|key| !key.is_empty()) {
+        Some(key) if allow_client_keys => Ok(Some(key.clone())),
+        // `/speak` takes no endpoint name -- `resolve_voice_endpoint` is reached only from
+        // /v1/audio/speech -- so the message must not tell the caller to use one here.
+        Some(_) => Err(
+            "Client-supplied api_key in tts_config is not accepted by this gateway. \
+             Vendor credentials are owned by the control plane and resolved here; remove the \
+             field. To address a specific deployment's credential, call POST /v1/audio/speech \
+             with `model` set to your Bud endpoint name."
+                .to_string(),
+        ),
+        None => Ok(None),
+    }
+}
+
 /// Collector for accumulating audio from TTS provider
 struct AudioCollector {
     audio_data: Arc<Mutex<Vec<u8>>>,
@@ -201,19 +234,32 @@ pub async fn speak_handler(
             .into_response();
     }
 
-    // Get API key: Client-provided key takes priority over server config (BYOK pattern)
-    // This allows multi-tenant setups where clients bring their own API keys
-    let api_key = if let Some(client_key) = request
-        .tts_config
-        .api_key
-        .as_ref()
-        .filter(|k| !k.is_empty())
-    {
+    // Get API key: a client-provided key takes priority over server config (BYOK pattern),
+    // except under the Bud control plane, which owns the tenant's credentials
+    let client_key = match vet_speak_api_key(
+        request.tts_config.api_key.as_ref(),
+        state.allows_client_supplied_keys(),
+    ) {
+        Ok(key) => key,
+        Err(message) => {
+            warn!(
+                provider = %request.tts_config.provider,
+                "Refused client-supplied API key: vendor credentials are owned by the control plane"
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response();
+        }
+    };
+
+    let api_key = if let Some(client_key) = client_key {
         info!(
             "Using client-provided API key for provider: {}",
             request.tts_config.provider
         );
-        client_key.clone()
+        client_key
     } else {
         // Fall back to server config
         match state.config.get_api_key(&request.tts_config.provider) {
@@ -441,4 +487,50 @@ pub async fn synthesize_once(
         .get_result()
         .await
         .map_err(|e| format!("synthesis error: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_client_api_key_refused_when_bud_owns_credentials() {
+        let client_key = "sk-caller-owned".to_string();
+
+        let message = vet_speak_api_key(Some(&client_key), false)
+            .expect_err("a client key must not resolve under Bud mode");
+
+        assert!(
+            message.contains("tts_config"),
+            "error must name the field to remove: {message}"
+        );
+        assert!(
+            !message.contains("sk-caller-owned"),
+            "the key must not be echoed back to the caller: {message}"
+        );
+    }
+
+    #[test]
+    fn test_client_api_key_honoured_in_standalone_mode() {
+        let client_key = "sk-caller-owned".to_string();
+
+        let resolved = vet_speak_api_key(Some(&client_key), true).unwrap();
+
+        assert_eq!(resolved.as_deref(), Some("sk-caller-owned"));
+    }
+
+    #[test]
+    fn test_empty_client_api_key_falls_back_under_bud_mode() {
+        let empty = String::new();
+
+        let resolved = vet_speak_api_key(Some(&empty), false)
+            .expect("an empty key bypasses nothing and must not fail the request");
+
+        assert_eq!(resolved, None, "an empty key falls back to server config");
+    }
+
+    #[test]
+    fn test_absent_client_api_key_falls_back_under_bud_mode() {
+        assert_eq!(vet_speak_api_key(None, false).unwrap(), None);
+    }
 }

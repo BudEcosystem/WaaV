@@ -400,6 +400,26 @@ class WebSocketSession:
                 self._connected = False
                 raise
 
+    def _vendor_api_key(self) -> Optional[str]:
+        """The key to put in `stt_config`/`tts_config`, or None to omit the field.
+
+        `self.api_key` is the SESSION's authentication -- it belongs in the `Authorization`
+        header, and nowhere else. Mirroring it into a provider config block treats the
+        caller's own credential as a vendor credential, which is wrong in both deployments:
+
+        * Against a Bud gateway it is REFUSED. Vendor credentials are owned by the control
+          plane, so a client-supplied `api_key` fails the session -- and because this SDK
+          always sent one, every Bud-mode session failed no matter what the caller intended.
+        * Against a standalone gateway it is worse than useless: WaaV would forward a `bud-`
+          key to Deepgram or ElevenLabs as if it were theirs.
+
+        A `bud-` prefixed key is therefore never a vendor key. Anything else is left alone,
+        so BYOK against a standalone gateway keeps working exactly as it did.
+        """
+        if not self.api_key or self.api_key.startswith("bud-"):
+            return None
+        return self.api_key
+
     async def _send_config(self) -> None:
         """Send configuration message with all gateway-supported fields.
 
@@ -425,9 +445,10 @@ class WebSocketSession:
                 "encoding": self.stt_config.encoding,
                 "model": self.stt_config.model or "nova-3",
             }
-            # Include API key if provided (gateway allows per-request override)
-            if self.api_key:
-                stt_dict["api_key"] = self.api_key
+            # A VENDOR key only -- never the session's own Bud credential.
+            vendor_key = self._vendor_api_key()
+            if vendor_key:
+                stt_dict["api_key"] = vendor_key
             config["stt_config"] = stt_dict
         else:
             # Gateway requires stt_config when audio=true - provide minimal default
@@ -454,9 +475,10 @@ class WebSocketSession:
                 tts_dict["audio_format"] = self.tts_config.audio_format
             if self.tts_config.speed is not None:
                 tts_dict["speaking_rate"] = self.tts_config.speed
-            # Include API key if provided (gateway allows per-request override)
-            if self.api_key:
-                tts_dict["api_key"] = self.api_key
+            # A VENDOR key only -- never the session's own Bud credential.
+            vendor_key = self._vendor_api_key()
+            if vendor_key:
+                tts_dict["api_key"] = vendor_key
             # Emotion fields (Unified Emotion System - gateway supports these)
             if self.tts_config.emotion is not None:
                 tts_dict["emotion"] = self.tts_config.emotion.value if hasattr(self.tts_config.emotion, 'value') else str(self.tts_config.emotion)

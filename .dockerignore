@@ -1,0 +1,22 @@
+# The image build context is the WaaV ROOT (gateway/Cargo.toml has path deps on sibling
+# crates), so this file — not gateway/.dockerignore — is what keeps the context small.
+# Without it the context includes every crate's target/, which is tens of gigabytes.
+**/target/
+target/
+*.rlib
+*.rmeta
+
+.git/
+.github/
+dist/
+node_modules/
+**/__pycache__/
+*.pyc
+
+# Docs, research notes and media that never enter the image.
+docs/
+examples/
+assets/
+clients_sdk/
+*.md
+!gateway/README.md

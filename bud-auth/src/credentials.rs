@@ -34,8 +34,19 @@ pub enum CredentialError {
 }
 
 /// Holds the private key used to open budapp-encrypted credentials.
+///
+/// `Debug` prints only whether a key is loaded. Deriving it would put the RSA private key's
+/// components into any log line or test failure that formats this value.
 pub struct CredentialDecryptor {
     key: Option<RsaPrivateKey>,
+}
+
+impl std::fmt::Debug for CredentialDecryptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialDecryptor")
+            .field("key_loaded", &self.key.is_some())
+            .finish()
+    }
 }
 
 impl CredentialDecryptor {
@@ -44,11 +55,48 @@ impl CredentialDecryptor {
         Self { key: None }
     }
 
+    /// Load an unencrypted PKCS#8 or PKCS#1 key.
     pub fn from_pem(pem: &str) -> Result<Self, CredentialError> {
-        let key = RsaPrivateKey::from_pkcs8_pem(pem)
-            .or_else(|_| rsa::pkcs1::DecodeRsaPrivateKey::from_pkcs1_pem(pem))
-            .map_err(|e| CredentialError::BadKey(e.to_string()))?;
-        Ok(Self { key: Some(key) })
+        Self::from_pem_with_password(pem, None)
+    }
+
+    /// Load a key, opening an encrypted PKCS#8 PEM when a passphrase is supplied.
+    ///
+    /// Bud's clusters do not store a bare key: `{release}-rsa-keys` holds an `ENCRYPTED
+    /// PRIVATE KEY` PEM alongside its passphrase, and budgateway opens it the same way
+    /// (`tensorzero-internal/src/encryption.rs`). Without this, every vendor credential in
+    /// `voice_table` stays unreadable and WaaV refuses to start -- with a message about a
+    /// malformed key, which is the wrong thing to go and look at.
+    pub fn from_pem_with_password(
+        pem: &str,
+        password: Option<&str>,
+    ) -> Result<Self, CredentialError> {
+        if let Ok(key) = RsaPrivateKey::from_pkcs8_pem(pem) {
+            return Ok(Self { key: Some(key) });
+        }
+        if let Ok(key) = rsa::pkcs1::DecodeRsaPrivateKey::from_pkcs1_pem(pem) {
+            return Ok(Self { key: Some(key) });
+        }
+
+        let encrypted = pem.contains("ENCRYPTED PRIVATE KEY");
+        match password.filter(|p| !p.is_empty()) {
+            Some(password) => RsaPrivateKey::from_pkcs8_encrypted_pem(pem, password.as_bytes())
+                .map(|key| Self { key: Some(key) })
+                .map_err(|e| {
+                    CredentialError::BadKey(format!("encrypted PKCS#8 key would not open: {e}"))
+                }),
+            // Naming the missing variable is the whole point: the alternative is an operator
+            // reading "invalid key" about a key that is perfectly valid.
+            None if encrypted => Err(CredentialError::BadKey(
+                "key is an encrypted PKCS#8 PEM but no passphrase was supplied; set \
+                 WAAV_RSA_PRIVATE_KEY_PASSWORD (budgateway reads the same passphrase from \
+                 the `private-key-password` entry of the rsa-keys secret)"
+                    .to_string(),
+            )),
+            None => Err(CredentialError::BadKey(
+                "not a PKCS#8 or PKCS#1 private key".to_string(),
+            )),
+        }
     }
 
     pub fn is_enabled(&self) -> bool {

@@ -30,6 +30,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Vendor-credential decryption, matching budgateway's encryption.rs.
 rsa = { version = "0.9", features = ["sha2"] }
 pkcs1 = "0.7"
+# `encryption` is what makes `RsaPrivateKey::from_pkcs8_encrypted_pem` exist. Bud's clusters
+# store the RSA key as an ENCRYPTED PKCS#8 PEM with the passphrase in the same secret, so
+# without this feature the key cannot be opened at all -- the same dependency budgateway
+# carries (tensorzero-internal/Cargo.toml) for the same key.
+pkcs8 = { version = "0.10", features = ["encryption", "pem"] }
 base64 = "0.22.0"
 
 async-trait = "0.1.88"

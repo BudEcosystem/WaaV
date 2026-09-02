@@ -43,6 +43,16 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Whether a caller may bring its own vendor `api_key` in a request or WebSocket config.
+    ///
+    /// Standalone WaaV is BYOK by design: the caller holds the vendor relationship and pays the
+    /// vendor directly. Under the Bud control plane the same field bypasses the tenant's
+    /// credential entirely — no project attribution, no quota, no billing — so it is refused
+    /// (FRD-018 §5.3.7).
+    pub fn allows_client_supplied_keys(&self) -> bool {
+        self.bud_mode.is_none()
+    }
+
     /// Resolve a Bud voice endpoint by the name the caller used, checking it serves what was
     /// asked for.
     ///

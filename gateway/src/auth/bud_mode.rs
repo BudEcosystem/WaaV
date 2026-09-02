@@ -27,6 +27,9 @@ pub struct BudModeConfig {
     pub redis_db: u8,
     /// PEM for opening RSA-encrypted vendor credentials in `voice_table`.
     pub rsa_private_key_path: Option<String>,
+    /// Passphrase for that PEM. Bud's clusters ship an ENCRYPTED PKCS#8 key, so this is the
+    /// normal case rather than the exotic one.
+    pub rsa_private_key_password: Option<String>,
 }
 
 impl BudModeConfig {
@@ -55,6 +58,7 @@ impl BudModeConfig {
             redis_url,
             redis_db,
             rsa_private_key_path: non_empty("WAAV_RSA_PRIVATE_KEY_PATH"),
+            rsa_private_key_password: non_empty("WAAV_RSA_PRIVATE_KEY_PASSWORD"),
         })
     }
 }
@@ -105,7 +109,10 @@ impl BudMode {
         // being used with ciphertext as its bearer token.
         let decryptor = match &cfg.rsa_private_key_path {
             Some(path) => match std::fs::read_to_string(path) {
-                Ok(pem) => match bud_auth::CredentialDecryptor::from_pem(&pem) {
+                Ok(pem) => match bud_auth::CredentialDecryptor::from_pem_with_password(
+                    &pem,
+                    cfg.rsa_private_key_password.as_deref(),
+                ) {
                     Ok(d) => {
                         tracing::info!(path = %path, "vendor-credential decryption enabled");
                         d
@@ -310,6 +317,21 @@ mod tests {
         .expect("configured");
         assert_eq!(cfg.redis_db, 6);
         assert!(cfg.rsa_private_key_path.is_none());
+        assert!(cfg.rsa_private_key_password.is_none());
+    }
+
+    #[test]
+    fn the_key_passphrase_is_read_from_the_environment() {
+        // Bud's clusters store an ENCRYPTED PKCS#8 key; dropping the passphrase here makes
+        // every vendor credential unreadable and the pod refuse to start.
+        let cfg = BudModeConfig::from_lookup(|k| match k {
+            "WAAV_REDIS_URL" => Some("redis://localhost:6379".to_string()),
+            "WAAV_RSA_PRIVATE_KEY_PATH" => Some("/app/keys/rsa-private-key.pem".to_string()),
+            "WAAV_RSA_PRIVATE_KEY_PASSWORD" => Some("s3cret".to_string()),
+            _ => None,
+        })
+        .expect("configured");
+        assert_eq!(cfg.rsa_private_key_password.as_deref(), Some("s3cret"));
     }
 
     #[test]
