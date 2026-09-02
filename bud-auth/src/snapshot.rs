@@ -20,6 +20,7 @@ use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::credentials::VoiceEndpoint;
 use crate::types::{AliasMap, AuthMetadata};
 
 /// One immutable generation of the auth map.
@@ -29,6 +30,11 @@ pub struct BudSnapshot {
     pub api_keys: HashMap<Arc<str>, Arc<AliasMap>>,
     /// Same hashed key -> attribution.
     pub metadata: HashMap<Arc<str>, Arc<AuthMetadata>>,
+    /// Endpoint id -> its voice configuration, credential already decrypted.
+    ///
+    /// Held in the same generation as the api-key map so a request never sees an endpoint
+    /// whose credential has not been resolved yet.
+    pub voice: HashMap<Arc<str>, Arc<VoiceEndpoint>>,
 }
 
 impl BudSnapshot {
@@ -36,6 +42,7 @@ impl BudSnapshot {
         Self {
             api_keys: self.api_keys.clone(),
             metadata: self.metadata.clone(),
+            voice: self.voice.clone(),
         }
     }
 }
@@ -118,6 +125,29 @@ impl BudAuth {
             .and_then(|m| m.get(alias).cloned())
     }
 
+    /// Look up a voice endpoint by id. Hot path for every audio request.
+    pub fn voice_endpoint(&self, endpoint_id: &str) -> Option<Arc<VoiceEndpoint>> {
+        self.snapshot.load().voice.get(endpoint_id).map(Arc::clone)
+    }
+
+    pub fn voice_count(&self) -> usize {
+        self.snapshot.load().voice.len()
+    }
+
+    /// Replace the whole voice table as one generation, leaving the api-key map untouched.
+    pub fn replace_voice(&self, voice: HashMap<Arc<str>, Arc<VoiceEndpoint>>) {
+        #[expect(
+            clippy::expect_used,
+            reason = "a poisoned auth writer is unrecoverable"
+        )]
+        let _guard = self.writer.lock().expect("bud auth writer mutex poisoned");
+        let mut next = self.snapshot.load().clone_contents();
+        next.voice = voice;
+        self.snapshot.store(Arc::new(next));
+        self.generations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn key_count(&self) -> usize {
         self.snapshot.load().api_keys.len()
     }
@@ -185,8 +215,14 @@ impl BudAuth {
             reason = "a poisoned auth writer is unrecoverable"
         )]
         let _guard = self.writer.lock().expect("bud auth writer mutex poisoned");
-        self.snapshot
-            .store(Arc::new(BudSnapshot { api_keys, metadata }));
+        // Carry the voice table across: `replace_all` re-publishes the api-key generation,
+        // and dropping the voice map here would blank every endpoint on the next key event.
+        let voice = self.snapshot.load().voice.clone();
+        self.snapshot.store(Arc::new(BudSnapshot {
+            api_keys,
+            metadata,
+            voice,
+        }));
         self.generations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }

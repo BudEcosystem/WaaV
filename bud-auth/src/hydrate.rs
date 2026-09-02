@@ -378,3 +378,190 @@ mod tests {
         assert_eq!(KeyEvent::parse("rename_from"), None);
     }
 }
+
+/// Full sweep of `voice_table:*`, decrypting every credential as it loads.
+///
+/// Decryption happens here, once per credential, and never on the request path — an RSA
+/// private-key operation per audio request on a path carrying ten thousand concurrent sessions
+/// is the shape of an outage this platform has already had.
+pub async fn hydrate_voice_table(
+    store: &dyn ControlPlaneStore,
+    auth: &BudAuth,
+    decryptor: &crate::credentials::CredentialDecryptor,
+) -> Result<VoiceHydrationStats, StoreError> {
+    let raw = store.scan(&format!("{VOICE_TABLE_PREFIX}*")).await?;
+
+    let mut voice: HashMap<Arc<str>, Arc<crate::credentials::VoiceEndpoint>> = HashMap::new();
+    let mut stats = VoiceHydrationStats::default();
+
+    for (key, value) in raw {
+        if key.strip_prefix(VOICE_TABLE_PREFIX).is_none() {
+            continue;
+        }
+        match crate::credentials::parse_voice_blob(&value, decryptor) {
+            Ok(entries) => {
+                if entries.is_empty() {
+                    // Parsed, but every endpoint inside was dropped — an unopenable credential,
+                    // usually. Counted so a wholly unusable table is visible rather than
+                    // looking like an empty one.
+                    stats.skipped += 1;
+                }
+                for (endpoint_id, endpoint) in entries {
+                    voice.insert(Arc::from(endpoint_id.as_str()), Arc::new(endpoint));
+                    stats.endpoints += 1;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(key = %key, error = %e, "skipping unparseable voice_table blob");
+                stats.skipped += 1;
+            }
+        }
+    }
+
+    auth.replace_voice(voice);
+    Ok(stats)
+}
+
+/// Outcome of one voice-table sweep.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct VoiceHydrationStats {
+    pub endpoints: usize,
+    pub skipped: usize,
+}
+
+#[cfg(test)]
+mod voice_tests {
+    use super::*;
+    use crate::credentials::CredentialDecryptor;
+    use crate::store::MemoryStore;
+
+    fn blob(vendor: &str, capability: &str) -> String {
+        format!(r#"{{"ep-1":{{"vendor":"{vendor}","endpoints":["{capability}"]}}}}"#)
+    }
+
+    #[tokio::test]
+    async fn hydrates_voice_endpoints() {
+        let store = MemoryStore::new();
+        store.set("voice_table:ep-1", &blob("deepgram", "text_to_speech"));
+        let auth = BudAuth::new();
+
+        let stats = hydrate_voice_table(&store, &auth, &CredentialDecryptor::disabled())
+            .await
+            .unwrap();
+
+        assert_eq!(stats.endpoints, 1);
+        let ep = auth.voice_endpoint("ep-1").expect("endpoint resolvable");
+        assert_eq!(ep.vendor, "deepgram");
+        assert!(ep.serves("text_to_speech"));
+    }
+
+    /// THE trap. `replace_all` re-publishes the api-key generation on every reconnect; if it
+    /// dropped the voice map, every audio endpoint would vanish on the next key event while
+    /// authentication carried on working — an outage that looks like a routing problem.
+    #[tokio::test]
+    async fn an_api_key_rehydration_does_not_blank_the_voice_table() {
+        let store = MemoryStore::new();
+        store.set("voice_table:ep-1", &blob("deepgram", "text_to_speech"));
+        store.set(
+            "api_key:h1",
+            r#"{"tts":{"endpoint_id":"ep-1"},"__metadata__":{"user_id":"u1"}}"#,
+        );
+        let auth = BudAuth::new();
+
+        hydrate_voice_table(&store, &auth, &CredentialDecryptor::disabled())
+            .await
+            .unwrap();
+        assert_eq!(auth.voice_count(), 1);
+
+        // A reconnect re-hydrates the api-key map.
+        hydrate_all(&store, &auth).await.unwrap();
+
+        assert_eq!(
+            auth.voice_count(),
+            1,
+            "re-hydrating api keys wiped the voice table; every audio endpoint would 404"
+        );
+        assert!(auth.voice_endpoint("ep-1").is_some());
+    }
+
+    /// The inverse: replacing the voice table must not disturb authentication.
+    #[tokio::test]
+    async fn a_voice_rehydration_does_not_blank_the_api_keys() {
+        let store = MemoryStore::new();
+        store.set(
+            "api_key:h1",
+            r#"{"tts":{"endpoint_id":"ep-1"},"__metadata__":{"user_id":"u1"}}"#,
+        );
+        store.set("voice_table:ep-1", &blob("deepgram", "text_to_speech"));
+        let auth = BudAuth::new();
+
+        hydrate_all(&store, &auth).await.unwrap();
+        hydrate_voice_table(&store, &auth, &CredentialDecryptor::disabled())
+            .await
+            .unwrap();
+
+        assert!(
+            auth.resolve("h1").is_some(),
+            "hydrating the voice table revoked every credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removed_endpoint_disappears_on_the_next_sweep() {
+        let store = MemoryStore::new();
+        store.set("voice_table:ep-1", &blob("deepgram", "text_to_speech"));
+        let auth = BudAuth::new();
+        hydrate_voice_table(&store, &auth, &CredentialDecryptor::disabled())
+            .await
+            .unwrap();
+        assert!(auth.voice_endpoint("ep-1").is_some());
+
+        store.remove("voice_table:ep-1");
+        hydrate_voice_table(&store, &auth, &CredentialDecryptor::disabled())
+            .await
+            .unwrap();
+
+        assert!(
+            auth.voice_endpoint("ep-1").is_none(),
+            "a deleted endpoint survived; it would keep serving with a stale credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_corrupt_blob_does_not_abort_the_sweep() {
+        let store = MemoryStore::new();
+        store.set("voice_table:good", &blob("deepgram", "text_to_speech"));
+        store.set("voice_table:bad", "{not json");
+        let auth = BudAuth::new();
+
+        let stats = hydrate_voice_table(&store, &auth, &CredentialDecryptor::disabled())
+            .await
+            .unwrap();
+
+        assert_eq!(stats.endpoints, 1);
+        assert_eq!(stats.skipped, 1);
+        assert!(auth.voice_endpoint("ep-1").is_some());
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_with_an_unopenable_credential_is_counted_as_skipped() {
+        // Without the count, a table where every credential failed to decrypt is
+        // indistinguishable from an empty one.
+        let store = MemoryStore::new();
+        store.set(
+            "voice_table:ep-1",
+            r#"{"ep-1":{"vendor":"deepgram","credential":"deadbeef","endpoints":["text_to_speech"]}}"#,
+        );
+        let auth = BudAuth::new();
+
+        let stats = hydrate_voice_table(&store, &auth, &CredentialDecryptor::disabled())
+            .await
+            .unwrap();
+
+        assert_eq!(stats.endpoints, 0);
+        assert_eq!(
+            stats.skipped, 1,
+            "a wholly unusable table must not look empty"
+        );
+    }
+}

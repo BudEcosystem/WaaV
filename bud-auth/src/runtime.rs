@@ -53,6 +53,9 @@ pub struct BudPlane {
     pub guards: Arc<MissGuards>,
     store: Arc<dyn ControlPlaneStore>,
     jwt: Option<Arc<JwtVerifier>>,
+    /// Opens RSA-encrypted vendor credentials at hydration. Absent means encrypted credentials
+    /// cannot be used — plaintext and keyless endpoints still work.
+    decryptor: crate::credentials::CredentialDecryptor,
     /// The published overlay: what any authenticated caller may reach.
     published: arc_swap::ArcSwap<AliasMap>,
     /// Readiness. A pod that answers before its first sweep answers 401 to valid keys.
@@ -66,7 +69,20 @@ pub struct BudPlane {
 
 impl BudPlane {
     pub fn new(store: Arc<dyn ControlPlaneStore>, jwt: Option<Arc<JwtVerifier>>) -> Self {
+        Self::with_decryptor(
+            store,
+            jwt,
+            crate::credentials::CredentialDecryptor::disabled(),
+        )
+    }
+
+    pub fn with_decryptor(
+        store: Arc<dyn ControlPlaneStore>,
+        jwt: Option<Arc<JwtVerifier>>,
+        decryptor: crate::credentials::CredentialDecryptor,
+    ) -> Self {
         Self {
+            decryptor,
             auth: BudAuth::new(),
             guards: Arc::new(MissGuards::default()),
             store,
@@ -81,6 +97,15 @@ impl BudPlane {
     /// Boot — the FIRST of the two required `hydrate_all` call sites.
     pub async fn boot(&self) -> Result<HydrationStats, crate::store::StoreError> {
         let stats = hydrate::hydrate_all(self.store.as_ref(), &self.auth).await?;
+        // The voice table is swept in the same breath. Booting with credentials but no
+        // endpoints would authenticate every caller and then 404 every audio request.
+        let voice =
+            hydrate::hydrate_voice_table(self.store.as_ref(), &self.auth, &self.decryptor).await?;
+        tracing::info!(
+            voice_endpoints = voice.endpoints,
+            voice_skipped = voice.skipped,
+            "voice table hydrated"
+        );
         self.hydrated.store(true, Ordering::SeqCst);
         Ok(stats)
     }
@@ -92,6 +117,8 @@ impl BudPlane {
     ) -> Result<HydrationStats, crate::store::StoreError> {
         tracing::info!("control-plane connection restored; re-hydrating");
         let stats = hydrate::hydrate_all(self.store.as_ref(), &self.auth).await?;
+        let _ =
+            hydrate::hydrate_voice_table(self.store.as_ref(), &self.auth, &self.decryptor).await?;
         self.hydrated.store(true, Ordering::SeqCst);
         Ok(stats)
     }
@@ -122,6 +149,11 @@ impl BudPlane {
         );
         hydrate::apply_key_event(self.store.as_ref(), &self.auth, &self.guards, key, event).await?;
         Ok(())
+    }
+
+    /// Resolve a voice endpoint by id. Hot path for every audio request; no I/O.
+    pub fn voice_endpoint(&self, endpoint_id: &str) -> Option<crate::credentials::VoiceEndpoint> {
+        self.auth.voice_endpoint(endpoint_id).map(|e| (*e).clone())
     }
 
     pub fn set_published_overlay(&self, overlay: AliasMap) {
@@ -462,5 +494,94 @@ mod tests {
             .await
             .unwrap();
         assert!(plane.seconds_since_last_event().is_some());
+    }
+}
+
+#[cfg(test)]
+mod voice_plane_tests {
+    use super::*;
+    use crate::store::MemoryStore;
+
+    #[tokio::test]
+    async fn boot_hydrates_voice_endpoints_alongside_credentials() {
+        // Booting with credentials but no endpoints would authenticate every caller and then
+        // 404 every audio request — a failure that reads as a routing problem.
+        let store = Arc::new(MemoryStore::new());
+        store.set(
+            "api_key:h1",
+            r#"{"tts":{"endpoint_id":"ep-1"},"__metadata__":{"api_key_project_id":"p1"}}"#,
+        );
+        store.set(
+            "voice_table:ep-1",
+            r#"{"ep-1":{"vendor":"deepgram","endpoints":["text_to_speech"],"voice":"aura-asteria-en"}}"#,
+        );
+
+        let plane = BudPlane::new(Arc::clone(&store) as Arc<dyn ControlPlaneStore>, None);
+        plane.boot().await.unwrap();
+
+        let ep = plane
+            .voice_endpoint("ep-1")
+            .expect("endpoint resolvable after boot");
+        assert_eq!(ep.vendor, "deepgram");
+        assert_eq!(ep.voice.as_deref(), Some("aura-asteria-en"));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_endpoint_resolves_to_nothing() {
+        let store = Arc::new(MemoryStore::new());
+        let plane = BudPlane::new(Arc::clone(&store) as Arc<dyn ControlPlaneStore>, None);
+        plane.boot().await.unwrap();
+        assert!(plane.voice_endpoint("no-such-endpoint").is_none());
+    }
+
+    #[tokio::test]
+    async fn voice_resolution_performs_no_store_io() {
+        let store = Arc::new(MemoryStore::new());
+        store.set(
+            "voice_table:ep-1",
+            r#"{"ep-1":{"vendor":"deepgram","endpoints":["text_to_speech"]}}"#,
+        );
+        let plane = BudPlane::new(Arc::clone(&store) as Arc<dyn ControlPlaneStore>, None);
+        plane.boot().await.unwrap();
+        let before = store.gets.load(Ordering::Relaxed);
+
+        for _ in 0..1000 {
+            assert!(plane.voice_endpoint("ep-1").is_some());
+        }
+
+        assert_eq!(
+            store.gets.load(Ordering::Relaxed),
+            before,
+            "voice resolution hit the store; it must be a map probe like credential resolution"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_rehydration_reconciles_the_voice_table_too() {
+        let store = Arc::new(MemoryStore::new());
+        store.set(
+            "voice_table:old",
+            r#"{"old":{"vendor":"deepgram","endpoints":["text_to_speech"]}}"#,
+        );
+        let plane = BudPlane::new(Arc::clone(&store) as Arc<dyn ControlPlaneStore>, None);
+        plane.boot().await.unwrap();
+
+        // Changes we never saw an event for.
+        store.remove("voice_table:old");
+        store.set(
+            "voice_table:new",
+            r#"{"new":{"vendor":"elevenlabs","endpoints":["text_to_speech"]}}"#,
+        );
+
+        plane.rehydrate_after_reconnect().await.unwrap();
+
+        assert!(
+            plane.voice_endpoint("new").is_some(),
+            "an endpoint added during the outage is invisible"
+        );
+        assert!(
+            plane.voice_endpoint("old").is_none(),
+            "a deleted endpoint survived and would keep serving with a stale credential"
+        );
     }
 }
