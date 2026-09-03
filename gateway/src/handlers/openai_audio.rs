@@ -23,6 +23,7 @@ use tracing::{info, warn};
 use waav_openai_audio::{
     AudioError,
     speech::{self, AudioFormat, SpeechRequest},
+    transcription,
 };
 
 use crate::state::AppState;
@@ -170,17 +171,210 @@ pub async fn speech_handler(
 
 /// `POST /v1/audio/transcriptions` and `/v1/audio/translations`.
 ///
-/// Not yet served. WaaV's STT providers are streaming-only — `BaseSTT` connects, receives audio
-/// frames and emits callbacks — and there is no batch file-transcription path to drive from a
-/// single upload. Building one is M5 work, and the honest answer meanwhile is a 501 that says
-/// so, rather than a 500 or a silent empty transcript.
-pub async fn transcription_not_implemented() -> Response {
-    openai_error(
-        StatusCode::NOT_IMPLEMENTED,
-        "api_error",
-        "Audio transcription is not yet served by this gateway. WaaV's STT providers are \
-         streaming-only; the batch file path is in progress."
-            .to_string(),
-        None,
-    )
+/// OpenAI's transcription API is a multipart upload, so this is the one audio route that does
+/// not take JSON. The file is decoded to PCM here and driven through a STREAMING provider by
+/// [`crate::handlers::transcribe::transcribe_once`] — WaaV has no batch STT provider to call,
+/// so the batch shape is synthesised from the streaming one.
+pub async fn transcription_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    multipart: axum::extract::Multipart,
+) -> Response {
+    transcription_inner(state, headers, multipart, false).await
+}
+
+/// `POST /v1/audio/translations` — same path, but the target language is always English.
+pub async fn translation_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    multipart: axum::extract::Multipart,
+) -> Response {
+    transcription_inner(state, headers, multipart, true).await
+}
+
+async fn transcription_inner(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    mut multipart: axum::extract::Multipart,
+    translate: bool,
+) -> Response {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().strip_prefix("Bearer ").unwrap_or(v).to_string());
+
+    let mut file: Option<Vec<u8>> = None;
+    let mut filename = String::new();
+    let mut model = String::new();
+    let mut response_format: Option<String> = None;
+    let mut language: Option<String> = None;
+    let mut prompt: Option<String> = None;
+    let mut temperature: Option<f32> = None;
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => {
+                return openai_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!("Malformed multipart body: {e}"),
+                    None,
+                );
+            }
+        };
+        let name = field.name().unwrap_or_default().to_string();
+        if name == "file" {
+            filename = field.file_name().unwrap_or_default().to_string();
+            match field.bytes().await {
+                Ok(b) => file = Some(b.to_vec()),
+                Err(e) => {
+                    return openai_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        format!("Could not read the uploaded file: {e}"),
+                        Some("file"),
+                    );
+                }
+            }
+            continue;
+        }
+        let value = field.text().await.unwrap_or_default();
+        match name.as_str() {
+            "model" => model = value,
+            "response_format" => response_format = Some(value),
+            "language" => language = Some(value),
+            "prompt" => prompt = Some(value),
+            "temperature" => temperature = value.parse().ok(),
+            _ => {}
+        }
+    }
+
+    let Some(file_bytes) = file else {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "`file` is required".to_string(),
+            Some("file"),
+        );
+    };
+
+    let req = transcription::TranscriptionRequest {
+        model: model.clone(),
+        filename: filename.clone(),
+        file_len: file_bytes.len(),
+        response_format,
+        language,
+        prompt,
+        temperature,
+        translate,
+    };
+    let settings = match transcription::translate(req) {
+        Ok(s) => s,
+        Err(e) => return translation_error(&e),
+    };
+
+    let capability = if translate {
+        "audio_translation"
+    } else {
+        "audio_transcription"
+    };
+    let Some(endpoint) =
+        state.resolve_voice_endpoint(&settings.endpoint, capability, bearer.as_deref())
+    else {
+        return model_not_found(&settings.endpoint, capability);
+    };
+
+    // Decode BEFORE touching the provider: a container we cannot read is the caller's problem
+    // and must not cost a vendor connection to discover.
+    let audio = match waav_openai_audio::pcm::decode(&file_bytes, &filename) {
+        Ok(a) => a,
+        Err(e) => return translation_error(&e),
+    };
+
+    let api_key = endpoint.credential.clone().unwrap_or_default();
+    if api_key.is_empty() && endpoint.vendor != "self_hosted" {
+        return openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            format!(
+                "Endpoint '{}' has no credential configured for vendor '{}'",
+                settings.endpoint, endpoint.vendor
+            ),
+            None,
+        );
+    }
+
+    info!(
+        endpoint = %settings.endpoint,
+        vendor = %endpoint.vendor,
+        capability,
+        secs = audio.duration_secs(),
+        rate = audio.sample_rate,
+        "openai audio/transcriptions"
+    );
+
+    let stt_config = crate::core::stt::STTConfig {
+        provider: endpoint.vendor.clone(),
+        api_key,
+        language: settings.language.clone().unwrap_or_else(|| "en-US".to_string()),
+        sample_rate: audio.sample_rate,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".to_string(),
+        model: endpoint.model.clone().unwrap_or_default(),
+    };
+
+    match crate::handlers::transcribe::transcribe_once(&endpoint.vendor, stt_config, &audio).await
+    {
+        Ok(t) => {
+            if t.truncated {
+                warn!(endpoint = %settings.endpoint, "returning a partial transcript");
+            }
+            let result = transcription::TranscriptionResult {
+                text: t.text,
+                language: settings.language.clone(),
+                duration: Some(audio.duration_secs()),
+                segments: Vec::new(),
+            };
+            render_transcription(&settings.response_format, &result)
+        }
+        Err(e) => {
+            warn!(endpoint = %settings.endpoint, error = %e, "transcription failed");
+            openai_error(StatusCode::BAD_GATEWAY, "api_error", e, None)
+        }
+    }
+}
+
+/// Render a result in the format the caller asked for.
+///
+/// `text`, `srt` and `vtt` are PLAIN BODIES, not JSON — a client that asked for an SRT file
+/// and got `{"text": "1\n00:00:00,000 ..."}` cannot feed it to a player.
+fn render_transcription(
+    format: &transcription::TranscriptionResponseFormat,
+    result: &transcription::TranscriptionResult,
+) -> Response {
+    use transcription::TranscriptionResponseFormat as F;
+    let mut headers = HeaderMap::new();
+    if let Ok(ct) = format.content_type().parse() {
+        headers.insert(header::CONTENT_TYPE, ct);
+    }
+    match format {
+        F::Json => (StatusCode::OK, Json(serde_json::json!({ "text": result.text }))).into_response(),
+        F::VerboseJson => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "task": "transcribe",
+                "language": result.language,
+                "duration": result.duration,
+                "text": result.text,
+                "segments": [],
+            })),
+        )
+            .into_response(),
+        F::Text => (StatusCode::OK, headers, result.text.clone()).into_response(),
+        F::Srt => (StatusCode::OK, headers, result.to_srt()).into_response(),
+        F::Vtt => (StatusCode::OK, headers, result.to_vtt()).into_response(),
+    }
 }

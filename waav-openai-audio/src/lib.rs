@@ -22,6 +22,7 @@
 //!    is a perfectly good voice name and rejecting it would make the vendor's own catalog
 //!    unreachable.
 
+pub mod pcm;
 pub mod speech;
 pub mod transcription;
 
@@ -58,4 +59,11 @@ pub enum AudioError {
         limit: String,
         actual: String,
     },
+
+    /// The field is present and well-formed as a value, but its CONTENT cannot be used --
+    /// an upload whose container this gateway cannot decode, say. Distinct from `Unsupported`,
+    /// which enumerates a closed set of accepted values; here the reason is specific to the
+    /// payload and carries its own remedy.
+    #[error("`{field}` cannot be used: {reason}")]
+    InvalidField { field: &'static str, reason: String },
 }

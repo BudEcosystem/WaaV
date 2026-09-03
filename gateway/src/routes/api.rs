@@ -25,11 +25,14 @@ pub fn create_api_router() -> Router<Arc<AppState>> {
         )
         .route(
             "/v1/audio/transcriptions",
-            post(crate::handlers::openai_audio::transcription_not_implemented),
+            post(crate::handlers::openai_audio::transcription_handler),
         )
         .route(
+            // translation_handler, NOT transcription_handler: the two differ only by the
+            // `translate` flag, and wiring both routes to the same one would make
+            // /v1/audio/translations silently return source-language text that looks correct.
             "/v1/audio/translations",
-            post(crate::handlers::openai_audio::transcription_not_implemented),
+            post(crate::handlers::openai_audio::translation_handler),
         )
         .route("/livekit/token", post(livekit::generate_token))
         .route("/livekit/rooms", get(livekit::list_rooms))

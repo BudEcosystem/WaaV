@@ -84,7 +84,9 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 
 # Server
-axum = { version = "0.8.4", features = ["ws"] }
+# `multipart` is what /v1/audio/transcriptions needs: OpenAI's transcription API is a
+# multipart/form-data upload, not JSON.
+axum = { version = "0.8.4", features = ["ws", "multipart"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tokio = { version = "1.46.0", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
