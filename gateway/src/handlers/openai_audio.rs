@@ -104,6 +104,19 @@ pub async fn speech_handler(
         return model_not_found(&settings.endpoint, "text_to_speech");
     };
 
+    // FRD-018 M7 exit criterion 3: a bad voice name must say which voices exist.
+    //
+    // Only checked where WaaV holds the vendor's catalog in process. Every other vendor
+    // publishes its voices from a live URL (`handlers::voices::list_voices` fetches them), and
+    // calling one here would put vendor I/O on the synthesis path — the thing the auth plane
+    // was built to avoid. Those keep forwarding verbatim, which is what `known_voices_for`
+    // returning an empty slice means. Giving another vendor an actionable error means
+    // hydrating its catalog into the snapshot the way credentials already are, which is a
+    // design change and not a line to bolt on here.
+    if let Err(e) = speech::validate_voice(&settings.voice, known_voices_for(&endpoint.vendor)) {
+        return translation_error(&e);
+    }
+
     // A hosted vendor with no credential is a misconfiguration worth naming here, rather than a
     // 401 from the vendor several seconds later that mentions neither Bud nor the endpoint.
     let api_key = endpoint.credential.clone().unwrap_or_default();
@@ -200,6 +213,18 @@ pub async fn speech_handler(
             // an operator whether to look at the vendor or at us.
             openai_error(StatusCode::BAD_GATEWAY, "api_error", e, None)
         }
+    }
+}
+
+/// The voices WaaV can name for a vendor without leaving the process.
+///
+/// Empty means "no catalog here, forward whatever the caller asked for" — the behaviour every
+/// vendor had before, and the only safe default: validating against an empty list would reject
+/// every voice and turn a missing catalog into an outage for that endpoint.
+fn known_voices_for(vendor: &str) -> &'static [&'static str] {
+    match vendor {
+        "openai" => speech::OPENAI_VOICES,
+        _ => &[],
     }
 }
 

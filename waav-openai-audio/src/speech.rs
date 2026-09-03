@@ -132,6 +132,28 @@ pub fn is_openai_voice(voice: &str) -> bool {
     OPENAI_VOICES.contains(&voice)
 }
 
+/// Check a requested voice against the voices a vendor is known to publish.
+///
+/// FRD-018 M7 wants a bad voice name to say which voices exist. Forwarding an unknown name to
+/// the vendor does not achieve that: the gateway turns a vendor rejection into a 502
+/// `api_error` carrying the vendor's wording, so the caller learns that something upstream
+/// broke and nothing about what to type instead. Rejecting here makes it a 400 the caller can
+/// act on, with the full list in the message.
+///
+/// `known` empty means WaaV has no catalog for that vendor — self-hosted deployments and any
+/// newly added vendor. Those forward verbatim, exactly as before. Validating against an empty
+/// list would refuse every voice and turn a missing catalog into an outage for that endpoint.
+pub fn validate_voice(voice: &str, known: &[&str]) -> Result<(), AudioError> {
+    if known.is_empty() || known.contains(&voice) {
+        return Ok(());
+    }
+    Err(AudioError::Unsupported {
+        field: "voice",
+        value: voice.to_string(),
+        expected: known.join(", "),
+    })
+}
+
 /// Validate and translate a synthesis request.
 pub fn translate(req: SpeechRequest) -> Result<SpeechSettings, AudioError> {
     if req.model.trim().is_empty() {
@@ -436,5 +458,57 @@ mod tests {
         let json = r#"{"model":"tts-1","input":"hi","voice":"alloy","some_future_field":true}"#;
         let parsed: SpeechRequest = serde_json::from_str(json).unwrap();
         assert!(translate(parsed).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod voice_validation_tests {
+    use super::*;
+
+    // FRD-018 M7 exit criterion 3: "a bad voice name says which voices exist".
+    //
+    // Before this, an unknown voice was forwarded verbatim on the assumption the vendor would
+    // reject it legibly. In practice the gateway wraps a vendor rejection as a 502 `api_error`
+    // carrying the vendor's own wording, so the caller learned that something upstream failed
+    // and nothing about what to type instead.
+
+    #[test]
+    fn an_unknown_voice_is_rejected_and_names_the_alternatives() {
+        let err = validate_voice("aloy", OPENAI_VOICES).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("aloy"), "must quote what the caller actually sent: {msg}");
+        assert!(msg.contains("alloy"), "must list the real voices: {msg}");
+        assert!(msg.contains("shimmer"), "must list ALL of them, not a sample: {msg}");
+    }
+
+    #[test]
+    fn a_known_voice_passes() {
+        for v in OPENAI_VOICES {
+            assert!(validate_voice(v, OPENAI_VOICES).is_ok(), "{v} should be accepted");
+        }
+    }
+
+    #[test]
+    fn an_empty_known_set_forwards_verbatim() {
+        // A vendor whose voice list WaaV does not know must keep working. Rejecting against an
+        // empty set would refuse every voice for self-hosted and any newly added vendor —
+        // turning a missing catalog into a total outage for that endpoint.
+        assert!(validate_voice("anything-at-all", &[]).is_ok());
+    }
+
+    #[test]
+    fn the_error_is_a_client_error_shape_not_an_upstream_one() {
+        // Unsupported is what `response_format` already uses, and the handler maps it to 400.
+        // The whole point is that this stops being a 502: the caller can fix it themselves.
+        let err = validate_voice("nope", OPENAI_VOICES).unwrap_err();
+        assert!(matches!(err, AudioError::Unsupported { field: "voice", .. }));
+    }
+
+    #[test]
+    fn matching_is_exact_not_fuzzy() {
+        // "Alloy" and " alloy" are mistakes worth naming rather than silently accepting; a
+        // caller who gets a quiet pass here would be surprised by a vendor rejection later.
+        assert!(validate_voice("Alloy", OPENAI_VOICES).is_err());
+        assert!(validate_voice(" alloy", OPENAI_VOICES).is_err());
     }
 }
