@@ -71,7 +71,10 @@ async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
 
     // Initialize tracing
-    tracing_subscriber::fmt::init();
+    // Exports to OTLP when the chart supplies an endpoint, stdout otherwise. The guard is
+    // held for the process lifetime so shutdown can flush: dropping it silently loses whatever
+    // is still batched, which is exactly the spans from the request that caused the shutdown.
+    let mut tracing_guard = waav_gateway::observability::tracing_init::init();
 
     // Initialize crypto provider for TLS connections
     // This must be done before any TLS connections are attempted
@@ -415,6 +418,11 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     }
+
+    // Flush batched spans BEFORE returning. Without this the exporter is dropped with its
+    // batch unsent, and the spans lost are the ones from the requests immediately before
+    // shutdown -- exactly the ones someone investigating a bad rollout is looking for.
+    tracing_guard.shutdown();
 
     info!("Server shutdown complete");
     Ok(())

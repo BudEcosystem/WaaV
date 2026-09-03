@@ -26,6 +26,9 @@ use waav_openai_audio::{
     transcription,
 };
 
+use tracing::Instrument;
+
+use crate::observability::voice_attrs;
 use crate::state::AppState;
 
 /// Render a failure as OpenAI's error envelope.
@@ -116,13 +119,37 @@ pub async fn speech_handler(
         );
     }
 
+    // FRD-018 M6. The field names are the attribute names budmetrics' VoiceTurnFact reads —
+    // `tracing_opentelemetry` maps span fields straight onto OTel attributes, so a typo here is
+    // a permanently NULL column rather than an error. They come from `voice_attrs`, which the
+    // cross-repo contract test pins against budmetrics' own registry.
+    //
+    // `duration_ms` is declared Empty and recorded after synthesis: a field not declared at
+    // span creation cannot be recorded later, and silently does nothing if you try.
+    let chars = settings.text.chars().count();
+    let turn_span = tracing::info_span!(
+        "voice.turn",
+        { voice_attrs::turn::CAPABILITY } = "text_to_speech",
+        { voice_attrs::turn::TRANSPORT } = "http",
+        { voice_attrs::turn::ENDPOINT_ID } = %settings.endpoint,
+        { voice_attrs::turn::CHARACTERS } = chars,
+        { voice_attrs::turn::LANGUAGE } = endpoint.language.as_deref().unwrap_or(""),
+        { voice_attrs::leg::TTS_VENDOR } = %endpoint.vendor,
+        { voice_attrs::leg::TTS_DURATION_MS } = tracing::field::Empty,
+    );
+    // NOT `turn_span.enter()`. A span guard held across an `.await` attaches the span to
+    // whatever task the executor resumes next, so the attributes land on someone else's work
+    // and this turn's span is missing them. `.instrument()` on the future is the async-correct
+    // form; the guard form is the single most common way to produce confidently wrong traces.
     info!(
         endpoint = %settings.endpoint,
         vendor = %endpoint.vendor,
         format = settings.format.as_str(),
-        chars = settings.text.chars().count(),
+        chars,
         "openai audio/speech"
     );
+
+    let started = std::time::Instant::now();
 
     let tts_config = crate::core::tts::TTSConfig {
         provider: endpoint.vendor.clone(),
@@ -142,8 +169,15 @@ pub async fn speech_handler(
         ..Default::default()
     };
 
-    match crate::handlers::speak::synthesize_once(&state, tts_config, &settings.text).await {
+    match crate::handlers::speak::synthesize_once(&state, tts_config, &settings.text)
+        .instrument(turn_span.clone())
+        .await
+    {
         Ok((audio, format, sample_rate)) => {
+            turn_span.record(
+                voice_attrs::leg::TTS_DURATION_MS,
+                started.elapsed().as_millis() as u64,
+            );
             let mut headers = HeaderMap::new();
             if let Ok(ct) = settings.format.content_type().parse() {
                 headers.insert(header::CONTENT_TYPE, ct);
