@@ -1180,11 +1180,40 @@ impl ConversationOrchestrator {
     /// (streaming) with the per-session history and pipe tokens to
     /// `VoiceManager::speak`. On a non-streaming config, the full reply is spoken
     /// once. Cancellation (barge-in/teardown) aborts promptly.
+    /// Run one conversation turn, inside a `voice.turn` span (FRD-018 M6).
+    ///
+    /// The span is opened HERE rather than inside the body because a turn is the unit budmetrics
+    /// records: the STT that triggered it, the LLM that answered, and the TTS that spoke are one
+    /// row, and they are only one row if they share a trace. The two HTTP audio routes already
+    /// emit this span; this is the WebSocket path, where all three legs actually occur together.
+    ///
+    /// `.instrument()` and not `enter()`: entering a span across an `.await` attaches it to
+    /// whatever the executor runs next on that thread, which silently mis-attributes the very
+    /// legs this exists to measure.
     pub async fn run_turn(&self, transcript: &str) -> Result<(), ConversationOrchestratorError> {
+        let span = crate::voice_turn_span!(capability = "conversation", transport = "websocket");
+        span.record(
+            crate::observability::voice_attrs::turn::SESSION_ID,
+            self.session_id.as_str(),
+        );
+        span.record(
+            crate::observability::voice_attrs::turn::TRANSCRIPT,
+            transcript,
+        );
+        tracing::Instrument::instrument(self.run_turn_inner(transcript), span).await
+    }
+
+    async fn run_turn_inner(&self, transcript: &str) -> Result<(), ConversationOrchestratorError> {
+        let span = tracing::Span::current();
         let (id, token) = self.begin_turn();
+        span.record(crate::observability::voice_attrs::turn::TURN_INDEX, id);
         // S2: select the fast or reasoning tier for this turn (both share
         // history; the D3 filler masks the reasoning tier's latency).
         let (llm, is_reasoning) = self.select_tier(transcript);
+        span.record(
+            crate::observability::voice_attrs::leg::LLM_MODEL,
+            llm.config().model.as_str(),
+        );
         // Barge-in clear epoch (review wf_85659e16 #5): captured ONCE at
         // turn start; any clear during the turn invalidates every later
         // sentence enqueue of this turn — checked under the TTS lock, so a
@@ -1433,6 +1462,10 @@ impl ConversationOrchestrator {
             0
         };
         let mut budget_exceeded = false;
+        // Wraps BOTH completion branches: the budgeted reasoning path and the plain one. Timing
+        // only one of them would leave the reasoning turns — the slow ones, the whole reason the
+        // measurement is interesting — silently unmeasured.
+        let llm_started = std::time::Instant::now();
         let result = if budget_ms > 0 && self.reasoning_llm.is_some() {
             let reasoner_token = token.child_token();
             let req_start = crate::core::observability::now_monotonic_ns();
@@ -1478,6 +1511,13 @@ impl ConversationOrchestrator {
             )
             .await
         };
+
+        // Recorded before the pump is awaited: this is the LLM leg, and the pump's remaining
+        // work is TTS. Folding the flush in here would quietly bill synthesis time to the model.
+        span.record(
+            crate::observability::voice_attrs::leg::LLM_DURATION_MS,
+            llm_started.elapsed().as_millis() as u64,
+        );
 
         // `complete()` returning drops the token callback → channel closes → the
         // pump flushes its remainder and exits. Await it so `spoke` is final and

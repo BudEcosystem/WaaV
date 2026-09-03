@@ -99,6 +99,55 @@ pub const ALL: &[&str] = &[
     leg::LLM_DURATION_MS,
 ];
 
+/// Open a `voice.turn` span that declares EVERY attribute in [`ALL`] up front.
+///
+/// This exists because of a failure mode that produces no error of any kind: `Span::record` on a
+/// field the span did not declare at creation is a silent no-op. A leg that measures its vendor
+/// and duration correctly, and records them into a span that never declared those fields, emits
+/// a trace that looks complete and arrives with the columns empty — and an empty column is
+/// indistinguishable from a feature nobody used.
+///
+/// Declaring the whole vocabulary in ONE place means a new leg cannot be wired to a span that
+/// silently ignores it. Fields nobody records stay `Empty` and are simply absent from the span,
+/// which costs nothing.
+///
+/// The caller supplies only what is known at turn start; everything else is recorded later.
+#[macro_export]
+macro_rules! voice_turn_span {
+    (capability = $capability:expr, transport = $transport:expr $(, $extra:ident = $value:expr)* $(,)?) => {
+        ::tracing::info_span!(
+            "voice.turn",
+            { $crate::observability::voice_attrs::turn::CAPABILITY } = $capability,
+            { $crate::observability::voice_attrs::turn::TRANSPORT } = $transport,
+            { $crate::observability::voice_attrs::turn::PROJECT_ID } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::ENDPOINT_ID } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::MODEL_ID } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::API_KEY_ID } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::USER_ID } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::SESSION_ID } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::TURN_INDEX } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::CHARACTERS } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::AUDIO_SECONDS } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::COST } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::RESPONSE_LATENCY_MS } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::BARGE_IN } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::TURN_DETECTOR } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::LANGUAGE } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::TRANSCRIPT } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::SYNTHESIS_INPUT } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::leg::STT_VENDOR } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::leg::STT_DURATION_MS } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::leg::STT_TTFB_MS } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::leg::TTS_VENDOR } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::leg::TTS_DURATION_MS } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::leg::TTS_TTFB_MS } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::leg::LLM_MODEL } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::leg::LLM_DURATION_MS } = ::tracing::field::Empty,
+            $( $extra = $value, )*
+        )
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +171,98 @@ mod tests {
         let before = seen.len();
         seen.dedup();
         assert_eq!(before, seen.len(), "duplicate attribute in ALL");
+    }
+
+    /// Collects the field names a span actually ends up carrying.
+    ///
+    /// Scoped with `with_default` rather than a global subscriber on purpose: a global one is
+    /// process-wide, so under a parallel test runner these assertions would see spans from
+    /// whatever else happened to be running and fail intermittently.
+    mod capture {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Metadata, subscriber::Interest};
+
+        #[derive(Default)]
+        pub struct Names(pub Arc<Mutex<HashSet<String>>>);
+
+        impl Visit for Names {
+            fn record_debug(&mut self, field: &Field, _v: &dyn std::fmt::Debug) {
+                self.0.lock().unwrap().insert(field.name().to_string());
+            }
+        }
+
+        pub struct Sub(pub Arc<Mutex<HashSet<String>>>);
+
+        impl tracing::Subscriber for Sub {
+            fn register_callsite(&self, _m: &'static Metadata<'static>) -> Interest {
+                Interest::always()
+            }
+            fn enabled(&self, _m: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, attrs: &Attributes<'_>) -> Id {
+                let mut v = Names(self.0.clone());
+                attrs.record(&mut v);
+                Id::from_u64(1)
+            }
+            fn record(&self, _id: &Id, values: &Record<'_>) {
+                let mut v = Names(self.0.clone());
+                values.record(&mut v);
+            }
+            fn record_follows_from(&self, _s: &Id, _f: &Id) {}
+            fn event(&self, _e: &Event<'_>) {}
+            fn enter(&self, _id: &Id) {}
+            fn exit(&self, _id: &Id) {}
+        }
+    }
+
+    #[test]
+    fn a_field_the_span_never_declared_is_silently_dropped() {
+        // The mechanism the macro exists to defeat, pinned rather than described. If tracing
+        // ever started surfacing this — panicking, warning, anything — the macro's whole
+        // rationale would be obsolete and this test would say so.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        tracing::subscriber::with_default(capture::Sub(seen.clone()), || {
+            let span = tracing::info_span!("voice.turn", { turn::CAPABILITY } = "text_to_speech");
+            span.record(leg::LLM_MODEL, "gpt-4o-mini");
+            span.record(leg::LLM_DURATION_MS, 42u64);
+        });
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.contains(turn::CAPABILITY),
+            "the declared field should be present"
+        );
+        assert!(
+            !seen.contains(leg::LLM_MODEL) && !seen.contains(leg::LLM_DURATION_MS),
+            "recording an undeclared field must be a silent no-op — if this now works, \
+             voice_turn_span!'s reason for existing is gone: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn the_turn_span_macro_accepts_every_attribute_in_all() {
+        // The guard proper. A leg added later records into a span built by this macro; if its
+        // attribute is not declared here the value vanishes with no error, and the column just
+        // stays NULL. Exercising the whole vocabulary is what keeps that from shipping.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        tracing::subscriber::with_default(capture::Sub(seen.clone()), || {
+            let span =
+                crate::voice_turn_span!(capability = "conversation", transport = "websocket");
+            for name in ALL {
+                span.record(*name, "x");
+            }
+        });
+        let seen = seen.lock().unwrap();
+        let missing: Vec<_> = ALL.iter().filter(|a| !seen.contains(**a)).collect();
+        assert!(
+            missing.is_empty(),
+            "voice_turn_span! does not declare {missing:?}; recording them is a silent no-op, \
+             so those columns would arrive empty with nothing reporting a problem"
+        );
     }
 
     #[test]
