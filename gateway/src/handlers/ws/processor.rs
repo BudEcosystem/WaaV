@@ -152,42 +152,88 @@ pub async fn handle_incoming_message(
 ///
 /// # Returns
 /// * `bool` - true on successful auth, false to close connection
+/// Which authenticator the first-message path should consult.
+///
+/// Extracted so the ORDERING is testable, because getting it wrong is invisible: the previous
+/// version consulted only `auth_api_secrets`, which a Bud deployment never configures, so
+/// every deferred WebSocket auth was refused with "API secret authentication not configured"
+/// no matter how good the caller's Bud key was. Browser clients cannot set an Authorization
+/// header on a WebSocket, so that deferred path is their ONLY route in — the effect was that
+/// no browser could open a voice session in Bud mode at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsAuthPath {
+    /// Resolve against the Bud control plane, exactly as `auth_middleware` does.
+    Bud,
+    /// Standalone WaaV: match against the configured API secret list.
+    ApiSecret,
+    /// Neither is configured; there is nothing to authenticate against.
+    Unconfigured,
+}
+
+/// Bud mode wins whenever it is present.
+///
+/// Same precedence as `auth_middleware`, and for the same reason: when a control plane is
+/// configured it IS the deployment's identity source, and falling through to a secret list
+/// that a Bud chart never populates rejects valid credentials.
+pub fn ws_auth_path(bud_mode_present: bool, has_api_secrets: bool) -> WsAuthPath {
+    if bud_mode_present {
+        WsAuthPath::Bud
+    } else if has_api_secrets {
+        WsAuthPath::ApiSecret
+    } else {
+        WsAuthPath::Unconfigured
+    }
+}
+
 async fn handle_auth_message(
     token: String,
     state: &Arc<RwLock<ConnectionState>>,
     message_tx: &mpsc::Sender<MessageRoute>,
     app_state: &Arc<AppState>,
 ) -> bool {
-    // Validate token against configured API secrets
-    if !app_state.config.has_api_secret_auth() {
-        warn!("First-message auth attempted but API secret auth not configured");
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: "API secret authentication not configured".to_string(),
-            }))
-            .await;
-        let _ = message_tx.send(MessageRoute::Close).await;
-        return false;
-    }
+    let path = ws_auth_path(
+        app_state.bud_mode.is_some(),
+        app_state.config.has_api_secret_auth(),
+    );
 
-    // Match token against configured API secrets
-    if let Some(secret_id) = match_api_secret_id(&token, &app_state.config.auth_api_secrets) {
-        let secret_id_owned = secret_id.to_string();
-        info!(auth_id = %secret_id_owned, "First-message authentication successful");
+    let resolved: Option<String> = match path {
+        WsAuthPath::Bud => {
+            // Unwrap is safe: `ws_auth_path` returns Bud only when bud_mode is Some.
+            let bud = app_state.bud_mode.as_ref().expect("bud mode present");
+            match bud.authenticate(&token).await {
+                Ok(auth) => auth.id,
+                Err(e) => {
+                    warn!(error = ?e, "first-message bud authentication failed");
+                    None
+                }
+            }
+        }
+        WsAuthPath::ApiSecret => {
+            match_api_secret_id(&token, &app_state.config.auth_api_secrets).map(str::to_string)
+        }
+        WsAuthPath::Unconfigured => {
+            warn!("First-message auth attempted but no authenticator is configured");
+            let _ = message_tx
+                .send(MessageRoute::Outgoing(OutgoingMessage::Error {
+                    message: "Authentication is not configured on this gateway".to_string(),
+                }))
+                .await;
+            let _ = message_tx.send(MessageRoute::Close).await;
+            return false;
+        }
+    };
 
-        // Update connection state with authenticated auth
+    if let Some(id) = resolved {
+        info!(auth_id = %id, ?path, "First-message authentication successful");
         {
             let mut conn_state = state.write().await;
-            conn_state.auth = Auth::new(secret_id_owned.clone());
+            conn_state.auth = Auth::new(id.clone());
         }
-
-        // Send authenticated response
         let _ = message_tx
             .send(MessageRoute::Outgoing(OutgoingMessage::Authenticated {
-                id: Some(secret_id_owned),
+                id: Some(id),
             }))
             .await;
-
         true
     } else {
         warn!("First-message authentication failed: invalid token");
@@ -196,9 +242,39 @@ async fn handle_auth_message(
                 message: "Invalid authentication token".to_string(),
             }))
             .await;
-        // Close connection on auth failure
         let _ = message_tx.send(MessageRoute::Close).await;
         false
+    }
+}
+
+#[cfg(test)]
+mod ws_auth_path_tests {
+    use super::{WsAuthPath, ws_auth_path};
+
+    #[test]
+    fn bud_mode_is_consulted_whenever_it_is_configured() {
+        // THE regression. A Bud chart configures no auth_api_secrets, so consulting the
+        // secret list first refused every valid Bud credential on the deferred path.
+        assert_eq!(ws_auth_path(true, false), WsAuthPath::Bud);
+    }
+
+    #[test]
+    fn bud_mode_outranks_a_configured_secret_list() {
+        // Same precedence as auth_middleware: when a control plane exists it is the identity
+        // source, and a leftover secret must not shadow it.
+        assert_eq!(ws_auth_path(true, true), WsAuthPath::Bud);
+    }
+
+    #[test]
+    fn standalone_waav_still_uses_its_api_secrets() {
+        assert_eq!(ws_auth_path(false, true), WsAuthPath::ApiSecret);
+    }
+
+    #[test]
+    fn with_neither_configured_the_socket_is_refused_rather_than_admitted() {
+        // Fail CLOSED. An unconfigured gateway must not treat "nothing to check against" as
+        // "everything passes".
+        assert_eq!(ws_auth_path(false, false), WsAuthPath::Unconfigured);
     }
 }
 
