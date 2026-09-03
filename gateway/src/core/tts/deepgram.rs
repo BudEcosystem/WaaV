@@ -11,6 +11,59 @@ use xxhash_rust::xxh3::xxh3_128;
 /// Deepgram TTS endpoint
 pub const DEEPGRAM_TTS_URL: &str = "https://api.deepgram.com/v1/speak";
 
+/// Deepgram's Flux voices are served from a second speak endpoint.
+pub const DEEPGRAM_TTS_URL_V2: &str = "https://api.deepgram.com/v2/speak";
+
+/// Pick the speak endpoint for a Deepgram model.
+///
+/// Deepgram rejects a Flux model on `/v1/speak` outright:
+///
+/// > V2_MODEL_ON_V1_SPEAK_ENDPOINT — Flux models are not supported on the `/v1/speak`
+/// > endpoint. Please use the `/v2/speak` endpoint for Flux text-to-speech requests.
+///
+/// Every request to a published Flux deployment therefore failed with a 502 carrying that
+/// text. The model name is the only signal available: budapp publishes it verbatim and the
+/// voice table carries no endpoint hint.
+///
+/// Matched on a `flux-` PREFIX rather than a substring. A voice merely containing "flux"
+/// somewhere in its name is not a Flux model, and sending it to v2 would break a working
+/// deployment to fix a broken one.
+pub fn deepgram_speak_url(model: &str) -> &'static str {
+    if model.trim_start().to_ascii_lowercase().starts_with("flux-") {
+        DEEPGRAM_TTS_URL_V2
+    } else {
+        DEEPGRAM_TTS_URL
+    }
+}
+
+#[cfg(test)]
+mod speak_url_tests {
+    use super::*;
+
+    #[test]
+    fn flux_models_go_to_v2() {
+        // The live failure: flux-hannah-en, published and 502ing on every request.
+        assert_eq!(deepgram_speak_url("flux-hannah-en"), DEEPGRAM_TTS_URL_V2);
+        assert_eq!(deepgram_speak_url("FLUX-Hannah-EN"), DEEPGRAM_TTS_URL_V2);
+    }
+
+    #[test]
+    fn every_other_model_stays_on_v1() {
+        // aura-2-thalia-en works today and must keep working; moving it would trade one
+        // broken deployment for another.
+        for m in ["aura-2-thalia-en", "aura-asteria-en", "nova-3", ""] {
+            assert_eq!(deepgram_speak_url(m), DEEPGRAM_TTS_URL, "{m} must stay on v1");
+        }
+    }
+
+    #[test]
+    fn a_name_merely_containing_flux_is_not_a_flux_model() {
+        // Prefix, not substring. "aura-flux-like" is an Aura voice.
+        assert_eq!(deepgram_speak_url("aura-flux-like"), DEEPGRAM_TTS_URL);
+        assert_eq!(deepgram_speak_url("influx-en"), DEEPGRAM_TTS_URL);
+    }
+}
+
 fn validate_deepgram_tts_endpoint(source: &str, endpoint: &str) -> TTSResult<()> {
     let endpoint = endpoint.trim();
     if endpoint.is_empty() {
@@ -86,8 +139,15 @@ impl TTSRequestBuilder for DeepgramRequestBuilder {
     fn build_http_request(&self, client: &reqwest::Client, text: &str) -> reqwest::RequestBuilder {
         // Build the URL with query parameters (honoring the W-T0 endpoint override, which swaps
         // scheme+host while keeping the `/v1/speak` path the mock serves on).
+        // v1 or v2 depending on the model: Deepgram serves Flux voices only from /v2/speak
+        // and rejects them on /v1 with V2_MODEL_ON_V1_SPEAK_ENDPOINT.
+        let base = deepgram_speak_url(if self.config.model.is_empty() {
+            self.config.voice_id.as_deref().unwrap_or("")
+        } else {
+            &self.config.model
+        });
         let mut url = crate::core::tts::standard::override_rest_endpoint(
-            DEEPGRAM_TTS_URL,
+            base,
             self.speak.endpoint_override.as_deref(),
         );
         let mut params: Vec<(&str, String)> = Vec::new();
