@@ -388,6 +388,9 @@ async fn transcription_inner(
             bytes = file_bytes.len(),
             "openai audio/transcriptions -> self-hosted passthrough"
         );
+        // Measured before `file_bytes` is moved into the call below. Header read only: no
+        // samples are allocated, so a long upload costs nothing to measure.
+        let measured_secs = waav_openai_audio::pcm::wav_duration_secs(&file_bytes);
         return match crate::handlers::transcribe::transcribe_self_hosted(
             &api_base,
             &api_key,
@@ -404,6 +407,15 @@ async fn transcription_inner(
                     voice_attrs::leg::STT_DURATION_MS,
                     stt_started.elapsed().as_millis() as u64,
                 );
+                // `audio_seconds` is the billing dimension for transcription. This branch
+                // forwards the upload verbatim and never decodes it, so the field the span
+                // reserves was never recorded and the column was permanently NULL for every
+                // self-hosted transcription. Read it from the WAV header instead — no samples
+                // are allocated. A container the header read cannot parse stays NULL, which is
+                // the honest answer: a guessed number in a billing column is worse than none.
+                if let Some(secs) = measured_secs {
+                    turn_span.record(voice_attrs::turn::AUDIO_SECONDS, secs);
+                }
                 passthrough_response(&settings.response_format, body)
             }
             Err(e) => {

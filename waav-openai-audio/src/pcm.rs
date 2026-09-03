@@ -115,6 +115,68 @@ fn decode_raw_pcm(bytes: &[u8], sample_rate: u32) -> Result<PcmAudio, AudioError
 /// recorders carry `LIST`/`INFO`/`fact` chunks before `data`, and a parser that reads `fmt `
 /// at 12 and `data` at 36 decodes those as silence or noise without erroring — the failure
 /// mode being an empty transcript nobody can explain.
+/// Duration of a RIFF/WAVE upload, read from its header without decoding the samples.
+///
+/// `audio_seconds` is the billing dimension for transcription, the way `characters` is for
+/// synthesis. The self-hosted STT path forwards the upload verbatim and never decodes it, so
+/// `PcmAudio::duration_secs` is not available there and the column was permanently NULL.
+/// This reads the `fmt ` and `data` chunk headers only: a one-hour file is answered without
+/// allocating a sample.
+///
+/// Returns `None` for anything it cannot read with certainty — a non-RIFF container, a
+/// truncated header, a zero sample rate. NULL is the honest answer there; putting a guessed
+/// number into a billing column is worse than putting nothing.
+pub fn wav_duration_secs(bytes: &[u8]) -> Option<f64> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+
+    let mut pos = 12usize;
+    let mut rate: Option<u32> = None;
+    let mut block_align: Option<u32> = None;
+    let mut data_len: Option<u32> = None;
+
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let size =
+            u32::from_le_bytes([bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]])
+                as usize;
+        let body = pos + 8;
+        match id {
+            // channels at +2, rate at +4, bits at +14 — enough to derive the frame size
+            // without parse_fmt, which validates things a duration read does not care about.
+            b"fmt " if size >= 16 && body + 16 <= bytes.len() => {
+                let channels = u16::from_le_bytes([bytes[body + 2], bytes[body + 3]]) as u32;
+                rate = Some(u32::from_le_bytes([
+                    bytes[body + 4],
+                    bytes[body + 5],
+                    bytes[body + 6],
+                    bytes[body + 7],
+                ]));
+                let bits = u16::from_le_bytes([bytes[body + 14], bytes[body + 15]]) as u32;
+                block_align = Some(channels * bits / 8);
+            }
+            // The DECLARED size, not what arrived: a truncated upload should not silently
+            // report a shorter clip than the caller sent.
+            b"data" => data_len = Some(size as u32),
+            _ => {}
+        }
+        let next = body.saturating_add(size).min(bytes.len());
+        if next <= pos {
+            break;
+        }
+        pos = next + (size & 1);
+    }
+
+    let (rate, align, len) = (rate?, block_align?, data_len?);
+    if rate == 0 || align == 0 {
+        return None;
+    }
+    // Frames over rate. Bytes over rate would report stereo as twice its length, which in a
+    // billing column is an overcharge rather than a rounding error.
+    Some((len / align) as f64 / rate as f64)
+}
+
 fn decode_wav(bytes: &[u8]) -> Result<PcmAudio, AudioError> {
     if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err(invalid("not a RIFF/WAVE file"));
@@ -383,5 +445,73 @@ mod tests {
             sample_rate: 16_000,
         };
         assert_eq!(pcm.to_bytes_le(), vec![1, 0, 254, 255, 44, 1]);
+    }
+}
+
+#[cfg(test)]
+mod wav_duration_tests {
+    use super::*;
+
+    /// A minimal but valid RIFF/WAVE with the given rate, channels and sample count.
+    fn wav(rate: u32, channels: u16, bits: u16, frames: u32) -> Vec<u8> {
+        let block_align = channels * bits / 8;
+        let data_len = frames * block_align as u32;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data_len).to_le_bytes());
+        b.extend_from_slice(b"WAVE");
+        b.extend_from_slice(b"fmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        b.extend_from_slice(&channels.to_le_bytes());
+        b.extend_from_slice(&rate.to_le_bytes());
+        b.extend_from_slice(&(rate * block_align as u32).to_le_bytes());
+        b.extend_from_slice(&block_align.to_le_bytes());
+        b.extend_from_slice(&bits.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data_len.to_le_bytes());
+        b.resize(b.len() + data_len as usize, 0);
+        b
+    }
+
+    #[test]
+    fn reads_duration_from_the_header_alone() {
+        // 16000 Hz, mono, 16-bit, 32000 frames => exactly 2 seconds.
+        let d = wav_duration_secs(&wav(16000, 1, 16, 32000)).unwrap();
+        assert!((d - 2.0).abs() < 1e-9, "got {d}");
+    }
+
+    #[test]
+    fn accounts_for_channels_and_bit_depth() {
+        // Duration is FRAMES over rate. Counting bytes instead would report stereo as twice
+        // its real length — and audio_seconds is a billing dimension, so that is an
+        // overcharge, not a rounding error.
+        let stereo = wav_duration_secs(&wav(16000, 2, 16, 16000)).unwrap();
+        assert!((stereo - 1.0).abs() < 1e-9, "stereo: got {stereo}");
+        let deep = wav_duration_secs(&wav(16000, 1, 32, 16000)).unwrap();
+        assert!((deep - 1.0).abs() < 1e-9, "32-bit: got {deep}");
+    }
+
+    #[test]
+    fn does_not_allocate_the_samples() {
+        // The point of a header read on the passthrough: a 60-second upload must not be
+        // materialised as samples just to be measured. A 1-hour file is answered instantly.
+        let big = wav(48000, 2, 16, 48000 * 3600);
+        assert!(wav_duration_secs(&big).is_some());
+    }
+
+    #[test]
+    fn returns_none_rather_than_guessing() {
+        // NULL is the honest answer for a container this cannot read. Reporting a wrong
+        // number into a billing column is worse than reporting nothing.
+        assert_eq!(wav_duration_secs(b"ID3\x04\x00mp3 data here"), None);
+        assert_eq!(wav_duration_secs(b""), None);
+        assert_eq!(wav_duration_secs(b"RIFF"), None);
+        assert_eq!(wav_duration_secs(&wav(16000, 1, 16, 100)[..20]), None);
+    }
+
+    #[test]
+    fn a_zero_rate_header_is_none_not_a_division_by_zero() {
+        assert_eq!(wav_duration_secs(&wav(0, 1, 16, 1000)), None);
     }
 }
