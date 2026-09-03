@@ -148,6 +148,9 @@ pub async fn speech_handler(
         { voice_attrs::turn::CHARACTERS } = chars,
         { voice_attrs::turn::LANGUAGE } = endpoint.language.as_deref().unwrap_or(""),
         { voice_attrs::leg::TTS_VENDOR } = %endpoint.vendor,
+        { voice_attrs::turn::PROJECT_ID } = tracing::field::Empty,
+        { voice_attrs::turn::USER_ID } = tracing::field::Empty,
+        { voice_attrs::turn::API_KEY_ID } = tracing::field::Empty,
         { voice_attrs::leg::TTS_DURATION_MS } = tracing::field::Empty,
     );
     // NOT `turn_span.enter()`. A span guard held across an `.await` attaches the span to
@@ -163,6 +166,25 @@ pub async fn speech_handler(
     );
 
     let started = std::time::Instant::now();
+
+    // Attribution. The identity was always resolvable — `resolve_voice_endpoint` just never
+    // asked for it — so project_id, user_id and api_key_id were NULL for every voice turn ever
+    // recorded, and VoiceTurnFact could not attribute usage to a project at all.
+    //
+    // `recordable` filters `Some("")`: an empty string is not NULL, and recording one makes the
+    // column look populated to the live check that asks whether a value ever arrived.
+    if let Some(p) = state.resolve_principal(bearer.as_deref()).await {
+        use waav_openai_audio::recordable;
+        if let Some(v) = recordable(p.project_id.as_deref()) {
+            turn_span.record(voice_attrs::turn::PROJECT_ID, v);
+        }
+        if let Some(v) = recordable(p.user_id.as_deref()) {
+            turn_span.record(voice_attrs::turn::USER_ID, v);
+        }
+        if let Some(v) = recordable(p.api_key_id.as_deref()) {
+            turn_span.record(voice_attrs::turn::API_KEY_ID, v);
+        }
+    }
 
     let tts_config = crate::core::tts::TTSConfig {
         provider: endpoint.vendor.clone(),
@@ -350,6 +372,9 @@ async fn transcription_inner(
         { voice_attrs::turn::ENDPOINT_ID } = %settings.endpoint,
         { voice_attrs::turn::LANGUAGE } = settings.language.as_deref().unwrap_or(""),
         { voice_attrs::turn::AUDIO_SECONDS } = tracing::field::Empty,
+        { voice_attrs::turn::PROJECT_ID } = tracing::field::Empty,
+        { voice_attrs::turn::USER_ID } = tracing::field::Empty,
+        { voice_attrs::turn::API_KEY_ID } = tracing::field::Empty,
         { voice_attrs::leg::STT_VENDOR } = tracing::field::Empty,
         { voice_attrs::leg::STT_DURATION_MS } = tracing::field::Empty,
     );
@@ -361,6 +386,25 @@ async fn transcription_inner(
     };
 
     turn_span.record(voice_attrs::leg::STT_VENDOR, endpoint.vendor.as_str());
+
+    // Attribution. The identity was always resolvable — `resolve_voice_endpoint` just never
+    // asked for it — so project_id, user_id and api_key_id were NULL for every voice turn ever
+    // recorded, and VoiceTurnFact could not attribute usage to a project at all.
+    //
+    // `recordable` filters `Some("")`: an empty string is not NULL, and recording one makes the
+    // column look populated to the live check that asks whether a value ever arrived.
+    if let Some(p) = state.resolve_principal(bearer.as_deref()).await {
+        use waav_openai_audio::recordable;
+        if let Some(v) = recordable(p.project_id.as_deref()) {
+            turn_span.record(voice_attrs::turn::PROJECT_ID, v);
+        }
+        if let Some(v) = recordable(p.user_id.as_deref()) {
+            turn_span.record(voice_attrs::turn::USER_ID, v);
+        }
+        if let Some(v) = recordable(p.api_key_id.as_deref()) {
+            turn_span.record(voice_attrs::turn::API_KEY_ID, v);
+        }
+    }
     let stt_started = std::time::Instant::now();
 
     let api_key = endpoint.credential.clone().unwrap_or_default();

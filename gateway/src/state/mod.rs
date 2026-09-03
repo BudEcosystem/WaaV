@@ -76,6 +76,25 @@ impl AppState {
     /// The capability check is not decoration: an endpoint registered for transcription would
     /// otherwise accept a synthesis request and fail deep inside a vendor call, with an error
     /// naming neither the endpoint nor the mistake.
+    /// Who the caller is, for attribution on the turn span.
+    ///
+    /// `resolve_voice_endpoint` deliberately does not return this: it resolves an ALIAS through
+    /// the caller's key and has no reason to care who they are. The identity was therefore
+    /// available all along and simply never asked for, which is why project_id, user_id and
+    /// api_key_id were NULL for every voice turn ever recorded.
+    ///
+    /// Cheap by construction — `authenticate` reads the in-memory ArcSwap snapshot and performs
+    /// no I/O, which is the whole point of the auth plane. The middleware has already
+    /// authenticated this request; this is a second lookup of the same map, not a second
+    /// round trip.
+    pub async fn resolve_principal(
+        &self,
+        bearer: Option<&str>,
+    ) -> Option<bud_auth::runtime::Principal> {
+        let plane = self.bud_mode.as_ref()?.plane();
+        plane.authenticate(bearer?).await.ok()
+    }
+
     pub fn resolve_voice_endpoint(
         &self,
         name: &str,

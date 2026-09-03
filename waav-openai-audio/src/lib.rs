@@ -67,3 +67,41 @@ pub enum AudioError {
     #[error("`{field}` cannot be used: {reason}")]
     InvalidField { field: &'static str, reason: String },
 }
+
+/// Whether an optional identity field is worth recording onto a span.
+///
+/// `Some("")` must NOT be recorded. An empty string is not NULL: it makes a column look
+/// populated to any check that asks "did a value ever arrive", while carrying no attribution.
+/// FRD-018 has already produced that failure three times — a declaration satisfying every
+/// guard while nothing was written — so the empty case is filtered in one place rather than at
+/// each call site that would have to remember.
+pub fn recordable(value: Option<&str>) -> Option<&str> {
+    match value {
+        Some(v) if !v.trim().is_empty() => Some(v),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod recordable_tests {
+    use super::recordable;
+
+    #[test]
+    fn a_real_value_is_recorded() {
+        assert_eq!(recordable(Some("proj-123")), Some("proj-123"));
+    }
+
+    #[test]
+    fn absent_stays_absent() {
+        assert_eq!(recordable(None), None);
+    }
+
+    #[test]
+    fn an_empty_string_is_not_a_value() {
+        // The trap: "" is not NULL. Recording it turns "this column is never written" — the
+        // question verify_live.sh now asks — into a false pass, hiding missing attribution
+        // instead of reporting it.
+        assert_eq!(recordable(Some("")), None);
+        assert_eq!(recordable(Some("   ")), None);
+    }
+}
