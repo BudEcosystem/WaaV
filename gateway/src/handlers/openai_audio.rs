@@ -286,6 +286,49 @@ async fn transcription_inner(
         return model_not_found(&settings.endpoint, capability);
     };
 
+    let api_key = endpoint.credential.clone().unwrap_or_default();
+
+    // A self-hosted deployment already speaks this exact API, so the file is FORWARDED whole
+    // rather than decoded and replayed through a streaming provider. That is not a shortcut:
+    // decoding would impose WaaV's WAV-only limit on a backend that may well accept mp3, and
+    // the settle heuristic exists only because streaming providers never say "done" -- an
+    // HTTP backend answers once and is finished.
+    if endpoint.vendor == "self_hosted" {
+        let Some(api_base) = endpoint.api_base.clone() else {
+            return openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                format!(
+                    "Endpoint '{}' is self-hosted but has no deployment URL configured",
+                    settings.endpoint
+                ),
+                None,
+            );
+        };
+        info!(
+            endpoint = %settings.endpoint,
+            capability,
+            bytes = file_bytes.len(),
+            "openai audio/transcriptions -> self-hosted passthrough"
+        );
+        return match crate::handlers::transcribe::transcribe_self_hosted(
+            &api_base,
+            &api_key,
+            &endpoint.model.clone().unwrap_or_default(),
+            file_bytes,
+            &filename,
+            &settings,
+        )
+        .await
+        {
+            Ok(body) => passthrough_response(&settings.response_format, body),
+            Err(e) => {
+                warn!(endpoint = %settings.endpoint, error = %e, "self-hosted transcription failed");
+                openai_error(StatusCode::BAD_GATEWAY, "api_error", e, None)
+            }
+        };
+    }
+
     // Decode BEFORE touching the provider: a container we cannot read is the caller's problem
     // and must not cost a vendor connection to discover.
     let audio = match waav_openai_audio::pcm::decode(&file_bytes, &filename) {
@@ -293,7 +336,6 @@ async fn transcription_inner(
         Err(e) => return translation_error(&e),
     };
 
-    let api_key = endpoint.credential.clone().unwrap_or_default();
     if api_key.is_empty() && endpoint.vendor != "self_hosted" {
         return openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -377,4 +419,22 @@ fn render_transcription(
         F::Srt => (StatusCode::OK, headers, result.to_srt()).into_response(),
         F::Vtt => (StatusCode::OK, headers, result.to_vtt()).into_response(),
     }
+}
+
+/// Return a self-hosted backend's response body unchanged, with the content type the caller
+/// asked for.
+///
+/// Re-parsing and re-rendering it would be worse than pointless: the backend was given the
+/// same `response_format`, so its body is already correct, and a round trip through our own
+/// structs would drop any field we do not model (word-level timestamps, per-segment
+/// confidence) from a response that had them.
+fn passthrough_response(
+    format: &transcription::TranscriptionResponseFormat,
+    body: String,
+) -> Response {
+    let mut headers = HeaderMap::new();
+    if let Ok(ct) = format.content_type().parse() {
+        headers.insert(header::CONTENT_TYPE, ct);
+    }
+    (StatusCode::OK, headers, body).into_response()
 }

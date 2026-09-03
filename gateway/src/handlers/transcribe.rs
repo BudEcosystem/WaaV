@@ -221,3 +221,79 @@ mod tests {
         assert_eq!((0usize * FRAME_MS / 1000).max(1), 1);
     }
 }
+
+/// Forward an upload to a self-hosted OpenAI-compatible backend and return its body verbatim.
+///
+/// `/audio/translations` is a DIFFERENT route on these servers, not a parameter, so the
+/// translate flag selects the URL. Sending a translation request to the transcription route
+/// returns source-language text with a 200 — correct-looking and wrong.
+pub async fn transcribe_self_hosted(
+    api_base: &str,
+    api_key: &str,
+    model: &str,
+    file_bytes: Vec<u8>,
+    filename: &str,
+    settings: &waav_openai_audio::transcription::TranscriptionSettings,
+) -> Result<String, String> {
+    use crate::core::tts::self_hosted::{transcription_url, translation_url};
+
+    let url = if settings.translate {
+        translation_url(api_base)
+    } else {
+        transcription_url(api_base)
+    };
+
+    let part = reqwest::multipart::Part::bytes(file_bytes).file_name(filename.to_string());
+    let mut form = reqwest::multipart::Form::new()
+        .part("file", part)
+        // The backend's own model name, not the Bud endpoint alias -- the alias means nothing
+        // to a server that has never heard of Bud.
+        .text("model", model.to_string())
+        .text("response_format", settings.response_format.as_str().to_string());
+
+    // Only forward what the caller actually set. Sending `language: ""` makes some servers
+    // fail validation on a field the caller never mentioned.
+    if let Some(lang) = &settings.language
+        && !settings.translate
+    {
+        form = form.text("language", lang.clone());
+    }
+    if let Some(prompt) = &settings.prompt {
+        form = form.text("prompt", prompt.clone());
+    }
+    if let Some(t) = settings.temperature {
+        form = form.text("temperature", t.to_string());
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(OVERALL_DEADLINE)
+        .build()
+        .map_err(|e| format!("could not build the http client: {e}"))?;
+
+    let mut req = client.post(&url).multipart(form);
+    // A keyless in-cluster deployment is normal; an empty Bearer is a malformed credential,
+    // not an anonymous one, and some servers reject it outright.
+    if !api_key.is_empty() {
+        req = req.bearer_auth(api_key);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("self-hosted deployment at {url} is unreachable: {e}"))?;
+
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("self-hosted deployment returned an unreadable body: {e}"))?;
+
+    if !status.is_success() {
+        // The backend's own message is far more useful than anything synthesised here.
+        return Err(format!(
+            "self-hosted deployment returned {status}: {}",
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    Ok(body)
+}

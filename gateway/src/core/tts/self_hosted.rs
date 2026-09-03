@@ -32,6 +32,22 @@ pub fn speech_url(api_base: &str) -> String {
     format!("{}/audio/speech", api_base.trim_end_matches('/'))
 }
 
+/// Join a configured base URL with the OpenAI transcription path.
+///
+/// Same trailing-slash discipline as [`speech_url`], for the same reason.
+pub fn transcription_url(api_base: &str) -> String {
+    format!("{}/audio/transcriptions", api_base.trim_end_matches('/'))
+}
+
+/// Join a configured base URL with the OpenAI translation path.
+///
+/// A SEPARATE path, not a flag on the transcription one: an OpenAI-compatible server decides
+/// "transcribe" versus "translate to English" by route, so collapsing the two would return
+/// source-language text from a translation request while looking entirely successful.
+pub fn translation_url(api_base: &str) -> String {
+    format!("{}/audio/translations", api_base.trim_end_matches('/'))
+}
+
 /// The OpenAI `response_format` value for a WaaV audio-format name.
 ///
 /// WaaV's internal vocabulary is the union of every vendor's; OpenAI-compatible servers accept
@@ -218,6 +234,32 @@ mod tests {
             speech_url("http://whisper.ns.svc:8000/v1///"),
             "http://whisper.ns.svc:8000/v1/audio/speech"
         );
+    }
+
+    #[test]
+    fn transcription_and_translation_are_distinct_paths() {
+        // Collapsing them returns source-language text from a translation request, with a
+        // 200 and no sign anything is wrong.
+        assert_eq!(
+            transcription_url("http://whisper.ns.svc:8000/v1"),
+            "http://whisper.ns.svc:8000/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            translation_url("http://whisper.ns.svc:8000/v1"),
+            "http://whisper.ns.svc:8000/v1/audio/translations"
+        );
+        assert_ne!(
+            transcription_url("http://x/v1"),
+            translation_url("http://x/v1")
+        );
+    }
+
+    #[test]
+    fn transcription_urls_normalise_trailing_slashes_like_speech_does() {
+        for base in ["http://w/v1", "http://w/v1/", "http://w/v1///"] {
+            assert_eq!(transcription_url(base), "http://w/v1/audio/transcriptions");
+            assert_eq!(translation_url(base), "http://w/v1/audio/translations");
+        }
     }
 
     #[test]
